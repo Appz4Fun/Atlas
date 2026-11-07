@@ -153,7 +153,7 @@ fn a_password_carries_to_xposts_and_twins_but_not_alts() {
 
     // the pages say so, and the alt is left alone
     let key = "k";
-    let login = atlas::web::post("/login", "key=k", None, false, "", key).unwrap();
+    let login = atlas::web::post("/login", "key=k", None, false, None, "", key).unwrap();
     let cookie =
         login.headers.iter().find(|(h, _)| h == "Set-Cookie").unwrap().1.split(';').next().unwrap().to_string();
     let page = |id: i64| atlas::web::get("/ui/release", &format!("id={id}"), Some(&cookie), "", key).unwrap().body;

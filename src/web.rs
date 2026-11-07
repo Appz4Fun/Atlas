@@ -95,26 +95,33 @@ pub fn get(path: &str, query: &str, cookies: Option<&str>, base: &str, api_key: 
         "/ui/same" if signed_in => same_key_page(&args),
         "/ui/meta" if signed_in => crate::web_meta::fragment(&args),
         "/ui/row" if signed_in => crate::web_meta::row_panel(&args),
-        "/ui/settings" if signed_in => html(200, settings_page(None)),
+        "/ui/settings" if signed_in => html(200, crate::web_settings::settings_page(None, api_key)),
+        "/ui/settings/groups/search" if signed_in => html(200, crate::web_settings::group_search(&args, api_key)),
         "/ui/nzb" if signed_in && args.get("fill").is_some_and(|v| v == "1") => filled_nzb(&args),
         "/ui/nzb" if signed_in => get_nzb(&args),
         "/ui/total" | "/ui/details" | "/ui/pending" | "/ui/poster" | "/ui/cover" | "/ui/still" | "/ui/samefilm"
         | "/ui/meta" | "/ui/row" | "/ui/stats/live" | "/ui/stats/stored" => {
             ApiResponse { headers: vec![("HX-Redirect".into(), "/".into())], ..html(401, String::new()) }
         }
-        "/ui/nzb" | "/ui/release" | "/ui/duplicates" | "/ui/stats" | "/ui/same" | "/ui/settings" => {
-            redirect(Vec::new())
-        }
+        "/ui/nzb"
+        | "/ui/release"
+        | "/ui/duplicates"
+        | "/ui/stats"
+        | "/ui/same"
+        | "/ui/settings"
+        | "/ui/settings/groups/search" => redirect(Vec::new()),
         _ => return None,
     })
 }
 
-/// A POST the ui answers. None: not ours. `htmx`: htmx sent it, and swaps in what comes back.
+/// A POST the ui answers. None: not ours. `htmx`: htmx sent it, and swaps in what comes back. `csrf`: the
+/// `X-CSRF-Token` header, which the settings forms take in place of their field.
 pub fn post(
     path: &str,
     body: &str,
     cookies: Option<&str>,
     htmx: bool,
+    csrf: Option<&str>,
     base: &str,
     api_key: &str,
 ) -> Option<ApiResponse> {
@@ -132,19 +139,20 @@ pub fn post(
         }
         "/logout" => Some(redirect(vec![cookie_header("", 0)])),
         "/ui/ask" if signed_in => Some(ask(body, htmx, cookie_value(cookies, INCOMPLETE_COOKIE) == Some(HIDE))),
-        "/ui/settings" if signed_in => Some(save_settings(body)),
         "/ui/thaw" if signed_in => Some(thaw_release(body)),
         "/ui/ask" if htmx => {
             Some(ApiResponse { headers: vec![("HX-Redirect".into(), "/".into())], ..html(401, String::new()) })
         }
-        "/ui/ask" | "/ui/settings" | "/ui/thaw" => Some(redirect(Vec::new())),
+        "/ui/ask" | "/ui/thaw" => Some(redirect(Vec::new())),
+        p if crate::web_settings::takes_post(p) && signed_in => crate::web_settings::post(p, body, csrf, api_key),
+        p if crate::web_settings::takes_post(p) => Some(redirect(Vec::new())),
         _ => None,
     }
 }
 
 /// The ui reads a request body only on these paths.
 pub fn takes_post(path: &str) -> bool {
-    matches!(path, "/login" | "/logout" | "/ui/ask" | "/ui/settings" | "/ui/thaw")
+    matches!(path, "/login" | "/logout" | "/ui/ask" | "/ui/thaw") || crate::web_settings::takes_post(path)
 }
 
 /// Whether to hide incomplete releases, put in `args` as `incomplete=hide` when the url doesn't say but the cookie does,
@@ -221,7 +229,7 @@ pub(crate) fn html(status: u16, body: String) -> ApiResponse {
 }
 
 /// What the cookie holds: stands in for the key, and changes with it.
-fn session_token(api_key: &str) -> String {
+pub(crate) fn session_token(api_key: &str) -> String {
     let digest = Sha1::digest(format!("atlas web session\0{api_key}").as_bytes());
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -235,7 +243,7 @@ fn signed_in(cookies: Option<&str>, api_key: &str) -> bool {
         .any(|(name, value)| name == COOKIE && same(value, &want))
 }
 
-fn same(a: &str, b: &str) -> bool {
+pub(crate) fn same(a: &str, b: &str) -> bool {
     a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0, |diff, (x, y)| diff | (x ^ y)) == 0
 }
 
@@ -4285,7 +4293,7 @@ fn ask_box(settings: &gemini::Settings) -> String {
     let note = ask_note("", "");
     if !settings.has_key() {
         return format!(
-            "<p class=\"ask-off\">Search in plain words with Gemini: <a href=\"/ui/settings\">add a key in Settings</a>.</p>{note}"
+            "<p class=\"ask-off\">Search in plain words with Gemini: <a href=\"/ui/settings#gemini\">add a key in Settings</a>.</p>{note}"
         );
     }
     format!(
@@ -4396,78 +4404,6 @@ fn ask(body: &str, htmx: bool, hide_incomplete: bool) -> ApiResponse {
     );
     // the search box takes the words from `data-q` (web.js): swapping the box would drop the form's listener on it
     first_page(&search, &ask_note(&note, " hx-swap-oob=\"true\""))
-}
-
-fn settings_page(message: Option<(&str, &str, String)>) -> String {
-    let settings = gemini::load();
-    let masked = escape(&gemini::masked(&settings.api_key));
-    let status = if settings.from_env {
-        format!(
-            "Atlas uses the key in <code>GEMINI_API_KEY</code>, <code>{masked}</code>. A key saved here takes its place."
-        )
-    } else if settings.has_key() {
-        format!("A key is saved: <code>{masked}</code>. Paste another to replace it.")
-    } else {
-        "No key yet. Make one in <a href=\"https://aistudio.google.com/apikey\" target=\"_blank\" rel=\"noreferrer noopener\">Google AI Studio</a>, then paste it here.".to_string()
-    };
-    let forget = if settings.has_key() && !settings.from_env {
-        "<button class=\"button\" name=\"do\" value=\"forget\">Remove key</button>"
-    } else {
-        ""
-    };
-    let message = message.map_or(String::new(), |(level, title, body)| diag(level, title, &body));
-    page(
-        "Atlas settings",
-        &format!(
-            r#"{masthead}<main class="detail settings">
-<p class="path"><a href="/">Atlas</a> › Settings</p><h1>Settings</h1>{message}
-<section class="panel"><h2>Ask AI with Gemini</h2>
-<p>Ask AI, on the search page, sends what you type to Google's Gemini with the list of categories and filters, then searches with the fields Gemini sends back. Nothing from your index goes to Google.</p>
-<p>{status}</p>
-<form class="settings-form" method="post" action="/ui/settings">
-<label for="gemini-key">Gemini API key</label>
-<input id="gemini-key" name="key" type="password" autocomplete="off" spellcheck="false" placeholder="{placeholder}">
-<label for="gemini-model">Model</label>
-<input id="gemini-model" name="model" type="text" value="{model}" placeholder="{default}" autocomplete="off" spellcheck="false">
-<p class="hint">Leave it empty for <code>{default}</code>, which follows Google's newest Flash model.</p>
-<div class="actions"><button class="button primary" name="do" value="save">Save</button>{forget}</div>
-</form></section></main>"#,
-            masthead = masthead(true),
-            placeholder = if settings.has_key() { "Paste a new key to replace it" } else { "Paste your key" },
-            model = attr(&settings.model),
-            default = gemini::DEFAULT_MODEL,
-        ),
-    )
-}
-
-fn save_settings(body: &str) -> ApiResponse {
-    let args = parse_query(body);
-    let get = |k: &str| args.get(k).map_or("", |v| v.trim());
-    let message = if get("do") == "forget" {
-        match gemini::forget() {
-            Ok(()) => ("help", "the key is removed", "Ask AI is off until you add another.".to_string()),
-            Err(e) => ("caution", "could not remove the key", e.to_string()),
-        }
-    } else {
-        let (key, model) = (get("key"), get("model"));
-        if !key.is_empty() && !gemini::looks_like_key(key) {
-            ("caution", "that is not a Gemini key", "A key is one line of letters, digits, - and _.".to_string())
-        } else if !model.is_empty()
-            && let Err(why) = gemini::model_path(model)
-        {
-            ("caution", "that is not a model name", why)
-        } else {
-            match gemini::save(key, model) {
-                Err(e) => ("caution", "could not save", e.to_string()),
-                Ok(saved) if !saved.has_key() => ("note", "saved", "Paste a key to turn Ask AI on.".to_string()),
-                Ok(saved) => match gemini::check(&saved) {
-                    Ok(()) => ("help", "saved", format!("Gemini took the key, and knows {}.", saved.model())),
-                    Err(why) => ("caution", "saved, but Gemini did not take it", why),
-                },
-            }
-        }
-    };
-    html(200, settings_page(Some(message)))
 }
 
 fn login_page(base: &str, wrong_key: bool) -> String {
@@ -4857,21 +4793,39 @@ mod tests {
 
     #[test]
     fn signing_in_takes_the_key_and_the_cookie_is_not_the_key() {
-        let wrong = post("/login", "key=nope", None, false, "http://x", KEY).unwrap();
+        let wrong = post("/login", "key=nope", None, false, None, "http://x", KEY).unwrap();
         assert_eq!(wrong.status, 401);
         assert!(header(&wrong, "Set-Cookie").is_none());
         assert!(wrong.body.contains("not the API key"));
 
-        let right = post("/login", &format!("key={KEY}"), None, false, "http://x", KEY).unwrap();
+        let right = post("/login", &format!("key={KEY}"), None, false, None, "http://x", KEY).unwrap();
         assert_eq!(right.status, 303);
         assert_eq!(header(&right, "Location"), Some("/"));
         let set = header(&right, "Set-Cookie").unwrap();
         assert!(set.contains("HttpOnly") && set.contains("SameSite=Strict"), "{set}");
         assert!(!set.contains(KEY), "{set}");
 
-        let out = post("/logout", "", None, false, "http://x", KEY).unwrap();
+        let out = post("/logout", "", None, false, None, "http://x", KEY).unwrap();
         assert!(header(&out, "Set-Cookie").unwrap().contains("Max-Age=0"));
-        assert!(post("/api", "", None, false, "http://x", KEY).is_none());
+        assert!(post("/api", "", None, false, None, "http://x", KEY).is_none());
+    }
+
+    #[test]
+    fn the_settings_pages_need_signing_in_and_a_csrf_token() {
+        let base = "http://127.0.0.1:9090";
+        let page = get("/ui/settings", "", Some(&cookie()), base, KEY).unwrap();
+        assert_eq!(page.status, 200);
+        for want in ["id=\"servers\"", "id=\"indexing\"", "id=\"api\"", "id=\"gemini\"", "name=\"_csrf\""] {
+            assert!(page.body.contains(want), "missing {want:?} in {}", page.body);
+        }
+        let search = get("/ui/settings/groups/search", "q=alt.binaries", Some(&cookie()), base, KEY).unwrap();
+        assert_eq!(search.status, 200);
+        for path in ["/ui/settings", "/ui/settings/groups/search"] {
+            assert_ne!(get(path, "", None, base, KEY).unwrap().status, 200, "{path} needs signing in");
+        }
+        assert!(crate::web_settings::takes_post("/ui/settings/servers"));
+        let forged = post("/ui/settings/servers", "host=x", Some(&cookie()), false, None, base, KEY).unwrap();
+        assert_ne!(forged.status, 200, "{}", forged.body);
     }
 
     #[test]

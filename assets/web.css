@@ -220,7 +220,7 @@ td.dim { color: var(--muted); font-size: .82rem; }
 .poster { flex: none; width: 171px; height: 256px; object-fit: cover; background: var(--sunken); border-radius: var(--radius-sm); }
 .poster:not([src]) { display: none; }
 .settings summary { cursor: pointer; color: var(--muted); font-size: .86rem; }
-.settings code { display: block; margin-top: 4px; white-space: normal; overflow-wrap: anywhere; font-size: .78rem; }
+.settings code { white-space: normal; overflow-wrap: anywhere; }
 .cover-panel { display: flex; justify-content: flex-start; }
 .cover { display: block; max-width: 100%; max-height: 360px; width: auto; height: auto; background: var(--sunken); border-radius: var(--radius-sm); }
 .backdrop { display: block; width: 100%; max-height: 240px; margin-bottom: 14px; object-fit: cover; background: var(--sunken); border-radius: var(--radius); }
@@ -306,12 +306,29 @@ tr.drawer-row code.key, .drawer-card code.key { background: var(--surface); }
 .ask-read .path { margin-top: 4px; }
 #ask-note .diag { margin-bottom: 14px; }
 .settings { max-width: 720px; }
+.settings .panel { margin-bottom: 18px; }
 .settings .panel h2 { margin-top: 0; }
+.settings .panel h3 { margin: 18px 0 6px; font-size: 1rem; }
+.settings-nav { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 12px; }
+.settings-nav a { padding: 3px 10px; font: 600 .74rem/1.5 var(--font-mono); color: var(--muted); text-decoration: none; background: var(--surface); border: 1px solid var(--line-strong); border-radius: 999px; }
+.settings-nav a:hover { color: var(--ink); border-color: var(--ink); }
 .settings-form { display: flex; flex-direction: column; gap: 6px; max-width: 480px; }
 .settings-form label { margin-top: 6px; font-weight: 600; font-size: .9rem; }
-.settings-form input[type="text"] { width: 100%; height: 40px; padding: 0 12px; font: inherit; color: var(--ink); background: var(--surface); border: 1px solid var(--line-strong); border-radius: var(--radius-sm); }
+.settings-form input:not([type="checkbox"]), .settings-form select { width: 100%; height: 40px; padding: 0 12px; font: inherit; font-weight: 400; color: var(--ink); background: var(--surface); border: 1px solid var(--line-strong); border-radius: var(--radius-sm); box-sizing: border-box; }
+.settings-form input:disabled, .settings-form select:disabled { color: var(--muted); background: var(--sunken); }
+.settings-form .field-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; }
+.settings-form .field-row label { display: flex; flex-direction: column; gap: 3px; margin-top: 6px; }
+.settings-form .check { display: flex; align-items: center; gap: 8px; font-weight: 500; }
+.settings-form .check input { width: auto; height: auto; margin: 0; }
 .hint { margin: 0; font-size: .82rem; color: var(--muted); }
+.managed { margin: 0 0 10px; padding: 8px 12px; font-size: .85rem; color: var(--muted); background: var(--sunken); border-left: 2px solid var(--steel); border-radius: var(--radius-sm); }
 .settings-form .actions { margin-bottom: 0; }
+details.server { margin-bottom: 8px; padding: 10px 14px; background: var(--sunken); border: 1px solid var(--line); border-radius: var(--radius-sm); }
+details.server summary { display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: baseline; cursor: pointer; font-size: .9rem; color: var(--muted); }
+details.server summary .host { color: var(--ink); font-weight: 600; overflow-wrap: anywhere; }
+details.server summary .tag { margin-left: 0; }
+details.server .settings-form { margin-top: 12px; }
+details.add summary .host { color: var(--rust); }
 .path a { color: inherit; }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 
