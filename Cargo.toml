@@ -17,6 +17,7 @@ path = "src/main.rs"
 anyhow = "1"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+num-bigint = "0.4"
 flate2 = "1"
 getrandom = "0.3"
 indexmap = "2"

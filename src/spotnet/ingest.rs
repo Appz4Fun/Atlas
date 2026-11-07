@@ -1,7 +1,8 @@
-//! Reads new spots from `free.pt` every `poll_minutes`: the overview first, keeping the signed movie and TV spots,
-//! then each of those whole (HEAD for its XML, BODY for its NZB in `alt.binaries.ftd`), saved as a release and
-//! tagged with its spot. About 75 spots a day pass the filter. Spots are fetched `concurrency` at a time: each
-//! request queues for a connection behind indexing, so one at a time was minutes a spot on a busy indexer.
+//! Reads new spots from `free.pt` every `poll_minutes`: the overview first, keeping the movie and TV spots whose
+//! signatures hold (`sign`), then each of those whole (HEAD for its XML, BODY for its NZB in `alt.binaries.ftd`),
+//! saved as a release and tagged with its spot. About 75 spots a day pass the filter. Spots are fetched
+//! `concurrency` at a time: each request queues for a connection behind indexing, so one at a time was minutes a
+//! spot on a busy indexer.
 //!
 //! Comments and spam reports on the spots kept (`comments`) are read by a task of their own, `run_comments`:
 //! with a backlog of spots a spot pass takes an hour, and comments read after it waited that long.
@@ -18,7 +19,7 @@ use crate::indexer::{Db, on_db};
 use crate::nntp::{Pool, says_absent};
 
 use super::store::{self, SAVED, SKIPPED, Settled, SpotRow};
-use super::{MAX_XML_BYTES, SPOT_GROUP, binary, comments, full, header, release};
+use super::{MAX_XML_BYTES, SPOT_GROUP, binary, comments, full, header, release, sign};
 
 /// Overview lines asked for in one XOVER.
 const XOVER_STEP: u64 = 5_000;
@@ -277,6 +278,17 @@ async fn fetch(
         Err(e) if says_absent(&e) => return Ok(Some(skipped(None))),
         Err(e) => return Err(e.into()),
     };
+    // checked again here, for spots noted before the overview was checked
+    let (subject, from) = (header::header_value(&head, "Subject"), header::header_value(&head, "From"));
+    let verdict = match (subject, from) {
+        (Some(subject), Some(from)) => {
+            header::parse(&subject, &from).map(|h| sign::verify(&h.title, &from, message_id)).unwrap_or_default()
+        }
+        _ => sign::Verdict::default(),
+    };
+    if !verdict.verified {
+        return Ok(Some(skipped(None)));
+    }
     let Some(xml) = full::xml_from_headers(&head) else { return Ok(Some(skipped(None))) };
     let Some(spot) = full::parse(&xml) else { return Ok(Some(skipped(None))) };
     let Some(kind) = spot.kind() else { return Ok(Some(skipped(None))) };
@@ -284,7 +296,7 @@ async fn fetch(
     if spot.nzb.is_empty() || !nzb_ids_usable(&spot.nzb) {
         return Ok(Some(skipped(None)));
     }
-    let spotter_id = header::spotter_id_of_head(&head);
+    let spotter_id = verdict.spotter_id;
     let row = |nzb_key: String| SpotRow {
         message_id: message_id.to_string(),
         kind,
@@ -446,7 +458,12 @@ async fn read_overview(
             .iter()
             .filter_map(|r| {
                 let h = header::parse(&r.subject, &r.from).filter(header::SpotHeader::wanted)?;
-                Some((r.message_id.trim_matches(['<', '>']).to_string(), r.number, h.spotter_id()))
+                // a spot whose signatures don't hold is one anyone could have posted: Spotweb drops it too
+                let verdict = sign::verify(&h.title, &r.from, &r.message_id);
+                if !verdict.verified {
+                    return None;
+                }
+                Some((r.message_id.trim_matches(['<', '>']).to_string(), r.number, verdict.spotter_id))
             })
             .collect();
         let key = host.clone();
