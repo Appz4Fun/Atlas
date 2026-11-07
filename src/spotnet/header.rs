@@ -121,11 +121,26 @@ pub fn subcats(list: &str) -> Subcats {
     out
 }
 
-/// The spotter id of the spot whose headers these are, from its `From`.
-pub fn spotter_id_of_head(head: &[u8]) -> Option<String> {
+/// The value of the header `name` in an article's headers, unfolded (a line that starts with a space or tab goes on
+/// the one before it).
+pub fn header_value(head: &[u8], name: &str) -> Option<String> {
     let text = String::from_utf8_lossy(head);
-    let from = text.lines().find_map(|l| l.get(..5).filter(|p| p.eq_ignore_ascii_case("from:")).map(|_| &l[5..]))?;
-    spotter_id_of_from(from)
+    let mut lines = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l));
+    let mut value = loop {
+        let line = lines.next()?;
+        if line.is_empty() {
+            return None;
+        }
+        if let Some((n, v)) = line.split_once(':')
+            && n.eq_ignore_ascii_case(name)
+        {
+            break v.trim_start().to_string();
+        }
+    };
+    for line in lines.take_while(|l| l.starts_with([' ', '\t'])) {
+        value.push_str(line);
+    }
+    Some(value)
 }
 
 /// The spotter id a Spotnet `From` value carries: its address is the poster's public key, `.`, the signature.
@@ -240,10 +255,13 @@ mod tests {
     }
 
     #[test]
-    fn spotter_id_from_headers() {
-        let head = b"Path: x\nFrom: Senua <1FNddBgs6c-pMxF9DDUjo9SQmtH-pgI5xOShhXz6EyZ7GHuXXWG-sSKP8sXt2EfOcz9.sig@17a09.1.2.3.4.5.6>\nSubject: s\n";
-        assert_eq!(spotter_id_of_head(head).as_deref(), Some("baTFcw"));
-        assert_eq!(spotter_id_of_head(b"Subject: s\n"), None);
+    fn header_values() {
+        let head = b"Path: x\r\nFrom: Senua <1FNdd.sig@17a09.1.2.3.4.5.6>\r\nSubject: a\r\n\tb\r\nX: y\r\n";
+        assert_eq!(header_value(head, "from").as_deref(), Some("Senua <1FNdd.sig@17a09.1.2.3.4.5.6>"));
+        assert_eq!(header_value(head, "Subject").as_deref(), Some("a\tb"));
+        assert_eq!(header_value(head, "Date"), None);
+        // the body isn't headers
+        assert_eq!(header_value(b"X: y\n\nDate: z\n", "Date"), None);
     }
 
     #[test]

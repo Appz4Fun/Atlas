@@ -231,6 +231,7 @@ dependencies = [
  "lzma-rs",
  "md-5 0.10.6",
  "nntmux-yenc",
+ "num-bigint",
  "par-rs",
  "postgres",
  "quick-xml",
