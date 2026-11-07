@@ -950,7 +950,7 @@ impl Search {
         let by = self.sort;
         let mut at_least = self.offset + PAGE_SIZE + 1;
         // a rating chip stopped the window growing with more of the search behind it
-        let mut rated_stop = false;
+        let mut rated_stop = None;
         let (rows, more) = loop {
             let window = match window_of(self, at_least) {
                 Ok(window) => window,
@@ -959,7 +959,8 @@ impl Search {
             let (rows, more) = window.page(self, by);
             // short of a page past the end of what was read: folded rows or filters left too few, soo read further
             if more || !window.can_grow(self) {
-                rated_stop = self.min_score.is_some() && window.more_in_db && window.asked >= GROW_WITH_RATING;
+                rated_stop = (self.min_score.is_some() && window.more_in_db && window.asked >= GROW_WITH_RATING)
+                    .then_some(window.asked);
                 break (rows, more);
             }
             at_least = window.asked.saturating_mul(2);
@@ -967,11 +968,11 @@ impl Search {
         if rows.is_empty() {
             return if self.offset == 0 {
                 self.nothing_found()
-            } else if rated_stop {
+            } else if let Some(asked) = rated_stop {
                 format!(
                     "<tr><td colspan=\"{COLUMNS}\" class=\"note dim\">A rating chip looks through the first {} results. \
                      Narrow the search to see further.</td></tr>",
-                    thousands(GROW_WITH_RATING)
+                    thousands(asked)
                 )
             } else if self.offset + PAGE_SIZE >= MAX_WINDOW {
                 format!(
@@ -1022,7 +1023,7 @@ impl Search {
             let all = attr(&Search { offset: 0, min_score: None, ..self.clone() }.query(&self.cat, 0));
             let _ = write!(
                 hint,
-                "Only releases rated that high are shown, by the scores kept so far, from the first {GROW_WITH_RATING} results. <a href=\"/?{all}\" hx-get=\"/ui/results?{all}\" hx-target=\"#results\">Show every rating</a>. "
+                "Only releases rated that high are shown, by the scores kept so far. <a href=\"/?{all}\" hx-get=\"/ui/results?{all}\" hx-target=\"#results\">Show every rating</a>. "
             );
         }
         if !self.q.is_empty() {
