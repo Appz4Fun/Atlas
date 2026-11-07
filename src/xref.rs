@@ -69,6 +69,8 @@ create table if not exists linked (
     parts   INTEGER NOT NULL,
     -- the parts that were the first a group got of the file in their batch, comma separated (`leads`)
     leads   TEXT NOT NULL DEFAULT '',
+    -- when the oldest of its saved articles came: while that's within the window, what comes again is told apart
+    oldest  INTEGER NOT NULL DEFAULT 0,
     added   INTEGER NOT NULL
 ) without rowid;
 create index if not exists linked_added on linked(added);
@@ -301,6 +303,7 @@ fn now() -> i64 {
 /// One article as the store keeps it.
 struct Row {
     message_id: String,
+    added: i64,
     /// the first its group got of the file, of the rows taken together
     lead: bool,
     posted: i64,
@@ -314,6 +317,8 @@ struct Row {
 struct Place {
     /// the parts that were a group's first, comma separated (`leads`)
     leads: String,
+    /// when the oldest of its saved articles came
+    oldest: i64,
     release: String,
     group: String,
     file: i64,
@@ -466,16 +471,21 @@ impl Store {
     fn place_of(&self, poster: &str) -> Result<Option<Place>> {
         Ok(self
             .conn
-            .query_row("select release, grp, file, files, parts, leads from linked where poster = ?1", [poster], |r| {
-                Ok(Place {
-                    release: r.get(0)?,
-                    group: r.get(1)?,
-                    file: r.get(2)?,
-                    files: r.get(3)?,
-                    parts: r.get(4)?,
-                    leads: r.get(5)?,
-                })
-            })
+            .query_row(
+                "select release, grp, file, files, parts, leads, oldest from linked where poster = ?1",
+                [poster],
+                |r| {
+                    Ok(Place {
+                        release: r.get(0)?,
+                        group: r.get(1)?,
+                        file: r.get(2)?,
+                        files: r.get(3)?,
+                        parts: r.get(4)?,
+                        leads: r.get(5)?,
+                        oldest: r.get(6)?,
+                    })
+                },
+            )
             .optional()?)
     }
 
@@ -485,7 +495,7 @@ impl Store {
     fn rows_of(&self, poster: &str) -> Result<Vec<Row>> {
         let mut stmt = self.conn.prepare_cached(
             "select message_id, posted, grp, number, bytes, lines,
-                    row_number() over (partition by grp order by number, message_id) as rank
+                    row_number() over (partition by grp order by number, message_id) as rank, added
              from headers where poster = ?1 and done = 0
              order by added, grp, number, message_id",
         )?;
@@ -498,6 +508,7 @@ impl Store {
                 bytes: r.get(4)?,
                 lines: r.get(5)?,
                 lead: r.get::<_, i64>(6)? == 1,
+                added: r.get(7)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -536,7 +547,12 @@ impl Store {
         let mut finished: Vec<(String, Option<Place>, Vec<String>)> = Vec::new();
 
         for (f, place) in late {
-            if settled(&f) {
+            if settled(&f) && place.oldest < now - KEEP_SECS {
+                // the file's first articles have left the window: one read again couldnt be told from a new one, and
+                // would be numbered as another part. Let go
+                let ids = self.rows_of(&f.poster)?.into_iter().map(|r| r.message_id).collect();
+                finished.push((f.poster, None, ids));
+            } else if settled(&f) {
                 let rows = self.rows_of(&f.poster)?;
                 let parts = place.parts + rows.len() as i64;
                 let ids = rows.iter().map(|r| r.message_id.clone()).collect();
@@ -606,6 +622,7 @@ impl Store {
                     files: count,
                     parts: 0,
                     leads: String::new(),
+                    oldest: rows.iter().map(|r| r.added).min().unwrap_or(now),
                 };
                 let ids = rows.iter().map(|r| r.message_id.clone()).collect();
                 let leads = with_leads("", self.add_file(&mut out, &place, &fresh[i].poster, rows, parts));
@@ -659,8 +676,8 @@ impl Store {
         {
             let mut done = tx.prepare_cached("update headers set done = 1 where message_id = ?1")?;
             let mut keep = tx.prepare_cached(
-                "insert into linked (poster, release, grp, file, files, parts, leads, added)
-                 values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "insert into linked (poster, release, grp, file, files, parts, leads, oldest, added)
+                 values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  on conflict(poster) do update set parts = excluded.parts, leads = excluded.leads, added = excluded.added",
             )?;
             for (poster, place, ids) in finished {
@@ -668,7 +685,9 @@ impl Store {
                     done.execute([id])?;
                 }
                 if let Some(p) = place {
-                    keep.execute(params![poster, p.release, p.group, p.file, p.files, p.parts, p.leads, now])?;
+                    keep.execute(params![
+                        poster, p.release, p.group, p.file, p.files, p.parts, p.leads, p.oldest, now
+                    ])?;
                 }
             }
             let mut upload = tx.prepare_cached(
@@ -1120,5 +1139,23 @@ mod tests {
         let again = parts(&store.pass_with(1003 + 2 * SETTLE_SECS, &mut |_, _| false).unwrap());
         assert!(first.iter().all(|(id, p)| again[id] == *p), "the same numbers");
         assert_eq!(again[&late.message_id], 13, "what came since goes after");
+    }
+
+    #[test]
+    fn articles_of_a_file_saved_past_the_window_are_let_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("atlas.xref.db")).unwrap();
+        for k in 0..12u64 {
+            let a = article(&format!("p{k:023}"), "file@x.y", "2023-12-03 16:23:23", k);
+            store.record("a.b.one", &[a], 1000).unwrap();
+        }
+        assert_eq!(store.pass(1001 + SETTLE_SECS).unwrap().len(), 1);
+        // read again two days on, its headers gone: it can't be told from a new part
+        let t = 1000 + 2 * KEEP_SECS;
+        store.prune(t).unwrap();
+        let again = article(&format!("p{:023}", 0), "file@x.y", "2023-12-03 16:23:23", 0);
+        assert_eq!(store.record("a.b.one", &[again], t).unwrap(), 1);
+        assert!(store.pass(t + 1 + SETTLE_SECS).unwrap().is_empty());
+        assert!(store.waiting().unwrap().is_empty(), "noted, not saved");
     }
 }
