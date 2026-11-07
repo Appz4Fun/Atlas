@@ -22,6 +22,7 @@ use crate::api::{ApiResponse, escape};
 use crate::archive::store::{InnerFileRow, InnerView, SOURCE_7Z, SOURCE_NZB, SOURCE_PAR2, SOURCE_RAR, SOURCE_ZIP};
 use crate::keys::Kind;
 use crate::naming::NameSource;
+use crate::probe::yenc_quirks;
 use crate::release_info::{self, Contents, Names};
 use crate::search::{ArticleRow, ReleaseRow};
 use crate::store::{self, FileInfo, SegmentPick, SegmentRef};
@@ -1291,13 +1292,22 @@ fn posted_by_panel(i: &MetaInputs<'_>, l: &Looked, compact: bool) -> Facts {
             f.add("Injection-Info", Some(text));
         }
         f.add("Ids look like", grammar);
+        if let Some(q) = i.probe.and_then(|p| p.quirks.as_ref()) {
+            let summary = q.summary();
+            let text = match yenc_quirks::class(q) {
+                Some(class) => format!("like {class}: {summary}"),
+                None => format!("like no documented encoder: {summary}"),
+            };
+            f.add("yEnc quirks", (!summary.is_empty()).then_some(text));
+        }
     }
     if let Some(p) = i.probe
         && let Some(agent) = crate::probe::agent_of(&p.headers)
     {
         let line_len = p.yenc.as_ref().and_then(|y| y.line_len);
         let mut text = escape(agent);
-        if let Some((agrees, why)) = tool_verdict(Some(agent), p.segment_size, line_len, grammar) {
+        let quirks = p.quirks.as_ref();
+        if let Some((agrees, why)) = tool_verdict(Some(agent), p.segment_size, line_len, grammar, quirks) {
             let _ = write!(
                 text,
                 "{} {}",
@@ -1441,18 +1451,49 @@ const TOOL_DEFAULTS: &[ToolDefaults] = &[
     ToolDefaults { agent: "jbinup", articles: &[], line: 128, grammar: "JBinUp" },
 ];
 
-/// Whether the article's shape matches the stated tool's defaults: article size, line length and id grammar.
-/// None when the tool is not one with known defaults, or nothing can be compared.
+/// Whether the article's shape matches the stated tool's defaults: article size, line length, id grammar, and the
+/// quirks of its yEnc (`yenc_quirks::witness`). None when the tool is not one with known defaults, or nothing can be
+/// compared.
 fn tool_verdict(
     agent: Option<&str>,
     segment_size: Option<u64>,
     line_len: Option<u32>,
     grammar: Option<&str>,
+    quirks: Option<&yenc_quirks::Quirks>,
 ) -> Option<(bool, String)> {
-    let agent = agent?.to_ascii_lowercase();
-    let tool = TOOL_DEFAULTS.iter().find(|t| agent.contains(t.agent))?;
+    let agent = agent?;
+    let lower = agent.to_ascii_lowercase();
+    let tool = TOOL_DEFAULTS.iter().find(|t| lower.contains(t.agent));
     let mut agree = Vec::new();
     let mut differ = Vec::new();
+    if let Some(tool) = tool {
+        tool_shape(tool, segment_size, line_len, grammar, &mut agree, &mut differ);
+    }
+    // a tool whose yEnc the research documents but whose article defaults it doesn't (postie, yEnc32) still gets this
+    match quirks.and_then(|q| yenc_quirks::witness(q, agent)) {
+        Some((true, why)) => agree.push(why),
+        Some((false, why)) => differ.push(why),
+        None => {}
+    }
+    if agree.is_empty() && differ.is_empty() {
+        return None;
+    }
+    Some(if differ.is_empty() {
+        (true, agree.join(", "))
+    } else {
+        (false, format!("{} are not the tool's defaults", differ.join(", ")))
+    })
+}
+
+/// The article size, line length and id grammar against a tool's defaults.
+fn tool_shape(
+    tool: &ToolDefaults,
+    segment_size: Option<u64>,
+    line_len: Option<u32>,
+    grammar: Option<&str>,
+    agree: &mut Vec<String>,
+    differ: &mut Vec<String>,
+) {
     if let Some(size) = segment_size
         && !tool.articles.is_empty()
     {
@@ -1475,14 +1516,6 @@ fn tool_verdict(
             differ.push(format!("ids that look like {g}"));
         }
     }
-    if agree.is_empty() && differ.is_empty() {
-        return None;
-    }
-    Some(if differ.is_empty() {
-        (true, agree.join(", "))
-    } else {
-        (false, format!("{} are not the tool's defaults", differ.join(", ")))
-    })
 }
 
 // ---------------------------------------------------------------- Inside
@@ -2164,6 +2197,21 @@ fn keys_panel(i: &MetaInputs<'_>, l: &Looked, compact: bool) -> Facts {
             .filter(|_| !same_link(l, id, Kind::MovieHash).is_empty())
             .map(|h| with_link(h.to_string(), Kind::MovieHash)),
     );
+    let media = i.probe.and_then(|p| p.media.as_ref());
+    f.add_html("Mux key", media.and_then(crate::keys::mux_text).map(|t| with_link(key16(t.as_bytes()), Kind::Mux)));
+    f.add_html(
+        "Encode key",
+        media.and_then(crate::keys::encode_text).map(|t| with_link(key16(t.as_bytes()), Kind::Encode)),
+    );
+    f.add_html(
+        "Thread key",
+        i.probe
+            .and_then(|p| crate::probe::thread_root(&p.headers))
+            .map(|root| with_link(key16(format!("thread:{root}").as_bytes()), Kind::Thread)),
+    );
+    // the poster's header names in order, the ones servers add left out: a tool's fingerprint, shared by everyone
+    // posting with it, soo no list
+    f.key("Header set", i.probe.and_then(|p| crate::probe::header_set(&p.header_order)).map(|t| key16(t.as_bytes())));
     // an archive's own keys: how many releases share one, never its value
     for (label, what, kind) in [
         ("Archive file CRC", "A file inside its archive, by size and CRC32", Kind::InnerFile),
@@ -2575,6 +2623,7 @@ mod tests {
     use crate::probe::media::{AudioTrack, MediaInfo, SubtitleTrack, VideoTrack};
     use crate::probe::nest::Layer;
     use crate::probe::yenc::YencLines;
+    use crate::probe::yenc_quirks::{Escapes, Quirks, Votes};
 
     const NAME: &str = "Cool.Movie.2024.1080p.BluRay.x264-GRP";
     const GROUP: &str = "alt.binaries.test";
@@ -2664,6 +2713,31 @@ mod tests {
         .collect()
     }
 
+    /// What Nyuu's first article shows: its key order, lowercase padded CRCs, tab and space escaped at both edges
+    /// and a dot at the start, nothing inside.
+    fn nyuu_quirks() -> Quirks {
+        let edge = Votes(40, 0);
+        Quirks {
+            begin: "part total line size name".into(),
+            ypart: "begin end".into(),
+            yend: "size part pcrc32".into(),
+            upper: Votes(0, 1),
+            padded: Votes(1, 0),
+            blank_before_yend: Votes(0, 1),
+            over_long: Votes(0, 1),
+            escapes: Escapes {
+                lead_tab: edge,
+                lead_space: edge,
+                lead_dot: edge,
+                end_tab: edge,
+                end_space: edge,
+                mid_dot: Votes(0, 900),
+                ..Escapes::default()
+            },
+            ..Quirks::default()
+        }
+    }
+
     fn probe() -> ProbeInfo {
         ProbeInfo {
             file: Some(VOLUME1.into()),
@@ -2680,6 +2754,7 @@ mod tests {
                 crc32: None,
             }),
             segment_size: Some(716_800),
+            quirks: Some(nyuu_quirks()),
             headers: headers(),
             archive: Some(ArchiveHead {
                 format: "RAR5".into(),
@@ -3010,19 +3085,55 @@ mod tests {
 
         // the tool against its defaults
         assert_eq!(
-            tool_verdict(Some("Nyuu/0.4.2"), Some(716_800), Some(128), Some("Nyuu")),
+            tool_verdict(Some("Nyuu/0.4.2"), Some(716_800), Some(128), Some("Nyuu"), None),
             Some((true, "700 KiB articles, 128-byte lines, Nyuu ids".into()))
         );
         assert_eq!(
-            tool_verdict(Some("ngPost v4.16"), Some(500_000), Some(128), Some("server-assigned (INN or Diablo)")),
+            tool_verdict(Some("ngPost v4.16"), Some(500_000), Some(128), Some("server-assigned (INN or Diablo)"), None),
             Some((false, "500,000 bytes per article are not the tool's defaults".into()))
         );
         assert_eq!(
-            tool_verdict(Some("Nyuu/0.4.2"), None, None, Some("ngPost")),
+            tool_verdict(Some("Nyuu/0.4.2"), None, None, Some("ngPost"), None),
             Some((false, "ids that look like ngPost are not the tool's defaults".into()))
         );
-        assert!(tool_verdict(Some("Mozilla Thunderbird"), Some(716_800), Some(128), None).is_none());
-        assert!(tool_verdict(None, Some(716_800), Some(128), Some("Nyuu")).is_none());
+        assert!(tool_verdict(Some("Mozilla Thunderbird"), Some(716_800), Some(128), None, None).is_none());
+        assert!(tool_verdict(None, Some(716_800), Some(128), Some("Nyuu"), None).is_none());
+
+        // the yEnc quirks as one more witness
+        let q = nyuu_quirks();
+        assert_eq!(
+            tool_verdict(Some("Nyuu/0.4.2"), Some(716_800), Some(128), Some("Nyuu"), Some(&q)),
+            Some((true, "700 KiB articles, 128-byte lines, Nyuu ids, Nyuu yEnc quirks".into()))
+        );
+        let ngpost = Quirks {
+            yend: "size pcrc32".into(),
+            padded: Votes(0, 3),
+            blank_before_yend: Votes(1, 0),
+            over_long: Votes::default(),
+            escapes: Escapes {
+                end_tab: Votes(0, 9),
+                end_space: Votes(0, 9),
+                lead_tab: Votes::default(),
+                lead_space: Votes::default(),
+                ..q.escapes.clone()
+            },
+            ..q.clone()
+        };
+        assert_eq!(
+            tool_verdict(Some("Nyuu/0.4.2"), Some(716_800), Some(128), Some("Nyuu"), Some(&ngpost)),
+            Some((false, "yEnc quirks of ngPost or NewsUP are not the tool's defaults".into()))
+        );
+        assert_eq!(
+            tool_verdict(Some("ngPost v4.16"), None, None, None, Some(&ngpost)),
+            Some((true, "ngPost yEnc quirks".into()))
+        );
+        // postie has no article defaults here: its yEnc alone answers
+        assert_eq!(
+            tool_verdict(Some("postie/0.0.35"), None, None, None, Some(&q)),
+            Some((true, "postie yEnc quirks".into()))
+        );
+        assert!(tool_verdict(Some("JBinUp"), None, None, None, Some(&q)).is_none(), "its yEnc isn't documented");
+        assert!(tool_verdict(Some("Nyuu/0.4.2"), None, None, None, Some(&Quirks::default())).is_none());
 
         let html = full();
         assert!(html.contains("<dt>From shape</dt><dd>Name &lt;address&gt;, made-up domain</dd>"), "{html}");
@@ -3036,6 +3147,18 @@ mod tests {
         assert!(html.contains("<dt>Ids look like</dt><dd>Nyuu</dd>"), "{html}");
         assert!(
             html.contains("<dt>Tool</dt><dd>Nyuu/0.4.2 <span class=\"tag tag-ok\">FINGERPRINT AGREES</span>"),
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                "FINGERPRINT AGREES</span> 700 KiB articles, 128-byte lines, Nyuu ids, Nyuu yEnc quirks</dd>"
+            ),
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                "<dt>yEnc quirks</dt><dd>like Nyuu or postie: =ybegin part total line size name; =ypart begin end; =yend size part pcrc32; lowercase zero-padded CRCs; escapes leading tabs, leading spaces, leading dots, trailing tabs, trailing spaces</dd>"
+            ),
             "{html}"
         );
         assert!(!html.contains(ACCOUNT) && !html.contains(HOST), "{html}");
