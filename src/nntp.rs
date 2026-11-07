@@ -354,6 +354,17 @@ const PLAIN_WAIT: Duration = Duration::from_millis(500);
 /// probation: the first unreadable listing turns it off again. Compression stayed off until a restart.
 const COMPRESS_RETRY: Duration = Duration::from_secs(60 * 60);
 
+/// What `XZVER` did on a server that refuses `XFEATURE COMPRESS GZIP`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Xzver {
+    /// not asked yet: the next listing asks
+    Untried,
+    /// answered a listing: listings go on asking for it
+    Works,
+    /// refused, unreadable, or too slow at this time: plain XOVER until `COMPRESS_RETRY` has passed
+    Refused(Instant),
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum Refusal {
     /// provider wont take another connection
@@ -596,6 +607,8 @@ pub struct Conn {
     pub group: Option<String>,
     /// server agreed to XFEATURE COMPRESS GZIP on this connection
     pub compressed: bool,
+    /// compression was asked for and the server said no: `XZVER` may stand in (see `Pool::wants_xzver`)
+    pub gzip_refused: bool,
     /// set when a compressed response timed out waiting for its stream end trailer, or the connection is a plain one
     /// standing in for a compressed one (`Pool::uncompressed`): never kept idle
     poisoned: bool,
@@ -726,6 +739,7 @@ impl Conn {
         if compress {
             let (code, _) = conn.command("XFEATURE COMPRESS GZIP", None).await?;
             conn.compressed = code == 290;
+            conn.gzip_refused = code != 290;
         }
 
         Ok(())
@@ -737,6 +751,7 @@ impl Conn {
             timeout,
             group: None,
             compressed: false,
+            gzip_refused: false,
             poisoned: false,
             wire: 0,
             text: 0,
@@ -1163,6 +1178,13 @@ impl Conn {
     /// where `XFEATURE COMPRESS GZIP` returns `500` but `XZVER` returns `224`.
     /// Refuses to send `XZVER` on Highwinds backends where `XZVER` hangs on the wire.
     pub async fn xzver(&mut self, start: u64, end: u64) -> Result<Vec<Overview>> {
+        let measure = self.measure("XZVER", "nntp.xzver");
+        let r = self.xzver_unmeasured(start, end).await;
+        self.measured(measure, &r);
+        r
+    }
+
+    async fn xzver_unmeasured(&mut self, start: u64, end: u64) -> Result<Vec<Overview>> {
         if is_highwinds_xzver_hang_host(&self.server) {
             return Err(NntpError::Protocol(format!(
                 "XZVER disabled on Highwinds host {} (hangs on wire; use XFEATURE COMPRESS GZIP)",
@@ -1485,6 +1507,8 @@ struct Server {
     compress_refusals: AtomicUsize,
     /// when `no_compress` was set (see `COMPRESS_RETRY`)
     compress_off: Mutex<Option<Instant>>,
+    /// whether `XZVER` reads this server's headers, for a server that refuses compression (see `Pool::wants_xzver`)
+    xzver: Mutex<Xzver>,
     /// server answered GROUP with 500/501: an article only server (fill / bonus),
     /// used for article lookups but not for indexing
     no_index: AtomicBool,
@@ -1983,6 +2007,7 @@ impl Pool {
                         no_compress: AtomicBool::new(false),
                         compress_refusals: AtomicUsize::new(0),
                         compress_off: Mutex::new(None),
+                        xzver: Mutex::new(Xzver::Untried),
                         no_index: AtomicBool::new(false),
                         group_refusals: AtomicUsize::new(0),
                         article_only: Mutex::new((None, ARTICLE_ONLY_REST)),
@@ -3277,14 +3302,84 @@ impl Pool {
         }
 
         let sent = Instant::now();
-        let r = within(self.xover_deadline, "XOVER", lease.begin().xover(start, end)).await;
+        let xzver = !plain && lease.conn.as_ref().is_some_and(|c| self.wants_xzver(&lease.server, c));
+        let (method, r) = if xzver {
+            match within(self.xover_deadline, "XZVER", lease.begin().xzver(start, end)).await {
+                Err(e) if e.is_timeout() => {
+                    // a server whose XZVER hangs: plain XOVER until `COMPRESS_RETRY`. The reply may still come, soo
+                    // the connection is thrown away and `xover_on` asks again
+                    self.xzver_refused(&lease.server, &e);
+                    return lease.check(Err(e));
+                }
+                Err(e) if e.is_empty_range() => {
+                    self.xzver_works(&lease.server);
+                    ("xzver", Err(e))
+                }
+                // a status line alone (refused: plain XOVER until `COMPRESS_RETRY`), or a listing read to its end that
+                // wouldnt decode: either way the connection takes a plain XOVER of the slice
+                Err(e @ (NntpError::Reply { .. } | NntpError::Decompress(_))) => {
+                    if matches!(e, NntpError::Decompress(_)) || matches!(e.code(), Some(500 | 501 | 503)) {
+                        self.xzver_refused(&lease.server, &e);
+                    }
+                    lease.busy = false;
+                    ("xover", within(self.xover_deadline, "XOVER", lease.begin().xover(start, end)).await)
+                }
+                r => {
+                    if r.is_ok() {
+                        self.xzver_works(&lease.server);
+                    }
+                    ("xzver", r)
+                }
+            }
+        } else {
+            let compressed = lease.conn.as_ref().is_some_and(|c| c.compressed);
+            let method = if compressed { "xover_gzip" } else { "xover" };
+            (method, within(self.xover_deadline, "XOVER", lease.begin().xover(start, end)).await)
+        };
         crate::profile::Load::add_since(&crate::profile::LOAD.xover_ns, sent);
         crate::profile::LOAD.xovers.fetch_add(1, Ordering::Relaxed);
         if let Ok(rows) = &r {
             lease.listing_read();
             lease.server.headers.fetch_add(rows.len() as u64, Ordering::Relaxed);
+            crate::metrics::names::NNTP_OVERVIEW_ROWS
+                .inc(&[("server", lease.server.key.as_str()), ("method", method)], rows.len() as u64);
         }
         lease.check(r)
+    }
+
+    /// Whether a listing on `conn` asks for `XZVER`: the server refused `XFEATURE COMPRESS GZIP` on it, compression
+    /// is on for it, it isnt a Highwinds one (where `XZVER` hangs), and `XZVER` hasnt failed on it lately. XSNews and
+    /// Usenet.Farm refuse gzip but answer `XZVER`, which cuts header traffic to about a third.
+    fn wants_xzver(&self, server: &Server, conn: &Conn) -> bool {
+        if !conn.gzip_refused || !server.cfg.compress.unwrap_or(true) || is_highwinds_xzver_hang_host(&server.key) {
+            return false;
+        }
+        let mut state = server.xzver.lock().unwrap();
+        match *state {
+            Xzver::Refused(at) if at.elapsed() < self.compress_retry => false,
+            Xzver::Refused(_) => {
+                *state = Xzver::Untried;
+                println!("{}: asking for XZVER headers again", server.cfg.host);
+                true
+            }
+            Xzver::Untried | Xzver::Works => true,
+        }
+    }
+
+    fn xzver_works(&self, server: &Server) {
+        let mut state = server.xzver.lock().unwrap();
+        if *state != Xzver::Works {
+            *state = Xzver::Works;
+            println!("{}: compression refused, reading headers with XZVER", server.cfg.host);
+        }
+    }
+
+    fn xzver_refused(&self, server: &Server, e: &NntpError) {
+        let mut state = server.xzver.lock().unwrap();
+        if !matches!(*state, Xzver::Refused(_)) {
+            println!("{}: XZVER failed ({e}), plain headers for now", server.cfg.host);
+        }
+        *state = Xzver::Refused(Instant::now());
     }
 
     /// Per server numbers for the stats dashboard.
@@ -4916,6 +5011,155 @@ mod tests {
 
             let dt = conn.server_date_utc().await.unwrap();
             assert_eq!(dt.to_rfc3339(), "2026-11-03T03:20:44+00:00");
+        });
+    }
+}
+
+#[cfg(test)]
+mod xzver_fallback_tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    const XOVER_ROWS: &[u8] = b"224 ok\r\n1\ta\tp\tdate\t<1@x>\t\t10\t1\r\n2\tb\tp\tdate\t<2@x>\t\t10\t1\r\n.\r\n";
+
+    /// An XZVER reply as XSNews sends it: the listing deflated, then yEnc encoded.
+    fn xzver_reply() -> Vec<u8> {
+        use flate2::Compression;
+        use flate2::write::DeflateEncoder;
+        use std::io::Write;
+        let mut enc = DeflateEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(b"1\ta\tp\tdate\t<1@x>\t\t10\t1\r\n2\tb\tp\tdate\t<2@x>\t\t10\t1\r\n").unwrap();
+        let deflated = enc.finish().unwrap();
+        let mut out = format!("224 compressed\r\n=ybegin line=128 size={} name=xzver\r\n", deflated.len()).into_bytes();
+        for &b in &deflated {
+            let e = b.wrapping_add(42);
+            if matches!(e, 0 | b'\n' | b'\r' | b'=' | b'.') {
+                out.extend_from_slice(&[b'=', e.wrapping_add(64)]);
+            } else {
+                out.push(e);
+            }
+        }
+        out.extend_from_slice(format!("\r\n=yend size={}\r\n.\r\n", deflated.len()).as_bytes());
+        out
+    }
+
+    /// A server that refuses `XFEATURE COMPRESS GZIP` and answers `XZVER` with `xzver`, logging every command.
+    async fn serve(xzver: Vec<u8>) -> (u16, Arc<Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let seen = log.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else { return };
+                let (seen, xzver) = (seen.clone(), xzver.clone());
+                tokio::spawn(async move {
+                    let (read, mut write) = sock.into_split();
+                    let mut lines = tokio::io::BufReader::new(read);
+                    let _ = write.write_all(b"200 hi\r\n").await;
+                    loop {
+                        let mut line = String::new();
+                        if tokio::io::AsyncBufReadExt::read_line(&mut lines, &mut line).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let verb = line.split_whitespace().next().unwrap_or("").to_string();
+                        seen.lock().unwrap().push(verb.clone());
+                        let reply: &[u8] = match verb.as_str() {
+                            "AUTHINFO" if line.contains("USER") => b"381 more\r\n",
+                            "AUTHINFO" => b"281 ok\r\n",
+                            "GROUP" => b"211 2 1 2 g\r\n",
+                            "XFEATURE" => b"500 unknown command\r\n",
+                            "XZVER" => &xzver,
+                            "XOVER" => XOVER_ROWS,
+                            _ => b"500 what\r\n",
+                        };
+                        let _ = write.write_all(reply).await;
+                    }
+                });
+            }
+        });
+        (port, log)
+    }
+
+    fn run<F: Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap().block_on(f)
+    }
+
+    fn pool(port: u16, compress: bool) -> Pool {
+        let mut server = UsenetServer::new("127.0.0.1", "u", "p", port);
+        server.ssl = Some(false);
+        server.compress = Some(compress);
+        Pool::new(&[server])
+    }
+
+    fn count(log: &Mutex<Vec<String>>, verb: &str) -> usize {
+        log.lock().unwrap().iter().filter(|v| *v == verb).count()
+    }
+
+    fn numbers(rows: &[Overview]) -> Vec<u64> {
+        rows.iter().map(|o| o.number).collect()
+    }
+
+    #[test]
+    fn a_server_that_refuses_gzip_is_read_with_xzver() {
+        run(async {
+            let (port, log) = serve(xzver_reply()).await;
+            let pool = pool(port, true);
+            assert_eq!(numbers(&pool.xover_on(0, "g", 1, 2).await.unwrap()), [1, 2]);
+            assert_eq!(numbers(&pool.xover_on(0, "g", 1, 2).await.unwrap()), [1, 2]);
+            assert_eq!(count(&log, "XZVER"), 2);
+            assert_eq!(count(&log, "XOVER"), 0);
+            assert_eq!(*pool.servers[0].xzver.lock().unwrap(), Xzver::Works);
+        });
+    }
+
+    #[test]
+    fn xzver_refused_falls_back_to_xover_and_isnt_asked_again() {
+        run(async {
+            let (port, log) = serve(b"500 unknown command\r\n".to_vec()).await;
+            let pool = pool(port, true);
+            assert_eq!(numbers(&pool.xover_on(0, "g", 1, 2).await.unwrap()), [1, 2]);
+            assert_eq!(numbers(&pool.xover_on(0, "g", 1, 2).await.unwrap()), [1, 2]);
+            assert_eq!(count(&log, "XZVER"), 1, "probed once");
+            assert_eq!(count(&log, "XOVER"), 2);
+            assert!(matches!(*pool.servers[0].xzver.lock().unwrap(), Xzver::Refused(_)));
+            // the same connection took the XOVER after the refusal
+            assert_eq!(count(&log, "AUTHINFO"), 2, "one login");
+        });
+    }
+
+    #[test]
+    fn an_unreadable_xzver_listing_falls_back_to_xover() {
+        run(async {
+            let (port, log) =
+                serve(b"224 compressed\r\n=ybegin line=128 size=3 name=xzver\r\nabc\r\n=yend\r\n.\r\n".to_vec()).await;
+            let pool = pool(port, true);
+            assert_eq!(numbers(&pool.xover_on(0, "g", 1, 2).await.unwrap()), [1, 2]);
+            assert_eq!(numbers(&pool.xover_on(0, "g", 1, 2).await.unwrap()), [1, 2]);
+            assert_eq!(count(&log, "XZVER"), 1);
+            assert_eq!(count(&log, "XOVER"), 2);
+        });
+    }
+
+    #[test]
+    fn xzver_is_asked_again_after_the_retry_wait() {
+        run(async {
+            let (port, log) = serve(b"500 unknown command\r\n".to_vec()).await;
+            let pool = pool(port, true).with_compress_retry(Duration::ZERO);
+            pool.xover_on(0, "g", 1, 2).await.unwrap();
+            pool.xover_on(0, "g", 1, 2).await.unwrap();
+            assert_eq!(count(&log, "XZVER"), 2);
+        });
+    }
+
+    #[test]
+    fn no_xzver_when_compression_is_off() {
+        run(async {
+            let (port, log) = serve(xzver_reply()).await;
+            let pool = pool(port, false);
+            assert_eq!(numbers(&pool.xover_on(0, "g", 1, 2).await.unwrap()), [1, 2]);
+            assert_eq!(count(&log, "XFEATURE"), 0);
+            assert_eq!(count(&log, "XZVER"), 0);
         });
     }
 }
