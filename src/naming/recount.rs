@@ -31,7 +31,14 @@ fn short(conn: &Connection, id: i64, size: i64, parts: i64, since: i64) -> rusql
     if !saved {
         return Ok(None);
     }
-    Ok(store::article_totals(conn, id)?.filter(|t| *t != (size, parts)))
+    // a blob that wont decode (or past the cap) leaves the row as it is, not the walk stuck on it
+    match store::article_totals(conn, id) {
+        Ok(totals) => Ok(totals.filter(|t| *t != (size, parts))),
+        Err(e) => {
+            eprintln!("release {id}: its articles couldnt be read, left as it is: {e}");
+            Ok(None)
+        }
+    }
 }
 
 fn dry_run(main: &Path, since: i64, sample: usize) -> anyhow::Result<()> {
@@ -75,6 +82,9 @@ fn apply_shard(
     let mut conn = db::open_shard(path)?;
     store::migrate_shard(&conn)?;
     db::tune_for_writing(&conn)?;
+    // every run walks from the start: one stopped under another `--since` mustnt skip rows (a row already right is
+    // passed over, soo a run again changes nothing twice)
+    conn.execute("delete from meta where key = ?", [CURSOR])?;
     let mut walk = walk::Walk {
         conn: &mut conn,
         path,
@@ -201,6 +211,9 @@ mod tests {
         // as the short-counting build left it
         assert_eq!(short(&conn, id, 100, 1, 0).unwrap(), Some((300, 3)));
         assert_eq!(short(&conn, id, 100, 1, i64::MAX).unwrap(), None, "not saved since");
+        // a blob that wont decode: left as it is, the walk goes on
+        conn.execute("update files set blob = x'00'", []).unwrap();
+        assert_eq!(short(&conn, id, 100, 1, 0).unwrap(), None);
         assert!(since(&["--recount-articles".into()]).is_err());
         assert_eq!(since(&["--since".into(), "5".into(), "--apply".into()]).unwrap(), (5, vec!["--apply".into()]));
     }
