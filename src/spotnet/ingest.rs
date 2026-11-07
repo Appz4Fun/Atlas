@@ -99,24 +99,26 @@ pub async fn pass(pool: &Arc<Pool>, db: &Db, config: &SpotsConfig, stopping: &im
     on_db(db, move |conn| Ok(store::prune(conn, now)?)).await?;
     let limit = config.per_pass;
     let todo = on_db(db, move |conn| Ok(store::todo(conn, limit)?)).await?;
-    let waiting = on_db(db, |conn| Ok(store::waiting(conn)?)).await?;
-    if !todo.is_empty() {
-        println!("spots: {waiting} waiting, fetching {} ({} at a time)", todo.len(), config.concurrency);
+    if todo.is_empty() {
+        return Ok(done);
     }
+    let waiting = on_db(db, |conn| Ok(store::waiting(conn)?)).await?;
+    println!("spots: {waiting} waiting, fetching {} ({} at a time)", todo.len(), config.concurrency);
     let shared = Arc::new(Shared::new(MAX_PASS_POSTED));
-    let slots = Arc::new(tokio::sync::Semaphore::new(config.concurrency.max(1)));
+    let slots = Arc::new(tokio::sync::Semaphore::new(config.concurrency));
     let mut tasks = tokio::task::JoinSet::new();
     for message_id in todo {
-        if stopping() || shared.budget.load(Ordering::Relaxed) == 0 {
+        // stopping, or too little budget left for a spot's first NZB article: the rest wait for the next pass
+        if stopping() || shared.budget.load(Ordering::Relaxed) < MAX_NZB_ARTICLE + CAP_OVERSHOOT {
             break;
         }
-        let Ok(slot) = slots.clone().acquire_owned().await else { break };
+        let slot = slots.clone().acquire_owned().await.expect("the pass's semaphore is never closed");
         let (pool, db, shared) = (pool.clone(), db.clone(), shared.clone());
         tasks.spawn(async move {
             let _slot = slot;
             // held until the outcome is in spots_seen, where the next spot with this NZB finds it
-            let mut claim = None;
-            let outcome = match fetch(&pool, &db, &message_id, &shared, &mut claim).await {
+            let mut claims = Vec::new();
+            let outcome = match fetch(&pool, &db, &message_id, &shared, &mut claims).await {
                 // left for a later pass: nothing to record
                 Ok(None) => return Ok(Waited::Pending),
                 Ok(Some(settled)) => Some(settled),
@@ -128,15 +130,24 @@ pub async fn pass(pool: &Arc<Pool>, db: &Db, config: &SpotsConfig, stopping: &im
             let state = outcome.as_ref().map(|s| s.state);
             let now = chrono::Utc::now().timestamp();
             on_db(&db, move |conn| Ok(store::settle(conn, &message_id, outcome.as_ref(), now)?)).await?;
-            drop(claim);
+            drop(claims);
             Ok(Waited::Done(state))
         });
         while let Some(joined) = tasks.try_join_next() {
-            count(&mut done, joined)?;
+            count(&mut done, joined);
         }
     }
-    while let Some(joined) = tasks.join_next().await {
-        count(&mut done, joined)?;
+    // every task runs to its end: one that failed doesn't cut the others short. Once stopping, the ones still at
+    // work leave their spots for later at their next step
+    loop {
+        if stopping() {
+            shared.stopping.store(true, Ordering::Relaxed);
+        }
+        match tokio::time::timeout(Duration::from_secs(1), tasks.join_next()).await {
+            Ok(Some(joined)) => count(&mut done, joined),
+            Ok(None) => break,
+            Err(_) => {}
+        }
     }
     Ok(done)
 }
@@ -155,13 +166,21 @@ struct Shared {
     /// one spot at a time from inflating its NZB to tagging its release: decoding is the memory a spot takes (an
     /// NZB of up to 64 MB, up to 300,000 articles), and the copy checks, save and tag must not interleave
     decoding: tokio::sync::Mutex<()>,
-    /// NZB keys of spots saved or tagged in this pass whose outcome isn't in spots_seen yet
+    /// NZB keys (and NZB article sets, `ref:`) of spots being read, saved or tagged in this pass whose outcome isn't
+    /// in spots_seen yet
     claims: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// set once the indexer is stopping: tasks leave their spots for later at their next step
+    stopping: std::sync::atomic::AtomicBool,
 }
 
 impl Shared {
     fn new(budget: usize) -> Shared {
-        Shared { budget: AtomicUsize::new(budget), decoding: Default::default(), claims: Default::default() }
+        Shared {
+            budget: AtomicUsize::new(budget),
+            decoding: Default::default(),
+            claims: Default::default(),
+            stopping: Default::default(),
+        }
     }
 
     /// Takes `n` bytes of the budget, or nothing when fewer are left.
@@ -192,15 +211,19 @@ impl Drop for Claim {
     }
 }
 
-/// One fetched spot into the pass's counts. A settle that failed fails the pass.
-fn count(done: &mut Pass, joined: std::result::Result<Result<Waited>, tokio::task::JoinError>) -> Result<()> {
-    match joined.map_err(|e| anyhow!("spot task failed: {e}"))?? {
-        Waited::Done(Some(SAVED)) => done.saved += 1,
-        Waited::Done(Some(_)) => done.skipped += 1,
-        Waited::Done(None) => done.retry += 1,
-        Waited::Pending => done.pending += 1,
+/// One spot task into the pass's counts. One whose outcome couldn't be recorded is logged, and its spot is fetched
+/// again next pass.
+fn count(done: &mut Pass, joined: std::result::Result<Result<Waited>, tokio::task::JoinError>) {
+    match joined.map_err(|e| anyhow!("spot task failed: {e}")).and_then(|r| r) {
+        Ok(Waited::Done(Some(SAVED))) => done.saved += 1,
+        Ok(Waited::Done(Some(_))) => done.skipped += 1,
+        Ok(Waited::Done(None)) => done.retry += 1,
+        Ok(Waited::Pending) => done.pending += 1,
+        Err(e) => {
+            eprintln!("spots: {e:#}");
+            done.retry += 1;
+        }
     }
-    Ok(())
 }
 
 /// Where a pass starts reading: after the cursor, or `first` articles back from the newest on the first pass and
@@ -213,15 +236,18 @@ pub fn start_at(cursor: Option<u64>, low: u64, high: u64, first: u64) -> u64 {
 }
 
 /// A spot fetched whole and saved, or skipped for good. Ok(None): left for a later pass, untouched. Err: try again
-/// later. `claim` keeps its NZB key claimed until the caller has recorded the outcome.
+/// later. `claims` keep its NZB article set and NZB key claimed until the caller has recorded the outcome.
 async fn fetch(
     pool: &Pool,
     db: &Db,
     message_id: &str,
     shared: &Arc<Shared>,
-    claim: &mut Option<Claim>,
+    claims: &mut Vec<Claim>,
 ) -> Result<Option<Settled>> {
     let skipped = |nzb_ref: Option<String>| Settled { state: SKIPPED, nzb_ref, ..Settled::default() };
+    if shared.stopping.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
     let head = match pool.fetch_head(&format!("<{message_id}>"), MAX_XML_BYTES * 4).await {
         Ok(Some(head)) => head,
         Ok(None) => return Ok(Some(skipped(None))),
@@ -247,6 +273,10 @@ async fn fetch(
 
     // another spot pointing at the same NZB articles was settled already: no need to read them again
     let nzb_ref = release::ids_key(&spot.nzb);
+    // another spot of this pass is reading the same articles: this one waits for the next pass, where `known_ref`
+    // has the other's outcome, rather than reading them twice
+    let Some(claimed) = shared.claim(&format!("ref:{nzb_ref}")) else { return Ok(None) };
+    claims.push(claimed);
     let r = nzb_ref.clone();
     match on_db(db, move |conn| Ok(store::known_ref(conn, &r)?)).await? {
         Some((SAVED, Some(id))) => return copy_of(db, id, row(String::new()), nzb_ref, None).await.map(Some),
@@ -260,7 +290,7 @@ async fn fetch(
         let cap = MAX_NZB_ARTICLE.min(left);
         // the most this read can take off the wire, reserved before it's sent
         let most = cap + CAP_OVERSHOOT;
-        if !shared.reserve(most) {
+        if shared.stopping.load(Ordering::Relaxed) || !shared.reserve(most) {
             return Ok(None);
         }
         match pool.fetch_body_capped(&format!("<{segment}>"), cap).await {
@@ -297,8 +327,11 @@ async fn fetch(
     let shard = crate::store::shard_of(&group);
     // a spot with this NZB was saved or tagged in this pass and isn't in spots_seen yet: this one waits for the next
     // pass, where `known_key` finds it
+    if shared.stopping.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
     let Some(claimed) = shared.claim(&nzb_key) else { return Ok(None) };
-    *claim = Some(claimed);
+    claims.push(claimed);
     // an edit or repost of a spot already saved (its release maybe frozen since): that release gets the newer
     // spot, and nothing is saved
     let k = nzb_key.clone();
