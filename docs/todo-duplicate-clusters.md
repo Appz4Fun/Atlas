@@ -99,7 +99,8 @@ Everything below goes on the release page in the web UI. The API has the tags an
 - [x] Ratings stored per title with the time they were fetched, and shown on the release page.
 - [x] The best kept score in results.
 - [x] Sorting by ratings, among the scores already kept, with unrated releases last.
-- [ ] Filtering by ratings, and ratings for titles nobody has opened. This needs fetching ahead of time, which uses up the providers' limits.
+- [x] Ratings for titles nobody has opened: the details backfill fetches them ahead at `media.details_per_minute`.
+- [x] Filtering by ratings: the Rated 6+, 7+ and 8+ chips, by the scores already kept, unrated releases left out.
 
 ## Open questions on clusters
 

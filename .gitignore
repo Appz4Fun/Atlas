@@ -75,3 +75,4 @@ dev_nntp_server.py
 # git worktrees for isolated work
 /.worktrees/
 /.superpowers/
+/stills/
