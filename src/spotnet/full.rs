@@ -115,13 +115,13 @@ pub fn parse(xml: &str) -> Option<FullSpot> {
         title,
         poster: text(posting, "Poster"),
         tag: text(posting, "Tag"),
-        description: text(posting, "Description").replace("[br]", "\n"),
+        description: prose(posting, "Description").replace("[br]", "\n"),
         website: text(posting, "Website"),
         size: text(posting, "Size").trim().parse().unwrap_or(0),
         nzb: segments(element(posting, "NZB")),
         image: segments(element(posting, "Image")),
         image_size: image_size(posting),
-        newsreader: element(&xml, "Extra").map(|extra| text(extra, "Newsreader")).unwrap_or_default(),
+        newsreader: element(&xml, "Extra").map(|extra| prose(extra, "Newsreader")).unwrap_or_default(),
     })
 }
 
@@ -158,7 +158,12 @@ fn element<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
 
 /// An element's text, CDATA unwrapped and entities decoded, trimmed; empty when it isn't there.
 fn text(xml: &str, name: &str) -> String {
-    element(xml, name).map(unescape).unwrap_or_default().trim().to_string()
+    element(xml, name).map(|raw| unescape(raw, false)).unwrap_or_default().trim().to_string()
+}
+
+/// `text` for prose only shown, never made a name of (the description): HTML's named entities decoded too.
+fn prose(xml: &str, name: &str) -> String {
+    element(xml, name).map(|raw| unescape(raw, true)).unwrap_or_default().trim().to_string()
 }
 
 /// The text before an element's first child: `<Category>01<Sub>...` is `01`.
@@ -166,14 +171,20 @@ fn leading_text(inside: &str) -> &str {
     inside.split('<').next().unwrap_or_default()
 }
 
-fn unescape(raw: &str) -> String {
+fn unescape(raw: &str, all_named: bool) -> String {
     let raw = raw.trim();
     let raw = raw.strip_prefix("<![CDATA[").and_then(|r| r.strip_suffix("]]>")).unwrap_or(raw);
-    decode_entities(raw)
+    decode(raw, all_named)
 }
 
-/// `&amp;`, `&#39;`, `&#x27;` and the named HTML entities spot texts use (`named`); anything else stays as written.
+/// `&amp;`, `&#39;`, `&#x27;` and the few named HTML entities spot titles use; anything else stays as written.
+/// Titles become release names, so this stays narrow: an `&shy;` decoded would hide inside a name.
 pub fn decode_entities(s: &str) -> String {
+    decode(s, false)
+}
+
+/// `decode_entities`, and with `all_named` the named HTML entities a description uses too (`named`).
+fn decode(s: &str, all_named: bool) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     while let Some(at) = rest.find('&') {
@@ -193,7 +204,7 @@ pub fn decode_entities(s: &str) -> String {
             "quot" => Some('"'),
             "apos" => Some('\''),
             "nbsp" => Some(' '),
-            _ => named(name).or_else(|| {
+            _ => named(name).filter(|_| all_named).or_else(|| {
                 name.strip_prefix("#x")
                     .or_else(|| name.strip_prefix("#X"))
                     .and_then(|h| u32::from_str_radix(h, 16).ok())
@@ -254,7 +265,7 @@ fn segments(inside: Option<&str>) -> Vec<String> {
     let Some(inside) = inside else { return Vec::new() };
     let mut out = Vec::new();
     for c in SEGMENT.captures_iter(inside) {
-        let id = unescape(&c[1]);
+        let id = unescape(&c[1], false);
         if !valid_message_id(&id) {
             return Vec::new();
         }
@@ -329,8 +340,10 @@ mod tests {
     #[test]
     fn entities() {
         assert_eq!(decode_entities("a &amp; b &#39;c&#x27; &bogus; & d"), "a & b 'c' &bogus; & d");
+        // titles keep the rest as written; descriptions decode them
+        assert_eq!(decode_entities("Movie&shy;Name &eacute;"), "Movie&shy;Name &eacute;");
         assert_eq!(
-            decode_entities("economie&euml;n &eacute;&Eacute; &yuml;&copy; &euro;5 &hellip;"),
+            decode("economie&euml;n &eacute;&Eacute; &yuml;&copy; &euro;5 &hellip;", true),
             "economieën éÉ ÿ© €5 …"
         );
         // a bare & before multibyte text, where the look-ahead ends inside a character
