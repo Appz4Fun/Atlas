@@ -51,23 +51,26 @@ pub(crate) fn tail_articles(ctx: &StepCtx<'_>, file: &FileInfo) -> Result<Vec<Se
     Ok(if last_is_there { segs } else { Vec::new() })
 }
 
-/// The articles to try as the first piece of an upload linked from its headers (`xref`), and their volumes: up to
-/// `xref::LEADS` of each volume, volume by volume, `xref::HEAD_PROBES` in all, and when to try the next volumes if
-/// none of these is one. Each hour since the upload was saved takes the volumes after the last hour's
-/// (`xref::guess_round`), until every volume has had its turn.
+/// The articles to try as the first piece of an upload linked from its headers (`xref`), and their volumes: the parts
+/// that were the first a group got of each volume (`xref::leads`, else its first `xref::LEADS`), volume by volume,
+/// `xref::HEAD_PROBES` in all, and when to look again for the next volumes if none of these is one. Each run takes the
+/// next round of volumes (`xref::take_round`) until every volume has had its turn.
 fn xref_heads<'a>(
     ctx: &StepCtx<'_>,
     files: &'a [FileInfo],
 ) -> Result<(Vec<(Head<'a>, SegmentRef)>, Option<i64>), StepError> {
     let volumes = select::volumes(files);
-    let now = chrono::Utc::now().timestamp();
-    let (start, again) = crate::xref::guess_round(crate::xref::saved_at(&ctx.release().name), volumes.len(), now);
-    let heads =
-        xref_order(&volumes, start, |f| ctx.segments(f.id, &SegmentPick::First(crate::xref::LEADS)).map_err(retry))?
-            .into_iter()
-            .map(|(f, seg)| (Head { file: f, tail: f, probe: true }, seg))
-            .collect();
-    Ok((heads, again))
+    let name = ctx.release().name.clone();
+    let (start, more) = crate::xref::take_round(&name, volumes.len());
+    let heads = xref_order(&volumes, start, |f| {
+        let leads = crate::xref::file_of(&f.filename).map(|k| crate::xref::leads(&name, k)).unwrap_or_default();
+        let pick = if leads.is_empty() { SegmentPick::First(crate::xref::LEADS) } else { SegmentPick::Parts(leads) };
+        ctx.segments(f.id, &pick).map_err(retry)
+    })?
+    .into_iter()
+    .map(|(f, seg)| (Head { file: f, tail: f, probe: true }, seg))
+    .collect();
+    Ok((heads, more.then(|| chrono::Utc::now().timestamp() + 3600)))
 }
 
 /// `volumes` from the one at `start` (wrapping), each with what `leads` gives of it, `xref::HEAD_PROBES` in all.

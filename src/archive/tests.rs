@@ -682,7 +682,7 @@ mod select_tests {
     }
 
     #[test]
-    fn an_xref_uploads_guesses_go_volume_by_volume_from_the_hours_one() {
+    fn an_xref_uploads_guesses_go_volume_by_volume_from_the_rounds_one() {
         let f = [file("v1", 293), file("v2", 293), file("v3", 293)];
         let vols: Vec<&FileInfo> = f.iter().collect();
         let seg = |name: &str, part: i64| crate::store::SegmentRef {

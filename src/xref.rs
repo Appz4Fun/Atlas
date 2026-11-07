@@ -67,14 +67,18 @@ create table if not exists linked (
     file    INTEGER NOT NULL,
     files   INTEGER NOT NULL,
     parts   INTEGER NOT NULL,
+    -- the parts that were the first a group got of the file in their batch, comma separated (`leads`)
+    leads   TEXT NOT NULL DEFAULT '',
     added   INTEGER NOT NULL
 ) without rowid;
 create index if not exists linked_added on linked(added);
+create index if not exists linked_release on linked(release, file);
 -- each upload saved: its release, the groups its articles have been read in so far, when its files were posted, and
--- how many it has, soo files read later in other groups join it; `saved` when it was first saved (`guess_round`)
+-- how many it has, soo files read later in other groups join it; `probed` how many rounds of first-piece guesses the
+-- archive step has taken (`take_round`)
 create table if not exists uploads (
     release TEXT PRIMARY KEY,
-    saved   INTEGER NOT NULL,
+    probed  INTEGER NOT NULL DEFAULT 0,
     grp     TEXT NOT NULL,
     groups  TEXT NOT NULL,
     first   INTEGER NOT NULL,
@@ -227,30 +231,61 @@ fn upload_name(poster: &str) -> String {
     format!("{NAME_PREFIX}{}-{}", hash >> 32, hash & 0xffff_ffff)
 }
 
-/// When the upload `release` was first saved, from the store the indexer writes. None when it isn't kept (any more), or
-/// in tests.
-pub fn saved_at(release: &str) -> Option<i64> {
+/// The round of first-piece guesses the archive step takes now for the upload `release` of `volumes` volumes: where its
+/// guesses start, and whether volumes are left for another round. Each call is a round (`uploads.probed`), soo every
+/// volume has its turn however late or often the step runs. Not known (pruned, or in tests): the first volumes, once.
+pub fn take_round(release: &str, volumes: usize) -> (usize, bool) {
     if cfg!(test) {
-        return None;
+        return round_window(0, volumes);
     }
-    let conn = Connection::open_with_flags(
-        path_for(&crate::paths::database()),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .ok()?;
-    conn.query_row("select saved from uploads where release = ?1", [release], |r| r.get(0)).optional().ok()?
+    let round = Connection::open(path_for(&crate::paths::database())).ok().and_then(|conn| {
+        conn.busy_timeout(Duration::from_secs(30)).ok()?;
+        conn.query_row(
+            "update uploads set probed = probed + 1 where release = ?1 returning probed - 1",
+            [release],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+        .ok()?
+    });
+    match round {
+        Some(round) => round_window(round.max(0) as usize, volumes),
+        None => (round_window(0, volumes).0, false),
+    }
 }
 
-/// Which of an upload's `volumes` the archive step starts its first-piece guesses at by `now`, and when to look again
-/// if they find none: each hour since it was `saved` takes the next `HEAD_PROBES / LEADS` volumes, until every volume
-/// has had a turn. Not known when it was saved: the first volumes, once.
-pub fn guess_round(saved: Option<i64>, volumes: usize, now: i64) -> (usize, Option<i64>) {
+/// Where round `round` of an upload's first-piece guesses starts among its `volumes`, `HEAD_PROBES / LEADS` volumes a
+/// round, and whether volumes are left after it.
+pub fn round_window(round: usize, volumes: usize) -> (usize, bool) {
     let per_round = (HEAD_PROBES / LEADS).max(1);
-    let rounds = volumes.div_ceil(per_round) as i64;
-    let Some(saved) = saved else { return (0, None) };
-    let round = (now - saved).max(0) / 3600;
-    let again = (round + 1 < rounds).then_some(saved + (round + 1) * 3600);
-    (round as usize * per_round, again)
+    (round * per_round, (round + 1) * per_round < volumes)
+}
+
+/// The parts of file `file` of the upload `release` that were the first a group got of it, in the order they were
+/// saved: the likely first pieces. Empty when not known (pruned, or in tests).
+pub fn leads(release: &str, file: i64) -> Vec<i64> {
+    if cfg!(test) {
+        return Vec::new();
+    }
+    let Ok(conn) = Connection::open_with_flags(
+        path_for(&crate::paths::database()),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return Vec::new();
+    };
+    let leads: Option<String> = conn
+        .query_row("select leads from linked where release = ?1 and file = ?2 limit 1", params![release, file], |r| {
+            r.get(0)
+        })
+        .optional()
+        .ok()
+        .flatten();
+    leads.unwrap_or_default().split(',').filter_map(|p| p.parse().ok()).collect()
+}
+
+/// The place of a file named for it (`add_file`): `<release>-<file>`.
+pub fn file_of(filename: &str) -> Option<i64> {
+    filename.rsplit_once('-')?.1.parse().ok()
 }
 
 /// Whether `name` is that of an upload this linked, whose files are named for their place and whose parts are in a
@@ -271,6 +306,8 @@ fn now() -> i64 {
 /// One article as the store keeps it.
 struct Row {
     message_id: String,
+    /// the first its group got of the file, of the rows taken together
+    lead: bool,
     posted: i64,
     grp: i64,
     number: i64,
@@ -280,6 +317,8 @@ struct Row {
 
 /// Where a file goes: its release, that release's group, its place among the upload's files, and the parts it has.
 struct Place {
+    /// the parts that were a group's first, comma separated (`leads`)
+    leads: String,
     release: String,
     group: String,
     file: i64,
@@ -377,7 +416,8 @@ impl Store {
             params![before, before - KEEP_SECS],
         )?;
         self.conn.execute("delete from linked where added < ?1", [before])?;
-        self.conn.execute("delete from uploads where added < ?1", [before])?;
+        // an upload outlasts the linking window by a week: the archive step may still be taking its rounds
+        self.conn.execute("delete from uploads where added < ?1", [before - 7 * KEEP_SECS])?;
         Ok(n)
     }
 
@@ -424,8 +464,15 @@ impl Store {
     fn place_of(&self, poster: &str) -> Result<Option<Place>> {
         Ok(self
             .conn
-            .query_row("select release, grp, file, files, parts from linked where poster = ?1", [poster], |r| {
-                Ok(Place { release: r.get(0)?, group: r.get(1)?, file: r.get(2)?, files: r.get(3)?, parts: r.get(4)? })
+            .query_row("select release, grp, file, files, parts, leads from linked where poster = ?1", [poster], |r| {
+                Ok(Place {
+                    release: r.get(0)?,
+                    group: r.get(1)?,
+                    file: r.get(2)?,
+                    files: r.get(3)?,
+                    parts: r.get(4)?,
+                    leads: r.get(5)?,
+                })
             })
             .optional()?)
     }
@@ -434,9 +481,10 @@ impl Store {
     /// then each group's second, and on. A file's first piece is most often among the first (see `LEADS`).
     fn rows_of(&self, poster: &str) -> Result<Vec<Row>> {
         let mut stmt = self.conn.prepare_cached(
-            "select message_id, posted, grp, number, bytes, lines from headers
-             where poster = ?1 and done = 0
-             order by row_number() over (partition by grp order by number, message_id), grp",
+            "select message_id, posted, grp, number, bytes, lines,
+                    row_number() over (partition by grp order by number, message_id) as rank
+             from headers where poster = ?1 and done = 0
+             order by rank, grp",
         )?;
         let rows = stmt.query_map([poster], |r| {
             Ok(Row {
@@ -446,6 +494,7 @@ impl Store {
                 number: r.get(3)?,
                 bytes: r.get(4)?,
                 lines: r.get(5)?,
+                lead: r.get::<_, i64>(6)? == 1,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -488,8 +537,8 @@ impl Store {
                 let rows = self.rows_of(&f.poster)?;
                 let parts = place.parts + rows.len() as i64;
                 let ids = rows.iter().map(|r| r.message_id.clone()).collect();
-                self.add_file(&mut out, &place, &f.poster, rows, parts);
-                finished.push((f.poster, Some(Place { parts, ..place }), ids));
+                let leads = with_leads(&place.leads, self.add_file(&mut out, &place, &f.poster, rows, parts));
+                finished.push((f.poster, Some(Place { parts, leads, ..place }), ids));
             }
         }
 
@@ -545,10 +594,11 @@ impl Store {
                     file: before + k as i64 + 1,
                     files: count,
                     parts: 0,
+                    leads: String::new(),
                 };
                 let ids = rows.iter().map(|r| r.message_id.clone()).collect();
-                self.add_file(&mut out, &place, &fresh[i].poster, rows, parts);
-                finished.push((fresh[i].poster.clone(), Some(Place { parts, ..place }), ids));
+                let leads = with_leads("", self.add_file(&mut out, &place, &fresh[i].poster, rows, parts));
+                finished.push((fresh[i].poster.clone(), Some(Place { parts, leads, ..place }), ids));
             }
             widened.push((release, group, span, count));
         }
@@ -590,20 +640,21 @@ impl Store {
         {
             let mut done = tx.prepare_cached("update headers set done = 1 where message_id = ?1")?;
             let mut keep = tx.prepare_cached(
-                "insert into linked (poster, release, grp, file, files, parts, added) values (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                 on conflict(poster) do update set parts = excluded.parts, added = excluded.added",
+                "insert into linked (poster, release, grp, file, files, parts, leads, added)
+                 values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 on conflict(poster) do update set parts = excluded.parts, leads = excluded.leads, added = excluded.added",
             )?;
             for (poster, place, ids) in &finished {
                 for id in ids {
                     done.execute([id])?;
                 }
                 if let Some(p) = place {
-                    keep.execute(params![poster, p.release, p.group, p.file, p.files, p.parts, now])?;
+                    keep.execute(params![poster, p.release, p.group, p.file, p.files, p.parts, p.leads, now])?;
                 }
             }
             let mut upload = tx.prepare_cached(
-                "insert into uploads (release, grp, groups, first, last, files, added, saved)
-                 values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+                "insert into uploads (release, grp, groups, first, last, files, added)
+                 values (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  on conflict(release) do update set groups = excluded.groups, first = excluded.first,
                      last = excluded.last, files = excluded.files, added = excluded.added",
             )?;
@@ -617,7 +668,16 @@ impl Store {
     }
 
     /// `rows` of one poster as a file of `place`'s release, parts numbered on from the ones it has, of `parts` in all.
-    fn add_file(&self, out: &mut HashMap<String, Release>, place: &Place, poster: &str, rows: Vec<Row>, parts: i64) {
+    /// The parts that were a group's first of them.
+    fn add_file(
+        &self,
+        out: &mut HashMap<String, Release>,
+        place: &Place,
+        poster: &str,
+        rows: Vec<Row>,
+        parts: i64,
+    ) -> Vec<i64> {
+        let mut leads = Vec::new();
         let key = format!("{}\0{}", place.release, place.group);
         let release = out.entry(key).or_insert_with(|| Release {
             name: place.release.clone(),
@@ -630,6 +690,9 @@ impl Store {
         let filename = format!("{}-{:05}", place.release, place.file);
         for (k, row) in rows.into_iter().enumerate() {
             let part = place.parts + k as i64 + 1;
+            if row.lead {
+                leads.push(part);
+            }
             release.size += row.bytes.max(0);
             release.articles.push(Article {
                 number: row.number.max(0) as u64,
@@ -648,37 +711,41 @@ impl Store {
                 ..Article::default()
             });
         }
+        leads
     }
+}
+
+/// `before`, a comma separated list of parts, with `more` after them.
+fn with_leads(before: &str, more: Vec<i64>) -> String {
+    before
+        .split(',')
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .chain(more.iter().map(i64::to_string))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// The store the indexer writes to, opened on first use. In tests only one a test opened.
 static STORE: Mutex<Option<Store>> = Mutex::new(None);
 
-/// Headers a slice brought while a pass held the store, kept here instead of making the slice wait: (group, its
-/// articles, when they came). Whoever next holds the store writes them first.
-static QUEUED: Mutex<Vec<(String, Vec<Article>, i64)>> = Mutex::new(Vec::new());
+/// The store `hold` writes headers to: its own connection, soo a slice never waits on a linker pass (which reads, then
+/// writes in short transactions; SQLite's busy timeout covers the overlap).
+static RECORDER: Mutex<Option<Store>> = Mutex::new(None);
 
 fn with_store<T>(f: impl FnOnce(&mut Store) -> Result<T>) -> Result<Option<T>> {
-    let store = STORE.lock().unwrap_or_else(|e| e.into_inner());
-    in_store(store, f)
+    in_store(&STORE, f)
 }
 
-fn in_store<T>(
-    mut store: std::sync::MutexGuard<'_, Option<Store>>,
-    f: impl FnOnce(&mut Store) -> Result<T>,
-) -> Result<Option<T>> {
+fn in_store<T>(store: &Mutex<Option<Store>>, f: impl FnOnce(&mut Store) -> Result<T>) -> Result<Option<T>> {
+    let mut store = store.lock().unwrap_or_else(|e| e.into_inner());
     if store.is_none() {
         if cfg!(test) {
             return Ok(None);
         }
         *store = Some(Store::open(&path_for(&crate::paths::database()))?);
     }
-    let s = store.as_mut().expect("opened above");
-    let queued = std::mem::take(&mut *QUEUED.lock().unwrap_or_else(|e| e.into_inner()));
-    for (group, articles, added) in queued {
-        s.record(&group, &articles, added)?;
-    }
-    f(s).map(Some)
+    f(store.as_mut().expect("opened above")).map(Some)
 }
 
 /// Whether `article` is one this keeps: no subject rule reads it, its subject is one random token or its own
@@ -701,18 +768,8 @@ pub fn hold(group: &str, articles: Vec<Article>) -> Vec<Article> {
         unparsable.note(a);
     }
     crate::collections::count_unparsable(group, &unparsable);
-    let store = match STORE.try_lock() {
-        Ok(store) => store,
-        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-        // a pass holds it: the slice goes on, and its headers are written after
-        Err(std::sync::TryLockError::WouldBlock) => {
-            QUEUED.lock().unwrap_or_else(|e| e.into_inner()).push((group.to_string(), held, now()));
-            return kept;
-        }
-    };
-    let count = held.len();
-    if let Err(e) = in_store(store, |s| s.record(group, &held, now())) {
-        eprintln!("xref: couldnt keep {count} headers of {group}: {e:#}");
+    if let Err(e) = in_store(&RECORDER, |s| s.record(group, &held, now())) {
+        eprintln!("xref: couldnt keep {} headers of {group}: {e:#}", held.len());
     }
     kept
 }
@@ -996,6 +1053,8 @@ mod tests {
         let more = store.pass(4601 + SETTLE_SECS).unwrap();
         let joined = more.iter().find(|r| r.name == first[0].name).expect("joins the saved upload");
         assert_eq!(joined.articles.len(), 7);
+        // a.b.two's first article of rar2 is a likely first piece too, though numbered after a.b.one's
+        assert_eq!(store.place_of("rar2@x.y").unwrap().unwrap().leads, "1,9");
         let vol: Vec<_> = joined.articles.iter().filter(|a| a.author == "vol@x.y").collect();
         assert_eq!(vol.len(), 4);
         assert!(vol.iter().all(|a| a.file_index == Some(3) && a.file_total == Some(3)), "its third file");
@@ -1003,13 +1062,15 @@ mod tests {
     }
 
     #[test]
-    fn each_hour_the_first_piece_guesses_take_the_next_volumes() {
+    fn each_round_the_first_piece_guesses_take_the_next_volumes() {
         let per = HEAD_PROBES / LEADS;
-        assert_eq!(guess_round(None, 40, 0), (0, None), "not known when saved: once");
-        assert_eq!(guess_round(Some(0), 40, 10), (0, Some(3600)));
-        assert_eq!(guess_round(Some(0), 40, 3600), (per, Some(7200)));
-        let last = 40usize.div_ceil(per) as i64 - 1;
-        assert_eq!(guess_round(Some(0), 40, last * 3600), (last as usize * per, None), "every volume has had a turn");
-        assert_eq!(guess_round(Some(0), 3, 0), (0, None), "one turn does them all");
+        assert_eq!(round_window(0, 40), (0, true));
+        assert_eq!(round_window(1, 40), (per, true));
+        let last = 40usize.div_ceil(per) - 1;
+        assert_eq!(round_window(last, 40), (last * per, false), "every volume has had a turn");
+        assert_eq!(round_window(0, 3), (0, false), "one round does them all");
+        assert_eq!(file_of("xref-upload-1-2-00007"), Some(7));
+        assert_eq!(with_leads("1,2", vec![9]), "1,2,9");
+        assert_eq!(with_leads("", vec![1, 3]), "1,3");
     }
 }
