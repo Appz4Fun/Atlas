@@ -646,12 +646,9 @@ impl Step for ProbeStep {
             }
             derive(&mut info, wire_bytes, file.expected, last_lines.as_ref());
             let known_last = last_part(&info, last_lines.as_ref(), last_body);
-            // a bare file's hash needs only its ends, read already or nearly: it's its own, and a lender's must
-            // agree with it, which catches a header or end Tags rewritten in place (`same_mux_media`)
-            let bare = info.archive.is_none() && info.layers.is_empty();
-            if bare {
-                info.moviehash = moviehash_of(ctx, file, &files, &front, &info, known_last.clone())?;
-            }
+            // the file's own OpenSubtitles hash, over its size and first and last 64 KiB: a lender's must agree with
+            // it (`same_mux_media`), which catches a header or end Tags rewritten in place
+            info.moviehash = moviehash_of(ctx, file, &files, &front, &info, known_last.clone())?;
             // the same mux already read whole by another release's probe: its media is taken, and nothing more of
             // this file is read for it (an explicit rerun reads its own)
             let shared = if front.is_empty() || crate::raw_store::is_explicit_rerun(ctx.conn(), release_id, PROBE_STEP)
@@ -660,24 +657,9 @@ impl Step for ProbeStep {
             } else {
                 same_mux_of(ctx, release_id, &info, stamp)
             };
-            let mut set_hash = None;
             if let Some(twin) = shared {
                 crate::metrics::names::MEDIA_SHARED.inc(&[("key", crate::keys::Kind::Mux.word())], 1);
-                let own_cover = info.media.as_mut().and_then(|m| m.cover.take());
-                twin_cover = if own_cover.is_none() { twin.cover } else { None };
-                let mut media = twin.media;
-                media.cover = own_cover;
-                info.media = Some(media);
-                info.media_from = Some(twin.release_id);
-                info.media_whole = Some(whole_mark(stamp));
-                // a set's hash takes its last volume's first article: the lender's, of the same file, saves it
-                set_hash = twin.moviehash;
-            }
-            if !bare {
-                info.moviehash = match set_hash {
-                    Some(hash) => Some(hash),
-                    None => moviehash_of(ctx, file, &files, &front, &info, known_last.clone())?,
-                };
+                twin_cover = take_lent(&mut info, twin, stamp);
             }
             // last, being the most it may read: a release's article budget goes to the checks above first. A release
             // whose media came from another's keeps the archive and layers its first article shows: the lender's
@@ -789,7 +771,6 @@ const SAME_MUX_CANDIDATES: i64 = 16;
 pub(crate) struct SameMux {
     pub release_id: i64,
     pub media: media::MediaInfo,
-    pub moviehash: Option<String>,
     /// its cover art, `(mime, sha256)`, while the folder still has it
     pub cover: Option<(String, String)>,
 }
@@ -800,6 +781,20 @@ fn same_mux_of(ctx: &StepCtx<'_>, release_id: i64, info: &ProbeInfo, stamp: u64)
     let main = ctx.conn().path().and_then(super::audio_print::main_of)?;
     let all = crate::db::open_with_shards(&main).ok()?;
     same_mux_media(&all, release_id, info, &mux, stamp)
+}
+
+/// Puts what another probe read of the same file (`same_mux_media`) on this one: its media, keeping this file's own
+/// cover when its first article had one, where it came from, and the whole mark. The lender's cover, `(mime,
+/// sha256)`, when this file had none of its own.
+fn take_lent(info: &mut ProbeInfo, twin: SameMux, stamp: u64) -> Option<(String, String)> {
+    let own_cover = info.media.as_mut().and_then(|m| m.cover.take());
+    let lent_cover = if own_cover.is_none() { twin.cover } else { None };
+    let mut media = twin.media;
+    media.cover = own_cover;
+    info.media = Some(media);
+    info.media_from = Some(twin.release_id);
+    info.media_whole = Some(whole_mark(stamp));
+    lent_cover
 }
 
 /// The size of the video file a probe read its media from: the innermost file the layers were followed down to (an
@@ -865,7 +860,8 @@ fn same_mux_sql(shard: usize) -> String {
 /// Another release whose probe already read the Matroska mux `mux` (`keys::mux_text`) that `own`'s first article
 /// shows, over every shard of `conn`, and whose file is this one: what it read is what the rest of this file's start
 /// and its end would say. Only a probe that read its media to the end under this probe's config `stamp`
-/// (`media_whole`) and isn't `stale_saved`, of a file of the same size (and CRC32, when both have one) whose header
+/// (`media_whole`) and isn't `stale_saved`, of a file of the same size and OpenSubtitles hash (and CRC32, when both
+/// have one) whose header
 /// agrees with what this first article shows (`same_header`), not from inside an archive when this file is posted
 /// bare (the end Tags are only read from a bare file), and not one whose attached cover is no longer kept. A packed
 /// file may borrow from a bare one: it then has the end Tags' statistics its own probe never reads from inside an
@@ -904,14 +900,10 @@ pub(crate) fn same_mux_media(
         let packed = other.archive.is_some() || !other.layers.is_empty();
         let size = content_size(info);
         let crc_differs = !packed && bare && other.file_crc32.zip(info.file_crc32).is_some_and(|(a, b)| a != b);
-        // a bare file's own hash, over its size and first and last 64 KiB, against the lender's of a bare file
-        let hash_differs = !packed
-            && bare
-            && moviehash
-                .as_deref()
-                .filter(|h| !h.is_empty())
-                .zip(info.moviehash.as_deref())
-                .is_some_and(|(a, b)| a != b);
+        // the OpenSubtitles hash, over the size and first and last 64 KiB, the same on both: none on either side
+        // (a missing last article, a compressed set) and nothing ties the ends of the two files
+        let hash_differs =
+            moviehash.as_deref().filter(|h| !h.is_empty()).is_none_or(|h| info.moviehash.as_deref() != Some(h));
         if other.media_whole != Some(mark)
             || (bare && packed)
             || size.is_none()
@@ -932,7 +924,7 @@ pub(crate) fn same_mux_media(
         if attached_cover && cover.is_none() {
             return None;
         }
-        Some(SameMux { release_id, media, moviehash: moviehash.filter(|h| !h.is_empty()), cover })
+        Some(SameMux { release_id, media, cover })
     })
 }
 
@@ -1355,7 +1347,7 @@ mod tests {
         conn.execute("insert into s0.releases (id, group_name) values (?1, ?2)", rusqlite::params![id, group]).unwrap();
         conn.execute(
             "insert into s0.release_probe (release_id, info, moviehash) values (?1, ?2, ?3)",
-            rusqlite::params![id, serde_json::to_string(info).unwrap(), moviehash],
+            rusqlite::params![id, serde_json::to_string(info).unwrap(), moviehash.or(info.moviehash.as_deref())],
         )
         .unwrap();
         let mux = info
@@ -1368,12 +1360,14 @@ mod tests {
     }
 
     const STAMP: u64 = 127;
+    const HASH: &str = "1d9da161e916b2fd";
     const SIZE: u64 = 4_000_000_000;
 
     /// A bare file of `SIZE` bytes whose probe read `media` to the end under `STAMP`.
     fn whole_bare(media: media::MediaInfo) -> ProbeInfo {
         ProbeInfo {
             yenc: Some(super::super::yenc::YencLines { file_size: Some(SIZE), ..Default::default() }),
+            moviehash: Some(HASH.into()),
             media: Some(media),
             media_whole: Some(whole_mark(STAMP)),
             ..Default::default()
@@ -1409,8 +1403,8 @@ mod tests {
         };
 
         // 0 read the whole mux, bare; 8 is in a blocked group; 16 stopped after its first article
-        probed(&conn, 0, "a.b.c", &whole_bare(whole.clone()), Some("1d9da161e916b2fd"));
-        probed(&conn, 8, "alt.binaries.pictures.erotica.teen", &whole_bare(whole.clone()), Some("1d9da161e916b2fd"));
+        probed(&conn, 0, "a.b.c", &whole_bare(whole.clone()), Some(HASH));
+        probed(&conn, 8, "alt.binaries.pictures.erotica.teen", &whole_bare(whole.clone()), Some(HASH));
         probed(&conn, 16, "a.b.c", &first_bare(whole.clone()), None);
         // 24 has another mux
         probed(&conn, 24, "a.b.c", &whole_bare(mkv("ffff", 1, 2)), Some("0000000000000001"));
@@ -1418,7 +1412,6 @@ mod tests {
         let got = same_mux_media(&conn, 99, &first, &mux, STAMP).expect("0 read it");
         assert_eq!(got.release_id, 0, "the newest that read it whole, the blocked group's left out");
         assert_eq!(got.media, whole, "its tracks, chapters, encoder and end tags");
-        assert_eq!(got.moviehash.as_deref(), Some("1d9da161e916b2fd"));
         assert!(got.cover.is_none(), "no cover row");
         assert_eq!(same_mux_media(&conn, 0, &first, &mux, STAMP).map(|t| t.release_id), None, "never itself");
         // a probe read under another config stamp lends nothing
@@ -1467,8 +1460,11 @@ mod tests {
         let mut rehashed = first.clone();
         rehashed.moviehash = Some("00000000000000ff".into());
         assert_eq!(lender(&conn, &rehashed), None, "another hash");
-        rehashed.moviehash = Some("1d9da161e916b2fd".into());
-        assert_eq!(lender(&conn, &rehashed), Some(0), "the same hash");
+        rehashed.moviehash = None;
+        assert_eq!(lender(&conn, &rehashed), None, "no hash of its own, nothing ties the ends");
+        let mut packed_rehashed = packed(first.clone());
+        packed_rehashed.moviehash = Some("00000000000000ff".into());
+        assert_eq!(lender(&conn, &packed_rehashed), None, "a packed file's hash is compared too");
         let mut bigger = first.clone();
         bigger.yenc.as_mut().unwrap().file_size = Some(SIZE + 1);
         assert_eq!(lender(&conn, &bigger), None, "another size");
@@ -1483,6 +1479,10 @@ mod tests {
         more.audio.push(media::AudioTrack { codec: "A_EAC3".into(), ..Default::default() });
         assert_eq!(lender(&conn, &first_bare(more)), None);
 
+        // a lender with no hash saved ties nothing
+        conn.execute("update s0.release_probe set moviehash = null where release_id = 0", []).unwrap();
+        assert_eq!(lender(&conn, &first), None);
+        conn.execute("update s0.release_probe set moviehash = ?1 where release_id = 0", [HASH]).unwrap();
         // a probe from inside an archive lends to a packed file, never to a bare one, whose end tags it would lack
         probed(&conn, 32, "a.b.c", &packed(whole_bare(whole.clone())), None);
         assert_eq!(lender(&conn, &first), Some(0));
@@ -1534,6 +1534,27 @@ mod tests {
     }
 
     #[test]
+    fn what_is_lent_keeps_the_files_own_cover() {
+        let lent =
+            || SameMux { release_id: 7, media: mkv("ab12", 1, 2), cover: Some(("image/jpeg".into(), "c0ffee".into())) };
+        let mut info = first_bare(mkv("ab12", 1, 1));
+        assert_eq!(
+            take_lent(&mut info, lent(), STAMP),
+            Some(("image/jpeg".into(), "c0ffee".into())),
+            "none of its own"
+        );
+        assert_eq!(info.media.as_ref().map(|m| m.audio.len()), Some(2));
+        assert_eq!((info.media_from, info.media_whole), (Some(7), Some(whole_mark(STAMP))));
+        assert_eq!(info.moviehash.as_deref(), Some(HASH), "its own hash stays");
+
+        let mut own = mkv("ab12", 1, 1);
+        own.cover = Some(media::Cover { mime: "image/png", bytes: vec![1, 2, 3] });
+        let mut info = first_bare(own);
+        assert_eq!(take_lent(&mut info, lent(), STAMP), None, "its own first");
+        assert_eq!(info.media.as_ref().and_then(|m| m.cover.as_ref()).map(|c| c.bytes.len()), Some(3));
+    }
+
+    #[test]
     fn only_a_probe_that_read_the_first_frame_keys_is_whole() {
         let mut m = mkv("ab12", 1, 1);
         assert!(!first_frame_read(&m), "HEVC without its keyframe key, E-AC-3 without its stream key");
@@ -1574,7 +1595,7 @@ mod tests {
         let info = whole_bare(whole.clone());
         conn.execute("insert into s1.releases (id, group_name) values (9, 'a.b.c')", []).unwrap();
         conn.execute(
-            "insert into s1.release_probe (release_id, info) values (9, ?1)",
+            "insert into s1.release_probe (release_id, info, moviehash) values (9, ?1, '1d9da161e916b2fd')",
             [serde_json::to_string(&info).unwrap()],
         )
         .unwrap();
