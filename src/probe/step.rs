@@ -663,7 +663,10 @@ impl Step for ProbeStep {
                 info.media = Some(media);
                 info.media_from = Some(twin.release_id);
                 info.media_whole = Some(stamp);
-                info.moviehash = match twin.moviehash {
+                // a bare file's hash needs only its first and last articles, read already: its own is taken, soo a
+                // header changed in place can't lend a wrong one. A set's takes its last volume's first article.
+                let bare = info.archive.is_none() && info.layers.is_empty();
+                info.moviehash = match twin.moviehash.filter(|_| !bare) {
                     Some(hash) => Some(hash),
                     None => moviehash_of(ctx, file, &files, &front, &info, known_last.clone())?,
                 };
@@ -675,14 +678,15 @@ impl Step for ProbeStep {
             // matched its unpacked size, soo more of the front would show no other file
             if !front.is_empty() && info.media_from.is_none() {
                 let before = info.layers.clone();
-                read_more_front(ctx, file, total, &mut front, found_nfo_password.as_deref(), &mut info)?;
+                let encoder_read =
+                    read_more_front(ctx, file, total, &mut front, found_nfo_password.as_deref(), &mut info)?;
                 // more of the front can show a bigger file than the one hashed
                 if info.layers != before {
                     info.moviehash = moviehash_of(ctx, file, &files, &front, &info, known_last.clone())?;
                 }
                 read_tail_moov(ctx, file, &front, &mut info)?;
                 let tags_read = read_tail_tags(ctx, file, &front, known_last.as_ref(), &mut info)?;
-                if tags_read && info.media.as_ref().is_some_and(|m| m.header_complete && !wants_encoder(m)) {
+                if encoder_read && tags_read && info.media.as_ref().is_some_and(|m| m.header_complete) {
                     info.media_whole = Some(stamp);
                 }
             }
@@ -796,16 +800,23 @@ fn content_size(p: &ProbeInfo) -> Option<u64> {
 /// title, each track's codec, language and name, and the attachments so far. mkvpropedit rewrites these in place
 /// and keeps the SegmentUID and DateUTC, soo the same mux key can name a file whose header was changed.
 fn same_header(mine: &media::MediaInfo, other: &media::MediaInfo) -> bool {
-    // every item of `a` is the one at its place in `b`
-    fn prefix<T, K: PartialEq>(a: &[T], b: &[T], label: impl Fn(&T) -> K) -> bool {
+    // every item of `a` is the one at its place in `b`; a header the first article cut off may show its last item
+    // only in part, soo that one isn't compared
+    let cut = usize::from(!mine.header_complete);
+    fn prefix<T, K: PartialEq>(a: &[T], b: &[T], cut: usize, label: impl Fn(&T) -> K) -> bool {
+        let a = &a[..a.len().saturating_sub(cut)];
         a.len() <= b.len() && a.iter().zip(b).all(|(x, y)| label(x) == label(y))
     }
     mine.title == other.title
-        && prefix(&mine.video, &other.video, |t| (t.codec.clone(), t.language.clone()))
-        && prefix(&mine.audio, &other.audio, |t| (t.codec.clone(), t.language.clone(), t.name.clone()))
-        && prefix(&mine.subtitles, &other.subtitles, |t| (t.codec.clone(), t.language.clone(), t.name.clone()))
-        && prefix(&mine.attachments, &other.attachments, |a| (a.name.clone(), a.size))
-        && mine.chapters.len() <= other.chapters.len()
+        && prefix(&mine.video, &other.video, cut, |t| (t.codec.clone(), t.language.clone()))
+        && prefix(&mine.audio, &other.audio, cut, |t| {
+            (t.codec.clone(), t.language.clone(), t.name.clone(), t.default, t.commentary)
+        })
+        && prefix(&mine.subtitles, &other.subtitles, cut, |t| {
+            (t.codec.clone(), t.language.clone(), t.name.clone(), t.default, t.forced, t.hearing_impaired, t.commentary)
+        })
+        && prefix(&mine.attachments, &other.attachments, cut, |a| (a.name.clone(), a.size))
+        && prefix(&mine.chapters, &other.chapters, cut, |c| (c.start_secs.to_bits(), c.name.clone()))
 }
 
 /// The releases other than `?1` in shard `shard` with the mux key `?3`, whose probe read its media whole under the
@@ -916,7 +927,9 @@ pub(crate) fn title_writes(release_id: i64, media: Option<&media::MediaInfo>) ->
 /// A later step's way to the hash this run found, before it's written.
 pub const MOVIEHASH_FACT: &str = "moviehash";
 
-/// More of the file's start, an article at a time, until the media header is all there.
+/// More of the file's start, an article at a time, until the media header is all there. Whether the encoder's
+/// settings were looked for to their end: found whole, not wanted, or the article past the header read and none
+/// there (a remux or a hardware encode writes none).
 fn read_more_front(
     ctx: &mut StepCtx<'_>,
     file: &FileInfo,
@@ -924,7 +937,7 @@ fn read_more_front(
     front: &mut Vec<u8>,
     password: Option<&str>,
     info: &mut ProbeInfo,
-) -> Result<(), StepError> {
+) -> Result<bool, StepError> {
     let mut part = 2;
     while info.media.as_ref().is_some_and(|m| !m.header_complete) && part <= total.min(FRONT_ARTICLES) {
         let Some(body) = read_part(ctx, file, part, front.len() as u64)? else { break };
@@ -933,14 +946,18 @@ fn read_more_front(
         part += 1;
     }
     // the encoder's settings are in the first frame, just past the header: one more article when they're not here yet
-    if info.media.as_ref().is_some_and(wants_encoder)
-        && part <= total.min(FRONT_ARTICLES)
+    if !info.media.as_ref().is_some_and(wants_encoder) {
+        return Ok(true);
+    }
+    if part <= total.min(FRONT_ARTICLES)
         && let Some(body) = read_part(ctx, file, part, front.len() as u64)?
     {
         front.extend(body);
         inspect(front, password, info);
+        // settings begun but cut off by the read's end aren't whole
+        return Ok(info.media.as_ref().is_some_and(|m| !wants_encoder(m) || m.encoder.is_none()));
     }
-    Ok(())
+    Ok(false)
 }
 
 /// Whether the header is all read but the encoder's settings, in the first frame just past it, aren't yet: an AVC or
@@ -1041,7 +1058,8 @@ fn read_tail_tags(
     };
     let Some(m) = info.media.as_mut() else { return Ok(false) };
     media::tail_tags(tags, m);
-    Ok(true)
+    // what a missing or short part cut off is read as far as it goes, but isn't the whole of them
+    Ok(whole(tags))
 }
 
 /// One part of a file, decoded, when it holds the file's bytes from `offset` (0 based) on.
@@ -1304,8 +1322,9 @@ mod tests {
         }
     }
 
-    /// The first article of a bare file of `SIZE` bytes, showing `media`.
-    fn first_bare(media: media::MediaInfo) -> ProbeInfo {
+    /// The first article of a bare file of `SIZE` bytes, showing `media` with its header all there.
+    fn first_bare(mut media: media::MediaInfo) -> ProbeInfo {
+        media.header_complete = true;
         ProbeInfo { media_whole: None, ..whole_bare(media) }
     }
 
@@ -1351,7 +1370,14 @@ mod tests {
         assert_eq!(lender(&conn, &first_bare(renamed)), None, "another title");
         let mut relabelled = mkv("ab12", 1, 1);
         relabelled.audio[0].language = Some("ger".into());
-        assert_eq!(lender(&conn, &first_bare(relabelled)), None, "another track language");
+        assert_eq!(lender(&conn, &first_bare(relabelled.clone())), None, "another track language");
+        let mut flagged = mkv("ab12", 1, 1);
+        flagged.audio[0].default = true;
+        assert_eq!(lender(&conn, &first_bare(flagged)), None, "another default flag");
+        // a header the first article cut off may show its last track only in part: that one isn't compared
+        let mut cut = first_bare(relabelled);
+        cut.media.as_mut().unwrap().header_complete = false;
+        assert_eq!(lender(&conn, &cut), Some(0));
         let mut bigger = first.clone();
         bigger.yenc.as_mut().unwrap().file_size = Some(SIZE + 1);
         assert_eq!(lender(&conn, &bigger), None, "another size");
