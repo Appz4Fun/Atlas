@@ -4,8 +4,9 @@
 //!
 //! `header`, `full` and `binary` read the formats: the overview line, the full spot XML and the posted binaries.
 //! `release` turns a spot's NZB into a release, `store` keeps the bookkeeping and the tags, `ingest` is the
-//! indexer's task that reads new spots, `comments` keeps what's said about them (comments, spam reports), and
-//! `names` says what a spot's subcategories mean, and `ubb` renders a spot's or comment's text.
+//! indexer's task that reads new spots, `comments` keeps what's said about them (comments, spam reports),
+//! `names` says what a spot's subcategories mean, `ubb` renders a spot's or comment's text, and `sign` checks a
+//! spot's signatures.
 
 pub mod binary;
 pub mod comments;
@@ -14,6 +15,7 @@ pub mod header;
 pub mod ingest;
 pub mod names;
 pub mod release;
+pub mod sign;
 pub mod store;
 pub mod ubb;
 
