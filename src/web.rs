@@ -291,6 +291,9 @@ struct Search {
 /// Up to this many results get sorted, the newest or best matching ones, unless the database orders by the column: then
 /// a window starts with this many of the top ones, and pages past it read a bigger one.
 const SORT_WINDOW: i64 = 2_000;
+/// How far a window grows to fill a page with a rating chip on: in a category where few titles have a score kept, most
+/// rows are left out, and each is looked up first.
+const GROW_WITH_RATING: i64 = 8_000;
 /// How far a window grows to fill a page when it also filters on tags, which are read from each name.
 const GROW_WITH_TAGS: i64 = 64_000;
 /// The deepest a ranked window reads: 2,000 pages of Load more. Each shard reads up to this many before they're merged,
@@ -763,6 +766,11 @@ impl Search {
                 }
                 sort_rows(&mut found, sort, self.descending, &categories, &scores);
             }
+            // the whole window is here: filtered before it's cut into pages, soo no page comes out empty
+            if self.min_score.is_some() {
+                let scores = kept_scores(&found.iter().map(|r| r.id).collect::<Vec<_>>());
+                found.retain(|r| !self.rated_out(r.id, &scores));
+            }
             let start = usize::try_from(self.offset).unwrap_or(0).min(found.len());
             let end = (start + PAGE_SIZE as usize).min(found.len());
             let more = end < found.len();
@@ -1069,7 +1077,9 @@ impl Search {
                 escape(&value)
             );
         }
+        // the rating chips share their window with the search without them, but not its count
         let total = if self.sorts_from_a_window()
+            && self.min_score.is_none()
             && let Ok(window) = window_of(self, 0)
         {
             window.total.get_or_init(|| self.total()).clone()
@@ -1178,8 +1188,9 @@ struct ShownRow {
     folded: bool,
     /// the row brought in to show here, for a post whose own row wasn't in the window
     brings: Option<i64>,
-    /// the best kept score of the row it shows (`score_value`), for the rating chips
-    score: Option<i64>,
+    /// the best kept score of the row it shows (`score_value`), for the rating chips: None until a page with a chip
+    /// looks it up, soo searches without one never read scores
+    score: Option<Option<i64>>,
 }
 
 /// The first `SORT_WINDOW` results of one search, whatever the sort, kept in memory: choosing a column only puts these
@@ -1190,6 +1201,8 @@ struct Window {
     /// by release, for the columns that need them, read once
     categories: OnceLock<HashMap<i64, i64>>,
     scores: OnceLock<HashMap<i64, i64>>,
+    /// for the rating chips, by window row: the rows with a title (a media row), and the best score kept for it
+    titled: OnceLock<HashMap<i64, Option<i64>>>,
     total: OnceLock<String>,
     shown: Mutex<HashMap<i64, ShownRow>>,
     /// rows brought in for a post whose own row isn't in the window: once each
@@ -1218,6 +1231,7 @@ impl Window {
             rows: search.keep_tagged(rows, usize::MAX),
             categories: OnceLock::new(),
             scores: OnceLock::new(),
+            titled: OnceLock::new(),
             total: OnceLock::new(),
             shown: Mutex::new(HashMap::new()),
             brought: Mutex::new(HashSet::new()),
@@ -1235,6 +1249,7 @@ impl Window {
             && self.asked < MAX_WINDOW
             && (search.in_order() || search.sort.is_none())
             && (!search.filters_by_tags() || search.indexed().is_some() || self.asked < GROW_WITH_TAGS)
+            && (search.min_score.is_none() || self.asked < GROW_WITH_RATING)
     }
 
     /// Takes in what a smaller window of the same search showed, soo growing it moves nothing already paged past. A
@@ -1277,6 +1292,19 @@ impl Window {
     }
 
     /// Only the scores already kept: fetching them for a whole search would use up the providers' limits.
+    /// `titled`, read once per window.
+    fn titled(&self) -> &HashMap<i64, Option<i64>> {
+        self.titled.get_or_init(|| {
+            let media = crate::media::query::attrs_of(&self.ids()).unwrap_or_default();
+            let scores: HashMap<i64, i64> =
+                crate::media::details::kept_for(media.iter().map(|(id, m)| (*id, m.kind, &m.ids)))
+                    .into_iter()
+                    .filter_map(|(id, d)| Some((id, score_value(&d)?)))
+                    .collect();
+            media.keys().map(|id| (*id, scores.get(id).copied())).collect()
+        })
+    }
+
     fn scores(&self) -> &HashMap<i64, i64> {
         self.scores.get_or_init(|| kept_scores(&self.ids()))
     }
@@ -1354,11 +1382,11 @@ impl Window {
                 Some(_) => done.push((place, left_out(&r))),
             }
         }
-        // by the row each place shows, which for a post brought in isn't the window's own row
-        let scores = kept_scores(&kept.iter().map(|r| r.id).collect::<Vec<_>>());
+        // by the row each place shows, which for a post brought in isn't the window's own row; only for a chip
+        let scores = search.min_score.map(|_| kept_scores(&kept.iter().map(|r| r.id).collect::<Vec<_>>()));
         for ((place, r), html) in places.into_iter().zip(&kept).zip(rows_html(&kept, split)) {
             let brings = (r.id != place).then_some(r.id);
-            let score = scores.get(&r.id).copied();
+            let score = scores.as_ref().map(|scores| scores.get(&r.id).copied());
             done.push((place, ShownRow { html, size: r.size, folded: false, brings, score }));
         }
         self.publish(done);
@@ -1403,28 +1431,50 @@ impl Window {
         } else {
             PAGE_SIZE as usize
         };
+        // a row with a title of its own stands for itself, soo one rated lower is left out before it's rendered; a row
+        // without one may be a post's file that brings the post in, and is rendered to know
+        let titled = search.min_score.map(|_| self.titled());
         loop {
             let mut page = Vec::with_capacity(wanted);
             let mut missing = Vec::new();
+            // rendered for a search without a chip: (place, the row it shows), looked up below, outside the lock
+            let mut unscored = Vec::new();
             {
                 let shown = lock(&self.shown);
                 let mut passed = 0;
                 for &place in order.iter() {
                     let r = &self.rows[place];
                     match shown.get(&r.id) {
-                        Some(row) if row.folded || search.scored_out(row.score) => continue,
+                        Some(row) if row.folded => continue,
+                        Some(row) if search.min_score.is_some() && row.score.is_none() => {
+                            unscored.push((r.id, row.brings.unwrap_or(r.id)));
+                        }
+                        Some(row) if search.scored_out(row.score.flatten()) => continue,
                         Some(row) => {
                             if passed >= skip {
                                 page.push(row.html.clone());
                             }
                             passed += 1;
                         }
+                        None if titled.and_then(|t| t.get(&r.id)).is_some_and(|score| search.scored_out(*score)) => {
+                            continue;
+                        }
                         None => missing.push(r.clone()),
                     }
-                    if page.len() == wanted || missing.len() == batch {
+                    if page.len() == wanted || missing.len() + unscored.len() >= batch {
                         break;
                     }
                 }
+            }
+            if !unscored.is_empty() {
+                let scores = kept_scores(&unscored.iter().map(|(_, id)| *id).collect::<Vec<_>>());
+                let mut shown = lock(&self.shown);
+                for (place, id) in unscored {
+                    if let Some(row) = shown.get_mut(&place) {
+                        row.score = Some(scores.get(&id).copied());
+                    }
+                }
+                continue;
             }
             if missing.is_empty() {
                 let more = page.len() == wanted;
@@ -2109,7 +2159,12 @@ pub(crate) fn diag(level: &str, title: &str, body: &str) -> String {
 fn results_html(search: &Search) -> String {
     let body = search.body();
     let content = if body.starts_with("<tr") { table(search, &body) } else { body };
-    let frozen = if search.deep { frozen_section(search) } else { String::new() };
+    let frozen = match (search.deep, search.min_score) {
+        // nothing frozen has a score kept: none would pass
+        (true, Some(_)) => "<section class=\"frozen-results\"><h2>Frozen releases</h2><p class=\"note dim\">Not listed with a rating chip on: frozen releases have no scores kept.</p></section>".to_string(),
+        (true, None) => frozen_section(search),
+        (false, _) => String::new(),
+    };
     format!("{}{}{content}{frozen}", search.filter_links(), search.summary())
 }
 
@@ -4399,6 +4454,7 @@ mod tests {
             rows,
             categories: OnceLock::new(),
             scores: OnceLock::new(),
+            titled: OnceLock::new(),
             total: OnceLock::new(),
             shown: Mutex::new(HashMap::new()),
             brought: Mutex::new(HashSet::new()),
@@ -5254,19 +5310,31 @@ mod tests {
     #[test]
     fn the_rating_chips_go_by_the_row_a_place_shows_and_share_its_window() {
         let row = |id: i64| ReleaseRow { id, size: Some(id), ..Default::default() };
-        let w = window_of_rows(vec![row(1), row(2), row(3)]);
+        let w = window_of_rows(vec![row(1), row(2), row(3), row(4)]);
+        // 4 has a title of its own rated lower: left out with nothing rendered
+        let _ = w.titled.set([(4, Some(50))].into_iter().collect());
         let scored =
             |html: &str, brings, score| ShownRow { html: html.into(), size: Some(1), folded: false, brings, score };
         // place 2 shows post 9, which is rated; place 1's own row isn't
         w.publish(vec![
-            (1, scored("<tr>1</tr>", None, None)),
-            (2, scored("<tr>9</tr>", Some(9), Some(80))),
-            (3, scored("<tr>3</tr>", None, Some(65))),
+            (1, scored("<tr>1</tr>", None, Some(None))),
+            (2, scored("<tr>9</tr>", Some(9), Some(Some(80)))),
+            (3, scored("<tr>3</tr>", None, Some(Some(65)))),
         ]);
         let rated = |q: &str| Search::from_args(&parse_query(q));
         assert_eq!(w.page(&rated("q=x&rated=70"), None).0, ["<tr>9</tr>"]);
         assert_eq!(w.page(&rated("q=x&rated=60"), None).0, ["<tr>9</tr>", "<tr>3</tr>"]);
-        assert_eq!(w.page(&rated("q=x"), None).0.len(), 3);
+        assert!(!lock(&w.shown).contains_key(&4), "never rendered");
+        w.publish(vec![(4, scored("<tr>4</tr>", None, None))]);
+        assert_eq!(w.page(&rated("q=x"), None).0.len(), 4, "without a chip nothing is looked up");
+        assert!(
+            Window { more_in_db: true, asked: GROW_WITH_RATING, ..window_of_rows(Vec::new()) }.can_grow(&rated("q=x"))
+        );
+        assert!(
+            !Window { more_in_db: true, asked: GROW_WITH_RATING, ..window_of_rows(Vec::new()) }
+                .can_grow(&rated("q=x&rated=70")),
+            "a chip stops growing sooner"
+        );
         let sorted = |q: &str| rated(&format!("q=x&sort=size{q}"));
         assert!(Arc::ptr_eq(&slot_of(&sorted(""), false), &slot_of(&sorted("&rated=70"), false)), "one window");
         let inputs = scope_inputs(&rated("q=x&rated=80"), "");
