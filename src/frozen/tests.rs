@@ -814,3 +814,67 @@ fn a_repost_freezes_and_thaws_with_every_article_it_holds() {
     assert_eq!(thaw(&conn, id, true, NOW).unwrap(), Thawed::Restored);
     assert_eq!((meta(&conn, "releases"), meta(&conn, "articles")), (releases, total));
 }
+
+/// A release split into one row per upload (`store::split_uploads`): a reread of a later upload's window thaws
+/// that upload's frozen row and joins it, and a frozen first row thaws with its routes before they are read.
+#[test]
+fn a_split_uploads_frozen_rows_thaw_for_their_own_articles() {
+    let f = Fixture::new();
+    let at = |t: i64| chrono::DateTime::from_timestamp(t, 0).unwrap().format("%a, %d %b %Y %H:%M:%S +0000").to_string();
+    let dated = |file: &str, n: i64, upload: u8, t: i64| Article {
+        message_id: format!("<{file}.{n}.u{upload}@news.example>"),
+        date: at(t),
+        file_total: Some(1),
+        ..article(file, n, 2, 100)
+    };
+    let articles = [0u8, 1].iter().flat_map(|u| (1..=2).map(move |n| dated("a.rar", n, *u, 1_000 + *u as i64 * 3_600)));
+    f.save(&[Release { name: "Split".into(), group: G.into(), articles: articles.collect(), ..Default::default() }]);
+    let mut conn = f.writer();
+    let id = f.id(&conn, "Split");
+    let upload_of: HashMap<String, usize> = store::release_articles(&conn, id)
+        .unwrap()
+        .into_iter()
+        .map(|a| {
+            let u = usize::from(a.4.contains(".u1@"));
+            (a.4, u)
+        })
+        .collect();
+    let dates: HashMap<String, i64> = upload_of.iter().map(|(m, u)| (m.clone(), 1_000 + *u as i64 * 3_600)).collect();
+    let tx = conn.transaction().unwrap();
+    let twin = store::split_uploads(&tx, &store::Ids::new(&f.main), id, &upload_of, &dates, 2).unwrap().unwrap()[0];
+    tx.commit().unwrap();
+
+    // the later upload's row frozen: a reread of its window brings it back with the article
+    conn.execute("insert into freeze_pending (release_id, reason, at) values (?1, 'test', 1)", [twin]).unwrap();
+    assert_eq!(freeze_all(&conn).frozen, 1);
+    drop(conn);
+    f.save(&[Release {
+        name: "Split".into(),
+        group: G.into(),
+        articles: vec![dated("a.rar", 2, 9, 4_600 + 30)],
+        ..Default::default()
+    }]);
+    let conn = f.writer();
+    assert_eq!(count(&conn, "select count(*) from frozen.frozen_releases"), 0, "thawed");
+    let parts =
+        |rid: i64| -> i64 { conn.query_row("select parts from releases where id = ?1", [rid], |r| r.get(0)).unwrap() };
+    assert_eq!((parts(id), parts(twin)), (2, 3));
+
+    // both rows frozen (the save queued the later one again): the first thaws with its routes, and the later
+    // upload's article still goes to its row, which thaws by its name
+    conn.execute("insert into freeze_pending (release_id, reason, at) values (?1, 'test', 1)", [id]).unwrap();
+    assert_eq!(freeze_all(&conn).frozen, 2);
+    assert_eq!(count(&conn, "select count(*) from releases"), 0);
+    drop(conn);
+    f.save(&[Release {
+        name: "Split".into(),
+        group: G.into(),
+        articles: vec![dated("a.rar", 1, 8, 4_600 - 30)],
+        ..Default::default()
+    }]);
+    let conn = f.writer();
+    assert_eq!(count(&conn, "select count(*) from frozen.frozen_releases"), 0, "thawed");
+    let parts =
+        |rid: i64| -> i64 { conn.query_row("select parts from releases where id = ?1", [rid], |r| r.get(0)).unwrap() };
+    assert_eq!((parts(id), parts(twin)), (2, 4));
+}
