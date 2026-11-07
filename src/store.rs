@@ -1768,6 +1768,8 @@ pub struct ShardWriter {
     ids_pruning: Option<i64>,
     /// no pruning step before this (unix seconds): the last one reached the end
     ids_rest_until: i64,
+    /// the least recently touched release this walk kept, for when the next may start
+    ids_oldest_kept: Option<i64>,
 }
 
 /// files sealed per writer tick at most
@@ -1779,14 +1781,17 @@ pub const PRUNE_IDS_BUDGET: std::time::Duration = std::time::Duration::from_mill
 /// the same when nothing waits for the writer
 pub const PRUNE_IDS_BUDGET_IDLE: std::time::Duration = std::time::Duration::from_millis(50);
 
-/// after a step reaches the end of `release_ids`, the next starts over this much later (seconds)
+/// after a step reaches the end of `release_ids`, the next starts over this much later at least (seconds)
 const PRUNE_IDS_REST: i64 = 600;
 
 /// releases a pruning step of `release_ids` looks at most
 const PRUNE_IDS_LOOKS: usize = 5_000;
 
 /// rows of one quiet release's `release_ids` taken at a time
-const PRUNE_IDS_CHUNK: i64 = 20_000;
+const PRUNE_IDS_CHUNK: i64 = 2_000;
+
+/// the same when nothing waits for the writer
+const PRUNE_IDS_CHUNK_IDLE: i64 = 20_000;
 
 /// a seal tick stops after this long, so the writer gets back to saving
 pub const SEAL_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
@@ -1811,6 +1816,7 @@ impl ShardWriter {
             ids_after: 0,
             ids_pruning: None,
             ids_rest_until: 0,
+            ids_oldest_kept: None,
         }
     }
 
@@ -1891,8 +1897,10 @@ impl ShardWriter {
 
     /// Take `release_ids` rows of quiet releases, for at most PRUNE_IDS_BUDGET
     /// (PRUNE_IDS_BUDGET_IDLE when `idle`): a step through the table by release
-    /// from where the last one stopped, starting over PRUNE_IDS_REST after the end. A release none of whose files was touched for
-    /// SEAL_AGE loses its own row first, then the rest PRUNE_IDS_CHUNK at a time
+    /// from where the last one stopped. After the end it starts over once the
+    /// least recently touched release it kept could be quiet (PRUNE_IDS_REST
+    /// at least, SEAL_AGE at most). A release none of whose files was touched for
+    /// SEAL_AGE loses its own row first, then the rest a chunk at a time
     /// over as many steps as it takes. The index is only a cache: without its
     /// own row, the next save to the release, or a spot placed on it, indexes it
     /// again in full (`index_release`), so a late article is still found in its
@@ -1901,57 +1909,74 @@ impl ShardWriter {
         if now < self.ids_rest_until {
             return Ok(0);
         }
-        let budget = if idle { PRUNE_IDS_BUDGET_IDLE } else { PRUNE_IDS_BUDGET };
+        let (budget, chunk) =
+            if idle { (PRUNE_IDS_BUDGET_IDLE, PRUNE_IDS_CHUNK_IDLE) } else { (PRUNE_IDS_BUDGET, PRUNE_IDS_CHUNK) };
         let started = Instant::now();
+        // worked on copies, kept only once the transaction has committed
+        let (mut after, mut pruning, mut oldest, mut rest_until) =
+            (self.ids_after, self.ids_pruning, self.ids_oldest_kept, self.ids_rest_until);
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut taken = 0;
         let mut looked = 0;
         while started.elapsed() < budget && looked < PRUNE_IDS_LOOKS {
-            if let Some(release_id) = self.ids_pruning {
+            if let Some(release_id) = pruning {
                 // a save indexed it again in full since: it's kept up once more
                 let again = tx
                     .prepare_cached("select 1 from release_ids where release_id = ? and id_hash = 0")?
                     .exists([release_id])?;
                 if again {
-                    self.ids_pruning = None;
+                    pruning = None;
                     continue;
                 }
-                let n = tx
+                // the rows are in id_hash order under the key: up to the chunk's last one, in one range
+                let last: Option<i64> = tx
                     .prepare_cached(
-                        "delete from release_ids where release_id = ?1 and id_hash in
-                         (select id_hash from release_ids where release_id = ?1 limit ?2)",
+                        "select id_hash from release_ids where release_id = ? order by id_hash limit 1 offset ?",
                     )?
-                    .execute(params![release_id, PRUNE_IDS_CHUNK])?;
-                taken += n;
-                if (n as i64) < PRUNE_IDS_CHUNK {
-                    self.ids_pruning = None;
-                }
+                    .query_row(params![release_id, chunk - 1], |r| r.get(0))
+                    .optional()?;
+                taken += match last {
+                    Some(last) => tx
+                        .prepare_cached("delete from release_ids where release_id = ? and id_hash <= ?")?
+                        .execute(params![release_id, last])?,
+                    None => {
+                        pruning = None;
+                        tx.prepare_cached("delete from release_ids where release_id = ?")?.execute([release_id])?
+                    }
+                };
                 continue;
             }
             looked += 1;
             let next: Option<i64> = tx
                 .prepare_cached("select release_id from release_ids where release_id > ? order by release_id limit 1")?
-                .query_row([self.ids_after], |r| r.get(0))
+                .query_row([after], |r| r.get(0))
                 .optional()?;
             let Some(release_id) = next else {
-                // the end: a later step starts over
-                self.ids_after = 0;
-                self.ids_rest_until = now + PRUNE_IDS_REST;
+                // the end: start over once the oldest release kept could be quiet, but no sooner than PRUNE_IDS_REST
+                after = 0;
+                rest_until =
+                    oldest.map_or(now + SEAL_AGE, |t| t + SEAL_AGE + 1).clamp(now + PRUNE_IDS_REST, now + SEAL_AGE);
+                oldest = None;
                 break;
             };
-            self.ids_after = release_id;
+            after = release_id;
+            // a file never touched since the upgrade counts as old, as for sealing (`due`)
             let touched: i64 = tx
-                .prepare_cached("select coalesce(max(coalesce(touched_at, 0)), 0) from files where release_id = ?")?
+                .prepare_cached("select coalesce(max(touched_at), 0) from files where release_id = ?")?
                 .query_row([release_id], |r| r.get(0))?;
             if touched < now - SEAL_AGE {
                 // its own row first: a release half taken is indexed again in full
                 taken += tx
                     .prepare_cached("delete from release_ids where release_id = ? and id_hash = 0")?
                     .execute([release_id])?;
-                self.ids_pruning = Some(release_id);
+                pruning = Some(release_id);
+            } else {
+                oldest = Some(oldest.map_or(touched, |o: i64| o.min(touched)));
             }
         }
         tx.commit()?;
+        (self.ids_after, self.ids_pruning, self.ids_oldest_kept, self.ids_rest_until) =
+            (after, pruning, oldest, rest_until);
         Ok(taken)
     }
 
@@ -4256,12 +4281,17 @@ mod tests {
         assert_eq!(writer.prune_ids_some(&mut conn, now, true).unwrap(), 0, "touched just now");
         assert_eq!(count(&conn), before);
 
-        assert_eq!(writer.ids_rest_until, now + PRUNE_IDS_REST, "the end: it rests");
+        assert_eq!(writer.ids_rest_until, now + SEAL_AGE, "the end: it rests till the release kept could be quiet");
         conn.execute("update files set touched_at = ?", [now - SEAL_AGE - 1]).unwrap();
         assert_eq!(writer.prune_ids_some(&mut conn, now, true).unwrap(), 0, "resting");
         writer.ids_rest_until = 0;
-        assert_eq!(writer.prune_ids_some(&mut conn, now, true).unwrap() as i64, before, "every row, its own too");
+        let mut taken = 0;
+        while writer.ids_rest_until == 0 {
+            taken += writer.prune_ids_some(&mut conn, now, true).unwrap() as i64;
+        }
+        assert_eq!(taken, before, "every row, its own too");
         assert_eq!(count(&conn), 0);
+        assert_eq!(writer.ids_rest_until, now + SEAL_AGE, "nothing kept: whatever comes next is new");
 
         save(&main, &[one_file_release("c.rar", &["<a1@x>", "<b1@x>"])]).unwrap();
         let files: i64 = conn.query_row("select count(*) from files", [], |r| r.get(0)).unwrap();
@@ -4279,7 +4309,7 @@ mod tests {
         let (release_id, file_id): (i64, i64) = conn
             .query_row("select release_id, id from files where filename = 'a.rar'", [], |r| Ok((r.get(0)?, r.get(1)?)))
             .unwrap();
-        let extra = PRUNE_IDS_CHUNK * 2 + 7;
+        let extra = PRUNE_IDS_CHUNK_IDLE * 2 + 7;
         conn.execute(
             "with recursive n(i) as (select 1 union all select i + 1 from n where i < ?)
              insert or ignore into release_ids select ?, 1000000 + i, ? from n",
@@ -4311,7 +4341,7 @@ mod tests {
         let mut writer = ShardWriter::new(shard_of("alt.binaries.t"));
         let mut taken = 0;
         for _ in 0..10 {
-            taken += writer.prune_ids_some(&mut conn, now, true).unwrap() as i64;
+            taken += writer.prune_ids_some(&mut conn, now, false).unwrap() as i64;
             assert!(!marked(&conn), "its own row goes first");
         }
         assert_eq!(taken, all);

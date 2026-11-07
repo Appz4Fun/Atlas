@@ -698,11 +698,15 @@ fn housekeeping(
     }
     drop(span);
     // the index of quiet releases' message-ids, a cache that is made again when needed (`ShardWriter::prune_ids_some`)
-    let span = crate::metrics::span("db.prune_ids");
-    if store.prune_ids_some(conn, now, idle).is_err() {
-        span.failed();
+    // (not while more saves wait, as for sealing)
+    if seal {
+        let span = crate::metrics::span("db.prune_ids");
+        if let Err(e) = store.prune_ids_some(conn, now, idle) {
+            span.failed();
+            eprintln!("pruning release_ids in shard {} failed: {e}", store.shard);
+        }
+        drop(span);
     }
-    drop(span);
     // the shared catalog's sent changes, as far as Postgres has them (`shared_catalog::prune_acked`)
     let span = crate::metrics::span("db.catalog_prune");
     if crate::shared_catalog::prune_acked(conn).is_err() {
