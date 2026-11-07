@@ -93,6 +93,7 @@ families! {
     STEP_RUNS "atlas_step_runs_total" Counter &[], "Runs of each processing step, by result.";
     STEP_PANICS "atlas_step_panics_total" Counter &[], "Runs of each processing step that panicked; atlas_step_runs_total counts them as retry.";
     AUDIO_PRINTS "atlas_audio_prints_total" Counter &[], "Audio print step results: made, linked (another key ties the release), failed, or why none could be made: ac3, dts, truehd, opus, aac_profile, other (no pure-Rust decoder), container, packed, short, size, bit_rate, no_audio.";
+    PROBES_SHARED "atlas_probes_shared_total" Counter &[], "Probes that took the media facts, the OpenSubtitles hash and the cover from a release with the same payload (PAR2 set data files by size and MD5) probed before, and read only the release's own first, middle and last article.";
     STILLS_SHARED "atlas_stills_shared_total" Counter &[], "Releases the stills step left to show another release's stills, by the key that proves the same video file: mux (Matroska SegmentUID and DateUTC) or moviehash (OpenSubtitles hash). No BODY was read for them.";
     STAGE_QUEUE "atlas_stage_queue" Gauge &[], "Releases waiting for the processing stage: due, net_wanted, failed.";
     STAGE_WALK "atlas_stage_walk" Gauge &[], "How far the backlog walks have come, in release ids: done, total.";

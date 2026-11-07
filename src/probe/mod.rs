@@ -112,7 +112,7 @@ pub fn keep_cover(bytes: &[u8]) -> Option<String> {
     Some(sha256)
 }
 
-fn cover_row(conn: &rusqlite::Connection, release_id: i64) -> Option<(String, String)> {
+pub(crate) fn cover_row(conn: &rusqlite::Connection, release_id: i64) -> Option<(String, String)> {
     let s = store::shard_of_id(release_id);
     conn.query_row(&format!("select mime, sha256 from s{s}.release_cover where release_id = ?"), [release_id], |r| {
         Ok((r.get(0)?, r.get(1)?))

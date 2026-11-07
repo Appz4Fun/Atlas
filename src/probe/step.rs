@@ -565,6 +565,13 @@ impl Step for ProbeStep {
         }
 
         let mut last_lines = None;
+        // the same payload probed before: its media facts and hash stand for this release's, and only this release's
+        // own articles (first, middle, last: its headers, yEnc and health) are read
+        let twin = if crate::raw_store::is_explicit_rerun(ctx.conn(), release_id, PROBE_STEP) {
+            None
+        } else {
+            probed_twin(ctx, release_id)?
+        };
         if let Some(file) = main_file(&files) {
             info.file = Some(file.filename.clone());
             // only the real ends count: an incomplete file's earliest article isn't its first
@@ -644,9 +651,16 @@ impl Step for ProbeStep {
             }
             derive(&mut info, wire_bytes, file.expected, last_lines.as_ref());
             let known_last = last_part(&info, last_lines.as_ref(), last_body);
-            info.moviehash = moviehash_of(ctx, file, &files, &front, &info, known_last.clone())?;
+            if let Some(twin) = &twin {
+                info.media = Some(twin.media.clone());
+                crate::metrics::names::PROBES_SHARED.inc(&[], 1);
+            }
+            info.moviehash = match twin.as_ref().and_then(|t| t.moviehash.clone()) {
+                Some(hash) => Some(hash),
+                None => moviehash_of(ctx, file, &files, &front, &info, known_last.clone())?,
+            };
             // last, being the most it may read: a release's article budget goes to the checks above first
-            if !front.is_empty() {
+            if !front.is_empty() && twin.is_none() {
                 let before = info.layers.clone();
                 read_more_front(ctx, file, total, &mut front, found_nfo_password.as_deref(), &mut info)?;
                 // more of the front can show a bigger file than the one hashed
@@ -664,7 +678,9 @@ impl Step for ProbeStep {
         }
         // a look that finds no cover drops one an earlier look kept
         let cover = info.media.as_mut().and_then(|m| m.cover.take());
-        let saved_cover = cover.and_then(|c| super::keep_cover(&c.bytes).map(|sha256| (c.mime.to_string(), sha256)));
+        let saved_cover = cover
+            .and_then(|c| super::keep_cover(&c.bytes).map(|sha256| (c.mime.to_string(), sha256)))
+            .or_else(|| twin.and_then(|t| t.cover));
         writes.push(match &saved_cover {
             Some((mime, sha256)) => {
                 StepWrite::new(SET_COVER, vec![release_id.into(), mime.clone().into(), sha256.clone().into()])
@@ -761,6 +777,67 @@ pub(crate) fn title_writes(release_id: i64, media: Option<&media::MediaInfo>) ->
 
 /// A later step's way to the hash this run found, before it's written.
 pub const MOVIEHASH_FACT: &str = "moviehash";
+
+/// Releases sharing a PAR2 set looked at for one already probed.
+const TWIN_CANDIDATES: i64 = 16;
+
+/// What a release holding the same payload has been probed to hold: read from it, soo the file's start and end
+/// aren't fetched again.
+struct Twin {
+    media: media::MediaInfo,
+    moviehash: Option<String>,
+    /// its cover's type and SHA-256 (`release_cover`): the image is one file in `covers/` either way
+    cover: Option<(String, String)>,
+}
+
+/// Another release with the same payload as `release_id`, probed before (`twin_of`), with every shard attached. None
+/// when the release has no PAR2 set, or no such release is probed yet.
+fn probed_twin(ctx: &StepCtx<'_>, release_id: i64) -> Result<Option<Twin>, StepError> {
+    let retry = |e: rusqlite::Error| StepError::Retry(e.to_string());
+    let par2_sets = crate::keys::par2_sets(ctx.conn(), release_id).map_err(retry)?;
+    if par2_sets.is_empty() {
+        return Ok(None);
+    }
+    let main = ctx
+        .conn()
+        .path()
+        .and_then(super::audio_print::main_of)
+        .ok_or_else(|| StepError::Retry("no main database".into()))?;
+    let all = crate::db::open_with_shards(&main).map_err(retry)?;
+    Ok(twin_of(&all, release_id, par2_sets))
+}
+
+/// Of the releases sharing a PAR2 set with `release_id` (`par2_sets`), over every shard of `all`, newest first, the
+/// first holding the same payload (`duplicates::same_payload`: its sets describe the very same data files, by size
+/// and MD5) whose probe is current and found tracks.
+fn twin_of(all: &rusqlite::Connection, release_id: i64, par2_sets: Vec<Vec<u8>>) -> Option<Twin> {
+    let lookup = crate::keys::Lookup { par2_sets, ..crate::keys::Lookup::default() };
+    crate::keys::others(all, release_id, &lookup, crate::keys::Kind::Par2, TWIN_CANDIDATES).into_iter().find_map(
+        |other| {
+            let s = crate::store::shard_of_id(other);
+            let (info, moviehash): (String, Option<String>) = all
+                .query_row(
+                    &format!("select info, moviehash from s{s}.release_probe where release_id = ?1"),
+                    [other],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .ok()?;
+            if stale_saved(&info) {
+                return None;
+            }
+            // a track list: what the probe would read from the same bytes (the header's end isn't kept)
+            let media = serde_json::from_str::<ProbeInfo>(&info)
+                .ok()?
+                .media
+                .filter(|m| !m.video.is_empty() || !m.audio.is_empty())?;
+            crate::duplicates::same_payload(all, release_id, other).then(|| Twin {
+                media,
+                moviehash,
+                cover: super::cover_row(all, other),
+            })
+        },
+    )
+}
 
 /// More of the file's start, an article at a time, until the media header is all there.
 fn read_more_front(
@@ -1443,5 +1520,85 @@ mod tests {
         let raw = [file("movie.mkv", 3000), file("sample.mkv", 10)];
         assert_eq!(main_file(&raw).unwrap().filename, "movie.mkv");
         assert!(main_file(&[file("a.nfo", 1)]).is_none());
+    }
+
+    /// The main database in memory with shard 0 attached: releases, their PAR2 files, probes and covers.
+    fn shards() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::filters::register_sql(&conn).unwrap();
+        conn.execute("attach ':memory:' as s0", []).unwrap();
+        conn.execute_batch("create table s0.releases (id integer primary key, group_name text not null)").unwrap();
+        for table in [&archive::store::PAR2_FILES, &super::super::PROBE, &super::super::COVER] {
+            conn.execute_batch(&table.create.replacen("exists ", "exists s0.", 1)).unwrap();
+            for (column, kind) in table.added {
+                let _ = conn.execute_batch(&format!("alter table s0.{} add column {column} {kind}", table.name));
+            }
+        }
+        conn
+    }
+
+    /// A release in shard 0 whose PAR2 set `set` describes `files` as (name, size, md5 byte), all posted.
+    fn posted(conn: &rusqlite::Connection, id: i64, set: u8, files: &[(&str, i64, u8)]) {
+        conn.execute("insert into s0.releases (id, group_name) values (?1, 'a.b.c')", [id]).unwrap();
+        for (n, (name, size, md5)) in files.iter().enumerate() {
+            conn.execute(
+                "insert into s0.par2_files (release_id, file_id, set_id, md5, md5_16k, size, name, bound)
+                 values (?1, ?2, ?3, ?4, ?4, ?5, ?6, 1)",
+                rusqlite::params![id, vec![n as u8; 16], vec![set; 16], vec![*md5; 16], size, name],
+            )
+            .unwrap();
+        }
+    }
+
+    fn probed(conn: &rusqlite::Connection, id: i64, tracks: bool) {
+        let video = if tracks { vec![media::VideoTrack::default()] } else { Vec::new() };
+        let media = media::MediaInfo {
+            container: "matroska".into(),
+            video,
+            duration_secs: Some(5_400.0),
+            ..Default::default()
+        };
+        let info = ProbeInfo { media: Some(media), ..Default::default() };
+        conn.execute(
+            "insert into s0.release_probe (release_id, info, moviehash) values (?1, ?2, '1d9da161e916b2fd')",
+            rusqlite::params![id, serde_json::to_string(&info).unwrap()],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_twin_with_the_same_payload_lends_its_probe() {
+        let conn = shards();
+        let rars = [("a.part1.rar", 50_000_000, 1), ("a.part2.rar", 20_000_000, 2), ("a.nfo", 900, 3)];
+        // 0 was probed; 8 is a twin under other names (and another NFO, a sidecar); 16 lacks a volume; 24 has
+        // other bytes in the same set
+        posted(&conn, 0, 9, &rars);
+        probed(&conn, 0, true);
+        conn.execute("insert into s0.release_cover (release_id, mime, sha256) values (0, 'image/jpeg', 'ab')", [])
+            .unwrap();
+        posted(&conn, 8, 9, &[("b.part1.rar", 50_000_000, 1), ("b.part2.rar", 20_000_000, 2), ("b.nfo", 700, 4)]);
+        posted(&conn, 16, 9, &rars[..1]);
+        posted(&conn, 24, 9, &[("a.part1.rar", 50_000_000, 5), ("a.part2.rar", 20_000_000, 2)]);
+        // the step reads its sets from its own shard (`keys::par2_sets`): here, the one they all share
+        let set = vec![vec![9u8; 16]];
+
+        let twin = twin_of(&conn, 8, set.clone()).expect("the same payload");
+        assert_eq!(twin.media.duration_secs, Some(5_400.0));
+        assert_eq!(twin.moviehash.as_deref(), Some("1d9da161e916b2fd"));
+        assert_eq!(twin.cover, Some(("image/jpeg".into(), "ab".into())));
+        assert!(twin_of(&conn, 16, set.clone()).is_none(), "a volume short");
+        assert!(twin_of(&conn, 24, set.clone()).is_none(), "other bytes");
+        assert!(twin_of(&conn, 0, set.clone()).is_none(), "8 isn't probed");
+
+        // a probe that found no tracks lends nothing
+        conn.execute("delete from s0.release_probe where release_id = 0", []).unwrap();
+        probed(&conn, 0, false);
+        assert!(twin_of(&conn, 8, set.clone()).is_none());
+        // nor does one in a blocked group
+        conn.execute("delete from s0.release_probe where release_id = 0", []).unwrap();
+        probed(&conn, 0, true);
+        conn.execute("update s0.releases set group_name = 'alt.binaries.pictures.erotica.teen' where id = 0", [])
+            .unwrap();
+        assert!(twin_of(&conn, 8, set).is_none());
     }
 }
