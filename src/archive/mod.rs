@@ -7,6 +7,7 @@ pub mod follow;
 pub mod link;
 pub mod names;
 pub mod nzb;
+pub mod ranged;
 pub mod rar;
 pub mod rev;
 pub mod select;
