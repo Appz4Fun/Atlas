@@ -2203,7 +2203,7 @@ impl ShardWriter {
             let mut releases: Vec<Cow<'_, Release>> = Vec::new();
             let frozen = frozen_attached && crate::frozen::any(&tx)?;
             // a release split into one row per upload: its articles go to their upload's row
-            let routed = tx.prepare_cached("select 1 from upload_routes limit 1")?.exists([])?;
+            let mut routed = tx.prepare_cached("select 1 from upload_routes limit 1")?.exists([])?;
             for release in batches.into_iter().flatten().filter(|r| !crate::filters::group_blocked(&r.group)) {
                 // a frozen first upload's row comes back, with its routes, before they are read
                 if frozen {
@@ -2213,9 +2213,15 @@ impl ShardWriter {
                         .iter()
                         .filter_map(|a| a.release_name.as_deref().map(|n| (n, a.author.as_str())))
                         .collect();
-                    crate::frozen::thaw_incoming(&tx, collection, &release.name, &articles, &release.group, now)?;
+                    let thawed =
+                        crate::frozen::thaw_incoming(&tx, collection, &release.name, &articles, &release.group, now)?;
+                    // a thawed row may bring the shard's first routes
+                    if thawed > 0 && !routed {
+                        routed = tx.prepare_cached("select 1 from upload_routes limit 1")?.exists([])?;
+                    }
                 }
-                let pieces = if routed { route_uploads(&tx, &key, release)? } else { vec![Cow::Borrowed(release)] };
+                let pieces =
+                    if routed { route_uploads(&tx, &key, release, frozen)? } else { vec![Cow::Borrowed(release)] };
                 for piece in pieces {
                     // a later upload's row thaws by its own name
                     let twin = piece.collection.is_none() && piece.name != release.name;
@@ -2453,7 +2459,12 @@ pub fn start_grouping(main: &Path) -> Result<()> {
 /// articles, and any with no Date or far from every window, stay in the release as it came; another upload's go in a
 /// piece named as its row, with no collection, soo the upsert finds that row. A release of no split row comes back as
 /// it is.
-fn route_uploads<'a>(tx: &Connection, key: &IdKey, release: &'a Release) -> Result<Vec<Cow<'a, Release>>> {
+fn route_uploads<'a>(
+    tx: &Connection,
+    key: &IdKey,
+    release: &'a Release,
+    frozen: bool,
+) -> Result<Vec<Cow<'a, Release>>> {
     let origin: Option<i64> = match release.collection.as_deref() {
         Some(c) => tx
             .prepare_cached("select release_id from collections where key = ?")?
@@ -2465,15 +2476,22 @@ fn route_uploads<'a>(tx: &Connection, key: &IdKey, release: &'a Release) -> Resu
             .optional()?,
     };
     let Some(origin) = origin else { return Ok(vec![Cow::Borrowed(release)]) };
-    // each upload's row by its name now (a rename keeps the id), and its window; a row gone since isnt routed to
+    // each upload's row by its name now (a rename keeps the id), live or frozen (its piece thaws it by that name),
+    // and its window; a row gone since isnt routed to
     type Route = (i64, String, i64, i64);
+    let sql = if frozen {
+        "select u.release_id, coalesce(r.name, f.name), u.first_date, u.last_date from upload_routes u
+         left join releases r on r.id = u.release_id left join frozen.frozen_releases f on f.id = u.release_id
+         where u.origin_id = ?1 and u.first_date is not null and u.last_date is not null
+         and coalesce(r.group_name, f.group_name) = ?2 order by u.first_date"
+    } else {
+        "select u.release_id, r.name, u.first_date, u.last_date from upload_routes u
+         join releases r on r.id = u.release_id
+         where u.origin_id = ?1 and u.first_date is not null and u.last_date is not null and r.group_name = ?2
+         order by u.first_date"
+    };
     let routes: Vec<Route> = tx
-        .prepare_cached(
-            "select u.release_id, r.name, u.first_date, u.last_date from upload_routes u
-             join releases r on r.id = u.release_id
-             where u.origin_id = ? and u.first_date is not null and u.last_date is not null and r.group_name = ?
-             order by u.first_date",
-        )?
+        .prepare_cached(sql)?
         .query_map(params![origin, release.group], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
         .collect::<Result<_>>()?;
     if routes.len() < 2 {
@@ -3544,6 +3562,20 @@ mod tests {
         assert!(mids(new[0]).contains(&"a.rar.2.renamed@x".to_string()));
         let n: i64 = conn.query_row("select count(*) from releases", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 2, "no fragment row under the old name");
+        conn.execute("delete from releases where id = ?", [new[0]]).unwrap();
+        save(
+            &main,
+            &[Release {
+                name: "Rel".into(),
+                group: "alt.binaries.t".into(),
+                articles: vec![late("a.rar.2.gone", "a.rar", 4_600)],
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        assert!(mids(id).contains(&"a.rar.2.gone@x".to_string()));
+        let n: i64 = conn.query_row("select count(*) from releases", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1, "a gone row isnt made again");
     }
     #[test]
     fn file_timing_folds_each_save() {
