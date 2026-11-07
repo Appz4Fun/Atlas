@@ -153,6 +153,8 @@ pub fn hold_off_compaction(main: &Path) -> Result<WriteGuard> {
 
 /// `hold_off_compaction`, None while a compaction runs.
 pub fn try_hold_off_compaction(main: &Path) -> Result<Option<WriteGuard>> {
+    // every writer holds this: none may write to shards a merge left half done
+    crate::merge_shards::refuse_if_merging(main)?;
     let file = open_lock(main)?;
     match file.try_lock_shared() {
         Ok(()) => Ok(Some(WriteGuard(file))),
@@ -339,6 +341,7 @@ pub fn run(main: &Path, progress: &(dyn Fn(&str) + Sync), stop: &Arc<AtomicBool>
 
 fn run_locked(main: &Path, progress: &(dyn Fn(&str) + Sync), stop: &Arc<AtomicBool>) -> Result<Shrunk> {
     let _lock = Lock::take(main)?;
+    crate::merge_shards::refuse_if_merging(main)?;
     // a conversion's swap cut short is finished (or undone) like at a start;
     // shards with no main database at all are refused: the main database
     // the next start made would hand out their ids again

@@ -86,6 +86,10 @@ fn skipped(table: &str) -> bool {
         || table.starts_with("releases_fts")
         || table.starts_with("frozen_fts")
         || matches!(table, "meta" | "pp_walks" | "merge_shards" | "merge_progress" | "merge_triggers")
+        // a cache of message-id hashes keyed by the source's secret: rebuilt under the target's (`store::IdKey`)
+        || table == "release_ids"
+        // the shared catalog is filled again after a merge (`--shared-catalog-fill`): its rows carry their shard
+        || table == "catalog_outbox"
         || table.starts_with("legacy_")
 }
 
@@ -251,7 +255,17 @@ fn merge_one(
                 Ok(conn.query_row("select value from src.meta where key = ?1", [key], |r| r.get(0)).optional()?)
             };
             let max_release: i64 = conn.query_row("select coalesce(max(id), 0) from src.releases", [], |r| r.get(0))?;
-            let max_file: i64 = conn.query_row("select coalesce(max(id), 0) from src.files", [], |r| r.get(0))?;
+            let mut max_file: i64 = conn.query_row("select coalesce(max(id), 0) from src.files", [], |r| r.get(0))?;
+            // release_ids isn't copied (`skipped`), and has no index on file_id
+            for t in FILE_KEYED.into_iter().filter(|t| *t != "release_ids") {
+                let there: bool =
+                    conn.prepare("select 1 from src.sqlite_master where type = 'table' and name = ?1")?.exists([t])?;
+                if there {
+                    let m: i64 =
+                        conn.query_row(&format!("select coalesce(max(file_id), 0) from src.{t}"), [], |r| r.get(0))?;
+                    max_file = max_file.max(m);
+                }
+            }
             conn.execute(
                 "insert into merge_shards (shard, file_offset, domain_offset, key0, key1, max_release, max_file, grouping_from)
                  values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -535,7 +549,7 @@ fn copy_table(
                 // the first key not copied yet: one past what progress says
                 let mut start: i128 = upto.map_or(lo as i128, |u| u as i128 + 1);
                 // the range a transaction takes, fitted to `BATCH_ROWS` as it goes
-                let mut width: i128 = BATCH_ROWS as i128;
+                let mut width: i128 = 1024;
                 let ranged = format!("{insert} and {k} >= ?1 and {k} <= ?2");
                 while start <= hi as i128 {
                     if !spend(budget) {
@@ -659,7 +673,8 @@ fn sync_dir(path: &Path) {
 
 /// A database file and everything beside it that belongs to it.
 fn remove_family(base: &Path) -> Result<()> {
-    for suffix in ["", "-wal", "-shm", "-journal", ".sealed-log-cursor", ".catalog-cursor"] {
+    // the database last: a -wal left beside no file would be replayed into a new file of that name
+    for suffix in ["-wal", "-shm", "-journal", ".sealed-log-cursor", ".catalog-cursor", ""] {
         let p = PathBuf::from(format!("{}{suffix}", base.display()));
         match std::fs::remove_file(&p) {
             Ok(()) => {}
@@ -673,6 +688,22 @@ fn remove_family(base: &Path) -> Result<()> {
 /// Set in `atlas.db` from a merge's start to its `finish`: no indexer may start in between, as it would write to
 /// shards half merged (`db::create_db_at` refuses).
 pub const MERGING: &str = "merging_shards";
+
+/// An error while a merge started on the database at `main` hasn't finished.
+pub fn refuse_if_merging(main: &Path) -> Result<()> {
+    if !main.exists() {
+        return Ok(());
+    }
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let Ok(conn) = Connection::open_with_flags(main, flags) else { return Ok(()) };
+    if in_progress(&conn) {
+        bail!("a shard merge is in progress: run `atlas --merge-shards --apply` to finish it first");
+    }
+    Ok(())
+}
+
+/// Set in `atlas.db` once `finish` has put the id counter in one-shard numbering.
+const COUNTER_DONE: &str = "merge_counter_done";
 
 /// Whether a merge started on `main` hasn't finished.
 pub fn in_progress(main: &Connection) -> bool {
@@ -696,9 +727,15 @@ pub fn finish(main: &Path, target: &Path) -> Result<()> {
         highest = highest.max(f.query_row("select coalesce(max(id), 0) from frozen_releases", [], |r| r.get(0))?);
     }
     let main_conn = crate::db::open_at(main)?;
-    let next = crate::store::get_meta(&main_conn, "next_seq")?.unwrap_or(0);
-    highest = highest.max(next.saturating_mul(LEGACY_SHARDS as i64));
-    crate::store::set_next_seq(&main_conn, highest + 1)?;
+    // the counter in one-shard numbering once, with a note that it is: a rerun doesn't take it for eight-shard again
+    if crate::store::get_meta(&main_conn, COUNTER_DONE)?.unwrap_or(0) == 0 {
+        let next = crate::store::get_meta(&main_conn, "next_seq")?.unwrap_or(0);
+        highest = highest.max(next.saturating_mul(LEGACY_SHARDS as i64));
+        let tx = main_conn.unchecked_transaction()?;
+        crate::store::set_next_seq(&tx, highest + 1)?;
+        tx.execute("insert or replace into meta (key, value) values (?1, 1)", [COUNTER_DONE])?;
+        tx.commit()?;
+    }
     restore_triggers(&conn)?;
     crate::sidecar::recount(&conn)?;
     main_conn.execute("insert or replace into meta (key, value) values (?1, 0)", [MERGING])?;
@@ -883,14 +920,7 @@ mod tests {
         let todo = sources(&main);
         assert_eq!(todo.len(), LEGACY_SHARDS - 1);
         let target = legacy_shard_path(&main, 0);
-        let markers: i64 = (0..LEGACY_SHARDS)
-            .map(|s| {
-                count(
-                    &crate::db::open_at(&legacy_shard_path(&main, s)).unwrap(),
-                    "select count(*) from release_ids where file_id = 0",
-                )
-            })
-            .sum();
+        let own_ids = count(&crate::db::open_at(&target).unwrap(), "select count(*) from release_ids");
         let merged = merge(&target, &todo, true, None, &|_| {}).unwrap();
         assert_eq!(merged.shards.len(), LEGACY_SHARDS - 1);
         finish(&main, &target).unwrap();
@@ -933,8 +963,8 @@ mod tests {
         assert_eq!(count(&c, "select count(distinct key0) from legacy_collections"), LEGACY_SHARDS as i64 - 1);
         assert_eq!(count(&c, "select count(*) from merge_shards where done = 1 and key0 is not null"), 7);
         assert_eq!(count(&c, "select value from meta where key = 'releases'"), 16);
-        // a release's own row in release_ids keeps file 0
-        assert_eq!(count(&c, "select count(*) from release_ids where file_id = 0"), markers);
+        // release_ids, hashed with each source's secret, isn't copied: it's built again under the target's
+        assert_eq!(count(&c, "select count(*) from release_ids"), own_ids);
         // ids go on past every release
         let max = count(&c, "select max(id) from releases");
         assert!(store::get_meta(&crate::db::open_at(&main).unwrap(), "next_seq").unwrap().unwrap() > max);
@@ -984,9 +1014,14 @@ mod tests {
         merge(&target, &sources(&main), true, None, &|_| {}).unwrap();
         let e = crate::db::create_db_at(&main).unwrap_err();
         assert!(format!("{e:#}").contains("merge"), "{e:#}");
+        assert!(crate::compact::try_hold_off_compaction(&main).is_err(), "nor any other writer");
         // the run stopped before finishing: finishing again is safe
         finish(&main, &target).unwrap();
+        let next = |m: &Connection| store::get_meta(m, "next_seq").unwrap().unwrap();
+        let once = next(&m);
         finish(&main, &target).unwrap();
+        assert_eq!(next(&m), once, "the counter converted once");
+        assert!(crate::compact::try_hold_off_compaction(&main).unwrap().is_some());
         // past the merge guard (the eight-shard layout's own check of its files is the next PR's)
         if let Err(e) = crate::db::create_db_at(&main) {
             assert!(!format!("{e:#}").contains("merge is in progress"), "{e:#}");
