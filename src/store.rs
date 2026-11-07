@@ -1235,13 +1235,14 @@ fn sealed_segments(conn: &Connection, file_id: i64) -> Result<Option<Vec<crate::
 /// already has its part under another message-id (see the save's `again`). Saves before that counted them in
 /// `releases.size` and `parts`; `atlas --recount-reposts` takes them back out. A file with more rows than a blob
 /// takes is read as far as `READ_MAX_SEGMENTS` goes.
-pub(crate) fn repost_excess(conn: &Connection, release_id: i64) -> Result<(i64, i64)> {
-    let files: Vec<i64> = conn
-        .prepare_cached("select id from files where release_id = ?")?
-        .query_map([release_id], |r| r.get(0))?
+pub(crate) fn repost_excess(conn: &Connection, release_id: i64) -> Result<Excess> {
+    let files: Vec<(i64, String)> = conn
+        .prepare_cached("select id, filename from files where release_id = ?")?
+        .query_map([release_id], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<Result<_>>()?;
-    let (mut bytes, mut count) = (0i64, 0i64);
-    for file in files {
+    let mut out = Excess::default();
+    for (file, filename) in files {
+        let shared = crate::filters::shared_file_row(&filename);
         let mut segs = sealed_segments(conn, file)?.unwrap_or_default();
         let mut rows =
             conn.prepare_cached("select part, bytes, domain, local from segments where file_id = ? limit ?")?;
@@ -1268,16 +1269,30 @@ pub(crate) fn repost_excess(conn: &Connection, release_id: i64) -> Result<(i64, 
         }
         let mut seen = Vec::new();
         for seg in segs {
-            let Some(part) = seg.part else { continue };
-            if has_part(&seen, part) {
-                bytes += seg.bytes;
-                count += 1;
+            // counted in `parts` but in no `seen`: what the recount's cap leaves for them
+            let Some(part) = seg.part.filter(|p| (0..=crate::parser::MAX_PARTS).contains(p)) else {
+                out.unseen += 1;
+                continue;
+            };
+            if has_part(&seen, part) && !shared {
+                out.bytes += seg.bytes;
+                out.count += 1;
             } else {
                 insert_part(&mut seen, part);
             }
         }
     }
-    Ok((bytes, count))
+    Ok(out)
+}
+
+/// What `repost_excess` found.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Excess {
+    /// reposts: their bytes and how many
+    pub bytes: i64,
+    pub count: i64,
+    /// articles with no part number (or one no `seen` holds), counted in `parts` all the same
+    pub unseen: i64,
 }
 
 /// Every article of a release on this shard, by the key sealing tells one message-id with (`seg_key`): the blobs'
@@ -2012,9 +2027,11 @@ impl ShardWriter {
                     }
                     let index = others.then_some((release_id, &key));
                     let before = added.len();
+                    // distinct files of a per-article upload share this row's part numbers
+                    let shared = crate::filters::shared_file_row(name);
                     let mut timing = Timing::default();
                     for a in articles {
-                        let again = a.part.is_some_and(|p| has_part(&f.seen, p));
+                        let again = !shared && a.part.is_some_and(|p| has_part(&f.seen, p));
                         if add_segment(&tx, domains, &f, index, a, &mut sealed)? {
                             let unsure = f.sealed && sealed.guessed;
                             // an article that may be a copy of one in the blob isn't timed: sealing again can drop
@@ -3033,8 +3050,43 @@ mod tests {
         assert_eq!(totals(), (2_003, 2));
         // what a save before this counted on top, which `--recount-reposts` takes out: the blob and the late row
         let id: i64 = c.query_row("select id from releases where name = 'Rel'", [], |r| r.get(0)).unwrap();
-        assert_eq!(repost_excess(&c, id).unwrap(), (1_001 + 1_002 + 1_001 + 1_002, 4));
+        assert_eq!(
+            repost_excess(&c, id).unwrap(),
+            Excess { bytes: 1_001 + 1_002 + 1_001 + 1_002, count: 4, unseen: 0 }
+        );
         assert_eq!(seen_parts(&c, id).unwrap(), 2);
+    }
+
+    /// The row a per-article upload puts its same-sized files in shares their part numbers: each file's part 1 is
+    /// counted, none taken for a repost.
+    #[test]
+    fn a_per_article_shared_row_counts_every_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+        let art = |id: &str| Article {
+            message_id: id.into(),
+            subject: "x".into(),
+            filename: Some("per-article.p2".into()),
+            part: Some(1),
+            total_parts: Some(2),
+            bytes: 10,
+            ..Default::default()
+        };
+        let rel = Release {
+            name: "Up".into(),
+            group: "alt.binaries.t".into(),
+            articles: vec![art("<a@x>"), art("<b@x>")],
+            ..Default::default()
+        };
+        save(&main, &[rel]).unwrap();
+        let c = db::open_at(&shard_path(&main, shard_of("alt.binaries.t"))).unwrap();
+        let (id, size, parts): (i64, i64, i64) =
+            c.query_row("select id, size, parts from releases", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        assert_eq!((size, parts), (20, 2));
+        assert_eq!(repost_excess(&c, id).unwrap().count, 0);
+        assert!(crate::filters::shared_file_row("per-article.p2"));
+        assert!(!crate::filters::shared_file_row("per-article.00001of00002.p2"), "a file with its counter is its own");
     }
 
     #[test]

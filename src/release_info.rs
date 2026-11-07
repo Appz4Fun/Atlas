@@ -245,6 +245,7 @@ fn contents_of(conn: &Connection, ids: &[i64], recovery: &[i64]) -> Result<Conte
         store::each_article(conn, *id, &mut |article| {
             let name = article.filename.unwrap_or_default();
             if let Some(part) = article.part
+                && !crate::filters::shared_file_row(&name)
                 && !parts.insert((name.clone(), part))
             {
                 return Ok(());

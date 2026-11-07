@@ -21,19 +21,21 @@ fn batch(conn: &Connection, after: i64) -> rusqlite::Result<Vec<(i64, i64)>> {
 }
 
 /// What a row's reposts added, when it has any: `(bytes, articles)`. Never more than `parts` is past the parts its
-/// files have seen: a repost saved after this build came in wasnt counted, and isnt taken out again (the bytes in
-/// proportion, the reposts of one row being copies of the same articles).
+/// files have seen and its articles without a part number: a repost saved after this build came in wasnt counted,
+/// and isnt taken out again (the bytes in proportion, the reposts of one row being copies of the same articles).
 fn excess(conn: &Connection, id: i64, parts: i64) -> rusqlite::Result<Option<(i64, i64)>> {
-    let over = parts - store::seen_parts(conn, id)?;
-    if over <= 0 {
+    let seen = store::seen_parts(conn, id)?;
+    if parts <= seen {
         return Ok(None);
     }
-    let (bytes, count) = store::repost_excess(conn, id)?;
-    if count <= 0 {
+    let found = store::repost_excess(conn, id)?;
+    let over = parts - seen - found.unseen;
+    if found.count <= 0 || over <= 0 {
         return Ok(None);
     }
-    let take = count.min(over);
-    let bytes = i64::try_from(i128::from(bytes) * i128::from(take) / i128::from(count)).unwrap_or(bytes);
+    let take = found.count.min(over);
+    let bytes =
+        i64::try_from(i128::from(found.bytes) * i128::from(take) / i128::from(found.count)).unwrap_or(found.bytes);
     Ok(Some((bytes, take)))
 }
 
