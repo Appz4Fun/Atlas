@@ -565,6 +565,8 @@ impl Step for ProbeStep {
         }
 
         let mut last_lines = None;
+        // the cover kept for a release whose media came from another's probe, when its own start had none
+        let mut twin_cover = None;
         if let Some(file) = main_file(&files) {
             info.file = Some(file.filename.clone());
             // only the real ends count: an incomplete file's earliest article isn't its first
@@ -644,9 +646,31 @@ impl Step for ProbeStep {
             }
             derive(&mut info, wire_bytes, file.expected, last_lines.as_ref());
             let known_last = last_part(&info, last_lines.as_ref(), last_body);
-            info.moviehash = moviehash_of(ctx, file, &files, &front, &info, known_last.clone())?;
+            // the same mux already read whole by another release's probe: its media is taken, and nothing more of
+            // this file is read for it (an explicit rerun reads its own)
+            let shared = if front.is_empty() || crate::raw_store::is_explicit_rerun(ctx.conn(), release_id, PROBE_STEP)
+            {
+                None
+            } else {
+                same_mux_of(ctx, release_id, &info)
+            };
+            if let Some(twin) = shared {
+                crate::metrics::names::MEDIA_SHARED.inc(&[("key", crate::keys::Kind::Mux.word())], 1);
+                let own_cover = info.media.as_mut().and_then(|m| m.cover.take());
+                twin_cover = if own_cover.is_none() { twin.cover } else { None };
+                let mut media = twin.media;
+                media.cover = own_cover;
+                info.media = Some(media);
+                info.media_from = Some(twin.release_id);
+                info.moviehash = match twin.moviehash {
+                    Some(hash) => Some(hash),
+                    None => moviehash_of(ctx, file, &files, &front, &info, known_last.clone())?,
+                };
+            } else {
+                info.moviehash = moviehash_of(ctx, file, &files, &front, &info, known_last.clone())?;
+            }
             // last, being the most it may read: a release's article budget goes to the checks above first
-            if !front.is_empty() {
+            if !front.is_empty() && info.media_from.is_none() {
                 let before = info.layers.clone();
                 read_more_front(ctx, file, total, &mut front, found_nfo_password.as_deref(), &mut info)?;
                 // more of the front can show a bigger file than the one hashed
@@ -664,7 +688,8 @@ impl Step for ProbeStep {
         }
         // a look that finds no cover drops one an earlier look kept
         let cover = info.media.as_mut().and_then(|m| m.cover.take());
-        let saved_cover = cover.and_then(|c| super::keep_cover(&c.bytes).map(|sha256| (c.mime.to_string(), sha256)));
+        let saved_cover =
+            cover.and_then(|c| super::keep_cover(&c.bytes).map(|sha256| (c.mime.to_string(), sha256))).or(twin_cover);
         writes.push(match &saved_cover {
             Some((mime, sha256)) => {
                 StepWrite::new(SET_COVER, vec![release_id.into(), mime.clone().into(), sha256.clone().into()])
@@ -729,6 +754,85 @@ impl Step for ProbeStep {
         let facts = hash.map(|h| vec![(MOVIEHASH_FACT, h)]).unwrap_or_default();
         Ok(Outcome { matched: true, writes, facts, rerun, ..Outcome::default() })
     }
+}
+
+/// Releases looked at per shard, newest first, for one whose probe already read the same mux.
+const SAME_MUX_CANDIDATES: i64 = 16;
+
+/// What another release's probe already read of the same Matroska mux.
+#[derive(Debug, PartialEq)]
+pub(crate) struct SameMux {
+    pub release_id: i64,
+    pub media: media::MediaInfo,
+    pub moviehash: Option<String>,
+    /// its cover art, `(mime, sha256)`, while the folder still has it
+    pub cover: Option<(String, String)>,
+}
+
+/// `same_mux_media` for the release being probed, with every shard opened beside its own. None without a mux key.
+fn same_mux_of(ctx: &StepCtx<'_>, release_id: i64, info: &ProbeInfo) -> Option<SameMux> {
+    let mux = info.media.as_ref().and_then(crate::keys::mux_text)?;
+    let main = ctx.conn().path().and_then(super::audio_print::main_of)?;
+    let all = crate::db::open_with_shards(&main).ok()?;
+    same_mux_media(&all, release_id, info, &mux)
+}
+
+/// The releases other than `?1` in shard `shard` with the mux key `?3`, probed, that the pages would show, newest
+/// first, at most `?2`, each with its probe and cover.
+fn same_mux_sql(shard: usize) -> String {
+    format!(
+        "select p.release_id, p.info, p.moviehash, c.mime, c.sha256 from s{shard}.release_keys k
+         join s{shard}.release_probe p on p.release_id = k.release_id
+         join s{shard}.releases r on r.id = k.release_id
+         left join s{shard}.release_cover c on c.release_id = k.release_id
+         where k.mux = ?3 and k.release_id != ?1 and not atlas_blocked(r.group_name)
+         order by k.release_id desc limit ?2"
+    )
+}
+
+/// Another release whose probe already read the Matroska mux `mux` (`keys::mux_text`) that `own`'s first article
+/// shows, over every shard of `conn`: the same SegmentUID and DateUTC is the same file, soo what it read is what the
+/// rest of this file's start and its end would say. Only a probe that read at least as much: one saved before a
+/// reader this probe has (`stale_saved`) isn't, nor one with fewer tracks or chapters than this first article shows,
+/// nor one inside an archive when this file is posted bare (the end Tags are only read from a bare file).
+pub(crate) fn same_mux_media(conn: &rusqlite::Connection, own: i64, info: &ProbeInfo, mux: &str) -> Option<SameMux> {
+    let key = crate::keys::as_key(crate::keys::digest8(mux.as_bytes()));
+    let mine = info.media.as_ref()?;
+    let bare = info.archive.is_none() && info.layers.is_empty();
+    type Row = (i64, String, Option<String>, Option<String>, Option<String>);
+    let mut found: Vec<Row> = Vec::new();
+    for shard in 0..crate::store::SHARDS {
+        // a shard without the tables yet has none
+        let Ok(mut q) = conn.prepare_cached(&same_mux_sql(shard)) else { continue };
+        let Ok(rows) = q.query_map(rusqlite::params![own, SAME_MUX_CANDIDATES, key], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        }) else {
+            continue;
+        };
+        found.extend(rows.filter_map(Result::ok));
+    }
+    found.sort_unstable_by_key(|row| std::cmp::Reverse(row.0));
+    found.into_iter().find_map(|(release_id, json, moviehash, mime, sha256)| {
+        if stale_saved(&json) {
+            return None;
+        }
+        let other: ProbeInfo = serde_json::from_str(&json).ok()?;
+        let media = other.media?;
+        let packed = other.archive.is_some() || !other.layers.is_empty();
+        let as_much = media.video.len() >= mine.video.len()
+            && media.audio.len() >= mine.audio.len()
+            && media.subtitles.len() >= mine.subtitles.len()
+            && media.chapters.len() >= mine.chapters.len();
+        if crate::keys::mux_text(&media).as_deref() != Some(mux)
+            || media.video.is_empty()
+            || !as_much
+            || (bare && packed)
+        {
+            return None;
+        }
+        let cover = mime.zip(sha256).filter(|(_, sha)| super::cover_file(sha).is_some_and(|f| f.exists()));
+        Some(SameMux { release_id, media, moviehash: moviehash.filter(|h| !h.is_empty()), cover })
+    })
 }
 
 /// Articles read from the start of a file, at most, when its header runs past the first one: Matroska puts
@@ -1087,6 +1191,103 @@ fn inspect(body: &[u8], password: Option<&str>, info: &mut ProbeInfo) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The main database in memory with shard 0 attached: releases, keys, probes and covers.
+    fn mux_shards() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::filters::register_sql(&conn).unwrap();
+        conn.execute("attach ':memory:' as s0", []).unwrap();
+        conn.execute_batch("create table s0.releases (id integer primary key, group_name text not null)").unwrap();
+        for table in [&crate::keys::RELEASE_KEYS, &super::super::PROBE, &super::super::COVER] {
+            conn.execute_batch(&table.create.replacen("exists ", "exists s0.", 1)).unwrap();
+            for (column, kind) in table.added {
+                let _ = conn.execute_batch(&format!("alter table s0.{} add column {column} {kind}", table.name));
+            }
+        }
+        conn
+    }
+
+    /// A Matroska mux with `video` video tracks and `audio` audio tracks, as a first article shows it.
+    fn mkv(uid: &str, video: usize, audio: usize) -> media::MediaInfo {
+        media::MediaInfo {
+            container: "matroska".into(),
+            segment_uid: Some(uid.into()),
+            muxed_at: Some(1_700_000_000),
+            video: vec![media::VideoTrack { codec: "V_MPEGH/ISO/HEVC".into(), ..Default::default() }; video],
+            audio: vec![media::AudioTrack { codec: "A_EAC3".into(), ..Default::default() }; audio],
+            ..Default::default()
+        }
+    }
+
+    /// A release in shard 0 whose probe read `info`, keyed by its mux as the keys step would.
+    fn probed(conn: &rusqlite::Connection, id: i64, group: &str, info: &ProbeInfo, moviehash: Option<&str>) {
+        conn.execute("insert into s0.releases (id, group_name) values (?1, ?2)", rusqlite::params![id, group]).unwrap();
+        conn.execute(
+            "insert into s0.release_probe (release_id, info, moviehash) values (?1, ?2, ?3)",
+            rusqlite::params![id, serde_json::to_string(info).unwrap(), moviehash],
+        )
+        .unwrap();
+        let mux = info
+            .media
+            .as_ref()
+            .and_then(crate::keys::mux_text)
+            .map(|t| crate::keys::as_key(crate::keys::digest8(t.as_bytes())));
+        conn.execute("insert into s0.release_keys (release_id, mux) values (?1, ?2)", rusqlite::params![id, mux])
+            .unwrap();
+    }
+
+    #[test]
+    fn a_mux_another_release_already_read_is_taken_from_it() {
+        let conn = mux_shards();
+        let mut whole = mkv("ab12", 1, 2);
+        whole.tags.insert("BPS".into(), "12000000".into());
+        whole.chapters = vec![media::Chapter::default(); 3];
+        let bare = |media| ProbeInfo { media: Some(media), ..Default::default() };
+        let packed = |media| ProbeInfo {
+            media: Some(media),
+            archive: Some(super::super::ArchiveHead::default()),
+            ..Default::default()
+        };
+        // 0 read the whole mux, bare; 8 is in a blocked group; 16 read less of it than a first article shows
+        probed(&conn, 0, "a.b.c", &bare(whole.clone()), Some("1d9da161e916b2fd"));
+        probed(&conn, 8, "alt.binaries.pictures.erotica.teen", &bare(whole.clone()), Some("1d9da161e916b2fd"));
+        probed(&conn, 16, "a.b.c", &bare(mkv("ab12", 1, 0)), None);
+        // 24 has another mux
+        probed(&conn, 24, "a.b.c", &bare(mkv("ffff", 1, 2)), Some("0000000000000001"));
+
+        let first = bare(mkv("ab12", 1, 1));
+        let mux = crate::keys::mux_text(first.media.as_ref().unwrap()).unwrap();
+        let got = same_mux_media(&conn, 99, &first, &mux).expect("0 read it");
+        assert_eq!(got.release_id, 0, "newest that read as much, the blocked group's left out");
+        assert_eq!(got.media, whole, "its tracks, chapters and end tags");
+        assert_eq!(got.moviehash.as_deref(), Some("1d9da161e916b2fd"));
+        assert!(got.cover.is_none(), "no cover row");
+        assert!(same_mux_media(&conn, 0, &first, &mux).is_none(), "never itself, and 16 read less");
+
+        // a first article that shows more audio than any saved probe read finds nothing to take
+        let more = bare(mkv("ab12", 1, 3));
+        assert!(same_mux_media(&conn, 99, &more, &mux).is_none());
+
+        // a probe from inside an archive lends to a packed file, never to a bare one, whose end tags it would lack
+        probed(&conn, 32, "a.b.c", &packed(mkv("ab12", 1, 2)), None);
+        assert_eq!(same_mux_media(&conn, 99, &first, &mux).map(|t| t.release_id), Some(0));
+        assert_eq!(same_mux_media(&conn, 99, &packed(mkv("ab12", 1, 1)), &mux).map(|t| t.release_id), Some(32));
+
+        // one saved before a reader this probe has isn't taken: Dolby Vision without `from_rpu`
+        let mut dv = mkv("cd34", 1, 1);
+        dv.video[0].dv_profile = Some(8);
+        probed(&conn, 40, "a.b.c", &bare(dv.clone()), None);
+        let stale: String =
+            conn.query_row("select info from s0.release_probe where release_id = 40", [], |r| r.get(0)).unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(&stale).unwrap();
+        v["media"]["video"][0]["dolby_vision"] = serde_json::json!({});
+        conn.execute("update s0.release_probe set info = ?1 where release_id = 40", [v.to_string()]).unwrap();
+        let dv_mux = crate::keys::mux_text(&dv).unwrap();
+        assert!(same_mux_media(&conn, 99, &bare(dv), &dv_mux).is_none());
+
+        // no mux key in the first article, nothing to look by
+        assert!(crate::keys::mux_text(&mkv("", 1, 1)).is_none());
+    }
 
     fn file(name: &str, parts: i64) -> FileInfo {
         FileInfo {
