@@ -2207,7 +2207,7 @@ fn release_page(args: &HashMap<String, String>) -> ApiResponse {
     let mut split_groups = None;
     // a post spread over several groups, or linked by its PAR2 set, is shown whole
     if let Ok(conn) = crate::db::open()
-        && let Ok(Some(post)) = release_info::whole_post_with(&conn, &release)
+        && let Ok(Some(post)) = release_info::whole_post_from_catalog(&conn, &release)
     {
         contents = release_info::contents_of_split(&conn, &post).unwrap_or(contents);
         split_groups = release_info::groups_of_ids(&conn, &post.ids).ok();

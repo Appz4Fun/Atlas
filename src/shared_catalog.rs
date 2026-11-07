@@ -1390,8 +1390,11 @@ pub mod reader {
 
     /// The indexes the readers use, built by the indexer when reads are on (`build_indexes`), and only used once
     /// valid: until then a lookup would scan a table of a hundred million rows.
-    pub const INDEXES: &[(&str, &str)] =
-        &[("releases_name", "create index concurrently if not exists releases_name on releases (name)")];
+    pub const INDEXES: &[(&str, &str)] = &[
+        ("releases_name", "create index concurrently if not exists releases_name on releases (name)"),
+        // byte order, as SQLite compares: a name's range (`stem.` to `stem/`) is the same rows only under "C"
+        ("releases_name_c", "create index concurrently if not exists releases_name_c on releases (name collate \"C\")"),
+    ];
 
     fn config() -> &'static SharedCatalogConfig {
         static CONFIG: OnceLock<SharedCatalogConfig> = OnceLock::new();
@@ -1566,6 +1569,97 @@ pub mod reader {
                 }
             }
         }
+    }
+
+    /// The most rows of one name, or one stem, a split-post lookup takes from the catalog; past it the shards answer,
+    /// as they would have stopped early too.
+    pub const NAMED_CAP: i64 = 4_096;
+    /// a stem's rows past which some shard would hold more than its 1,024 anyway (`release_info::LINKED_ROWS`)
+    pub const STEM_CAP: i64 = 8_200;
+
+    /// A release row as a split-post lookup needs it, with its shard: `posted` is the text `julianday` reads.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct NamedRow {
+        pub id: i64,
+        pub shard: i16,
+        pub name: String,
+        pub group: String,
+        pub bytes: i64,
+        pub posted: Option<String>,
+        pub poster: Option<String>,
+    }
+
+    fn named_from(r: &postgres::Row) -> NamedRow {
+        NamedRow {
+            id: r.get(0),
+            shard: r.get(1),
+            name: r.get(2),
+            group: r.get(3),
+            bytes: r.get(4),
+            posted: r.get(5),
+            poster: r.get(6),
+        }
+    }
+
+    const NAMED_COLUMNS: &str =
+        "id, shard, coalesce(name, ''), coalesce(group_name, ''), coalesce(size, 0), posted_date, poster";
+
+    /// Every row of exactly this name (and, with `poster`, that poster), up to `NAMED_CAP`: None past it, when reads
+    /// are off, or when the catalog can't answer. The caller filters and limits as the shard lookup does.
+    pub fn named(name: &str, poster: Option<Option<String>>) -> Option<Vec<NamedRow>> {
+        if !index_ready("releases_name") {
+            return None;
+        }
+        let name = name.to_string();
+        with(move |pg| query_named(pg, &name, poster.clone())).flatten()
+    }
+
+    pub fn query_named(
+        pg: &mut postgres::Client,
+        name: &str,
+        poster: Option<Option<String>>,
+    ) -> Result<Option<Vec<NamedRow>>, postgres::Error> {
+        let limit = NAMED_CAP + 1;
+        let rows = match poster {
+            Some(p) => pg.query(
+                &format!(
+                    "select {NAMED_COLUMNS} from releases where name = $1 and poster is not distinct from $2 limit $3"
+                ),
+                &[&name, &p, &limit],
+            )?,
+            None => {
+                pg.query(&format!("select {NAMED_COLUMNS} from releases where name = $1 limit $2"), &[&name, &limit])?
+            }
+        };
+        if rows.len() as i64 > NAMED_CAP {
+            return Ok(None);
+        }
+        Ok(Some(rows.iter().map(named_from).collect()))
+    }
+
+    /// Every row named `stem` or starting `stem.` (byte order), up to `STEM_CAP`: None past it, when reads are off,
+    /// or when the catalog can't answer.
+    pub fn stem_rows(stem: &str) -> Option<Vec<NamedRow>> {
+        if !index_ready("releases_name") || !index_ready("releases_name_c") {
+            return None;
+        }
+        let stem = stem.to_string();
+        with(move |pg| query_stem(pg, &stem)).flatten()
+    }
+
+    pub fn query_stem(pg: &mut postgres::Client, stem: &str) -> Result<Option<Vec<NamedRow>>, postgres::Error> {
+        let (lo, hi, limit) = (format!("{stem}."), format!("{stem}/"), STEM_CAP + 1);
+        let rows = pg.query(
+            &format!(
+                "select {NAMED_COLUMNS} from releases
+                 where name = $1 or (name collate \"C\" >= $2 and name collate \"C\" < $3) limit $4"
+            ),
+            &[&stem, &lo, &hi, &limit],
+        )?;
+        if rows.len() as i64 > STEM_CAP {
+            return Ok(None);
+        }
+        Ok(Some(rows.iter().map(named_from).collect()))
     }
 
     /// Every group with a release of exactly this posted name, from the catalog: `release_info::groups_of`.
@@ -2222,6 +2316,50 @@ mod tests {
         found.sort();
         assert_eq!(found, [("a.b.one".into(), 10, 8), ("a.b.two".into(), 20, 13)]);
         assert!(reader::query_groups(&mut pg, "Nothing").unwrap().is_empty());
+        pg.batch_execute("drop table releases, collections, par2_files, nzb_pointed").unwrap();
+    }
+
+    /// Against a real Postgres when `ATLAS_CATALOG_TEST_URL` names an empty database to use: a name's rows with and
+    /// without a poster, and a stem's range in byte order whatever the database's collation.
+    #[test]
+    fn split_post_lookups_read_names_and_stems_as_sqlite_compares_them() {
+        let Ok(url) = std::env::var("ATLAS_CATALOG_TEST_URL") else { return };
+        let _one = PG.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pg = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        pg.batch_execute("drop table if exists releases, collections, par2_files, nzb_pointed").unwrap();
+        let conn = shard();
+        conn.execute_batch(
+            "alter table releases add column group_name TEXT;
+             alter table releases add column poster TEXT;
+             insert into releases (id, name, group_name, poster, size, posted_date) values
+                (8, 'Stem', 'g1', 'p', 1, '2026-11-07 12:00:00'),
+                (16, 'Stem.part1.rar', 'g2', 'p', 2, '2026-11-07 12:01:00'),
+                (24, 'Stem.B', 'g3', 'q', 3, null),
+                (32, 'Stem-x', 'g4', 'p', 4, null),
+                (40, 'Stem/', 'g5', 'p', 5, null),
+                (48, 'stem.lower', 'g6', 'p', 6, null),
+                (56, 'Stem', 'g7', null, 7, null);",
+        )
+        .unwrap();
+        let t = tables(&conn).unwrap();
+        ensure_schema(&mut pg, &t).unwrap();
+        fill_shard(&conn, &mut pg, 3).unwrap();
+        reader::build_indexes(&mut pg).unwrap();
+        let ids = |rows: Option<Vec<reader::NamedRow>>| -> Vec<i64> {
+            let mut v: Vec<i64> = rows.unwrap().iter().map(|r| r.id).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(ids(reader::query_named(&mut pg, "Stem", None).unwrap()), [8, 56]);
+        assert_eq!(ids(reader::query_named(&mut pg, "Stem", Some(Some("p".into()))).unwrap()), [8]);
+        assert_eq!(ids(reader::query_named(&mut pg, "Stem", Some(None)).unwrap()), [56], "no poster is a poster too");
+        let named = reader::query_named(&mut pg, "Stem.part1.rar", None).unwrap().unwrap();
+        assert_eq!(
+            (named[0].shard, named[0].group.as_str(), named[0].bytes, named[0].posted.as_deref()),
+            (3, "g2", 2, Some("2026-11-07 12:01:00"))
+        );
+        // byte order: '-' sorts before '.', '/' is the end, and a lower-case 's' after every capital
+        assert_eq!(ids(reader::query_stem(&mut pg, "Stem").unwrap()), [8, 16, 24, 56]);
         pg.batch_execute("drop table releases, collections, par2_files, nzb_pointed").unwrap();
     }
 

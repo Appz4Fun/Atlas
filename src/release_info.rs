@@ -580,8 +580,18 @@ pub fn linked_post_with(conn: &Connection, id: i64) -> Result<Option<SplitPost>>
 
 /// All of the post a row is part of: an upload linked by its PAR2 set, or the same post cut across groups or files.
 pub fn whole_post_with(conn: &Connection, release: &crate::search::ReleaseRow) -> Result<Option<SplitPost>> {
+    whole_post_from(conn, release, false)
+}
+
+/// `whole_post_with` for one release (its page), the split post's candidates from the shared catalog when reads are on.
+/// Lists, the API and the NZB keep the shards' local lookups: a page of rows would cost a catalog round trip each.
+pub fn whole_post_from_catalog(conn: &Connection, release: &crate::search::ReleaseRow) -> Result<Option<SplitPost>> {
+    whole_post_from(conn, release, true)
+}
+
+fn whole_post_from(conn: &Connection, release: &crate::search::ReleaseRow, catalog: bool) -> Result<Option<SplitPost>> {
     if let Some(post) = linked_post_with(conn, release.id)? {
-        if let Ok(Some(mut split)) = split_post_with(conn, release)
+        if let Ok(Some(mut split)) = split_post_from(conn, release, catalog)
             && post.ids.iter().all(|id| split.ids.binary_search(id).is_ok())
             && (split.ids.len() > post.ids.len() || (split.complete && !post.complete))
         {
@@ -591,7 +601,7 @@ pub fn whole_post_with(conn: &Connection, release: &crate::search::ReleaseRow) -
         }
         return Ok(Some(post));
     }
-    split_post_with(conn, release)
+    split_post_from(conn, release, catalog)
 }
 
 /// Whether a single-row release's files are all complete under the current 0- or 1-indexed file counter rule.
@@ -610,9 +620,14 @@ const SPLIT_POST_GROUPS: usize = 16;
 /// look like it don't add up to one upload. Name and poster are only what the headers say, and anyone can copy those to
 /// another group, soo any doubt leaves every row on its own, and every row of a post gets the same answer.
 pub fn split_post_with(conn: &Connection, release: &crate::search::ReleaseRow) -> Result<Option<SplitPost>> {
+    split_post_from(conn, release, false)
+}
+
+/// `split_post_with`, its candidate rows from the shared catalog when `catalog` and catalog reads are on.
+fn split_post_from(conn: &Connection, release: &crate::search::ReleaseRow, catalog: bool) -> Result<Option<SplitPost>> {
     let posted = names_with(conn, release.id)?.map_or(release.name.clone(), |n| n.posted);
-    let exact = exact_split_post(conn, &posted, release)?;
-    if let Some(stem_post) = split_stem_post(conn, &posted, release)?
+    let exact = exact_split_post(conn, &posted, release, catalog)?;
+    if let Some(stem_post) = split_stem_post(conn, &posted, release, catalog)?
         && exact.as_ref().is_none_or(|e| stem_post.ids.len() > e.ids.len())
     {
         return Ok(Some(stem_post));
@@ -629,7 +644,92 @@ struct Named {
     poster: Option<String>,
 }
 
-fn exact_split_post(conn: &Connection, posted: &str, release: &crate::search::ReleaseRow) -> Result<Option<SplitPost>> {
+/// The rows the catalog names as candidates, read again from their own shards by id: the shard's row is what's
+/// true (a row deleted there, or changed since, the catalog may not have caught up with), its blocked groups are left
+/// out as the shards' lookup does, and only rows still `named` stay. Lowest shard first, then by group name, the
+/// order of each shard's (name, group) index.
+fn reread_candidates(
+    conn: &Connection,
+    candidates: &[crate::shared_catalog::reader::NamedRow],
+    named: impl Fn(&str) -> bool,
+) -> Result<Vec<(usize, String, Named)>> {
+    let mut out = Vec::new();
+    for c in candidates {
+        let s = store::shard_of_id(c.id);
+        let row = conn
+            .prepare_cached(&format!(
+                "select coalesce(name, ''), group_name, coalesce(size, 0), julianday(posted_date), poster
+                 from s{s}.releases where id = ?1 and not atlas_blocked(group_name)"
+            ))?
+            .query_row([c.id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    Named {
+                        id: c.id,
+                        group: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                        bytes: r.get(2)?,
+                        date: r.get(3)?,
+                        poster: r.get(4)?,
+                    },
+                ))
+            })
+            .optional()?;
+        if let Some((name, n)) = row
+            && named(&name)
+        {
+            out.push((s, name, n));
+        }
+    }
+    out.sort_by(|a, b| (a.0, a.2.group.as_bytes()).cmp(&(b.0, b.2.group.as_bytes())));
+    Ok(out)
+}
+
+/// Each shard's first `per_shard` rows, as a shard's `limit` gives them.
+fn first_per_shard(rows: Vec<(usize, String, Named)>, per_shard: usize) -> Vec<Named> {
+    let mut taken: HashMap<usize, usize> = HashMap::new();
+    rows.into_iter()
+        .filter(|(s, _, _)| {
+            let n = taken.entry(*s).or_insert(0);
+            *n += 1;
+            *n <= per_shard
+        })
+        .map(|(_, _, n)| n)
+        .collect()
+}
+
+/// A post's rows of its name from the catalog: the poster's own and everyone's, as the shards' two lookups give them.
+/// None (the shards answer) when catalog reads are off or can't answer, or when the catalog doesn't have the release
+/// asked about yet: one a few seconds behind could otherwise hand over an older post of the same name in its place.
+fn catalog_named(
+    conn: &Connection,
+    posted: &str,
+    release: &crate::search::ReleaseRow,
+) -> Result<Option<(Vec<Named>, Vec<Named>)>> {
+    let Some(rows) = crate::shared_catalog::reader::named(posted, None) else { return Ok(None) };
+    if !rows.iter().any(|r| r.id == release.id) {
+        return Ok(None);
+    }
+    let all = reread_candidates(conn, &rows, |name| name == posted)?;
+    let same: Vec<(usize, String, Named)> = all
+        .iter()
+        .filter(|(_, _, n)| n.poster == release.poster)
+        .map(|(s, name, n)| {
+            (
+                *s,
+                name.clone(),
+                Named { id: n.id, group: n.group.clone(), bytes: n.bytes, date: n.date, poster: n.poster.clone() },
+            )
+        })
+        .collect();
+    Ok(Some((first_per_shard(same, 64), first_per_shard(all, 64))))
+}
+
+fn exact_split_post(
+    conn: &Connection,
+    posted: &str,
+    release: &crate::search::ReleaseRow,
+    catalog: bool,
+) -> Result<Option<SplitPost>> {
     let named_rows = |sql: fn(usize) -> String, poster: Option<&Option<String>>| -> Result<Vec<Named>> {
         let mut out = Vec::new();
         for s in 0..store::SHARDS {
@@ -651,9 +751,16 @@ fn exact_split_post(conn: &Connection, posted: &str, release: &crate::search::Re
         }
         Ok(out)
     };
-    // the poster's own rows by a lookup of their own: other posters' rows mustn't use up its limit
-    let same = named_rows(split_post_sql, Some(&release.poster))?;
-    let named = named_rows(named_rows_sql, None)?;
+    let from_catalog = if catalog { catalog_named(conn, posted, release)? } else { None };
+    if catalog {
+        let source = if from_catalog.is_some() { "catalog" } else { "shards" };
+        crate::metrics::names::SHARED_CATALOG_READS.inc(&[("lookup", "split_post"), ("source", source)], 1);
+    }
+    let (same, named) = match from_catalog {
+        Some(both) => both,
+        // the poster's own rows by a lookup of their own: other posters' rows mustn't use up its limit
+        None => (named_rows(split_post_sql, Some(&release.poster))?, named_rows(named_rows_sql, None)?),
+    };
     let same: Vec<&Named> = same.iter().collect();
     let by_poster = same_poster_post(conn, &same)?;
     // one poster can have several of the groups: the post across posters is taken only if it holds all of those
@@ -802,7 +909,12 @@ struct StemCandidate {
     date: Option<f64>,
 }
 
-fn split_stem_post(conn: &Connection, posted: &str, release: &crate::search::ReleaseRow) -> Result<Option<SplitPost>> {
+fn split_stem_post(
+    conn: &Connection,
+    posted: &str,
+    release: &crate::search::ReleaseRow,
+    catalog: bool,
+) -> Result<Option<SplitPost>> {
     let stem = post_stem(posted);
     if stem.len() < 4 {
         return Ok(None);
@@ -810,6 +922,34 @@ fn split_stem_post(conn: &Connection, posted: &str, release: &crate::search::Rel
     let dot_lo = format!("{stem}.");
     let dot_hi = format!("{stem}/");
     let mut all = Vec::new();
+    // the name's own row in the stem's range (byte order, as the shards compare): otherwise no row of the catalog's
+    // answer could be the one asked about
+    let in_range = |name: &str| name == stem || (name >= dot_lo.as_str() && name < dot_hi.as_str());
+    if catalog && in_range(&release.name) {
+        // as for a name: the catalog's rows only if they have the release asked about, each read again from its shard
+        let rows =
+            crate::shared_catalog::reader::stem_rows(&stem).filter(|rows| rows.iter().any(|r| r.id == release.id));
+        let source = if rows.is_some() { "catalog" } else { "shards" };
+        crate::metrics::names::SHARED_CATALOG_READS.inc(&[("lookup", "split_stem"), ("source", source)], 1);
+        if let Some(rows) = rows {
+            // a stem one shard holds more than LINKED_ROWS rows of is no post, as the shards' lookup stops there
+            let mut per_shard: HashMap<usize, usize> = HashMap::new();
+            for (s, name, n) in reread_candidates(conn, &rows, in_range)? {
+                let count = per_shard.entry(s).or_insert(0);
+                *count += 1;
+                if *count > LINKED_ROWS {
+                    return Ok(None);
+                }
+                if post_stem(&name).eq_ignore_ascii_case(&stem) {
+                    all.push(StemCandidate { id: n.id, group: n.group, bytes: n.bytes, date: n.date });
+                    if all.len() > LINKED_ROWS {
+                        return Ok(None);
+                    }
+                }
+            }
+            return stem_post_of(conn, all, release, &stem);
+        }
+    }
     for s in 0..store::SHARDS {
         let mut stmt = conn.prepare_cached(&split_stem_sql(s))?;
         let rows = stmt.query_map(rusqlite::params![stem, dot_lo, dot_hi], |r| {
@@ -836,6 +976,16 @@ fn split_stem_post(conn: &Connection, posted: &str, release: &crate::search::Rel
             }
         }
     }
+    stem_post_of(conn, all, release, &stem)
+}
+
+/// The post a stem's candidates make with this release, if any.
+fn stem_post_of(
+    conn: &Connection,
+    all: Vec<StemCandidate>,
+    release: &crate::search::ReleaseRow,
+    stem: &str,
+) -> Result<Option<SplitPost>> {
     if all.len() < 2 {
         return Ok(None);
     }
@@ -847,7 +997,7 @@ fn split_stem_post(conn: &Connection, posted: &str, release: &crate::search::Rel
     let Some(linked) = linked_stem_candidates(conn, release.id, &close)? else {
         return Ok(None);
     };
-    try_stem_subset(conn, &stem, &linked)
+    try_stem_subset(conn, stem, &linked)
 }
 
 fn candidate_lead(conn: &Connection, id: i64) -> Result<Option<i64>> {
@@ -1544,6 +1694,73 @@ pub fn harvested_password(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalog_candidates_are_read_again_from_their_shards_as_the_shards_give_them() {
+        use crate::shared_catalog::reader::NamedRow;
+        let conn = Connection::open_in_memory().unwrap();
+        crate::filters::register_sql(&conn).unwrap();
+        for s in 0..store::SHARDS {
+            conn.execute_batch(&format!(
+                "attach ':memory:' as s{s};
+                 create table s{s}.releases (id INTEGER PRIMARY KEY, name TEXT, group_name TEXT, size INTEGER,
+                    posted_date TEXT, poster TEXT);"
+            ))
+            .unwrap();
+        }
+        // ids carry their shard: id = seq * 8 + shard
+        let id = |seq: i64, shard: i64| seq * 8 + shard;
+        for i in 0..70 {
+            conn.execute(
+                "insert into s1.releases values (?1, 'Post', ?2, 10, '2026-11-07 12:00:00', 'p@x')",
+                rusqlite::params![id(100 + (69 - i), 1), format!("a.b.g{i:03}")],
+            )
+            .unwrap();
+        }
+        conn.execute_batch(&format!(
+            "insert into s2.releases values ({}, 'Post', 'a.b.other', 99, '2026-11-07 13:00:00', 'q@x');
+             insert into s2.releases values ({}, 'Post', '{}', 1, null, 'p@x');
+             insert into s2.releases values ({}, 'Renamed', 'a.b.moved', 1, null, 'p@x');",
+            id(500, 2),
+            id(600, 2),
+            "x".repeat(1_000),
+            id(700, 2)
+        ))
+        .unwrap();
+        let catalog_row = |i: i64| NamedRow {
+            id: i,
+            shard: store::shard_of_id(i) as i16,
+            name: "Post".into(),
+            group: "stale".into(),
+            bytes: 0,
+            posted: None,
+            poster: None,
+        };
+        let mut candidates: Vec<NamedRow> = (100..170).map(|seq| catalog_row(id(seq, 1))).collect();
+        // a row the shard deleted, a blocked group, and one renamed since
+        candidates.extend([
+            catalog_row(id(800, 2)),
+            catalog_row(id(500, 2)),
+            catalog_row(id(600, 2)),
+            catalog_row(id(700, 2)),
+        ]);
+        let rows = reread_candidates(&conn, &candidates, |name| name == "Post").unwrap();
+        let named = first_per_shard(rows, 64);
+        let shard1: Vec<&str> =
+            named.iter().filter(|n| store::shard_of_id(n.id) == 1).map(|n| n.group.as_str()).collect();
+        assert_eq!(shard1.len(), 64, "the first 64 of the shard");
+        assert_eq!((shard1[0], shard1[63]), ("a.b.g000", "a.b.g063"), "by group name, as the (name, group) index");
+        let other = named.iter().find(|n| n.id == id(500, 2)).unwrap();
+        assert_eq!(
+            (other.group.as_str(), other.bytes, other.poster.as_deref()),
+            ("a.b.other", 99, Some("q@x")),
+            "the shard's row, not the catalog's"
+        );
+        assert!(other.date.is_some_and(|d| d > 2_461_000.0), "julianday from the shard's own sql");
+        for gone in [id(800, 2), id(600, 2), id(700, 2)] {
+            assert!(!named.iter().any(|n| n.id == gone), "deleted, blocked or renamed: {gone}");
+        }
+    }
 
     #[test]
     fn a_password_in_a_name_inside_is_a_hint() {
