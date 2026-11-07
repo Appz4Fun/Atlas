@@ -2211,6 +2211,23 @@ impl ShardWriter {
         Ok(sealed)
     }
 
+    /// Whether a pruning step is due (`prune_ids_some`): not while resting after a walk, nor while freezing says
+    /// the indexer is stopping, and no sooner than the interval for how busy the writer is.
+    pub fn prune_ids_due(&self, now: i64, idle: bool, queued: bool) -> bool {
+        // a step every so often between saves, and only now and then while more are queued: steady ingest neither
+        // starves it nor pays for it on every batch
+        let every = if queued {
+            PRUNE_IDS_QUEUED_EVERY
+        } else if idle {
+            PRUNE_IDS_IDLE_EVERY
+        } else {
+            PRUNE_IDS_EVERY
+        };
+        !crate::frozen::STOPPING.load(std::sync::atomic::Ordering::Relaxed)
+            && now >= self.ids.rest_until
+            && self.ids_step.is_none_or(|t| t.elapsed() >= every)
+    }
+
     /// Take `release_ids` rows of quiet releases, for at most PRUNE_IDS_BUDGET
     /// (PRUNE_IDS_BUDGET_IDLE when `idle`): a step through the table by release
     /// from where the last one stopped. After the end it starts over once the
@@ -2224,30 +2241,20 @@ impl ShardWriter {
     /// own row, the next save to the release, or a spot placed on it, indexes it
     /// again in full (`index_release`), so a late article is still found in its
     /// other files. Not for use inside a save transaction. Returns the rows taken.
-    pub fn prune_ids_due(&self, now: i64, idle: bool, queued: bool) -> bool {
-        // a step every so often between saves, and only now and then while more are queued: steady ingest neither
-        // starves it nor pays for it on every batch
-        let every = if queued {
-            PRUNE_IDS_QUEUED_EVERY
-        } else if idle {
-            PRUNE_IDS_IDLE_EVERY
-        } else {
-            PRUNE_IDS_EVERY
-        };
-        now >= self.ids.rest_until && self.ids_step.is_none_or(|t| t.elapsed() >= every)
-    }
-
-    /// One pruning step, when `prune_ids_due`; a write lock another connection holds past PRUNE_IDS_BUSY lets it go.
+    /// Only when `prune_ids_due`; a write lock another connection holds past PRUNE_IDS_BUSY lets the step go.
     pub fn prune_ids_some(&mut self, conn: &mut Connection, now: i64, idle: bool, queued: bool) -> Result<usize> {
         if !self.prune_ids_due(now, idle, queued) {
             return Ok(0);
         }
         self.ids_step = Some(Instant::now());
         conn.busy_timeout(PRUNE_IDS_BUSY)?;
-        let done = self.prune_ids_step(conn, now, idle && !queued);
+        let done = self.prune_ids_step(conn, now, idle);
         conn.busy_timeout(crate::frozen::WRITER_BUSY)?;
         match done {
-            Err(e) if crate::frozen::is_busy(&e) => Ok(0),
+            Err(e) if crate::frozen::is_busy(&e) => {
+                crate::metrics::names::RELEASE_IDS.inc(&[("event", "busy"), ("shard", &self.shard.to_string())], 1);
+                Ok(0)
+            }
             done => done,
         }
     }

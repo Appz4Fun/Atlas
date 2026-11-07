@@ -660,8 +660,22 @@ fn freeze_idle(conn: &mut Connection, store: &mut crate::store::ShardWriter) {
         eprintln!("freezing in shard {} failed: {e}", store.shard);
     }
     drop(span);
+    prune_ids(conn, store, true, false);
     // the writer's time like any other housekeeping's
     crate::profile::Load::add_since(&crate::profile::LOAD.writer_busy_ns, t);
+}
+
+/// A pruning step of quiet releases' message-id index, when one is due (`ShardWriter::prune_ids_some`).
+fn prune_ids(conn: &mut Connection, store: &mut crate::store::ShardWriter, idle: bool, queued: bool) {
+    let now = chrono::Utc::now().timestamp();
+    if store.prune_ids_due(now, idle, queued) {
+        let span = crate::metrics::span("db.prune_ids");
+        if let Err(e) = store.prune_ids_some(conn, now, idle, queued) {
+            span.failed();
+            eprintln!("pruning release_ids in shard {} failed: {e}", store.shard);
+        }
+        drop(span);
+    }
 }
 
 /// A writer's work between saves: seal some of what is due (when `seal`),
@@ -701,14 +715,8 @@ fn housekeeping(
     drop(span);
     // the index of quiet releases' message-ids, a cache that is made again when needed (`ShardWriter::prune_ids_some`);
     // with more saves queued only a short step now and then
-    if store.prune_ids_due(now, idle, queued) {
-        let span = crate::metrics::span("db.prune_ids");
-        if let Err(e) = store.prune_ids_some(conn, now, idle, queued) {
-            span.failed();
-            eprintln!("pruning release_ids in shard {} failed: {e}", store.shard);
-        }
-        drop(span);
-    }
+    // (the bigger idle steps are for a writer with nothing to save, `freeze_idle`: a save may come any moment here)
+    prune_ids(conn, store, false, queued);
     // the shared catalog's sent changes, as far as Postgres has them (`shared_catalog::prune_acked`)
     let span = crate::metrics::span("db.catalog_prune");
     if crate::shared_catalog::prune_acked(conn).is_err() {

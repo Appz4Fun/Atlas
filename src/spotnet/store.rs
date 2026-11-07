@@ -411,7 +411,10 @@ pub fn placement(
     }
     // every message-id of the release, sealed files' too, by their keyed hash, with the file it's in
     let key = crate::store::IdKey::of(conn)?;
-    crate::store::index_release(conn, &key, id)?;
+    if crate::store::index_release(conn, &key, id)? {
+        let shard = crate::store::shard_of_id(id).to_string();
+        crate::metrics::names::RELEASE_IDS.inc(&[("event", "indexed"), ("shard", &shard)], 1);
+    }
     let mut file_of = conn.prepare_cached(
         "select f.filename from release_ids r join files f on f.id = r.file_id where r.release_id = ? and r.id_hash = ?",
     )?;
