@@ -110,6 +110,37 @@ pub struct Batch {
 /// One batch of a shard's uncounted blobs past `after` (up to `WINDOW` ids on) counted. A blob that won't decode stays
 /// uncounted and is passed over; one in the sealed log that can't be fetched is tried again by the next batch.
 pub fn count_batch(conn: &Connection, after: i64, stop: &AtomicBool) -> Result<Batch> {
+    count_batch_with(conn, after, stop, &of_blob)
+}
+
+/// Whether a blob's read failed on the way to the sealed log (worth trying again), not on what came back.
+fn unreachable(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::*;
+    matches!(
+        e.kind(),
+        NotConnected
+            | ConnectionRefused
+            | ConnectionReset
+            | ConnectionAborted
+            | TimedOut
+            | BrokenPipe
+            | Interrupted
+            | WouldBlock
+            | UnexpectedEof
+            | AddrNotAvailable
+            | HostUnreachable
+            | NetworkUnreachable
+            | NetworkDown
+    )
+}
+
+/// `count_batch`, each blob counted by `count`.
+fn count_batch_with(
+    conn: &Connection,
+    after: i64,
+    stop: &AtomicBool,
+    count: &dyn Fn(&[u8]) -> std::io::Result<i64>,
+) -> Result<Batch> {
     let batch: Vec<(i64, Vec<u8>)> = conn
         .prepare_cached(
             "select id, blob from files where id > ?1 and id <= ?1 + ?2 and blob is not null and blob_bytes is null
@@ -145,15 +176,19 @@ pub fn count_batch(conn: &Connection, after: i64, stop: &AtomicBool) -> Result<B
             break;
         }
         fetches += usize::from(remote);
-        match of_blob(blob) {
+        match count(blob) {
             Ok(bytes) => counted.push((*id, blob, bytes)),
-            Err(_) if remote => {
+            // the sealed log out of reach: this blob again later. What it gave back that won't decode is passed over
+            Err(e) if remote && unreachable(&e) => {
                 next = id - 1;
                 fetch_failed = true;
                 break;
             }
             Err(e) => eprintln!("blob bytes: file {id} left uncounted: {e}"),
         }
+    }
+    if counted.is_empty() {
+        return Ok(Batch { next: Some(next), counted: 0, fetch_failed });
     }
     let mut tries = 0;
     loop {
@@ -213,7 +248,14 @@ fn run(main: &Path, stop: &AtomicBool) {
             busy = true;
             let after = if done_at > 0 { 0 } else { after };
             // a connection a batch, as the sealed log's offload: none is held while a compaction swaps the shard
-            let batch = crate::db::open_at(shard).and_then(|conn| count_batch(&conn, after, stop));
+            let batch = crate::db::open_at(shard).and_then(|conn| {
+                // its commits don't copy the shard's WAL each time (see the constant)
+                conn.execute_batch(&format!(
+                    "pragma wal_autocheckpoint = {}",
+                    crate::db::OCCASIONAL_WRITER_AUTOCHECKPOINT
+                ))?;
+                count_batch(&conn, after, stop)
+            });
             match batch {
                 Ok(Batch { next: Some(next), counted, fetch_failed }) => {
                     total += counted;
@@ -343,31 +385,36 @@ mod tests {
     }
 
     #[test]
-    fn a_blob_the_sealed_log_cant_give_back_is_tried_again() {
+    fn a_blob_the_sealed_log_cant_be_reached_for_is_tried_again_and_a_bad_one_passed_over() {
         let (_dir, conn) = shard();
-        crate::sealed_store::configure("");
         let mut place = sealed_log::REF_TAG.to_vec();
         place.resize(sealed_log::REF_BYTES, 7);
-        conn.execute(
-            "insert into files (id, release_id, filename, seen, blob) values (1, 1, 'a', x'00', ?)",
-            [crate::blob::encode(&segs(&[4]))],
-        )
-        .unwrap();
-        conn.execute("insert into files (id, release_id, filename, seen, blob) values (2, 1, 'b', x'00', ?)", [&place])
+        let local = |sizes: &[i64]| crate::blob::encode(&segs(sizes));
+        for (id, blob) in [(1, local(&[4])), (2, place.clone()), (3, local(&[6]))] {
+            conn.execute(
+                "insert into files (id, release_id, filename, seen, blob) values (?, 1, ?, x'00', ?)",
+                params![id, format!("f{id}"), blob],
+            )
             .unwrap();
-        conn.execute(
-            "insert into files (id, release_id, filename, seen, blob) values (3, 1, 'c', x'00', ?)",
-            [crate::blob::encode(&segs(&[6]))],
-        )
-        .unwrap();
-        let batch = count_batch(&conn, 0, &AtomicBool::new(false)).unwrap();
-        assert_eq!(batch, Batch { next: Some(1), counted: 1, fetch_failed: true }, "stops before the one in the log");
-        // a blob changed between its read and the write keeps no count
-        conn.execute("update files set blob = ? where id = 3", [crate::blob::encode(&segs(&[60]))]).unwrap();
+        }
         let count = |id: i64| {
             conn.query_row("select blob_bytes from files where id = ?", [id], |r| r.get::<_, Option<i64>>(0)).unwrap()
         };
+        let stop = AtomicBool::new(false);
+        let decode_or = |kind: std::io::ErrorKind| {
+            move |blob: &[u8]| {
+                if crate::blob::is_remote(blob) { Err(std::io::Error::from(kind)) } else { of_blob(blob) }
+            }
+        };
+        // out of reach: it stops before the blob in the log, to try it again
+        let batch = count_batch_with(&conn, 0, &stop, &decode_or(std::io::ErrorKind::NotConnected)).unwrap();
+        assert_eq!(batch, Batch { next: Some(1), counted: 1, fetch_failed: true });
         assert_eq!((count(1), count(2), count(3)), (Some(4), None, None));
+        // what came back won't decode: passed over, and the pass goes on
+        let batch = count_batch_with(&conn, 1, &stop, &decode_or(std::io::ErrorKind::InvalidData)).unwrap();
+        assert!(!batch.fetch_failed);
+        assert_eq!((count(2), count(3)), (None, Some(6)));
+        assert_eq!(count_batch(&conn, batch.next.unwrap(), &stop).unwrap().next, None);
     }
 
     #[test]

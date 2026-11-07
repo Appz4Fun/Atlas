@@ -252,7 +252,7 @@ pub fn migrate_shard(conn: &Connection) -> Result<()> {
     // the sealed log, which swaps the blob for its place and keeps what's in it
     conn.execute_batch(
         "create trigger if not exists files_blob_bytes_unknown after update of blob on files
-         when new.blob is not old.blob and new.blob_bytes is old.blob_bytes and new.blob_bytes is not null
+         when new.blob_bytes is not null and new.blob_bytes is old.blob_bytes and new.blob is not old.blob
           and (new.blob is null or not (length(new.blob) = 21 and substr(new.blob, 1, 5) = x'FF534C4731'))
          begin update files set blob_bytes = null where id = new.id; end;",
     )?;
