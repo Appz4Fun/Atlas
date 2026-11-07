@@ -3574,7 +3574,8 @@ fn stills_html(id: i64, stills: &[(u8, Option<i64>, u32, u32)], from: Option<(i6
             )
         })
         .collect();
-    // the releases showing the same pictures, looked up after the page is up: it reads every shard
+    // the releases showing the same pictures, looked up after the page is up: it reads every shard. For stills shown
+    // from another release, that's the other release's list: the pictures are its
     let note = from
         .map(|(other, kind)| {
             let why = match kind {
