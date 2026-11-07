@@ -414,7 +414,8 @@ async fn fetch(
 
 /// Reads again the XML of up to `XML_BACKFILL` spots saved before it was kept, so their release pages get the
 /// description and the rest. A spot whose article is gone, or whose XML won't read, gets an empty one and isn't
-/// asked for again. Returns how many were filled.
+/// asked for again. The first other error ends it for this pass; spots are taken in no order (`missing_xml`), so
+/// one that keeps failing doesn't keep the rest waiting. Returns how many were filled.
 async fn backfill_xml(pool: &Pool, db: &Db, stopping: &impl Fn() -> bool) -> Result<usize> {
     let mut filled = 0;
     let mut left = XML_BACKFILL;
@@ -434,10 +435,11 @@ async fn backfill_xml(pool: &Pool, db: &Db, stopping: &impl Fn() -> bool) -> Res
                 Ok(Some(head)) => full::xml_from_headers(&head).filter(|x| full::parse(x).is_some()),
                 Ok(None) => None,
                 Err(e) if says_absent(&e) => None,
-                // try again next pass
+                // the servers aren't answering: the rest wait for the next pass, rather than each waiting out the
+                // deadline in turn ahead of the pass's new spots
                 Err(e) => {
                     eprintln!("spots: {message_id}: {e:#}");
-                    continue;
+                    return Ok(filled);
                 }
             };
             let xml = xml.unwrap_or_default();
