@@ -419,14 +419,13 @@ pub fn placement(
         return Ok(Placement::Taken);
     }
     // a one-file release's index isn't kept up by saves: one made before is not to be trusted
-    let indexed = names.len() > 1
-        && conn.prepare_cached("select 1 from release_ids where release_id = ? and id_hash = 0")?.exists([id])?;
+    let indexed = names.len() > 1 && crate::store::is_indexed(conn, id)?;
     if !indexed {
         // no index kept (one file, or pruned once quiet): each named file's ids streamed past the spot's own, without
         // making an index that saves wouldnt keep up or that would only be pruned again
+        let mut suffixes = Default::default();
         for (filename, ids) in files.iter().filter(|(_, ids)| !ids.is_empty()) {
             let mut wanted: std::collections::HashSet<i64> = ids.iter().map(|m| key.hash(&format!("<{m}>"))).collect();
-            let mut suffixes = Default::default();
             for (file_id, _) in names.iter().filter(|(_, n)| n == filename) {
                 if wanted.is_empty() {
                     break;

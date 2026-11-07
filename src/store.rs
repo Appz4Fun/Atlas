@@ -1018,6 +1018,11 @@ pub(crate) fn file_id_hashes(
     Ok(())
 }
 
+/// Whether `release_id` has its index of message-ids: its own (release_id, 0, 0) row.
+pub(crate) fn is_indexed(conn: &Connection, release_id: i64) -> Result<bool> {
+    conn.prepare_cached("select 1 from release_ids where release_id = ? and id_hash = 0")?.exists([release_id])
+}
+
 /// Drop `release_id`'s index of message-ids and its stamp: made again in full by the next save or spot that needs it.
 pub(crate) fn unindex_release(conn: &Connection, release_id: i64) -> Result<()> {
     conn.prepare_cached("delete from release_ids where release_id = ?")?.execute([release_id])?;
@@ -1029,9 +1034,7 @@ pub(crate) fn unindex_release(conn: &Connection, release_id: i64) -> Result<()> 
 /// added the first time (once it has a second file, or after an upgrade, or
 /// after the pruning walk took it). True when it was made just now.
 pub(crate) fn index_release(conn: &Connection, key: &IdKey, release_id: i64) -> Result<bool> {
-    let marked =
-        conn.prepare_cached("select 1 from release_ids where release_id = ? and id_hash = 0")?.exists([release_id])?;
-    if marked {
+    if is_indexed(conn, release_id)? {
         return Ok(false);
     }
     let ids: Vec<i64> = conn
@@ -2083,6 +2086,8 @@ pub struct ShardWriter {
     ids: IdsPrune,
     /// when the walk last took a step
     ids_step: Option<Instant>,
+    /// the release the step in hand is at, for going on past it if the step fails
+    ids_failing: Option<i64>,
 }
 
 /// Where the walk taking quiet releases' `release_ids` is (`ShardWriter::prune_ids_some`).
@@ -2159,6 +2164,7 @@ impl ShardWriter {
             freezer: crate::frozen::Ticker::default(),
             ids: IdsPrune::default(),
             ids_step: None,
+            ids_failing: None,
         }
     }
 
@@ -2276,6 +2282,7 @@ impl ShardWriter {
             return Ok(0);
         }
         self.ids_step = Some(Instant::now());
+        self.ids_failing = None;
         // with saves about, a held lock lets the step go at once nearly
         conn.busy_timeout(if idle && !queued { PRUNE_IDS_BUSY } else { PRUNE_IDS_BUSY_SAVING })?;
         let done = self.prune_ids_step(conn, now, idle);
@@ -2285,9 +2292,14 @@ impl ShardWriter {
                 crate::metrics::names::RELEASE_IDS.inc(&[("event", "busy"), ("shard", &self.shard.to_string())], 1);
                 Ok(0)
             }
-            // anything else would likely fail the same way next time: the walk rests a while
+            // anything else would likely fail the same way next time: the walk rests a while, then goes on past the
+            // release it failed at
             Err(e) => {
                 self.ids.rest_until = now + PRUNE_IDS_FAILED_REST;
+                if let Some(failed) = self.ids_failing {
+                    self.ids.after = self.ids.after.max(failed);
+                    self.ids.pruning = None;
+                }
                 Err(e)
             }
             done => done,
@@ -2306,11 +2318,9 @@ impl ShardWriter {
         let mut looked = 0;
         while started.elapsed() < budget && looked < PRUNE_IDS_LOOKS {
             if let Some(release_id) = w.pruning {
+                self.ids_failing = Some(release_id);
                 // a save indexed it again in full since: it's kept up once more
-                let again = tx
-                    .prepare_cached("select 1 from release_ids where release_id = ? and id_hash = 0")?
-                    .exists([release_id])?;
-                if again {
+                if is_indexed(&tx, release_id)? {
                     w.pruning = None;
                     continue;
                 }
@@ -2349,6 +2359,7 @@ impl ShardWriter {
                 break;
             };
             w.after = release_id;
+            self.ids_failing = Some(release_id);
             // a file never touched since the upgrade counts as old, as for sealing (`due`); a release without its own
             // row is half taken already
             let (files, touched): (i64, i64) = tx
@@ -2360,7 +2371,8 @@ impl ShardWriter {
                 .optional()?
                 .unwrap_or(0);
             let last = touched.max(indexed);
-            if files < 2 || last < now - SEAL_AGE {
+            // without its own row it's half taken (a step cut short by a restart): no save trusts what's left
+            if files < 2 || last < now - SEAL_AGE || !is_indexed(&tx, release_id)? {
                 // its own row first: a release half taken is indexed again in full
                 let own = tx
                     .prepare_cached("delete from release_ids where release_id = ? and id_hash = 0")?
