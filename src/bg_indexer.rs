@@ -1084,6 +1084,11 @@ async fn run_servers(
         scans_stop.store(true, Ordering::Relaxed);
         crate::frozen::STOPPING.store(true, Ordering::Relaxed);
     });
+    // uploads whose every article has a random subject, linked across groups from the headers kept (`xref`)
+    {
+        let s = sched.clone();
+        tasks.spawn(named!("the xref linker".into(), crate::xref::run(db.clone(), move || s.stopping())));
+    }
     tasks.spawn(named!("the config watcher".into(), watch_config(sched.clone(), servers)));
     tasks.spawn(named!("the status report".into(), report(sched.clone())));
     tasks.spawn(named!("the compaction timer".into(), compact_timer(sched.clone())));

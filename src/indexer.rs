@@ -2333,15 +2333,18 @@ async fn parse_and_save(
         let group = group.to_string();
         move || {
             let _span = crate::metrics::span("indexer.parse_slice");
-            let (articles, uploads, skipped) = crate::filters::gather_per_article(&group, headers_to_articles(headers));
+            // articles whose every subject is random go to the store that links them across groups (`xref`)
+            // the slice fails, and is read again, when their headers couldnt be kept
+            let articles = crate::xref::hold(&group, headers_to_articles(headers))?;
+            let (articles, uploads, skipped) = crate::filters::gather_per_article(&group, articles);
             let mut releases: Vec<Release> =
                 crate::collections::group_articles(&group, articles).into_values().collect();
             releases.extend(uploads);
-            (releases, skipped)
+            anyhow::Ok((releases, skipped))
         }
     };
     let (mut releases, skipped) =
-        tokio::task::spawn_blocking(parsing).await.map_err(|e| anyhow!("parse task failed: {e}"))?;
+        tokio::task::spawn_blocking(parsing).await.map_err(|e| anyhow!("parse task failed: {e}"))??;
     crate::profile::PARSE.add_since(t);
     crate::profile::Load::add_since(&crate::profile::LOAD.parse_ns, t);
 

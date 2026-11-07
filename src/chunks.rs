@@ -73,7 +73,9 @@ pub fn create(conn: &Connection) -> Result<()> {
             primary key (grp, day)
         ) without rowid;
         create index if not exists idx_backfill_chunks_grp_state_day
-            on backfill_chunks (grp, state, day desc, claimed_at);",
+            on backfill_chunks (grp, state, day desc, claimed_at);
+        -- whether any group still has a day to read (`xref::unread_days`)
+        create index if not exists idx_backfill_chunks_day_state on backfill_chunks (day, state);",
     )?;
     add_column(conn, "backfill_chunks", "done_at")?;
     add_column(conn, "backfill_chunks", "failures")?;
