@@ -431,6 +431,19 @@ impl Step for AudioPrintStep {
         if has_print(ctx.conn(), id) {
             return Ok(Outcome { matched: true, ..Outcome::default() });
         }
+        // nor is one kept in `atlas.raw.db` from before a shard reset, for the same files
+        let (name, group) = (ctx.release().name.clone(), ctx.release().group.clone());
+        let content_id = crate::raw_store::release_content_id(ctx.conn(), id).unwrap_or_default();
+        if !crate::raw_store::is_explicit_rerun(ctx.conn(), id, AUDIO_PRINT_STEP) {
+            let saved: Prints = crate::raw_store::get_audio_prints(&name, &group, &content_id)
+                .into_iter()
+                .map(|p| (p.position, p.at_ms, audio::from_blob(&p.items)))
+                .filter(|(_, _, items)| !items.is_empty())
+                .collect();
+            if !saved.is_empty() {
+                return Ok(Outcome { matched: true, writes: print_writes(id, &saved), ..Outcome::default() });
+            }
+        }
         let info: Option<String> =
             ctx.conn().query_row("select info from release_probe where release_id = ?1", [id], |r| r.get(0)).ok();
         let Some(info) = info.and_then(|i| serde_json::from_str::<ProbeInfo>(&i).ok()) else {
@@ -480,21 +493,34 @@ impl Step for AudioPrintStep {
             return Ok(Outcome::default());
         }
         count("made");
-        let mut writes =
-            vec![StepWrite::new(DROP_PRINTS, vec![id.into()]), StepWrite::new(DROP_ANCHORS, vec![id.into()])];
-        let mut anchors: Vec<i64> = Vec::new();
-        for (position, at, items) in &prints {
-            anchors.extend(audio::anchors(items));
-            writes.push(StepWrite::new(
-                SET_PRINT,
-                vec![id.into(), i64::from(*position).into(), (*at).into(), audio::to_blob(items).into()],
-            ));
-        }
-        anchors.sort_unstable();
-        anchors.dedup();
-        writes.extend(anchors.into_iter().map(|a| StepWrite::new(SET_ANCHOR, vec![id.into(), a.into()])));
-        Ok(Outcome { matched: true, writes, ..Outcome::default() })
+        let saved: Vec<crate::raw_store::SavedPrint> = prints
+            .iter()
+            .map(|(position, at, items)| crate::raw_store::SavedPrint {
+                position: *position,
+                at_ms: *at,
+                items: audio::to_blob(items),
+            })
+            .collect();
+        crate::raw_store::put_audio_prints(&name, &group, &content_id, &saved);
+        Ok(Outcome { matched: true, writes: print_writes(id, &prints), ..Outcome::default() })
     }
+}
+
+/// The writes that keep a release's prints, in place of any it had, and their anchors, made from the items.
+fn print_writes(id: i64, prints: &Prints) -> Vec<StepWrite> {
+    let mut writes = vec![StepWrite::new(DROP_PRINTS, vec![id.into()]), StepWrite::new(DROP_ANCHORS, vec![id.into()])];
+    let mut anchors: Vec<i64> = Vec::new();
+    for (position, at, items) in prints {
+        anchors.extend(audio::anchors(items));
+        writes.push(StepWrite::new(
+            SET_PRINT,
+            vec![id.into(), i64::from(*position).into(), (*at).into(), audio::to_blob(items).into()],
+        ));
+    }
+    anchors.sort_unstable();
+    anchors.dedup();
+    writes.extend(anchors.into_iter().map(|a| StepWrite::new(SET_ANCHOR, vec![id.into(), a.into()])));
+    writes
 }
 
 #[cfg(test)]

@@ -7,9 +7,9 @@
 //! - Cached HTTP responses (`raw_http_cache`, Zstd-compressed) for static PreDB archive dumps
 //!   and external metadata APIs (`tmdb`, `tvdb`, `tvmaze`, `trakt`, `omdb`, `opensubtitles`).
 //! - Natural-keyed Usenet & hash enrichments (`raw_opensubtitles` by `moviehash`, `raw_probes`, `raw_covers`,
-//!   `raw_archives`, `raw_archive_inner_files`, `raw_nfo_passwords`, `raw_stills` by `(name, group_name)`, and
-//!   `raw_backfill_deepest` / `raw_group_bounds`) so shard resets never require re-querying OpenSubtitles or
-//!   re-downloading probed Usenet article bodies or video stills.
+//!   `raw_archives`, `raw_archive_inner_files`, `raw_nfo_passwords`, `raw_stills`, `raw_audio_prints` by
+//!   `(name, group_name)`, and `raw_backfill_deepest` / `raw_group_bounds`) so shard resets never require
+//!   re-querying OpenSubtitles or re-downloading probed Usenet article bodies, video stills or audio windows.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -39,6 +39,8 @@ pub const MAX_RAW_PROBES_ROWS: i64 = 250_000;
 pub const MAX_RAW_PROBES_BYTES: i64 = 512 << 20;
 /// Maximum rows kept in `raw_stills`.
 pub const MAX_RAW_STILLS_ROWS: i64 = 300_000;
+/// Maximum rows kept in `raw_audio_prints`: one a window, three windows a release, about 400 bytes each.
+pub const MAX_RAW_AUDIO_PRINTS_ROWS: i64 = 300_000;
 /// Maximum rows kept in `raw_archives` / `raw_par2`.
 pub const MAX_RAW_ARCHIVES_ROWS: i64 = 250_000;
 /// Hard ceiling on total inner-file name bytes in `raw_archive_inner_files` (256 MiB).
@@ -252,6 +254,16 @@ CREATE TABLE IF NOT EXISTS raw_stills (
     width      INTEGER,
     height     INTEGER,
     phash      INTEGER,
+    PRIMARY KEY (name, group_name, position)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS raw_audio_prints (
+    name       TEXT NOT NULL,
+    group_name TEXT NOT NULL,
+    position   INTEGER NOT NULL,
+    content_id BLOB,
+    at_ms      INTEGER NOT NULL,
+    items      BLOB NOT NULL,
     PRIMARY KEY (name, group_name, position)
 ) WITHOUT ROWID;
 
@@ -1021,6 +1033,8 @@ const NFO_PASSWORD_GROUP: &str = "SELECT group_name FROM raw_nfo_passwords WHERE
      ORDER BY group_name != ?2, group_name LIMIT 1";
 const STILLS_GROUP: &str = "SELECT group_name FROM raw_stills WHERE name = ?1 AND content_id = ?3
      ORDER BY group_name != ?2, group_name LIMIT 1";
+const AUDIO_PRINTS_GROUP: &str = "SELECT group_name FROM raw_audio_prints WHERE name = ?1 AND content_id = ?3
+     ORDER BY group_name != ?2, group_name LIMIT 1";
 const ARCHIVE_GROUP: &str = "SELECT group_name FROM raw_archives WHERE name = ?1 AND content_id = ?3
      ORDER BY group_name != ?2, group_name LIMIT 1";
 const PAR2_GROUP: &str = "SELECT group_name FROM raw_par2 WHERE name = ?1 AND content_id = ?3
@@ -1365,6 +1379,66 @@ pub fn put_stills(name: &str, group_name: &str, content_id: &[u8], stills: &[Sav
                 i64::from(s.height),
                 s.phash
             ])?;
+        }
+        Ok(())
+    });
+}
+
+/// One window of a release's audio print (`probe::audio_print`), as kept: its position in percent, where it starts in
+/// ms, and its items as stored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SavedPrint {
+    pub position: u8,
+    pub at_ms: i64,
+    pub items: Vec<u8>,
+}
+
+/// Looks up previously made audio prints for `(name, group_name)` and `content_id` in `raw_audio_prints`.
+pub fn get_audio_prints(name: &str, group_name: &str, content_id: &[u8]) -> Vec<SavedPrint> {
+    if content_id.is_empty() {
+        return Vec::new();
+    }
+    with_raw(|conn| {
+        let Some(group_name) = saved_group(conn, AUDIO_PRINTS_GROUP, name, group_name, content_id)? else {
+            return Ok(Vec::new());
+        };
+        conn.prepare_cached(
+            "SELECT position, at_ms, items FROM raw_audio_prints
+             WHERE name = ?1 AND group_name = ?2 AND content_id = ?3 ORDER BY position",
+        )?
+        .query_map(params![name, group_name, content_id], |r| {
+            Ok(SavedPrint { position: r.get::<_, i64>(0)?.clamp(0, 255) as u8, at_ms: r.get(1)?, items: r.get(2)? })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()
+    })
+    .unwrap_or_default()
+}
+
+/// Persists audio prints for `(name, group_name)` and `content_id` in `raw_audio_prints`, bounded by
+/// `MAX_RAW_AUDIO_PRINTS_ROWS`.
+pub fn put_audio_prints(name: &str, group_name: &str, content_id: &[u8], prints: &[SavedPrint]) {
+    if content_id.is_empty() {
+        return;
+    }
+    let _ = with_raw_tx(|conn| {
+        conn.prepare_cached("DELETE FROM raw_audio_prints WHERE name = ?1 AND group_name = ?2")?
+            .execute(params![name, group_name])?;
+        let count: i64 = conn.query_row("SELECT count(*) FROM raw_audio_prints", [], |r| r.get(0))?;
+        if count + prints.len() as i64 > MAX_RAW_AUDIO_PRINTS_ROWS {
+            let to_drop = (count + prints.len() as i64 - MAX_RAW_AUDIO_PRINTS_ROWS).max(64);
+            conn.execute(
+                "DELETE FROM raw_audio_prints WHERE (name, group_name, position) IN (
+                    SELECT name, group_name, position FROM raw_audio_prints LIMIT ?1
+                )",
+                params![to_drop],
+            )?;
+        }
+        let mut insert = conn.prepare_cached(
+            "INSERT OR REPLACE INTO raw_audio_prints (name, group_name, position, content_id, at_ms, items)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        for p in prints {
+            insert.execute(params![name, group_name, i64::from(p.position), content_id, p.at_ms, p.items])?;
         }
         Ok(())
     });
@@ -2011,6 +2085,7 @@ fn populate_harvest_content_ids(tx: &rusqlite::Transaction<'_>, schema: &str) ->
         "release_fingerprint",
         "release_nfo_password",
         "release_stills",
+        "release_audio_print",
     ] {
         if has_table(tx, schema, table)? {
             tx.execute_batch(&format!(
@@ -2212,6 +2287,15 @@ fn enforce_harvest_quotas(conn: &Connection) -> rusqlite::Result<()> {
                 SELECT name, group_name, position FROM raw_stills LIMIT ?1
             )",
             params![stills_count - MAX_RAW_STILLS_ROWS],
+        )?;
+    }
+    let prints_count: i64 = conn.query_row("SELECT count(*) FROM raw_audio_prints", [], |r| r.get(0))?;
+    if prints_count > MAX_RAW_AUDIO_PRINTS_ROWS {
+        conn.execute(
+            "DELETE FROM raw_audio_prints WHERE (name, group_name, position) IN (
+                SELECT name, group_name, position FROM raw_audio_prints LIMIT ?1
+            )",
+            params![prints_count - MAX_RAW_AUDIO_PRINTS_ROWS],
         )?;
     }
     Ok(())
@@ -2674,6 +2758,26 @@ fn harvest_attached_release_tables(tx: &rusqlite::Transaction<'_>, schema: &str)
              WHERE excluded.content_id IS NOT NULL;"
         ))?;
     }
+    if has_table(tx, schema, "release_audio_print")? {
+        let prints_mask = crate::postprocess::step::mask(crate::probe::audio_print::AUDIO_PRINT_STEP);
+        let prints_verified = verified_step_sql(schema, prints_mask, has_pp_state, has_pp_walks);
+        tx.execute_batch(&format!(
+            "INSERT INTO main.raw_audio_prints (name, group_name, position, content_id, at_ms, items)
+             SELECT r.name, r.group_name, p.position,
+                    CASE WHEN {prints_verified} THEN hcid.content_id ELSE NULL END,
+                    p.at_ms, p.items
+             FROM {schema}.release_audio_print p
+             JOIN {schema}.releases r ON r.id = p.release_id
+             LEFT JOIN temp.harvest_content_ids hcid ON hcid.release_id = r.id
+             WHERE r.name IS NOT NULL AND r.group_name IS NOT NULL
+             ORDER BY r.id DESC LIMIT {MAX_RAW_AUDIO_PRINTS_ROWS}
+             ON CONFLICT(name, group_name, position) DO UPDATE SET
+                content_id = excluded.content_id,
+                at_ms = excluded.at_ms,
+                items = excluded.items
+             WHERE excluded.content_id IS NOT NULL;"
+        ))?;
+    }
     enforce_harvest_quotas(tx)?;
     Ok(())
 }
@@ -3066,6 +3170,15 @@ mod tests {
         assert_eq!(get_stills("Some.Release-GRP", "alt.binaries.test", cid_a), stills);
         assert!(get_stills("Some.Release-GRP", "alt.binaries.test", cid_b).is_empty());
 
+        // Audio prints roundtrip (bound to content_id)
+        let prints = vec![
+            SavedPrint { position: 25, at_ms: 1_350_000, items: vec![1, 2, 3, 4] },
+            SavedPrint { position: 50, at_ms: 2_700_000, items: vec![5, 6, 7, 8] },
+        ];
+        put_audio_prints("Some.Release-GRP", "alt.binaries.test", cid_a, &prints);
+        assert_eq!(get_audio_prints("Some.Release-GRP", "alt.binaries.test", cid_a), prints);
+        assert!(get_audio_prints("Some.Release-GRP", "alt.binaries.test", cid_b).is_empty());
+
         // Archive & PAR2 inner-files roundtrip (bound to content_id and preserving full-list content_fp)
         let archive_files = vec![crate::archive::InnerFile {
             name: "Movie.2026.1080p.mkv".to_string(),
@@ -3444,6 +3557,61 @@ mod tests {
         let legacy_cid = release_content_id(&legacy, 1).expect("legacy content_id");
         let sharded_cid = release_content_id(&sharded, 1).expect("sharded content_id");
         assert_eq!(legacy_cid, sharded_cid);
+    }
+
+    #[test]
+    fn audio_prints_are_harvested_before_a_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        crate::db::create_db_at(&main).unwrap();
+        let group = "alt.binaries.test";
+        let name = "Printed.Film.2024-GRP";
+        let articles: Vec<crate::parser::Article> = (1..=2)
+            .map(|p| crate::parser::Article {
+                message_id: format!("<p{p}@x>"),
+                subject: format!("\"f.mkv\" yEnc ({p}/2)"),
+                filename: Some("f.mkv".into()),
+                part: Some(p),
+                total_parts: Some(2),
+                bytes: 700_000,
+                ..Default::default()
+            })
+            .collect();
+        let release = crate::parser::Release {
+            name: name.into(),
+            group: group.into(),
+            size: 1_400_000,
+            articles,
+            complete: true,
+            ..Default::default()
+        };
+        crate::store::save(&main, &[release]).unwrap();
+        let shard = crate::db::open_shard(&crate::store::shard_path(&main, crate::store::shard_of(group))).unwrap();
+        let id: i64 = shard.query_row("select id from releases where name = ?1", [name], |r| r.get(0)).unwrap();
+        let parts: i64 =
+            shard.query_row("select coalesce(parts, 0) from releases where id = ?1", [id], |r| r.get(0)).unwrap();
+        let bit = crate::postprocess::step::mask(crate::probe::audio_print::AUDIO_PRINT_STEP);
+        shard
+            .execute(
+                "insert into pp_state (release_id, done, parts_seen) values (?1, ?2, ?3)",
+                rusqlite::params![id, bit, parts],
+            )
+            .unwrap();
+        shard
+            .execute(
+                "insert into release_audio_print (release_id, position, at_ms, items) values (?1, 50, 2700000, x'01020304')",
+                [id],
+            )
+            .unwrap();
+        let content_id = release_content_id(&shard, id).unwrap();
+        drop(shard);
+        set_test_raw_path(Some(path_for(&main)));
+        harvest_from_shards(&main, &|_| {}).unwrap();
+        assert_eq!(
+            get_audio_prints(name, group, &content_id),
+            vec![SavedPrint { position: 50, at_ms: 2_700_000, items: vec![1, 2, 3, 4] }]
+        );
+        set_test_raw_path(None);
     }
 
     #[test]
