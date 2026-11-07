@@ -433,6 +433,18 @@ impl Step for AudioPrintStep {
         if has_print(ctx.conn(), id) {
             return Ok(Outcome { matched: true, ..Outcome::default() });
         }
+        let info: Option<String> =
+            ctx.conn().query_row("select info from release_probe where release_id = ?1", [id], |r| r.get(0)).ok();
+        let Some(info) = info.and_then(|i| serde_json::from_str::<ProbeInfo>(&i).ok()) else {
+            return Ok(Outcome::default());
+        };
+        let plan = match plan(&info) {
+            Ok(plan) => plan,
+            Err(why) => {
+                count(why);
+                return Ok(Outcome::default());
+            }
+        };
         // nor is one kept in `atlas.raw.db` from before a shard reset, for the same files
         let (name, group) = (ctx.release().name.clone(), ctx.release().group.clone());
         let content_id = crate::raw_store::release_content_id(ctx.conn(), id).unwrap_or_default();
@@ -446,18 +458,6 @@ impl Step for AudioPrintStep {
                 return Ok(Outcome { matched: true, writes: print_writes(id, &saved), ..Outcome::default() });
             }
         }
-        let info: Option<String> =
-            ctx.conn().query_row("select info from release_probe where release_id = ?1", [id], |r| r.get(0)).ok();
-        let Some(info) = info.and_then(|i| serde_json::from_str::<ProbeInfo>(&i).ok()) else {
-            return Ok(Outcome::default());
-        };
-        let plan = match plan(&info) {
-            Ok(plan) => plan,
-            Err(why) => {
-                count(why);
-                return Ok(Outcome::default());
-            }
-        };
         // only for a release no other key ties to another
         let main = ctx.conn().path().and_then(main_of).ok_or_else(|| StepError::Retry("no main database".into()))?;
         let all = crate::db::open_with_shards(&main).map_err(retry)?;
