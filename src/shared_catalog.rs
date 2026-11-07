@@ -360,14 +360,16 @@ pub fn sync_triggers(conn: &Connection, on: bool) -> rusqlite::Result<()> {
     let tables = tables(conn)?;
     if on {
         // a table no longer copied loses its triggers; the rest are made again
-        let mut sql = outbox_ddl("main");
+        // the triggers go first: rebuilding an old outbox renames it, which would take them along
+        let mut sql = drop_catalog_triggers(conn)?;
+        sql.push_str(&upgrade_outbox(conn)?);
+        sql.push_str(&outbox_ddl("main"));
         // which outbox this is: its seqs start again when it's made again, soo a position saved for an earlier one
         // means nothing
         sql.push_str(&format!(
             "create table if not exists meta (key TEXT PRIMARY KEY, value INTEGER);
              insert or ignore into meta (key, value) values ('{EPOCH}', abs(random()) % 9007199254740991 + 1);"
         ));
-        sql.push_str(&drop_catalog_triggers(conn)?);
         for t in &tables {
             sql.push_str(&t.triggers());
         }
@@ -401,12 +403,33 @@ fn drop_catalog_triggers(conn: &Connection) -> rusqlite::Result<String> {
     Ok(names.iter().map(|n| format!("drop trigger if exists {};", quote(n))).collect())
 }
 
+/// AUTOINCREMENT: a seq is never given out twice, not even once the outbox is empty, soo a position saved in
+/// Postgres (`catalog_cursor`) always means the same changes.
 fn outbox_ddl(schema: &str) -> String {
     format!(
         "create table if not exists {schema}.{OUTBOX} (
-            seq INTEGER PRIMARY KEY, tbl TEXT NOT NULL, k1, k2, at INTEGER NOT NULL DEFAULT (unixepoch())
+            seq INTEGER PRIMARY KEY AUTOINCREMENT, tbl TEXT NOT NULL, k1, k2, at INTEGER NOT NULL DEFAULT (unixepoch())
          );"
     )
+}
+
+/// An outbox made before AUTOINCREMENT, rebuilt with it, its rows and seqs kept: run with no catalog triggers in
+/// place (a rename would carry them along to the old table).
+fn upgrade_outbox(conn: &Connection) -> rusqlite::Result<String> {
+    use rusqlite::OptionalExtension;
+    let sql: Option<String> = conn
+        .query_row("select sql from main.sqlite_schema where type = 'table' and name = ?1", [OUTBOX], |r| r.get(0))
+        .optional()?;
+    match sql {
+        Some(sql) if !sql.to_ascii_uppercase().contains("AUTOINCREMENT") => Ok(format!(
+            "alter table {OUTBOX} rename to {OUTBOX}_old;
+             {ddl}
+             insert into {OUTBOX} (seq, tbl, k1, k2, at) select seq, tbl, k1, k2, at from {OUTBOX}_old order by seq;
+             drop table {OUTBOX}_old;",
+            ddl = outbox_ddl("main"),
+        )),
+        _ => Ok(String::new()),
+    }
 }
 
 /// For a compaction, which builds a shard afresh from the original attached as `old`: the original's waiting
@@ -432,6 +455,15 @@ pub fn carry_outbox(conn: &Connection) -> rusqlite::Result<bool> {
     conn.execute_batch(&format!(
         "{ddl}
          insert into main.{OUTBOX} (seq, tbl, k1, k2, at) select seq, tbl, k1, k2, at from old.{OUTBOX} order by seq;
+         -- the next seq stays past every one given out, an emptied outbox's too
+         update main.sqlite_sequence set seq = max(seq,
+             coalesce((select seq from old.sqlite_sequence where name = '{OUTBOX}'), 0),
+             coalesce((select max(seq) from old.{OUTBOX}), 0))
+         where name = '{OUTBOX}';
+         insert into main.sqlite_sequence (name, seq)
+         select '{OUTBOX}', max(coalesce((select seq from old.sqlite_sequence where name = '{OUTBOX}'), 0),
+                                coalesce((select max(seq) from old.{OUTBOX}), 0))
+         where not exists (select 1 from main.sqlite_sequence where name = '{OUTBOX}');
          insert into main.{OUTBOX} (tbl, k1, k2)
          select 'releases', r.id, null from main.releases r join old.releases o on o.id = r.id
          where {changed};",
@@ -732,6 +764,11 @@ pub fn send_with_cursor(
 /// Postgres's position in the shard's outbox: 0 when it has none for this epoch.
 pub fn pg_cursor(pg: &mut postgres::Client, shard: usize, epoch: Option<i64>) -> Result<i64, postgres::Error> {
     let Some(epoch) = epoch else { return Ok(0) };
+    // a catalog nothing has written to yet has no position
+    let made: bool = pg.query_one("select to_regclass('catalog_cursor') is not null", &[])?.get(0);
+    if !made {
+        return Ok(0);
+    }
     let row = pg.query_opt("select epoch, seq from catalog_cursor where shard = $1", &[&(shard as i16)])?;
     Ok(row.filter(|r| r.get::<_, i64>(0) == epoch).map_or(0, |r| r.get(1)))
 }
@@ -1487,6 +1524,65 @@ mod tests {
         assert_eq!(epoch(&conn).unwrap(), None);
         sync_triggers(&conn, true).unwrap();
         assert_ne!(epoch(&conn).unwrap(), Some(first), "a new outbox, a new epoch");
+    }
+
+    #[test]
+    fn a_seq_is_never_given_out_twice_even_after_the_outbox_empties() {
+        let conn = shard();
+        sync_triggers(&conn, true).unwrap();
+        conn.execute("insert into releases (id, name) values (8, 'a')", []).unwrap();
+        let t = tables(&conn).unwrap();
+        let first = read_batch_after(&conn, &t, 100, BATCH_BYTES, 0).unwrap();
+        ack(&conn, first.max_seq).unwrap();
+        conn.execute("insert into releases (id, name) values (16, 'b')", []).unwrap();
+        let next = read_batch_after(&conn, &t, 100, BATCH_BYTES, first.max_seq).unwrap();
+        assert_eq!(next.changes, 1, "the change after an emptied outbox isn't skipped");
+        assert!(next.max_seq > first.max_seq);
+    }
+
+    #[test]
+    fn a_compaction_keeps_the_next_seq_past_an_emptied_outboxs() {
+        let conn = shard();
+        sync_triggers(&conn, true).unwrap();
+        for i in 1..=4 {
+            conn.execute("insert into releases (id, name) values (?1, 'x')", [i * 8]).unwrap();
+        }
+        ack(&conn, 4).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let orig = dir.path().join("orig.db");
+        conn.execute("vacuum into ?1", [orig.to_string_lossy()]).unwrap();
+        let copy = Connection::open(dir.path().join("copy.db")).unwrap();
+        copy.execute_batch(
+            "create table releases (id INTEGER PRIMARY KEY, name TEXT, size INTEGER, posted_date TEXT);",
+        )
+        .unwrap();
+        copy.execute("attach database ?1 as old", [orig.to_string_lossy()]).unwrap();
+        // the copy has the same releases: nothing changed, nothing left out
+        copy.execute_batch("insert into main.releases select * from old.releases;").unwrap();
+        assert!(carry_outbox(&copy).unwrap());
+        copy.execute_batch("detach database old").unwrap();
+        copy.execute("insert into catalog_outbox (tbl, k1) values ('releases', 8)", []).unwrap();
+        let seq: i64 = copy.query_row("select max(seq) from catalog_outbox", [], |r| r.get(0)).unwrap();
+        assert_eq!(seq, 5, "past the 4 the original gave out, though its outbox was empty");
+    }
+
+    #[test]
+    fn an_outbox_made_before_autoincrement_is_rebuilt_with_its_rows_and_seqs() {
+        let conn = shard();
+        conn.execute_batch(
+            "create table catalog_outbox (seq INTEGER PRIMARY KEY, tbl TEXT NOT NULL, k1, k2, at INTEGER NOT NULL DEFAULT (unixepoch()));
+             insert into catalog_outbox (seq, tbl, k1) values (7, 'releases', 8), (9, 'releases', 16);",
+        )
+        .unwrap();
+        sync_triggers(&conn, true).unwrap();
+        let sql: String =
+            conn.query_row("select sql from sqlite_schema where name = 'catalog_outbox'", [], |r| r.get(0)).unwrap();
+        assert!(sql.contains("AUTOINCREMENT"), "{sql}");
+        conn.execute("delete from catalog_outbox", []).unwrap();
+        conn.execute("insert into releases (id, name) values (24, 'c')", []).unwrap();
+        let seq: i64 = conn.query_row("select seq from catalog_outbox", [], |r| r.get(0)).unwrap();
+        assert_eq!(seq, 10, "past the old rows' seqs, and the triggers write to the rebuilt table");
+        sync_triggers(&conn, true).unwrap(); // again: nothing to rebuild
     }
 
     #[test]
