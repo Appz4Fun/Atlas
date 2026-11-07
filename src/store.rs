@@ -2286,8 +2286,9 @@ impl ShardWriter {
         // with saves about, a held lock lets the step go at once nearly
         conn.busy_timeout(if idle && !queued { PRUNE_IDS_BUSY } else { PRUNE_IDS_BUSY_SAVING })?;
         let done = self.prune_ids_step(conn, now, idle);
-        conn.busy_timeout(crate::frozen::WRITER_BUSY)?;
-        match done {
+        // put back whatever came of the step: a failure here mustnt hide the step's own
+        let restored = conn.busy_timeout(crate::frozen::WRITER_BUSY);
+        let done = match done {
             Err(e) if crate::frozen::is_busy(&e) => {
                 crate::metrics::names::RELEASE_IDS.inc(&[("event", "busy"), ("shard", &self.shard.to_string())], 1);
                 Ok(0)
@@ -2298,12 +2299,17 @@ impl ShardWriter {
                 self.ids.rest_until = now + PRUNE_IDS_FAILED_REST;
                 if let Some(failed) = self.ids_failing {
                     self.ids.after = self.ids.after.max(failed);
-                    self.ids.pruning = None;
+                    // only the release it failed at is given up; one being taken stays in hand otherwise
+                    if self.ids.pruning == Some(failed) {
+                        self.ids.pruning = None;
+                    }
                 }
                 Err(e)
             }
             done => done,
-        }
+        };
+        restored?;
+        done
     }
 
     fn prune_ids_step(&mut self, conn: &mut Connection, now: i64, idle: bool) -> Result<usize> {
@@ -2362,14 +2368,13 @@ impl ShardWriter {
             self.ids_failing = Some(release_id);
             // a file never touched since the upgrade counts as old, as for sealing (`due`); a release without its own
             // row is half taken already
-            let (files, touched): (i64, i64) = tx
-                .prepare_cached("select count(*), coalesce(max(touched_at), 0) from files where release_id = ?")?
-                .query_row([release_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
-            let indexed: i64 = tx
-                .prepare_cached("select at from release_indexed where release_id = ?")?
-                .query_row([release_id], |r| r.get(0))
-                .optional()?
-                .unwrap_or(0);
+            let (files, touched, indexed): (i64, i64, i64) = tx
+                .prepare_cached(
+                    "select count(*), coalesce(max(touched_at), 0),
+                            coalesce((select at from release_indexed where release_id = ?1), 0)
+                     from files where release_id = ?1",
+                )?
+                .query_row([release_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
             let last = touched.max(indexed);
             // without its own row it's half taken (a step cut short by a restart): no save trusts what's left
             if files < 2 || last < now - SEAL_AGE || !is_indexed(&tx, release_id)? {
