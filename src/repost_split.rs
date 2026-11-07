@@ -181,6 +181,177 @@ pub async fn dates_on(
     Ok(Some(out))
 }
 
+/// The most overview lines `--split-reposts` reads for one release.
+const MAX_NUMBERS: u64 = 5_000_000;
+
+/// Whether a row could be several uploads, without the network: its files hold `k` articles for each part they
+/// have seen, `k` between 2 and 20 (within 2%), over at least 50 parts. Rows whose files share part numbers for other
+/// reasons pass too; `decide` tells them apart once it has the Dates.
+pub fn looks_reposted(parts: i64, seen: i64) -> bool {
+    if seen < 50 || parts < 2 * seen {
+        return false;
+    }
+    let k = (parts as f64 / seen as f64).round();
+    (2.0..=20.0).contains(&k) && (parts as f64 - k * seen as f64).abs() <= 0.02 * k * seen as f64
+}
+
+fn seen_of(conn: &rusqlite::Connection, id: i64) -> rusqlite::Result<i64> {
+    let mut stmt = conn.prepare_cached("select seen from files where release_id = ?")?;
+    let rows = stmt.query_map([id], |r| r.get::<_, Vec<u8>>(0))?;
+    let mut n = 0i64;
+    for seen in rows {
+        n += seen?.iter().map(|b| i64::from(b.count_ones())).sum::<i64>();
+    }
+    Ok(n)
+}
+
+/// `--split-reposts --list [--sample N]`: the rows that could be several uploads, read only.
+fn list(main: &std::path::Path, sample: usize) -> anyhow::Result<()> {
+    let (mut found, mut shown) = (0u64, Vec::new());
+    for path in crate::store::shard_paths(main) {
+        let conn = crate::naming::walk::open_for_reading(&path)?;
+        let mut after = i64::MIN;
+        loop {
+            let rows: Vec<(i64, i64, String)> = conn
+                .prepare_cached("select id, parts, name from releases where id > ? order by id limit 2000")?
+                .query_map([after], |r| Ok((r.get(0)?, r.get::<_, Option<i64>>(1)?.unwrap_or(0), r.get(2)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            let Some((last, ..)) = rows.last() else { break };
+            after = *last;
+            for (id, parts, name) in rows {
+                if parts >= 100 && looks_reposted(parts, seen_of(&conn, id)?) {
+                    found += 1;
+                    if shown.len() < sample {
+                        shown.push(format!("{id} {parts} {name}"));
+                    }
+                }
+            }
+        }
+    }
+    println!("{found} rows could be several uploads (their Dates tell)");
+    for line in shown {
+        println!("  {line}");
+    }
+    Ok(())
+}
+
+/// The release's first and last Date in UTC: `file_timing` keeps them by the poster's clock, soo one article's Date
+/// header gives the zone.
+async fn span_utc(
+    pool: &crate::nntp::Pool,
+    conn: &rusqlite::Connection,
+    id: i64,
+    sample_id: &str,
+) -> anyhow::Result<Option<(i64, i64)>> {
+    let (first, last): (Option<i64>, Option<i64>) =
+        conn.query_row("select min(first_date), max(last_date) from file_timing where release_id = ?", [id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
+    let (Some(first), Some(last)) = (first, last) else { return Ok(None) };
+    let head = pool.fetch_head(&format!("<{sample_id}>"), 64 << 10).await?.unwrap_or_default();
+    let text = String::from_utf8_lossy(&head);
+    let date = text.lines().find_map(|l| l.strip_prefix("Date:").or_else(|| l.strip_prefix("date:")));
+    let offset = date
+        .and_then(|d| Some(crate::dates::naive_timestamp(d.trim())? - crate::dates::posted_timestamp(d.trim())?))
+        .unwrap_or(0);
+    Ok(Some((first - offset, last - offset)))
+}
+
+/// `--split-reposts --id ID [--server HOST] [--apply]`: read the release's Dates, say what `decide` makes of them,
+/// and with `--apply` (indexer stopped) split it.
+fn one(main: &std::path::Path, id: i64, server: Option<&str>, apply: bool) -> anyhow::Result<()> {
+    let shard = crate::store::shard_path(main, crate::store::shard_of_id(id));
+    let conn = crate::naming::walk::open_for_reading(&shard)?;
+    let group: String = conn.query_row("select group_name from releases where id = ?", [id], |r| r.get(0))?;
+    let articles = crate::store::release_articles(&conn, id)?;
+    let Some(sample) = articles.first().map(|a| a.4.clone()) else { anyhow::bail!("release {id} holds no articles") };
+    let cfg = crate::config::load_config().ok_or_else(|| anyhow::anyhow!("no config"))?;
+    let pool = crate::nntp::BlockingPool::from_config(&cfg);
+    pool.connect()?;
+    let i = match server {
+        Some(h) => (0..pool.pool.len()).find(|i| pool.pool.host(*i).contains(h)),
+        None => pool.pool.indexing_servers().first().copied(),
+    }
+    .ok_or_else(|| anyhow::anyhow!("no such server"))?;
+    let Some(span) = pool.block_on(span_utc(&pool.pool, &conn, id, &sample))? else {
+        anyhow::bail!("release {id} has no dates in file_timing")
+    };
+    let want: HashSet<String> = articles.iter().map(|a| a.4.clone()).collect();
+    let Some(dates) = pool.block_on(dates_on(&pool.pool, i, &group, span, &want, MAX_NUMBERS))? else {
+        println!("{id}: its range is past {MAX_NUMBERS} articles on {}, left as it is", pool.pool.host(i));
+        return Ok(());
+    };
+    println!("{id}: Dates for {} of {} articles from {}", dates.len(), want.len(), pool.pool.host(i));
+    let copies: Vec<Copy> = articles
+        .iter()
+        .map(|(file, part, total, bytes, mid)| Copy {
+            file: file.clone(),
+            part: *part,
+            total: *total,
+            bytes: *bytes,
+            date: dates.get(mid).copied(),
+        })
+        .collect();
+    let (windows, uploads) = match decide(&copies) {
+        Verdict::Keep(why) => {
+            println!("{id}: one release ({why:?})");
+            return Ok(());
+        }
+        Verdict::Split { windows, uploads } => (windows, uploads),
+    };
+    let mut sizes = vec![0usize; windows];
+    for u in &uploads {
+        if let Some(n) = sizes.get_mut(*u) {
+            *n += 1;
+        }
+    }
+    println!("{id}: {windows} uploads, articles each {sizes:?}");
+    if !apply {
+        println!("a dry run: nothing was changed. --apply splits it (stop indexing first)");
+        return Ok(());
+    }
+    let _lock = crate::naming::walk::take_lock(main).map_err(|e| anyhow::anyhow!(e))?;
+    drop(conn);
+    let mut conn = crate::db::open_shard(&shard)?;
+    crate::store::migrate_shard(&conn)?;
+    let upload_of: HashMap<String, usize> = articles.iter().map(|a| a.4.clone()).zip(uploads.iter().copied()).collect();
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    // the release as it was read: a save in between would have made the plan stale
+    if crate::store::release_articles(&tx, id)?.len() != articles.len() {
+        anyhow::bail!("release {id} changed since it was read; run it again");
+    }
+    let ids = crate::store::Ids::new(main);
+    match crate::store::split_uploads(&tx, &ids, id, &upload_of, windows)? {
+        Some(rows) => {
+            tx.commit()?;
+            println!("{id}: split, new rows {rows:?}");
+        }
+        None => println!("{id}: not split (held-back articles, or an upload past a blob); nothing changed"),
+    }
+    Ok(())
+}
+
+/// `atlas --split-reposts --list [--sample N]` or `--split-reposts --id ID [--server HOST] [--apply]`.
+pub fn run(args: &[String]) -> i32 {
+    let value = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned();
+    let main = crate::naming::walk::main_path();
+    let result = if args.iter().any(|a| a == "--list") {
+        let sample = value("--sample").and_then(|v| v.parse().ok()).unwrap_or(20);
+        crate::naming::walk::may_read(&main).map_err(|e| anyhow::anyhow!(e)).and_then(|()| list(&main, sample))
+    } else if let Some(id) = value("--id").and_then(|v| v.parse::<i64>().ok()) {
+        one(&main, id, value("--server").as_deref(), args.iter().any(|a| a == "--apply"))
+    } else {
+        Err(anyhow::anyhow!("--split-reposts needs --list or --id RELEASE_ID"))
+    };
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            println!("{e:#}");
+            1
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,6 +409,16 @@ mod tests {
     fn two_uploads_days_apart_are_two_twins() {
         let copies = post(2, 164, &[0, 6 * 86_400]);
         assert!(matches!(decide(&copies), Verdict::Split { windows: 2, .. }));
+    }
+
+    #[test]
+    fn the_rows_worth_reading_dates_for() {
+        assert!(looks_reposted(273_344, 54_669), "five uploads, one article missing");
+        assert!(looks_reposted(328, 164));
+        assert!(!looks_reposted(26, 1), "too few parts to tell");
+        assert!(!looks_reposted(5_000, 3_000), "not a whole number of copies");
+        assert!(!looks_reposted(54_669, 54_669), "one upload");
+        assert!(!looks_reposted(30_000, 1_000), "more copies than any repost");
     }
 
     #[test]
