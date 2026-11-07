@@ -4871,7 +4871,7 @@ dependencies = [
 [[package]]
 name = "zipview"
 version = "0.1.0"
-source = "git+https://github.com/xbmc4lyfe/zipview?rev=a1c381b93b92d5eac51adb5e177c5394c2ca20bb#a1c381b93b92d5eac51adb5e177c5394c2ca20bb"
+source = "git+https://github.com/xbmc4lyfe/zipview?rev=e994bfcd0bb0bfd24cabcf97bfd8a72c1d84f67c#e994bfcd0bb0bfd24cabcf97bfd8a72c1d84f67c"
 dependencies = [
  "flate2",
 ]
