@@ -827,9 +827,15 @@ fn exact_split_post(
         None => (named_rows(split_post_sql, Some(&release.poster))?, named_rows(named_rows_sql, None)?),
     };
     let same: Vec<&Named> = same.iter().collect();
+    let (across, shared) = across_posters(conn, release.id, &named)?;
+    // rows of the name that share parts are grouped by `across_posters` alone, whichever row asks: a poster's own
+    // rows could otherwise make a post of their own beside the one they are part of
+    if shared {
+        return Ok(across.map(|(post, _)| post));
+    }
     let by_poster = same_poster_post(conn, &same)?;
     // one poster can have several of the groups: the post across posters is taken only if it holds all of those
-    match (by_poster, across_posters(conn, release.id, &named)?) {
+    match (by_poster, across) {
         // a row of the poster's post may be in the other as a crosspost of it
         (Some(one), Some((across, covers)))
             if one.ids.iter().all(|id| covers.contains(id)) && covers.len() > one.ids.len() =>
@@ -863,16 +869,20 @@ fn same_poster_post(conn: &Connection, rows: &[&Named]) -> Result<Option<SplitPo
 /// The most rows of one name looked at for a post whose groups each got a poster of their own.
 const ACROSS_POSTERS_ROWS: usize = 32;
 
+/// `across_posters`'s answer: the post the row asking is in, with the rows it stands for, and whether any rows of the
+/// name share parts.
+type AcrossPosters = (Option<(SplitPost, Vec<i64>)>, bool);
+
 /// One post whose groups each got another made-up poster (Nyuu and ngPost can give every connection its own From): the
 /// rows share the post's files, and each holds parts of them no other row has. A name and a subject are only headers,
 /// soo rows join only where they fill each other's gaps, file by file, under the same subject, and a row that is a
 /// crosspost of another (the same parts of the same files) is left out of the post, its group kept. Rows are taken
 /// lowest id first whichever row asks, soo every row of the post gets the same answer.
-fn across_posters(conn: &Connection, anchor: i64, named: &[Named]) -> Result<Option<(SplitPost, Vec<i64>)>> {
+fn across_posters(conn: &Connection, anchor: i64, named: &[Named]) -> Result<AcrossPosters> {
     // every row of the name, whichever asks: a dated one, lowest ids first
     let mut rows: Vec<&Named> = named.iter().filter(|n| n.date.is_some()).collect();
     if rows.len() < 2 || rows.iter().all(|n| n.poster == rows[0].poster) || !rows.iter().any(|n| n.id == anchor) {
-        return Ok(None);
+        return Ok((None, false));
     }
     rows.sort_by_key(|n| n.id);
     rows.truncate(ACROSS_POSTERS_ROWS);
@@ -891,6 +901,9 @@ fn across_posters(conn: &Connection, anchor: i64, named: &[Named]) -> Result<Opt
             None => kept.push((n, files)),
         }
     }
+    // whether any rows share parts, the same for every row of the name
+    let ids: Vec<i64> = kept.iter().map(|(n, _)| n.id).collect();
+    let shared = ids.len() > 1 && union_files(conn, &ids)?.overlap;
     // the rows fall into posts, each grown from its lowest row left: the same posts whoever asks
     let mut taken: HashSet<i64> = HashSet::new();
     for seed in 0..kept.len() {
@@ -904,11 +917,14 @@ fn across_posters(conn: &Connection, anchor: i64, named: &[Named]) -> Result<Opt
             continue;
         }
         if chosen.len() < 2 || !union.one_upload() {
-            return Ok(None);
+            return Ok((None, shared));
         }
-        return Ok(post_of(kept.iter().map(|(n, _)| *n).filter(|n| chosen.contains(&n.id)).collect(), &copies, union));
+        return Ok((
+            post_of(kept.iter().map(|(n, _)| *n).filter(|n| chosen.contains(&n.id)).collect(), &copies, union),
+            shared,
+        ));
     }
-    Ok(None)
+    Ok((None, shared))
 }
 
 /// The rows not `taken` that join `kept[seed]`, looked at again whenever one joins (a row can share a file only with
@@ -922,6 +938,8 @@ fn grow_post(
     let mut chosen = vec![kept[seed].0.id];
     let mut union = union_files(conn, &chosen)?;
     let mut span = kept[seed].0.date.map_or((0.0, 0.0), |d| (d, d));
+    // a row whole on its own is an upload of its own: no row sharing parts with the post joins one that has it
+    let mut whole = kept[seed].1.complete();
     let mut grew = true;
     while grew {
         grew = false;
@@ -932,7 +950,7 @@ fn grow_post(
             }
             let (lo, hi) = (span.0.min(date), span.1.max(date));
             let shares = files.files.keys().any(|f| union.files.contains_key(f));
-            if hi - lo > SPLIT_POST_DAYS || !shares || !union.fills_gaps(files) {
+            if hi - lo > SPLIT_POST_DAYS || !shares || !union.fills_gaps(files, whole) {
                 continue;
             }
             chosen.push(n.id);
@@ -944,6 +962,7 @@ fn grow_post(
             }
             union = grown;
             span = (lo, hi);
+            whole |= files.complete();
             grew = true;
         }
     }
@@ -960,7 +979,17 @@ fn post_of(rows: Vec<&Named>, copies: &[(&Named, i64)], union: UnionFiles) -> Op
     if groups.len() > SPLIT_POST_GROUPS {
         return None;
     }
-    let size = rows.iter().map(|n| n.bytes).sum();
+    let summed: i64 = rows.iter().map(|n| n.bytes).sum();
+    // rows sharing parts hold some bytes more than once: the files' sizes from their subjects, each by the share of
+    // its parts there, or else the rows' bytes scaled by the parts there are to the parts they hold
+    let size = match (union.overlap, union.subject_bytes(), union.parts_held) {
+        (false, ..) => summed,
+        (true, Some(bytes), _) => bytes,
+        (true, None, held) if held > 0 => {
+            (i128::from(summed) * i128::from(union.distinct_parts()) / i128::from(held)) as i64
+        }
+        (true, None, _) => summed,
+    };
     ids.sort_unstable();
     let mut covers = ids.clone();
     covers.extend(copies.iter().filter(|(_, of)| ids.contains(of)).map(|(n, _)| n.id));
@@ -1161,12 +1190,20 @@ struct UnionFile {
     subject: Option<String>,
 }
 
-/// Whether a file's subject (less its part number) ends with the file's size in bytes, as yEnc posters write it:
-/// `"Film.mkv" yEnc (/21040) 88246893816`. The name, the article count and the byte count then all say it's one file.
+/// Whether a file's subject (less its part number) ends with a byte count, as Nyuu and ngPost write the file's size:
+/// `"Film.mkv" yEnc (/21040) 88246893816`. Two rows agreeing on such a subject agree on the file's name, article count
+/// and size. Message-ids aren't compared: two uploads of one file this alike hold parts that stand in for each other.
 fn subject_has_size(subject: &str) -> bool {
-    let Some(close) = subject.rfind(')') else { return false };
-    let tail = subject[close + 1..].trim();
-    !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit())
+    subject_size(subject).is_some()
+}
+
+/// The byte count a subject ends with, after its last `)` (`subject_has_size`).
+fn subject_size(subject: &str) -> Option<i64> {
+    let tail = subject[subject.rfind(')')? + 1..].trim();
+    if tail.is_empty() || !tail.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    tail.parse().ok()
 }
 
 /// Each file across these releases, by name, and what says whether they're one upload.
@@ -1182,6 +1219,8 @@ struct UnionFiles {
     /// two releases have a part of a file both agree on, its subject carrying the file's size: a post whose poster
     /// sent each article to some of its groups, soo a part can be in more than one row
     overlap: bool,
+    /// the parts every row holds, added up: more than `distinct_parts` where rows share parts
+    parts_held: i64,
     /// whether any file carries a 0-indexed `[0/N]` or `[00/N]` counter
     zero_indexed: bool,
     /// each release's name
@@ -1231,10 +1270,11 @@ impl UnionFiles {
     }
 
     /// Whether `other` only adds what this lacks: every file both have is the same file under the same subject, and
-    /// they say the same of how many files the post has. No part is in both, except under a subject that carries the
-    /// file's size, from a row that isn't whole on its own, and where it still adds a part this lacks: a poster can
+    /// they say the same of how many files the post has. No part is in both, except under a subject that ends with a
+    /// byte count (the same name, part count and size: `subject_has_size`), where neither `other` nor a row already
+    /// in this (`whole`) is the whole post on its own, and where `other` still adds a part this lacks: a poster can
     /// send each article to some of the post's groups, soo its rows share parts, but a whole upload is its own post.
-    fn fills_gaps(&self, other: &UnionFiles) -> bool {
+    fn fills_gaps(&self, other: &UnionFiles, whole: bool) -> bool {
         if other.conflict || self.conflict {
             return false;
         }
@@ -1253,7 +1293,7 @@ impl UnionFiles {
                 let same =
                     f.expected.is_some() && f.expected == o.expected && f.subject.is_some() && f.subject == o.subject;
                 let both = f.seen.iter().zip(&o.seen).any(|(a, b)| a & b != 0);
-                adds |= o.seen.iter().enumerate().any(|(at, b)| b & !f.seen.get(at).copied().unwrap_or(0) != 0);
+                adds |= adds_parts(&f.seen, &o.seen, o.expected);
                 if both {
                     shared = true;
                     return same && f.subject.as_deref().is_some_and(subject_has_size);
@@ -1261,7 +1301,23 @@ impl UnionFiles {
                 same
             }
         });
-        agrees && (!shared || (adds && !other.complete_by_files()))
+        agrees && (!shared || (adds && !whole && !other.complete()))
+    }
+
+    /// The bytes of the parts there are, by each file's size in its subject (`subject_size`) times the share of its
+    /// expected parts there. None when a file's subject doesn't give its size.
+    fn subject_bytes(&self) -> Option<i64> {
+        self.files.values().try_fold(0i64, |sum, f| {
+            let size = subject_size(f.subject.as_deref()?)?;
+            let expected = f.expected.filter(|e| *e > 0)?;
+            let have = store::seen_count(&f.seen).min(expected);
+            Some(sum + (i128::from(size) * i128::from(have) / i128::from(expected)) as i64)
+        })
+    }
+
+    /// The parts there are, each once however many rows hold it.
+    fn distinct_parts(&self) -> i64 {
+        self.files.values().map(|f| store::seen_count(&f.seen)).sum()
     }
 
     fn linked(&self) -> bool {
@@ -1294,6 +1350,14 @@ impl UnionFiles {
             && (total.is_none_or(|total| self.files.len() as i64 == total + i64::from(self.zero_indexed))
                 || store::one_video_named(self.names.iter().map(String::as_str), self.files.keys().map(String::as_str)))
     }
+}
+
+/// Whether `theirs` has a part `ours` lacks, among the file's `expected` parts (a stray bit past them adds nothing).
+fn adds_parts(ours: &[u8], theirs: &[u8], expected: Option<i64>) -> bool {
+    theirs.iter().enumerate().any(|(at, b)| {
+        let new = b & !ours.get(at).copied().unwrap_or(0);
+        (0..8).any(|bit| new >> bit & 1 == 1 && expected.is_none_or(|e| (at * 8 + bit) as i64 <= e))
+    })
 }
 
 /// A `seen` bitmap without its trailing empty bytes, soo two of different lengths compare by their bits.
@@ -1370,6 +1434,7 @@ fn union_files(conn: &Connection, ids: &[i64]) -> Result<UnionFiles> {
         for row in rows {
             let (filename, expected, seen, total, subject) = row?;
             union.file_totals.insert(total);
+            union.parts_held += store::seen_count(&seen);
             union.zero_indexed |= subject.as_deref().is_some_and(crate::parser::has_zero_file_index);
             filenames.insert(filename.clone());
             let subject = subject.as_deref().map(|subject| subject_of_file(subject, expected));
@@ -2903,11 +2968,80 @@ mod tests {
     }
 
     #[test]
+    fn a_post_sharing_parts_counts_each_parts_bytes_once() {
+        let (_dir, conn) = all_shards();
+        let name = "Some.Film.2026.2160p.UHD.Blu-ray.Remux.HDR.HEVC.DTS-HD.MA.5.1-GRP";
+        let mkv = "Some.Film.mkv";
+        let (a, b) = ("alt.binaries.a", "alt.binaries.b");
+        let at = "2026-11-07 05:16:17";
+        // each row holds 300 bytes of it (`put_row_subjects`: 100 a part); the subject says the file is 4 * 716,800
+        put_row_subjects(&conn, 1, name, a, "x1@nyuu", &[(mkv, &[1, 2, 3], 4)], at, 1, true);
+        put_row_subjects(&conn, 2, name, b, "x2@nyuu", &[(mkv, &[2, 3, 4], 4)], at, 1, true);
+        let post = whole_post_with(&conn, &row_of(&conn, 1, a)).unwrap().unwrap();
+        assert_eq!(post.ids.len(), 2);
+        assert!(post.complete);
+        assert_eq!(post.size, 4 * 716_800, "the file once, not 600 bytes of rows");
+        // a part gone: its share of the file's size goes too
+        let (_dir2, conn2) = all_shards();
+        put_row_subjects(&conn2, 1, name, a, "x1@nyuu", &[(mkv, &[1, 2], 4)], at, 1, true);
+        put_row_subjects(&conn2, 2, name, b, "x2@nyuu", &[(mkv, &[2, 3], 4)], at, 1, true);
+        let post = whole_post_with(&conn2, &row_of(&conn2, 1, a)).unwrap().unwrap();
+        assert!(!post.complete);
+        assert_eq!(post.size, 3 * 716_800);
+    }
+
+    #[test]
+    fn a_posters_own_rows_dont_make_a_post_beside_the_one_sharing_parts() {
+        let (_dir, conn) = all_shards();
+        let name = "Some.Film.2026.2160p.UHD.Blu-ray.Remux.HDR.HEVC.DTS-HD.MA.5.1-GRP";
+        let mkv = "Some.Film.mkv";
+        let (a, b, c, d) = ("alt.binaries.a", "alt.binaries.b", "alt.binaries.c", "alt.binaries.d");
+        let at = "2026-11-07 05:16:17";
+        // p has groups a and c, q has b and d; rows 1 and 2 share part 2
+        put_row_subjects(&conn, 1, name, a, "p@nyuu", &[(mkv, &[1, 2], 4)], at, 1, true);
+        put_row_subjects(&conn, 2, name, b, "q@nyuu", &[(mkv, &[2, 3], 4)], at, 1, true);
+        put_row_subjects(&conn, 3, name, c, "p@nyuu", &[(mkv, &[3], 4)], at, 1, true);
+        put_row_subjects(&conn, 4, name, d, "q@nyuu", &[(mkv, &[4], 4)], at, 1, true);
+        let rows = [row_of(&conn, 1, a), row_of(&conn, 2, b), row_of(&conn, 3, c), row_of(&conn, 4, d)];
+        let answers: Vec<Option<SplitPost>> = rows.iter().map(|r| whole_post_with(&conn, r).unwrap()).collect();
+        let post = answers.iter().flatten().next().expect("a post").clone();
+        assert!(post.complete);
+        for (row, answer) in rows.iter().zip(&answers) {
+            match answer {
+                Some(p) => assert_eq!(p.ids, post.ids, "row {}", row.id),
+                None => assert!(!post.ids.contains(&row.id), "row {} is in the post but got no answer", row.id),
+            }
+        }
+    }
+
+    #[test]
+    fn a_row_whole_on_its_own_stays_out_whichever_row_comes_first() {
+        let name = "Some.Film.2026.2160p.UHD.Blu-ray.Remux.HDR.HEVC.DTS-HD.MA.5.1-GRP";
+        let (mkv, vol) =
+            ("Some.Film.2026.2160p.UHD.Blu-ray.Remux.HDR.HEVC.DTS-HD.MA.5.1-GRP.mkv", "Some.Film.vol00+01.par2");
+        let (a, b, c) = ("alt.binaries.a", "alt.binaries.b", "alt.binaries.c");
+        let at = "2026-11-07 05:16:17";
+        // the film alone and whole in one group (whole by `one_video_named`), its pieces and the volume elsewhere
+        for whole_first in [false, true] {
+            let (_dir, conn) = all_shards();
+            let (w, x, z) = if whole_first { (1, 2, 3) } else { (3, 1, 2) };
+            put_row_subjects(&conn, x, name, a, "x@nyuu", &[(mkv, &[1, 2], 4), (vol, &[1], 2)], at, 2, true);
+            put_row_subjects(&conn, w, name, b, "w@else", &[(mkv, &[1, 2, 3, 4], 4)], at, 2, true);
+            put_row_subjects(&conn, z, name, c, "z@nyuu", &[(mkv, &[3], 4), (vol, &[2], 2)], at, 2, true);
+            assert_eq!(whole_post_with(&conn, &row_of(&conn, w, b)).unwrap(), None, "whole first: {whole_first}");
+            let post = whole_post_with(&conn, &row_of(&conn, x, a)).unwrap().unwrap();
+            assert_eq!(post.ids.len(), 2, "whole first: {whole_first}");
+            assert!(!post.complete, "part 4 is only in the whole one, whole first: {whole_first}");
+        }
+    }
+
+    #[test]
     fn a_subject_has_the_files_size_only_as_its_last_number() {
         assert!(subject_has_size(r#"[10/11] - "Film.mkv" yEnc (/21040) 88246893816"#));
         assert!(!subject_has_size(r#"[10/11] - "Film.mkv" yEnc (/21040)"#));
         assert!(!subject_has_size(r#"[10/11] - "Film.mkv" yEnc (/21040) 88 MB"#));
         assert!(!subject_has_size("Film.mkv 88246893816"));
+        assert_eq!(subject_size(r#""Film.mkv" yEnc (/21040) 88246893816"#), Some(88_246_893_816));
     }
 
     #[test]

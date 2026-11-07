@@ -327,6 +327,8 @@ pub(crate) fn inventory(release: &ReleaseRow) -> crate::db::Result<(Vec<ArticleR
         }
         let mut all: Vec<ArticleRow> = rows.into_iter().flat_map(|(_, articles)| articles).collect();
         all.sort_by(|a, b| (&a.filename, a.part, &a.message_id).cmp(&(&b.filename, b.part, &b.message_id)));
+        // an article posted to several of the post's groups is in each of their rows: it's listed once
+        all.dedup_by(|a, b| a.filename == b.filename && a.part == b.part && a.message_id == b.message_id);
         return Ok((all, post.groups, post.ids));
     }
     Ok((get_articles(release.id)?, vec![release.group_name.clone()], vec![release.id]))
