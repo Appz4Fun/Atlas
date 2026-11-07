@@ -324,10 +324,14 @@ fn contents_of(conn: &Connection, ids: &[i64], recovery: &[i64], with_bytes: Byt
 /// SABnzbd do on their own. Goes by the article counts and, once read, the PAR2 set's blocks; else by the bytes its
 /// files keep counted (`blob_bytes`). A file whose sealed blob isn't counted yet leaves the bytes unknown, and the
 /// answer no: a list of results doesn't wait on the sealed log. Data missing whole files isn't counted as missing
-/// (`Contents::repairable`), soo it says no there too, short of the PAR2 set.
+/// (`Contents::repairable`), soo a post whose counter says a file is missing gets no too.
 pub fn repair_needed(conn: &Connection, id: i64) -> Result<bool> {
     let mut c = contents_of(conn, &[id], &[], Bytes::None)?;
     if c.data_articles_seen >= c.data_articles_expected || c.recovery_articles_seen == 0 {
+        return Ok(false);
+    }
+    // a file that never turned up isn't in the counts: what's there could cover the gaps it can see, and not it
+    if !union_files(conn, &[id])?.every_file_here() {
         return Ok(false);
     }
     if verdict_needs_bytes(&c) {
@@ -1298,14 +1302,19 @@ impl UnionFiles {
     /// are one video named as the post beside side files (`store::one_video_named`): the counter can count a
     /// `thumbnail.jpg` that came as a row of its own.
     fn complete(&self) -> bool {
+        !self.files.is_empty()
+            && self.files.values().all(|f| f.expected.is_some_and(|want| store::is_exactly(&f.seen, want)))
+            && self.every_file_here()
+    }
+
+    /// Whether every file the post's counter says it has is here, whole or not (`complete` also wants them whole).
+    fn every_file_here(&self) -> bool {
         if self.file_totals.len() > 1 {
             return false;
         }
         let total = self.file_totals.iter().copied().flatten().next_back();
-        !self.files.is_empty()
-            && self.files.values().all(|f| f.expected.is_some_and(|want| store::is_exactly(&f.seen, want)))
-            && (total.is_none_or(|total| self.files.len() as i64 == total + i64::from(self.zero_indexed))
-                || store::one_video_named(self.names.iter().map(String::as_str), self.files.keys().map(String::as_str)))
+        total.is_none_or(|total| self.files.len() as i64 == total + i64::from(self.zero_indexed))
+            || store::one_video_named(self.names.iter().map(String::as_str), self.files.keys().map(String::as_str))
     }
 }
 
@@ -2104,8 +2113,21 @@ mod tests {
         assert!(repair_needed(&conn, enough).unwrap(), "1 part missing, 2 parts of recovery");
         assert!(!repair_needed(&conn, short).unwrap(), "no recovery there");
         assert_eq!(repair_needed_of(&conn, &[enough, short]), HashSet::from([enough]));
-        // a sealed blob not counted yet: the bytes aren't known without the sealed log, soo no
+        // the counter says a third file that never turned up (a RAR volume): the volumes can't be known to cover it.
+        // One video named as the release would be all of it (`store::one_video_named`)
         let s = store::shard_of(group);
+        conn.execute(
+            &format!(
+                "update s{s}.files set file_total = 3,
+                        filename = replace(filename, '.mkv', '.part1.rar') where release_id = ?1"
+            ),
+            [enough],
+        )
+        .unwrap();
+        assert!(!repair_needed(&conn, enough).unwrap(), "a whole file missing");
+        conn.execute(&format!("update s{s}.files set file_total = 2 where release_id = ?1"), [enough]).unwrap();
+        assert!(repair_needed(&conn, enough).unwrap(), "both files the counter says");
+        // a sealed blob not counted yet: the bytes aren't known without the sealed log, soo no
         conn.execute(&format!("update s{s}.files set blob = x'00', blob_bytes = null where release_id = ?1"), [enough])
             .unwrap();
         assert!(!repair_needed(&conn, enough).unwrap());
