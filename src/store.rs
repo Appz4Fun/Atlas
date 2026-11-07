@@ -4480,6 +4480,62 @@ mod tests {
             .collect()
     }
 
+    /// `nzb::missing_files` on what storage gives back: one subject per file, not per article
+    #[test]
+    fn missing_files_after_a_save() {
+        let saved = |subjects: &[&str]| {
+            let (_dir, main, _conn) = fresh_shard_db();
+            let posted = subjects
+                .iter()
+                .enumerate()
+                .map(|(i, s)| Article {
+                    message_id: format!("<{i}@x>"),
+                    subject: (*s).into(),
+                    bytes: 10,
+                    ..Default::default()
+                })
+                .collect();
+            let releases: Vec<Release> = crate::parser::group_articles(posted)
+                .into_values()
+                .map(|r| Release { group: "alt.binaries.t".into(), ..r })
+                .collect();
+            assert_eq!(releases.len(), 1, "{subjects:?}");
+            save(&main, &releases).unwrap();
+            let conn = db::open_with_shards(&main).unwrap();
+            let id: i64 = conn.query_row("select id from releases", [], |r| r.get(0)).unwrap();
+            let r = crate::search::get_release_with(&conn, id).unwrap().unwrap();
+            (r, articles(&conn, id).unwrap())
+        };
+
+        // bracket parts: one file as [n/3] single articles, part 3 missing. A part gap, no file gap
+        let (r, rows) = saved(&["[1/3] - \"x.bin\" yEnc (1/1)", "[2/3] - \"x.bin\" yEnc (1/1)"]);
+        assert!(!r.complete);
+        assert_eq!(rows.iter().map(|a| a.part).collect::<Vec<_>>(), [Some(1), Some(2)]);
+        assert_eq!(crate::nzb::missing_files(&rows), None);
+        assert_eq!(crate::nzb::gaps(&rows)[0].missing, [3]);
+        let (r, rows) = saved(&["abcdefghijklmnop [1/3]", "abcdefghijklmnop [2/3]"]);
+        assert!(!r.complete);
+        assert_eq!(crate::nzb::missing_files(&rows), None);
+
+        // a file counter: file 1 of 2 whole, file 2 never came
+        let (r, rows) = saved(&["[1/2] - \"a.bin\" yEnc (1/2)", "[1/2] - \"a.bin\" yEnc (2/2)"]);
+        assert!(!r.complete);
+        assert!(crate::nzb::gaps(&rows).is_empty());
+        let gap = crate::nzb::missing_files(&rows).expect("file 2 is missing");
+        assert_eq!((gap.have, gap.total, gap.missing), (1, Some(2), vec![2]));
+
+        // both files there: complete, no gap
+        let (r, rows) =
+            saved(&["[1/2] - \"a.rar\" yEnc (1/2)", "[1/2] - \"a.rar\" yEnc (2/2)", "[2/2] - \"a.par2\" yEnc (1/1)"]);
+        assert!(r.complete);
+        assert_eq!(crate::nzb::missing_files(&rows), None);
+
+        // a 0-based file is saved complete
+        let (r, rows) = saved(&["\"z.bin\" yEnc (0/2)", "\"z.bin\" yEnc (1/2)"]);
+        assert_eq!(rows.iter().map(|a| a.part).collect::<Vec<_>>(), [Some(0), Some(1)]);
+        assert!(r.complete, "parts 0 and 1 of 2");
+    }
+
     fn part_of(name: &str, part: i64, total: i64, id: &str) -> Release {
         let article = Article {
             message_id: id.into(),

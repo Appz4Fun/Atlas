@@ -118,19 +118,11 @@ pub fn gaps(articles: &[ArticleRow]) -> Vec<FileGap> {
 }
 
 /// The files `articles` lack by their subjects' `[n/N]` file counter: None when it lists as many as the counter
-/// says (or more, or no counter says). A file's counter is the one all its articles carry; one that changes from
-/// article to article numbers parts, not files (`parser` reads such bracket counters as part numbers). With more
-/// than one total among the files the counters disagree, and say nothing, as in `parser::is_complete`.
+/// says (or more, or no counter says). With more than one total among the files the counters disagree, and say
+/// nothing, as in `parser::is_complete`.
 pub fn missing_files(articles: &[ArticleRow]) -> Option<FileGap> {
     let files = files(articles);
-    let counters: Vec<(i64, i64)> = files
-        .iter()
-        .filter_map(|f| {
-            let mut each = f.iter().map(|a| a.subject.as_deref().and_then(crate::parser::file_counter));
-            let first = each.next()??;
-            each.all(|c| c == Some(first)).then_some(first)
-        })
-        .collect();
+    let counters: Vec<(i64, i64)> = files.iter().filter_map(|f| file_counter(f)).collect();
     let totals: std::collections::BTreeSet<i64> = counters.iter().map(|&(_, total)| total).collect();
     let [total] = totals.into_iter().collect::<Vec<_>>()[..] else { return None };
     if !(1..=crate::parser::MAX_PARTS).contains(&total) {
@@ -167,6 +159,22 @@ fn nth_file(articles: &[ArticleRow], file: usize) -> Option<Vec<ArticleRow>> {
 /// Whether `articles` make a whole release: some articles, and every file numbered exactly 1..=total.
 pub fn articles_complete(articles: &[ArticleRow]) -> bool {
     !articles.is_empty() && gaps(articles).is_empty()
+}
+
+/// A file's `[n/N]` file counter, read the way `parser` read it when the articles were saved. A saved file keeps
+/// one subject for all its articles, soo the subject alone can't tell a file counter from a bracket counter
+/// `parser` turned into part numbers: it counts files only when `parse_subject` takes it as one (not
+/// `name [n/N]`), and the parts the subject's own `(p/t)` counter gives are the parts the file has (bracket
+/// parts are single `(1/1)` articles the file got N parts from). Live rows carry each article's own subject,
+/// soo all of them have to agree too.
+fn file_counter(file: &[&ArticleRow]) -> Option<(i64, i64)> {
+    let expected = file.iter().filter_map(|a| a.total_parts).max();
+    let mut each = file.iter().map(|a| {
+        let parsed = crate::parser::parse_subject(a.subject.as_deref()?)?;
+        (Some(parsed.total_parts) == expected).then_some((parsed.file_index?, parsed.file_total?))
+    });
+    let first = each.next()??;
+    each.all(|c| c == Some(first)).then_some(first)
 }
 
 /// One line for a gap, for the NZB's head and the log.
@@ -614,6 +622,26 @@ mod tests {
             .collect();
         assert!(articles_complete(&articles));
         assert_eq!(missing_files(&articles), None);
+        // read back from storage every article has the file's one subject, and part 3 never came
+        let saved: Vec<_> = articles[..2]
+            .iter()
+            .cloned()
+            .map(|mut a| {
+                a.subject = Some("[1/3] \"x\" yEnc (1/1)".into());
+                a
+            })
+            .collect();
+        assert_eq!(missing_files(&saved), None, "a part gap, not a file gap");
+        assert_eq!(gaps(&saved)[0].missing, [3]);
+        // nor `name [n/N]`, which is only ever a part counter
+        let short: Vec<_> = saved
+            .into_iter()
+            .map(|mut a| {
+                a.subject = Some("abcdefghijklmnop [1/3]".into());
+                a
+            })
+            .collect();
+        assert_eq!(missing_files(&short), None);
         // and counters that disagree say nothing
         assert_eq!(missing_files(&[counted("a", 1, 3, 1, 1), counted("b", 2, 4, 1, 1)]), None);
     }
