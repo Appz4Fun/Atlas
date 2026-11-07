@@ -873,7 +873,6 @@ fn a_split_uploads_frozen_rows_thaw_for_their_own_articles() {
         ..Default::default()
     }]);
     let conn = f.writer();
-    let conn = f.writer();
     assert_eq!(count(&conn, "select count(*) from frozen.frozen_releases"), 0, "thawed");
     let parts =
         |rid: i64| -> i64 { conn.query_row("select parts from releases where id = ?1", [rid], |r| r.get(0)).unwrap() };
