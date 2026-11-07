@@ -1434,26 +1434,31 @@ fn seal_rows(conn: &Connection, file_id: i64) -> Result<usize> {
         for p in segs.iter().filter_map(|s| s.part) {
             insert_part(&mut have, p);
         }
+        // against the blob and the other held-back rows only: a row a save could tell was a repost wasnt counted,
+        // soo the held-back first of a part stays counted whatever order the rows come in
         for r in &rows {
-            let again = r.part.is_some_and(|p| has_part(&have, p));
             if let Some(a) = held.remove(&key(r)?) {
                 news.push(a);
+                let again = r.part.is_some_and(|p| has_part(&have, p));
                 if again && !shared {
                     repost_bytes += r.bytes;
                     reposts += 1;
                 }
-            }
-            if let Some(p) = r.part {
-                insert_part(&mut have, p);
+                if let Some(p) = r.part {
+                    insert_part(&mut have, p);
+                }
             }
         }
     }
     if reposts > 0 {
         let release_id: i64 =
             conn.prepare_cached("select release_id from files where id = ?")?.query_row([file_id], |r| r.get(0))?;
-        // the articles stay, and so does the shard's count of them
+        // the articles stay, and so does the shard's count of them. Postprocessing's growth mark comes down too,
+        // or the next real part would read as no growth
         conn.prepare_cached("update releases set size = size - ?, parts = parts - ? where id = ?")?
             .execute(params![repost_bytes, reposts, release_id])?;
+        conn.prepare_cached("update pp_state set parts_seen = max(parts_seen - ?, 0) where release_id = ?")?
+            .execute(params![reposts, release_id])?;
     }
     for copy in &copies {
         conn.prepare_cached("delete from segments where file_id = ? and local = ? and domain = ?")?
@@ -4001,6 +4006,25 @@ mod tests {
         assert_eq!(totals(&conn), before, "a repost: out of size and parts");
         let kept: i64 = conn.query_row("select count(*) from held_back", [], |r| r.get(0)).unwrap();
         assert_eq!(kept, 0);
+
+        // a new part held back (counted), then a copy of it a save could tell (not counted): the first stays
+        let part4 = |id: &str| Article {
+            message_id: id.into(),
+            subject: "\"a.rar\" yEnc (4/4)".into(),
+            filename: Some("a.rar".into()),
+            part: Some(4),
+            total_parts: Some(4),
+            bytes: 104,
+            ..Default::default()
+        };
+        let one =
+            |a| Release { name: "Rel".into(), group: "alt.binaries.t".into(), articles: vec![a], ..Default::default() };
+        writer.save(&mut conn, &Ids::new(&main), [std::slice::from_ref(&one(part4("<z4@x>")))]).unwrap();
+        let mut sure = ShardWriter::new(shard);
+        sure.save(&mut conn, &Ids::new(&main), [std::slice::from_ref(&one(part4("<a4.again@x>")))]).unwrap();
+        assert_eq!(totals(&conn), (before.0 + 104, before.1 + 1));
+        seal_file(&conn, a).unwrap();
+        assert_eq!(totals(&conn), (before.0 + 104, before.1 + 1), "part 4 counted once, whichever row sorts first");
     }
 
     /// A genuinely new article a save past its decode budget keeps as a row
