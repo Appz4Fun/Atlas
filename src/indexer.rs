@@ -697,6 +697,12 @@ fn housekeeping(
         eprintln!("freezing in shard {} failed: {e}", store.shard);
     }
     drop(span);
+    // the index of quiet releases' message-ids, a cache that is made again when needed (`ShardWriter::prune_ids_some`)
+    let span = crate::metrics::span("db.prune_ids");
+    if store.prune_ids_some(conn, now, idle).is_err() {
+        span.failed();
+    }
+    drop(span);
     // the shared catalog's sent changes, as far as Postgres has them (`shared_catalog::prune_acked`)
     let span = crate::metrics::span("db.catalog_prune");
     if crate::shared_catalog::prune_acked(conn).is_err() {
