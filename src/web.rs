@@ -1729,11 +1729,12 @@ fn spot_html(d: &crate::spotnet::store::Detail, said: &SpotSaid) -> String {
     fact("Sender", sender);
     fact("Tag", escape(&spot.tag));
     let website = spot.website.trim();
-    let lower = website.to_ascii_lowercase();
-    if lower.starts_with("https://") || lower.starts_with("http://") {
-        fact("Website", format!("<a href=\"{}\" rel=\"noreferrer nofollow\">{}</a>", attr(website), escape(website)));
-    } else {
-        fact("Website", escape(website));
+    match crate::spotnet::ubb::web_url(website) {
+        Some(href) => fact(
+            "Website",
+            format!("<a href=\"{}\" rel=\"{}\">{}</a>", attr(href), crate::spotnet::ubb::REL, escape(href)),
+        ),
+        None => fact("Website", escape(website)),
     }
     if let Some(imdb) = d
         .imdb_id
@@ -1766,7 +1767,7 @@ fn spot_html(d: &crate::spotnet::store::Detail, said: &SpotSaid) -> String {
     } else if spot.description.trim().is_empty() {
         "<p class=\"note\">The spot has no description.</p>".to_string()
     } else {
-        format!("<div class=\"panel spot-desc\">{}</div>", spot_text(&spot.description))
+        format!("<div class=\"panel spot-desc\">{}</div>", crate::spotnet::ubb::to_html(&spot.description))
     };
     format!(
         "<h2>Spot</h2><div class=\"panel\"><dl class=\"facts\">{facts}</dl></div><h3>Description</h3>{description}{}",
@@ -1794,51 +1795,12 @@ fn spot_comments_html(comments: &[crate::spotnet::comments::Comment]) -> String 
         }
         let text = match c.state {
             READ if c.body.is_empty() => "<p class=\"note\">An empty comment.</p>".to_string(),
-            READ => format!("<div class=\"spot-desc\">{}</div>", spot_text(&c.body)),
+            READ => format!("<div class=\"spot-desc\">{}</div>", crate::spotnet::ubb::to_html(&c.body)),
             GONE => "<p class=\"note\">Its text couldn't be read: the article is gone, too big to be a comment, or the servers kept failing.</p>".to_string(),
             _ => "<p class=\"note\">Its text is read on the indexer's next spot pass.</p>".to_string(),
         };
         let _ = write!(out, "<div class=\"panel spot-comment\"><p class=\"dim\">{}</p>{text}</div>", by.join(" · "));
     }
-    out
-}
-
-/// A link found in text without what's more likely the sentence's: trailing punctuation, and a closing parenthesis
-/// that has no opening one in the link (`(see https://x.org/a)`), while `https://x.org/Heat_(1995)` keeps its own.
-fn link_end(found: &str) -> &str {
-    let mut url = found;
-    loop {
-        let trimmed = url.trim_end_matches(['.', ',', ';', ':', '!', '?', '\'', '"']);
-        let unbalanced = trimmed.ends_with(')') && trimmed.matches(')').count() > trimmed.matches('(').count();
-        let next = if unbalanced { &trimmed[..trimmed.len() - 1] } else { trimmed };
-        if next.len() == url.len() {
-            return url;
-        }
-        url = next;
-    }
-}
-
-/// A spot's description, or a comment, as HTML: escaped, its line breaks kept, the simple bold, italic and
-/// underline tags it may use dropped, a smiley (`[img=klappen]`) written `:klappen:`, and its web links made links.
-fn spot_text(text: &str) -> String {
-    static FORMATTING: std::sync::LazyLock<regex::Regex> =
-        std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\[/?(?:b|i|u)\]").unwrap());
-    static LINK: std::sync::LazyLock<regex::Regex> =
-        std::sync::LazyLock::new(|| regex::Regex::new(r#"(?i)\bhttps?://[^\s<>"'\[\]]+"#).unwrap());
-    static SMILEY: std::sync::LazyLock<regex::Regex> =
-        std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\[img=([a-z0-9_-]{1,32})\]").unwrap());
-    let text = FORMATTING.replace_all(text.trim(), "");
-    // smileys outside links only: a `[` ends a link, and `:x:` would carry it on
-    let plain = |s: &str| SMILEY.replace_all(&escape(s), ":$1:").into_owned();
-    let mut out = String::with_capacity(text.len());
-    let mut at = 0;
-    for m in LINK.find_iter(&text) {
-        out.push_str(&plain(&text[at..m.start()]));
-        let url = link_end(m.as_str());
-        let _ = write!(out, "<a href=\"{}\" rel=\"noreferrer nofollow\">{}</a>", attr(url), escape(url));
-        at = m.start() + url.len();
-    }
-    out.push_str(&plain(&text[at..]));
     out
 }
 
@@ -4284,22 +4246,15 @@ mod tests {
             "<h3>Comments (3)</h3>",
             "<p class=\"dim\">Olli &lt;W&gt; · spotter ab1 · 2026-08-18 20:53 UTC · rated 8 / 10</p>",
             // a password a commenter wrote, shown as written
-            "Thanks!:klappen:\nWachtwoord: s3cret &lt;b&gt; <a href=\"https://example.org/x_(1)\" rel=\"noreferrer nofollow\">https://example.org/x_(1)</a>:buigen:",
+            "Thanks!:klappen:\nWachtwoord: s3cret &lt;b&gt; <a href=\"https://example.org/x_(1)\" rel=\"noopener noreferrer nofollow\">https://example.org/x_(1)</a>:buigen:",
             "<p class=\"dim\">Penny · 2026-08-18 21:41 UTC · rated 6 / 10</p><p class=\"note\">Its text couldn't be read",
             "<p class=\"dim\">Vector · 2026-08-18 22:23 UTC</p><p class=\"note\">Its text is read on the indexer's next",
             // the description whole, escaped, a password the poster wrote included, its link made a link
-            "Great film\nPassword: s3cr&lt;et\nMore at <a href=\"https://example.org/page?a=1&amp;b=2\" rel=\"noreferrer nofollow\">https://example.org/page?a=1&amp;b=2</a>. Bye",
+            "<b>Great</b> film\nPassword: s3cr&lt;et\nMore at <a href=\"https://example.org/page?a=1&amp;b=2\" rel=\"noopener noreferrer nofollow\">https://example.org/page?a=1&amp;b=2</a>. Bye",
         ] {
             assert!(h.contains(want), "missing {want:?} in {h}");
         }
         assert!(!h.contains("[b]"), "{h}");
-        // a link's own parentheses stay; the sentence's don't
-        assert_eq!(
-            super::link_end("https://en.wikipedia.org/wiki/Heat_(1995_film)"),
-            "https://en.wikipedia.org/wiki/Heat_(1995_film)"
-        );
-        assert_eq!(super::link_end("https://x.org/a)."), "https://x.org/a");
-        assert_eq!(super::link_end("https://x.org/a_(b))"), "https://x.org/a_(b)");
         // a website that isn't a web link is shown, not linked
         let mut odd = d.clone();
         odd.spot.website = "javascript:alert(1)".into();
