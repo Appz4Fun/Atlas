@@ -1329,6 +1329,7 @@ pub fn run() -> i32 {
 
     crate::metrics::start(&config, crate::metrics::Role::Indexer);
     crate::sealed_store::spawn_offload(&config.sealed_log, stop.clone());
+    crate::blob_bytes::spawn(stop.clone());
     crate::shared_catalog::start(&config.shared_catalog, stop.clone());
     if config.metrics.enabled {
         crate::metrics::catalog::spawn(Duration::from_secs(config.metrics.catalog_every_secs), stop.clone());

@@ -8,6 +8,7 @@ pub mod atomic;
 pub mod audio;
 pub mod bg_indexer;
 pub mod blob;
+pub mod blob_bytes;
 pub mod category;
 pub mod chunks;
 pub mod collections;

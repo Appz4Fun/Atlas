@@ -276,11 +276,11 @@ fn contents_of(conn: &Connection, ids: &[i64], recovery: &[i64], with_bytes: Byt
     };
     let mut bytes: HashMap<String, i64> = HashMap::new();
     if read_bytes {
+        // each file's blob count and a sum of its rows (`blob_bytes`): no article is read
         for id in ids {
-            store::each_article(conn, *id, &mut |article| {
-                *bytes.entry(article.filename.unwrap_or_default()).or_default() += article.bytes.unwrap_or(0);
-                Ok(())
-            })?;
+            for (filename, b) in crate::blob_bytes::of_release(conn, *id)? {
+                *bytes.entry(filename).or_default() += b;
+            }
         }
     }
     for file in &mut totals.list {

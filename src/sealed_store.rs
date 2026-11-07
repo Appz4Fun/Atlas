@@ -181,9 +181,13 @@ fn swap_in(
         let (mut swapped, mut changed, mut freed) = (0u64, 0u64, 0u64);
         // a blob that changed meanwhile (more articles sealed into it) keeps its
         // new self, and its copy in the log goes unused
-        let mut swap = conn.prepare_cached("update files set blob = ? where id = ? and blob = ?")?;
+        // what the blob holds is counted on the way, for one from before `blob_bytes` (`blob_bytes.rs`)
+        let mut swap = conn.prepare_cached(
+            "update files set blob = ?, blob_bytes = coalesce(blob_bytes, ?) where id = ? and blob = ?",
+        )?;
         for ((id, blob), at) in batch.iter().zip(places) {
-            if swap.execute(params![at.to_ref(), id, blob])? > 0 {
+            let bytes = crate::blob_bytes::of_blob(blob).ok();
+            if swap.execute(params![at.to_ref(), bytes, id, blob])? > 0 {
                 swapped += 1;
                 freed += (blob.len() - sealed_log::REF_BYTES) as u64;
             } else {
@@ -367,7 +371,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let shard = dir.join("shard.db");
         let conn = crate::db::create_at(&shard).unwrap();
-        conn.execute_batch("create table files (id integer primary key, touched_at integer, blob blob)").unwrap();
+        conn.execute_batch(
+            "create table files (id integer primary key, touched_at integer, blob blob, blob_bytes integer)",
+        )
+        .unwrap();
         let (big, small, recent) = (incompressible(), vec![1u8; 10], incompressible());
         let insert = "insert into files (id, touched_at, blob) values (?, ?, ?)";
         conn.execute(insert, params![1, 100, big]).unwrap();
