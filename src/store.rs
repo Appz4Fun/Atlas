@@ -552,6 +552,12 @@ pub(crate) fn insert_part(bits: &mut Vec<u8>, part: i64) {
     bits[byte] |= 1 << bit;
 }
 
+/// whether `part` is in a file's seen parts (as `insert_part` puts it there)
+pub(crate) fn has_part(bits: &[u8], part: i64) -> bool {
+    (0..=crate::parser::MAX_PARTS).contains(&part)
+        && bits.get((part / 8) as usize).is_some_and(|b| b & (1 << (part % 8)) != 0)
+}
+
 /// exactly parts 1..=expected, or exactly 0..expected for a file numbered from 0, nothing else
 /// (as `parser::is_complete` and `nzb::gaps` count them)
 pub(crate) fn is_exactly(bits: &[u8], expected: i64) -> bool {
@@ -1223,6 +1229,62 @@ fn sealed_segments(conn: &Connection, file_id: i64) -> Result<Option<Vec<crate::
         .optional()?
         .map(|b| crate::blob::decode_capped(&b, READ_MAX_SEGMENTS as usize).map_err(blob_error))
         .transpose()
+}
+
+/// What reposts add to a release beyond one article a part: the bytes and the count of every article whose file
+/// already has its part under another message-id (see the save's `again`). Saves before that counted them in
+/// `releases.size` and `parts`; `atlas --recount-reposts` takes them back out. A file with more rows than a blob
+/// takes is read as far as `READ_MAX_SEGMENTS` goes.
+pub(crate) fn repost_excess(conn: &Connection, release_id: i64) -> Result<(i64, i64)> {
+    let files: Vec<i64> = conn
+        .prepare_cached("select id from files where release_id = ?")?
+        .query_map([release_id], |r| r.get(0))?
+        .collect::<Result<_>>()?;
+    let (mut bytes, mut count) = (0i64, 0i64);
+    for file in files {
+        let mut segs = sealed_segments(conn, file)?.unwrap_or_default();
+        let mut rows =
+            conn.prepare_cached("select part, bytes, domain, local from segments where file_id = ? limit ?")?;
+        let rows = rows.query_map(params![file, READ_MAX_SEGMENTS], |r| {
+            Ok(crate::blob::Seg {
+                part: r.get(0)?,
+                bytes: r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                domain: r.get(2)?,
+                local: r.get(3)?,
+            })
+        })?;
+        // a row that is the blob's own article again (kept past a save's decode budget) is sealing's to drop
+        let held: HashSet<(i64, Vec<u8>)> = segs.iter().map(|s| (s.domain, s.local.clone())).collect();
+        for row in rows {
+            let row = row?;
+            if !held.contains(&(row.domain, row.local.clone())) {
+                segs.push(row);
+            }
+        }
+        let mut seen = Vec::new();
+        for seg in segs {
+            let Some(part) = seg.part else { continue };
+            if has_part(&seen, part) {
+                bytes += seg.bytes;
+                count += 1;
+            } else {
+                insert_part(&mut seen, part);
+            }
+        }
+    }
+    Ok((bytes, count))
+}
+
+/// The parts a release's files have seen, all files together: fewer than its `parts` is the one way it can hold a
+/// repost (or an article without a part number), soo the rest need no blob read.
+pub(crate) fn seen_parts(conn: &Connection, release_id: i64) -> Result<i64> {
+    let mut stmt = conn.prepare_cached("select seen from files where release_id = ?")?;
+    let rows = stmt.query_map([release_id], |r| r.get::<_, Vec<u8>>(0))?;
+    let mut count = 0i64;
+    for seen in rows {
+        count += seen?.iter().map(|b| i64::from(b.count_ones())).sum::<i64>();
+    }
+    Ok(count)
 }
 
 /// Seal a file: its rows (and any blob it already has) become one blob, the
@@ -1899,8 +1961,9 @@ impl ShardWriter {
                     by_file.entry(a.filename.as_deref().unwrap_or("")).or_default().push(a);
                 }
 
-                // and whether each might be a copy of a sealed article (see `SealedCache`)
-                let mut added: Vec<(&Article, bool)> = Vec::new();
+                // and whether each might be a copy of a sealed article (see `SealedCache`), and whether
+                // it's a repost: a part its file already has, under another message-id
+                let mut added: Vec<(&Article, bool, bool)> = Vec::new();
                 for (name, articles) in by_file {
                     let mut f = file(&tx, release_id, name)?;
                     // a release with other files is checked for the same message-id
@@ -1915,6 +1978,7 @@ impl ShardWriter {
                     let before = added.len();
                     let mut timing = Timing::default();
                     for a in articles {
+                        let again = a.part.is_some_and(|p| has_part(&f.seen, p));
                         if add_segment(&tx, domains, &f, index, a, &mut sealed)? {
                             let unsure = f.sealed && sealed.guessed;
                             // an article that may be a copy of one in the blob isn't timed: sealing again can drop
@@ -1933,7 +1997,8 @@ impl ShardWriter {
                             } else {
                                 f.add(a);
                             }
-                            added.push((a, unsure));
+                            // a maybe-copy is counted as before: sealing again takes a true copy back out
+                            added.push((a, unsure, again && !unsure));
                         }
                     }
                     if added.len() > before {
@@ -1970,17 +2035,20 @@ impl ShardWriter {
                 let t = Instant::now();
                 let file_total = added
                     .iter()
-                    .filter(|(_, unsure)| !unsure)
-                    .filter_map(|(a, _)| a.file_total)
+                    .filter(|(_, unsure, _)| !unsure)
+                    .filter_map(|(a, _, _)| a.file_total)
                     .chain(old_file_total)
                     .max();
                 let old_parts = old_parts.unwrap_or(0);
                 let earlier_size = if old_parts > 0 { old_size.unwrap_or(0) } else { 0 };
                 let complete = release_complete(&tx, release_id, file_total)?;
+                // a repost of a part (the same file posted again, under other message-ids) is kept, but the
+                // release's size and parts count each part once: five reposts of a 40 GB post are 40 GB
+                let counted = || added.iter().filter(|(_, _, again)| !again);
                 update_stats.execute(params![
-                    earlier_size + added.iter().map(|(a, _)| a.bytes).sum::<i64>(),
+                    earlier_size + counted().map(|(a, _, _)| a.bytes).sum::<i64>(),
                     complete as i64,
-                    old_parts + added.len() as i64,
+                    old_parts + counted().count() as i64,
                     file_total,
                     release_id
                 ])?;
@@ -2886,6 +2954,51 @@ mod tests {
         };
         save(&main, &[release]).unwrap();
         (dir, main)
+    }
+
+    /// The same file posted again under other message-ids (an uploader posting a post five times over, every
+    /// article the same) keeps every article, but the release's size and parts count each part once: in the
+    /// first save, in a later one, and in a late one to a file already sealed.
+    #[test]
+    fn a_repost_of_a_part_is_kept_but_counted_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+        let art = |part: i64, copy: u8| Article {
+            message_id: format!("<p{part}c{copy}@x>"),
+            subject: format!("\"a.rar\" yEnc ({part}/2)"),
+            filename: Some("a.rar".into()),
+            part: Some(part),
+            total_parts: Some(2),
+            bytes: 1_000 + part,
+            ..Default::default()
+        };
+        let rel =
+            |articles| Release { name: "Rel".into(), group: "alt.binaries.t".into(), articles, ..Default::default() };
+        let conn = || db::open_at(&shard_path(&main, shard_of("alt.binaries.t"))).unwrap();
+        let totals = || -> (i64, i64) {
+            conn()
+                .query_row("select size, parts from releases where name = 'Rel'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+        };
+        save(&main, &[rel(vec![art(1, 0), art(1, 1), art(2, 0)])]).unwrap();
+        assert_eq!(totals(), (2_003, 2), "the copy of part 1 isnt counted");
+        save(&main, &[rel(vec![art(2, 1), art(1, 2)])]).unwrap();
+        assert_eq!(totals(), (2_003, 2));
+        let c = conn();
+        let file: i64 = c.query_row("select id from files where filename = 'a.rar'", [], |r| r.get(0)).unwrap();
+        let rows: i64 = c.query_row("select count(*) from segments where file_id = ?", [file], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 5, "every copy is kept");
+        seal_file(&c, file).unwrap();
+        assert_eq!(totals(), (2_003, 2), "sealing changes nothing");
+        save(&main, &[rel(vec![art(2, 3)])]).unwrap();
+        assert_eq!(totals(), (2_003, 2), "a late copy to a sealed file isnt counted either");
+        save(&main, &[rel(vec![art(2, 3)])]).unwrap();
+        assert_eq!(totals(), (2_003, 2));
+        // what a save before this counted on top, which `--recount-reposts` takes out: the blob and the late row
+        let id: i64 = c.query_row("select id from releases where name = 'Rel'", [], |r| r.get(0)).unwrap();
+        assert_eq!(repost_excess(&c, id).unwrap(), (1_001 + 1_002 + 1_001 + 1_002, 4));
+        assert_eq!(seen_parts(&c, id).unwrap(), 2);
     }
 
     #[test]
@@ -4344,6 +4457,8 @@ mod tests {
         before_collections(&main, "a.jpg", "<a@x>", "p");
         // a new part of it, a copy of what it has, and a new file of the same post
         let mut late = in_collection("k", "a.jpg", "a.jpg", "<a2@x>", "p");
+        // its second part: the same part again under another message-id would be a repost, not counted
+        late.articles[0].part = Some(2);
         late.articles.extend(in_collection("k", "a.jpg", "a.jpg", "<a@x>", "p").articles);
         late.articles.extend(in_collection("k", "a.jpg", "b.jpg", "<b@x>", "p").articles);
         save(&main, &[late]).unwrap();

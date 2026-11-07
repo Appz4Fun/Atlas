@@ -219,10 +219,16 @@ fn from_regex(re: &Regex, base: &str) -> Option<String> {
 /// post's articles, and whether a regex of the group said it
 fn clean(base: &str, group: &str, release_name: &str, regexes: &[Regex]) -> (String, bool) {
     match regexes.iter().find_map(|r| from_regex(r, base)) {
-        Some(name) => (name, true),
+        // some of upstream's regexes take a recovery volume's tag into the name: `\.vol\d+\+\d+\.par2"` then
+        // another quote never matches, and the lazy name runs on to `.vol015+016`. Every volume would be a post
+        // of its own, apart from the files it repairs
+        Some(name) => (VOLUME_TAIL.replace(&name, "").into_owned(), true),
         None => (clean_generic(base, group, release_name), false),
     }
 }
+
+/// a PAR2 recovery volume's tag at the end of what a group regex took: `.vol015+016`, `.vol00-01`
+static VOLUME_TAIL: LazyLock<Regex> = LazyLock::new(|| insensitive(r"\.vol\d+[+-]\d+$"));
 
 /// letters and digits in a cleaned name, a `yEnc` left in it not counted
 fn name_strength(clean: &str) -> usize {
@@ -450,6 +456,19 @@ mod tests {
         assert_eq!(a, clean(r#"[01/12] "Artist Name - Song One.mp3" yEnc (1/8)"#, G), "by extension too");
         let hit = clean(r#"Some_Artist_Name-404 "00-some_artist-unknown-2009.sfv" yEnc"#, music);
         assert_eq!(hit, r#"Some_Artist_Name-404 ""#);
+    }
+
+    /// alt.binaries.hdtv.x264's rule 362 asks for a quote after `.vol015+016.par2"`, soo a volume's name ran on to its
+    /// tag and each recovery volume was a release of its own (seen 2026-11-07, a 14-volume ngPost post).
+    #[test]
+    fn a_group_regex_keeps_recovery_volumes_with_their_post() {
+        let group = "alt.binaries.hdtv.x264";
+        let name = |s: &str| clean(&subject_base(s), group, "", &compiled(group));
+        let rar = name(r#"[002/114] "Film 1982 1080p Blu-ray AVC-Grp.part001.rar" (1/512)"#);
+        assert!(rar.1, "a group regex takes it");
+        assert_eq!(name(r#"[105/114] "Film 1982 1080p Blu-ray AVC-Grp.vol015+016.par2" (1/119)"#), rar);
+        assert_eq!(name(r#"[001/114] "Film 1982 1080p Blu-ray AVC-Grp.par2" (1/1)"#), rar);
+        assert_eq!(name(r#"[114/114] "Film 1982 1080p Blu-ray AVC-Grp.vol547+007.PAR2" (1/53)"#), rar);
     }
 
     #[test]

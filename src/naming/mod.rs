@@ -5,6 +5,7 @@ pub mod clean;
 pub mod decide;
 pub mod judge;
 pub mod obfuscation;
+pub mod recount;
 pub mod reflag;
 pub mod regexes;
 pub mod steps;

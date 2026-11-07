@@ -3633,8 +3633,10 @@ fn parse_overview(line: &[u8]) -> Option<Overview> {
             .and_then(|v| v.trim().parse::<i64>().ok())
             .unwrap_or(0)
     };
-    let subject = str_field(fields.next());
-    let from = str_field(fields.next());
+    // some servers keep their overview as UTF-8 read as cp1252 and written out again: the same article's subject
+    // from them and from the rest would name two releases
+    let subject = undo_mojibake(str_field(fields.next()));
+    let from = undo_mojibake(str_field(fields.next()));
     let date = str_field(fields.next());
     let message_id = str_field(fields.next());
     let references = str_field(fields.next());
@@ -3656,6 +3658,42 @@ fn parse_overview(line: &[u8]) -> Option<Overview> {
         lines,
         xref_groups,
     })
+}
+
+/// cp1252's 0x80..=0x9F as a decoder makes them chars. The five it leaves out come through as U+0081 and the like,
+/// which is how Latin-1 has every byte, soo `cp1252_byte` takes those as their own byte.
+const CP1252_HIGH: [char; 32] = [
+    '\u{20ac}', '\u{81}', '\u{201a}', '\u{192}', '\u{201e}', '\u{2026}', '\u{2020}', '\u{2021}', '\u{2c6}', '\u{2030}',
+    '\u{160}', '\u{2039}', '\u{152}', '\u{8d}', '\u{17d}', '\u{8f}', '\u{90}', '\u{2018}', '\u{2019}', '\u{201c}',
+    '\u{201d}', '\u{2022}', '\u{2013}', '\u{2014}', '\u{2dc}', '\u{2122}', '\u{161}', '\u{203a}', '\u{153}', '\u{9d}',
+    '\u{17e}', '\u{178}',
+];
+
+/// The byte a cp1252 (or Latin-1) decoder made `c` of. None: no such byte, soo the text wasnt made that way.
+fn cp1252_byte(c: char) -> Option<u8> {
+    match u32::from(c) {
+        u @ 0..=0xFF => Some(u as u8),
+        _ => CP1252_HIGH.iter().position(|h| *h == c).map(|i| 0x80 + i as u8),
+    }
+}
+
+/// Text that is UTF-8 read as cp1252 (or Latin-1) and encoded again, as it was: `CultFilmsâ„¢` is `CultFilms™`.
+/// Only when every char maps back to a byte and the bytes are UTF-8, which a real Latin-1 accent next to ASCII never
+/// is (`Café`'s é is a lone 0xE9). Undone up to three times: a subject posted that way once already comes from such a
+/// server twice over, and both have to end up the same.
+pub(crate) fn undo_mojibake(text: String) -> String {
+    let mut text = text;
+    for _ in 0..3 {
+        if text.is_ascii() {
+            break;
+        }
+        let Some(bytes) = text.chars().map(cp1252_byte).collect::<Option<Vec<u8>>>() else { break };
+        match String::from_utf8(bytes) {
+            Ok(fixed) if fixed != text => text = fixed,
+            _ => break,
+        }
+    }
+    text
 }
 
 /// The groups an overview's `Xref:` field names: `Xref: host group:number group:number`, the full-header form
@@ -4586,6 +4624,45 @@ mod tests {
             assert_eq!(chunk2.len(), 5_000);
             assert_eq!(conn.wire, 10_000);
         });
+    }
+
+    /// XSNews keeps some overviews as UTF-8 read as cp1252 and written again (seen 2026-11-07 on a ngPost post): the
+    /// same article from it and from Eweka must give one subject, or one post is two releases.
+    #[test]
+    fn a_subject_a_server_encoded_twice_reads_as_the_others_send_it() {
+        let eweka: &[u8] = "1\t[002/114] \"Film 1982-CultFilms\u{2122}.part001.rar\" (1/512)\tx@ngPost.com\t26 Oct 26 04:58:14 GMT\t<a@ngPost>\t\t730143\t5657\t".as_bytes();
+        // ™ is E2 84 A2: read as cp1252 that is â „ ¢
+        let twice = "Film 1982-CultFilms\u{e2}\u{201e}\u{a2}";
+        let xsnews = format!(
+            "1\t[002/114] \"{twice}.part001.rar\" (1/512)\tx@ngPost.com\t26 Oct 26 04:58:14 GMT\t<a@ngPost>\t\t730143\t5657\t"
+        );
+        let (a, b) = (parse_overview(eweka).unwrap(), parse_overview(xsnews.as_bytes()).unwrap());
+        assert_eq!(a.subject, b.subject);
+        assert!(a.subject.contains("CultFilms\u{2122}.part001.rar"), "{}", a.subject);
+    }
+
+    #[test]
+    fn mojibake_is_undone_only_where_it_is_mojibake() {
+        use super::undo_mojibake as undo;
+        let s = |t: &str| t.to_string();
+        // once, twice (a subject posted that way, then encoded again by the server), and Latin-1 controls
+        assert_eq!(undo(s("espa\u{c3}\u{b1}ol")), "espa\u{f1}ol");
+        assert_eq!(undo(s("He\u{c3}\u{a2}\u{e2}\u{201a}\u{ac}\u{e2}\u{201e}\u{a2}s")), "He\u{2019}s");
+        assert_eq!(undo(s("CultFilms\u{e2}\u{84}\u{a2}")), "CultFilms\u{2122}");
+        // real text stays: an accent next to ASCII isnt UTF-8, nor is a dash before one, and other scripts dont map
+        for real in [
+            "Caf\u{e9}",
+            "Pok\u{e9}mon \u{2013} S\u{e9}rie",
+            "\u{41c}\u{43e}\u{441}\u{43a}\u{432}\u{430}",
+            "na\u{ef}ve",
+            "\u{2122}",
+            "plain",
+            "\u{fffd}x",
+        ] {
+            assert_eq!(undo(s(real)), real);
+        }
+        // mixed with a char no cp1252 byte makes: left as it is
+        assert_eq!(undo(s("espa\u{c3}\u{b1}ol \u{4e2d}")), "espa\u{c3}\u{b1}ol \u{4e2d}");
     }
 
     #[test]
