@@ -803,7 +803,11 @@ impl Search {
         }
         if found.is_empty() && (self.hide_incomplete || self.min_score.is_some()) {
             // every row of this page was incomplete: there may be complete ones further on
-            let what = if self.hide_incomplete { "complete" } else { "rated that high" };
+            let what = match (self.hide_incomplete, self.min_score.is_some()) {
+                (true, true) => "complete and rated that high",
+                (true, false) => "complete",
+                _ => "rated that high",
+            };
             let note = format!(
                 "<tr><td colspan=\"{COLUMNS}\" class=\"note dim\">Nothing {what} in these {PAGE_SIZE}.</td></tr>"
             );
@@ -823,6 +827,11 @@ impl Search {
                     self.fold_split_post(conn.as_ref(), r, &mut HashMap::new());
                     !self.hides(r)
                 });
+            }
+            // nor does one the rating chips leave out
+            if self.min_score.is_some() {
+                let scores = kept_scores(&before.iter().map(|r| r.id).collect::<Vec<_>>());
+                before.retain(|r| !self.rated_out(r.id, &scores));
             }
             let ids: Vec<i64> = before.iter().filter(|r| tagged(r)).chain(found.iter()).map(|r| r.id).collect();
             let hidden = crate::duplicates::later_copies(&ids).unwrap_or_default();
@@ -867,7 +876,12 @@ impl Search {
 
     /// Whether a release is left out for its score: below the least asked for, or none kept.
     fn rated_out(&self, id: i64, scores: &HashMap<i64, i64>) -> bool {
-        self.min_score.is_some_and(|min| scores.get(&id).is_none_or(|s| *s < min))
+        self.scored_out(scores.get(&id).copied())
+    }
+
+    /// `rated_out`, for a row whose score is already known.
+    fn scored_out(&self, score: Option<i64>) -> bool {
+        self.min_score.is_some_and(|min| score.is_none_or(|s| s < min))
     }
 
     /// Makes a row of a post say what all of the post comes to. When another row stands for it, that row's id: the
@@ -982,6 +996,13 @@ impl Search {
             let _ = write!(
                 hint,
                 "Incomplete releases are hidden. <a href=\"/?{shown}\" hx-get=\"/ui/results?{shown}\" hx-target=\"#results\">Show them</a>. "
+            );
+        }
+        if self.min_score.is_some() {
+            let all = attr(&Search { offset: 0, min_score: None, ..self.clone() }.query(&self.cat, 0));
+            let _ = write!(
+                hint,
+                "Only releases rated that high are shown, by the scores kept so far. <a href=\"/?{all}\" hx-get=\"/ui/results?{all}\" hx-target=\"#results\">Show every rating</a>. "
             );
         }
         if !self.q.is_empty() {
@@ -1157,6 +1178,8 @@ struct ShownRow {
     folded: bool,
     /// the row brought in to show here, for a post whose own row wasn't in the window
     brings: Option<i64>,
+    /// the best kept score of the row it shows (`score_value`), for the rating chips
+    score: Option<i64>,
 }
 
 /// The first `SORT_WINDOW` results of one search, whatever the sort, kept in memory: choosing a column only puts these
@@ -1225,12 +1248,21 @@ impl Window {
             if !places.contains(&place) {
                 continue;
             }
-            let carried = ShownRow { html: row.html.clone(), size: row.size, folded: row.folded, brings: row.brings };
+            let carried = ShownRow {
+                html: row.html.clone(),
+                size: row.size,
+                folded: row.folded,
+                brings: row.brings,
+                score: row.score,
+            };
             shown.insert(place, carried);
             if let Some(listed) = row.brings.filter(|_| !row.folded) {
                 brought.insert(listed);
                 if places.contains(&listed) {
-                    shown.insert(listed, ShownRow { html: String::new(), size: row.size, folded: true, brings: None });
+                    shown.insert(
+                        listed,
+                        ShownRow { html: String::new(), size: row.size, folded: true, brings: None, score: None },
+                    );
                 }
             }
         }
@@ -1294,7 +1326,8 @@ impl Window {
         let mut kept = Vec::with_capacity(rows.len());
         let mut split = HashMap::new();
         let mut done = Vec::with_capacity(rows.len());
-        let left_out = |r: &ReleaseRow| ShownRow { html: String::new(), size: r.size, folded: true, brings: None };
+        let left_out =
+            |r: &ReleaseRow| ShownRow { html: String::new(), size: r.size, folded: true, brings: None, score: None };
         for r in rows {
             let place = r.id;
             let mut r = r.clone();
@@ -1321,9 +1354,12 @@ impl Window {
                 Some(_) => done.push((place, left_out(&r))),
             }
         }
+        // by the row each place shows, which for a post brought in isn't the window's own row
+        let scores = kept_scores(&kept.iter().map(|r| r.id).collect::<Vec<_>>());
         for ((place, r), html) in places.into_iter().zip(&kept).zip(rows_html(&kept, split)) {
             let brings = (r.id != place).then_some(r.id);
-            done.push((place, ShownRow { html, size: r.size, folded: false, brings }));
+            let score = scores.get(&r.id).copied();
+            done.push((place, ShownRow { html, size: r.size, folded: false, brings, score }));
         }
         self.publish(done);
     }
@@ -1362,7 +1398,11 @@ impl Window {
         let skip = usize::try_from(search.offset).unwrap_or(0);
         let wanted = PAGE_SIZE as usize + 1;
         // hiding incomplete ones, a page can pass many rows it leaves out: they're rendered several pages at a time
-        let batch = if search.hide_incomplete { PAGE_SIZE as usize * FILL_THREADS } else { PAGE_SIZE as usize };
+        let batch = if search.hide_incomplete || search.min_score.is_some() {
+            PAGE_SIZE as usize * FILL_THREADS
+        } else {
+            PAGE_SIZE as usize
+        };
         loop {
             let mut page = Vec::with_capacity(wanted);
             let mut missing = Vec::new();
@@ -1371,11 +1411,8 @@ impl Window {
                 let mut passed = 0;
                 for &place in order.iter() {
                     let r = &self.rows[place];
-                    if search.rated_out(r.id, self.scores()) {
-                        continue;
-                    }
                     match shown.get(&r.id) {
-                        Some(row) if row.folded => continue,
+                        Some(row) if row.folded || search.scored_out(row.score) => continue,
                         Some(row) => {
                             if passed >= skip {
                                 page.push(row.html.clone());
@@ -1480,10 +1517,11 @@ fn still_kept(slot: &Arc<WindowSlot>) -> bool {
 
 fn slot_of(search: &Search, always: bool) -> Arc<WindowSlot> {
     // a sort read from the database in its own order has a window of its own; any other reads the newest
+    // the rating chips only pick among rendered rows, soo they share the window of the search without them
     let plain = if search.in_order() {
-        Search { offset: 0, ..search.clone() }
+        Search { offset: 0, min_score: None, ..search.clone() }
     } else {
-        Search { offset: 0, sort: None, descending: true, ..search.clone() }
+        Search { offset: 0, sort: None, descending: true, min_score: None, ..search.clone() }
     };
     // by the categories the filter comes to, not how the url spells them: `8000,x1` and `8000,x2` are one window
     let key = format!("{}|{:?}", plain.query("", 0), parse_filter(&plain.cat));
@@ -2213,7 +2251,7 @@ fn scope_inputs(search: &Search, oob: &str) -> String {
         if search.deep { " checked" } else { "" }
     );
     format!(
-        "<details id=\"scope\" class=\"more-fields\"{open}{oob}><summary>More fields</summary><div class=\"field-grid\">{}{}{}{}{}{}{}</div>{}{}{}{}{}</details>",
+        "<details id=\"scope\" class=\"more-fields\"{open}{oob}><summary>More fields</summary><div class=\"field-grid\">{}{}{}{}{}{}{}</div>{}{}{}{}{}{}</details>",
         field("group", "Usenet group", &search.fields.group),
         field("poster", "Poster", &search.fields.poster),
         field("email", "Email", &search.fields.email),
@@ -2224,6 +2262,7 @@ fn scope_inputs(search: &Search, oob: &str) -> String {
         deep,
         hidden("filters", &search.filters.join(",")),
         hidden(INCOMPLETE_ARG, if search.hide_incomplete { HIDE } else { "" }),
+        hidden(RATED_ARG, &search.min_score.map_or(String::new(), |m| m.to_string())),
         hidden("sort", search.sort.map_or("", SortBy::word)),
         hidden(
             "dir",
@@ -4373,7 +4412,7 @@ mod tests {
     }
 
     fn shown(html: &str, size: i64, folded: bool) -> ShownRow {
-        ShownRow { html: html.into(), size: Some(size), folded, brings: None }
+        ShownRow { html: html.into(), size: Some(size), folded, brings: None, score: None }
     }
 
     #[test]
@@ -5201,7 +5240,7 @@ mod tests {
         let old = window_of_rows(vec![row(1), row(2)]);
         old.publish(vec![
             (1, shown("<tr>1</tr>", 1, false)),
-            (2, ShownRow { html: "<tr>9</tr>".into(), size: Some(20), folded: false, brings: Some(9) }),
+            (2, ShownRow { html: "<tr>9</tr>".into(), size: Some(20), folded: false, brings: Some(9), score: None }),
         ]);
         let grown = window_of_rows(vec![row(1), row(2), row(9), row(3)]);
         grown.carry_from(&old);
@@ -5210,6 +5249,28 @@ mod tests {
         assert!(shown[&9].folded, "its own row, read in now, doesn't show it a second time");
         assert!(!shown.contains_key(&3), "new rows are rendered when a page reaches them");
         assert!(lock(&grown.brought).contains(&9));
+    }
+
+    #[test]
+    fn the_rating_chips_go_by_the_row_a_place_shows_and_share_its_window() {
+        let row = |id: i64| ReleaseRow { id, size: Some(id), ..Default::default() };
+        let w = window_of_rows(vec![row(1), row(2), row(3)]);
+        let scored =
+            |html: &str, brings, score| ShownRow { html: html.into(), size: Some(1), folded: false, brings, score };
+        // place 2 shows post 9, which is rated; place 1's own row isn't
+        w.publish(vec![
+            (1, scored("<tr>1</tr>", None, None)),
+            (2, scored("<tr>9</tr>", Some(9), Some(80))),
+            (3, scored("<tr>3</tr>", None, Some(65))),
+        ]);
+        let rated = |q: &str| Search::from_args(&parse_query(q));
+        assert_eq!(w.page(&rated("q=x&rated=70"), None).0, ["<tr>9</tr>"]);
+        assert_eq!(w.page(&rated("q=x&rated=60"), None).0, ["<tr>9</tr>", "<tr>3</tr>"]);
+        assert_eq!(w.page(&rated("q=x"), None).0.len(), 3);
+        let sorted = |q: &str| rated(&format!("q=x&sort=size{q}"));
+        assert!(Arc::ptr_eq(&slot_of(&sorted(""), false), &slot_of(&sorted("&rated=70"), false)), "one window");
+        let inputs = scope_inputs(&rated("q=x&rated=80"), "");
+        assert!(inputs.contains("name=\"rated\" value=\"80\""), "a new search keeps the chip: {inputs}");
     }
 
     #[test]
