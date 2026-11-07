@@ -220,7 +220,7 @@ fn split_zip_marker_off(mut stream: Vec<u8>) -> Vec<u8> {
 
 /// Where an NZB starts in these bytes, if one does, in one pass: at its first `<nzb`, or at an XML prolog or doctype
 /// shortly before it (`nzb::is_nzb` wants the root within 4 KiB of the start).
-fn nzb_start(bytes: &[u8]) -> Option<usize> {
+pub(crate) fn nzb_start(bytes: &[u8]) -> Option<usize> {
     let root = bytes.windows(4).position(|w| w.eq_ignore_ascii_case(b"<nzb"))?;
     let window = root.saturating_sub(4096);
     let before = &bytes[window..root];
