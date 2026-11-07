@@ -112,6 +112,27 @@ pub struct Batch {
     pub fetch_failed: bool,
     /// blobs fetched from the sealed log
     pub fetched: usize,
+    /// the failed fetch couldn't reach the sealed log at all (not counted as a try at that blob)
+    pub log_down: bool,
+}
+
+/// Whether a fetch failed on the way to the sealed log (it's down, or no address is set), not on what it answered.
+fn log_down(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::*;
+    matches!(
+        e.kind(),
+        NotConnected
+            | ConnectionRefused
+            | ConnectionReset
+            | ConnectionAborted
+            | TimedOut
+            | BrokenPipe
+            | WouldBlock
+            | AddrNotAvailable
+            | HostUnreachable
+            | NetworkUnreachable
+            | NetworkDown
+    )
 }
 
 /// One batch of a shard's uncounted blobs past `after` (up to `WINDOW` ids on) counted. A blob that won't decode stays
@@ -151,7 +172,7 @@ fn count_batch_with(
             let last: Option<i64> = conn.query_row("select max(id) from files", [], |r| r.get(0))?;
             if last.is_none_or(|last| after + WINDOW >= last) {
                 if batch.is_empty() {
-                    return Ok(Batch { next: None, counted: 0, fetch_failed: false, fetched: 0 });
+                    return Ok(Batch { next: None, counted: 0, fetch_failed: false, fetched: 0, log_down: false });
                 }
                 batch.last().map_or(after, |b| b.0)
             } else {
@@ -160,10 +181,10 @@ fn count_batch_with(
         }
     };
     let mut counted: Vec<(i64, &[u8], i64)> = Vec::new();
-    let (mut fetches, mut fetch_failed) = (0usize, false);
+    let (mut fetches, mut fetch_failed, mut down) = (0usize, false, false);
     for (id, blob) in &batch {
         if stop.load(Ordering::Relaxed) {
-            return Ok(Batch { next: Some(after), counted: 0, fetch_failed: false, fetched: 0 });
+            return Ok(Batch { next: Some(after), counted: 0, fetch_failed: false, fetched: 0, log_down: false });
         }
         let remote = crate::blob::is_remote(blob);
         if remote && fetches == FETCHES {
@@ -175,9 +196,10 @@ fn count_batch_with(
         let fetched = if remote {
             match fetch(blob) {
                 Ok(raw) => Some(raw),
-                Err(_) => {
+                Err(e) => {
                     next = id - 1;
                     fetch_failed = true;
+                    down = log_down(&e);
                     break;
                 }
             }
@@ -190,7 +212,7 @@ fn count_batch_with(
         }
     }
     if counted.is_empty() {
-        return Ok(Batch { next: Some(next), counted: 0, fetch_failed, fetched: fetches });
+        return Ok(Batch { next: Some(next), counted: 0, fetch_failed, fetched: fetches, log_down: down });
     }
     let mut tries = 0;
     loop {
@@ -222,6 +244,7 @@ fn count_batch_with(
             counted: n,
             fetch_failed,
             fetched: fetches,
+            log_down: down,
         }),
         Err(e) => {
             let _ = conn.execute_batch("rollback");
@@ -270,10 +293,13 @@ fn run(main: &Path, skip_over: usize, stop: &AtomicBool) {
                 count_batch_with(&conn, after, stop, skip_over, &fetch)
             });
             match batch {
-                Ok(Batch { next: Some(next), counted, fetch_failed, fetched }) => {
+                Ok(Batch { next: Some(next), counted, fetch_failed, fetched, log_down }) => {
                     total += counted;
                     let mut next = next;
-                    if fetch_failed {
+                    if fetch_failed && log_down {
+                        // the log out of reach: no try at the blob, the same one again in a while
+                        waiting.insert(shard.clone(), Instant::now() + FETCH_REST);
+                    } else if fetch_failed {
                         // the blob after `next` wasn't fetched: again in a while, given up on after `FETCH_TRIES`
                         let tries = match failing.get(shard) {
                             Some((id, n)) if *id == next + 1 => n + 1,
@@ -297,7 +323,10 @@ fn run(main: &Path, skip_over: usize, stop: &AtomicBool) {
                     println!("blob bytes: {} done, {total} blobs counted so far", shard.display());
                     write_cursor(shard, 0, now);
                 }
-                Err(e) => eprintln!("blob bytes: {}: {e}", shard.display()),
+                Err(e) => {
+                    eprintln!("blob bytes: {}: {e}", shard.display());
+                    waiting.insert(shard.clone(), Instant::now() + FETCH_REST);
+                }
             }
         }
         nap(if busy { REST } else { Duration::from_secs(3600) });
@@ -435,7 +464,7 @@ mod tests {
         let unreachable = |_: &[u8]| Err(std::io::Error::from(std::io::ErrorKind::NotConnected));
         // out of reach: it stops before the blob in the log, to try it again
         let batch = count_batch_with(&conn, 0, &stop, 0, &unreachable).unwrap();
-        assert_eq!(batch, Batch { next: Some(1), counted: 1, fetch_failed: true, fetched: 1 });
+        assert_eq!(batch, Batch { next: Some(1), counted: 1, fetch_failed: true, fetched: 1, log_down: true });
         assert_eq!((count(1), count(2), count(3)), (Some(4), None, None));
         // what came back is cut short and won't decode: passed over, and the pass goes on
         let whole = local(&[1, 2, 3]);
@@ -487,7 +516,7 @@ mod tests {
         // with the offload moving blobs over a byte, it leaves every one of these to it
         assert_eq!(count_batch_with(&conn, 0, &stop, 1, &fetch).unwrap().counted, 0);
         let batch = count_batch(&conn, 0, &stop).unwrap();
-        assert_eq!(batch, Batch { next: Some(3), counted: 2, fetch_failed: false, fetched: 0 });
+        assert_eq!(batch, Batch { next: Some(3), counted: 2, fetch_failed: false, fetched: 0, log_down: false });
         assert_eq!(count_batch(&conn, 3, &stop).unwrap().next, None);
         let counts: Vec<Option<i64>> = conn
             .prepare("select blob_bytes from files order by id")
