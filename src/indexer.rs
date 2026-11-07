@@ -359,6 +359,9 @@ pub(crate) type StageWork = Box<dyn FnOnce(&Connection) -> rusqlite::Result<()> 
 pub(crate) struct StageJob {
     /// what the job is, for its own `atlas_function_duration_seconds` series (`db.stage.*`)
     kind: &'static str,
+    /// goes ahead of the other stage work, and runs after every save whatever stage work's share is
+    /// (`Db::on_writer_first`): a few small writes someone waits on, not a backlog
+    first: bool,
     work: StageWork,
     done: std::sync::mpsc::SyncSender<std::result::Result<(), String>>,
 }
@@ -451,7 +454,7 @@ fn writer(
             None => match jobs.recv_timeout(wait) {
                 Ok(WriterJob::Save(job)) => job,
                 Ok(WriterJob::Stage(job)) => {
-                    stage.push_back(job);
+                    queue_stage(&mut stage, job);
                     continue;
                 }
                 // nothing to save: files still come due as they go stale
@@ -489,7 +492,7 @@ fn writer(
         while batch.len() < MAX_BATCH {
             match jobs.try_recv() {
                 Ok(WriterJob::Save(job)) => batch.push(job),
-                Ok(WriterJob::Stage(job)) => stage.push_back(job),
+                Ok(WriterJob::Stage(job)) => queue_stage(&mut stage, job),
                 Err(_) => break,
             }
         }
@@ -525,6 +528,14 @@ fn writer(
         }
         bank = (bank + t.elapsed().as_secs_f64() * STAGE_SHARE).min(STAGE_BANK);
         last_save = Some(std::time::Instant::now());
+        // jobs that go first run now, whatever stage work's share
+        if stage.front().is_some_and(|job| job.first) {
+            let mut firsts: std::collections::VecDeque<StageJob> = Default::default();
+            while stage.front().is_some_and(|job| job.first) {
+                firsts.extend(stage.pop_front());
+            }
+            run_stage_jobs(&mut opened, path, &mut firsts, None);
+        }
         if bank > 0.0 {
             bank -= run_stage_jobs(&mut opened, path, &mut stage, Some(STAGE_BUDGET_BUSY));
         }
@@ -541,7 +552,7 @@ fn writer(
                         seal = false;
                         break;
                     }
-                    Ok(WriterJob::Stage(job)) => stage.push_back(job),
+                    Ok(WriterJob::Stage(job)) => queue_stage(&mut stage, job),
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         seal = false;
@@ -592,6 +603,16 @@ fn run_stage_jobs(
         }
     }
     start.elapsed().as_secs_f64()
+}
+
+/// Queues stage work: one that goes first ahead of the rest (behind any other that goes first), the rest in turn.
+fn queue_stage(stage: &mut std::collections::VecDeque<StageJob>, job: StageJob) {
+    if job.first {
+        let at = stage.iter().take_while(|queued| queued.first).count();
+        stage.insert(at, job);
+    } else {
+        stage.push_back(job);
+    }
 }
 
 fn stage_transaction(conn: &Connection, work: StageWork) -> rusqlite::Result<()> {
@@ -673,7 +694,22 @@ impl Db {
     ) -> Result<std::sync::mpsc::Receiver<std::result::Result<(), String>>> {
         let (done, answer) = std::sync::mpsc::sync_channel(1);
         self.saves[shard]
-            .send(WriterJob::Stage(StageJob { kind, work, done }))
+            .send(WriterJob::Stage(StageJob { kind, work, done, first: false }))
+            .map_err(|_| anyhow!("db writer stopped"))?;
+        Ok(answer)
+    }
+
+    /// `on_writer` for a small job someone waits on: it goes ahead of the queued stage work and runs right after the
+    /// next save, whatever stage work's share. Behind a backlog of processing work an ordinary job can wait minutes.
+    pub(crate) fn on_writer_first(
+        &self,
+        shard: usize,
+        kind: &'static str,
+        work: StageWork,
+    ) -> Result<std::sync::mpsc::Receiver<std::result::Result<(), String>>> {
+        let (done, answer) = std::sync::mpsc::sync_channel(1);
+        self.saves[shard]
+            .send(WriterJob::Stage(StageJob { kind, work, done, first: true }))
             .map_err(|_| anyhow!("db writer stopped"))?;
         Ok(answer)
     }
@@ -2943,6 +2979,41 @@ mod tests {
         let conn = db::open_at(&main).unwrap();
         let shard = crate::store::shard_path(&main, 0);
         (dir, shared_db(conn), shard)
+    }
+
+    #[test]
+    fn a_job_that_goes_first_runs_ahead_of_queued_stage_work() {
+        let (_dir, db, _shard) = stage_db();
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let job = |name: &'static str, slow: bool| -> StageWork {
+            let order = order.clone();
+            Box::new(move |_| {
+                if slow {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                order.lock().unwrap().push(name);
+                Ok(())
+            })
+        };
+        let mut answers: Vec<_> = (0..10).map(|_| db.on_writer(0, "db.stage.test", job("queued", true)).unwrap()).collect();
+        answers.push(db.on_writer_first(0, "db.stage.test", job("first", false)).unwrap());
+        for answer in answers {
+            answer.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+        }
+        let order = order.lock().unwrap();
+        let at = order.iter().position(|n| *n == "first").unwrap();
+        assert!(at < 3, "ran {at}th: {order:?}");
+    }
+
+    #[test]
+    fn jobs_that_go_first_keep_their_own_order() {
+        let (done, _answer) = std::sync::mpsc::sync_channel(1);
+        let job = |first, kind| StageJob { kind, work: Box::new(|_| Ok(())), done: done.clone(), first };
+        let mut stage = std::collections::VecDeque::new();
+        for (first, kind) in [(false, "a"), (true, "f1"), (false, "b"), (true, "f2")] {
+            queue_stage(&mut stage, job(first, kind));
+        }
+        assert_eq!(stage.iter().map(|j| j.kind).collect::<Vec<_>>(), ["f1", "f2", "a", "b"]);
     }
 
     #[test]

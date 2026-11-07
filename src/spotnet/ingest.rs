@@ -27,6 +27,9 @@ const MAX_NZB_ARTICLES: usize = 16;
 const MAX_NZB_POSTED: usize = 16 * 1024 * 1024;
 /// What `body_capped` may read past its cap before it gives up: one long line.
 const CAP_OVERSHOOT: usize = 64 * 1024;
+/// Spots decoded and on their way to being saved at once. Each save waits behind indexing's on its shard's writer
+/// (seconds to minutes on a busy indexer), so one at a time was the pass's pace.
+const DECODING: usize = 4;
 /// NZB article bytes one pass reads at most; the spots left wait for the next pass.
 const MAX_PASS_POSTED: usize = 256 * 1024 * 1024;
 
@@ -163,9 +166,12 @@ struct Shared {
     /// NZB article bytes the pass may still read: each BODY reserves the most it can take first, and gives back
     /// what it didn't read
     budget: AtomicUsize,
-    /// one spot at a time from inflating its NZB to tagging its release: decoding is the memory a spot takes (an
-    /// NZB of up to 64 MB, up to 300,000 articles), and the copy checks, save and tag must not interleave
-    decoding: tokio::sync::Mutex<()>,
+    /// `DECODING` spots at a time from inflating their NZB to tagging their release: decoding is the memory a spot
+    /// takes (an NZB of up to 64 MB, up to 300,000 articles), held until its save is done
+    decoding: tokio::sync::Semaphore,
+    /// one spot of a shard at a time through the copy checks, save and tag: spots of one title go to the same group,
+    /// and so the same shard (copies of one NZB in other shards are kept apart by `claims`)
+    saving: Vec<tokio::sync::Mutex<()>>,
     /// NZB keys (and NZB article sets, `ref:`) of spots being read, saved or tagged in this pass whose outcome isn't
     /// in spots_seen yet
     claims: std::sync::Mutex<std::collections::HashSet<String>>,
@@ -177,7 +183,8 @@ impl Shared {
     fn new(budget: usize) -> Shared {
         Shared {
             budget: AtomicUsize::new(budget),
-            decoding: Default::default(),
+            decoding: tokio::sync::Semaphore::new(DECODING),
+            saving: (0..crate::store::SHARDS).map(|_| Default::default()).collect(),
             claims: Default::default(),
             stopping: Default::default(),
         }
@@ -248,7 +255,11 @@ async fn fetch(
     if shared.stopping.load(Ordering::Relaxed) {
         return Ok(None);
     }
-    let head = match pool.fetch_head(&format!("<{message_id}>"), MAX_XML_BYTES * 4).await {
+    // each step timed (`atlas_function_duration_seconds{function="spots.*"}`), to see where a slow pass waits
+    let span = crate::metrics::span("spots.head");
+    let head = pool.fetch_head(&format!("<{message_id}>"), MAX_XML_BYTES * 4).await;
+    drop(span);
+    let head = match head {
         Ok(Some(head)) => head,
         Ok(None) => return Ok(Some(skipped(None))),
         Err(e) if says_absent(&e) => return Ok(Some(skipped(None))),
@@ -293,7 +304,10 @@ async fn fetch(
         if shared.stopping.load(Ordering::Relaxed) || !shared.reserve(most) {
             return Ok(None);
         }
-        match pool.fetch_body_capped(&format!("<{segment}>"), cap).await {
+        let span = crate::metrics::span("spots.body");
+        let body = pool.fetch_body_capped(&format!("<{segment}>"), cap).await;
+        drop(span);
+        match body {
             Ok(Some(body)) => {
                 shared.give_back(most.saturating_sub(body.len()));
                 bodies.push(body);
@@ -309,8 +323,10 @@ async fn fetch(
             }
         }
     }
-    // one spot at a time from here (`Shared::decoding`)
-    let _decoding = shared.decoding.lock().await;
+    // `DECODING` spots at a time from here (`Shared::decoding`)
+    let span = crate::metrics::span("spots.wait_turn");
+    let _decoding = shared.decoding.acquire().await.expect("the pass's semaphore is never closed");
+    drop(span);
     let parts: Vec<&[u8]> = bodies.iter().map(Vec::as_slice).collect();
     let Some(nzb) = binary::nzb(&parts) else { return Ok(Some(skipped(Some(nzb_ref)))) };
     let parsed = crate::archive::nzb::parse_keeping(&nzb, release::MAX_SEGMENTS);
@@ -332,6 +348,7 @@ async fn fetch(
     }
     let Some(claimed) = shared.claim(&nzb_key) else { return Ok(None) };
     claims.push(claimed);
+    let _saving = shared.saving[shard].lock().await;
     // an edit or repost of a spot already saved (its release maybe frozen since): that release gets the newer
     // spot, and nothing is saved
     let k = nzb_key.clone();
@@ -368,7 +385,9 @@ async fn fetch(
         release::rename(&mut release, &own);
     }
     let name = release.name.clone();
+    let span = crate::metrics::span("spots.save");
     db.save(vec![release]).await?;
+    drop(span);
     // tagged on its shard's writer after the save: the save doesn't say which id the release got
     let title = row.spot.title.clone();
     let id = on_shard(db, shard, move |conn| store::tag(conn, &name, &group, &row)).await?;
@@ -403,7 +422,8 @@ async fn on_shard<T: Send + 'static>(
 ) -> Result<T> {
     let out = Arc::new(std::sync::Mutex::new(None));
     let into = out.clone();
-    let answer = db.on_writer(
+    // ahead of the processing stage's queued work: behind it, one of these waited many minutes on prod
+    let answer = db.on_writer_first(
         shard,
         "db.stage.spots",
         Box::new(move |conn| {
@@ -411,8 +431,10 @@ async fn on_shard<T: Send + 'static>(
             Ok(())
         }),
     )?;
-    tokio::task::spawn_blocking(move || answer.recv())
-        .await
+    let span = crate::metrics::span("spots.writer");
+    let answered = tokio::task::spawn_blocking(move || answer.recv()).await;
+    drop(span);
+    answered
         .map_err(|e| anyhow!("spot task failed: {e}"))?
         .map_err(|_| anyhow!("db writer stopped"))?
         .map_err(|e| anyhow!("spots: {e}"))?;
