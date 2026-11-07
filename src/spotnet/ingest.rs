@@ -117,7 +117,14 @@ pub async fn pass(pool: &Arc<Pool>, db: &Db, config: &SpotsConfig, stopping: &im
     let comments_off = !config.comments;
     on_db(db, move |conn| Ok(store::prune(conn, now)? + if comments_off { comments::prune(conn, now)? } else { 0 }))
         .await?;
-    if !config.blacklist_url.is_empty() {
+    if config.blacklist_url.is_empty() {
+        // turned off: the list kept goes too, so it no longer removes anything
+        match on_db(db, |conn| Ok(blacklist::clear(conn)?)).await {
+            Ok(0) => {}
+            Ok(n) => println!("spots: the blacklist is off, {n} spotters taken off it"),
+            Err(e) => eprintln!("spots: blacklist: {e:#}"),
+        }
+    } else {
         refresh_blacklist(db, &config.blacklist_url, now).await;
     }
     match backfill_xml(pool, db, stopping).await {

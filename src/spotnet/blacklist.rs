@@ -81,6 +81,14 @@ pub fn replace(conn: &mut Connection, spotters: &[String], now: i64) -> Result<u
     Ok(spotters.len())
 }
 
+/// Empties the list kept, for a blacklist turned off; the next one turned on is read at once. Returns how many
+/// spotters it named.
+pub fn clear(conn: &Connection) -> rusqlite::Result<usize> {
+    let n = conn.execute("delete from spot_blacklist", [])?;
+    conn.execute("delete from meta where key = ?", [READ_AT])?;
+    Ok(n)
+}
+
 /// Notes a failed read, so it's tried again at the next refresh, not every pass.
 pub fn tried(conn: &Connection, now: i64) -> rusqlite::Result<()> {
     super::store::write_cursor(conn, READ_AT, now.max(0) as u64)
@@ -132,5 +140,9 @@ mod tests {
         assert_eq!(left, ["xyz"]);
         tried(&conn, 400).unwrap();
         assert!(!due(&conn, 401).unwrap());
+        // turned off: nothing left, and turned on again it's read at once
+        assert_eq!(clear(&conn).unwrap(), 1);
+        assert_eq!(clear(&conn).unwrap(), 0);
+        assert!(due(&conn, 402).unwrap());
     }
 }
