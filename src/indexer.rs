@@ -447,6 +447,8 @@ fn writer(
     // jobs from the `firsts` lane waiting to run: a few at a time between saves (`STAGE_BUDGET_BUSY`), outside stage
     // work's share
     let mut firsts: std::collections::VecDeque<StageJob> = Default::default();
+    // when the WAL is copied into the shard and starts over: by its size or age, not after every save (#228)
+    let mut checkpoints = db::Checkpoints::for_writer();
 
     loop {
         run_firsts(&mut opened, path, &first_jobs, &mut firsts);
@@ -481,7 +483,7 @@ fn writer(
                 }
                 Err(RecvTimeoutError::Timeout) if stage.is_empty() => {
                     if let Ok(conn) = &mut opened {
-                        housekeeping(conn, &mut store, true, true);
+                        housekeeping(conn, &mut store, &mut checkpoints, true, true);
                     }
                     last_housekeeping = std::time::Instant::now();
                     continue;
@@ -494,7 +496,7 @@ fn writer(
                     }
                     if last_housekeeping.elapsed() >= Duration::from_secs(1) {
                         if let Ok(conn) = &mut opened {
-                            housekeeping(conn, &mut store, true, false);
+                            housekeeping(conn, &mut store, &mut checkpoints, true, false);
                         }
                         last_housekeeping = std::time::Instant::now();
                     }
@@ -572,7 +574,7 @@ fn writer(
             }
             // nothing came in meanwhile and no stage work waits: the writer would sit idle
             let idle = next.is_none() && stage.is_empty() && saved;
-            housekeeping(conn, &mut store, seal, idle);
+            housekeeping(conn, &mut store, &mut checkpoints, seal, idle);
             last_housekeeping = std::time::Instant::now();
         }
     }
@@ -642,8 +644,6 @@ fn stage_transaction(conn: &Connection, work: StageWork) -> rusqlite::Result<()>
     }
 }
 
-/// A writer's work between saves: seal some of what is due (when `seal`),
-/// and copy the WAL into the shard.
 /// Only the idle freezing of `housekeeping`, for a writer woken with nothing to do between its housekeepings.
 fn freeze_idle(conn: &mut Connection, store: &mut crate::store::ShardWriter) {
     let t = std::time::Instant::now();
@@ -657,8 +657,16 @@ fn freeze_idle(conn: &mut Connection, store: &mut crate::store::ShardWriter) {
     crate::profile::Load::add_since(&crate::profile::LOAD.writer_busy_ns, t);
 }
 
+/// A writer's work between saves: seal some of what is due (when `seal`),
+/// and copy the WAL into the shard once `checkpoints` says it is due.
 /// `idle`: nothing waits for the writer, soo freezing may take longer (`frozen::Ticker::tick_idle`).
-fn housekeeping(conn: &mut Connection, store: &mut crate::store::ShardWriter, seal: bool, idle: bool) {
+fn housekeeping(
+    conn: &mut Connection,
+    store: &mut crate::store::ShardWriter,
+    checkpoints: &mut db::Checkpoints,
+    seal: bool,
+    idle: bool,
+) {
     use crate::profile::{LOAD, Load};
     use std::sync::atomic::Ordering::Relaxed;
 
@@ -690,7 +698,7 @@ fn housekeeping(conn: &mut Connection, store: &mut crate::store::ShardWriter, se
     drop(span);
     let checkpointing = std::time::Instant::now();
     let span = crate::metrics::span("db.checkpoint");
-    if db::finish_checkpoint(conn).is_err() {
+    if checkpoints.checkpoint_if_due(conn).is_err() {
         span.failed();
     }
     drop(span);
