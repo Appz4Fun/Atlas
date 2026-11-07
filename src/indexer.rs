@@ -533,7 +533,9 @@ fn writer(
         let span = crate::metrics::span("db.save_batch");
         let result = match &mut opened {
             Ok(conn) => {
-                store.save(conn, ids, batch.iter().map(|job| job.releases.as_slice())).map_err(|e| e.to_string())
+                db::with_full_flush(conn, |conn| store.save(conn, ids, batch.iter().map(|job| job.releases.as_slice())))
+                    .and_then(|saved| saved)
+                    .map_err(|e| e.to_string())
             }
             Err(e) => Err(format!("couldnt open {}: {e}", path.display())),
         };

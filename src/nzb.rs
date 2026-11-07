@@ -381,6 +381,73 @@ pub fn build_nzb_file_checked(release_id: i64, file: usize) -> Result<Option<Nzb
     crate::metrics::timed("nzb.build_file", || one_file_nzb(release_id, file))
 }
 
+/// One file of a release, as its listing and `t=files` show it: where the whole NZB puts it, from 1.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListedFile {
+    pub n: usize,
+    /// None: its articles had no file name, soo only `n` picks it
+    pub name: Option<String>,
+    /// as posted: the articles' bytes, yEnc and all
+    pub bytes: i64,
+    pub articles: usize,
+}
+
+/// The files of `articles` in the order the whole NZB lists them.
+fn listed(articles: &[ArticleRow]) -> Vec<ListedFile> {
+    files(articles)
+        .into_iter()
+        .enumerate()
+        .map(|(at, file)| ListedFile {
+            n: at + 1,
+            name: file.first().and_then(|a| a.filename.clone()),
+            bytes: file.iter().filter_map(|a| a.bytes).sum(),
+            articles: file.len(),
+        })
+        .collect()
+}
+
+/// The files a release's whole NZB lists, gaps filled from its copies as `t=get` fills them. None: no such release.
+pub fn file_list(release_id: i64) -> Result<Option<Vec<ListedFile>>> {
+    crate::metrics::timed("nzb.file_list", || {
+        let Some(release) = get_release(release_id)? else { return Ok(None) };
+        let (articles, _) = filled_inventory(&release)?;
+        Ok(Some(listed(&articles)))
+    })
+}
+
+/// The articles of every file named `name` in the whole NZB of `articles`: the one file, or, in an upload linked by
+/// its PAR2 set, each row's file of that name, which the NZB keeps apart as `name #id` and a release page lists as one.
+fn files_named(articles: &[ArticleRow], name: &str) -> Vec<ArticleRow> {
+    let apart = format!("{name} #");
+    files(articles)
+        .into_iter()
+        .filter(|file| {
+            file.first().and_then(|a| a.filename.as_deref()).is_some_and(|f| {
+                f == name
+                    || f.strip_prefix(&apart).is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+            })
+        })
+        .flatten()
+        .cloned()
+        .collect()
+}
+
+/// One file of a release as its own NZB, picked by its name: a release page links each file this way, since its
+/// list is sorted by name and not in the NZB's order.
+pub fn build_nzb_named_checked(release_id: i64, name: &str) -> Result<Option<NzbBuild>> {
+    crate::metrics::timed("nzb.build_file", || {
+        let Some(release) = get_release(release_id)? else { return Ok(None) };
+        let (articles, groups) = filled_inventory(&release)?;
+        let one = files_named(&articles, name);
+        if name.is_empty() || one.is_empty() {
+            return Ok(None);
+        }
+        let built = render_checked(&release, &one, &groups, false);
+        note_gaps(&release, &built);
+        Ok(Some(built))
+    })
+}
+
 fn one_file_nzb(release_id: i64, file: usize) -> Result<Option<NzbBuild>> {
     let Some(release) = get_release(release_id)? else { return Ok(None) };
     let (articles, groups) = filled_inventory(&release)?;
@@ -425,6 +492,42 @@ pub fn generate_nzb(release_id: i64, output_dir: Option<&Path>) -> Result<PathBu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn files_are_listed_and_picked_in_the_nzbs_order() {
+        let art = |file: Option<&str>, part: i64, bytes: i64| ArticleRow {
+            message_id: format!("<{file:?}{part}@x>"),
+            filename: file.map(String::from),
+            part: Some(part),
+            total_parts: Some(2),
+            bytes: Some(bytes),
+            subject: None,
+            poster: None,
+            posted_date: None,
+        };
+        let articles =
+            [art(Some("b.mkv"), 1, 10), art(Some("a.par2"), 1, 3), art(Some("b.mkv"), 2, 5), art(None, 1, 7)];
+        let list = listed(&articles);
+        assert_eq!(
+            list,
+            vec![
+                ListedFile { n: 1, name: Some("b.mkv".into()), bytes: 15, articles: 2 },
+                ListedFile { n: 2, name: Some("a.par2".into()), bytes: 3, articles: 1 },
+                ListedFile { n: 3, name: None, bytes: 7, articles: 1 },
+            ]
+        );
+        assert_eq!(files_named(&articles, "a.par2").len(), 1);
+        assert!(files_named(&articles, "c.nfo").is_empty());
+        assert_eq!(files_named(&articles, "b.mkv").len(), 2);
+        // a linked upload's second row of the same name, kept apart in the NZB, comes along
+        let linked = [
+            art(Some("v.par2"), 1, 1),
+            art(Some("v.par2 #42"), 1, 1),
+            art(Some("v.par2 #x"), 1, 1),
+            art(Some("v.par2 #"), 1, 1),
+        ];
+        assert_eq!(files_named(&linked, "v.par2").len(), 2);
+    }
 
     #[test]
     fn filenames_are_safe() {
