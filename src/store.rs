@@ -288,6 +288,9 @@ impl Ids {
         let mut range = self.range.lock().unwrap();
         if range.0 >= range.1 {
             let conn = db::open_at(&self.main)?;
+            // on disk before any save uses the block: the shards' saves are synced at commit, and atlas.db's WAL
+            // only once checkpointed, up to a minute on (#228). A power cut must not hand out the same ids again
+            conn.execute_batch("pragma main.synchronous = full")?;
             let end: i64 = conn.query_row(
                 "update meta set value = value + ? where key = 'next_seq' returning value",
                 [ID_BLOCK],

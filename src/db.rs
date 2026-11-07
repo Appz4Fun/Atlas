@@ -197,7 +197,13 @@ pub fn tune_for_writing(conn: &Connection) -> Result<()> {
 /// quick, the background checkpointer has done the bulk of it already.
 /// The writer calls it through `Checkpoints::checkpoint_if_due`, not after every save.
 pub fn finish_checkpoint(conn: &Connection) -> Result<()> {
-    conn.query_row("pragma wal_checkpoint(passive)", [], |_| Ok(()))
+    passive_checkpoint(conn).map(|_| ())
+}
+
+/// A passive checkpoint of every database of `conn`; false when it was busy
+/// (another connection was checkpointing), which isnt an error to SQLite.
+fn passive_checkpoint(conn: &Connection) -> Result<bool> {
+    conn.query_row("pragma wal_checkpoint(passive)", [], |r| r.get::<_, i64>(0)).map(|busy| busy == 0)
 }
 
 /// Frames in the WAL of `conn`'s database `schema` (main, or an attached one),
@@ -297,19 +303,18 @@ impl Checkpoints {
         if waiting <= 0 {
             return Ok(false);
         }
-        if self.last.elapsed() >= self.age {
-            return Ok(true);
-        }
         let quoted = schema.replace('"', "\"\"");
         let page_size = conn
             .prepare_cached(&format!("pragma \"{quoted}\".page_size"))?
             .query_row([], |r| r.get::<_, i64>(0))?
             .max(512);
+        let aged = self.last.elapsed() >= self.age;
         Ok(if self.whole_wal {
+            // the writer copies a little at most, also when its age comes: the background copying does the bulk
             let (log, waiting) = (log * page_size, waiting * page_size);
-            log >= 2 * self.due_bytes || (log >= self.due_bytes && waiting <= self.copy_bytes)
+            log >= 2 * self.due_bytes || ((aged || log >= self.due_bytes) && waiting <= self.copy_bytes)
         } else {
-            waiting * page_size >= self.due_bytes
+            aged || waiting * page_size >= self.due_bytes
         })
     }
 
@@ -318,8 +323,10 @@ impl Checkpoints {
         if !self.due(conn)? {
             return Ok(false);
         }
-        finish_checkpoint(conn)?;
-        self.last = Instant::now();
+        // a checkpoint that was busy copied nothing: the age rule asks again next time
+        if passive_checkpoint(conn)? {
+            self.last = Instant::now();
+        }
         Ok(true)
     }
 }
@@ -948,6 +955,10 @@ mod tests {
         let mut aged = Checkpoints::new(1 << 40, false, Duration::ZERO);
         assert!(!aged.due(&conn).unwrap(), "nothing waits");
         fill(&conn, 1);
+        let mut aged_writer = Checkpoints::new(1 << 40, true, Duration::ZERO);
+        assert!(aged_writer.due(&conn).unwrap(), "the writer's age comes too");
+        aged_writer.copy_bytes = 0;
+        assert!(!aged_writer.due(&conn).unwrap(), "but it copies only a little: more waits than it would");
         assert!(aged.checkpoint_if_due(&conn).unwrap());
     }
 

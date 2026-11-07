@@ -1154,6 +1154,12 @@ pub fn thaw_by_hand(main: &Path, id: i64) -> Result<Thawed> {
     let shard = crate::store::shard_path(main, crate::store::shard_of_id(id));
     let conn = crate::db::open_shard(&shard)?;
     attach(&conn, &shard)?;
+    // like the shard's writer: the live row synced at commit like the frozen file's delete, and the commit not
+    // copying whatever waits in the shard's WAL (`db::OCCASIONAL_WRITER_AUTOCHECKPOINT`)
+    conn.execute_batch(&format!(
+        "pragma main.synchronous = full; pragma wal_autocheckpoint = {}",
+        crate::db::OCCASIONAL_WRITER_AUTOCHECKPOINT
+    ))?;
     conn.execute_batch("begin immediate")?;
     match thaw(&conn, id, true, chrono::Utc::now().timestamp()) {
         Ok(t) => {
