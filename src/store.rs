@@ -1263,7 +1263,10 @@ pub(crate) fn repost_excess(conn: &Connection, release_id: i64) -> Result<Excess
         }
         let rows: Vec<crate::blob::Seg> = rows.collect::<Result<_>>()?;
         for row in rows {
-            if !held.contains(&seg_key(conn, &mut suffixes, &row)?) {
+            if held.contains(&seg_key(conn, &mut suffixes, &row)?) {
+                // counted in `parts` till sealing drops it: the recount's cap leaves it for sealing
+                out.unseen += 1;
+            } else {
                 segs.push(row);
             }
         }
@@ -1291,7 +1294,8 @@ pub(crate) struct Excess {
     /// reposts: their bytes and how many
     pub bytes: i64,
     pub count: i64,
-    /// articles with no part number (or one no `seen` holds), counted in `parts` all the same
+    /// articles counted in `parts` that are neither in a `seen` nor reposts: no part number (or one no `seen`
+    /// holds), and a copy of a blob's own article that sealing will take out
     pub unseen: i64,
 }
 

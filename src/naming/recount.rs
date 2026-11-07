@@ -93,9 +93,13 @@ fn apply_shard(
     let write = |tx: &Connection, ids: &[(i64, i64)]| -> rusqlite::Result<()> {
         // the reposted articles stay, and so does the shard's count of articles: only the release's size and parts
         let mut update = tx.prepare_cached("update releases set size = size - ?, parts = parts - ? where id = ?")?;
+        // postprocessing's growth mark comes down with it, or the next real part would read as no growth
+        let mut mark =
+            tx.prepare_cached("update pp_state set parts_seen = max(parts_seen - ?, 0) where release_id = ?")?;
         for (id, parts) in ids {
             if let Some((bytes, count)) = excess(tx, *id, *parts)? {
                 update.execute(params![bytes, count, id])?;
+                mark.execute(params![count, id])?;
                 fixed.fetch_add(1, Relaxed);
             }
         }
