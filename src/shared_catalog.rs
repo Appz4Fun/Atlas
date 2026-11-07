@@ -452,17 +452,29 @@ pub fn carry_outbox(conn: &Connection) -> rusqlite::Result<bool> {
         .query_map([], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     let changed = cols.iter().map(|c| format!("r.{0} is not o.{0}", quote(c))).collect::<Vec<_>>().join(" or ");
+    // the next seq stays past every one given out, an emptied outbox's too: the original's AUTOINCREMENT mark if
+    // it has one (an outbox from before AUTOINCREMENT, and its shard, have none), and its last row's
+    let has_sequence: i64 = conn.query_row(
+        "select count(*) from old.sqlite_schema where type = 'table' and name = 'sqlite_sequence'",
+        [],
+        |r| r.get(0),
+    )?;
+    let marked: i64 = if has_sequence > 0 {
+        conn.query_row(
+            &format!("select coalesce((select seq from old.sqlite_sequence where name = '{OUTBOX}'), 0)"),
+            [],
+            |r| r.get(0),
+        )?
+    } else {
+        0
+    };
+    let last: i64 = conn.query_row(&format!("select coalesce(max(seq), 0) from old.{OUTBOX}"), [], |r| r.get(0))?;
+    let high = marked.max(last);
     conn.execute_batch(&format!(
         "{ddl}
          insert into main.{OUTBOX} (seq, tbl, k1, k2, at) select seq, tbl, k1, k2, at from old.{OUTBOX} order by seq;
-         -- the next seq stays past every one given out, an emptied outbox's too
-         update main.sqlite_sequence set seq = max(seq,
-             coalesce((select seq from old.sqlite_sequence where name = '{OUTBOX}'), 0),
-             coalesce((select max(seq) from old.{OUTBOX}), 0))
-         where name = '{OUTBOX}';
-         insert into main.sqlite_sequence (name, seq)
-         select '{OUTBOX}', max(coalesce((select seq from old.sqlite_sequence where name = '{OUTBOX}'), 0),
-                                coalesce((select max(seq) from old.{OUTBOX}), 0))
+         update main.sqlite_sequence set seq = max(seq, {high}) where name = '{OUTBOX}';
+         insert into main.sqlite_sequence (name, seq) select '{OUTBOX}', {high}
          where not exists (select 1 from main.sqlite_sequence where name = '{OUTBOX}');
          insert into main.{OUTBOX} (tbl, k1, k2)
          select 'releases', r.id, null from main.releases r join old.releases o on o.id = r.id
@@ -1564,6 +1576,34 @@ mod tests {
         copy.execute("insert into catalog_outbox (tbl, k1) values ('releases', 8)", []).unwrap();
         let seq: i64 = copy.query_row("select max(seq) from catalog_outbox", [], |r| r.get(0)).unwrap();
         assert_eq!(seq, 5, "past the 4 the original gave out, though its outbox was empty");
+    }
+
+    #[test]
+    fn a_compaction_carries_an_outbox_from_before_autoincrement() {
+        let dir = tempfile::tempdir().unwrap();
+        let orig = dir.path().join("orig.db");
+        Connection::open(&orig)
+            .unwrap()
+            .execute_batch(
+                "create table releases (id INTEGER PRIMARY KEY, name TEXT);
+                 create table catalog_outbox (seq INTEGER PRIMARY KEY, tbl TEXT NOT NULL, k1, k2, at INTEGER NOT NULL DEFAULT 0);
+                 insert into catalog_outbox (seq, tbl, k1) values (6, 'releases', 8);",
+            )
+            .unwrap();
+        let copy = Connection::open(dir.path().join("copy.db")).unwrap();
+        copy.execute_batch("create table releases (id INTEGER PRIMARY KEY, name TEXT);").unwrap();
+        copy.execute("attach database ?1 as old", [orig.to_string_lossy()]).unwrap();
+        assert!(carry_outbox(&copy).unwrap(), "no sqlite_sequence in the original: still carried");
+        copy.execute_batch("detach database old").unwrap();
+        copy.execute("insert into catalog_outbox (tbl, k1) values ('releases', 16)", []).unwrap();
+        let seqs: Vec<i64> = copy
+            .prepare("select seq from catalog_outbox order by seq")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(seqs, [6, 7]);
     }
 
     #[test]
