@@ -571,6 +571,7 @@ mod tests {
         assert!(!prints_match(&[], &[(0, b)]));
     }
 
+    #[cfg(feature = "ac3")]
     #[test]
     fn ac3_and_a_5_1_eac3_match_the_aac_encode() {
         let aac = fixture("tune.aac.mkv");
@@ -579,7 +580,7 @@ mod tests {
         let (_, c) = print_of("other.aac.mkv", other.len() / 5, 3_000).unwrap();
         for name in ["tune.ac3.mkv", "tune.eac3.mkv"] {
             let file = fixture(name);
-            let (at, d) = print_of(name, file.len() / 5, 3_000).unwrap();
+            let (at, d) = print_of(name, file.len() / 5, 3_000).expect(name);
             assert!((3_000..3_100).contains(&at), "{name}: {at}");
             assert!(audio::informative(&d), "{name}");
             assert!(audio::same_sound(&a, &d), "{name}: {:?}", audio::best_alignment(&a, &d));
@@ -663,7 +664,7 @@ mod tests {
     fn only_decodable_matroska_sound_at_a_fair_bit_rate_is_planned() {
         let p = plan(&probe("A_AAC", "matroska", 5_400.0)).unwrap();
         assert_eq!((p.duration_ms, p.size, p.stored, p.window_ms), (5_400_000, 2_000_000_000, false, WINDOW_MS));
-        assert!(plan(&probe("A_EAC3", "matroska", 5_400.0)).is_ok());
+        assert_eq!(plan(&probe("A_EAC3", "matroska", 5_400.0)).is_ok(), cfg!(feature = "ac3"));
         assert_eq!(plan(&probe("A_TRUEHD", "matroska", 5_400.0)), Err("truehd"));
         assert_eq!(plan(&probe("A_DTS", "matroska", 5_400.0)), Err("dts"));
         assert_eq!(plan(&probe("A_AAC", "mp4", 5_400.0)), Err("container"));

@@ -25,13 +25,12 @@ enum Codec {
     PcmBe,
     PcmFloat,
     /// AC-3 and E-AC-3 syncframes, one or more to a block
+    #[cfg_attr(not(feature = "ac3"), allow(dead_code))]
     Ac3,
 }
 
 /// The Matroska codec ids decoded here.
-const READ: [&str; 12] = [
-    "A_AC3",
-    "A_EAC3",
+const READ: [&str; 10] = [
     "A_AAC",
     "A_AAC/MPEG2/LC",
     "A_AAC/MPEG4/LC",
@@ -54,6 +53,7 @@ fn codec(id: &str) -> Option<Codec> {
         "A_PCM/INT/LIT" => Codec::PcmLe,
         "A_PCM/INT/BIG" => Codec::PcmBe,
         "A_PCM/FLOAT/IEEE" => Codec::PcmFloat,
+        #[cfg(feature = "ac3")]
         "A_AC3" | "A_EAC3" => Codec::Ac3,
         _ => return None,
     })
@@ -62,7 +62,7 @@ fn codec(id: &str) -> Option<Codec> {
 /// Why a track of codec `id` (the Matroska codec id, as the probe keeps it) can't be fingerprinted, in a word or
 /// two; None when it can.
 pub fn why_not(id: &str) -> Option<&'static str> {
-    if READ.contains(&id) {
+    if READ.contains(&id) || cfg!(feature = "ac3") && matches!(id, "A_AC3" | "A_EAC3") {
         return None;
     }
     let upper = id.to_ascii_uppercase();
@@ -94,7 +94,10 @@ pub fn decode(track: &AudioTrack, frames: &[&[u8]], max_ms: i64) -> Option<(u32,
     let max_ms = max_ms.clamp(0, MAX_MS);
     std::panic::catch_unwind(|| match codec {
         Codec::PcmLe | Codec::PcmBe | Codec::PcmFloat => pcm(track, codec, frames, max_ms),
+        #[cfg(feature = "ac3")]
         Codec::Ac3 => ac3(frames, max_ms),
+        #[cfg(not(feature = "ac3"))]
+        Codec::Ac3 => None,
         _ => with_symphonia(track, codec, frames, max_ms),
     })
     .ok()
@@ -178,6 +181,7 @@ fn with_symphonia(track: &AudioTrack, codec: Codec, frames: &[&[u8]], max_ms: i6
     Some((rate?, out))
 }
 
+#[cfg(feature = "ac3")]
 /// AC-3 and E-AC-3: each block holds whole syncframes, E-AC-3's dependent substreams among them (they decode to no
 /// channels and add nothing). A block's samples are those of all its syncframes in turn; a block with a syncframe
 /// that doesn't decode keeps none, as another codec's frame that doesn't decode.
@@ -223,6 +227,7 @@ fn ac3(frames: &[&[u8]], max_ms: i64) -> Option<(u32, Vec<Vec<i16>>)> {
     Some((rate?, out))
 }
 
+#[cfg(feature = "ac3")]
 /// AC-3 channels (WAV order: the front ones, LFE, then the surrounds) mixed down to one: front left and right at
 /// full level, centre and surrounds at -3 dB, LFE left out, as a stereo downmix of the same film hears it; soo a
 /// 5.1 AC-3 track and a stereo AAC encode of it print alike.
@@ -356,8 +361,9 @@ mod tests {
     fn codecs_without_a_decoder_say_why() {
         assert_eq!(why_not("A_AAC"), None);
         assert_eq!(why_not("A_FLAC"), None);
-        assert_eq!(why_not("A_AC3"), None);
-        assert_eq!(why_not("A_EAC3"), None);
+        let ac3 = if cfg!(feature = "ac3") { None } else { Some("ac3") };
+        assert_eq!(why_not("A_AC3"), ac3);
+        assert_eq!(why_not("A_EAC3"), ac3);
         assert_eq!(why_not("A_AC3/BSID9"), Some("ac3"));
         assert_eq!(why_not("A_DTS/MA"), Some("dts"));
         assert_eq!(why_not("A_TRUEHD"), Some("truehd"));
@@ -423,6 +429,7 @@ mod tests {
         assert_eq!(out.len(), 600, "never more than a minute");
     }
 
+    #[cfg(feature = "ac3")]
     #[test]
     fn ac3_downmix_leaves_out_the_lfe() {
         // 3/2 with LFE: L R C LFE Ls Rs
