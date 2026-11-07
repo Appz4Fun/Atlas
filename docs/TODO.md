@@ -6,9 +6,9 @@ Deliberately not done, with why, so it can be picked up later.
 
 The 2026-11-02 metadata and linking research lives in [research/](research/README.md). Its own list of what is left to build (probe fixes, archive and container facts, twin and alt keys, linking split posts) is [research/TODO.md](research/TODO.md).
 
-## Result totals count releases, not rows
+## Result totals count releases, not rows (past one window)
 
-The total over each results page (`web::Search::total`) counts releases in the word index, or in the database for field searches. A page shows a post spread over several groups, and an upload linked by its PAR2 set, as one row, soo the total can be more than the rows. With "Hide copies" or "Hide incomplete" on, the total says "Up to": what they leave out is worked out per row as it's shown. Fix: keep in the index whether a release is folded into another (`upload_link` rows that aren't the lead; split posts need their grouping stored first), whether it's a later copy, and whether its whole post is complete, with triggers queueing a release when any of them change, and count without them.
+The total over each results page (`web::Search::total`) counts releases in the word index, or in the database for field searches. A page shows a post spread over several groups, and an upload linked by its PAR2 set, as one row, soo that count can be more than the rows. With "Hide copies", "Hide incomplete" or a rating chip on, it says "Up to". When the count is 2,000 (`SORT_WINDOW`) or less, the page then asks `/ui/total`, which renders the search's whole window and counts the rows it shows, leaving out folded rows, later copies, incomplete and unrated ones. That count is exact. A bigger search keeps the index's count. Fix for those: keep in the index whether a release is folded into another (`upload_link` rows that aren't the lead; split posts need their grouping stored first), whether it's a later copy, and whether its whole post is complete, with triggers queueing a release when any of them change, and count without them. This needs a full rebuild of the word index.
 
 ## Lent articles are not yet checked against the set
 
