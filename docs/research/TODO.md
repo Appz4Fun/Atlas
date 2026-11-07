@@ -16,23 +16,24 @@ Source: [container-metadata/FINAL-REPORT.md](container-metadata/FINAL-REPORT.md)
 - [x] (RPU presence, profile, FEL/MEL and CM version are read; L5/L6/L9/L11 values are not kept yet) Dolby Vision from the first RPU (FEL/MEL, CM 2.9/4.0, L5/L6/L9/L11), and DV in ffmpeg-made files, which carry no dvcC. Crate `dolby_vision` 3.4.0 rejects RPUs with a Level 253 block: pin git or fall back to dvcC.
 - [ ] HDR10+ (today only the release name's "HDR10+" tag is used): check both the HEVC SEI (T.35 0xB5/0x003C) and the MKV BlockAdditionMapping type 4.
 - [x] (TrueHD, E-AC-3 JOC via dec3 and EMDF, DTS XLL in `src/probe/media.rs`) Atmos and DTS:X from audio frames (TrueHD FBA sync + substream_info bit 7, verified on 52 files; E-AC-3 JOC; DTS XLL sync) instead of the track name.
-- [x] x264/x265 settings string (SEI 5) as encoder fact (`encoder_options`, shown on the release page). Not yet used as a same-encode key.
+- [x] x264/x265 settings string (SEI 5) as encoder fact (`encoder_options`, shown on the release page). Used as a same-encode key with the length to the second since #224 (`keys::Kind::Encode`).
 - Integration plan: [stream-metadata/raw/w10-a-atlas-integration.md](stream-metadata/raw/w10-a-atlas-integration.md) (serde(default) fields, bump `ProbeStep::config_stamp` to 2). Prototype: [stream-metadata/code/streamprobe/](stream-metadata/code/streamprobe/). Keep Atlas's own EBML walker: `matroska-demuxer` fails on partial files.
 
 ## 2. Container facts not read yet
 
 Source: [container-metadata/FINAL-REPORT.md](container-metadata/FINAL-REPORT.md), catalogs in [container-metadata/catalog/](container-metadata/catalog/).
 
-- [ ] Store mux identity: SegmentUUID, DateUTC, MuxingApp/WritingApp, Duration float size (twin key and tool fingerprint). Already there: SegmentUID and MuxingApp are read and shown, DateUTC is read. Not yet: the Duration float size, and using any of them as a key.
+- [ ] Store mux identity: SegmentUUID, DateUTC, MuxingApp/WritingApp, Duration float size (twin key and tool fingerprint). Already there: SegmentUID and MuxingApp are read and shown, DateUTC is read, and SegmentUID with DateUTC is the same-mux key (#224, `keys::Kind::Mux`). Not yet: the Duration float size, and MuxingApp/WritingApp as a tool fingerprint.
 - [x] Matroska Tags shown on the release page (#165): the Tags in front of the first Cluster, sorted, IMDB/TMDB linked, ENCODED_BY, purchase and e-mail tags never shown.
-- [ ] Matroska Tags, the rest: IMDB/TMDB/TVDB IDs used to identify the title, and mkvmerge statistics tags (BPS, NUMBER_OF_FRAMES) at the file end (+1 tail article).
+- [x] (#221) mkvmerge statistics tags at the file end (+1 tail article): the front's SeekHead says where the Tags are; past the first Cluster, the part holding them is read (the last part, already read, when they're in it; one more when they run into it), and each track keeps `stats` (BPS, NUMBER_OF_FRAMES, NUMBER_OF_BYTES, DURATION), shown on its line on the release page. The tail's other tags join `tags`, those that can name a person left out. Bare files only (not in an archive), and only a SeekHead that names the Tags itself (a second SeekHead at the end isn't followed). Not a key yet: same frames and bytes per track is a same-mux witness for a reader.
+- [x] (#224: the probe pins a well-formed `IMDB`, `TMDB` (`movie/` or `tv/`, matched to the row's kind) or `TVDB` tag on `media_release` before any lookup by name, and a lookup can't replace it: `imdb_from_nfo`, `tmdb_from_tag`, `tvdb_from_tag`. MP4 `cnID` is Apple's own id, not mapped) Matroska Tags, the rest: IMDB/TMDB/TVDB IDs used to identify the title.
 - [ ] Subtitle and attachment keys: ASS header hash (strip the Aegisub section), font-set hash, VobSub palette.
 - [ ] ChapterSkipType (intro, credits) and a chapter timing signature.
 - [ ] FLAC STREAMINFO MD5 as an exact audio alt key.
 - [ ] MP4 `colr`/`mdcv`/`clli`, `chpl` chapters, `ilst` title and `cnID`; `stts`/`stsz` for exact frame count and bitrate. Already there: the sample tables are walked for stills (#160). Not yet: the rest.
 - [x] Disc posts: ISO 9660 and UDF walk, DVD IFOs (#151), Blu-ray `index.bdmv`/MPLS/CLPI main playlist (#153).
 - [x] DVD disc ID (#165): libdvdread's DVDDiscID (MD5 of VIDEO_TS.IFO and VTS_01..N_0.IFO) in `src/probe/dvd.rs`, stored as the probe's `disc_id` and shown on the page; an ISO's sets found by its directory records, a stored VIDEO_TS folder's by its entry names. Releases probed before need a reprobe to get one.
-- [ ] Blu-ray `id.bdmv` disc_id is not read.
+- [x] (#221) Blu-ray `id.bdmv` disc ID: `bluray::disc_id` finds `BDID` and its version in what was read and keeps the 4-byte org ID at byte 40 and the 16-byte disc ID at 44, in hex (40 digits), as the probe's `disc_id`, shown on the page as "Blu-ray disc ID". All-zero IDs are dropped. Only when the file is in the front read; not a merging key (per pressing or per title is still open, section 8).
 - [ ] TS broadcast captures: SDT channel, EIT programme, TDT capture time. (#157 reads TS tracks; these tables are not read.)
 - [x] Legacy writers: AVI ISFT and Xvid/DivX strings (#145), ASF/WMV (#148), MPEG-PS/VOB (#149).
 - [ ] Ogg vendor string and FLV onMetaData.
@@ -61,7 +62,7 @@ Source: [archive-metadata/FINAL-REPORT.md](archive-metadata/FINAL-REPORT.md), [a
 
 Source: [payload-fingerprints/final-report.md](payload-fingerprints/final-report.md). Prototypes: [opus-tools/w9b_crc32gf2/](payload-fingerprints/opus-tools/w9b_crc32gf2/) (CRC32 GF(2) toolkit, std only), [opus-tools/w10b_walker/](payload-fingerprints/opus-tools/w10b_walker/) (PAR2 + RAR4/5 partial-buffer walker, 332/332 vs rarfile).
 
-- [ ] Store yEnc `pcrc32` per part and fold it into a whole-file (size, CRC32) with the GF(2) toolkit. Stored: every article a step reads whole leaves `(decoded length, CRC32)` in `segment_crc`. Not yet: the fold to a whole-file CRC, since only a few articles of a file are ever read.
+- [x] (#224: `keys::folded_files` folds a file once every part 1..N has a `segment_crc` row, for `Kind::FileCrc` and the `release_keys.file_crc` of a release whose probe has no trailer CRC; only files read whole get one, which is mostly small ones) Store yEnc `pcrc32` per part and fold it into a whole-file (size, CRC32) with the GF(2) toolkit. Stored: every article a step reads whole leaves `(decoded length, CRC32)` in `segment_crc`.
 - [x] PAR2 index per set: full MD5 + length, 16 KB MD5 + length (`par2_files`, indexed on `(size, md5_16k)` and on `set_id`; it finds file twins across shards). The IFSC fold is kept per file; binding it to a pcrc32 fold waits on the item above.
 - [ ] Last RAR volume's first article: inner file (name, size, CRC32) as the alt key.
 - [ ] Encrypted reposts: `(V, n, S_last)` size tuple from the exact `-hp` size model, as a blocking key only.
@@ -73,6 +74,8 @@ Source: [payload-fingerprints/final-report.md](payload-fingerprints/final-report
 Sources: [posting-behavior/FINAL-REPORT.md](posting-behavior/FINAL-REPORT.md) (v1 pipeline spec [wave-09-A-pipeline-spec.md](posting-behavior/wave-09-A-pipeline-spec.md) with fixes in [wave-10-A-redteam.md](posting-behavior/wave-10-A-redteam.md)), [yenc-header-forensics/opus/FINAL-yenc-header-forensics.md](yenc-header-forensics/opus/FINAL-yenc-header-forensics.md) (rollout P1-P6 in [w9b-atlas-rust-spec.md](yenc-header-forensics/opus/w9b-atlas-rust-spec.md)). Open PR #64 links the files of fully obfuscated uploads; #67 keeps per-file timing.
 
 - [x] P1: posting-tool classifier and per-file fields (`file_timing.tool`, `clock_first`/`clock_last` in ms from Nyuu or the server's id, Highwinds `hw_host`, `hw_key`, `hw_n_first`/`hw_n_last`), folded at ingest by `discovery::id_facts` and shown on the release page. Not yet: using the (host, K) key to join files across rows.
+- [x] (#224) References as a thread key: the probe keeps `Message-ID` and `References`, and `keys::Kind::Thread` links releases whose probed articles hang on one id (the first References id, else the article's own), the parts of one post its poster threaded.
+- [x] (#224) Header order: the probe keeps every header name of the article in order (`ProbeInfo::header_order`, names only) and the release page shows a header-set fingerprint over the poster's names, servers' left out.
 - [ ] P2: Nyuu Message-ID stream linker (Node 12+ xorshift128+, solver in [nyuu-id-solver/](yenc-header-forensics/opus/nyuu-id-solver/)); links every article of one upload from two IDs.
 - [ ] P3-P6: ms-continuity placement, NewsUP drand48, size-vector twin key with entropy gate, X-Received-Body-CRC twin key, offline seed searches.
 - [x] End-to-start file join by the right clock, then PAR2 file-size match and 16 KB MD5 tie-break: the link step (`archive/link.rs`) now takes candidates from every group of its shard, orders them by `merging::ReleaseAssembler`'s end-to-start window over `file_timing`'s clocks, and links on size + first-16-KiB MD5 against the stored set. Not yet: candidates in other shards (the stage's writes are per shard), and the veto DSU over more than one set at a time.

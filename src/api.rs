@@ -396,6 +396,27 @@ fn release_attrs(
     out
 }
 
+/// Which rows get an item: a post whose articles went to several groups, a row for each, or an upload linked by its
+/// PAR2 set, is one item, the way the web page lists it, and each of its rows' NZBs is all of it anyway. The row that
+/// stands for the post when it's on the page, else the first of its rows that is. `posts[i]` is `rows[i]`'s post.
+fn one_item_per_post(
+    rows: &[crate::search::ReleaseRow],
+    posts: &[Option<crate::release_info::SplitPost>],
+) -> Vec<bool> {
+    let on_page: std::collections::HashSet<i64> = rows.iter().map(|r| r.id).collect();
+    let mut given = std::collections::HashSet::new();
+    rows.iter()
+        .zip(posts)
+        .map(|(r, post)| match post {
+            None => true,
+            Some(post) => {
+                let listed = post.listed_id();
+                (r.id == listed || !on_page.contains(&listed)) && given.insert(listed)
+            }
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn rss(
     base: &str,
@@ -412,11 +433,18 @@ fn rss(
     let spots = crate::spotnet::store::spots_of(&ids).unwrap_or_default();
     // what the NZB holds: all of a post cut across groups, or of an upload linked by its PAR2 set
     let conn = crate::db::open().ok();
+    let wholes: Vec<Option<crate::release_info::SplitPost>> = releases
+        .iter()
+        .map(|r| conn.as_ref().and_then(|conn| crate::release_info::whole_post_with(conn, r).ok().flatten()))
+        .collect();
+    let keep = one_item_per_post(releases, &wholes);
     let items: String = releases
         .iter()
-        .map(|r| {
+        .zip(wholes)
+        .zip(keep)
+        .filter(|(_, keep)| *keep)
+        .map(|((r, whole), _)| {
             let nzb_url = format!("{base}/api?t=get&id={}&apikey={api_key}", r.id);
-            let whole = conn.as_ref().and_then(|conn| crate::release_info::whole_post_with(conn, r).ok().flatten());
             let size = whole.map_or(r.size.unwrap_or(0), |post| post.size);
             let password = passwords
                 .get(&r.id)
@@ -793,6 +821,30 @@ mod tests {
         assert!(body.contains(r#"<newznab:attr name="password" value="2"/>"#), "{body}");
         assert_eq!(body.matches("name=\"password\"").count(), 2);
         assert_eq!(body.matches("name=\"category\"").count(), 3);
+    }
+
+    #[test]
+    fn a_post_cut_across_groups_is_one_item() {
+        use crate::release_info::SplitPost;
+        let row = |id: i64| crate::search::ReleaseRow { id, name: "Some.Film-GRP".into(), ..Default::default() };
+        let post = |ids: &[i64]| {
+            Some(SplitPost {
+                ids: ids.to_vec(),
+                groups: vec!["a".into(), "b".into()],
+                size: 1,
+                complete: false,
+                lead: None,
+                recovery: Vec::new(),
+            })
+        };
+        // the post of rows 1, 2 and 4 stands as row 4, its highest id; row 3 is a post of its own
+        let rows = [row(1), row(2), row(3), row(4)];
+        let posts = [post(&[1, 2, 4]), post(&[1, 2, 4]), None, post(&[1, 2, 4])];
+        assert_eq!(one_item_per_post(&rows, &posts), [false, false, true, true]);
+        // its row isn't on this page: the first of the post's rows that is stands for it, once
+        let rows = [row(1), row(2), row(3)];
+        let posts = [post(&[1, 2, 4]), post(&[1, 2, 4]), None];
+        assert_eq!(one_item_per_post(&rows, &posts), [true, false, true]);
     }
 
     #[test]
