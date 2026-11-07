@@ -153,7 +153,15 @@ const SCHEMA: &str = "
 pub fn create(path: &Path) -> Result<()> {
     let conn = crate::db::create_at(path)?;
     conn.query_row("pragma journal_mode = wal", [], |_| Ok(()))?;
-    conn.execute_batch(SCHEMA)
+    conn.execute_batch(SCHEMA)?;
+    // the articles it held (`Summary::articles`), for the shard's total on thawing. None: frozen before
+    // reposts were counted once, when `parts` was the same
+    let has: bool =
+        conn.prepare("select 1 from pragma_table_info('frozen_releases') where name = 'articles'")?.exists([])?;
+    if !has {
+        conn.execute_batch("alter table frozen_releases add column articles INTEGER")?;
+    }
+    Ok(())
 }
 
 /// Attach shard `shard_path`'s frozen file to `conn` (the shard's writer) as `frozen`, made if missing.
@@ -193,6 +201,9 @@ pub struct Summary {
     pub parts: Option<i64>,
     pub complete: Option<i64>,
     pub category: Option<i64>,
+    /// the articles it holds, its blobs' and rows': the shard's article total counts each, where `parts` counts a
+    /// part posted again under another message-id once
+    pub articles: i64,
 }
 
 /// The tables a release's rows are in, besides `releases`, `files` and what hangs off a file: every registered table
@@ -274,10 +285,12 @@ pub fn collect(conn: &Connection, id: i64) -> Result<Option<(Summary, Payload)>>
     {
         used.extend(segments.rows.iter().filter_map(|r| int(Some(&r[c]))));
     }
+    let mut articles = tables.iter().find(|t| t.name == "segments").map_or(0, |t| t.rows.len() as i64);
     let blob_col = tables[1].column("blob");
     for row in &tables[1].rows {
         if let Some(Value::Blob(b)) = blob_col.map(|c| &row[c]) {
             let segs = crate::blob::decode(b).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            articles += segs.len() as i64;
             used.extend(segs.iter().map(|s| s.domain));
         }
     }
@@ -307,6 +320,7 @@ pub fn collect(conn: &Connection, id: i64) -> Result<Option<(Summary, Payload)>>
         parts: int(get("parts")),
         complete: int(get("complete")),
         category,
+        articles,
     };
     Ok(Some((summary, Payload { domains, tables })))
 }
@@ -336,8 +350,8 @@ pub fn write(conn: &Connection, s: &Summary, p: &Payload, reason: &str, now: i64
     conn.prepare_cached("delete from frozen.frozen_collections where release_id = ?1")?.execute([s.id])?;
     conn.prepare_cached(
         "insert into frozen.frozen_releases (id, name, group_name, display_name, poster, posted_date, size, parts,
-             complete, category, reason, frozen_at, payload)
-         values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+             complete, category, reason, frozen_at, payload, articles)
+         values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
     )?
     .execute(params![
         s.id,
@@ -352,7 +366,8 @@ pub fn write(conn: &Connection, s: &Summary, p: &Payload, reason: &str, now: i64
         s.category,
         reason,
         now,
-        packed
+        packed,
+        s.articles
     ])?;
     if let Some(c) = p.table("collections")
         && let Some(k) = c.column("key")
@@ -370,11 +385,11 @@ pub fn write(conn: &Connection, s: &Summary, p: &Payload, reason: &str, now: i64
 
 /// A frozen release's live rows gone, in the caller's transaction on the shard: its articles, files, collection keys
 /// and every registered row (their triggers). The shard's totals lose it.
-pub fn remove_live(conn: &Connection, id: i64, parts: i64) -> Result<()> {
+pub fn remove_live(conn: &Connection, id: i64, articles: i64) -> Result<()> {
     conn.prepare_cached("delete from collections where release_id = ?1")?.execute([id])?;
     crate::store::delete_release_rows(conn, id)?;
     let mut less = conn.prepare_cached("update meta set value = max(value - ?1, 0) where key = ?2")?;
-    less.execute(params![parts.max(0), "articles"])?;
+    less.execute(params![articles.max(0), "articles"])?;
     less.execute(params![1, "releases"])?;
     Ok(())
 }
@@ -393,8 +408,8 @@ pub struct Moved {
     pub busy: bool,
 }
 
-/// A release a tick copied into the frozen file: its id, and its size and parts as copied.
-pub type Copied = (i64, Option<i64>, Option<i64>);
+/// A release a tick copied into the frozen file: its id, its size and parts as copied, and the articles it holds.
+pub type Copied = (i64, Option<i64>, Option<i64>, i64);
 
 /// Move up to `limit` releases queued at `ready` or before, longest queued first, for about `budget`. Two
 /// transactions on `conn` (the shard's writer with its frozen file attached): the frozen rows (`copy`), then the live
@@ -452,7 +467,7 @@ pub fn copy(
         match collected {
             None => dropped.push(*id),
             Some((s, p)) => match write(conn, &s, &p, reason, now)? {
-                Written::Written => copied.push((*id, s.size, s.parts)),
+                Written::Written => copied.push((*id, s.size, s.parts, s.articles)),
                 Written::NameTaken => {
                     crate::metrics::names::FROZEN.inc(&[("event", "name_taken")], 1);
                     dropped.push(*id);
@@ -475,7 +490,7 @@ pub fn copy(
 /// gone, and it stays live).
 pub fn drop_copied(conn: &Connection, copied: &[Copied], dropped: &[i64]) -> Result<Moved> {
     let mut moved = Moved::default();
-    for (id, size, parts) in copied {
+    for (id, size, parts, articles) in copied {
         let still_frozen: bool = conn
             .prepare_cached(
                 "select exists (select 1 from frozen.frozen_releases where id = ?1)
@@ -493,7 +508,7 @@ pub fn drop_copied(conn: &Connection, copied: &[Copied], dropped: &[i64]) -> Res
             .optional()?;
         match now_is {
             Some(n) if n == (*size, *parts) => {
-                remove_live(conn, *id, parts.unwrap_or(0))?;
+                remove_live(conn, *id, *articles)?;
                 moved.frozen += 1;
             }
             // gone meanwhile: the frozen copy is all there is
@@ -720,7 +735,7 @@ pub enum Domains {
 }
 
 /// A payload's rows into `schema` (`main`, the live shard, or a scratch copy that may have only some of the tables):
-/// files get new ids, soo they can't meet files saved since. Returns the release's articles for the shard's totals.
+/// files get new ids, soo they can't meet files saved since. Returns the release's parts.
 pub fn restore(conn: &Connection, schema: &str, p: &Payload, how: Domains) -> Result<i64> {
     let mut domain_of: HashMap<i64, i64> = HashMap::new();
     for (old, suffix) in &p.domains {
@@ -811,11 +826,12 @@ pub fn restore(conn: &Connection, schema: &str, p: &Payload, how: Domains) -> Re
 /// Put frozen release `id` back into the live shard, in the caller's transaction on the shard's writer (live rows
 /// first, then the frozen row goes). `exempt`: thawed by hand, soo no rule freezes it again.
 pub fn thaw(conn: &Connection, id: i64, exempt: bool, now: i64) -> Result<Thawed> {
-    let row: Option<(Option<String>, Option<String>, Vec<u8>)> = conn
-        .prepare_cached("select name, group_name, payload from frozen.frozen_releases where id = ?1")?
-        .query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+    type Row = (Option<String>, Option<String>, Vec<u8>, Option<i64>);
+    let row: Option<Row> = conn
+        .prepare_cached("select name, group_name, payload, articles from frozen.frozen_releases where id = ?1")?
+        .query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
         .optional()?;
-    let Some((name, group, packed)) = row else { return Ok(Thawed::NotFrozen) };
+    let Some((name, group, packed, articles)) = row else { return Ok(Thawed::NotFrozen) };
     let live: bool = conn
         .prepare_cached("select exists (select 1 from main.releases where id = ?1)")?
         .query_row([id], |r| r.get(0))?;
@@ -830,7 +846,7 @@ pub fn thaw(conn: &Connection, id: i64, exempt: bool, now: i64) -> Result<Thawed
         }
         let p = payload::decode(&packed).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
         let parts = restore(conn, "main", &p, Domains::Map)?;
-        crate::store::add_totals(conn, 1, parts.max(0))?;
+        crate::store::add_totals(conn, 1, articles.unwrap_or(parts).max(0))?;
         Thawed::Restored
     };
     if exempt {

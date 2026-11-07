@@ -865,9 +865,9 @@ mod tests {
         save(&second);
         assert_eq!(stats(&main, "Rel"), (500, true, 5));
 
-        // a repost of a part under a new message id doesnt break completeness
+        // a repost of a part under a new message id doesnt break completeness, nor counts the part twice
         save(&slice("Rel", vec![art("b.rar", 2, 2, Some(2), "b2-repost")]));
-        assert_eq!(stats(&main, "Rel"), (600, true, 6));
+        assert_eq!(stats(&main, "Rel"), (500, true, 5));
 
         // a third file when the post said 2 makes it incomplete
         save(&slice("Rel", vec![art("c.rar", 1, 1, Some(2), "c1")]));

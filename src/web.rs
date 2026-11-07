@@ -2656,11 +2656,11 @@ fn release_html(
     }
 
     let nzb_files = nzb_files_html(contents);
-    let files = if inner.files.is_empty() {
+    let (heading, listed) = inner_files_listed(inner, recovery.is_some());
+    let files = if listed.is_empty() {
         String::new()
     } else {
-        let rows: String = inner
-            .files
+        let rows: String = listed
             .iter()
             .map(|f| {
                 format!(
@@ -2670,7 +2670,6 @@ fn release_html(
                 )
             })
             .collect();
-        let heading = if recovery.is_some() { "Files its PAR2 set repairs" } else { "Files inside the archives" };
         format!(
             "<h2>{heading}</h2><div class=\"table-wrap\"><table><thead><tr><th>Name</th><th class=\"num\">Size</th></tr></thead><tbody>{rows}</tbody></table></div>"
         )
@@ -2745,6 +2744,38 @@ fn release_html(
             raw = raw_name_html(raw.as_deref()),
         ),
     )
+}
+
+/// The release page's list of the files a release holds, and its heading. An archive's own headers say what is
+/// inside it: when they were read, they are the list. A PAR2 set lists the posted files, which are the archive
+/// volumes when the release is an archive set: shown as what the set protects, not as what is inside, or a set's
+/// first volume reads as an archive inside the archive. A posted NZB lists another post's files.
+fn inner_files_listed(
+    inner: &crate::archive::store::InnerView,
+    repairs: bool,
+) -> (&'static str, Vec<&crate::archive::store::InnerFileRow>) {
+    use crate::archive::store::{SOURCE_NZB, SOURCE_PAR2};
+    if repairs {
+        return ("Files its PAR2 set repairs", inner.files.iter().collect());
+    }
+    let read: Vec<_> = inner.files.iter().filter(|f| f.source != SOURCE_PAR2 && f.source != SOURCE_NZB).collect();
+    if !read.is_empty() {
+        // what the PAR2 set names besides archives (an NFO, a sample) is posted beside them: still shown
+        let beside = inner.files.iter().filter(|f| {
+            f.source == SOURCE_PAR2 && !crate::duplicates::lists_archives(std::iter::once(f.name.as_str()))
+        });
+        return ("Files inside the archives", read.into_iter().chain(beside).collect());
+    }
+    let par2: Vec<_> = inner.files.iter().filter(|f| f.source == SOURCE_PAR2).collect();
+    if !par2.is_empty() {
+        let heading = if crate::duplicates::lists_archives(par2.iter().map(|f| f.name.as_str())) {
+            "Archive volumes its PAR2 set protects"
+        } else {
+            "Files its PAR2 set protects"
+        };
+        return (heading, par2);
+    }
+    ("Files its posted NZB points to", inner.files.iter().collect())
 }
 
 /// The files the NZB lists, with how many of each one's articles were seen.
@@ -4302,6 +4333,39 @@ mod tests {
         let chain = super::nested_chain(&layers);
         assert!(chain.starts_with("RAR5 m0 › x.7z › 7z copy › a.zip › ZIP "), "{chain}");
         assert!(chain.ends_with(" › movie.mkv"), "a stopped layer still names its file: {chain}");
+    }
+
+    /// A PAR2 set's list of an archive set is its volumes (stored as the first one with the whole set's size): not
+    /// what is inside it, which only the archive's headers say, and next to those it isnt shown at all.
+    #[test]
+    fn a_par2_list_of_volumes_isnt_called_the_inside() {
+        use crate::archive::store::{InnerFileRow, InnerView, SOURCE_NZB, SOURCE_PAR2, SOURCE_RAR};
+        let row = |seq, name: &str, source| InnerFileRow { seq, name: name.into(), size: Some(9), source };
+        let view = |files| InnerView { files, ..Default::default() };
+        fn names((h, rows): (&'static str, Vec<&InnerFileRow>)) -> (&'static str, Vec<String>) {
+            (h, rows.iter().map(|r| r.name.clone()).collect())
+        }
+
+        let volumes = view(vec![row(0, "Film.part001.rar", SOURCE_PAR2), row(1, "Film.nfo", SOURCE_PAR2)]);
+        assert_eq!(
+            names(super::inner_files_listed(&volumes, false)),
+            ("Archive volumes its PAR2 set protects", vec!["Film.part001.rar".into(), "Film.nfo".into()])
+        );
+        let both = view(vec![
+            row(0, "Film.part001.rar", SOURCE_PAR2),
+            row(1, "Film.nfo", SOURCE_PAR2),
+            row(2, "Film/BDMV/index.bdmv", SOURCE_RAR),
+        ]);
+        assert_eq!(
+            names(super::inner_files_listed(&both, false)),
+            ("Files inside the archives", vec!["Film/BDMV/index.bdmv".into(), "Film.nfo".into()])
+        );
+        let plain = view(vec![row(0, "Film.mkv", SOURCE_PAR2)]);
+        assert_eq!(super::inner_files_listed(&plain, false).0, "Files its PAR2 set protects");
+        assert_eq!(super::inner_files_listed(&plain, true).0, "Files its PAR2 set repairs");
+        let nzb = view(vec![row(0, "Other.mkv", SOURCE_NZB)]);
+        assert_eq!(super::inner_files_listed(&nzb, false).0, "Files its posted NZB points to");
+        assert!(super::inner_files_listed(&view(vec![]), false).1.is_empty());
     }
 
     #[test]

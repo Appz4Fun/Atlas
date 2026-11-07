@@ -519,8 +519,9 @@ fn compact_shard(
         let open = || Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY);
         let (files_read, rows_read) = (open()?, open()?);
         let mut suffix_of = files_read.prepare("select suffix from domains where id = ?")?;
-        let mut held_of = files_read
-            .prepare("select message_id, subject, part, total_parts, file_total from held_back where file_id = ?")?;
+        let mut held_of = files_read.prepare(
+            "select message_id, subject, part, total_parts, file_total, again from held_back where file_id = ?",
+        )?;
         let mut files_stmt = files_read.prepare(&format!("select {FILE_COLUMNS} from files order by id"))?;
         let mut files = files_stmt.query([])?;
         let mut rows_stmt = rows_read.prepare(
@@ -610,8 +611,8 @@ fn compact_shard(
                     continue;
                 }
                 tx.prepare_cached(
-                    "insert into held_back (file_id, message_id, subject, part, total_parts, file_total)
-                     values (?, ?, ?, ?, ?, ?)",
+                    "insert into held_back (file_id, message_id, subject, part, total_parts, file_total, again)
+                     values (?, ?, ?, ?, ?, ?, ?)",
                 )?
                 .execute(params![
                     id,
@@ -619,7 +620,8 @@ fn compact_shard(
                     h.get::<_, Value>(1)?,
                     h.get::<_, Value>(2)?,
                     h.get::<_, Value>(3)?,
-                    h.get::<_, Value>(4)?
+                    h.get::<_, Value>(4)?,
+                    h.get::<_, Value>(5)?
                 ])?;
                 held_back += 1;
                 in_tx += 1;
@@ -895,7 +897,7 @@ const CORE_TABLES: &[(&str, &str)] = &[
     ("files", FILE_COLUMNS),
     ("segments", "file_id, local, domain, part, bytes"),
     ("domains", "id, suffix"),
-    ("held_back", "file_id, message_id, subject, part, total_parts, file_total"),
+    ("held_back", "file_id, message_id, subject, part, total_parts, file_total, again"),
     ("release_ids", "release_id, id_hash, file_id"),
     ("meta", "key, value"),
     ("collections", "key, release_id"),
