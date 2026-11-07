@@ -3,9 +3,7 @@
 
 use std::collections::HashMap;
 
-use atlas::discovery::{
-    ArrivalRank, HeaderMap, PostingTool, ServerClock, ToolType, XrefSync,
-};
+use atlas::discovery::{ArrivalRank, HeaderMap, PostingTool, ServerClock, ToolType, XrefSync};
 use base64::Engine;
 
 // ============================================================================
@@ -126,9 +124,7 @@ fn tc_t1_f10_1_sub_second_rank_clock_calculation() {
 fn tc_t1_f10_2_strict_monotonicity_across_articles() {
     let s = 1729000000u64;
     let total = 5usize;
-    let timestamps: Vec<f64> = (0..5)
-        .map(|rank| ArrivalRank::calculate(s, rank, total))
-        .collect();
+    let timestamps: Vec<f64> = (0..5).map(|rank| ArrivalRank::calculate(s, rank, total)).collect();
 
     for i in 0..timestamps.len() - 1 {
         assert!(
@@ -143,18 +139,8 @@ fn tc_t1_f10_2_strict_monotonicity_across_articles() {
 #[test]
 fn tc_t1_f10_3_atomic_inn_xref_crosspost_anchoring() {
     let xref = "Xref: news.server.com alt.binaries.movies:1001 alt.binaries.test:5002";
-    let offset = XrefSync::anchor_offset(
-        xref,
-        "alt.binaries.movies",
-        1001,
-        "alt.binaries.test",
-        5002,
-    );
-    assert_eq!(
-        offset,
-        Some(0.0),
-        "Atomic crosspost anchor must produce exactly 0.000 s offset"
-    );
+    let offset = XrefSync::anchor_offset(xref, "alt.binaries.movies", 1001, "alt.binaries.test", 5002);
+    assert_eq!(offset, Some(0.0), "Atomic crosspost anchor must produce exactly 0.000 s offset");
 }
 
 #[test]

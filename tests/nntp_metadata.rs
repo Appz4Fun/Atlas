@@ -4,8 +4,8 @@
 use std::io::Write;
 
 use atlas::probe::{
-    ArchiveFormat, ArchiveStream, AudioBitstream, AvcDepth, DecompressError, DiscProber,
-    DolbyVisionInfo, H265Sps, HevcDepth, MkvMetadata, Mp4Prober, unwrap_nested,
+    ArchiveFormat, ArchiveStream, AudioBitstream, AvcDepth, DecompressError, DiscProber, DolbyVisionInfo, H265Sps,
+    HevcDepth, MkvMetadata, Mp4Prober, unwrap_nested,
 };
 use flate2::Compression;
 use flate2::write::DeflateEncoder;
@@ -59,13 +59,7 @@ fn tc_t1_f19_1_matroska_hidden_edition_filtering() {
         let body = [ebml_elem(&[0x91], &(100_000_000_000u64).to_be_bytes()), ebml_elem(&[0x80], &display)].concat();
         ebml_elem(&[0xB6], &body)
     };
-    let edition_default = [
-        ebml_elem(&[0x45, 0xDB], &[1]),
-        ebml_elem(&[0x45, 0xBD], &[0]),
-        chapter1,
-        chapter2,
-    ]
-    .concat();
+    let edition_default = [ebml_elem(&[0x45, 0xDB], &[1]), ebml_elem(&[0x45, 0xBD], &[0]), chapter1, chapter2].concat();
 
     let chapters_elem = ebml_elem(
         &[0x10, 0x43, 0xA7, 0x70],
@@ -73,12 +67,9 @@ fn tc_t1_f19_1_matroska_hidden_edition_filtering() {
     );
 
     let info = ebml_elem(&[0x7B, 0xA9], b"Test Title");
-    let segment = [
-        ebml_elem(&[0x15, 0x49, 0xA9, 0x66], &info),
-        chapters_elem,
-        ebml_elem(&[0x1F, 0x43, 0xB6, 0x75], &[0; 16]),
-    ]
-    .concat();
+    let segment =
+        [ebml_elem(&[0x15, 0x49, 0xA9, 0x66], &info), chapters_elem, ebml_elem(&[0x1F, 0x43, 0xB6, 0x75], &[0; 16])]
+            .concat();
     let mkv_bytes = [
         ebml_elem(&[0x1A, 0x45, 0xDF, 0xA3], &ebml_elem(&[0x42, 0x82], b"matroska")),
         ebml_elem(&[0x18, 0x53, 0x80, 0x67], &segment),
@@ -95,17 +86,13 @@ fn tc_t1_f19_1_matroska_hidden_edition_filtering() {
 
 #[test]
 fn tc_t1_f19_2_matroska_segment_uid_extraction() {
-    let raw_uid: [u8; 16] = [
-        0x10, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x01,
-    ];
+    let raw_uid: [u8; 16] =
+        [0x10, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x01];
     let segment_uid_elem = ebml_elem(&[0x73, 0xA4], &raw_uid);
     let info = [ebml_elem(&[0x7B, 0xA9], b"UID Video"), segment_uid_elem].concat();
 
-    let segment = [
-        ebml_elem(&[0x15, 0x49, 0xA9, 0x66], &info),
-        ebml_elem(&[0x1F, 0x43, 0xB6, 0x75], &[0; 16]),
-    ]
-    .concat();
+    let segment =
+        [ebml_elem(&[0x15, 0x49, 0xA9, 0x66], &info), ebml_elem(&[0x1F, 0x43, 0xB6, 0x75], &[0; 16])].concat();
     let mkv_bytes = [
         ebml_elem(&[0x1A, 0x45, 0xDF, 0xA3], &ebml_elem(&[0x42, 0x82], b"matroska")),
         ebml_elem(&[0x18, 0x53, 0x80, 0x67], &segment),
@@ -122,32 +109,17 @@ fn tc_t1_f19_2_matroska_segment_uid_extraction() {
 
 #[test]
 fn tc_t1_f19_3_matroska_tags_extraction() {
-    let simple_tag1 = [
-        ebml_elem(&[0x45, 0xA3], b"TITLE"),
-        ebml_elem(&[0x44, 0x87], b"Atlas NNTP Release"),
-    ]
-    .concat();
-    let simple_tag2 = [
-        ebml_elem(&[0x45, 0xA3], b"ENCODER"),
-        ebml_elem(&[0x44, 0x87], b"x265 3.5+1"),
-    ]
-    .concat();
+    let simple_tag1 = [ebml_elem(&[0x45, 0xA3], b"TITLE"), ebml_elem(&[0x44, 0x87], b"Atlas NNTP Release")].concat();
+    let simple_tag2 = [ebml_elem(&[0x45, 0xA3], b"ENCODER"), ebml_elem(&[0x44, 0x87], b"x265 3.5+1")].concat();
 
-    let tag_elem = [
-        ebml_elem(&[0x67, 0xC8], &simple_tag1),
-        ebml_elem(&[0x67, 0xC8], &simple_tag2),
-    ]
-    .concat();
+    let tag_elem = [ebml_elem(&[0x67, 0xC8], &simple_tag1), ebml_elem(&[0x67, 0xC8], &simple_tag2)].concat();
 
     let tags_elem = ebml_elem(&[0x12, 0x54, 0xC3, 0x67], &ebml_elem(&[0x73, 0x73], &tag_elem));
 
     let info = ebml_elem(&[0x7B, 0xA9], b"Tags Video");
-    let segment = [
-        ebml_elem(&[0x15, 0x49, 0xA9, 0x66], &info),
-        tags_elem,
-        ebml_elem(&[0x1F, 0x43, 0xB6, 0x75], &[0; 16]),
-    ]
-    .concat();
+    let segment =
+        [ebml_elem(&[0x15, 0x49, 0xA9, 0x66], &info), tags_elem, ebml_elem(&[0x1F, 0x43, 0xB6, 0x75], &[0; 16])]
+            .concat();
     let mkv_bytes = [
         ebml_elem(&[0x1A, 0x45, 0xDF, 0xA3], &ebml_elem(&[0x42, 0x82], b"matroska")),
         ebml_elem(&[0x18, 0x53, 0x80, 0x67], &segment),
@@ -171,8 +143,9 @@ fn tc_t1_f19_4_mkv_metadata_parse_wrapper() {
 fn build_hevc_10bit_sps_nal(primaries: u8, transfer: u8, matrix: u8) -> Vec<u8> {
     vec![
         0x42, 0x01, // NAL header (type 33 = SPS_NUT)
-        0x01,       // vps_id=0, max_sub_layers_minus1=0, temporal_id_nesting_flag=1
-        0x02, 0x20, 0x40, 0x08, 0x01, 0xB0, 0x01, 0x01, 0x01, 0x01, 0x01, 0x99, // profile_tier_level (Main 10, Level 5.1)
+        0x01, // vps_id=0, max_sub_layers_minus1=0, temporal_id_nesting_flag=1
+        0x02, 0x20, 0x40, 0x08, 0x01, 0xB0, 0x01, 0x01, 0x01, 0x01, 0x01,
+        0x99, // profile_tier_level (Main 10, Level 5.1)
         0x22, 0x12, 0x24, 0xDA, 0x7A, 0xAC, 0x22, 0xB5, // SPS fields up to colour_description_present_flag=1
         primaries, transfer, matrix, 0x80,
     ]
@@ -516,11 +489,7 @@ fn tc_t3_04_metadata_extraction_hdr_audio_recovery_integration() {
     // SegmentUID
     let raw_uid: [u8; 16] = [0x55; 16];
     let segment_uid_elem = ebml_elem(&[0x73, 0xA4], &raw_uid);
-    let info = [
-        ebml_elem(&[0x7B, 0xA9], b"Master Feature (2026)"),
-        segment_uid_elem,
-    ]
-    .concat();
+    let info = [ebml_elem(&[0x7B, 0xA9], b"Master Feature (2026)"), segment_uid_elem].concat();
 
     // Video Track
     let colour = [
@@ -535,11 +504,8 @@ fn tc_t3_04_metadata_extraction_hdr_audio_recovery_integration() {
         ebml_elem(&[0x55, 0xB0], &colour),
     ]
     .concat();
-    let dv_box = [
-        ebml_elem(&[0x41, 0xE7], b"dvvC"),
-        ebml_elem(&[0x41, 0xED], &[1, 0, 7 << 1, 6 << 3 | 0b011]),
-    ]
-    .concat();
+    let dv_box =
+        [ebml_elem(&[0x41, 0xE7], b"dvvC"), ebml_elem(&[0x41, 0xED], &[1, 0, 7 << 1, 6 << 3 | 0b011])].concat();
     let video_entry = [
         ebml_elem(&[0x83], &[1]), // Video track number 1
         ebml_elem(&[0x86], b"V_MPEGH/ISO/HEVC"),

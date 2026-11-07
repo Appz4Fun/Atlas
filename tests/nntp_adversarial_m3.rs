@@ -11,8 +11,7 @@
 use atlas::discovery::{HeaderMap, PostingTool, ServerClock, ToolType};
 use atlas::gf2::{crc32, crc32_combine, crc32_unzero, fold_yenc_parts};
 use atlas::merging::{
-    CandidateFileRun, InterReleaseDeduplication, InterReleaseVeto,
-    IntraReleaseGrouping, IntraReleaseVeto, MergeResult,
+    CandidateFileRun, InterReleaseDeduplication, InterReleaseVeto, IntraReleaseGrouping, IntraReleaseVeto, MergeResult,
     ReleaseAssembler, ReleaseCandidate, ReleasePartition, VetoDsu,
 };
 
@@ -59,9 +58,8 @@ fn test_gf2_combine_identity_arbitrary_chunk_boundaries() {
 
     // Test across boundary cuts spanning powers of 2, primes, and edge cases
     let cuts = [
-        0, 1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128, 255, 256,
-        511, 512, 1023, 1024, 2048, 4095, 4096, 8191, 8192, 16384, 32768,
-        65535, 65536, 65537,
+        0, 1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128, 255, 256, 511, 512, 1023, 1024, 2048, 4095, 4096, 8191,
+        8192, 16384, 32768, 65535, 65536, 65537,
     ];
 
     for &cut in &cuts {
@@ -70,7 +68,8 @@ fn test_gf2_combine_identity_arbitrary_chunk_boundaries() {
         let c2 = crc32(right);
         let combined = crc32_combine(c1, c2, right.len());
         assert_eq!(
-            combined, full_crc,
+            combined,
+            full_crc,
             "GF(2) combine failed at cut offset {cut} (left len={}, right len={})",
             left.len(),
             right.len()
@@ -99,10 +98,7 @@ fn test_gf2_combine_multi_chunk_folding_100_parts() {
     let yenc_parts: Vec<(u32, usize)> = parts.iter().map(|p| (crc32(p), p.len())).collect();
     let folded = fold_yenc_parts(&yenc_parts).expect("folding must succeed");
 
-    assert_eq!(
-        folded, expected_full_crc,
-        "Folded 100 yEnc parts must exactly match whole-file CRC32"
-    );
+    assert_eq!(folded, expected_full_crc, "Folded 100 yEnc parts must exactly match whole-file CRC32");
 }
 
 #[test]
@@ -125,18 +121,12 @@ fn test_gf2_combine_large_buffer_55mb() {
     let c2 = crc32(c2_bytes);
 
     let combined = crc32_combine(c1, c2, c2_bytes.len());
-    assert_eq!(
-        combined, expected_crc,
-        "GF(2) combination over 52 MB buffer split at 32 MB must match full CRC32"
-    );
+    assert_eq!(combined, expected_crc, "GF(2) combination over 52 MB buffer split at 32 MB must match full CRC32");
 
     // Also test split at 1 MB + 51 MB
     let (c1_1mb, c2_51mb) = buffer.split_at(1024 * 1024);
     let combined_1mb = crc32_combine(crc32(c1_1mb), crc32(c2_51mb), c2_51mb.len());
-    assert_eq!(
-        combined_1mb, expected_crc,
-        "GF(2) combination over 52 MB buffer split at 1 MB must match full CRC32"
-    );
+    assert_eq!(combined_1mb, expected_crc, "GF(2) combination over 52 MB buffer split at 1 MB must match full CRC32");
 }
 
 // ============================================================================
@@ -158,10 +148,7 @@ fn test_par2_ifsc_unzero_raw_slice_identity() {
             let padded_crc = crc32(&padded);
 
             let unzeroed = crc32_unzero(padded_crc, pad_len);
-            assert_eq!(
-                unzeroed, raw_crc,
-                "PAR2 unzero failed for slice_size={slice_sz}, pad_len={pad_len}"
-            );
+            assert_eq!(unzeroed, raw_crc, "PAR2 unzero failed for slice_size={slice_sz}, pad_len={pad_len}");
         }
     }
 }
@@ -226,11 +213,9 @@ fn test_batman_knightfall_50_groups_realistic_gap_distribution() {
 
     // Realistic gaps within [-0.68, +2.0]s
     let realistic_gaps: [f64; 49] = [
-        -0.50, 0.12, 0.05, 0.80, -0.20, 0.15, 0.30, 1.20, -0.67, 0.10,
-        0.02, 0.45, 1.90, -0.10, 0.08, 0.12, 0.22, 0.95, -0.35, 0.18,
-        0.04, 0.60, 1.80, -0.05, 0.14, 0.11, 0.33, 1.10, -0.40, 0.16,
-        0.06, 0.70, 1.99, -0.15, 0.09, 0.13, 0.28, 1.05, -0.30, 0.17,
-        0.03, 0.55, 1.85, -0.25, 0.11, 0.15, 0.40, 2.00, -0.12,
+        -0.50, 0.12, 0.05, 0.80, -0.20, 0.15, 0.30, 1.20, -0.67, 0.10, 0.02, 0.45, 1.90, -0.10, 0.08, 0.12, 0.22, 0.95,
+        -0.35, 0.18, 0.04, 0.60, 1.80, -0.05, 0.14, 0.11, 0.33, 1.10, -0.40, 0.16, 0.06, 0.70, 1.99, -0.15, 0.09, 0.13,
+        0.28, 1.05, -0.30, 0.17, 0.03, 0.55, 1.85, -0.25, 0.11, 0.15, 0.40, 2.00, -0.12,
     ];
 
     #[allow(clippy::needless_range_loop)]
@@ -272,11 +257,7 @@ fn test_batman_knightfall_50_groups_realistic_gap_distribution() {
 
     let merged = ReleaseAssembler::join_runs(&shuffled, None);
 
-    assert_eq!(
-        merged.len(),
-        1,
-        "Batman Knightfall 50-file cross-group upload must join into exactly 1 release"
-    );
+    assert_eq!(merged.len(), 1, "Batman Knightfall 50-file cross-group upload must join into exactly 1 release");
     assert_eq!(merged[0].runs.len(), 50);
     assert_eq!(merged[0].total_size, 50 * 50_000_000);
 }
@@ -313,11 +294,7 @@ fn test_batman_knightfall_gap_boundary_rejection() {
     run_too_late.t_end = 122.001;
 
     let merged_late = ReleaseAssembler::join_runs(&[run1.clone(), run_too_late], None);
-    assert_eq!(
-        merged_late.len(),
-        2,
-        "Gap of +2.001s exceeds window and must produce 2 distinct releases"
-    );
+    assert_eq!(merged_late.len(), 2, "Gap of +2.001s exceeds window and must produce 2 distinct releases");
 
     // Lower boundary test: default lower bound is -0.68s. Gap of -0.681s -> must reject join
     let mut run_too_early = run1.clone();
@@ -327,11 +304,7 @@ fn test_batman_knightfall_gap_boundary_rejection() {
     run_too_early.t_end = 119.319;
 
     let merged_early = ReleaseAssembler::join_runs(&[run1, run_too_early], None);
-    assert_eq!(
-        merged_early.len(),
-        2,
-        "Gap of -0.681s falls below window and must produce 2 distinct releases"
-    );
+    assert_eq!(merged_early.len(), 2, "Gap of -0.681s falls below window and must produce 2 distinct releases");
 }
 
 // ============================================================================
@@ -470,19 +443,13 @@ fn test_intra_release_dsu_domain_vetoes() {
     let mut dup_vol = base.clone();
     dup_vol.member_id = None;
     dup_vol.filename = "file1_duplicate.rar".into();
-    assert_eq!(
-        IntraReleaseGrouping::can_group(&base, &dup_vol),
-        Err(IntraReleaseVeto::DuplicateVolumeIndex)
-    );
+    assert_eq!(IntraReleaseGrouping::can_group(&base, &dup_vol), Err(IntraReleaseVeto::DuplicateVolumeIndex));
 
     // Veto 2: Overlapping byte offsets for same member ID
     let mut overlap = base.clone();
     overlap.rar_volume_idx = Some(2); // different volume
     overlap.byte_offset = 25_000_000; // overlaps [0, 50M]
-    assert_eq!(
-        IntraReleaseGrouping::can_group(&base, &overlap),
-        Err(IntraReleaseVeto::OverlappingByteOffsets)
-    );
+    assert_eq!(IntraReleaseGrouping::can_group(&base, &overlap), Err(IntraReleaseVeto::OverlappingByteOffsets));
 
     // Contiguous byte offsets for same member ID: OK
     let mut non_overlap = base.clone();
@@ -495,20 +462,14 @@ fn test_intra_release_dsu_domain_vetoes() {
     bad_container.rar_volume_idx = Some(2);
     bad_container.member_id = None;
     bad_container.archive_format = Some("7z".into());
-    assert_eq!(
-        IntraReleaseGrouping::can_group(&base, &bad_container),
-        Err(IntraReleaseVeto::IncompatibleContainer)
-    );
+    assert_eq!(IntraReleaseGrouping::can_group(&base, &bad_container), Err(IntraReleaseVeto::IncompatibleContainer));
 
     // Veto 4: Part size mismatch for same member ID
     let mut part_size_mismatch = base.clone();
     part_size_mismatch.rar_volume_idx = Some(2);
     part_size_mismatch.byte_offset = 50_000_000;
     part_size_mismatch.yenc_part_size = Some(716_800);
-    assert_eq!(
-        IntraReleaseGrouping::can_group(&base, &part_size_mismatch),
-        Err(IntraReleaseVeto::PartSizeMismatch)
-    );
+    assert_eq!(IntraReleaseGrouping::can_group(&base, &part_size_mismatch), Err(IntraReleaseVeto::PartSizeMismatch));
 
     // Veto 5: Discrepant yEnc total for the SAME file index
     let mut discrepant_total = base.clone();
@@ -570,29 +531,20 @@ fn test_inter_release_dsu_cryptographic_vetoes_and_partitioning() {
 
     // Partitioning: Twin
     let rel_twin = rel_alpha.clone();
-    assert_eq!(
-        InterReleaseDeduplication::partition_releases(&rel_alpha, &rel_twin),
-        ReleasePartition::Twin
-    );
+    assert_eq!(InterReleaseDeduplication::partition_releases(&rel_alpha, &rel_twin), ReleasePartition::Twin);
 
     // Partitioning: Alt (differing container MD5, but identical unpacked CRC32)
     let mut rel_alt_crc = rel_alpha.clone();
     rel_alt_crc.full_md5 = Some([0xCC; 16]);
     rel_alt_crc.creation_salt = Some(vec![5, 6, 7, 8]);
-    assert_eq!(
-        InterReleaseDeduplication::partition_releases(&rel_alpha, &rel_alt_crc),
-        ReleasePartition::Alt
-    );
+    assert_eq!(InterReleaseDeduplication::partition_releases(&rel_alpha, &rel_alt_crc), ReleasePartition::Alt);
 
     // Partitioning: Alt (differing container MD5, but identical SegmentUID)
     let mut rel_alt_segment = rel_alpha.clone();
     rel_alt_segment.full_md5 = Some([0xDD; 16]);
     rel_alt_segment.unpacked_crc32 = Some(0x99999999);
     rel_alt_segment.creation_salt = Some(vec![7, 7, 7, 7]);
-    assert_eq!(
-        InterReleaseDeduplication::partition_releases(&rel_alpha, &rel_alt_segment),
-        ReleasePartition::Alt
-    );
+    assert_eq!(InterReleaseDeduplication::partition_releases(&rel_alpha, &rel_alt_segment), ReleasePartition::Alt);
 
     // Partitioning: Distinct (everything differs)
     let mut rel_distinct = rel_alpha.clone();
@@ -600,10 +552,7 @@ fn test_inter_release_dsu_cryptographic_vetoes_and_partitioning() {
     rel_distinct.unpacked_crc32 = Some(0x55555555);
     rel_distinct.segment_uid = Some([0x99; 16]);
     rel_distinct.creation_salt = Some(vec![8, 8, 8, 8]);
-    assert_eq!(
-        InterReleaseDeduplication::partition_releases(&rel_alpha, &rel_distinct),
-        ReleasePartition::Distinct
-    );
+    assert_eq!(InterReleaseDeduplication::partition_releases(&rel_alpha, &rel_distinct), ReleasePartition::Distinct);
 }
 
 // ============================================================================
@@ -634,7 +583,8 @@ fn test_server_clock_fuzz_highwinds() {
     for mid in adversarial_mids {
         // Must never panic!
         let _ = ServerClock::decode(mid);
-        let local = mid.trim().trim_start_matches('<').trim_end_matches('>').split_once('@').map(|(l, _)| l).unwrap_or("");
+        let local =
+            mid.trim().trim_start_matches('<').trim_end_matches('>').split_once('@').map(|(l, _)| l).unwrap_or("");
         let _ = ServerClock::decode_highwinds(local);
     }
 }
@@ -647,9 +597,9 @@ fn test_server_clock_fuzz_giganews() {
         "<@giganews.com>",
         "<short@giganews.com>",
         "<dGVzdHRlc3R0ZXN0dGVzdHRlc3R0ZXN0dGVz@giganews.com>", // 36 chars
-        "<AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA@giganews.com>",       // 31 chars
-        "<AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA@giganews.com>",      // 32 valid chars
-        "<!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!@giganews.com>",      // 32 invalid chars
+        "<AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA@giganews.com>",      // 31 chars
+        "<AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA@giganews.com>",     // 32 valid chars
+        "<!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!@giganews.com>",     // 32 invalid chars
         "<================================@giganews.com>",
         "<                                @giganews.com>",
     ];
@@ -657,7 +607,8 @@ fn test_server_clock_fuzz_giganews() {
     for mid in adversarial_mids {
         // Must never panic!
         let _ = ServerClock::decode(mid);
-        let local = mid.trim().trim_start_matches('<').trim_end_matches('>').split_once('@').map(|(l, _)| l).unwrap_or("");
+        let local =
+            mid.trim().trim_start_matches('<').trim_end_matches('>').split_once('@').map(|(l, _)| l).unwrap_or("");
         let _ = ServerClock::decode_giganews(local);
     }
 }
@@ -678,7 +629,8 @@ fn test_server_clock_fuzz_diablo() {
 
     for mid in adversarial_mids {
         let _ = ServerClock::decode(mid);
-        let local = mid.trim().trim_start_matches('<').trim_end_matches('>').split_once('@').map(|(l, _)| l).unwrap_or("");
+        let local =
+            mid.trim().trim_start_matches('<').trim_end_matches('>').split_once('@').map(|(l, _)| l).unwrap_or("");
         let _ = ServerClock::decode_diablo(local);
     }
 }
@@ -697,7 +649,8 @@ fn test_server_clock_fuzz_inn() {
 
     for mid in adversarial_mids {
         let _ = ServerClock::decode(mid);
-        let local = mid.trim().trim_start_matches('<').trim_end_matches('>').split_once('@').map(|(l, _)| l).unwrap_or("");
+        let local =
+            mid.trim().trim_start_matches('<').trim_end_matches('>').split_once('@').map(|(l, _)| l).unwrap_or("");
         let _ = ServerClock::decode_inn(local);
     }
 }
@@ -725,11 +678,7 @@ fn test_posting_tool_fuzz_adversarial_grammars() {
     let headers = HeaderMap::new();
     for mid in adversarial_inputs {
         let info = PostingTool::classify(mid, &headers);
-        assert_ne!(
-            info.tool,
-            ToolType::Nyuu,
-            "Invalid Nyuu syntax should not falsely classify for {mid}"
-        );
+        assert_ne!(info.tool, ToolType::Nyuu, "Invalid Nyuu syntax should not falsely classify for {mid}");
     }
 }
 
@@ -850,15 +799,15 @@ fn test_server_clock_exact_decoding_known_vectors() {
     let hw_dt = ServerClock::decode(&hw_mid).expect("Highwinds LE base64 must decode");
     assert_eq!(hw_dt.timestamp(), 876_645_500 + 10_000_000);
 
-    let hw_doc_dt = ServerClock::decode("<EaPmB.546176$JP7.228032@fx09.am4>")
-        .expect("Documented Highwinds vector must decode");
+    let hw_doc_dt =
+        ServerClock::decode("<EaPmB.546176$JP7.228032@fx09.am4>").expect("Documented Highwinds vector must decode");
     assert_eq!(hw_doc_dt.timestamp(), 1_503_379_236);
 
     // 2. Giganews: verify XOR-0x9D unpacked base64
     let target_ts = 1729000000u32;
     let mut giga_raw = [0u8; 24];
     giga_raw[0..4].copy_from_slice(&12345u32.to_le_bytes()); // PID
-    giga_raw[4..8].copy_from_slice(&1u32.to_le_bytes());     // seq
+    giga_raw[4..8].copy_from_slice(&1u32.to_le_bytes()); // seq
     giga_raw[8..12].copy_from_slice(&target_ts.to_le_bytes()); // timestamp w2
     giga_raw[12..16].copy_from_slice(&99u32.to_le_bytes());
     giga_raw[16..20].copy_from_slice(&42u32.to_le_bytes()); // box ID
@@ -894,4 +843,3 @@ fn test_server_clock_exact_decoding_known_vectors() {
     let inn_dt = ServerClock::decode(&inn_mid).expect("INN must decode");
     assert_eq!(inn_dt.timestamp(), 673_416_000 + inn_offset as i64);
 }
-

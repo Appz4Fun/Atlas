@@ -30,23 +30,16 @@ pub struct ToolInfo {
 
 pub type HeaderMap = HashMap<String, String>;
 
-static NYUU_TIMESTAMP_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^[a-z0-9_-]+-(\d{10,13})@.*$").unwrap());
-static NYUU_RANDOM_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[0-9a-zA-Z]{24,32}@nyuu$").unwrap());
+static NYUU_TIMESTAMP_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^[a-z0-9_-]+-(\d{10,13})@.*$").unwrap());
+static NYUU_RANDOM_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[0-9a-zA-Z]{24,32}@nyuu$").unwrap());
 static NGPOST_UUID_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}@[a-z0-9.-]+$").unwrap()
 });
-static POSTIE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[a-z0-9]{32}@[a-z0-9]{8}\.[a-z0-9]{3}$").unwrap());
-static NXG_UPPER_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^[0-9a-f]{40}@[0-9a-f]{21}\.3$").unwrap());
-static NEWSUP_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^[a-z0-9]{20,24}@[a-z0-9.-]+$").unwrap());
-static GOPOSTSTUFF_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^gps-[a-z0-9]+-(\d{10,19})@.*$").unwrap());
-static GOPOSTSTUFF_ALT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^(\d{10,19})\$gps@.*$").unwrap());
+static POSTIE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[a-z0-9]{32}@[a-z0-9]{8}\.[a-z0-9]{3}$").unwrap());
+static NXG_UPPER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^[0-9a-f]{40}@[0-9a-f]{21}\.3$").unwrap());
+static NEWSUP_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^[a-z0-9]{20,24}@[a-z0-9.-]+$").unwrap());
+static GOPOSTSTUFF_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^gps-[a-z0-9]+-(\d{10,19})@.*$").unwrap());
+static GOPOSTSTUFF_ALT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^(\d{10,19})\$gps@.*$").unwrap());
 
 pub struct PostingTool;
 
@@ -55,12 +48,7 @@ impl PostingTool {
     pub fn classify(message_id: &str, headers: &HeaderMap) -> ToolInfo {
         let mid = message_id.trim().trim_start_matches('<').trim_end_matches('>');
         if mid.len() > 4096 || !mid.contains('@') || !mid.is_ascii() {
-            return ToolInfo {
-                tool: ToolType::Unknown,
-                version: None,
-                embedded_time_ms: None,
-                deterministic: false,
-            };
+            return ToolInfo { tool: ToolType::Unknown, version: None, embedded_time_ms: None, deterministic: false };
         }
 
         let (_local, domain) = match mid.split_once('@') {
@@ -78,26 +66,14 @@ impl PostingTool {
         // 1. nxg-upper check via header or SHA256 grammar
         let has_nxg_header = headers.keys().any(|k| k.eq_ignore_ascii_case("x-nxg"));
         if has_nxg_header || NXG_UPPER_RE.is_match(mid) {
-            return ToolInfo {
-                tool: ToolType::NxgUpper,
-                version: None,
-                embedded_time_ms: None,
-                deterministic: true,
-            };
+            return ToolInfo { tool: ToolType::NxgUpper, version: None, embedded_time_ms: None, deterministic: true };
         }
 
         // 2. GoPostStuff grammar (checked before Nyuu timestamp since gps-<id>-<ts>@... is a subset)
         if let Some(caps) = GOPOSTSTUFF_RE.captures(mid).or_else(|| GOPOSTSTUFF_ALT_RE.captures(mid)) {
-            let ts: Option<u64> = caps
-                .get(1)
-                .and_then(|m| m.as_str().parse::<u64>().ok())
-                .map(Self::normalize_timestamp_to_ms);
-            return ToolInfo {
-                tool: ToolType::GoPostStuff,
-                version: None,
-                embedded_time_ms: ts,
-                deterministic: false,
-            };
+            let ts: Option<u64> =
+                caps.get(1).and_then(|m| m.as_str().parse::<u64>().ok()).map(Self::normalize_timestamp_to_ms);
+            return ToolInfo { tool: ToolType::GoPostStuff, version: None, embedded_time_ms: ts, deterministic: false };
         }
         if domain.to_ascii_lowercase().contains("gopoststuff") {
             let ts = NYUU_TIMESTAMP_RE
@@ -105,71 +81,39 @@ impl PostingTool {
                 .and_then(|caps| caps.get(1))
                 .and_then(|m| m.as_str().parse::<u64>().ok())
                 .map(Self::normalize_timestamp_to_ms);
-            return ToolInfo {
-                tool: ToolType::GoPostStuff,
-                version: None,
-                embedded_time_ms: ts,
-                deterministic: false,
-            };
+            return ToolInfo { tool: ToolType::GoPostStuff, version: None, embedded_time_ms: ts, deterministic: false };
         }
 
         // 3. Nyuu timestamp grammar
         if let Some(caps) = NYUU_TIMESTAMP_RE.captures(mid) {
             let ms: Option<u64> = caps.get(1).and_then(|m| m.as_str().parse().ok());
-            return ToolInfo {
-                tool: ToolType::Nyuu,
-                version: None,
-                embedded_time_ms: ms,
-                deterministic: false,
-            };
+            return ToolInfo { tool: ToolType::Nyuu, version: None, embedded_time_ms: ms, deterministic: false };
         }
 
         // Nyuu random grammar
         if NYUU_RANDOM_RE.is_match(mid) || domain.eq_ignore_ascii_case("nyuu") {
-            return ToolInfo {
-                tool: ToolType::Nyuu,
-                version: None,
-                embedded_time_ms: None,
-                deterministic: false,
-            };
+            return ToolInfo { tool: ToolType::Nyuu, version: None, embedded_time_ms: None, deterministic: false };
         }
 
         // 4. ngPost UUIDv4 grammar
-        if NGPOST_UUID_RE.is_match(mid) || domain.eq_ignore_ascii_case("ngpost") || domain.eq_ignore_ascii_case("ngpost.com") {
-            return ToolInfo {
-                tool: ToolType::NgPost,
-                version: None,
-                embedded_time_ms: None,
-                deterministic: false,
-            };
+        if NGPOST_UUID_RE.is_match(mid)
+            || domain.eq_ignore_ascii_case("ngpost")
+            || domain.eq_ignore_ascii_case("ngpost.com")
+        {
+            return ToolInfo { tool: ToolType::NgPost, version: None, embedded_time_ms: None, deterministic: false };
         }
 
         // 5. Postie grammar
         if POSTIE_RE.is_match(mid) {
-            return ToolInfo {
-                tool: ToolType::Postie,
-                version: None,
-                embedded_time_ms: None,
-                deterministic: false,
-            };
+            return ToolInfo { tool: ToolType::Postie, version: None, embedded_time_ms: None, deterministic: false };
         }
 
         // 6. NewsUP grammar
         if mid.to_ascii_lowercase().contains("newsup") || NEWSUP_RE.is_match(mid) {
-            return ToolInfo {
-                tool: ToolType::NewsUp,
-                version: None,
-                embedded_time_ms: None,
-                deterministic: false,
-            };
+            return ToolInfo { tool: ToolType::NewsUp, version: None, embedded_time_ms: None, deterministic: false };
         }
 
-        ToolInfo {
-            tool: ToolType::Unknown,
-            version: None,
-            embedded_time_ms: None,
-            deterministic: false,
-        }
+        ToolInfo { tool: ToolType::Unknown, version: None, embedded_time_ms: None, deterministic: false }
     }
 
     /// Normalize a 10–19 digit Unix timestamp (seconds, milliseconds, microseconds,
@@ -429,11 +373,7 @@ impl ServerClock {
         }
 
         let ts = HW_EPOCH.checked_add(i64::try_from(hw_val).ok()?)?;
-        if (HW_EPOCH..=2_200_000_000).contains(&ts) {
-            DateTime::from_timestamp(ts, 0)
-        } else {
-            None
-        }
+        if (HW_EPOCH..=2_200_000_000).contains(&ts) { DateTime::from_timestamp(ts, 0) } else { None }
     }
 
     /// Decode Giganews 32-character base64 local part with XOR-0x9D mask.
@@ -444,7 +384,8 @@ impl ServerClock {
         }
 
         let b64_str = &local[..32];
-        let bytes = base64::engine::general_purpose::STANDARD.decode(b64_str)
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64_str)
             .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(b64_str))
             .ok()?;
 
@@ -459,11 +400,7 @@ impl ServerClock {
 
         // w2 is at bytes 8..12 (little-endian u32)
         let w2 = u32::from_le_bytes(unpacked[8..12].try_into().ok()?);
-        if (900_000_000..=2_500_000_000).contains(&w2) {
-            DateTime::from_timestamp(w2 as i64, 0)
-        } else {
-            None
-        }
+        if (900_000_000..=2_500_000_000).contains(&w2) { DateTime::from_timestamp(w2 as i64, 0) } else { None }
     }
 
     /// Decode Diablo server Message-ID: <hex$seq$pid$hosthash@cluster>
@@ -477,11 +414,7 @@ impl ServerClock {
             return None;
         }
         let ts = i64::from_str_radix(hex_part, 16).ok()?;
-        if (900_000_000..=2_500_000_000).contains(&ts) {
-            DateTime::from_timestamp(ts, 0)
-        } else {
-            None
-        }
+        if (900_000_000..=2_500_000_000).contains(&ts) { DateTime::from_timestamp(ts, 0) } else { None }
     }
 
     /// Decode INN radix32 Message-ID: <radix32(t)$radix32(pid)$count@host>
@@ -497,11 +430,7 @@ impl ServerClock {
         let offset = u64::from_str_radix(r32_part, 32).ok()?;
         const INN_EPOCH: i64 = 673_416_000; // May 5, 1991
         let ts = INN_EPOCH.wrapping_add(offset as i64);
-        if (INN_EPOCH..=2_500_000_000).contains(&ts) {
-            DateTime::from_timestamp(ts, 0)
-        } else {
-            None
-        }
+        if (INN_EPOCH..=2_500_000_000).contains(&ts) { DateTime::from_timestamp(ts, 0) } else { None }
     }
 }
 
@@ -518,17 +447,8 @@ impl ArrivalRank {
 
     /// Calculate arrival timestamp respecting Abavia synthesis detection.
     /// When Abavia backend is detected, rank interpolation is disabled.
-    pub fn calculate_with_backend(
-        second: u64,
-        rank: usize,
-        total_in_sec: usize,
-        is_abavia: bool,
-    ) -> f64 {
-        if is_abavia {
-            second as f64
-        } else {
-            Self::calculate(second, rank, total_in_sec)
-        }
+    pub fn calculate_with_backend(second: u64, rank: usize, total_in_sec: usize, is_abavia: bool) -> f64 {
+        if is_abavia { second as f64 } else { Self::calculate(second, rank, total_in_sec) }
     }
 }
 
@@ -556,24 +476,13 @@ impl XrefSync {
     /// Calculate relative arrival timeline offset between two groups anchored by an atomic INN Xref crosspost.
     /// Since the physical message was injected atomically into INN across all listed groups,
     /// the timestamp difference at the cross-post anchor is exactly 0.000 s.
-    pub fn anchor_offset(
-        xref: &str,
-        group_a: &str,
-        art_a: u64,
-        group_b: &str,
-        art_b: u64,
-    ) -> Option<f64> {
+    pub fn anchor_offset(xref: &str, group_a: &str, art_a: u64, group_b: &str, art_b: u64) -> Option<f64> {
         let pairs = Self::parse_xref_pairs(xref);
         let has_a = pairs.iter().any(|(g, n)| g == group_a && *n == art_a);
         let has_b = pairs.iter().any(|(g, n)| g == group_b && *n == art_b);
-        if has_a && has_b {
-            Some(0.0)
-        } else {
-            None
-        }
+        if has_a && has_b { Some(0.0) } else { None }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -616,8 +525,8 @@ mod tests {
         // Empirical probe (2026-11-03): Giganews (`super.newsgroupdirect.com`) returned
         // `111 20260419205543` when local UTC was 5.74s behind (`2026-04-19T20:55:37.260Z`).
         let local = DateTime::from_timestamp(1_776_632_137, 260_000_000).unwrap();
-        let skew = ServerClock::measure_skew_seconds("111 20260419205543", local)
-            .expect("must parse NNTP 111 DATE response");
+        let skew =
+            ServerClock::measure_skew_seconds("111 20260419205543", local).expect("must parse NNTP 111 DATE response");
         assert!((skew - 5.74).abs() < 1e-3, "expected +5.74s skew, got {skew}");
 
         let corrected = ServerClock::correct_skew(1_776_632_143.0, skew);
@@ -627,13 +536,7 @@ mod tests {
     #[test]
     fn xref_multibyte_utf8_prefix_does_not_panic() {
         let pairs = XrefSync::parse_xref_pairs("hosté alt.binaries.test:42 alt.binaries.movies:99");
-        assert_eq!(
-            pairs,
-            vec![
-                ("alt.binaries.test".to_string(), 42),
-                ("alt.binaries.movies".to_string(), 99),
-            ]
-        );
+        assert_eq!(pairs, vec![("alt.binaries.test".to_string(), 42), ("alt.binaries.movies".to_string(), 99),]);
     }
 
     #[test]
@@ -662,7 +565,10 @@ mod tests {
         let hw = id_facts("<EaPmB.546176$JP7.228032@fx09.am4>");
         assert_eq!(hw.tool, None);
         assert_eq!(hw.clock_ms, Some(1_503_379_236_000));
-        assert_eq!((hw.hw_host.as_deref(), hw.hw_key.as_deref(), hw.hw_n), (Some("fx09.am4"), Some("JP7"), Some(546_176)));
+        assert_eq!(
+            (hw.hw_host.as_deref(), hw.hw_key.as_deref(), hw.hw_n),
+            (Some("fx09.am4"), Some("JP7"), Some(546_176))
+        );
         let nyuu = id_facts("<ZjPsQyLgOjNtQvXbHeKaXyCm1730295651235@nyuu>");
         assert_eq!(nyuu.tool, Some(ToolType::Nyuu));
         assert_eq!(nyuu.clock_ms, Some(1_730_295_651_235));

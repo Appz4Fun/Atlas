@@ -114,9 +114,8 @@ impl ReleaseAssembler {
             if let Some(last) = current_runs.last() {
                 let delta_t = run.t_start - last.t_end;
                 let within_window = delta_t >= lower_bound && delta_t <= upper_bound;
-                let can_group = current_runs
-                    .iter()
-                    .all(|existing| IntraReleaseGrouping::can_group(existing, &run).is_ok());
+                let can_group =
+                    current_runs.iter().all(|existing| IntraReleaseGrouping::can_group(existing, &run).is_ok());
 
                 if within_window && can_group {
                     current_runs.push(run);
@@ -150,14 +149,7 @@ impl ReleaseAssembler {
         let total_size: u64 = runs.iter().map(|r| r.size).sum();
         let name = runs.first().map(|r| r.filename.clone()).unwrap_or_else(|| "unnamed".to_string());
         let any_obfuscated = runs.iter().any(|r| r.is_obfuscated);
-        MergedRelease {
-            name,
-            runs,
-            total_size,
-            complete: true,
-            display_name: None,
-            is_obfuscated: any_obfuscated,
-        }
+        MergedRelease { name, runs, total_size, complete: true, display_name: None, is_obfuscated: any_obfuscated }
     }
 }
 
@@ -183,20 +175,12 @@ impl Par2Bridge {
         first_articles: &[ArticleHead],
     ) -> Par2BridgeResult {
         if par2_data.is_empty() || candidate_runs.is_empty() {
-            return Par2BridgeResult {
-                resolved_count: 0,
-                total_candidates: candidate_runs.len(),
-                success: false,
-            };
+            return Par2BridgeResult { resolved_count: 0, total_candidates: candidate_runs.len(), success: false };
         }
 
         let inv = crate::par2::inventory(par2_data);
         if inv.files.is_empty() {
-            return Par2BridgeResult {
-                resolved_count: 0,
-                total_candidates: candidate_runs.len(),
-                success: false,
-            };
+            return Par2BridgeResult { resolved_count: 0, total_candidates: candidate_runs.len(), success: false };
         }
 
         let mut resolved = 0;
@@ -243,9 +227,8 @@ impl Par2Bridge {
         let all_in_slice_bounds = first_articles.iter().all(|a| a.file_index < candidate_runs.len());
         let any_zero_head = first_articles.iter().any(|a| a.file_index == 0);
         let any_zero_run = candidate_runs.iter().any(|r| r.file_index == Some(0));
-        let all_match_run_index = first_articles
-            .iter()
-            .all(|a| candidate_runs.iter().any(|r| r.file_index == Some(a.file_index as i64)));
+        let all_match_run_index =
+            first_articles.iter().all(|a| candidate_runs.iter().any(|r| r.file_index == Some(a.file_index as i64)));
         let use_run_file_index = !first_articles.is_empty()
             && all_match_run_index
             && (!all_in_slice_bounds || (!any_zero_head && !any_zero_run));
@@ -258,9 +241,7 @@ impl Par2Bridge {
                 continue;
             }
             let head = if use_run_file_index {
-                first_articles
-                    .iter()
-                    .find(|a| Some(a.file_index as i64) == run.file_index)
+                first_articles.iter().find(|a| Some(a.file_index as i64) == run.file_index)
             } else {
                 first_articles.iter().find(|a| a.file_index == i)
             };
@@ -484,11 +465,7 @@ impl Deobfuscator {
             .unwrap_or("")
             .to_string();
 
-        if leaf.chars().count() > 255 {
-            leaf.chars().take(255).collect()
-        } else {
-            leaf
-        }
+        if leaf.chars().count() > 255 { leaf.chars().take(255).collect() } else { leaf }
     }
 
     /// Check if filename looks random / obfuscated.
@@ -502,9 +479,7 @@ impl Deobfuscator {
             return true;
         }
 
-        let has_vowels = stem
-            .chars()
-            .any(|c| matches!(c, 'a' | 'e' | 'i' | 'o' | 'u' | 'A' | 'E' | 'I' | 'O' | 'U'));
+        let has_vowels = stem.chars().any(|c| matches!(c, 'a' | 'e' | 'i' | 'o' | 'u' | 'A' | 'E' | 'I' | 'O' | 'U'));
         let has_separators = stem.chars().any(|c| matches!(c, '.' | '-' | '_' | ' '));
         if stem.len() >= 20 && !has_separators && !has_vowels {
             return true;
@@ -533,12 +508,7 @@ pub struct VetoDsu<T> {
 impl<T> VetoDsu<T> {
     pub fn new(elements: Vec<T>) -> Self {
         let n = elements.len();
-        Self {
-            parent: (0..n).collect(),
-            rank: vec![0; n],
-            members: (0..n).map(|idx| vec![idx]).collect(),
-            elements,
-        }
+        Self { parent: (0..n).collect(), rank: vec![0; n], members: (0..n).map(|idx| vec![idx]).collect(), elements }
     }
 
     pub fn find(&mut self, i: usize) -> usize {
@@ -700,10 +670,7 @@ pub struct InterReleaseDeduplication;
 
 impl InterReleaseDeduplication {
     /// Evaluates whether two distinct releases represent byte-identical duplicate reposts (Twins).
-    pub fn can_deduplicate_as_twin(
-        a: &ReleaseCandidate,
-        b: &ReleaseCandidate,
-    ) -> Result<(), InterReleaseVeto> {
+    pub fn can_deduplicate_as_twin(a: &ReleaseCandidate, b: &ReleaseCandidate) -> Result<(), InterReleaseVeto> {
         // VETO 1: Conflicting full file cryptographic hashes
         if let (Some(ha), Some(hb)) = (&a.full_md5, &b.full_md5)
             && ha != hb
@@ -743,8 +710,7 @@ impl InterReleaseDeduplication {
                 (Some(ha), Some(hb)) => ha == hb && a.size == b.size,
                 _ => false,
             };
-            let lcm_match = a.size == b.size
-                && (a.lcm_matched_intervals >= 4 || b.lcm_matched_intervals >= 4);
+            let lcm_match = a.size == b.size && (a.lcm_matched_intervals >= 4 || b.lcm_matched_intervals >= 4);
 
             if md5_match || lcm_match {
                 return ReleasePartition::Twin;
@@ -761,11 +727,7 @@ impl InterReleaseDeduplication {
             _ => false,
         };
 
-        if inner_crc_match || segment_uid_match {
-            ReleasePartition::Alt
-        } else {
-            ReleasePartition::Distinct
-        }
+        if inner_crc_match || segment_uid_match { ReleasePartition::Alt } else { ReleasePartition::Distinct }
     }
 }
 
@@ -1225,10 +1187,7 @@ mod tests {
                 creation_salt: None,
                 is_obfuscated: true,
             });
-            heads.push(ArticleHead {
-                file_index: (i - 1) as usize,
-                payload,
-            });
+            heads.push(ArticleHead { file_index: (i - 1) as usize, payload });
         }
 
         // Reverse `heads` so `ArticleHead { file_index: 1 }` precedes `ArticleHead { file_index: 0 }`
@@ -1389,10 +1348,7 @@ mod tests {
             creation_salt: None,
             is_obfuscated: true,
         }];
-        let heads = vec![ArticleHead {
-            file_index: 0,
-            payload: foreign_vol1,
-        }];
+        let heads = vec![ArticleHead { file_index: 0, payload: foreign_vol1 }];
 
         let res = Par2Bridge::resolve(&par2, &mut runs, &heads);
         assert_eq!(res.resolved_count, 0, "foreign volume 1 with mismatched 16 KiB prefix must not resolve");
