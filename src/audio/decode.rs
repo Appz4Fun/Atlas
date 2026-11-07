@@ -197,19 +197,23 @@ fn ac3(frames: &[&[u8]], max_ms: i64) -> Option<(u32, Vec<Vec<i16>>)> {
         }
         let mut mono = Vec::new();
         let mut rest = *frame;
+        // a block that holds no syncframe at all skips sound: the overlap carried over it is wrong now
+        if !rest.starts_with(&[0x0B, 0x77]) {
+            decoder.reset();
+        }
         // padding after the last syncframe is no syncframe: what was decoded before it stands
         while rest.starts_with(&[0x0B, 0x77]) {
-            let Ok(header) = filmcraft_ac3::parse_header(rest) else {
-                mono.clear();
-                break;
-            };
-            let Some(syncframe) = rest.get(..header.frame_bytes).filter(|_| header.frame_bytes > 0) else {
+            let Some((header, syncframe)) = filmcraft_ac3::parse_header(rest)
+                .ok()
+                .and_then(|h| rest.get(..h.frame_bytes).filter(|_| h.frame_bytes > 0).map(|f| (h, f)))
+            else {
+                // a syncframe skipped, as one that doesn't decode: the overlap carried from before it is wrong
+                decoder.reset();
                 mono.clear();
                 break;
             };
             rest = &rest[header.frame_bytes..];
             let Ok(decoded) = decoder.decode(syncframe) else {
-                // the overlap carried from this frame is wrong now
                 decoder.reset();
                 mono.clear();
                 break;
