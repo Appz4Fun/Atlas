@@ -322,7 +322,13 @@ impl Default for PassSettings {
 }
 
 /// slices saved together in one transaction at most.
-const MAX_BATCH: usize = 32;
+const MAX_BATCH: usize = 128;
+/// How long a writer waits, after the first slice of a save, for more to save
+/// with it. Every transaction writes each page it changed (index pages above
+/// all) to the WAL again, so fewer, bigger transactions write less: on
+/// `examples/bench_writes` 32 slices a transaction wrote about half the bytes
+/// per header 1 did. A save takes far longer than this, so slices hardly wait more.
+const BATCH_GATHER: Duration = Duration::from_millis(250);
 
 /// The indexer's database, shared by every pass. Small writes (cursors) run on
 /// the main database's connection directly. Slices go to the writer thread of
@@ -486,8 +492,10 @@ fn writer(
             },
         };
         let mut batch = vec![first];
+        let gather_until = std::time::Instant::now() + BATCH_GATHER;
         while batch.len() < MAX_BATCH {
-            match jobs.try_recv() {
+            let left = gather_until.saturating_duration_since(std::time::Instant::now());
+            match jobs.recv_timeout(left) {
                 Ok(WriterJob::Save(job)) => batch.push(job),
                 Ok(WriterJob::Stage(job)) => stage.push_back(job),
                 Err(_) => break,

@@ -189,30 +189,78 @@ pub fn tune_for_writing(conn: &Connection) -> Result<()> {
     )
 }
 
-/// For the writer, between transactions: copy what `checkpointer` hasnt yet
-/// into the main file. With no write in progress it can copy everything, soo
-/// the next transaction starts the WAL over instead of growing it. Mostly
-/// quick, the background checkpointer has done the bulk of it already.
+/// A shard's WAL is copied into it once it holds this much, not after every
+/// transaction: a page the writer changes in many transactions (an index's
+/// inner pages, the meta row, the fts pages) then goes into the shard once per
+/// checkpoint instead of once per transaction. Copying after every save and
+/// twice a second wrote ~50x what the shards grew by during a big backfill.
+pub const CHECKPOINT_WAL_BYTES: u64 = 256 << 20;
+/// ... or once it has waited this long, so a quiet shard's WAL still goes in
+pub const CHECKPOINT_EVERY: Duration = Duration::from_secs(60);
+
+/// Whether a WAL holding `len` bytes not yet copied into its database, last
+/// checkpointed `since` ago, is due.
+pub fn checkpoint_due(len: u64, since: Duration) -> bool {
+    len >= CHECKPOINT_WAL_BYTES || (len > 0 && since >= CHECKPOINT_EVERY)
+}
+
+/// Bytes of `db`'s WAL not copied into it yet, from the WAL index (the -shm
+/// file): its header's last frame (`mxFrame`, offset 16) less the frames
+/// checkpointed (`nBackfill`, offset 96), at the page size (offset 14) plus
+/// each frame's 24 byte header, in the machine's byte order. The WAL file's
+/// own length says nothing: it stays at `journal_size_limit` once it starts
+/// over. None when the index cant be read, for the caller to checkpoint
+/// anyway. A read racing a commit is only off by that commit.
+pub fn wal_pending(db: &Path) -> Option<u64> {
+    use std::io::Read;
+
+    let mut shm = std::path::PathBuf::from(db).into_os_string();
+    shm.push("-shm");
+    let mut head = [0u8; 100];
+    fs::File::open(shm).ok()?.read_exact(&mut head).ok()?;
+    let u32_at = |at: usize| u32::from_ne_bytes(head[at..at + 4].try_into().unwrap());
+    let page = match u16::from_ne_bytes([head[14], head[15]]) {
+        0 => return None,
+        1 => 65536,
+        n => n as u64,
+    };
+    let (frames, copied) = (u32_at(16), u32_at(96));
+    Some(frames.saturating_sub(copied) as u64 * (page + 24))
+}
+
+/// For the writer, between transactions: once the WAL is big enough
+/// (`CHECKPOINT_WAL_BYTES`), copy what `checkpointer` hasnt yet into the main
+/// file. With no write in progress it can copy everything, so the next
+/// transaction starts the WAL over instead of growing it. A smaller WAL waits:
+/// the background checkpointer copies it once it is old enough.
 pub fn finish_checkpoint(conn: &Connection) -> Result<()> {
+    let small = conn.path().and_then(|p| wal_pending(Path::new(p))).is_some_and(|len| len < CHECKPOINT_WAL_BYTES);
+    if small {
+        return Ok(());
+    }
     conn.query_row("pragma wal_checkpoint(passive)", [], |_| Ok(()))
 }
 
-/// Background WAL checkpoints for a writer tuned with `tune_for_writing`.
-/// Passive checkpoints never block readers or the writer, soo copying the WAL
-/// into the main file happens alongside the writes. They never let the WAL
-/// start over on their own (the writer keeps adding to it); the writer does
-/// that with `finish_checkpoint`. A blocking checkpoint stalls the writer for
-/// as long as it copies (20s for a 1.5GB WAL), soo it is only a last resort
-/// when the WAL got huge anyway. Runs until `stop` is set.
+/// Background WAL checkpoints for a writer tuned with `tune_for_writing`, each
+/// shard once its WAL is due (`checkpoint_due`). Passive checkpoints never
+/// block readers or the writer, so copying the WAL into the main file happens
+/// alongside the writes. They never let the WAL start over on their own (the
+/// writer keeps adding to it); the writer's next transaction does once all of
+/// it is copied. A blocking checkpoint stalls the writer for as long as it
+/// copies (20s for a 1.5GB WAL), so it is only a last resort when the WAL got
+/// huge anyway. Runs until `stop` is set.
 pub fn checkpointer(stop: std::sync::Arc<std::sync::atomic::AtomicBool>) -> std::thread::JoinHandle<()> {
     use std::sync::atomic::Ordering;
 
     std::thread::spawn(move || {
-        // the main database and every shard
+        // the main database and every shard, each with when it was last checkpointed
         let main = paths::database();
         let files: Vec<std::path::PathBuf> = std::iter::once(main.clone()).chain(store::shard_paths(&main)).collect();
-        let conns: Vec<(Connection, std::path::PathBuf)> =
-            files.iter().filter(|p| p.exists()).filter_map(|p| open_at(p).ok().map(|c| (c, wal_path(p)))).collect();
+        let mut conns: Vec<(Connection, &std::path::PathBuf, Instant)> = files
+            .iter()
+            .filter(|p| p.exists())
+            .filter_map(|p| open_at(p).ok().map(|c| (c, p, Instant::now())))
+            .collect();
 
         let stopping = || stop.load(Ordering::Relaxed);
         while !stopping() {
@@ -223,16 +271,22 @@ pub fn checkpointer(stop: std::sync::Arc<std::sync::atomic::AtomicBool>) -> std:
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
-            for (conn, wal) in &conns {
-                let big = fs::metadata(wal).is_ok_and(|m| m.len() > 8 << 30);
+            for (conn, db, last) in &mut conns {
+                // unreadable: checkpointed as before, every round
+                let pending = wal_pending(db);
+                if pending.is_some_and(|len| !checkpoint_due(len, last.elapsed())) {
+                    continue;
+                }
+                let big = fs::metadata(wal_path(db)).is_ok_and(|m| m.len() > 8 << 30);
                 let mode = if big { "truncate" } else { "passive" };
                 let _ = conn.query_row(&format!("pragma wal_checkpoint({mode})"), [], |_| Ok(()));
+                *last = Instant::now();
             }
         }
 
         // leave small wals behind, where nothing holds them: a file still busy (a reader, or a writer still there)
         // is left as it is, the next start checkpoints it, rather than each one waiting out the 30s busy timeout
-        for (conn, _) in &conns {
+        for (conn, _, _) in &conns {
             let _ = conn.busy_timeout(Duration::ZERO);
             let _ = conn.query_row("pragma wal_checkpoint(truncate)", [], |_| Ok(()));
         }
@@ -733,6 +787,34 @@ pub fn update_backfill_cursor(conn: &Connection, group: &str, article: i64) -> R
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn checkpoints_wait_for_a_big_or_old_wal() {
+        assert!(!checkpoint_due(0, CHECKPOINT_EVERY * 2));
+        assert!(!checkpoint_due(CHECKPOINT_WAL_BYTES - 1, Duration::from_secs(1)));
+        assert!(checkpoint_due(CHECKPOINT_WAL_BYTES, Duration::ZERO));
+        assert!(checkpoint_due(1, CHECKPOINT_EVERY));
+    }
+
+    #[test]
+    fn wal_pending_counts_what_isnt_copied_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.db");
+        let conn = create_at(&path).unwrap();
+        conn.query_row("pragma journal_mode = wal", [], |_| Ok(())).unwrap();
+        tune_for_writing(&conn).unwrap();
+        conn.execute_batch("create table t (x BLOB)").unwrap();
+        for _ in 0..20 {
+            conn.execute("insert into t values (zeroblob(8000))", []).unwrap();
+        }
+        let pending = wal_pending(&path).unwrap();
+        assert!(pending > 20 * 4096, "{pending}");
+        // small: the writer leaves it for the checkpointer
+        finish_checkpoint(&conn).unwrap();
+        assert_eq!(wal_pending(&path), Some(pending));
+        conn.query_row("pragma wal_checkpoint(passive)", [], |_| Ok(())).unwrap();
+        assert_eq!(wal_pending(&path), Some(0));
+    }
 
     /// Marks the connection `f` gets: true when it's one that was marked before.
     fn was_kept(main: &Path) -> bool {
