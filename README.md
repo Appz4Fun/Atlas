@@ -275,6 +275,8 @@ All of these go in a `postprocess` object, and each has a default. See [Post-pro
 | `min_completion_percent` | `0` | Below this a release gets no body, and `--purge --dead` can take it. At `0` every release, however incomplete, is read, so a post cut across groups or an upload whose files were posted one by one gets its names, hashes and links before the rest of it arrives. |
 | `dead_after_secs` | `172800` | Quiet time before purge may delete anything but a blocked group's rows. |
 | `max_attempts` | `5` | Failed attempts before a step gives up on a release. |
+| `body_timeout_secs` | `60` | Time limit for one article on one server. Each server asked gets its own limit, so asking eight servers can take eight of these. A step's two-minute run deadline only stops new articles from starting. It doesn't cut off an article that's still working through the servers. Read at startup. |
+| `body_retries` | `2` | How many more times an article is asked of a server that timed out or failed on it, after the other servers have been tried. A server that says it doesn't have the article isn't asked again, and neither is one resting after a failed connection. Read at startup. |
 
 ### Server fields (`usenet_servers`)
 

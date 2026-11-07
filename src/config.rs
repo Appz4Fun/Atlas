@@ -860,6 +860,10 @@ pub struct PostprocessConfig {
     pub min_completion_percent: i64,
     pub dead_after_secs: i64,
     pub max_attempts: i64,
+    /// a body's time limit on each server it asks: asking eight servers can take eight of these
+    pub body_timeout_secs: i64,
+    /// how many times more a body asks a server that timed out or failed on it (not one that said it hasnt it)
+    pub body_retries: i64,
 }
 
 impl Default for PostprocessConfig {
@@ -884,6 +888,8 @@ impl Default for PostprocessConfig {
             min_completion_percent: 0,
             dead_after_secs: 172_800,
             max_attempts: 5,
+            body_timeout_secs: 60,
+            body_retries: crate::nntp::BODY_RETRIES as i64,
         }
     }
 }
@@ -910,6 +916,8 @@ impl PostprocessConfig {
         int("min_completion_percent", &mut c.min_completion_percent, 0);
         int("dead_after_secs", &mut c.dead_after_secs, 0);
         int("max_attempts", &mut c.max_attempts, 1);
+        int("body_timeout_secs", &mut c.body_timeout_secs, 1);
+        int("body_retries", &mut c.body_retries, 0);
         c.settle_secs = c.settle_secs.max(1);
         c.complete_settle_secs = c.complete_settle_secs.max(1);
         c.min_completion_percent = c.min_completion_percent.min(100);

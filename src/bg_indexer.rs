@@ -1208,7 +1208,11 @@ async fn supervise(stop: Arc<AtomicBool>, stats: Arc<Mutex<Stats>>, writing: Opt
         }
         started = true;
 
-        let pool = Arc::new(Pool::new(&servers).with_max_unsaved(config.max_unsaved_headers()));
+        let pp = &config.postprocess;
+        let pool = Arc::new(Pool::new(&servers).with_max_unsaved(config.max_unsaved_headers()).with_body_tries(
+            Duration::from_secs(pp.body_timeout_secs.max(1) as u64),
+            usize::try_from(pp.body_retries).unwrap_or(0),
+        ));
 
         // at least one server has to answer before spinning everything up
         if let Err(e) = pool.connect().await {
