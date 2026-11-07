@@ -741,7 +741,7 @@ fn compact_shard(
         // the releases' message-id index: its files and their ids are the same
         tx.execute_batch(
             "insert into release_ids select * from old.release_ids
-             where id_hash = 0 or file_id in (select id from files);
+             where file_id = 0 or file_id in (select id from files);
              insert into collections select * from old.collections
              where release_id in (select id from releases);",
         )?;

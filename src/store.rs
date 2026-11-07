@@ -225,7 +225,8 @@ pub fn migrate_shard(conn: &Connection) -> Result<()> {
         -- every message-id of a release with more than one file, by its keyed
         -- hash (`id_hash`), and the file it is in: one lookup tells whether
         -- another file of the release has it. A release is in it once its
-        -- (release_id, 0, 0) row is (`index_release`).
+        -- (release_id, 0, 0) row is (`index_release`); a cache, taken again for
+        -- releases gone quiet (`ShardWriter::prune_ids_some`).
         create table if not exists release_ids (
             release_id INTEGER NOT NULL,
             id_hash INTEGER NOT NULL,
@@ -586,6 +587,20 @@ pub(crate) fn is_exactly(bits: &[u8], expected: i64) -> bool {
 /// after the file sealed, and how many articles all that covers. One row a
 /// file, written by `Timing::write`; a release saved before the table has
 /// none, and its facts stay off.
+/// When each release's `release_ids` were last made in full (`index_release`): a release indexed again without a
+/// new article (all copies, a spot placed on it) isn't quiet for the pruning walk till SEAL_AGE after
+/// (`ShardWriter::prune_ids_some`).
+pub const RELEASE_INDEXED: ShardTable = ShardTable {
+    name: "release_indexed",
+    create: "create table if not exists release_indexed (
+        release_id INTEGER PRIMARY KEY,
+        at         INTEGER NOT NULL
+    )",
+    indexes: &[],
+    release_key: Some("release_id"),
+    added: &[],
+};
+
 pub const FILE_TIMING: ShardTable = ShardTable {
     name: "file_timing",
     create: "create table if not exists file_timing (
@@ -979,10 +994,11 @@ pub(crate) fn index_release(conn: &Connection, key: &IdKey, release_id: i64) -> 
             insert.execute(params![release_id, key.hash(&seg_key(conn, &mut suffixes, &s)?), file_id])?;
         }
     }
-    // its own row's file_id is when it was indexed: a release indexed again without a new article (all copies, a
-    // spot placed on it) isn't quiet for the pruning walk till SEAL_AGE after that (`ShardWriter::prune_ids_some`)
-    conn.prepare_cached("insert or ignore into release_ids (release_id, id_hash, file_id) values (?, 0, unixepoch())")?
+    conn.prepare_cached("insert or ignore into release_ids (release_id, id_hash, file_id) values (?, 0, 0)")?
         .execute([release_id])?;
+    conn.prepare_cached("insert or replace into release_indexed (release_id, at) values (?, unixepoch())")?
+        .execute([release_id])?;
+    crate::metrics::names::RELEASE_IDS.inc(&[("event", "indexed")], 1);
     Ok(())
 }
 
@@ -1784,10 +1800,10 @@ struct IdsPrune {
 /// files sealed per writer tick at most
 pub const SEAL_PER_TICK: usize = 2_000;
 
-/// a pruning step of `release_ids` stops after this long, so the writer gets back to saving
+/// a pruning step of `release_ids` stops after this long while stage jobs wait, so the writer gets back to them
 pub const PRUNE_IDS_BUDGET: std::time::Duration = std::time::Duration::from_millis(10);
 
-/// the same when nothing waits for the writer
+/// the same when nothing waits for the writer (a save that comes in meanwhile waits up to this)
 pub const PRUNE_IDS_BUDGET_IDLE: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// after a step reaches the end of `release_ids`, the next starts over this much later at least (seconds)
@@ -1797,10 +1813,10 @@ const PRUNE_IDS_REST: i64 = 600;
 const PRUNE_IDS_LOOKS: usize = 5_000;
 
 /// rows of one quiet release's `release_ids` taken at a time
-const PRUNE_IDS_CHUNK: i64 = 2_000;
+const PRUNE_IDS_CHUNK: i64 = 1_000;
 
 /// the same when nothing waits for the writer
-const PRUNE_IDS_CHUNK_IDLE: i64 = 10_000;
+const PRUNE_IDS_CHUNK_IDLE: i64 = 5_000;
 
 /// a seal tick stops after this long, so the writer gets back to saving
 pub const SEAL_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
@@ -1922,6 +1938,7 @@ impl ShardWriter {
         let mut w = self.ids;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut taken = 0;
+        let mut quiet = 0;
         let mut looked = 0;
         while started.elapsed() < budget && looked < PRUNE_IDS_LOOKS {
             if let Some(release_id) = w.pruning {
@@ -1974,7 +1991,7 @@ impl ShardWriter {
                 .prepare_cached("select coalesce(max(touched_at), 0) from files where release_id = ?")?
                 .query_row([release_id], |r| r.get(0))?;
             let indexed: i64 = tx
-                .prepare_cached("select file_id from release_ids where release_id = ? and id_hash = 0")?
+                .prepare_cached("select at from release_indexed where release_id = ?")?
                 .query_row([release_id], |r| r.get(0))
                 .optional()?
                 .unwrap_or(0);
@@ -1984,13 +2001,17 @@ impl ShardWriter {
                 taken += tx
                     .prepare_cached("delete from release_ids where release_id = ? and id_hash = 0")?
                     .execute([release_id])?;
+                tx.prepare_cached("delete from release_indexed where release_id = ?")?.execute([release_id])?;
                 w.pruning = Some(release_id);
+                quiet += 1;
             } else {
                 w.oldest_kept = Some(w.oldest_kept.map_or(last, |o| o.min(last)));
             }
         }
         tx.commit()?;
         self.ids = w;
+        crate::metrics::names::RELEASE_IDS.inc(&[("event", "pruned_releases")], quiet);
+        crate::metrics::names::RELEASE_IDS.inc(&[("event", "pruned_rows")], taken as u64);
         Ok(taken)
     }
 
@@ -4303,7 +4324,7 @@ mod tests {
         conn.execute("update files set touched_at = ?", [now - SEAL_AGE - 1]).unwrap();
         writer.ids.rest_until = 0;
         assert_eq!(writer.prune_ids_some(&mut conn, now, true).unwrap(), 0, "indexed just now");
-        conn.execute("update release_ids set file_id = ? where id_hash = 0", [now - SEAL_AGE - 1]).unwrap();
+        conn.execute("update release_indexed set at = ?", [now - SEAL_AGE - 1]).unwrap();
         writer.ids.rest_until = now + 1;
         assert_eq!(writer.prune_ids_some(&mut conn, now, true).unwrap(), 0, "resting");
         writer.ids.rest_until = 0;
@@ -4366,7 +4387,7 @@ mod tests {
         assert_eq!(writer.ids.pruning, None);
 
         conn.execute("update files set touched_at = ?", [now - SEAL_AGE - 1]).unwrap();
-        conn.execute("update release_ids set file_id = ? where id_hash = 0", [now - SEAL_AGE - 1]).unwrap();
+        conn.execute("update release_indexed set at = ?", [now - SEAL_AGE - 1]).unwrap();
 
         let mut writer = ShardWriter::new(shard_of("alt.binaries.t"));
         let mut taken = 0;
