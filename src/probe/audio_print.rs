@@ -7,7 +7,7 @@
 //! across RAR volumes. Each window starts at a time in the film, not at a share of its bytes, soo two encodes at
 //! different bit rates read the same seconds: a first read lands near the time by the average bit rate, its first
 //! cluster says where it really landed, and one or two more hops put it a little before. Only Matroska, and only
-//! AAC-LC, FLAC, MP3, MP2, Vorbis and PCM tracks, which have a pure-Rust decoder. AC-3, E-AC-3, DTS, TrueHD and Opus
+//! AAC-LC, FLAC, MP3, MP2, Vorbis, PCM, AC-3 and E-AC-3 tracks, which have a pure-Rust decoder. DTS, TrueHD and Opus
 //! don't, and get no print.
 //!
 //! A print is a candidate for a reader, never a merge.
@@ -572,6 +572,22 @@ mod tests {
     }
 
     #[test]
+    fn ac3_and_a_5_1_eac3_match_the_aac_encode() {
+        let aac = fixture("tune.aac.mkv");
+        let (_, a) = print_of("tune.aac.mkv", aac.len() / 5, 3_000).unwrap();
+        let other = fixture("other.aac.mkv");
+        let (_, c) = print_of("other.aac.mkv", other.len() / 5, 3_000).unwrap();
+        for name in ["tune.ac3.mkv", "tune.eac3.mkv"] {
+            let file = fixture(name);
+            let (at, d) = print_of(name, file.len() / 5, 3_000).unwrap();
+            assert!((3_000..3_100).contains(&at), "{name}: {at}");
+            assert!(audio::informative(&d), "{name}");
+            assert!(audio::same_sound(&a, &d), "{name}: {:?}", audio::best_alignment(&a, &d));
+            assert!(!audio::same_sound(&c, &d), "{name} against another tune");
+        }
+    }
+
+    #[test]
     fn vorbis_in_matroska_decodes_from_its_xiph_laced_headers() {
         // CodecPrivate is the packet count, the Xiph lengths and the three headers, as Matroska stores them
         let file = fixture("tune.vorbis.mkv");
@@ -621,9 +637,12 @@ mod tests {
         }
         assert_eq!(window_print(&junk, &track, 3_000, 8_000).map(|(_, p)| audio::informative(&p)), None);
         assert_eq!(window_print(&[], &track, 0, 8_000), None);
+        let mut dts = track.clone();
+        dts.codec = "A_DTS".into();
+        assert_eq!(window_print(&file, &dts, 3_000, 8_000), None, "no decoder, no print");
         let mut ac3 = track.clone();
         ac3.codec = "A_AC3".into();
-        assert_eq!(window_print(&file, &ac3, 3_000, 8_000), None, "no decoder, no print");
+        assert_eq!(window_print(&file, &ac3, 3_000, 8_000), None, "AAC frames are no AC-3 syncframes");
     }
 
     fn probe(codec: &str, container: &str, secs: f64) -> ProbeInfo {
@@ -644,7 +663,8 @@ mod tests {
     fn only_decodable_matroska_sound_at_a_fair_bit_rate_is_planned() {
         let p = plan(&probe("A_AAC", "matroska", 5_400.0)).unwrap();
         assert_eq!((p.duration_ms, p.size, p.stored, p.window_ms), (5_400_000, 2_000_000_000, false, WINDOW_MS));
-        assert_eq!(plan(&probe("A_EAC3", "matroska", 5_400.0)), Err("ac3"));
+        assert!(plan(&probe("A_EAC3", "matroska", 5_400.0)).is_ok());
+        assert_eq!(plan(&probe("A_TRUEHD", "matroska", 5_400.0)), Err("truehd"));
         assert_eq!(plan(&probe("A_DTS", "matroska", 5_400.0)), Err("dts"));
         assert_eq!(plan(&probe("A_AAC", "mp4", 5_400.0)), Err("container"));
         assert_eq!(plan(&probe("A_AAC", "matroska", 60.0)), Err("short"));
