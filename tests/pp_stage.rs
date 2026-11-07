@@ -155,7 +155,7 @@ fn a_panicking_step_is_retried_with_backoff_then_failed_and_later_steps_still_ru
     conn.execute("update pp_queue set due_at = 1", []).unwrap();
     wait_for("the failed bit", || h.bits("Rel.One").is_some_and(|b| b.1 == mask(StepId(9))));
     let error: String = conn.query_row("select last_error from pp_state", [], |r| r.get(0)).unwrap();
-    assert!(error.contains("boom"), "{error}");
+    assert!(error.starts_with("bad: ") && error.contains("boom"), "{error}");
 }
 
 #[test]
