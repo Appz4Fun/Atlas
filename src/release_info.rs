@@ -959,12 +959,15 @@ fn across_posters(conn: &Connection, anchor: i64, named: &[Named]) -> Result<Acr
     if one_poster && !posts.iter().any(|(_, union)| union.overlap) {
         return Ok((None, false, HashSet::new()));
     }
-    // the rows of the posts sharing parts: a poster's own rows that one of them is in make no post of their own
-    let claimed: HashSet<i64> = posts
+    // the rows of the posts sharing parts and their crossposts: a poster's own rows that one of them is in make no
+    // post of their own
+    let mut claimed: HashSet<i64> = posts
         .iter()
         .filter(|(chosen, union)| chosen.len() > 1 && union.overlap)
         .flat_map(|(chosen, _)| chosen.iter().copied())
         .collect();
+    let copies_claimed: Vec<i64> = copies.iter().filter(|(_, of)| claimed.contains(of)).map(|(n, _)| n.id).collect();
+    claimed.extend(copies_claimed);
     for (chosen, union) in posts {
         let anchor_in = chosen.contains(&anchor) || copies.iter().any(|(n, of)| n.id == anchor && chosen.contains(of));
         if !anchor_in {
@@ -3227,6 +3230,32 @@ mod tests {
             let post = whole_post_with(&conn, row).unwrap().unwrap();
             assert_eq!(post.ids, vec![rows[2].id, rows[3].id]);
             assert!(!post.complete);
+        }
+    }
+
+    #[test]
+    fn a_crosspost_of_a_row_in_a_post_sharing_parts_isnt_in_its_posters_own_post() {
+        let name = "Some.Film.2026.2160p.UHD.Blu-ray.Remux.HDR.HEVC.DTS-HD.MA.5.1-GRP";
+        let (mkv, vol) = ("Some.Film.mkv", "Some.Film.vol00+01.par2");
+        let at = "2026-11-07 05:16:17";
+        let g = groups_in_one_shard(5);
+        let (_dir, conn) = all_shards();
+        put_row_subjects(&conn, 1, name, &g[0], "p0@nyuu", &[(mkv, &[3, 4], 4)], at, 2, true);
+        put_row_subjects(&conn, 2, name, &g[1], "p3@nyuu", &[(mkv, &[1, 3], 4), (vol, &[1, 2], 2)], at, 2, true);
+        put_row_subjects(&conn, 3, name, &g[2], "p1@nyuu", &[(mkv, &[1], 4), (vol, &[1], 2)], at, 2, true);
+        // a crosspost of row 1 by row 3's poster
+        put_row_subjects(&conn, 4, name, &g[3], "p1@nyuu", &[(mkv, &[3, 4], 4)], at, 2, true);
+        put_row_subjects(&conn, 5, name, &g[4], "p0@nyuu", &[(mkv, &[1, 2, 4], 4), (vol, &[2], 2)], at, 2, true);
+        let rows: Vec<_> = (1..=5).map(|i| row_of(&conn, i, &g[i as usize - 1])).collect();
+        let answers: Vec<Option<SplitPost>> = rows.iter().map(|r| whole_post_with(&conn, r).unwrap()).collect();
+        // row 4 is answered with the post of the row it copies, and is in no other
+        let of_copy = answers[3].clone().expect("the copy's post");
+        for (row, answer) in rows.iter().zip(&answers) {
+            if let Some(p) = answer
+                && p.ids != of_copy.ids
+            {
+                assert!(!p.ids.contains(&rows[3].id), "row {} has the copy in another post", row.id);
+            }
         }
     }
 
