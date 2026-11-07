@@ -32,6 +32,25 @@ fn has_row(conn: &Connection, id: i64) -> rusqlite::Result<bool> {
     Ok(found.is_some())
 }
 
+/// The kind and subcategories of release `id`'s spot, when it was saved from one (`spotnet::store::SPOTS`).
+fn spot_of(conn: &Connection, id: i64) -> rusqlite::Result<Option<(crate::spotnet::Kind, crate::spotnet::Subcats)>> {
+    let row: Option<(String, String)> = conn
+        .prepare_cached("select kind, coalesce(subcats, '') from spots where release_id = ?1")?
+        .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    Ok(row.and_then(|(kind, subcats)| {
+        let kind = match kind.as_str() {
+            "movie" => crate::spotnet::Kind::Movie,
+            "series" => crate::spotnet::Kind::Series,
+            _ => return None,
+        };
+        Some((kind, crate::spotnet::header::subcats(&subcats)))
+    }))
+}
+
+/// The category step's id, for a rerun of it alone.
+pub const STEP: StepId = StepId(24);
+
 pub struct CategoryStep {
     options: RwLock<Options>,
 }
@@ -50,7 +69,7 @@ impl Default for CategoryStep {
 
 impl Step for CategoryStep {
     fn id(&self) -> StepId {
-        StepId(24)
+        STEP
     }
     fn name(&self) -> &'static str {
         "category"
@@ -72,6 +91,15 @@ impl Step for CategoryStep {
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let id = ctx.release().id;
         let mut d = classify_release(ctx.release(), &self.options.read().unwrap());
+        // a release saved from a spot: the spotter said movie or series, which wins over a pick elsewhere
+        if let Some((kind, subcats)) = spot_of(ctx.conn(), id).map_err(|e| StepError::Retry(e.to_string()))? {
+            let release = ctx.release();
+            let name = release.display_name.as_deref().unwrap_or(&release.name);
+            let picked = if stores(&d) { d.category } else { 0 };
+            if let Some(category) = crate::spotnet::category::hint(kind, &subcats, name, picked) {
+                d = super::Decision { category, confidence: 900, rule: "spot_kind" };
+            }
+        }
         // there is no PC category: a PC match is junk, unless it has video, which then goes uncategorized
         if crate::junk::is_pc(d.category) {
             let files = ctx.files().map_err(|e| StepError::Retry(e.to_string()))?;
@@ -100,5 +128,26 @@ impl Step for CategoryStep {
             facts: vec![("category", d.category.to_string()), ("category_rule", d.rule.to_string())],
             ..Outcome::default()
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_a_releases_spot() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(crate::spotnet::store::SPOTS.create).unwrap();
+        conn.execute(
+            "insert into spots (release_id, message_id, kind, title, subcats) values (8, 'a', 'series', 'A', 'a9|d18|z1|'), (16, 'b', 'book', 'B', '')",
+            [],
+        )
+        .unwrap();
+        let (kind, subcats) = spot_of(&conn, 8).unwrap().unwrap();
+        assert_eq!(kind, crate::spotnet::Kind::Series);
+        assert_eq!(subcats.d, [18]);
+        assert!(spot_of(&conn, 16).unwrap().is_none(), "not a kind Atlas takes");
+        assert!(spot_of(&conn, 24).unwrap().is_none());
     }
 }

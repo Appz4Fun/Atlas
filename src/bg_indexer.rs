@@ -1084,6 +1084,11 @@ async fn run_servers(
         scans_stop.store(true, Ordering::Relaxed);
         crate::frozen::STOPPING.store(true, Ordering::Relaxed);
     });
+    // uploads whose every article has a random subject, linked across groups from the headers kept (`xref`)
+    {
+        let s = sched.clone();
+        tasks.spawn(named!("the xref linker".into(), crate::xref::run(db.clone(), move || s.stopping())));
+    }
     tasks.spawn(named!("the config watcher".into(), watch_config(sched.clone(), servers)));
     tasks.spawn(named!("the status report".into(), report(sched.clone())));
     tasks.spawn(named!("the compaction timer".into(), compact_timer(sched.clone())));
@@ -1329,6 +1334,7 @@ pub fn run() -> i32 {
 
     crate::metrics::start(&config, crate::metrics::Role::Indexer);
     crate::sealed_store::spawn_offload(&config.sealed_log, stop.clone());
+    crate::blob_bytes::spawn(&config.sealed_log, stop.clone());
     crate::shared_catalog::start(&config.shared_catalog, stop.clone());
     if config.metrics.enabled {
         crate::metrics::catalog::spawn(Duration::from_secs(config.metrics.catalog_every_secs), stop.clone());

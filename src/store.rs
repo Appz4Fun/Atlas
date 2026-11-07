@@ -243,11 +243,20 @@ pub fn migrate_shard(conn: &Connection) -> Result<()> {
     }
     let cols: Vec<String> =
         conn.prepare("pragma table_info(files)")?.query_map([], |r| r.get(1))?.collect::<Result<_>>()?;
-    for (col, kind) in [("touched_at", "INTEGER"), ("blob", "BLOB")] {
+    for (col, kind) in [("touched_at", "INTEGER"), ("blob", "BLOB"), ("blob_bytes", "INTEGER")] {
         if !cols.iter().any(|c| c == col) {
             conn.execute(&format!("alter table files add column {col} {kind}"), [])?;
         }
     }
+    // `blob_bytes` is the bytes of the articles in `blob`, kept by whatever writes the blob (`blob_bytes.rs`). A
+    // writer that changes the blob without it leaves it NULL (unknown) rather than wrong, except the move of a blob to
+    // the sealed log, which swaps the blob for its place and keeps what's in it
+    conn.execute_batch(
+        "create trigger if not exists files_blob_bytes_unknown after update of blob on files
+         when new.blob_bytes is not null and new.blob_bytes is old.blob_bytes and new.blob is not old.blob
+          and (new.blob is null or not (length(new.blob) = 21 and substr(new.blob, 1, 5) = x'FF534C4731'))
+         begin update files set blob_bytes = null where id = new.id; end;",
+    )?;
     // whether a held-back article's part was the file's already when it was saved (1). Kept, not read: a part
     // under another message-id isnt known to be a repost (different files can share a row). NULL: held back before
     let held: bool = conn.prepare("select 1 from pragma_table_info('held_back') where name = 'again'")?.exists([])?;
@@ -288,12 +297,19 @@ impl Ids {
     pub fn next(&self) -> Result<i64> {
         let mut range = self.range.lock().unwrap();
         if range.0 >= range.1 {
-            let conn = db::open_at(&self.main)?;
-            let end: i64 = conn.query_row(
+            let mut conn = db::open_at(&self.main)?;
+            // on the disk before any of the block is saved to a shard (whose saves are, `db::with_full_flush`):
+            // a power cut that kept a save and lost its block would hand its ids out again
+            conn.execute_batch("pragma synchronous = full; pragma fullfsync = on")?;
+            // an explicit commit: an autocommit's would happen as the RETURNING row is dropped, and a failure
+            // there (disk full, a failed sync) wouldnt reach us, the block handed out yet never reserved
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let end: i64 = tx.query_row(
                 "update meta set value = value + ? where key = 'next_seq' returning value",
                 [ID_BLOCK],
                 |r| r.get(0),
             )?;
+            tx.commit()?;
             *range = (end - ID_BLOCK, end);
         }
         let seq = range.0;
@@ -1544,9 +1560,16 @@ pub(crate) fn split_uploads(
             let target = if u == 0 { Some(*file) } else { None };
             if let Some(file) = target {
                 conn.prepare_cached(
-                    "update files set seen = ?, blob = ?, subject_part = ?, subject_mid = ? where id = ?",
+                    "update files set seen = ?, blob = ?, blob_bytes = ?, subject_part = ?, subject_mid = ? where id = ?",
                 )?
-                .execute(params![seen_of(segs), blob, subject_part, subject_mid, file])?;
+                .execute(params![
+                    seen_of(segs),
+                    blob,
+                    blob.as_ref().map(|_| crate::blob_bytes::of_segs(segs)),
+                    subject_part,
+                    subject_mid,
+                    file
+                ])?;
                 conn.prepare_cached("delete from segments where file_id = ?")?.execute([file])?;
                 // its timing is its own upload's now: the repair rereads that window
                 conn.prepare_cached(
@@ -1556,7 +1579,7 @@ pub(crate) fn split_uploads(
             } else if let Some(blob) = blob {
                 conn.prepare_cached(
                     "insert into files (release_id, filename, subject, subject_part, subject_mid, expected, file_total,
-                     seen, touched_at, blob) values (?, ?, ?, ?, ?, ?, ?, ?, unixepoch(), ?)",
+                     seen, touched_at, blob, blob_bytes) values (?, ?, ?, ?, ?, ?, ?, ?, unixepoch(), ?, ?)",
                 )?
                 .execute(params![
                     rows.get(u).copied().unwrap_or(release_id),
@@ -1567,7 +1590,8 @@ pub(crate) fn split_uploads(
                     expected,
                     ftotal,
                     seen_of(segs),
-                    blob
+                    blob,
+                    crate::blob_bytes::of_segs(segs)
                 ])?;
                 let new_file = conn.last_insert_rowid();
                 conn.prepare_cached(
@@ -1752,8 +1776,11 @@ fn seal_rows(conn: &Connection, file_id: i64) -> Result<usize> {
         return Ok(0);
     }
     segs.extend(rows);
-    conn.prepare_cached("update files set blob = ? where id = ?")?
-        .execute(params![crate::blob::encode(&segs), file_id])?;
+    conn.prepare_cached("update files set blob = ?, blob_bytes = ? where id = ?")?.execute(params![
+        crate::blob::encode(&segs),
+        crate::blob_bytes::of_segs(&segs),
+        file_id
+    ])?;
     conn.prepare_cached("delete from segments where file_id = ?")?.execute([file_id])?;
     Ok(segs.len())
 }

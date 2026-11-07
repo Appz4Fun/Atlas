@@ -3176,6 +3176,8 @@ pub fn reset_shards_at(main: &Path, log: &dyn Fn(&str)) -> anyhow::Result<()> {
     }
     remove_db_family(&main.with_file_name("atlas.old.db"))?;
     remove_db_family(&main.with_file_name("atlas.new.db"))?;
+    // the xref store's headers are marked done for releases of the shards gone: read again, they link anew
+    remove_db_family(&crate::xref::path_for(main))?;
     remove_db_family(main)?;
     if let Some(dir) = main.parent()
         && let Ok(entries) = std::fs::read_dir(dir)

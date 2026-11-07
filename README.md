@@ -54,7 +54,12 @@ The Rust version replaces the original Python version. It keeps the same menus, 
 | Web UI & Newznab API | [`tiny_http`](https://github.com/tiny-http/tiny-http) + embedded [`htmx`](https://htmx.org) and Oxide CSS |
 | Compression & archives | [`zstd`](https://github.com/gyscos/zstd-rs), [`flate2`](https://github.com/rust-lang/flate2-rs), [`lzma-rs`](https://github.com/gendx/lzma-rs), and native RAR/7z/ZIP/PPMd/bzip2/lz4 decoders |
 | yEnc decoding | [`nntmux-yenc`](https://github.com/xbmc4lyfe/newznab-tmux) shared with `newznab-tmux` |
+| Audio fingerprints | [`rusty-chromaprint`](https://github.com/darksv/rusty-chromaprint) and [`symphonia`](https://github.com/pdeljanov/Symphonia), plus the external [`filmcraft-ac3`](https://crates.io/crates/filmcraft-ac3) for AC-3 and E-AC-3 (optional, see below) |
 | System stats | [`sysinfo`](https://github.com/GuillaumeGomez/sysinfo) |
+
+### External dependency: `filmcraft-ac3`
+
+AC-3 and E-AC-3 audio prints use [`filmcraft-ac3`](https://crates.io/crates/filmcraft-ac3), a pure-Rust decoder (MIT or Apache-2.0) from outside the project. It is on by default through the `ac3` Cargo feature. To build without it, run `just build-no-ac3` or `cargo build --release --no-default-features`; AC-3 and E-AC-3 tracks then get no audio print.
 
 rustup installs the pinned toolchain the first time you build, and the `just` recipes always use it, even when another Rust installation, such as Homebrew's, comes first on your `PATH`.
 
@@ -869,7 +874,7 @@ Turn a provider on to fill in IDs, with no restart. Each title is asked once, ho
 
 Search results in the [web UI](#web-ui) have quick filters for resolution, HDR and source, and tags for copies and any score already fetched. In the API, each item also carries `poster`, `group`, `resolution`, `video`, `audio`, `hdr`, `source`, `language` and `team` attributes read from its name, and `twins` and `alts` when it has copies.
 
-Opening a release in the [web UI](#web-ui) also shows its overview, cast, dates and poster from TMDB, its ratings from OMDb when `media.omdb.api_key` is set (a free key from omdbapi.com), and its Trakt rating when Trakt is on. These are fetched when the page opens, and the indexer also fetches them in the background for every title with an id, at `media.details_per_minute` titles a minute (120 by default, 0 turns it off). So results show thumbnails and scores without anyone opening a release. They're kept for 30 days in `atlas.details.db`, with posters in `posters/`, at most 4 GB. A show TMDB has no record of comes from TheTVDB when `media.tvdb.api_key` is set, and the page has a backdrop where TMDB has one. With neither key, the page leaves all this out. In results, Best rated sorts by the scores already kept, with the rest last. Any provider's `requests_per_minute` can be `-1` for no limit, for a plan that has none.
+Opening a release in the [web UI](#web-ui) also shows its overview, cast, dates and poster from TMDB, its ratings from OMDb when `media.omdb.api_key` is set (a free key from omdbapi.com), and its Trakt rating when Trakt is on. These are fetched when the page opens, and the indexer also fetches them in the background for every title with an id, at `media.details_per_minute` titles a minute (120 by default, 0 turns it off). So results show thumbnails and scores without anyone opening a release. They're kept for 30 days in `atlas.details.db`, with posters in `posters/`, at most 4 GB. A show TMDB has no record of comes from TheTVDB when `media.tvdb.api_key` is set, and the page has a backdrop where TMDB has one. With neither key, the page leaves all this out. In results, Best rated sorts by the scores already kept, with the rest last. The Rated 6+, 7+ and 8+ chips keep only releases whose title has a kept score that high (IMDb, else TMDB, else Trakt, out of 10), leaving unrated ones out; the count above the results then reads "Up to". With a sort, they filter the sorted window of 2,000. Any provider's `requests_per_minute` can be `-1` for no limit, for a plan that has none.
 
 **AlloCiné numbers are read as titles.** French groups (FRQC, GL0P, SUPPLY, BYOR and others) name a release after its AlloCiné page, as in `AC31594.2024.S02E05.Love.and.Be.Loved.MULTi…-BYOR` for series 31594, Dark Matter, or `AC317772.2026.MULTi.VFF…-FRQC` for film 317772, Matchbox: The Movie. A name with an episode is a series, and one without is a film: AlloCiné numbers the two apart. Atlas asks Wikidata, which lists most AlloCiné numbers beside their IMDb, TMDB and TVDB IDs, and those IDs go on the release with no search. Where Wikidata has no entry, the AlloCiné page gives the title (the original one where it shows it) and the year. Either way the providers are then asked by that title, never by the number. `media.allocine.enabled: false` turns it off. Each number is asked once, like any title.
 
@@ -1052,6 +1057,7 @@ Common tasks are [just](https://github.com/casey/just) recipes. Run `just` to li
 | `just format` | Runs `cargo fmt`. CI runs `just format-check` and `just lint`. |
 | `just lint` | Runs `cargo clippy` with warnings treated as errors. |
 | `just build`, `just build-release` | Optimized build in `target/release/atlas`. |
+| `just build-no-ac3` | Optimized build without the external `filmcraft-ac3` decoder. |
 | `just build-debug` | Debug build in `target/debug/atlas`. |
 | `just build-remote`, `just build-remote-release` | Optimized build on another machine over SSH, copied back to `target/remote/release/atlas`. |
 | `just build-remote-debug` | The same, as a debug build. |

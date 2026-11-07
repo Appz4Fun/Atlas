@@ -177,8 +177,27 @@ fn set_up(conn: Connection) -> Result<Connection> {
     // cut could keep a cursor and lose the save before it, soo the shard writers
     // commit with `synchronous = full` (indexer::writer)
     conn.execute_batch("pragma synchronous = normal")?;
+    // macOS's fsync leaves the writes in the drive's cache, which may write them out in any order: once a WAL
+    // starts over, a power cut could keep its new start and lose pages a checkpoint copied into the main file,
+    // which the WAL no longer holds. F_FULLFSYNC on each checkpoint, a few a second (elsewhere a plain fsync)
+    conn.execute_batch("pragma checkpoint_fullfsync = on")?;
     crate::filters::register_sql(&conn)?;
     Ok(conn)
+}
+
+/// Run `save` with each commit flushed past the drive's cache (F_FULLFSYNC on macOS, elsewhere a plain fsync):
+/// for the shard writers' saves, which the group cursors in atlas.db move past once committed. macOS's fsync
+/// leaves them in the drive's cache, soo after a power cut a cursor could be kept and the save before it lost.
+/// Saves only: a flush costs about 17ms, nothing next to a save (seconds, under one a second on prod), but the
+/// writers' many small stage transactions, which no cursor waits for, would spend most of their time on it.
+pub fn with_full_flush<T>(conn: &mut Connection, save: impl FnOnce(&mut Connection) -> T) -> Result<T> {
+    conn.execute_batch("pragma fullfsync = on")?;
+    let saved = save(conn);
+    // the save is committed (or not) by now: failing here would only have it fetched and saved again
+    if let Err(e) = conn.execute_batch("pragma fullfsync = off") {
+        eprintln!("couldnt turn fullfsync off again after a save: {e}");
+    }
+    Ok(saved)
 }
 
 /// Tune a connection for heavy indexing writes: a big page cache, no
@@ -1054,6 +1073,23 @@ mod tests {
         fill(&conn, 10);
         let (log, _) = wal_frames(&conn, "main").unwrap().unwrap();
         assert!(log < 20, "started over: {log} frames");
+    }
+
+    /// Every connection flushes its checkpoints past the drive's cache, and a save's flush ends with the save.
+    #[test]
+    fn checkpoints_and_saves_are_flushed_past_the_drive_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        create_db_at(&main).unwrap();
+        let mut conn = open_at(&main).unwrap();
+        let flag = |conn: &Connection, name: &str| -> i64 {
+            conn.query_row(&format!("pragma {name}"), [], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(flag(&conn, "checkpoint_fullfsync"), 1);
+        assert_eq!(flag(&conn, "fullfsync"), 0);
+        let during = with_full_flush(&mut conn, |conn| flag(conn, "fullfsync")).unwrap();
+        assert_eq!(during, 1, "on while saving");
+        assert_eq!(flag(&conn, "fullfsync"), 0, "and off again for the stage's transactions");
     }
 
     /// The writer's connection has the shard's frozen file attached: its WAL counts too, and one not in WAL mode

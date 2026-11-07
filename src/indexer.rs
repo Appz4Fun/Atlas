@@ -535,7 +535,9 @@ fn writer(
         let span = crate::metrics::span("db.save_batch");
         let result = match &mut opened {
             Ok(conn) => {
-                store.save(conn, ids, batch.iter().map(|job| job.releases.as_slice())).map_err(|e| e.to_string())
+                db::with_full_flush(conn, |conn| store.save(conn, ids, batch.iter().map(|job| job.releases.as_slice())))
+                    .and_then(|saved| saved)
+                    .map_err(|e| e.to_string())
             }
             Err(e) => Err(format!("couldnt open {}: {e}", path.display())),
         };
@@ -1014,8 +1016,8 @@ where
         )
         .await?
     {
-        // a split group's backfill is day chunks, this server takes the next one: a day asked for, or one of the
-        // newest month any tracked split group still has to do (see `chunks::claim_turn`), else none
+        // a split group's backfill is day chunks, this server takes the next one: a day asked for, or one no more than
+        // a day past the newest any tracked split group still has to do (see `chunks::claim_turn`), else none
         let host = ctx.pool.host(server);
         let wanted = (group.to_string(), ctx.states.keeps_from(group, &host));
         let (kept, running) = (ctx.states.kept_days(&host), ctx.states.groups());
@@ -2359,15 +2361,18 @@ async fn parse_and_save(
         let group = group.to_string();
         move || {
             let _span = crate::metrics::span("indexer.parse_slice");
-            let (articles, uploads, skipped) = crate::filters::gather_per_article(&group, headers_to_articles(headers));
+            // articles whose every subject is random go to the store that links them across groups (`xref`)
+            // the slice fails, and is read again, when their headers couldnt be kept
+            let articles = crate::xref::hold(&group, headers_to_articles(headers))?;
+            let (articles, uploads, skipped) = crate::filters::gather_per_article(&group, articles);
             let mut releases: Vec<Release> =
                 crate::collections::group_articles(&group, articles).into_values().collect();
             releases.extend(uploads);
-            (releases, skipped)
+            anyhow::Ok((releases, skipped))
         }
     };
     let (mut releases, skipped) =
-        tokio::task::spawn_blocking(parsing).await.map_err(|e| anyhow!("parse task failed: {e}"))?;
+        tokio::task::spawn_blocking(parsing).await.map_err(|e| anyhow!("parse task failed: {e}"))??;
     crate::profile::PARSE.add_since(t);
     crate::profile::Load::add_since(&crate::profile::LOAD.parse_ns, t);
 
