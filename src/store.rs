@@ -1010,9 +1010,7 @@ fn release_complete(conn: &Connection, release_id: i64, file_total: Option<i64>)
         return Ok(true);
     }
     // every file it has is whole, but the counter says another number of files
-    Ok(own_whole_video(conn, release_id, files)?
-        || own_whole_rar_set(conn, release_id)?
-        || vouched_by_set(conn, release_id)?)
+    Ok(own_whole_video(conn, release_id)? || own_whole_rar_set(conn, release_id)? || vouched_by_set(conn, release_id)?)
 }
 
 /// The complete PAR2 sets read for release `?1` (`archive::store::par2_inventory`) name only files it has, and name
@@ -1138,26 +1136,60 @@ fn own_whole_rar_set(conn: &Connection, release_id: i64) -> Result<bool> {
 const VIDEO_EXTENSIONS: &[&str] =
     &[".mkv", ".mp4", ".m4v", ".avi", ".ts", ".m2ts", ".wmv", ".mov", ".mpg", ".mpeg", ".webm"];
 
-/// Whether the one file `files` counts is a whole video the release is named after (`name` is the file's name, with
-/// or without its extension). A season posted under one counter is a row per episode, each "1 of 24 files", and
-/// each a whole episode. Not a part of a video cut in pieces (`CD1`, `Part 2`, `Disc 1`): that needs the others; nor
-/// a sample, which is whole but not what was posted.
-fn own_whole_video(conn: &Connection, release_id: i64, files: i64) -> Result<bool> {
+/// Whether the release's files are one whole video named as the release, beside side files only (`one_video_named`).
+fn own_whole_video(conn: &Connection, release_id: i64) -> Result<bool> {
+    let Some(name) = conn
+        .prepare_cached("select name from releases where id = ?")?
+        .query_row([release_id], |r| r.get::<_, Option<String>>(0))
+        .optional()?
+        .flatten()
+    else {
+        return Ok(false);
+    };
+    let files: Vec<String> = conn
+        .prepare_cached("select filename from files where release_id = ?")?
+        .query_map([release_id], |r| r.get(0))?
+        .collect::<Result<_>>()?;
+    Ok(one_video_named([name.as_str()], files.iter().map(String::as_str)))
+}
+
+/// Whether `files` are one video named as the release (any of `names`: the file's name, with or without its
+/// extension, or with the post's id after it, `name [54205819]`) beside side files only (`SIDE_EXTENSIONS`: its PAR2
+/// set, an NFO, a thumbnail). The video plays on its own, soo the release is whole whatever the subject counter
+/// says. A season posted under one counter is a row per episode, each "1 of 24 files", and each a whole episode. An
+/// uploader can count a file that turns up as a row of its own: `[9/9] - "thumbnail.jpg"` under another name and
+/// poster, posted after the film and its PAR2 set. Not a part of a video cut in pieces (`CD1`, `Part 2`, `Disc 1`):
+/// that needs the others; nor a sample, which is whole but not what was posted; nor two videos.
+pub(crate) fn one_video_named<'a, 'b>(
+    names: impl IntoIterator<Item = &'a str>,
+    files: impl IntoIterator<Item = &'b str>,
+) -> bool {
     static PIECE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         #[allow(clippy::unwrap_used)]
         regex::Regex::new(r"(?i)(?:^|[^a-z0-9])(cd|dis[ck]|part|pt)[ ._-]?\d|sample").unwrap()
     });
-    if files != 1 {
-        return Ok(false);
+    let mut others = files
+        .into_iter()
+        .map(|file| file.trim().to_lowercase())
+        .filter(|file| !SIDE_EXTENSIONS.iter().any(|ext| file.ends_with(ext)));
+    let (Some(file), None) = (others.next(), others.next()) else { return false };
+    let Some(stem) = VIDEO_EXTENSIONS.iter().find_map(|ext| file.strip_suffix(ext)) else { return false };
+    if stem.is_empty() || PIECE.is_match(&file) {
+        return false;
     }
-    let found: Option<(Option<String>, String)> = conn
-        .prepare_cached("select r.name, f.filename from releases r join files f on f.release_id = r.id where r.id = ?")?
-        .query_row([release_id], |r| Ok((r.get(0)?, r.get(1)?)))
-        .optional()?;
-    let Some((Some(name), file)) = found else { return Ok(false) };
-    let (name, file) = (name.trim().to_lowercase(), file.trim().to_lowercase());
-    let Some(stem) = VIDEO_EXTENSIONS.iter().find_map(|ext| file.strip_suffix(ext)) else { return Ok(false) };
-    Ok(!stem.is_empty() && (name == file || name == stem) && !PIECE.is_match(&file))
+    names.into_iter().any(|name| {
+        let name = name.trim().to_lowercase();
+        let name = without_post_id(&name);
+        name == file || name == stem
+    })
+}
+
+/// A release name without the post's id a collection put after it: `name [54205819]` is `name`.
+fn without_post_id(name: &str) -> &str {
+    name.strip_suffix(']')
+        .and_then(|rest| rest.rsplit_once(" ["))
+        .filter(|(_, id)| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+        .map_or(name, |(name, _)| name)
 }
 
 /// The incomplete movie and TV releases that are whole after all (`release_complete`): the rows saved before a
@@ -4934,6 +4966,42 @@ mod tests {
             r.articles.extend(counted(name, file, i as i64 + 1, total, *parts).articles);
         }
         r
+    }
+
+    #[test]
+    fn a_whole_video_beside_its_par2_set_is_complete_without_the_posts_thumbnail() {
+        let (_dir, main, conn) = fresh_shard_db();
+        // `[9/9] - "thumbnail.jpg"` came as a row of its own, under another name and poster
+        let film = "Some.Film.1997.2160p.MA.WEB-DL.DDP5.1.H.265-GRP";
+        let files = [
+            ("Some.Film.1997.2160p.MA.WEB-DL.DDP5.1.H.265-GRP.par2", 1),
+            ("Some.Film.1997.2160p.MA.WEB-DL.DDP5.1.H.265-GRP.vol00-01.par2", 2),
+            ("Some.Film.1997.2160p.MA.WEB-DL.DDP5.1.H.265-GRP.vol01-03.par2", 3),
+            ("Some.Film.1997.2160p.MA.WEB-DL.DDP5.1.H.265-GRP.mkv", 4),
+            ("Some.Film.1997.2160p.MA.WEB-DL.DDP5.1.H.265-GRP.nfo", 1),
+        ];
+        save(&main, &[files_of(film, &files, 9)]).unwrap();
+        assert_eq!(complete_of(&conn, film), 1);
+        // with the post's id after its name
+        let named = "other.film.2001.1080p.bluray-grp [54205819]";
+        let files = [("other.film.2001.1080p.bluray-grp.mkv", 3), ("other.film.2001.1080p.bluray-grp.vol0+1.par2", 1)];
+        save(&main, &[files_of(named, &files, 3)]).unwrap();
+        assert_eq!(complete_of(&conn, named), 1);
+        // two videos, a video of another name, a sample beside the film, a piece of a film: not
+        for (name, files) in [
+            ("Two.2002", vec![("Two.2002.mkv", 2), ("Two.2002.Extras.mkv", 1), ("Two.2002.par2", 1)]),
+            ("Abc.2003", vec![("xyz.mkv", 2), ("Abc.2003.par2", 1)]),
+            ("Smp.2004", vec![("Smp.2004.mkv", 2), ("Smp.2004.sample.mkv", 1)]),
+            ("Cut.2005.CD1", vec![("Cut.2005.CD1.avi", 2), ("Cut.2005.CD1.par2", 1)]),
+        ] {
+            save(&main, &[files_of(name, &files, 9)]).unwrap();
+            assert_eq!(complete_of(&conn, name), 0, "{name}");
+        }
+        // a part of the film missing
+        let mut short = files_of("Gap.2006", &[("Gap.2006.mkv", 3), ("Gap.2006.par2", 1)], 3);
+        short.articles.remove(1);
+        save(&main, &[short]).unwrap();
+        assert_eq!(complete_of(&conn, "Gap.2006"), 0, "a part missing");
     }
 
     #[test]
