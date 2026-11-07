@@ -1,19 +1,6 @@
 //! What a video spot's subcategory numbers mean, as Spotweb names them (`SpotCategories::$_categories` for
 //! category 0). Atlas only keeps video spots, so only those are here.
 
-/// What a subcategory letter of a video spot says: `a` the format, `b` the source, `c` the language, `d` the
-/// genre, `z` the kind.
-pub fn letter_label(letter: char) -> Option<&'static str> {
-    Some(match letter {
-        'a' => "Format",
-        'b' => "Source",
-        'c' => "Language",
-        'd' => "Genre",
-        'z' => "Type",
-        _ => return None,
-    })
-}
-
 /// The name of video subcategory `letter` `n`, or None for a number Spotweb doesn't name.
 pub fn name(letter: char, n: u16) -> Option<&'static str> {
     let list: &[&str] = match letter {
@@ -152,7 +139,5 @@ mod tests {
         assert_eq!(name('b', 5), None);
         assert_eq!(name('d', 75), None);
         assert_eq!(name('q', 0), None);
-        assert_eq!(letter_label('c'), Some("Language"));
-        assert_eq!(letter_label('x'), None);
     }
 }

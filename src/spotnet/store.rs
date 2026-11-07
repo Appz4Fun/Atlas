@@ -76,6 +76,8 @@ pub const SPOTS: ShardTable = ShardTable {
     indexes: &[
         ("spots_message_id", "create index if not exists spots_message_id on spots(message_id)"),
         ("spots_nzb_key", "create index if not exists spots_nzb_key on spots(nzb_key)"),
+        // what `missing_xml` looks for, and once the backfill is done, nothing
+        ("spots_xml_missing", "create index if not exists spots_xml_missing on spots(release_id) where xml is null"),
     ],
     release_key: Some("release_id"),
     // NULL: saved before the XML was kept, to be read again (`missing_xml`); empty: read again and gone
@@ -431,18 +433,29 @@ pub fn spots_of_with(conn: &Connection, ids: &[i64]) -> Result<HashMap<i64, Tagg
     Ok(out)
 }
 
+/// Whether a spot row has the spot's XML.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Xml {
+    /// kept, and it reads
+    Kept,
+    /// saved before the XML was kept, and not read again yet (`missing_xml`)
+    #[default]
+    Pending,
+    /// read again, and the article was gone or its XML wouldn't read
+    Gone,
+}
+
 /// Everything a release's spot row keeps, for the release page.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Detail {
     pub message_id: String,
-    pub kind: String,
     pub spotter_id: Option<String>,
-    /// what the spot says, from its XML when that was kept, else from the row's columns (no description then)
+    /// the spot's IMDb id, `tt` and its digits
+    pub imdb_id: Option<String>,
+    /// what the spot says: from its XML when that's `Kept`, else what the row's columns have (title, poster, tag,
+    /// categories, size, when it was made)
     pub spot: FullSpot,
-    /// whether the spot's XML was kept: without it, the description, website, image and newsreader are unknown
-    pub whole: bool,
-    /// the XML was read again for a spot saved before it was kept, and the article was gone or wouldn't read
-    pub gone: bool,
+    pub xml: Xml,
 }
 
 /// Release `id`'s spot, from its shard, when it has one.
@@ -452,8 +465,8 @@ pub fn detail_of(id: i64) -> Result<Option<Detail>> {
 
 pub fn detail_of_with(conn: &Connection, id: i64) -> Result<Option<Detail>> {
     let sql = format!(
-        "select message_id, kind, spotter_id, title, coalesce(poster, ''), coalesce(tag, ''), category,
-            coalesce(subcats, ''), size, imdb_id, created, xml
+        "select message_id, spotter_id, imdb_id, title, coalesce(poster, ''), coalesce(tag, ''), category,
+            coalesce(subcats, ''), size, created, xml
          from s{}.spots where release_id = ?",
         crate::store::shard_of_id(id)
     );
@@ -466,27 +479,29 @@ pub fn detail_of_with(conn: &Connection, id: i64) -> Result<Option<Detail>> {
                 category: r.get::<_, Option<i32>>(6)?.unwrap_or(0),
                 subcats: super::header::subcats(&r.get::<_, String>(7)?),
                 size: r.get::<_, Option<i64>>(8)?.and_then(|n| u64::try_from(n).ok()).unwrap_or(0),
-                // the row keeps the id, not the link: the link the page shows is IMDb's
-                website: r
-                    .get::<_, Option<String>>(9)?
-                    .map(|id| format!("https://www.imdb.com/title/{id}/"))
-                    .unwrap_or_default(),
-                created: r.get::<_, Option<i64>>(10)?.unwrap_or(0),
+                created: r.get::<_, Option<i64>>(9)?.unwrap_or(0),
                 ..FullSpot::default()
             };
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, columns, r.get::<_, Option<String>>(11)?))
+            let parts: (String, Option<String>, Option<String>) = (r.get(0)?, r.get(1)?, r.get(2)?);
+            Ok((parts, columns, r.get::<_, Option<String>>(10)?))
         })
         .optional()?;
-    Ok(row.map(|(message_id, kind, spotter_id, columns, xml)| {
+    Ok(row.map(|((message_id, spotter_id, imdb_id), columns, xml)| {
         let parsed = xml.as_deref().filter(|x| !x.is_empty()).and_then(super::full::parse);
-        let gone = parsed.is_none() && xml.is_some();
-        Detail { message_id, kind, spotter_id, whole: parsed.is_some(), gone, spot: parsed.unwrap_or(columns) }
+        let state = match (&parsed, &xml) {
+            (Some(_), _) => Xml::Kept,
+            (None, None) => Xml::Pending,
+            (None, Some(_)) => Xml::Gone,
+        };
+        let imdb_id = parsed.as_ref().map_or(imdb_id, FullSpot::imdb_id);
+        Detail { message_id, spotter_id, imdb_id, spot: parsed.unwrap_or(columns), xml: state }
     }))
 }
 
-/// Spots of this shard saved before their XML was kept: (release id, spot message-id), at most `limit`.
+/// Spots of this shard saved before their XML was kept: (release id, spot message-id), at most `limit`, in no
+/// order, so one whose article can't be read for now doesn't hold the rest back pass after pass.
 pub fn missing_xml(conn: &Connection, limit: usize) -> Result<Vec<(i64, String)>> {
-    conn.prepare_cached("select release_id, message_id from spots where xml is null order by release_id desc limit ?")?
+    conn.prepare_cached("select release_id, message_id from spots where xml is null order by random() limit ?")?
         .query_map([limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect()
 }
@@ -790,10 +805,11 @@ mod tests {
         )
         .unwrap();
         let d = detail_of_with(&conn, id).unwrap().unwrap();
-        assert!(!d.whole && !d.gone);
+        assert_eq!(d.xml, Xml::Pending);
+        assert_eq!(d.imdb_id.as_deref(), Some("tt1234567"));
+        assert_eq!(d.spot.website, "", "the row keeps the IMDb id, not the website");
         assert_eq!((d.spot.title.as_str(), d.spot.size, d.spot.created), ("Old", 42, 100));
         assert_eq!(d.spot.subcats.spotweb(), "a9|d5|z0|");
-        assert_eq!(d.spot.imdb_id().as_deref(), Some("tt1234567"));
         assert_eq!(d.spot.description, "");
         // read again: the XML wins, description and all
         let shard = Connection::open_in_memory().unwrap();
@@ -815,13 +831,13 @@ mod tests {
         shard.execute_batch(&SPOTS.create.replace("exists spots", "exists s2.spots")).unwrap();
         shard.execute("insert into s2.spots select * from main.spots", []).unwrap();
         let d = detail_of_with(&shard, id).unwrap().unwrap();
-        assert!(d.whole);
+        assert_eq!(d.xml, Xml::Kept);
+        assert_eq!(d.imdb_id, None, "the XML has no IMDb link");
         assert_eq!(d.spot.title, "New");
         assert_eq!(d.spot.description, "Line one\npw: hunter2");
         assert_eq!(d.spot.newsreader, "SpotPost 2");
         // read again and gone: the columns, not tried again
         shard.execute("update s2.spots set xml = ''", []).unwrap();
-        let d = detail_of_with(&shard, id).unwrap().unwrap();
-        assert!(!d.whole && d.gone);
+        assert_eq!(detail_of_with(&shard, id).unwrap().unwrap().xml, Xml::Gone);
     }
 }
