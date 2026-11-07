@@ -578,15 +578,6 @@ pub(crate) fn is_exactly(bits: &[u8], expected: i64) -> bool {
     count == expected && highest == Some(if zero_based { expected - 1 } else { expected })
 }
 
-/// What the overview said about a file's articles, folded in as they are
-/// saved, for the Where and when, Health and Keys facts of the release page:
-/// the first and last Date (the poster's clock, zone dropped), the first and
-/// last article number, the Lines sum, how many carried References, the most
-/// groups an Xref named (only servers with `Xref:full` send one), how the From
-/// changed, whether a subject had an RFC 2047 word, how many articles came
-/// after the file sealed, and how many articles all that covers. One row a
-/// file, written by `Timing::write`; a release saved before the table has
-/// none, and its facts stay off.
 /// When each release's `release_ids` were last made in full (`index_release`): a release indexed again without a
 /// new article (all copies, a spot placed on it) isn't quiet for the pruning walk till SEAL_AGE after
 /// (`ShardWriter::prune_ids_some`).
@@ -601,6 +592,15 @@ pub const RELEASE_INDEXED: ShardTable = ShardTable {
     added: &[],
 };
 
+/// What the overview said about a file's articles, folded in as they are
+/// saved, for the Where and when, Health and Keys facts of the release page:
+/// the first and last Date (the poster's clock, zone dropped), the first and
+/// last article number, the Lines sum, how many carried References, the most
+/// groups an Xref named (only servers with `Xref:full` send one), how the From
+/// changed, whether a subject had an RFC 2047 word, how many articles came
+/// after the file sealed, and how many articles all that covers. One row a
+/// file, written by `Timing::write`; a release saved before the table has
+/// none, and its facts stay off.
 pub const FILE_TIMING: ShardTable = ShardTable {
     name: "file_timing",
     create: "create table if not exists file_timing (
@@ -1565,6 +1565,7 @@ pub(crate) fn split_uploads(
     .execute([release_id])?;
     // the index of message-ids is made again by the next save that needs it
     conn.prepare_cached("delete from release_ids where release_id = ?")?.execute([release_id])?;
+    conn.prepare_cached("delete from release_indexed where release_id = ?")?.execute([release_id])?;
     for (u, id) in rows.iter().enumerate() {
         let (bytes, count) =
             parts.iter().filter_map(|by| by.get(u)).flatten().fold((0i64, 0i64), |(b, c), s| (b + s.bytes, c + 1));
@@ -2054,6 +2055,8 @@ pub struct ShardWriter {
     pub freezer: crate::frozen::Ticker,
     /// the walk taking quiet releases' `release_ids` (`prune_ids_some`)
     ids: IdsPrune,
+    /// when the walk last took a step while saves were queued
+    ids_queued_step: Option<Instant>,
 }
 
 /// Where the walk taking quiet releases' `release_ids` is (`ShardWriter::prune_ids_some`).
@@ -2072,14 +2075,17 @@ struct IdsPrune {
 /// files sealed per writer tick at most
 pub const SEAL_PER_TICK: usize = 2_000;
 
-/// a pruning step of `release_ids` stops after this long while stage jobs wait, so the writer gets back to them
+/// a pruning step of `release_ids` stops after this long while saves or stage jobs wait, so the writer gets back to them
 pub const PRUNE_IDS_BUDGET: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// the same when nothing waits for the writer (a save that comes in meanwhile waits up to this)
 pub const PRUNE_IDS_BUDGET_IDLE: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// after a step reaches the end of `release_ids`, the next starts over this much later at least (seconds)
-const PRUNE_IDS_REST: i64 = 600;
+const PRUNE_IDS_REST: i64 = 3_600;
+
+/// while more saves are queued, a pruning step at most this often
+const PRUNE_IDS_QUEUED_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// releases a pruning step of `release_ids` looks at most
 const PRUNE_IDS_LOOKS: usize = 5_000;
@@ -2111,6 +2117,7 @@ impl ShardWriter {
             decode_budget: SEALED_DECODE_BUDGET,
             freezer: crate::frozen::Ticker::default(),
             ids: IdsPrune::default(),
+            ids_queued_step: None,
         }
     }
 
@@ -2193,16 +2200,25 @@ impl ShardWriter {
     /// (PRUNE_IDS_BUDGET_IDLE when `idle`): a step through the table by release
     /// from where the last one stopped. After the end it starts over once the
     /// least recently touched release it kept could be quiet (PRUNE_IDS_REST
-    /// at least, SEAL_AGE at most). A release none of whose files was touched,
+    /// at least, SEAL_AGE at most). While more saves are `queued` it takes a
+    /// short step every PRUNE_IDS_QUEUED_EVERY at most. A release none of whose files was touched,
     /// and that wasn't indexed itself, for SEAL_AGE loses its own row first, then the rest a chunk at a time
     /// over as many steps as it takes. The index is only a cache: without its
     /// own row, the next save to the release, or a spot placed on it, indexes it
     /// again in full (`index_release`), so a late article is still found in its
     /// other files. Not for use inside a save transaction. Returns the rows taken.
-    pub fn prune_ids_some(&mut self, conn: &mut Connection, now: i64, idle: bool) -> Result<usize> {
+    pub fn prune_ids_some(&mut self, conn: &mut Connection, now: i64, idle: bool, queued: bool) -> Result<usize> {
         if now < self.ids.rest_until {
             return Ok(0);
         }
+        // more saves queued: a short step now and then, soo steady ingest doesnt starve it
+        if queued {
+            if self.ids_queued_step.is_some_and(|t| t.elapsed() < PRUNE_IDS_QUEUED_EVERY) {
+                return Ok(0);
+            }
+            self.ids_queued_step = Some(Instant::now());
+        }
+        let idle = idle && !queued;
         let (budget, chunk) =
             if idle { (PRUNE_IDS_BUDGET_IDLE, PRUNE_IDS_CHUNK_IDLE) } else { (PRUNE_IDS_BUDGET, PRUNE_IDS_CHUNK) };
         let started = Instant::now();
@@ -2282,8 +2298,9 @@ impl ShardWriter {
         }
         tx.commit()?;
         self.ids = w;
-        crate::metrics::names::RELEASE_IDS.inc(&[("event", "pruned_releases")], quiet);
-        crate::metrics::names::RELEASE_IDS.inc(&[("event", "pruned_rows")], taken as u64);
+        let shard = self.shard.to_string();
+        crate::metrics::names::RELEASE_IDS.inc(&[("event", "pruned_releases"), ("shard", &shard)], quiet);
+        crate::metrics::names::RELEASE_IDS.inc(&[("event", "pruned_rows"), ("shard", &shard)], taken as u64);
         Ok(taken)
     }
 
@@ -2520,6 +2537,8 @@ impl ShardWriter {
                             .exists([release_id])?;
                         if gone > 0 && !others {
                             tx.prepare_cached("delete from release_ids where release_id = ?")?.execute([release_id])?;
+                            tx.prepare_cached("delete from release_indexed where release_id = ?")?
+                                .execute([release_id])?;
                         }
                     }
                 }
@@ -4853,7 +4872,7 @@ mod tests {
         assert!(before > 0, "the fixture's two files are indexed");
         let now = chrono::Utc::now().timestamp();
         let mut writer = ShardWriter::new(shard_of("alt.binaries.t"));
-        assert_eq!(writer.prune_ids_some(&mut conn, now, true).unwrap(), 0, "touched just now");
+        assert_eq!(writer.prune_ids_some(&mut conn, now, true, false).unwrap(), 0, "touched just now");
         assert_eq!(count(&conn), before);
 
         let rest = writer.ids.rest_until - now;
@@ -4863,14 +4882,14 @@ mod tests {
         );
         conn.execute("update files set touched_at = ?", [now - SEAL_AGE - 1]).unwrap();
         writer.ids.rest_until = 0;
-        assert_eq!(writer.prune_ids_some(&mut conn, now, true).unwrap(), 0, "indexed just now");
+        assert_eq!(writer.prune_ids_some(&mut conn, now, true, false).unwrap(), 0, "indexed just now");
         conn.execute("update release_indexed set at = ?", [now - SEAL_AGE - 1]).unwrap();
         writer.ids.rest_until = now + 1;
-        assert_eq!(writer.prune_ids_some(&mut conn, now, true).unwrap(), 0, "resting");
+        assert_eq!(writer.prune_ids_some(&mut conn, now, true, false).unwrap(), 0, "resting");
         writer.ids.rest_until = 0;
         let mut taken = 0;
         while writer.ids.rest_until == 0 {
-            taken += writer.prune_ids_some(&mut conn, now, true).unwrap() as i64;
+            taken += writer.prune_ids_some(&mut conn, now, true, false).unwrap() as i64;
         }
         assert_eq!(taken, before, "every row, its own too");
         assert_eq!(count(&conn), 0);
@@ -4884,7 +4903,7 @@ mod tests {
         // all copies: no file was touched, but the index is new, soo it stays
         writer.ids.rest_until = 0;
         while writer.ids.rest_until == 0 {
-            writer.prune_ids_some(&mut conn, now, true).unwrap();
+            writer.prune_ids_some(&mut conn, now, true, false).unwrap();
         }
         assert_eq!(count(&conn), before, "indexed again just now: not quiet");
     }
@@ -4922,7 +4941,7 @@ mod tests {
         // a save in between touched it and indexed it again: the rest stays
         let mut writer = ShardWriter::new(shard_of("alt.binaries.t"));
         writer.ids.pruning = Some(release_id);
-        assert_eq!(writer.prune_ids_some(&mut conn, now, true).unwrap(), 0, "kept up again: nothing goes");
+        assert_eq!(writer.prune_ids_some(&mut conn, now, true, false).unwrap(), 0, "kept up again: nothing goes");
         assert_eq!(count(&conn), all);
         assert_eq!(writer.ids.pruning, None);
 
@@ -4932,7 +4951,7 @@ mod tests {
         let mut writer = ShardWriter::new(shard_of("alt.binaries.t"));
         let mut taken = 0;
         while writer.ids.rest_until == 0 {
-            taken += writer.prune_ids_some(&mut conn, now, false).unwrap() as i64;
+            taken += writer.prune_ids_some(&mut conn, now, false, false).unwrap() as i64;
             assert!(!marked(&conn), "its own row goes first");
         }
         assert_eq!(taken, all);

@@ -4237,6 +4237,313 @@
       },
       "id": 46,
       "panels": [],
+      "title": "Message-id index",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "release_ids rows taken from releases quiet for 3 days. The space goes to each shard's free pages and is reused.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 8,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "shard 0"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#3987e5",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "shard 1"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#d95926",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "shard 2"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#199e70",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "shard 3"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#c98500",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "shard 4"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#d55181",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "shard 5"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#008300",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "shard 6"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#9085e9",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "shard 7"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#e66767",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 96
+      },
+      "id": 47,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "sortBy": "Max",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "rate(atlas_release_ids_events_total{host=\"$host\",event=\"pruned_rows\"}[5m]) * 60",
+          "instant": false,
+          "legendFormat": "shard {{shard}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Index rows pruned a minute, per shard",
+      "transformations": [],
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "Indexed counts every full index: a release's second file, and a pruned release that got a late article or spot. A rise in indexed with pruning on means rebuilds.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 8,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "indexed"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#3987e5",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "pruned"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#d95926",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 96
+      },
+      "id": 48,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "sortBy": "Max",
+          "sortDesc": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(atlas_release_ids_events_total{host=\"$host\",event=\"indexed\"}[5m])) * 60",
+          "instant": false,
+          "legendFormat": "indexed",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(atlas_release_ids_events_total{host=\"$host\",event=\"pruned_releases\"}[5m])) * 60",
+          "instant": false,
+          "legendFormat": "pruned",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Releases indexed and pruned a minute",
+      "transformations": [],
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 104
+      },
+      "id": 49,
+      "panels": [],
       "title": "Shared catalog",
       "type": "row"
     },
@@ -4265,9 +4572,9 @@
         "h": 4,
         "w": 6,
         "x": 0,
-        "y": 96
+        "y": 105
       },
-      "id": 47,
+      "id": 50,
       "options": {
         "colorMode": "value",
         "graphMode": "none",
@@ -4332,9 +4639,9 @@
         "h": 4,
         "w": 6,
         "x": 6,
-        "y": 96
+        "y": 105
       },
-      "id": 48,
+      "id": 51,
       "options": {
         "colorMode": "background",
         "graphMode": "none",
@@ -4391,9 +4698,9 @@
         "h": 4,
         "w": 6,
         "x": 12,
-        "y": 96
+        "y": 105
       },
-      "id": 49,
+      "id": 52,
       "options": {
         "colorMode": "value",
         "graphMode": "none",
@@ -4450,9 +4757,9 @@
         "h": 4,
         "w": 6,
         "x": 18,
-        "y": 96
+        "y": 105
       },
-      "id": 50,
+      "id": 53,
       "options": {
         "colorMode": "value",
         "graphMode": "none",
@@ -4632,9 +4939,9 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 100
+        "y": 109
       },
-      "id": 51,
+      "id": 54,
       "options": {
         "legend": {
           "calcs": [
@@ -4818,9 +5125,9 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 100
+        "y": 109
       },
-      "id": 52,
+      "id": 55,
       "options": {
         "legend": {
           "calcs": [
@@ -4886,9 +5193,9 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 100
+        "y": 109
       },
-      "id": 53,
+      "id": 56,
       "options": {
         "legend": {
           "calcs": [
@@ -4930,9 +5237,9 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 108
+        "y": 117
       },
-      "id": 54,
+      "id": 57,
       "panels": [],
       "title": "Errors",
       "type": "row"
@@ -4966,9 +5273,9 @@
         "h": 4,
         "w": 6,
         "x": 0,
-        "y": 109
+        "y": 118
       },
-      "id": 55,
+      "id": 58,
       "options": {
         "colorMode": "background",
         "graphMode": "none",
@@ -5029,9 +5336,9 @@
         "h": 4,
         "w": 6,
         "x": 6,
-        "y": 109
+        "y": 118
       },
-      "id": 56,
+      "id": 59,
       "options": {
         "colorMode": "background",
         "graphMode": "none",
@@ -5092,9 +5399,9 @@
         "h": 4,
         "w": 6,
         "x": 12,
-        "y": 109
+        "y": 118
       },
-      "id": 57,
+      "id": 60,
       "options": {
         "colorMode": "background",
         "graphMode": "none",
@@ -5155,9 +5462,9 @@
         "h": 4,
         "w": 6,
         "x": 18,
-        "y": 109
+        "y": 118
       },
-      "id": 58,
+      "id": 61,
       "options": {
         "colorMode": "background",
         "graphMode": "none",
@@ -5219,9 +5526,9 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 113
+        "y": 122
       },
-      "id": 59,
+      "id": 62,
       "options": {
         "legend": {
           "calcs": [
@@ -5287,9 +5594,9 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 113
+        "y": 122
       },
-      "id": 60,
+      "id": 63,
       "options": {
         "legend": {
           "calcs": [
@@ -5355,9 +5662,9 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 113
+        "y": 122
       },
-      "id": 61,
+      "id": 64,
       "options": {
         "legend": {
           "calcs": [

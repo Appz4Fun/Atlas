@@ -209,7 +209,7 @@ pub struct Summary {
 /// The tables a release's rows are in, besides `releases`, `files` and what hangs off a file: every registered table
 /// keyed by release, but for what only makes sense live (the queue, freezing's own tables).
 fn release_tables() -> impl Iterator<Item = (&'static str, &'static str)> {
-    const LIVE_ONLY: &[&str] = &["pp_queue", "freeze_pending", "freeze_exempt"];
+    const LIVE_ONLY: &[&str] = &["pp_queue", "freeze_pending", "freeze_exempt", "release_indexed"];
     SHARD_TABLES.iter().filter(|t| !LIVE_ONLY.contains(&t.name)).filter_map(|t| t.release_key.map(|key| (t.name, key)))
 }
 
