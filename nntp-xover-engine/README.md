@@ -17,26 +17,29 @@ Columnar, compressed storage for NNTP overview lines (RFC 3977 `XOVER` / `OVER`)
       MsgIdXor8        (16 + 3*B bytes)    /  never compressed
       FsstTables       dictionary directory, FSST symbol tables, xref slot counts, subject counter masks
       MsgIdBucketIndex [u32; 257] offsets, N tags, N u16 rows
-      SubjTplIds, SubjPadMasks, XrefSkelIds, AuthorIds, DomainIds, MsgIdPfxIds   (&[u16], one per row)
-      MsgIdTailOffsets (&[u32])  StringPoolOffsets (&[u32])  StringPoolData  MsgIdTailData
+      SubjTplIds, SubjPadMasks, XrefSkelIds, AuthorIds, DomainIds, MsgIdPfxIds   (one id per row, see below)
+      MsgIdTailOffsets (&[u32], one per 32 rows)  StringPoolOffsets (&[u32], one per 32 entries)
+      StringPoolData   MsgIdTailData (a segment per row: packed message-id tail, then a per-row subject if any)
       NumericVarints   one interleaved zigzag-LEB128 stream, row after row
-      ReferencesData   length-prefixed, structured rows only
+      ReferencesData   length-prefixed, structured rows of sub-blocks that have references
 ```
+
+That is format version 2, which the builder writes. Readers take version 1 too (`build_hot_block_version` still writes it, for tests and size comparisons); the differences are listed under Format notes.
 
 Each field and how it is stored:
 
 | Field | Stored as |
 |---|---|
-| article number | delta from the previous row |
-| subject | template with `[n/m]`, `(n/m)` and `.NN.` lifted out. Dictionary id, plus a PadMask of leading-zero widths, plus only the counters the template has, as deltas. If the subject is the message-id's local part (obfuscating posters do that), only a flag is stored. |
+| article number | delta from the previous row; nothing in a sub-block whose numbers run one by one |
+| subject | template with `[n/m]`, `(n/m)` and `.NN.` lifted out. Dictionary id, plus a PadMask of leading-zero widths, plus only the counters the template has, as deltas (a template with three or more counters writes a mask of the ones that moved, then only those). If the subject is the message-id's local part (obfuscating posters do that), only a flag is stored. A random token (12 or more characters of `0-9 a-z A-Z . -`, no counters) that no other row of the block has is packed like a message-id tail into the row's segment, with no dictionary entry. |
 | from | dictionary id |
 | date | UTC second as a delta, plus a style word for weekday, day padding, 2- or 4-digit year, zone and a trailing ` (UTC)` comment, written back with Hinnant's `civil_from_days`. The style word is stored only when it changes. |
 | message-id | domain id and local-prefix id (dictionaries), plus the tail packed by alphabet: hex 4 bits a char, Usenet base64 6 bits, otherwise raw. The tail header's 2-bit mode has a fourth value, `0b11`, for hex with no dot (no dot-position byte follows). |
-| references | length and bytes |
+| references | length and bytes; nothing in a sub-block where no row has any |
 | bytes, lines | deltas. An empty field is a style flag and stores no value. |
-| Xref | skeleton id with each `group:N` number lifted out. Slot 0 is stored against the row's own article number. Every slot is a delta from the last row in the sub-block with the same skeleton (for the 16 skeletons seen most recently in it; otherwise from the previous row), so a cross-posted post moves each group's number only a little. |
+| Xref | skeleton id with each `group:N` number lifted out. Slot 0 is stored against the row's own article number. Every slot is a delta from the last row in the sub-block with the same skeleton (for the 16 skeletons seen most recently in it; otherwise from the previous row), so a cross-posted post moves each group's number only a little. Nothing for slot 0 in a sub-block where it is always the article number. |
 
-Each dictionary is stored raw, FSST-coded, or alphabet-packed (for random strings FSST can't shrink), whichever is smallest.
+Each dictionary is stored raw, FSST-coded, alphabet-packed (for random strings FSST can't shrink), or shaped (version 2: each entry a shape such as `\0 <\0@\0>` from a small table, then its runs of `0-9 a-z A-Z . -` packed; for posters made of random tokens), whichever is smallest. Each id column is stored as one value when the block has one, as a palette and a byte per row when it has at most 256, as nothing when each row's id is its row number (every row a new poster or domain), and as a u16 per row otherwise.
 
 ## Measurements
 
@@ -68,6 +71,7 @@ Against the targets in the brief:
 
 ## Format notes
 
+- Version 2 differs from version 1 only in how these sections are kept. Packed strings (message-id tails, per-row subjects, packed dictionary entries) delimit themselves through their header, and a raw or FSST dictionary entry carries a varint length, so `MsgIdTailOffsets` keeps one u32 per 32 rows and `StringPoolOffsets` one u32 per 32 entries of each dictionary, in place of a u32 per row and per entry; a reader walks at most 31 segments or entries from one (the range cursor walks one per row, and remembers where the next dictionary entry starts). Checkpoints every 128 would save another 0.17 bytes a row but made `OVER <message-id>` about twice as slow again. A per-row subject has the template id one past the subject dictionary's last entry. An id column's section `encoding_flags` hold its width (0 one value, 1 palette and u8 indices, 2 u16s, 3 row numbers) and, from bit 8, the palette's length; the palette (u16s, padded to 8 bytes) comes first. The top two bits of a checkpoint's `varint_byte_offset` (a block is at most 1 GiB) mark a sub-block whose article numbers run one by one and one whose Xref slot 0 is always the article number. A sub-block with no references has the same `refs_byte_offset` as the next.
 - The header's last 8 bytes (56..64) hold `cold_prefix_bytes` and `hot_block_bytes`. The section table's `encoding_flags` of sections 0 and 15 hold the low and high words of the xxh3 hash of everything after the section table (checkpoints, filter and body); the header CRC covers the table, so it covers that hash. `verify_body()` checks a hot block, and decompressing a cold one checks it.
 - A checkpoint is 64 bytes: `base_art_num`, `base_timestamp`, `base_xref_slot1` (i64), `base_bytes`, `base_lines` (i32), `base_subj_nums` (5 x i32), `base_xref_slot0_delta` (i32), `varint_byte_offset`, `refs_byte_offset` (u32). The i64s come first for alignment, and the references stream gets its own offset.
 - PadMask bit 15 marks a literal row, kept whole in the literal dictionary.

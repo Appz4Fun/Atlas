@@ -234,6 +234,36 @@ pub fn unpack_msgid_tail_into(packed: &[u8], out: &mut Vec<u8>) {
     }
 }
 
+/// How many bytes the packed tail at the start of `packed` takes, header included: a packed tail delimits itself, soo
+/// packed tails can follow one another without lengths. Damaged bytes may give a length past the end of `packed`.
+#[inline(always)]
+pub fn packed_tail_len(packed: &[u8]) -> usize {
+    let Some(&h) = packed.first() else { return 0 };
+    let mut pos = 1usize;
+    let len = if h & 0x3F == 63 { read_varint_unchecked(packed, &mut pos) as usize } else { (h & 0x3F) as usize };
+    pos.saturating_add(match h >> 6 {
+        0b00 => {
+            let dot = packed.get(pos).copied().unwrap_or(NONE);
+            1 + if dot != NONE { len.saturating_sub(1) } else { len }.div_ceil(2)
+        }
+        0b11 => len.div_ceil(2),
+        0b01 => len.saturating_mul(6).div_ceil(8),
+        _ => len,
+    })
+}
+
+/// Whether `b` is in the packing alphabet `0-9 a-z A-Z . -`.
+#[inline(always)]
+pub fn in_pack_alphabet(b: u8) -> bool {
+    B64_CODE[b as usize] != NONE
+}
+
+/// Whether `s` packs by alphabet (every byte in `0-9 a-z A-Z . -`, and not empty): hex or base64, never raw.
+#[inline]
+pub fn packs_by_alphabet(s: &[u8]) -> bool {
+    classify(s) != PackMode::Raw8Bit
+}
+
 /// `(prefix, tail, domain)` of `<prefix tail@domain>`. A string not shaped like a message-id comes back
 /// whole as the tail, with an empty prefix and domain; the block keeps such a row literal.
 pub fn split_msgid_parts(raw: &[u8]) -> (&[u8], &[u8], &[u8]) {
@@ -287,6 +317,61 @@ mod tests {
         let mut dotlate = longhex.clone();
         dotlate[100] = b'.';
         assert_eq!(rt(&dotlate).0, PackMode::Base64Usenet);
+    }
+
+    #[test]
+    fn packed_tails_delimit_themselves() {
+        let long: Vec<u8> = (0..200).map(|i| B64_CHAR[i % 64]).collect();
+        let longhex: Vec<u8> = (0..130).map(|i| B64_CHAR[i % 16]).collect();
+        let mut cases: Vec<Vec<u8>> = [
+            &b"853c49e6748fea9b.2545f491"[..],
+            b"853c49e6748fea9b2545f49",
+            b".abc",
+            b"abc.",
+            b"a.b.c",
+            b"Xa9Bc-Zz.0q",
+            b"ab$cd",
+            b"",
+            b".",
+            b"0",
+            b"0a",
+            b"Jyxvw2NVsNbCUKanNIw35B2w9NkvgEjQY55QuUT9CqOz9fh",
+        ]
+        .iter()
+        .map(|c| c.to_vec())
+        .collect();
+        cases.extend([long.clone(), longhex.clone(), long[..62].to_vec(), long[..63].to_vec(), longhex[..63].to_vec()]);
+        let mut dotted = longhex[..62].to_vec();
+        dotted[30] = b'.';
+        cases.push(dotted);
+        // a hex tail with no dot in the older dotted mode (0b00, dot byte 0xFF) still measures right
+        cases.push(b"\x0a\xff\xab\xcd\xef\x01\x23".to_vec());
+        for c in &cases {
+            let mut p = Vec::new();
+            if c.first() == Some(&0x0a) {
+                p.extend_from_slice(c);
+            } else {
+                pack_msgid_tail(c, &mut p);
+            }
+            let n = p.len();
+            // anything after it is left alone
+            p.extend_from_slice(b"\x41trailing bytes");
+            assert_eq!(packed_tail_len(&p), n, "{}", String::from_utf8_lossy(c));
+            let mut a = Vec::new();
+            unpack_msgid_tail_into(&p[..n], &mut a);
+            let mut b = Vec::new();
+            unpack_msgid_tail_into(&p, &mut b);
+            assert_eq!(a, b);
+        }
+        assert_eq!(packed_tail_len(&[]), 0);
+        // a damaged length doesn't overflow
+        assert!(packed_tail_len(&[0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01]) > 1 << 60);
+        assert!(packs_by_alphabet(b"abc-XYZ.09") && !packs_by_alphabet(b"") && !packs_by_alphabet(b"a_b"));
+        assert!(
+            (0..=255u8)
+                .filter(|&b| in_pack_alphabet(b))
+                .eq(B64_CHAR.iter().copied().collect::<std::collections::BTreeSet<u8>>())
+        );
     }
 
     #[test]

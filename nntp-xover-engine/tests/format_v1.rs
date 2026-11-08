@@ -1,7 +1,9 @@
 //! Version-1 blocks still read. `tests/data/v1-block.nxv` was written by the version-1 writer before version 2
 //! existed; every row of it comes back by row, by article number, by message-id and through the cursor, cold too.
 
-use nntp_xover_engine::container::{AlignedBytes, BlockMeta, NxvBlockBuilder, NxvBlockView, msgid_field_pub};
+use nntp_xover_engine::container::{
+    AlignedBytes, BlockMeta, NxvBlockBuilder, NxvBlockView, VERSION_1, msgid_field_pub,
+};
 use nntp_xover_engine::corpus::{Rng, generate};
 use nntp_xover_engine::*;
 
@@ -74,10 +76,18 @@ fn sorted_lines() -> Vec<Vec<u8>> {
 fn write_v1_fixture() {
     let lines = fixture_lines();
     let refs: Vec<&[u8]> = lines.iter().map(|l| l.as_slice()).collect();
-    let a = NxvBlockBuilder::build_hot_block_meta(&refs, FIXTURE_META).unwrap();
-    let b = NxvBlockBuilder::build_hot_block_meta(&refs, FIXTURE_META).unwrap();
+    let a = NxvBlockBuilder::build_hot_block_version(&refs, FIXTURE_META, VERSION_1).unwrap();
+    let b = NxvBlockBuilder::build_hot_block_version(&refs, FIXTURE_META, VERSION_1).unwrap();
     assert_eq!(a, b, "the writer is deterministic");
     std::fs::write(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/v1-block.nxv"), &a).unwrap();
+}
+
+#[test]
+fn the_v1_writer_still_writes_the_fixture() {
+    let lines = fixture_lines();
+    let refs: Vec<&[u8]> = lines.iter().map(|l| l.as_slice()).collect();
+    let again = NxvBlockBuilder::build_hot_block_version(&refs, FIXTURE_META, VERSION_1).unwrap();
+    assert!(again == FIXTURE, "the version-1 writer no longer writes what it did");
 }
 
 #[test]
