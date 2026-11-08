@@ -166,14 +166,28 @@ fn ask_ai_end_to_end() {
     let settings = fetch(port, "/ui/settings", &cookie);
     assert_eq!(settings.status(), 200);
     assert!(settings.body.contains("No key yet"), "{}", settings.body);
+    let token =
+        settings.body.split("name=\"_csrf\" value=\"").nth(1).and_then(|s| s.split('"').next()).unwrap().to_string();
+    // a settings form without its CSRF token is refused, and saves nothing
+    assert_eq!(post(port, "/ui/settings", &format!("key={GEMINI_KEY}&do=save"), &cookie, false).status(), 403);
+    assert!(!home.path().join("gemini.json").exists());
 
     // a key Gemini doesn't take is saved, and said so
-    let bad = post(port, "/ui/settings", "key=AIzaWrong-0123456789&model=&do=save", &cookie, false);
+    let bad =
+        post(port, "/ui/settings", &format!("_csrf={token}&key=AIzaWrong-0123456789&model=&do=save"), &cookie, false);
     assert!(bad.body.contains("Gemini did not take it") && bad.body.contains("API key not valid"), "{}", bad.body);
-    assert!(post(port, "/ui/settings", "key=two+words&do=save", &cookie, false).body.contains("not a Gemini key"));
-    assert!(post(port, "/ui/settings", "model=..%2Fx&do=save", &cookie, false).body.contains("not a model name"));
+    assert!(
+        post(port, "/ui/settings", &format!("_csrf={token}&key=two+words&do=save"), &cookie, false)
+            .body
+            .contains("not a Gemini key")
+    );
+    assert!(
+        post(port, "/ui/settings", &format!("_csrf={token}&model=..%2Fx&do=save"), &cookie, false)
+            .body
+            .contains("not a model name")
+    );
 
-    let good = post(port, "/ui/settings", &format!("key={GEMINI_KEY}&model=&do=save"), &cookie, false);
+    let good = post(port, "/ui/settings", &format!("_csrf={token}&key={GEMINI_KEY}&model=&do=save"), &cookie, false);
     assert!(good.body.contains("Gemini took the key"), "{}", good.body);
     assert!(!good.body.contains(GEMINI_KEY), "the key is never shown whole");
     assert!(good.body.contains("••••••••wxyz"), "{}", good.body);
@@ -188,7 +202,8 @@ fn ask_ai_end_to_end() {
     let lookup = seen.lock().unwrap().last().cloned().unwrap();
     assert!(lookup.starts_with("GET /v1beta/models/gemini-flash-latest "), "{lookup}");
     // saving again without a key keeps it
-    let again = post(port, "/ui/settings", "key=&model=gemini-3.8-flash&do=save", &cookie, false);
+    let again =
+        post(port, "/ui/settings", &format!("_csrf={token}&key=&model=gemini-3.8-flash&do=save"), &cookie, false);
     assert!(again.body.contains("knows gemini-3.8-flash") && !again.body.contains(GEMINI_KEY), "{}", again.body);
 
     // the search page has the box now, and never the key
@@ -239,7 +254,7 @@ fn ask_ai_end_to_end() {
     );
 
     // a busy model is asked again, then a fallback answers, and the note says which
-    post(port, "/ui/settings", "key=&model=gemini-busy&do=save", &cookie, false);
+    post(port, "/ui/settings", &format!("_csrf={token}&key=&model=gemini-busy&do=save"), &cookie, false);
     let fell_back = post(port, "/ui/ask", "ask=4k+findword", &cookie, true);
     assert!(fell_back.body.contains("Film.Findword"), "{}", fell_back.body);
     assert!(
@@ -258,7 +273,7 @@ fn ask_ai_end_to_end() {
     all_busy.store(false, Ordering::SeqCst);
 
     // removing the key turns it off
-    let removed = post(port, "/ui/settings", "do=forget", &cookie, false);
+    let removed = post(port, "/ui/settings", &format!("_csrf={token}&do=forget"), &cookie, false);
     assert!(removed.body.contains("the key is removed") && removed.body.contains("No key yet"), "{}", removed.body);
     let failed = post(port, "/ui/ask", "ask=findword", &cookie, true);
     assert_eq!(failed.header("HX-Retarget").as_deref(), Some("#ask-note"));

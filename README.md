@@ -320,7 +320,7 @@ The background indexer reads `config.toml` again every 5 seconds:
 
 - New groups, `index_mode`, `batch_size`, `request_size`, and `auto_run_compact` apply immediately.
 - Changes to servers, logins, `connections`, `parallel_groups`, or `max_unsaved_headers` rebuild the connection pool. A login you fix in the file, or in **Settings > Usenet servers**, takes effect within a few seconds.
-- `api_host` and `api_port` apply when the API restarts. Restart Atlas, or use **Settings > Change API port**.
+- `api_host` and `api_port` apply when the API restarts. Restart Atlas, use **Settings > Change API port**, or save a new address on the Web UI's Settings page, which moves the API there within a second.
 - `metrics` applies when Atlas restarts.
 
 ### Measure connection limits
@@ -763,6 +763,12 @@ The search box's More fields searches on Usenet group, poster, email, size (`123
 
 With a Google Gemini API key configured in **Settings** (or via `GEMINI_API_KEY`), the **Ask AI** search bar translates natural-language queries (for example, `4K Dolby Vision remuxes of Dune, biggest first`) into search terms, categories, quality filters, and sort order. Nothing from your index is sent to Google—only your question and the list of available categories and filter names. If the configured Gemini model is busy (`503`/`429`), Atlas retries and automatically falls back across Gemini Flash models.
 
+### Settings in the browser
+
+**Settings**, in the masthead, edits what the terminal's Settings menu edits, behind the same sign in: the Usenet servers (add, change, remove; host, login, port, SSL, connections, priority, and whether a server indexes or only serves downloads), the indexer mode, groups indexed at once and the header cap, the groups to index (including provider search and add/remove), the API address, and the metadata provider keys. It writes `config.toml` the way the terminal does (the file is replaced whole, never half written) and the indexer picks the change up within a few seconds, as above. A password or key is write-only: the page says whether one is saved, never what it is, and an empty field keeps it. Every form carries a token tied to your sign in, so a page on another site can't change your settings with your browser's cookie; a form kept open across a restart of Atlas says so and has to be sent again.
+
+Where something outside Atlas owns a setting, the page shows it read-only instead of taking a change the next start would undo: the servers and the API address when `ATLAS_NNTP_*` is set, the mode when `ATLAS_INDEX_MODE` is, and any `config.toml` key named in `ATLAS_MANAGED_KEYS` (for example `ATLAS_MANAGED_KEYS=api_key,groups,parallel_groups` for a container whose start script writes those).
+
 Every page in the Web UI includes a persistent footer displaying the compile-time build metadata (`Atlas - Rust Edition`, authors, latest tag/version, git commit link, copyright year, GPL v3.0 license link, compiled Rust version, UTC compilation timestamp, and Patreon support link).
 
 [htmx](https://htmx.org) (0BSD) is built into the binary from `assets/`, so the page needs no internet access. The look is [Oxide](https://appz4fun.github.io/RustyGet/design-system.html), the design system of RustyGet, in light and dark.
@@ -1027,6 +1033,7 @@ The screenshots come from a real instance, with its address, host name and news 
 | `ATLAS_AI_MODEL` | Ollama model for AI search. Default: `qwen3:4b`. |
 | `GEMINI_API_KEY` | Google Gemini API key for **Ask AI** in the Web UI (can also be saved in **Settings** in the Web UI). |
 | `ATLAS_NO_KEYRING` | Skips the OS keyring and keeps passwords in `config.toml`. |
+| `ATLAS_MANAGED_KEYS` | Comma-separated `config.toml` keys something outside Atlas writes (a container's start script, say), such as `api_key,groups,parallel_groups`. The Web UI's Settings page shows them read-only. |
 | `ATLAS_PROFILE` | Set to `1` to log a timing breakdown of the indexer every 30 seconds. |
 | `ATLAS_SAB_HOST`, `ATLAS_SAB_PORT`, `ATLAS_SAB_DIR`, `ATLAS_PYTHON` | Optional SABnzbd handoff. See [Direct downloads](#direct-downloads-with-sabnzbd). |
 

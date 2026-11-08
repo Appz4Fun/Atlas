@@ -803,6 +803,11 @@ fn respond(mut request: Request, api_key: &str, fallback_host: &str) {
         let _ = request.as_reader().take(MAX_FORM_BODY + 1).read_to_string(&mut body);
         let too_long = body.len() as u64 > MAX_FORM_BODY;
         let htmx = request.headers().iter().any(|h| h.field.equiv("HX-Request"));
+        let csrf = request
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv(crate::web_settings::CSRF_HEADER))
+            .map(|h| h.value.as_str().to_string());
         if too_long {
             ApiResponse {
                 status: 413,
@@ -813,7 +818,7 @@ fn respond(mut request: Request, api_key: &str, fallback_host: &str) {
                 failed: false,
             }
         } else {
-            crate::web::post(path, &body, cookies.as_deref(), htmx, &base, api_key)
+            crate::web::post(path, &body, cookies.as_deref(), htmx, csrf.as_deref(), &base, api_key)
                 .unwrap_or_else(ApiResponse::not_found)
         }
     } else {
