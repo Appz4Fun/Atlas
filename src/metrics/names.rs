@@ -69,6 +69,7 @@ families! {
     NNTP_FAILURES "atlas_nntp_failures_total" Counter &[], "Failures per server, by kind.";
     NNTP_LAST_FAILURE "atlas_nntp_last_failure_timestamp_seconds" Gauge &[], "When each kind of failure last hit each server.";
     NNTP_HEADERS "atlas_nntp_headers_total" Counter &[], "Headers read per server.";
+    NNTP_OVERVIEW_ROWS "atlas_nntp_overview_rows_total" Counter &[], "Header listing rows read per server, by method: xover (plain), xover_gzip (XFEATURE COMPRESS GZIP), xzver.";
     NNTP_TRAFFIC "atlas_nntp_traffic_bytes_total" Counter &[], "Bytes per server: wire (off the socket), text (after decompression).";
 
     // indexing
