@@ -979,12 +979,22 @@ fn with_store<T>(f: impl FnOnce(&mut Store) -> Result<T>) -> Result<Option<T>> {
 }
 
 fn in_store<T>(store: &Mutex<Option<Store>>, f: impl FnOnce(&mut Store) -> Result<T>) -> Result<Option<T>> {
+    let store_ref = store;
     let mut store = store.lock().unwrap_or_else(|e| e.into_inner());
     if store.is_none() {
         if cfg!(test) {
             return Ok(None);
         }
-        *store = Some(Store::open(&path_for(&crate::paths::database()))?);
+        let opened = Store::open(&path_for(&crate::paths::database()))?;
+        if std::ptr::eq(store_ref, &RECORDER) {
+            // the parse path's connection: each header goes into four B-trees by random keys (message-id, poster
+            // twice, arrival), and with the default 2 MB page cache nearly every insert read its pages from disk (it
+            // kept about 4k headers a second). 512 MiB keeps the trees' upper levels and recent leaves in memory. The
+            // linker's connection keeps the default: a commit on the other connection empties a WAL reader's cache
+            // before its next read, and the linker reads after every one of the recorder's
+            opened.conn.execute_batch("pragma cache_size = -524288;")?;
+        }
+        *store = Some(opened);
     }
     f(store.as_mut().expect("opened above")).map(Some)
 }
