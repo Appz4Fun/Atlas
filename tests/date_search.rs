@@ -15,7 +15,7 @@ fn exact() -> atlas::indexer::PassSettings {
 /// `day` of `group` claimed by the mock's server, the way a worker claims it
 /// (only the claim's owner finishes or gives back a chunk)
 fn claimed(main: &std::path::Path, group: &str, day: i64) -> atlas::chunks::Claim {
-    let chunk = atlas::chunks::Claim { group: group.into(), day, server: "127.0.0.1".into(), claimed_at: 1 };
+    let chunk = atlas::chunks::Claim { group: group.into(), day, server: "127.0.0.1".into(), claimed_at: 1, reread: false };
     atlas::db::open_at(main)
         .unwrap()
         .execute(
@@ -378,6 +378,7 @@ fn a_failing_chunk_reports_its_own_error() {
                 day: 20_455,
                 server: "127.0.0.1".into(),
                 claimed_at: 1,
+                reread: false,
             },
             0,
             &mut |_| {},
@@ -526,7 +527,7 @@ fn only_the_server_going_back_furthest_does_the_oldest_day() {
     let db = atlas::indexer::shared_db(main_conn);
     let conn = atlas::db::open_at(&main).unwrap();
     let run = |server: usize| {
-        let chunk = atlas::chunks::Claim { group: GROUP.into(), day, server: pool.pool.host(server), claimed_at: 1 };
+        let chunk = atlas::chunks::Claim { group: GROUP.into(), day, server: pool.pool.host(server), claimed_at: 1, reread: false };
         conn.execute(
             "update backfill_chunks set state = 1, server = ?, claimed_at = 1 where grp = ? and day = ?",
             rusqlite::params![chunk.server, GROUP, day],
@@ -588,7 +589,7 @@ fn the_oldest_day_moves_on_when_the_deepest_server_drops_the_group() {
     let db = atlas::indexer::shared_db(main_conn);
     let conn = atlas::db::open_at(&main).unwrap();
     let run = |server: usize| {
-        let chunk = atlas::chunks::Claim { group: GROUP.into(), day, server: pool.pool.host(server), claimed_at: 1 };
+        let chunk = atlas::chunks::Claim { group: GROUP.into(), day, server: pool.pool.host(server), claimed_at: 1, reread: false };
         conn.execute(
             "update backfill_chunks set state = 1, server = ?, claimed_at = 1 where grp = ? and day = ?",
             rusqlite::params![chunk.server, GROUP, day],
@@ -655,7 +656,7 @@ fn the_oldest_day_moves_on_when_the_deepest_server_no_longer_keeps_it() {
     let db = atlas::indexer::shared_db(main_conn);
     let conn = atlas::db::open_at(&main).unwrap();
     let run = |server: usize| {
-        let chunk = atlas::chunks::Claim { group: GROUP.into(), day, server: pool.pool.host(server), claimed_at: 1 };
+        let chunk = atlas::chunks::Claim { group: GROUP.into(), day, server: pool.pool.host(server), claimed_at: 1, reread: false };
         conn.execute(
             "update backfill_chunks set state = 1, server = ?, claimed_at = 1 where grp = ? and day = ?",
             rusqlite::params![chunk.server, GROUP, day],
@@ -754,7 +755,7 @@ fn a_split_reaches_back_when_a_deeper_server_joins() {
 
     // and the new days get indexed: the new oldest by the server that has it
     for day in [day0 + 4, day0] {
-        let chunk = atlas::chunks::Claim { group: GROUP.into(), day, server: pool.pool.host(1), claimed_at: 1 };
+        let chunk = atlas::chunks::Claim { group: GROUP.into(), day, server: pool.pool.host(1), claimed_at: 1, reread: false };
         conn.execute(
             "update backfill_chunks set state = 1, server = ?, claimed_at = 1 where grp = ? and day = ?",
             rusqlite::params![chunk.server, GROUP, day],
@@ -971,7 +972,7 @@ fn a_split_redoes_its_oldest_day_when_a_server_goes_back_further_in_it() {
     };
     let run_day = |day: i64, server: usize| {
         let host = if server == 0 { "127.0.0.1" } else { "localhost" };
-        let chunk = atlas::chunks::Claim { group: GROUP.into(), day, server: host.into(), claimed_at: 1 };
+        let chunk = atlas::chunks::Claim { group: GROUP.into(), day, server: host.into(), claimed_at: 1, reread: false };
         conn.execute(
             "update backfill_chunks set state = 1, server = ?, claimed_at = 1 where grp = ? and day = ?",
             rusqlite::params![host, GROUP, day],
@@ -1319,6 +1320,7 @@ fn day_chunk_ranges_cover_every_number_whatever_the_forged_runs() {
                     day,
                     (oldest_day, newest_day),
                     (high, 0),
+                    false,
                 );
                 pool.block_on(range).unwrap()
             })
@@ -1374,7 +1376,7 @@ fn adjacent_days_on_two_servers_leave_no_article_between_them() {
     let days = (day0, day0 + 2);
     let (a_marks, b_marks) = ((1, 3 * 1440), (50_001, number_b(3 * 1440 - 1)));
     let range = |server: usize, marks: (u64, u64), day: i64, safety: u64| {
-        pool.block_on(atlas::indexer::chunk_range(&pool.pool, server, GROUP, marks, day, days, (marks.1, safety)))
+        pool.block_on(atlas::indexer::chunk_range(&pool.pool, server, GROUP, marks, day, days, (marks.1, safety), false))
             .unwrap()
     };
     // day 1 on "localhost", day 2 on "127.0.0.1"

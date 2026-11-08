@@ -776,7 +776,7 @@ pub fn restore(conn: &Connection, schema: &str, p: &Payload, how: Domains) -> Re
         let new = match found {
             Some(d) => d,
             None => {
-                conn.prepare_cached(&format!("insert into {schema}.domains (suffix) values (?1)"))?
+                conn.prepare_cached(&crate::store::NEW_DOMAIN.replace("domains", &format!("{schema}.domains")))?
                     .execute([suffix])?;
                 conn.last_insert_rowid()
             }

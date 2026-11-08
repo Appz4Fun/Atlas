@@ -155,14 +155,17 @@ pub fn merge(
         conn.execute_batch(SCHEMA)?;
         refuse_an_earlier_builds_merge(&conn)?;
         domains_not_unique(&conn)?;
-        // in shard order only (`sources`): a source after a higher one would take its domains' lowest ids
-        let later: Option<i64> = conn.query_row(
-            "select max(shard) from merge_shards where shard > ?1 and done = 1",
-            [source.shard as i64],
-            |r| r.get(0),
-        )?;
+        // in shard order only (`sources`): a source after a higher one, merged or started, would take its domains'
+        // lowest ids
+        let later: Option<i64> =
+            conn.query_row("select max(shard) from merge_shards where shard > ?1", [source.shard as i64], |r| {
+                r.get(0)
+            })?;
         if let Some(later) = later {
-            bail!("shard {} comes before shard {later}, merged already: shards merge in shard order", source.shard);
+            bail!(
+                "shard {} comes before shard {later}, merged or started already: shards merge in shard order",
+                source.shard
+            );
         }
         park_triggers(&conn)?;
         let rows = merge_one(&conn, source, &mut budget, log)?;
@@ -368,13 +371,24 @@ fn merge_one(
     result
 }
 
-/// Each source domain id and the target's id for its suffix, as a temp table (`temp.domain_map`) for the segment rows
-/// and a map for the blobs (`atlas_remap_blob`, registered on `conn`). A blob that won't decode is copied as it is,
-/// and counted.
 /// A source's domain ids and the target's for the same suffix, and a count of blobs that wouldn't read.
 type DomainMap = (std::sync::Arc<std::collections::HashMap<i64, i64>>, std::sync::Arc<std::sync::atomic::AtomicUsize>);
 
+/// Each source domain id and the target's id for its suffix, as a temp table (`temp.domain_map`) for the segment rows
+/// and a map for the blobs (`atlas_remap_blob`, registered on `conn`). A blob that won't decode is copied as it is,
+/// and counted.
 fn map_domains(conn: &Connection, base: i64) -> Result<DomainMap> {
+    // a suffix the target has no small id for gets one (the next below `1 << 32`), soo the rows and blobs that move to
+    // it stay short; the source's own row at `base` on stays, for its sealed-log places (`blob::shifted`). Once per
+    // suffix, soo a rerun adds none
+    let dense: i64 =
+        conn.query_row("select coalesce(max(id), 0) from main.domains where id < 4294967296", [], |r| r.get(0))?;
+    conn.execute(
+        "insert into main.domains (id, suffix)
+             select ?1 + row_number() over (order by s.id), s.suffix from src.domains s
+             where not exists (select 1 from main.domains d where d.suffix = s.suffix and d.id < 4294967296)",
+        [dense],
+    )?;
     conn.execute_batch(
         "create temp table if not exists domain_map (old INTEGER PRIMARY KEY, new INTEGER NOT NULL);
          delete from temp.domain_map;
@@ -802,8 +816,17 @@ fn remove_family(base: &Path) -> Result<()> {
 /// shards half merged (`db::create_db_at` refuses).
 pub const MERGING: &str = "merging_shards";
 
-/// An error while a merge started on the database at `main` hasn't finished.
+/// An error while a merge started on the database at `main` hasn't finished, or while the shards from before one
+/// shard are still there to merge: a write then would hand out ids in one-shard numbering from the counter in
+/// eight-shard numbering, which the merge's copies could meet.
 pub fn refuse_if_merging(main: &Path) -> Result<()> {
+    let left = legacy_leftovers(main);
+    if !left.is_empty() {
+        bail!(
+            "the shards from before one shard are still there ({}): run `atlas --merge-shards --apply` first",
+            left.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+        );
+    }
     if !main.exists() {
         return Ok(());
     }
@@ -893,6 +916,23 @@ pub fn finish(main: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The shards a merge into `target` has begun (or finished and not yet deleted).
+fn started_shards(target: &Path) -> Result<Vec<usize>> {
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(target, flags)?;
+    conn.busy_timeout(std::time::Duration::from_secs(30))?;
+    let has: bool =
+        conn.prepare("select 1 from sqlite_master where type = 'table' and name = 'merge_shards'")?.exists([])?;
+    if !has {
+        return Ok(Vec::new());
+    }
+    let shards = conn
+        .prepare("select shard from merge_shards order by shard")?
+        .query_map([], |r| r.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(shards.into_iter().map(|s| s as usize).collect())
+}
+
 /// `atlas --merge-shards [--apply]`.
 pub fn run(args: &[String]) -> i32 {
     let apply = args.iter().any(|a| a == "--apply");
@@ -959,7 +999,18 @@ pub fn run(args: &[String]) -> i32 {
     }
     let free = crate::frozen::free_bytes(&main).unwrap_or(0);
     let size = |p: &Path| std::fs::metadata(p).map_or(0, |m| m.len());
-    let biggest = todo.iter().map(|s| size(&s.path) + size(&crate::frozen::path(&s.path))).max().unwrap_or(0);
+    // a source a run stopped in (started, or copied and not yet deleted) needs room only for what's left of it, which
+    // the copy so far has taken from the free space already: counted as the rest, not whole
+    let started = started_shards(&target).unwrap_or_default();
+    let biggest = todo
+        .iter()
+        .filter(|s| !started.contains(&s.shard))
+        .map(|s| size(&s.path) + size(&crate::frozen::path(&s.path)))
+        .max()
+        .unwrap_or(0);
+    if !started.is_empty() {
+        println!("going on with the merge a run stopped in (shards {started:?} begun already)");
+    }
     println!("merging {} shards into {}:", todo.len(), target.display());
     for s in &todo {
         let size = std::fs::metadata(&s.path).map_or(0, |m| m.len());
@@ -1378,6 +1429,9 @@ mod tests {
             .unwrap();
         let todo = sources(&main);
         assert_eq!(todo.iter().map(|s| s.shard).collect::<Vec<_>>(), (1..LEGACY_SHARDS).collect::<Vec<_>>());
+        // no writer before the merge: its ids would come from the counter in eight-shard numbering
+        assert!(crate::compact::try_hold_off_compaction(&main).is_err());
+        assert!(crate::compact::Lock::take(&main).is_err());
         let target = legacy_shard_path(&main, 0);
         merge(&target, &todo, true, None, &|_| {}).unwrap();
         finish(&main, &target).unwrap();
@@ -1385,6 +1439,9 @@ mod tests {
         let shared = "select count(distinct s.domain) from segments s join domains d on d.id = s.domain
                       where d.suffix = '@both.example>'";
         assert_eq!(count(&c, shared), 1, "one id for the domain");
+        // every row under a small id (a source's own rows past `1 << 32` are kept for sealed-log places only)
+        assert_eq!(count(&c, "select count(*) from segments where domain >= 4294967296"), 0);
+        assert_eq!(count(&c, "select count(*) from domains where id < 4294967296"), 1 + 7 + 1, "own0..7, both");
         // shard 5's article again: found under that id, not added
         let segments = "select count(*) from segments";
         let before = count(&c, segments);
@@ -1397,6 +1454,16 @@ mod tests {
         };
         store::save(&main, &[again]).unwrap();
         assert_eq!(count(&c, segments), before, "seen again, not added");
+        // a domain new since takes the next small id
+        let fresh = Release {
+            name: "Fresh".into(),
+            group: groups[0].clone(),
+            collection: Some("fresh".into()),
+            articles: (1..=4).map(|n| art("c.rar", n, &format!("f{n}"), "fresh.example")).collect(),
+            ..Default::default()
+        };
+        store::save(&main, &[fresh]).unwrap();
+        assert_eq!(count(&c, "select id from domains where suffix = '@fresh.example>'"), 10);
         // and a merge given its sources out of order stops
         let dir = tempfile::tempdir().unwrap();
         let main = dir.path().join("atlas.db");

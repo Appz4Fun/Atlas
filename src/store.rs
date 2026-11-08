@@ -460,6 +460,10 @@ pub(crate) fn split_message_id(id: &str) -> Option<(&str, &str)> {
     Some((&inner[..at], &inner[at..]))
 }
 
+/// A new domain row, under the next id below `1 << 32`: ids from there on are a merged shard's own
+/// (`merge_shards`), and a small id keeps segment rows and blobs short.
+pub(crate) const NEW_DOMAIN: &str = "insert into domains (id, suffix) values ((select coalesce(max(id), 0) + 1 from domains where id < 4294967296), ?1)";
+
 /// The domains a shard's writer knows. Only domains shared by several
 /// articles get a row in `domains`: some posting tools make up a new domain
 /// for every article, and those message-ids are stored whole instead. A
@@ -511,7 +515,7 @@ impl Domains {
                     return Ok((whole(id), 0));
                 }
                 self.seen.remove(suffix);
-                conn.prepare_cached("insert into domains (suffix) values (?)")?.execute([suffix])?;
+                conn.prepare_cached(NEW_DOMAIN)?.execute([suffix])?;
                 let domain = conn.last_insert_rowid();
                 self.staged.insert(suffix.to_string(), domain);
                 return Ok((pack_local(local), domain));
