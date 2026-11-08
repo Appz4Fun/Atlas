@@ -354,6 +354,13 @@ const PLAIN_WAIT: Duration = Duration::from_millis(500);
 /// probation: the first unreadable listing turns it off again. Compression stayed off until a restart.
 const COMPRESS_RETRY: Duration = Duration::from_secs(60 * 60);
 
+/// The longest an `XZVER` probe may take: where it hangs (as on Highwinds backends) a probe costs this, not a whole
+/// `XOVER_DEADLINE`.
+const XZVER_PROBE_DEADLINE: Duration = Duration::from_secs(30);
+/// After a probe that said nothing either way (a dropped connection, a `400`, a wide slice that timed out), how long
+/// before the next one, soo the slice's halves and the next listings dont each pay for one.
+const XZVER_PROBE_COOLDOWN: Duration = Duration::from_secs(10 * 60);
+
 /// What `XZVER` did on a server that refuses `XFEATURE COMPRESS GZIP`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Xzver {
@@ -361,6 +368,8 @@ enum Xzver {
     Untried,
     /// one listing is asking (see `Probe`)
     Probing,
+    /// the last probe said nothing either way: the next waits until then (see `XZVER_PROBE_COOLDOWN`)
+    Cooling(Instant),
     /// answered a listing: listings go on asking for it
     Works,
     /// refused, unreadable, or too slow at this time: plain XOVER until `COMPRESS_RETRY` has passed
@@ -1851,6 +1860,8 @@ pub struct Pool {
     body_patience: Duration,
     /// `XOVER_DEADLINE` and `BODY_DEADLINE`, shorter in tests
     xover_deadline: Duration,
+    /// see `XZVER_PROBE_COOLDOWN`
+    xzver_cooldown: Duration,
     body_deadline: Duration,
     /// tries of a background body on one server past its first, after a timeout or a failure (not after "not here")
     body_retries: usize,
@@ -2061,6 +2072,7 @@ impl Pool {
             compress_retry: COMPRESS_RETRY,
             body_patience: BODY_PATIENCE,
             xover_deadline: XOVER_DEADLINE,
+            xzver_cooldown: XZVER_PROBE_COOLDOWN,
             body_deadline: BODY_DEADLINE,
             body_retries: BODY_RETRIES,
             unsaved: UnsavedBudget::new(crate::config::DEFAULT_MAX_UNSAVED_HEADERS as usize),
@@ -3273,14 +3285,19 @@ impl Pool {
     }
 
     pub(crate) async fn xover_on(&self, i: usize, group: &str, start: u64, end: u64) -> Result<Vec<Overview>> {
-        match self.xover_once(i, group, start, end, false).await {
+        let mut r = self.xover_once(i, group, start, end, false).await;
+        if r.as_ref().err().is_some_and(NntpError::is_closed) {
+            // the server closed the connection before answering: once more, on another one
+            r = self.xover_once(i, group, start, end, false).await;
+        }
+        match r {
+            // also after a closed connection's retry, which used to hand an unreadable listing to the indexer as an
+            // error ("compressed headers: deflate decompression error" on prod)
             Err(NntpError::Decompress(e)) => {
                 // count it against the server's compression, and redo the slice uncompressed
                 self.no_compression(i, &e);
                 self.xover_once(i, group, start, end, true).await
             }
-            // the server closed the connection before answering: once more, on another one
-            Err(e) if e.is_closed() => self.xover_once(i, group, start, end, false).await,
             // too wide to answer in time: in halves (see `xover_halves`)
             Err(e) if e.is_timeout() && end.saturating_sub(start) + 1 >= 2 * MIN_CHUNK => {
                 self.xover_halves(i, group, start, end).await
@@ -3343,7 +3360,9 @@ impl Pool {
                 let method = if compressed { "xover_gzip" } else { "xover" };
                 (method, within(self.xover_deadline, "XOVER", lease.begin().xover(start, end)).await)
             } else {
-                match within(self.xover_deadline, "XZVER", lease.begin().xzver(start, end)).await {
+                let deadline =
+                    if probing { self.xover_deadline.min(XZVER_PROBE_DEADLINE) } else { self.xover_deadline };
+                match within(deadline, "XZVER", lease.begin().xzver(start, end)).await {
                     // nothing to tell it works by, and a server that ignores the range would read empty for good:
                     // the connection takes a plain XOVER of the slice, and the next listing probes
                     Ok(rows) if probing && rows.is_empty() => {
@@ -3368,7 +3387,7 @@ impl Pool {
                     // a status line alone, or a listing read to its end that wouldnt decode: the connection takes a
                     // plain XOVER of the slice
                     Err(e @ (NntpError::Reply { .. } | NntpError::Decompress(_))) => {
-                        self.xzver_failed(&lease.server, &e, probing);
+                        self.xzver_failed(&lease.server, &e, probing, false);
                         lease.busy = false;
                         requests = 2;
                         ("xover", within(self.xover_deadline, "XOVER", lease.begin().xover(start, end)).await)
@@ -3379,7 +3398,7 @@ impl Pool {
                     // may still have the reply coming). A wide probe that timed out may only have been slow: it
                     // counts toward `GROUP_REFUSALS` (see `xzver_failed`), and XOVER is halved in turn if it times out too
                     Err(e) => {
-                        self.xzver_failed(&lease.server, &e, probing && !(e.is_timeout() && wide));
+                        self.xzver_failed(&lease.server, &e, probing, e.is_timeout() && wide);
                         crate::profile::Load::add_since(&crate::profile::LOAD.xover_ns, sent);
                         crate::profile::LOAD.xovers.fetch_add(1, Ordering::Relaxed);
                         let _ = lease.check(Err::<(), _>(e));
@@ -3414,9 +3433,10 @@ impl Pool {
         match *state {
             Xzver::Works => Ask::Use,
             Xzver::Probing => Ask::No,
+            Xzver::Cooling(until) if Instant::now() < until => Ask::No,
             Xzver::Refused(at) if at.elapsed() < self.compress_retry => Ask::No,
-            Xzver::Refused(_) | Xzver::Untried => {
-                if *state != Xzver::Untried {
+            Xzver::Refused(_) | Xzver::Untried | Xzver::Cooling(_) => {
+                if matches!(*state, Xzver::Refused(_)) {
                     println!("{}: asking for XZVER headers again", server.cfg.host);
                 }
                 *state = Xzver::Probing;
@@ -3434,14 +3454,19 @@ impl Pool {
         }
     }
 
-    /// `XZVER` failed on server `i`: plain XOVER until `COMPRESS_RETRY` when a probe that settles it (`decisive`)
-    /// failed other than by a dropped connection or a `400` (which say nothing about `XZVER`), or after
-    /// `GROUP_REFUSALS` failures in a row (one odd group, a dropped connection or a backend 502 where it works
-    /// doesnt cost an hour of plain headers).
-    fn xzver_failed(&self, server: &Server, e: &NntpError, decisive: bool) {
-        let transient = e.is_closed() || e.code() == Some(400);
-        if (decisive && !transient) || server.xzver_failures.fetch_add(1, Ordering::Relaxed) + 1 >= GROUP_REFUSALS {
+    /// `XZVER` failed on server `i`. Plain XOVER until `COMPRESS_RETRY` when the probe failed in a way that settles
+    /// it, or after `GROUP_REFUSALS` failures in a row: one odd group, a dropped connection or a backend 502 where it
+    /// works doesnt cost an hour of plain headers. A probe that said nothing either way (a dropped connection, a
+    /// `400`, a wide slice that timed out, which XOVER might too) waits `XZVER_PROBE_COOLDOWN` for the next.
+    fn xzver_failed(&self, server: &Server, e: &NntpError, probing: bool, wide_timeout: bool) {
+        let says_nothing = e.is_closed() || e.code() == Some(400) || wide_timeout;
+        if (probing && !says_nothing) || server.xzver_failures.fetch_add(1, Ordering::Relaxed) + 1 >= GROUP_REFUSALS {
             self.xzver_refused(server, e);
+        } else if probing {
+            let mut state = server.xzver.lock().unwrap();
+            if *state == Xzver::Probing {
+                *state = Xzver::Cooling(Instant::now() + self.xzver_cooldown);
+            }
         }
     }
 
@@ -5318,7 +5343,13 @@ mod xzver_fallback_tests {
             assert!(pool.xover_on(0, "g", 1, 2 * MIN_CHUNK).await.is_ok());
             assert_eq!(count(&log, "XZVER"), 1);
             assert_eq!(count(&log, "XOVER"), 1, "the whole slice, not halves");
-            assert_eq!(*pool.servers[0].xzver.lock().unwrap(), Xzver::Untried);
+            assert!(matches!(*pool.servers[0].xzver.lock().unwrap(), Xzver::Cooling(_)));
+            // cooling: the next listing doesnt probe
+            assert!(pool.xover_on(0, "g", 1, 2 * MIN_CHUNK).await.is_ok());
+            assert_eq!(count(&log, "XZVER"), 1);
+            // past the cooldown, and none from now on: a probe a listing, refused after `GROUP_REFUSALS` in all
+            pool.xzver_cooldown = Duration::ZERO;
+            *pool.servers[0].xzver.lock().unwrap() = Xzver::Cooling(Instant::now());
             for _ in 1..GROUP_REFUSALS {
                 assert!(pool.xover_on(0, "g", 1, 2 * MIN_CHUNK).await.is_ok());
             }
@@ -5330,7 +5361,8 @@ mod xzver_fallback_tests {
     fn a_server_that_hangs_up_on_xzver_gets_xover() {
         run(async {
             let (port, log) = serve_with(Answer::Close).await;
-            let pool = pool(port, true);
+            let mut pool = pool(port, true);
+            pool.xzver_cooldown = Duration::ZERO;
             for _ in 0..(GROUP_REFUSALS + 1) {
                 assert_eq!(numbers(&pool.xover_on(0, "g", 1, 2).await.unwrap()), [1, 2]);
             }
@@ -5410,6 +5442,49 @@ mod xzver_fallback_tests {
             assert_eq!(count(&log, "XZVER"), 1 + GROUP_REFUSALS);
             assert_eq!(count(&log, "XOVER"), GROUP_REFUSALS + 1);
             assert!(matches!(*pool.servers[0].xzver.lock().unwrap(), Xzver::Refused(_)));
+        });
+    }
+
+    /// A gzip server that hangs up on the first XOVER and sends an unreadable compressed listing on the retry: the
+    /// slice is read plain on a third connection, not handed to the indexer as a deflate error.
+    #[test]
+    fn an_unreadable_listing_after_a_hang_up_is_read_plain() {
+        run(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let connections = Arc::new(AtomicUsize::new(0));
+            let seen = connections.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((sock, _)) = listener.accept().await else { return };
+                    let n = seen.fetch_add(1, Ordering::SeqCst);
+                    tokio::spawn(async move {
+                        let (read, mut write) = sock.into_split();
+                        let mut lines = tokio::io::BufReader::new(read);
+                        let _ = write.write_all(b"200 hi\r\n").await;
+                        loop {
+                            let mut line = String::new();
+                            if tokio::io::AsyncBufReadExt::read_line(&mut lines, &mut line).await.unwrap_or(0) == 0 {
+                                return;
+                            }
+                            let reply: &[u8] = match line.split_whitespace().next().unwrap_or("") {
+                                "AUTHINFO" if line.contains("USER") => b"381 more\r\n",
+                                "AUTHINFO" => b"281 ok\r\n",
+                                "GROUP" => b"211 2 1 2 g\r\n",
+                                "XFEATURE" => b"290 compressing\r\n",
+                                "XOVER" if n == 0 => return,
+                                "XOVER" if n == 1 => b"224 ok [COMPRESS=GZIP]\r\nnot a deflate stream at all\r\n.\r\n",
+                                "XOVER" => XOVER_ROWS,
+                                _ => b"500 what\r\n",
+                            };
+                            let _ = write.write_all(reply).await;
+                        }
+                    });
+                }
+            });
+            let pool = pool(port, true);
+            assert_eq!(numbers(&pool.xover_on(0, "g", 1, 2).await.unwrap()), [1, 2]);
+            assert_eq!(connections.load(Ordering::SeqCst), 3);
         });
     }
 }
