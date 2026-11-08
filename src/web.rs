@@ -1060,6 +1060,14 @@ impl Search {
                 "Incomplete releases are hidden. <a href=\"/?{shown}\" hx-get=\"/ui/results?{shown}\" hx-target=\"#results\">Show them</a>. "
             );
         }
+        if self.hides_spots() {
+            let filters: Vec<&'static str> = self.filters.iter().copied().filter(|f| *f != HIDE_SPOTS).collect();
+            let shown = attr(&Search { offset: 0, filters, ..self.clone() }.query(&self.cat, 0));
+            let _ = write!(
+                hint,
+                "Spots are hidden. <a href=\"/?{shown}\" hx-get=\"/ui/results?{shown}\" hx-target=\"#results\">Show them</a>. "
+            );
+        }
         if self.min_score.is_some() {
             let all = attr(&Search { offset: 0, min_score: None, ..self.clone() }.query(&self.cat, 0));
             let _ = write!(
@@ -1105,6 +1113,7 @@ impl Search {
             None => "Best or newest matches first".to_string(),
         };
         let sort = if self.hide_incomplete { format!("{sort}, incomplete hidden") } else { sort };
+        let sort = if self.hides_spots() { format!("{sort}, spots hidden") } else { sort };
         let sort = match self.min_score {
             Some(min) => format!("{sort}, rated {}+ only", min / 10),
             None => sort,
@@ -2424,6 +2433,10 @@ fn frozen_section(search: &Search) -> String {
                 tags.iter().all(|t| filter_matches(t, &parsed))
             })
             .collect();
+        if search.hides_spots() {
+            let spots = spot_ids(&hits.iter().map(|h| h.row.id).collect::<Vec<_>>());
+            hits.retain(|h| !spots.contains(&h.row.id));
+        }
         hits.truncate(FROZEN_LISTED);
         hits
     }) {
@@ -5768,6 +5781,7 @@ mod tests {
         assert!(!s.filters_by_tags() && s.tag_filters().is_empty(), "spots aren't read from a name's tags");
         assert_eq!(s.query("", 0), "q=x&filters=Hide%20spots");
         assert!(s.filter_links().contains("aria-current=\"true\">Hide spots<"));
+        assert!(s.nothing_found().contains("Spots are hidden. <a href=\"/?q=x\""), "an empty page says why");
         let off = Search::from_args(&parse_query("q=x"));
         assert!(!off.hides_spots());
         assert!(
