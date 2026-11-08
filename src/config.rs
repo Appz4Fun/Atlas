@@ -197,6 +197,7 @@ pub struct Config {
     pub metrics: MetricsConfig,
     pub sealed_log: SealedLogConfig,
     pub overview_archive: OverviewArchiveConfig,
+    pub header_window: HeaderWindowConfig,
     pub freeze: FreezeConfig,
     pub shared_catalog: SharedCatalogConfig,
 }
@@ -717,6 +718,56 @@ impl OverviewArchiveConfig {
     }
 }
 
+/// The `header_window` object of config.toml (`crate::header_window`): the last day of overview lines around where
+/// reading stands, compressed on local disk, for linking uploads across groups. Off unless enabled.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeaderWindowConfig {
+    pub enabled: bool,
+    /// where it lives, `header-window` next to the databases unless set (a relative path is taken from there too)
+    pub dir: String,
+    /// hours of live reading kept, besides the days around the backfill frontier
+    pub keep_hours: i64,
+}
+
+impl Default for HeaderWindowConfig {
+    fn default() -> Self {
+        HeaderWindowConfig { enabled: false, dir: String::new(), keep_hours: 24 }
+    }
+}
+
+impl HeaderWindowConfig {
+    fn from_value(v: Option<&Value>) -> HeaderWindowConfig {
+        let mut c = HeaderWindowConfig::default();
+        let Some(v) = v else { return c };
+        if let Some(b) = v.get("enabled").and_then(as_bool) {
+            c.enabled = b;
+        }
+        if let Some(d) = v.get("dir").and_then(Value::as_str) {
+            c.dir = d.trim().to_string();
+        }
+        if let Some(n) = v.get("keep_hours").and_then(as_int) {
+            c.keep_hours = n.clamp(1, 24 * 30);
+        }
+        c
+    }
+
+    pub fn root(&self) -> std::path::PathBuf {
+        let dir = std::path::PathBuf::from(&self.dir);
+        if self.dir.is_empty() {
+            crate::paths::app_dir().join("header-window")
+        } else if dir.is_absolute() {
+            dir
+        } else {
+            crate::paths::app_dir().join(dir)
+        }
+    }
+}
+
+/// The file's `header_window` object: no keyring.
+pub fn header_window_config() -> HeaderWindowConfig {
+    read_file().map_or_else(HeaderWindowConfig::default, |v| HeaderWindowConfig::from_value(v.get("header_window")))
+}
+
 /// The file's `overview_archive` object: no keyring.
 pub fn overview_archive_config() -> OverviewArchiveConfig {
     read_file()
@@ -1056,6 +1107,7 @@ impl Default for Config {
             metrics: MetricsConfig::default(),
             sealed_log: SealedLogConfig::default(),
             overview_archive: OverviewArchiveConfig::default(),
+            header_window: HeaderWindowConfig::default(),
             shared_catalog: SharedCatalogConfig::default(),
             predb: PredbConfig::default(),
             spots: SpotsConfig::default(),
@@ -1239,6 +1291,7 @@ impl Config {
             metrics: MetricsConfig::from_value(v.get("metrics")),
             sealed_log: SealedLogConfig::from_value(v.get("sealed_log")),
             overview_archive: OverviewArchiveConfig::from_value(v.get("overview_archive")),
+            header_window: HeaderWindowConfig::from_value(v.get("header_window")),
             shared_catalog: SharedCatalogConfig::from_value(v.get("shared_catalog")),
             predb: PredbConfig::from_value(v.get("predb")),
             spots: SpotsConfig::from_value(v.get("spots")),

@@ -287,6 +287,14 @@ pub const LOCKSTEP_DAYS: i64 = 1;
 /// spare workers wait too. Within that the newest day goes first, a group big
 /// releases come from (`media_groups`) first among equals.
 pub fn claim(conn: &Connection, groups: &[(String, i64)], host: &str, now: i64) -> Result<Option<Claim>> {
+    let claimed = claim_any(conn, groups, host, now)?;
+    if let Some(c) = &claimed {
+        crate::header_window::note_claimed_day(c.day);
+    }
+    Ok(claimed)
+}
+
+fn claim_any(conn: &Connection, groups: &[(String, i64)], host: &str, now: i64) -> Result<Option<Claim>> {
     if groups.is_empty() {
         return Ok(None);
     }
@@ -305,6 +313,20 @@ pub fn claim(conn: &Connection, groups: &[(String, i64)], host: &str, now: i64) 
 /// (likewise, `group` among them) still has to do or is doing, else none: a group whose days left are older waits
 /// for the others to come back to them (see `claim`).
 pub fn claim_turn(
+    conn: &Connection,
+    group: (String, i64),
+    all: &[(String, i64)],
+    host: &str,
+    now: i64,
+) -> Result<Option<Claim>> {
+    let claimed = claim_turn_any(conn, group, all, host, now)?;
+    if let Some(c) = &claimed {
+        crate::header_window::note_claimed_day(c.day);
+    }
+    Ok(claimed)
+}
+
+fn claim_turn_any(
     conn: &Connection,
     group: (String, i64),
     all: &[(String, i64)],
