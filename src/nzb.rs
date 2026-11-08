@@ -226,8 +226,15 @@ impl InferredFile {
 /// `id` (with or without its `<>`) split as `part{p}of{total}.{rest}`, written just soo (no leading zeros):
 /// the rest, or None.
 fn pattern_rest(id: &str, p: i64, total: i64) -> Option<&str> {
+    // a number exactly as `{n}` writes it
+    fn number(s: &str, n: i64) -> Option<&str> {
+        let digits = s.bytes().take_while(u8::is_ascii_digit).count();
+        let (head, tail) = s.split_at(digits);
+        (digits > 0 && !(digits > 1 && head.starts_with('0')) && head.parse() == Ok(n)).then_some(tail)
+    }
     let id = id.trim_matches(['<', '>']);
-    let rest = id.strip_prefix(&format!("part{p}of{total}."))?;
+    let rest = number(id.strip_prefix("part")?, p)?;
+    let rest = number(rest.strip_prefix("of")?, total)?.strip_prefix('.')?;
     // the rest has to be an id's own tail: something@domain, nothing that could be another counter
     let (left, domain) = rest.split_once('@')?;
     (!left.is_empty() && !domain.is_empty() && !rest.contains(['<', '>', ' '])).then_some(rest)
@@ -244,8 +251,9 @@ fn common_size(sizes: impl Iterator<Item = i64>) -> Option<i64> {
 
 /// For each file of `articles` whose ids prove the `part{N}of{T}.{rest}` pattern, the parts it lacks. Proven means:
 /// a file name; one part count T (2..=MAX_PARTS) on every article; every article numbered 1..=T and its id exactly
-/// `part{its number}of{T}.{rest}`, one rest throughout; at least two parts known. Any file short of that gets
-/// nothing: an id is never guessed past what the file's own ids say.
+/// `part{its number}of{T}.{rest}`, one rest throughout; at least two parts known, and at least half of T, soo a
+/// couple of articles can't call up a hundred thousand segments. Any file short of that gets nothing: an id is
+/// never guessed past what the file's own ids say.
 pub fn inferred_segments(articles: &[ArticleRow]) -> Vec<InferredFile> {
     let mut out = Vec::new();
     for (index, file) in files(articles).into_iter().enumerate() {
@@ -262,24 +270,22 @@ pub fn inferred_segments(articles: &[ArticleRow]) -> Vec<InferredFile> {
             known.insert(p);
             *rest.get_or_insert(r) == r
         });
-        let Some(rest) = rest.filter(|_| proven && known.len() >= 2) else { continue };
+        let Some(rest) = rest.filter(|_| proven && known.len() >= 2 && known.len() as i64 * 2 >= total) else {
+            continue;
+        };
         if known.len() as i64 == total {
             continue;
         }
         // a missing part is as big as the file's parts mostly are; the last is never seen when it's the one missing
-        let sizes = || file.iter().filter(|a| a.part != Some(total)).filter_map(|a| a.bytes);
-        let size = common_size(sizes()).or_else(|| common_size(file.iter().filter_map(|a| a.bytes)));
-        let bracketed = file[0].message_id.starts_with('<');
+        let size = common_size(file.iter().filter(|a| a.part != Some(total)).filter_map(|a| a.bytes))
+            .or_else(|| common_size(file.iter().filter_map(|a| a.bytes)));
         let rows = (1..=total)
             .filter(|p| !known.contains(p))
-            .map(|p| {
-                let id = format!("part{p}of{total}.{rest}");
-                ArticleRow {
-                    message_id: if bracketed { format!("<{id}>") } else { id },
-                    part: Some(p),
-                    bytes: size,
-                    ..file[0].clone()
-                }
+            .map(|p| ArticleRow {
+                message_id: format!("<part{p}of{total}.{rest}>"),
+                part: Some(p),
+                bytes: size,
+                ..file[0].clone()
             })
             .collect();
         out.push(InferredFile { file: index, filename, total, rows });
@@ -963,6 +969,9 @@ mod tests {
         none(zeros);
         // one known part proves nothing
         none(post("a.rar", 6, &[2], "t"));
+        // nor do two of a hundred thousand
+        none(post("a.rar", 100_000, &[1, 2], "t"));
+        none(post("a.rar", 7, &[1, 2, 3], "t"));
         // ids of another shape
         none(vec![part("a.rar", 1, 3), part("a.rar", 3, 3)]);
         // no file name
