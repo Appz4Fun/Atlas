@@ -21,7 +21,8 @@ pub const IMAGES_STEP: StepId = StepId(13);
 pub const MAX_IMAGES: usize = 6;
 const MAX_PARTS: usize = 8;
 /// Articles a book or comic may take to be read whole for the pictures inside it.
-const MAX_CONTAINER_PARTS: usize = 24;
+/// A whole read stops past 8 MiB, which is about 11 articles: past that the articles would be fetched for nothing.
+const MAX_CONTAINER_PARTS: usize = 10;
 /// Past this, the oldest pictures go from the folder.
 const MAX_IMAGE_CACHE: u64 = 2 << 30;
 const TRIM_EVERY: u64 = 64;
@@ -187,8 +188,11 @@ pub fn same_pictures(conn: &rusqlite::Connection, release_id: i64, limit: usize)
                     .map(|rows| rows.filter_map(Result::ok).collect())
                     .unwrap_or_default();
                 for id in ids {
-                    if !found.iter().any(|(other, _, _)| *other == id) {
-                        found.push((id, position, tie));
+                    match found.iter_mut().find(|(other, _, _)| *other == id) {
+                        // found again by a stronger tie: shown by that one
+                        Some(seen) if (tie as u8) < (seen.2 as u8) => *seen = (id, position, tie),
+                        Some(_) => {}
+                        None => found.push((id, position, tie)),
                     }
                 }
             }
@@ -241,6 +245,13 @@ pub fn containers(files: &[FileInfo]) -> Vec<&FileInfo> {
 /// Document ids that say nothing of one picture: empty uuids and the default some editors write on every file.
 const SHARED_DOCUMENT_IDS: [&str; 2] = ["faf5bdd5-ba3d-11da-ad31-d33d75182f1b", "00000000-0000-0000-0000-000000000000"];
 
+/// An ImageUniqueID that names one picture: 16 hex digits or more, not all one digit. Some cameras write their model
+/// or firmware there, the same on every shot.
+fn is_telling_image_id(id: &str) -> bool {
+    let hex: Vec<char> = id.chars().filter(|c| !c.is_whitespace()).collect();
+    hex.len() >= 16 && hex.iter().all(char::is_ascii_hexdigit) && hex.iter().any(|c| !c.eq_ignore_ascii_case(&hex[0]))
+}
+
 fn is_telling_document_id(id: &str) -> bool {
     let lower = id.to_ascii_lowercase();
     let bare = lower.rsplit(':').next().unwrap_or(&lower);
@@ -251,10 +262,15 @@ fn is_telling_document_id(id: &str) -> bool {
 
 /// What's kept of one picture read: its row's values after the release id and position.
 pub fn row_values(file: &str, bytes: &[u8], sha256: &str) -> Option<Vec<rusqlite::types::Value>> {
-    let sniffed = sniff(bytes)?;
-    let info = (sniffed.format == "jpeg").then(|| jpeg::read(bytes)).flatten();
+    // a JPEG's headers read once: its size comes from them too
+    let (sniffed, info) = if jpeg::is_jpeg(bytes) {
+        let info = jpeg::read(bytes)?;
+        (super::Sniffed { format: "jpeg", width: u32::from(info.width), height: u32::from(info.height) }, Some(info))
+    } else {
+        (sniff(bytes)?, None)
+    };
     let meta = info.as_ref().and_then(|i| serde_json::to_string(i).ok());
-    let exif_id = info.as_ref().and_then(|i| i.exif.unique_id.clone()).filter(|id| !id.trim_matches('0').is_empty());
+    let exif_id = info.as_ref().and_then(|i| i.exif.unique_id.clone()).filter(|id| is_telling_image_id(id));
     // the original's id names the picture through every save; an editor that writes only its own takes that. One
     // stamped on every file a tool makes ties nothing
     let document_id = info
@@ -312,12 +328,12 @@ impl Step for ImagesStep {
         let mut writes = vec![StepWrite::new(DROP_IMAGES, vec![release_id.into()])];
         let mut kept = 0i64;
         let mut row = |name: &str, body: &[u8], writes: &mut Vec<StepWrite>| {
-            // checked before it's kept: a file named .jpg that isn't a picture never reaches the folder
-            if sniff(body).is_none() {
+            // read before it's kept: a file named .jpg that isn't a picture never reaches the folder
+            let sha256 = sha256_hex(body);
+            let Some(values) = row_values(name, body, &sha256) else { return };
+            if keep(body).is_none() {
                 return;
             }
-            let Some(sha256) = keep(body) else { return };
-            let Some(values) = row_values(name, body, &sha256) else { return };
             let mut params = vec![release_id.into(), kept.into()];
             params.extend(values);
             writes.push(StepWrite::new(SET_IMAGE, params));
@@ -378,6 +394,13 @@ mod tests {
         assert_eq!(names, ["00-thumbnail.jpg", "a-shot.jpg", "b-shot.png"]);
         let many: Vec<FileInfo> = (0..20).map(|i| file(&format!("{i:03}.jpg"), 1)).collect();
         assert_eq!(picked(&many).len(), MAX_IMAGES);
+    }
+
+    #[test]
+    fn image_ids_that_name_a_camera_tie_nothing() {
+        assert!(is_telling_image_id("0123456789abcdef0123456789abcdef"));
+        assert!(!is_telling_image_id("E08LLKL01AM"));
+        assert!(!is_telling_image_id("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"));
     }
 
     #[test]

@@ -15,6 +15,8 @@ const MAX_TEXT: usize = 512;
 /// IFDs followed at most, and entries read from one: a loop of offsets or a huge count ends here.
 const MAX_IFDS: usize = 8;
 const MAX_ENTRIES: usize = 512;
+/// Places an XMP property's name is looked at, at most, for its value.
+const MAX_XMP_TRIES: usize = 16;
 
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -101,6 +103,7 @@ pub fn read(bytes: &[u8]) -> Option<JpegInfo> {
     let mut icc_chunks: BTreeMap<u8, &[u8]> = BTreeMap::new();
     let mut framed = false;
     let mut scan_at = None;
+    let mut xmp_read = false;
     let mut at = 2;
     while at + 4 <= bytes.len() {
         if bytes[at] != 0xFF {
@@ -137,7 +140,11 @@ pub fn read(bytes: &[u8]) -> Option<JpegInfo> {
             0xE1 => {
                 if let Some(tiff) = body.strip_prefix(b"Exif\0\0") {
                     exif(tiff, &mut info);
-                } else if let Some(xml) = body.strip_prefix(b"http://ns.adobe.com/xap/1.0/\0") {
+                } else if let Some(xml) = body.strip_prefix(b"http://ns.adobe.com/xap/1.0/\0")
+                    && !xmp_read
+                {
+                    // the first packet only: the rest are extensions, or a file made to cost time
+                    xmp_read = true;
                     xmp(xml, &mut info.xmp);
                 }
             }
@@ -485,7 +492,13 @@ fn xmp(xml: &[u8], out: &mut Xmp) {
 
 fn xmp_value(xml: &str, name: &str) -> Option<String> {
     let mut from = 0;
+    // a name written over and over, each with nothing behind it, is looked at this many times
+    let mut tries = 0;
     while let Some(found) = xml[from..].find(name) {
+        tries += 1;
+        if tries > MAX_XMP_TRIES {
+            return None;
+        }
         let at = from + found;
         from = at + name.len();
         // a longer name that starts the same, as `xmpMM:DocumentIDs`
@@ -503,6 +516,14 @@ fn xmp_value(xml: &str, name: &str) -> Option<String> {
         } else {
             continue;
         };
+        // only as far as a value can be: one that runs on is cut, as `text` would cut it
+        let value = value.map(|v| {
+            let mut end = v.len().min(MAX_TEXT * 8);
+            while !v.is_char_boundary(end) {
+                end -= 1;
+            }
+            &v[..end]
+        });
         if let Some(value) = value.and_then(|v| text(unescape(v).as_bytes())) {
             return Some(value);
         }
@@ -765,6 +786,18 @@ mod tests {
         let cut = &whole[..whole.len() - 40];
         assert_eq!(read(cut).unwrap().after_end, 0);
         assert_eq!(read(&whole).unwrap().after_end, 0);
+    }
+
+    #[test]
+    fn xmp_written_to_cost_time_costs_little() {
+        let mut xmp = b"http://ns.adobe.com/xap/1.0/\0".to_vec();
+        while xmp.len() < 65_000 {
+            xmp.extend(b"xmpMM:DocumentID>\0");
+        }
+        let segments: Vec<(u8, Vec<u8>)> = (0..40).map(|_| (0xE1, xmp.clone())).collect();
+        let started = std::time::Instant::now();
+        assert!(read(&with(&segments, b"")).is_some());
+        assert!(started.elapsed() < std::time::Duration::from_millis(500), "{:?}", started.elapsed());
     }
 
     #[test]
