@@ -47,6 +47,8 @@ fn wait_unless_stopping(tries: i32) -> bool {
 
 /// rows one write transaction takes at most, soo no writer holds the file for long
 const WRITE_CHUNK: usize = 2000;
+/// how often a pass starts the WAL over between its reads (`Store::checkpoint_tick`)
+const RESTART_EVERY: Duration = Duration::from_secs(10);
 /// how often the linker runs
 const PASS_EVERY: Duration = Duration::from_secs(60);
 /// what the name of every upload saved here starts with (`is_upload`)
@@ -402,6 +404,8 @@ struct Saved {
 pub struct Store {
     conn: Connection,
     groups: HashMap<String, i64>,
+    /// when this connection last started the WAL over (`checkpoint_tick`)
+    restarted: std::cell::Cell<std::time::Instant>,
 }
 
 impl Store {
@@ -422,7 +426,7 @@ impl Store {
             let mut stmt = conn.prepare("select name, id from groups")?;
             stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
         };
-        Ok(Store { conn, groups })
+        Ok(Store { conn, groups, restarted: std::cell::Cell::new(std::time::Instant::now()) })
     }
 
     fn group_id(&mut self, name: &str) -> Result<i64> {
@@ -493,6 +497,21 @@ impl Store {
         Ok(self.conn.query_row("pragma wal_checkpoint(passive)", [], |r| {
             Ok((r.get::<_, i64>(0)? != 0, r.get(1)?, r.get(2)?))
         })?)
+    }
+
+    /// Between a pass's reads: a passive checkpoint, and every `RESTART_EVERY` one that starts the WAL over. A passive
+    /// one only copies frames back; the WAL starts over only when a writer begins after a complete one, and while a
+    /// pass reads back to back the parse path's writer always begins mid-read, soo the WAL grew by all it wrote for
+    /// the length of a pass (13 GB in passes of minutes). The truncating one takes the write lock: it waits out the
+    /// writer's current transaction (a second or two), copies what's left and empties the file, and the writer goes
+    /// on into an empty WAL. Blocked (another checkpoint, or a reader that wouldn't leave) is tried next time.
+    pub fn checkpoint_tick(&self) -> Result<()> {
+        self.checkpoint()?;
+        if self.restarted.get().elapsed() >= RESTART_EVERY {
+            self.restarted.set(std::time::Instant::now());
+            self.conn.query_row("pragma wal_checkpoint(truncate)", [], |_| Ok(()))?;
+        }
+        Ok(())
     }
 
     /// Drop what arrived over `KEEP_SECS` ago.
@@ -618,7 +637,7 @@ impl Store {
                 break;
             }
             after = last;
-            self.checkpoint()?;
+            self.checkpoint_tick()?;
         }
         Ok(out)
     }
@@ -718,7 +737,7 @@ impl Store {
             }
             if k % 256 == 255 {
                 // between this connection's reads: what the parse path wrote meanwhile can go back (`checkpoint`)
-                self.checkpoint()?;
+                self.checkpoint_tick()?;
             }
             if settled(&f) && place.oldest < now - KEEP_SECS {
                 // the file's first articles have left the window: one read again couldnt be told from a new one, and
@@ -752,7 +771,7 @@ impl Store {
         let mut grown: BTreeSet<usize> = BTreeSet::new();
         for (k, (poster, place, _)) in finished.iter().enumerate() {
             if k % 256 == 255 {
-                self.checkpoint()?;
+                self.checkpoint_tick()?;
             }
             let Some(place) = place else { continue };
             let Some(j) = saved.iter().position(|u| u.release == place.release) else { continue };
@@ -783,7 +802,7 @@ impl Store {
             }
             if k % 64 == 63 {
                 // a chain reads its files' rows: what the parse path wrote meanwhile goes back between (`checkpoint`)
-                self.checkpoint()?;
+                self.checkpoint_tick()?;
             }
             if !files.iter().all(|&i| settled(&fresh[i])) {
                 continue;
@@ -1848,6 +1867,24 @@ mod tests {
         drop(tx);
         record_queued(rx, &mut |_, _, _| anyhow::bail!("disk full"));
         assert!(Written(r2).wait(Duration::ZERO).is_err());
+    }
+
+    #[test]
+    fn a_tick_past_its_time_empties_the_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("atlas.xref.db");
+        let mut store = Store::open(&path).unwrap();
+        let batch: Vec<Article> = (0..3000u64)
+            .map(|k| article(&format!("t{k:023}"), &format!("p{}@x.y", k % 5), "2023-12-03 16:23:23", k))
+            .collect();
+        store.record("a.b.one", &batch, 1000).unwrap();
+        let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
+        store.checkpoint_tick().unwrap();
+        assert!(std::fs::metadata(&wal).unwrap().len() > 0, "not yet its time: copied back, the file kept");
+        store.restarted.set(std::time::Instant::now() - RESTART_EVERY);
+        store.checkpoint_tick().unwrap();
+        assert_eq!(std::fs::metadata(&wal).unwrap().len(), 0, "its time: emptied");
+        assert_eq!(store.waiting().unwrap().len(), 5, "nothing lost");
     }
 
     #[test]
