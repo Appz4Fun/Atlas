@@ -403,7 +403,10 @@ impl Store {
     pub fn open(path: &Path) -> Result<Store> {
         let conn = Connection::open(path)?;
         conn.busy_handler(Some(wait_unless_stopping))?;
-        conn.execute_batch("pragma journal_mode = wal; pragma synchronous = normal;")?;
+        // a WAL reset leaves its file at most this big
+        conn.execute_batch(
+            "pragma journal_mode = wal; pragma synchronous = normal; pragma journal_size_limit = 268435456;",
+        )?;
         conn.execute_batch(SCHEMA)?;
         // once: a store made by a build from before this kept no start, soo its file's birth or oldest header says
         if conn.query_row("select 1 from meta where key = 'started'", [], |_| Ok(())).optional()?.is_none() {
@@ -468,6 +471,15 @@ impl Store {
             tx.commit()?;
         }
         Ok(n)
+    }
+
+    /// The WAL written back into the file and started over, between passes. Writers commit all the time, soo the
+    /// passive checkpoints at each commit never get to the end of it while a pass reads: on a busy run the WAL
+    /// grew past the file many times over (hundreds of GB in hours), and every write and read through it slowed
+    /// with it. Here no read is open on this connection; a write that comes meanwhile waits on the busy handler.
+    /// Returns the WAL's frames and those written back.
+    pub fn checkpoint(&mut self) -> Result<(i64, i64)> {
+        Ok(self.conn.query_row("pragma wal_checkpoint(truncate)", [], |r| Ok((r.get(1)?, r.get(2)?)))?)
     }
 
     /// Drop what arrived over `KEEP_SECS` ago.
@@ -1148,6 +1160,12 @@ pub async fn run(db: crate::indexer::Db, stopping: impl Fn() -> bool) {
         if stopping() {
             break;
         }
+        // the WAL written back before each pass, while no pass reads (`Store::checkpoint`)
+        match tokio::task::spawn_blocking(|| with_store(|s| s.checkpoint())).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => eprintln!("xref: couldnt write the WAL back: {e:#}"),
+            Err(e) => eprintln!("xref: writing the WAL back failed: {e}"),
+        }
         let found = match pending.take() {
             Some(found) => found,
             None => {
@@ -1525,6 +1543,28 @@ mod tests {
         store.record("a.b.one", &[later], 2000).unwrap();
         store.ack(&found.ack).unwrap();
         assert_eq!(store.waiting().unwrap().len(), 1, "the later article waits");
+    }
+
+    #[test]
+    fn a_checkpoint_writes_the_wal_back_and_starts_it_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("atlas.xref.db");
+        let mut store = Store::open(&path).unwrap();
+        // a reader on another connection while the writes go in: passive checkpoints can't finish meanwhile
+        let reader = Connection::open(&path).unwrap();
+        reader.execute_batch("begin; select count(*) from headers;").unwrap();
+        let batch: Vec<Article> = (0..5000u64)
+            .map(|k| article(&format!("w{k:023}"), &format!("p{}@x.y", k % 7), "2023-12-03 16:23:23", k))
+            .collect();
+        store.record("a.b.one", &batch, 1000).unwrap();
+        let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
+        assert!(std::fs::metadata(&wal).unwrap().len() > 0);
+        reader.execute_batch("commit;").unwrap();
+        drop(reader);
+        let (frames, written) = store.checkpoint().unwrap();
+        assert_eq!(frames, written, "all of it written back");
+        assert_eq!(std::fs::metadata(&wal).unwrap().len(), 0, "and the WAL started over");
+        assert_eq!(store.waiting().unwrap().len(), 7, "nothing lost");
     }
 
     #[test]
