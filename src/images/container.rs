@@ -7,6 +7,10 @@ use std::io::Read;
 /// Entries read at most from one directory, and how big one picture may be once unpacked.
 const MAX_ENTRIES: usize = 20_000;
 const MAX_PICTURE: usize = 16 << 20;
+/// Bytes unpacked from one archive in all, and entries tried: a directory of thousands of entries pointing at one
+/// big stream would otherwise inflate it again and again.
+const MAX_UNPACKED: usize = 64 << 20;
+const MAX_TRIES: usize = 64;
 
 /// Whether a file is a ZIP whose pictures are worth reading, by its name.
 pub fn is_container_name(name: &str) -> bool {
@@ -35,7 +39,21 @@ pub fn pictures(zip: &[u8], max: usize) -> Vec<Inside> {
     entries.retain(|e| super::is_image_name(&e.name) && e.unpacked > 0 && e.unpacked <= MAX_PICTURE);
     let cover = |e: &Entry| !e.name.to_ascii_lowercase().contains("cover");
     entries.sort_by_key(|e| cover(e));
-    entries.iter().filter_map(|e| Some(Inside { name: e.name.clone(), bytes: unpack(zip, e)? })).take(max).collect()
+    let (mut out, mut budget, mut seen) = (Vec::new(), MAX_UNPACKED, std::collections::HashSet::new());
+    for e in entries.iter().take(MAX_TRIES) {
+        if out.len() >= max || budget < e.unpacked {
+            break;
+        }
+        // one stream named twice is read once
+        if !seen.insert(e.local) {
+            continue;
+        }
+        budget -= e.unpacked;
+        if let Some(bytes) = unpack(zip, e) {
+            out.push(Inside { name: e.name.clone(), bytes });
+        }
+    }
+    out
 }
 
 fn le16(b: &[u8], at: usize) -> Option<usize> {
@@ -82,10 +100,10 @@ fn unpack(zip: &[u8], e: &Entry) -> Option<Vec<u8>> {
     let start = e.local + 30 + le16(zip, e.local + 26)? + le16(zip, e.local + 28)?;
     let data = zip.get(start..start.checked_add(e.packed)?)?;
     match e.method {
-        0 => Some(data.to_vec()),
+        0 => (e.packed == e.unpacked).then(|| data.to_vec()),
         8 => {
             let mut out = Vec::with_capacity(e.unpacked);
-            flate2::read::DeflateDecoder::new(data).take(MAX_PICTURE as u64 + 1).read_to_end(&mut out).ok()?;
+            flate2::read::DeflateDecoder::new(data).take(e.unpacked as u64 + 1).read_to_end(&mut out).ok()?;
             (out.len() == e.unpacked).then_some(out)
         }
         _ => None,

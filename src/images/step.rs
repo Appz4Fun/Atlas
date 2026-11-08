@@ -194,6 +194,8 @@ pub fn same_pictures(conn: &rusqlite::Connection, release_id: i64, limit: usize)
             }
         }
     }
+    // the strongest tie first, each kept in the order found
+    found.sort_by_key(|&(_, _, tie)| tie as u8);
     found.truncate(limit);
     found
 }
@@ -234,6 +236,17 @@ pub fn containers(files: &[FileInfo]) -> Vec<&FileInfo> {
         .filter(|f| (1..=MAX_CONTAINER_PARTS as i64).contains(&f.expected.unwrap_or(0).max(f.parts_seen)))
         .take(2)
         .collect()
+}
+
+/// Document ids that say nothing of one picture: empty uuids and the default some editors write on every file.
+const SHARED_DOCUMENT_IDS: [&str; 2] = ["faf5bdd5-ba3d-11da-ad31-d33d75182f1b", "00000000-0000-0000-0000-000000000000"];
+
+fn is_telling_document_id(id: &str) -> bool {
+    let lower = id.to_ascii_lowercase();
+    let bare = lower.rsplit(':').next().unwrap_or(&lower);
+    bare.chars().filter(char::is_ascii_alphanumeric).count() >= 16
+        && bare.chars().any(|c| c.is_ascii_alphanumeric() && c != '0')
+        && !SHARED_DOCUMENT_IDS.contains(&bare)
 }
 
 /// What's kept of one picture read: its row's values after the release id and position.
@@ -296,6 +309,10 @@ impl Step for ImagesStep {
         let mut writes = vec![StepWrite::new(DROP_IMAGES, vec![release_id.into()])];
         let mut kept = 0i64;
         let mut row = |name: &str, body: &[u8], writes: &mut Vec<StepWrite>| {
+            // checked before it's kept: a file named .jpg that isn't a picture never reaches the folder
+            if sniff(body).is_none() {
+                return;
+            }
             let Some(sha256) = keep(body) else { return };
             let Some(values) = row_values(name, body, &sha256) else { return };
             let mut params = vec![release_id.into(), kept.into()];
@@ -358,6 +375,14 @@ mod tests {
         assert_eq!(names, ["00-thumbnail.jpg", "a-shot.jpg", "b-shot.png"]);
         let many: Vec<FileInfo> = (0..20).map(|i| file(&format!("{i:03}.jpg"), 1)).collect();
         assert_eq!(picked(&many).len(), MAX_IMAGES);
+    }
+
+    #[test]
+    fn shared_document_ids_tie_nothing() {
+        assert!(is_telling_document_id("xmp.did:8a1f3c2e-55b0-4c6d-9e71-0b2d4f6a8c13"));
+        assert!(!is_telling_document_id("uuid:faf5bdd5-ba3d-11da-ad31-d33d75182f1b"));
+        assert!(!is_telling_document_id("uuid:00000000-0000-0000-0000-000000000000"));
+        assert!(!is_telling_document_id("xmp.did:1"));
     }
 
     #[test]

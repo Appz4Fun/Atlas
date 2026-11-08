@@ -100,6 +100,7 @@ pub fn read(bytes: &[u8]) -> Option<JpegInfo> {
     let mut tables: BTreeMap<u8, [u16; 64]> = BTreeMap::new();
     let mut icc_chunks: BTreeMap<u8, &[u8]> = BTreeMap::new();
     let mut framed = false;
+    let mut scan_at = None;
     let mut at = 2;
     while at + 4 <= bytes.len() {
         if bytes[at] != 0xFF {
@@ -150,7 +151,10 @@ pub fn read(bytes: &[u8]) -> Option<JpegInfo> {
             0xEE if body.starts_with(b"Adobe") && body.len() >= 12 => info.adobe_transform = Some(body[11]),
             0xFE if info.comment.is_none() => info.comment = text(body),
             // the first scan: what follows is coded data, and every header that matters came before it
-            0xDA => break,
+            0xDA => {
+                scan_at = Some(at);
+                break;
+            }
             _ => {}
         }
         if end == bytes.len() && at + 2 + len > bytes.len() {
@@ -166,7 +170,7 @@ pub fn read(bytes: &[u8]) -> Option<JpegInfo> {
         info.icc = icc_description(&profile);
     }
     quality(&tables, &mut info);
-    info.after_end = after_end(bytes);
+    info.after_end = scan_at.map_or(0, |scan| after_end(&bytes[scan..]));
     Some(info)
 }
 
@@ -549,7 +553,8 @@ fn icc_description(profile: &[u8]) -> Option<String> {
     None
 }
 
-/// Bytes after the last EOI. A file with none at all (cut short) has nothing after its end.
+/// Bytes after the last EOI past the first scan. A file with none there (cut short) has nothing after its end, even
+/// when an EXIF preview's EOI sits in its headers.
 fn after_end(bytes: &[u8]) -> usize {
     bytes.windows(2).rposition(|w| w == [0xFF, 0xD9]).map_or(0, |at| bytes.len() - at - 2)
 }
@@ -748,6 +753,18 @@ mod tests {
         assert_eq!(info.icc.as_deref(), Some("sRGB IEC61966-2.1"));
         assert_eq!(info.adobe_transform, Some(1));
         assert_eq!(info.after_end, 13);
+    }
+
+    #[test]
+    fn a_previews_end_in_the_headers_is_not_the_files() {
+        let mut app1 = b"Exif\0\0".to_vec();
+        app1.extend(tiff());
+        app1.extend([0xFF, 0xD9]);
+        let whole = with(&[(0xE1, app1)], b"");
+        // cut short in its coded data: the only EOI left is the preview's, in the headers
+        let cut = &whole[..whole.len() - 40];
+        assert_eq!(read(cut).unwrap().after_end, 0);
+        assert_eq!(read(&whole).unwrap().after_end, 0);
     }
 
     #[test]
