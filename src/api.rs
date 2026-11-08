@@ -1083,6 +1083,7 @@ mod tests {
                 complete: false,
                 lead: None,
                 recovery: Vec::new(),
+                beside: Vec::new(),
             })
         };
         // the post of rows 1, 2 and 4 stands as row 4, its highest id; row 3 is a post of its own
