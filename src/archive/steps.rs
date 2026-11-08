@@ -1213,6 +1213,51 @@ fn part_of(
     Ok(body)
 }
 
+/// A file split over RAR volumes has its whole CRC32 only in the last volume's header: the first volume's is its own
+/// part's. When the listing has such a file, its set's last volume's first article is read (its start, within the
+/// budget) and the CRC of each file it closes, the same name and size, is taken: the file key a split film has no
+/// other way to. Encrypted headers are read with the password the listing was read with, or not at all.
+fn last_volume_crcs(
+    ctx: &mut StepCtx<'_>,
+    head: &Head<'_>,
+    listing: &mut Listing,
+    password: Option<&str>,
+    left: &mut usize,
+) -> Result<(), StepError> {
+    let open = |f: &InnerFile| f.crc32.is_none() && f.size.is_some_and(|s| s > 0);
+    if head.probe || head.tail.id == head.file.id || *left == 0 || !listing.files.iter().any(open) {
+        return Ok(());
+    }
+    if listing.headers_encrypted && password.is_none() {
+        return Ok(());
+    }
+    // an extra the listing doesn't depend on: only a stop ends the step, any other error leaves the CRC unknown
+    let Some(seg) = first_article(ctx, head.tail).or_else(optional)? else { return Ok(()) };
+    *left -= 1;
+    let Some(body) = fetch_start(ctx, &seg, &head.tail.filename).or_else(optional)? else { return Ok(()) };
+    if !matches!(identify(&body), Format::Rar4 | Format::Rar5) {
+        return Ok(());
+    }
+    let last = if listing.headers_encrypted { rar::list_with_password(&body, password) } else { rar::list(&body) };
+    close_split_files(listing, &last);
+    Ok(())
+}
+
+/// An optional read's error as nothing read, unless it is a stop.
+fn optional<T>(e: StepError) -> Result<Option<T>, StepError> {
+    if matches!(e, StepError::Stopped) { Err(e) } else { Ok(None) }
+}
+
+/// Each file of `listing` with no CRC takes the one `last` (its set's last volume, read from its start) gives the
+/// file of the same name and size.
+pub(super) fn close_split_files(listing: &mut Listing, last: &Listing) {
+    for f in listing.files.iter_mut().filter(|f| f.crc32.is_none()) {
+        if let Some(t) = last.files.iter().find(|t| t.crc32.is_some() && t.name == f.name && t.size == f.size) {
+            f.crc32 = t.crc32;
+        }
+    }
+}
+
 /// 7z's header may be at its end, in up to its set's last two articles.
 fn seven_list(
     ctx: &mut StepCtx<'_>,
@@ -1404,6 +1449,7 @@ impl Step for ListStep {
                             }
                         }
                     }
+                    last_volume_crcs(ctx, &head, &mut listing, pw_found.as_deref(), &mut left)?;
                     let wrapper_encrypted = listing.encrypted;
                     let has_inner_nzb = listing.files.iter().any(|f| select::classify(&f.name) == Kind::Nzb);
                     let pw_available = pw_found.is_some();
