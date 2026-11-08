@@ -85,6 +85,8 @@ pub struct ReleaseInfo {
     pub file_total: Option<i64>,
     pub is_obfuscated: bool,
     pub name_source: Option<i64>,
+    /// a movie or series, when the release was saved from a Spotnet spot that says so (`spotnet::store::SPOTS`)
+    pub spot_kind: Option<crate::spotnet::Kind>,
 }
 
 /// What a step gets for one release.

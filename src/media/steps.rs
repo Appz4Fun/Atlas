@@ -146,6 +146,15 @@ fn name_of(r: &ReleaseInfo) -> &str {
 }
 
 fn target_of(media: &Media, r: &ReleaseInfo) -> Option<(Kind, Parsed)> {
+    // a spot's title is what its spotter typed, which the name rules often don't read as a movie or show: the
+    // spotter's kind says which it is (`spotnet::category`)
+    if let Some(kind) = r.spot_kind {
+        let category = match kind {
+            crate::spotnet::Kind::Movie => 2000,
+            crate::spotnet::Kind::Series => 5000,
+        };
+        return media_target(category, "spot_kind", name_of(r));
+    }
     let d: Decision = category::classify_release(r, &media.category_options());
     media_target(d.category, d.rule, name_of(r))
 }
@@ -440,6 +449,23 @@ impl Step for MediaNfo {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn a_spots_kind_gives_its_title_to_look_up() {
+        // a name the category rules don't read as a movie: the spot says it is one
+        let media = Media::new(Path::new("/nowhere/atlas.db"));
+        let r = ReleaseInfo {
+            name: "01. The Matrix (1999) 4k UHD Rife 60fps AI-Enhanced Dolby True-HD Atmos".into(),
+            group: "alt.binaries.boneless".into(),
+            poster: Some("yEncBin@Poster.com (FrameMaster)".into()),
+            ..Default::default()
+        };
+        assert!(target_of(&media, &r).is_none(), "no movie by its name alone");
+        let spot = ReleaseInfo { spot_kind: Some(crate::spotnet::Kind::Movie), ..r };
+        let (kind, p) = target_of(&media, &spot).unwrap();
+        assert_eq!((kind, p.title.as_str(), p.year), (Kind::Movie, "The Matrix", Some(1999)));
+        assert_eq!(MediaLookup(media.clone()).skip_reason(&spot), None);
+    }
 
     #[test]
     fn each_step_has_its_lane() {

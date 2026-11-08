@@ -238,7 +238,13 @@ pub fn parse_tv(name: &str) -> Option<Parsed> {
     })
 }
 
+/// A number a list puts before a title: `01. The Matrix (1999)`, `3 - Alien (1979)`, `12) Heat (1995)`. Only with
+/// a space after it, so `21.Jump.Street.2012` and `1917 (2019)` keep their numbers.
+static LIST_NUMBER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*\d{1,3}\s*(?:[.)]|\s-)\s+").unwrap());
+
 pub fn parse_movie(name: &str) -> Option<Parsed> {
+    let name = LIST_NUMBER.replace(name, "");
+    let name = name.as_ref();
     let spaced = SPACES.replace_all(&name.replace(['.', '_'], " "), " ").into_owned();
     let (raw, year): (String, Option<i32>) = if let Some(c) = M1.captures(&spaced) {
         (c[1].to_string(), c[2].parse().ok())
@@ -367,6 +373,29 @@ mod tests {
             }
         }
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    #[test]
+    fn a_list_number_before_the_title_goes() {
+        // spot titles from a numbered series (spot K6rspFvcMg49TvvagOSea@spot.net and its sequels)
+        for (name, title, year) in [
+            ("01. The Matrix (1999) 4k UHD Rife 60fps AI-Enhanced Dolby True-HD Atmos", "The Matrix", Some(1999)),
+            (
+                "02. The Matrix Reloaded (2006) 4k UHD Rife 60fps AI-Enhanced Dolby True-HD Atmos",
+                "The Matrix Reloaded",
+                Some(2006),
+            ),
+            ("3 - Alien (1979) 1080p", "Alien", Some(1979)),
+            ("12) Heat (1995) 1080p", "Heat", Some(1995)),
+            // a number that is the title, or sits in a dotted name, stays
+            ("21.Jump.Street.2012.1080p.BluRay.x264-GRP", "21 Jump Street", Some(2012)),
+            ("1917 (2019) 2160p", "1917", Some(2019)),
+            ("300 (2006) 1080p BluRay", "300", Some(2006)),
+            ("2001 A Space Odyssey (1968) 1080p", "2001 A Space Odyssey", Some(1968)),
+        ] {
+            let got = parse_movie(name).unwrap_or_else(|| panic!("{name}"));
+            assert_eq!((got.title.as_str(), got.year), (title, year), "{name}");
+        }
     }
 
     #[test]
