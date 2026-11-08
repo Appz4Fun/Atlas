@@ -68,7 +68,7 @@ Against the targets in the brief:
 
 ## Format notes
 
-- The header's last 8 bytes (56..64) hold `cold_prefix_bytes` and `hot_block_bytes`. The section table's `encoding_flags` of sections 0 and 15 hold the low and high words of the xxh3 hash of the hot body; the header CRC covers the table, so it covers that hash. `verify_body()` checks a hot body, and decompressing a cold one checks it.
+- The header's last 8 bytes (56..64) hold `cold_prefix_bytes` and `hot_block_bytes`. The section table's `encoding_flags` of sections 0 and 15 hold the low and high words of the xxh3 hash of everything after the section table (checkpoints, filter and body); the header CRC covers the table, so it covers that hash. `verify_body()` checks a hot block, and decompressing a cold one checks it.
 - A checkpoint is 64 bytes: `base_art_num`, `base_timestamp`, `base_xref_slot1` (i64), `base_bytes`, `base_lines` (i32), `base_subj_nums` (5 x i32), `base_xref_slot0_delta` (i32), `varint_byte_offset`, `refs_byte_offset` (u32). The i64s come first for alignment, and the references stream gets its own offset.
 - PadMask bit 15 marks a literal row, kept whole in the literal dictionary.
 - `min_timestamp` and `max_timestamp` cover structured rows only; a block with none stores 0 for both.

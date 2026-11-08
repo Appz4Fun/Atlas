@@ -1,3 +1,4 @@
+use nntp_xover_engine::container::DATA_START;
 use nntp_xover_engine::container::msgid_field_pub as msgid_field;
 use nntp_xover_engine::corpus::{Rng, generate};
 use nntp_xover_engine::*;
@@ -284,4 +285,15 @@ fn blocks_with_the_same_layout_but_different_bytes_dont_share_a_cache() {
     tampered[at] ^= 1;
     let t = AlignedBytes::from_slice(&tampered);
     assert!(!NxvBlockView::from_mmap_slice(&t).unwrap().verify_body());
+    // and so does a changed checkpoint or filter byte
+    for at in [DATA_START + 3, va.sections[SectionId::MsgIdXor8 as usize].offset as usize + 20] {
+        let mut t = ba.to_vec();
+        t[at] ^= 1;
+        let t = AlignedBytes::from_slice(&t);
+        assert!(!NxvBlockView::from_mmap_slice(&t).unwrap().verify_body(), "byte {at}");
+        let cold = compress_block_to_cold(&ba, 3).unwrap();
+        let mut c = cold.clone();
+        c[at] ^= 1;
+        assert!(decompress_cold_block(&c).is_err(), "cold byte {at}");
+    }
 }
