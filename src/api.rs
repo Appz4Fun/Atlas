@@ -369,7 +369,10 @@ fn search(q: &str, args: &HashMap<String, String>, base: &str, api_key: &str) ->
     });
 
     match found {
-        Ok((listed, frozen_categories)) => {
+        Ok((mut listed, frozen_categories)) => {
+            if !deep {
+                listed.total = match_count(q, filter.as_ref());
+            }
             let ids: Vec<i64> = listed.rows.iter().map(|release| release.id).collect();
             let mut categories = crate::category::categories_of(&ids).unwrap_or_else(|e| {
                 eprintln!("api categories failed: {e}");
@@ -384,6 +387,22 @@ fn search(q: &str, args: &HashMap<String, String>, base: &str, api_key: &str) ->
             eprintln!("api search failed: {e}");
             ApiResponse::error(900, "Search failed")
         }
+    }
+}
+
+/// How many releases match a search, for Newznab's `total`: the full count, the same on every page, which clients
+/// page by. Counted the way the search finds them, incomplete ones too, soo it can be more than paging reaches. None
+/// where there's no count to be had cheaply (a category filter without the word index): `total` is then what was
+/// listed up to this page, as before.
+fn match_count(q: &str, filter: Option<&crate::category::CatFilter>) -> Option<i64> {
+    if crate::word_index::searchable(q)
+        && let Some(index) = crate::word_index::ready()
+    {
+        return index.count(q, filter, &[]).ok().and_then(|n| i64::try_from(n).ok());
+    }
+    match filter {
+        None if !q.trim().is_empty() => crate::search::count_all_releases(q).ok(),
+        _ => None,
     }
 }
 
@@ -465,6 +484,8 @@ struct Listed {
     repair: Vec<bool>,
     /// rows the search gave, listed or not: none means nothing matched at all
     read: usize,
+    /// how many match in all, every page alike (Newznab's `total`), where the search can count them
+    total: Option<i64>,
 }
 
 impl Listed {
@@ -475,7 +496,7 @@ impl Listed {
             .collect();
         let (complete, repair) =
             rows.iter().zip(&posts).map(|(r, post)| listed_complete(conn, r, post.as_ref())).unzip();
-        Listed { read: rows.len(), rows, posts, complete, repair }
+        Listed { read: rows.len(), rows, posts, complete, repair, total: None }
     }
 }
 
@@ -582,7 +603,9 @@ fn rss_listed(
     media: &HashMap<i64, crate::media::query::MediaAttrs>,
     on: &crate::media::query::IdParams,
 ) -> ApiResponse {
-    let Listed { rows: releases, posts: wholes, complete, repair, .. } = listed;
+    let Listed { rows: releases, posts: wholes, complete, repair, total, .. } = listed;
+    // never less than this page reaches
+    let total = total.unwrap_or(0).max(offset + releases.len() as i64);
     let releases = &releases[..];
     let ids: Vec<i64> = releases.iter().map(|r| r.id).collect();
     let copies = crate::duplicates::counts(&ids).unwrap_or_default();
@@ -640,7 +663,7 @@ fn rss_listed(
     </channel>
 </rss>"#,
         escape(base),
-        offset + releases.len() as i64,
+        total,
     );
 
     ApiResponse::xml(200, xml)
@@ -1223,8 +1246,14 @@ mod tests {
     #[test]
     fn rss_flags_an_incomplete_release() {
         let rows = rows_every(2, 2);
-        let listed =
-            Listed { rows, posts: vec![None, None], complete: vec![false, true], repair: vec![false, false], read: 2 };
+        let listed = Listed {
+            rows,
+            posts: vec![None, None],
+            complete: vec![false, true],
+            repair: vec![false, false],
+            read: 2,
+            total: None,
+        };
         let body = rss_listed(
             "http://x",
             "k",
@@ -1250,6 +1279,7 @@ mod tests {
             complete: vec![true, true],
             repair: vec![true, false],
             read: 2,
+            total: None,
         };
         let body = rss_listed(
             "http://x",
