@@ -743,12 +743,36 @@ pub fn restore(conn: &Connection, schema: &str, p: &Payload, how: Domains) -> Re
     let mut domain_of: HashMap<i64, i64> = HashMap::new();
     // Keep: what the payload's ids are moved on by, 0 unless one of them is another suffix's here
     let mut base = 0i64;
+    let suffix_at = |id: i64| -> Result<Option<String>> {
+        conn.prepare_cached(&format!("select suffix from {schema}.domains where id = ?1"))?
+            .query_row([id], |r| r.get(0))
+            .optional()
+    };
+    // Map: the base the payload's ids already read right on from here, when they do, soo its blobs needn't be
+    // decoded (a sealed-log place fetched) to be renumbered: 0 for a payload frozen since the shards were folded
+    // into one, `shard << 32` for one frozen in a folded shard before (`merge_shards` keeps its domains there)
+    let reads_same = |base: i64| -> Result<bool> {
+        for (old, suffix) in &p.domains {
+            if suffix_at(old + base)?.as_deref() != Some(suffix.as_str()) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    };
+    let mut kept_base: Option<i64> = None;
+    if how == Domains::Map {
+        let release_id = p
+            .table("releases")
+            .and_then(|r| r.rows.first().and_then(|row| int(r.column("id").map(|c| &row[c]))))
+            .unwrap_or(0);
+        let shard = release_id.rem_euclid(crate::merge_shards::LEGACY_SHARDS as i64);
+        if reads_same(0)? {
+            kept_base = Some(0);
+        } else if shard != 0 && reads_same(shard << 32)? {
+            kept_base = Some(shard << 32);
+        }
+    }
     if how == Domains::Keep {
-        let suffix_at = |id: i64| -> Result<Option<String>> {
-            conn.prepare_cached(&format!("select suffix from {schema}.domains where id = ?1"))?
-                .query_row([id], |r| r.get(0))
-                .optional()
-        };
         let fits = |base: i64| -> Result<bool> {
             for (old, suffix) in &p.domains {
                 if suffix_at(old + base)?.is_some_and(|there| &there != suffix) {
@@ -801,6 +825,14 @@ pub fn restore(conn: &Connection, schema: &str, p: &Payload, how: Domains) -> Re
             "insert",
             &["id"],
             &mut |c, v| match (c, v) {
+                ("blob", Value::Blob(b)) if how == Domains::Map && !same_domains && kept_base == Some(0) => {
+                    Ok(Value::Blob(b))
+                }
+                ("blob", Value::Blob(b)) if how == Domains::Map && !same_domains && kept_base.is_some() => {
+                    crate::blob::remap_blob(&b, kept_base.unwrap_or(0), &domain_of)
+                        .map(Value::Blob)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+                }
                 ("blob", Value::Blob(b)) if how == Domains::Map && !same_domains => {
                     let mut segs =
                         crate::blob::decode(&b).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;

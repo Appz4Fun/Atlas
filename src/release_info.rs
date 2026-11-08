@@ -446,11 +446,14 @@ fn sort_groups(out: &mut [GroupPosting]) {
     out.sort_by(|a, b| b.articles.cmp(&a.articles).then_with(|| a.group.cmp(&b.group)));
 }
 
+/// The most rows of one name a lookup reads: what eight shards' lookups of 64 each read together, before one shard.
+const NAME_ROWS: usize = 64 * crate::merge_shards::LEGACY_SHARDS;
+
 pub fn groups_of_with(conn: &Connection, name: &str) -> Result<Vec<GroupPosting>> {
     let mut out = Vec::new();
     for s in 0..store::SHARDS {
         let mut stmt = conn.prepare_cached(&format!(
-            "select group_name, coalesce(parts, 0), id from s{s}.releases where name = ?1 limit 64"
+            "select group_name, coalesce(parts, 0), id from s{s}.releases where name = ?1 limit {NAME_ROWS}"
         ))?;
         let rows = stmt.query_map([name], |r| {
             Ok(GroupPosting {
@@ -838,7 +841,7 @@ fn catalog_named(
             )
         })
         .collect();
-    Ok(Some((first_per_shard(same, 64), first_per_shard(all, 64))))
+    Ok(Some((first_per_shard(same, NAME_ROWS), first_per_shard(all, NAME_ROWS))))
 }
 
 fn exact_split_post(
@@ -1177,7 +1180,7 @@ fn try_stem_subset(conn: &Connection, stem: &str, subset: &[StemCandidate]) -> R
 fn split_post_sql(s: usize) -> String {
     format!(
         "select id, group_name, coalesce(size, 0), julianday(posted_date), poster from s{s}.releases
-         where name = ?1 and +poster is ?2 and not atlas_blocked(group_name) limit 64"
+         where name = ?1 and +poster is ?2 and not atlas_blocked(group_name) limit {NAME_ROWS}"
     )
 }
 
@@ -1185,7 +1188,7 @@ fn split_post_sql(s: usize) -> String {
 fn named_rows_sql(s: usize) -> String {
     format!(
         "select id, group_name, coalesce(size, 0), julianday(posted_date), poster from s{s}.releases
-         where name = ?1 and not atlas_blocked(group_name) limit 64"
+         where name = ?1 and not atlas_blocked(group_name) limit {NAME_ROWS}"
     )
 }
 
