@@ -396,10 +396,22 @@ fn row_order(
 /// How far back "Hide copies" looks for what a page's copies are copies of.
 const MAX_EARLIER_FOR_COPIES: i64 = 2_000;
 
-/// The quick filters over results. Each but the last keeps the results whose name's tags say so, among the first
+/// The quick filters over results. Each but the last two keeps the results whose name's tags say so, among the first
 /// `SORT_WINDOW`: searching the index for each way a tag is written was three or four full searches a click.
-const FILTERS: &[&str] = &["2160p", "1080p", "DV", "HDR", "Remux", "WEB-DL", "BluRay", HIDE_COPIES];
+const FILTERS: &[&str] = &["2160p", "1080p", "DV", "HDR", "Remux", "WEB-DL", "BluRay", HIDE_SPOTS, HIDE_COPIES];
 const HIDE_COPIES: &str = "Hide copies";
+/// Leaves out the rows tagged SPOT: releases saved from a Spotnet spot.
+const HIDE_SPOTS: &str = "Hide spots";
+
+/// Whether a filter goes by the tags read from a name, not by what else is known of a row.
+fn is_tag_filter(filter: &str) -> bool {
+    filter != HIDE_COPIES && filter != HIDE_SPOTS
+}
+
+/// The ids among these that the results tag SPOT (`spots_of`, which leaves out removed spots).
+fn spot_ids(ids: &[i64]) -> HashSet<i64> {
+    crate::spotnet::store::spots_of(ids).map(|spots| spots.into_keys().collect()).unwrap_or_default()
+}
 
 /// How many names have their tags read at once, before checking whether the page is full.
 const TAG_SLICE: usize = 128;
@@ -521,9 +533,14 @@ impl Search {
         self.query_with(cat, offset, &self.filters)
     }
 
-    /// Whether a filter other than "Hide copies" is on: those go by the tags of the results.
+    /// Whether a filter other than "Hide copies" or "Hide spots" is on: those go by the tags of the results.
     fn filters_by_tags(&self) -> bool {
-        self.filters.iter().any(|f| *f != HIDE_COPIES)
+        self.filters.iter().any(|f| is_tag_filter(f))
+    }
+
+    /// Whether rows tagged SPOT are left out. Like incomplete ones, by the row each shows once its post is folded in.
+    fn hides_spots(&self) -> bool {
+        self.filters.contains(&HIDE_SPOTS)
     }
 
     /// Whether the page is cut from the first `SORT_WINDOW` results, sorted or filtered, instead of read by offset.
@@ -616,7 +633,7 @@ impl Search {
 
     /// The tag filters on, as the word index has them.
     fn tag_filters(&self) -> Vec<&'static str> {
-        self.filters.iter().copied().filter(|f| *f != HIDE_COPIES).collect()
+        self.filters.iter().copied().filter(|f| is_tag_filter(f)).collect()
     }
 
     /// The search itself: one, whatever the filters.
@@ -817,16 +834,25 @@ impl Search {
             })
             .filter(|r| !self.hides(r))
             .collect();
+        let mut spots_left_out = false;
+        if self.hides_spots() {
+            let spots = spot_ids(&found.iter().map(|r| r.id).collect::<Vec<_>>());
+            let before = found.len();
+            found.retain(|r| !spots.contains(&r.id));
+            spots_left_out = found.len() < before;
+        }
         if self.min_score.is_some() {
             let scores = post_scores(&found, &split);
             found.retain(|r| !self.rated_out(r.id, &scores));
         }
-        if found.is_empty() && (self.hide_incomplete || self.min_score.is_some()) {
-            // every row of this page was incomplete: there may be complete ones further on
-            let what = match (self.hide_incomplete, self.min_score.is_some()) {
-                (true, true) => "complete and rated that high",
-                (true, false) => "complete",
-                _ => "rated that high",
+        if found.is_empty() && (self.hide_incomplete || self.min_score.is_some() || self.hides_spots()) {
+            // every row of this page was left out: there may be others further on
+            let what = match (self.hide_incomplete, self.min_score.is_some(), spots_left_out) {
+                (true, true, false) => "complete and rated that high",
+                (true, false, false) => "complete",
+                (false, true, false) => "rated that high",
+                (false, false, true) => "but spots",
+                _ => "left to show",
             };
             let note = format!(
                 "<tr><td colspan=\"{COLUMNS}\" class=\"note dim\">Nothing {what} in these {PAGE_SIZE}.</td></tr>"
@@ -847,6 +873,11 @@ impl Search {
                     self.fold_split_post(conn.as_ref(), r, &mut HashMap::new());
                     !self.hides(r)
                 });
+            }
+            // nor does a spot left out
+            if self.hides_spots() {
+                let spots = spot_ids(&before.iter().map(|r| r.id).collect::<Vec<_>>());
+                before.retain(|r| !spots.contains(&r.id));
             }
             // nor does one the rating chips leave out
             if self.min_score.is_some() {
@@ -955,7 +986,7 @@ impl Search {
     /// Hiding incomplete releases goes by the whole post each row stands for, which only rendering a row works out,
     /// soo those pages come from a window too, in the search's own order when there's no sort.
     fn sorts_from_a_window(&self) -> bool {
-        (self.sort.is_some() || self.hide_incomplete || self.min_score.is_some())
+        (self.sort.is_some() || self.hide_incomplete || self.hides_spots() || self.min_score.is_some())
             && !self.filters.contains(&HIDE_COPIES)
     }
 
@@ -1032,6 +1063,14 @@ impl Search {
                 "Incomplete releases are hidden. <a href=\"/?{shown}\" hx-get=\"/ui/results?{shown}\" hx-target=\"#results\">Show them</a>. "
             );
         }
+        if self.hides_spots() {
+            let filters: Vec<&'static str> = self.filters.iter().copied().filter(|f| *f != HIDE_SPOTS).collect();
+            let shown = attr(&Search { offset: 0, filters, ..self.clone() }.query(&self.cat, 0));
+            let _ = write!(
+                hint,
+                "Spots are hidden. <a href=\"/?{shown}\" hx-get=\"/ui/results?{shown}\" hx-target=\"#results\">Show them</a>. "
+            );
+        }
         if self.min_score.is_some() {
             let all = attr(&Search { offset: 0, min_score: None, ..self.clone() }.query(&self.cat, 0));
             let _ = write!(
@@ -1077,6 +1116,7 @@ impl Search {
             None => "Best or newest matches first".to_string(),
         };
         let sort = if self.hide_incomplete { format!("{sort}, incomplete hidden") } else { sort };
+        let sort = if self.hides_spots() { format!("{sort}, spots hidden") } else { sort };
         let sort = match self.min_score {
             Some(min) => format!("{sort}, rated {}+ only", min / 10),
             None => sort,
@@ -1150,6 +1190,9 @@ impl Search {
         }
         if self.hide_incomplete {
             left_out.push("incomplete releases");
+        }
+        if self.hides_spots() {
+            left_out.push("spots");
         }
         if self.min_score.is_some() {
             left_out.push("releases rated lower or not rated");
@@ -1442,6 +1485,20 @@ impl Window {
                 Some(_) => done.push((place, left_out(&r))),
             }
         }
+        // a row tagged SPOT, by the row it shows: left out like a folded row
+        if search.hides_spots() {
+            let spots = spot_ids(&kept.iter().map(|r| r.id).collect::<Vec<_>>());
+            let (mut keep_places, mut keep_rows) = (Vec::with_capacity(kept.len()), Vec::with_capacity(kept.len()));
+            for (place, r) in places.into_iter().zip(kept) {
+                if spots.contains(&r.id) {
+                    done.push((place, left_out(&r)));
+                } else {
+                    keep_places.push(place);
+                    keep_rows.push(r);
+                }
+            }
+            (places, kept) = (keep_places, keep_rows);
+        }
         // by the row each place shows, which for a post brought in isn't the window's own row; only for a chip
         let scores = search.min_score.map(|_| post_scores(&kept, &split));
         let posts: Vec<Vec<i64>> =
@@ -1488,7 +1545,7 @@ impl Window {
         let skip = usize::try_from(search.offset).unwrap_or(0);
         let wanted = PAGE_SIZE as usize + 1;
         // hiding incomplete ones, a page can pass many rows it leaves out: they're rendered several pages at a time
-        let batch = if search.hide_incomplete || search.min_score.is_some() {
+        let batch = if search.hide_incomplete || search.hides_spots() || search.min_score.is_some() {
             PAGE_SIZE as usize * FILL_THREADS
         } else {
             PAGE_SIZE as usize
@@ -2368,10 +2425,14 @@ fn frozen_section(search: &Search) -> String {
     };
     // tags are read from each name: a wider window, soo the newest ones that have them still come to the limit
     let tags = search.tag_filters();
-    let window = if tags.is_empty() { FROZEN_LISTED } else { FROZEN_LISTED * 20 };
+    // as do spots, left out once read
+    let window = if tags.is_empty() && !search.hides_spots() { FROZEN_LISTED } else { FROZEN_LISTED * 20 };
     let filter = parse_filter(&search.cat);
     let found = crate::frozen::search(&crate::paths::database(), &search.q, filter.as_ref(), &narrow, window);
+    // the read came back full: there may be older ones, whatever the filters left of it
+    let mut full = false;
     let hits = match found.map(|hits| {
+        full = hits.len() >= window;
         let mut hits: Vec<_> = hits
             .into_iter()
             .filter(|h| {
@@ -2379,6 +2440,10 @@ fn frozen_section(search: &Search) -> String {
                 tags.iter().all(|t| filter_matches(t, &parsed))
             })
             .collect();
+        if search.hides_spots() {
+            let spots = spot_ids(&hits.iter().map(|h| h.row.id).collect::<Vec<_>>());
+            hits.retain(|h| !spots.contains(&h.row.id));
+        }
         hits.truncate(FROZEN_LISTED);
         hits
     }) {
@@ -2406,8 +2471,9 @@ fn frozen_section(search: &Search) -> String {
         );
     }
     let note = match hits.len() {
+        0 if full => format!("None of the newest {window} match; a narrower search finds older ones."),
         0 => "None match.".to_string(),
-        n if n >= FROZEN_LISTED => format!("The newest {n}; a narrower search finds older ones."),
+        n if n >= FROZEN_LISTED || full => format!("The newest {n}; a narrower search finds older ones."),
         n => format!("{n} set aside, out of the default search."),
     };
     let table = if hits.is_empty() {
@@ -5714,6 +5780,26 @@ mod tests {
         assert_eq!(w.shown_count(&search("q=x")), Some(3), "kept per window and chip");
         let unfilled = window_of_rows(vec![row(1)]);
         assert_eq!(unfilled.shown_count(&search("q=x")), None, "not counted before the fill; waits, then gives up");
+    }
+
+    #[test]
+    fn hiding_spots_is_a_chip_that_pages_from_a_window() {
+        let s = Search::from_args(&parse_query("q=x&filters=Hide%20spots"));
+        assert!(s.hides_spots() && s.sorts_from_a_window(), "a page needs its rows rendered to know");
+        assert!(!s.filters_by_tags() && s.tag_filters().is_empty(), "spots aren't read from a name's tags");
+        assert_eq!(s.query("", 0), "q=x&filters=Hide%20spots");
+        assert!(s.filter_links().contains("aria-current=\"true\">Hide spots<"));
+        assert!(s.nothing_found().contains("Spots are hidden. <a href=\"/?q=x\""), "an empty page says why");
+        let off = Search::from_args(&parse_query("q=x"));
+        assert!(!off.hides_spots());
+        assert!(
+            off.filter_links().contains(">Hide spots<")
+                && !off.filter_links().contains("aria-current=\"true\">Hide spots<")
+        );
+        let both = Search::from_args(&parse_query("q=x&filters=1080p,Hide%20spots"));
+        assert_eq!(both.tag_filters(), vec!["1080p"]);
+        let with_copies = Search::from_args(&parse_query("q=x&filters=Hide%20spots,Hide%20copies"));
+        assert!(with_copies.hides_spots() && !with_copies.sorts_from_a_window(), "copies page a page at a time");
     }
 
     #[test]
