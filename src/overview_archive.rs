@@ -393,14 +393,25 @@ pub struct Stats {
 impl GroupArchive {
     pub fn open(root: &Path, server: &str, group: &str) -> Result<Self> {
         let dir = group_dir(root, server, group);
-        let mut paths: Vec<PathBuf> = segment_files(&dir).into_iter().map(|(_, p)| p).collect();
-        let tail = dir.join(TAIL);
-        if tail.exists() {
-            paths.push(tail);
-        }
+        // the tail first, then the segments: a seal in between moves rows from the tail into segments, and
+        // holding the old tail open means they are seen twice (reads drop the copy) rather than not at all
         let mut files = Vec::new();
-        for p in paths {
-            let f = File::open(&p).with_context(|| format!("opening {}", p.display()))?;
+        let tail = dir.join(TAIL);
+        let tail_file = match File::open(&tail) {
+            Ok(f) => Some(f),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e).with_context(|| format!("opening {}", tail.display())),
+        };
+        let mut opened: Vec<(PathBuf, File)> = Vec::new();
+        for (_, p) in segment_files(&dir) {
+            match File::open(&p) {
+                Ok(f) => opened.push((p, f)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e).with_context(|| format!("opening {}", p.display())),
+            }
+        }
+        opened.extend(tail_file.map(|f| (tail, f)));
+        for (p, f) in opened {
             if f.metadata()?.len() == 0 {
                 continue;
             }
@@ -420,6 +431,7 @@ impl GroupArchive {
         })
     }
 
+    /// Sizes as mapped. While a seal is under way the rows it moves can be counted twice.
     pub fn stats(&self) -> Stats {
         let mut s = Stats { files: self.files.len(), ..Default::default() };
         for v in self.blocks() {
