@@ -1051,6 +1051,9 @@ const RECORD_QUEUE: usize = 32;
 const RECORD_BATCH: usize = 200_000;
 const RECORD_GATHER: Duration = Duration::from_secs(2);
 
+/// How the recorder's thread writes a group's headers (group, headers, when): to the store, or in a test anywhere.
+type WriteHeaders<'a> = dyn FnMut(&str, &[Article], i64) -> Result<()> + 'a;
+
 /// What goes to the recorder's thread: a slice's headers (group, headers, when), or a barrier answered once every
 /// slice queued before it is written (`flush_recorder`).
 enum Queued {
@@ -1078,7 +1081,7 @@ fn recorder() -> &'static std::sync::mpsc::SyncSender<Queued> {
 /// group at a time sorted by message-id, soo the key's B-tree is written in order and many slices share each
 /// transaction, rather than every parse thread taking the store's lock in turn for its own few thousand rows. A
 /// write that fails is said and counted; the slice was saved already.
-fn record_queued(rx: std::sync::mpsc::Receiver<Queued>, write: &mut dyn FnMut(&str, &[Article], i64) -> Result<()>) {
+fn record_queued(rx: std::sync::mpsc::Receiver<Queued>, write: &mut WriteHeaders<'_>) {
     let mut first = match rx.recv() {
         Ok(q) => q,
         Err(_) => return,
