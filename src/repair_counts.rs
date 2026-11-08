@@ -78,6 +78,18 @@ pub fn run(args: &[String]) -> i32 {
         .and_then(|v| v.parse().ok())
         .unwrap_or(20);
     let main = crate::paths::database();
+    // writing counts: held off a compaction, and refused on shards a merge left half done
+    let _held = if apply {
+        match crate::compact::hold_off_compaction(&main) {
+            Ok(held) => Some(held),
+            Err(e) => {
+                println!("{e:#}");
+                return 1;
+            }
+        }
+    } else {
+        None
+    };
     let tally = Tally::default();
     let shown = std::sync::Mutex::new(Vec::new());
     let failed: Vec<String> = std::thread::scope(|scope| {

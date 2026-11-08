@@ -231,12 +231,8 @@ pub fn run_move() -> i32 {
         return 1;
     }
     // held for the whole sweep: a merge or a compaction can't start under it, and it refuses a merge half done
-    let _held = match crate::compact::try_hold_off_compaction(&crate::paths::database()) {
-        Ok(Some(held)) => held,
-        Ok(None) => {
-            println!("the database is being compacted or merged; try again later");
-            return 1;
-        }
+    let _held = match crate::compact::hold_off_compaction(&crate::paths::database()) {
+        Ok(held) => held,
         Err(e) => {
             println!("{e:#}");
             return 1;
