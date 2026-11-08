@@ -22,6 +22,8 @@ struct Kept {
     name: &'static str,
     /// the rows kept, when not all of them
     filter: Option<&'static str>,
+    /// a table its own cap prunes: fewer rows than the last run is no sign of trouble
+    capped: bool,
 }
 
 fn kept() -> Vec<Kept> {
@@ -31,23 +33,24 @@ fn kept() -> Vec<Kept> {
     let raw = crate::raw_store::path_for;
     vec![
         // PreDB titles and where each feed stands (`title_keys` is built from the titles)
-        Kept { db: predb, table: "titles", name: "predb_titles", filter: None },
-        Kept { db: predb, table: "feeds", name: "predb_feeds", filter: None },
-        Kept { db: predb, table: "meta", name: "predb_meta", filter: None },
+        Kept { db: predb, table: "titles", name: "predb_titles", filter: None, capped: false },
+        Kept { db: predb, table: "feeds", name: "predb_feeds", filter: None, capped: false },
+        Kept { db: predb, table: "meta", name: "predb_meta", filter: None, capped: false },
         // the media providers' answers: ids per title, and TMDB's details
-        Kept { db: media, table: "media_titles", name: "media_titles", filter: None },
-        Kept { db: details, table: "details", name: "media_details", filter: None },
-        Kept { db: details, table: "details_lookups", name: "media_details_lookups", filter: None },
+        Kept { db: media, table: "media_titles", name: "media_titles", filter: None, capped: false },
+        Kept { db: details, table: "details", name: "media_details", filter: None, capped: false },
+        Kept { db: details, table: "details_lookups", name: "media_details_lookups", filter: None, capped: false },
         // OpenSubtitles' answers, and the PreDB feeds' pages as fetched
-        Kept { db: raw, table: "raw_opensubtitles", name: "opensubtitles", filter: None },
-        Kept { db: raw, table: "raw_predb_log", name: "predb_pages", filter: None },
-        Kept { db: raw, table: "raw_predb_events", name: "predb_page_events", filter: None },
+        Kept { db: raw, table: "raw_opensubtitles", name: "opensubtitles", filter: None, capped: true },
+        Kept { db: raw, table: "raw_predb_log", name: "predb_pages", filter: None, capped: true },
+        Kept { db: raw, table: "raw_predb_events", name: "predb_page_events", filter: None, capped: true },
         // historical PreDB snapshots, downloaded once and pinned (the rest of the HTTP cache lives 12 hours)
         Kept {
             db: raw,
             table: "raw_http_cache",
             name: "predb_snapshots",
             filter: Some("source in ('nzedb_archive', 'dats_pciso_1998')"),
+            capped: true,
         },
     ]
 }
@@ -184,6 +187,11 @@ fn tally_sql(conn: &Connection, sql: &str, cols: &[Column]) -> Result<Tally> {
             if !fits {
                 bail!("{}: a {v:?} in a {:?} column can't go to Postgres as it is", col.name, col.pg);
             }
+            if let Value::Text(t) = &v
+                && t.contains('\0')
+            {
+                bail!("{}: a text with a zero byte, which Postgres's text refuses", col.name);
+            }
             row.push(v);
         }
         t.add(&row, &mut buf);
@@ -224,6 +232,7 @@ pub struct Copied {
     pub name: String,
     columns: Vec<Column>,
     pub tally: Tally,
+    capped: bool,
 }
 
 /// `keep.db` at `out`, every kept table copied from beside `main` and checked against its source.
@@ -269,7 +278,7 @@ pub fn build(main: &Path, out: &Path, allow_missing: bool) -> Result<Vec<Copied>
         if theirs != ours {
             bail!("{}: the copy differs from {} ({theirs:?} vs {ours:?})", k.name, src.display());
         }
-        copied.push(Copied { name: k.name.into(), columns: cols, tally: ours });
+        copied.push(Copied { name: k.name.into(), columns: cols, tally: ours, capped: k.capped });
     }
     // hand thaws, from every shard, by name and group
     let cols = freeze_exempt_columns();
@@ -297,7 +306,7 @@ pub fn build(main: &Path, out: &Path, allow_missing: bool) -> Result<Vec<Copied>
     if theirs != ours {
         bail!("{FREEZE_EXEMPT}: the copy differs from the shards ({theirs:?} vs {ours:?})");
     }
-    copied.push(Copied { name: FREEZE_EXEMPT.into(), columns: cols, tally: ours });
+    copied.push(Copied { name: FREEZE_EXEMPT.into(), columns: cols, tally: ours, capped: false });
     drop(conn);
     std::fs::File::open(out)?.sync_all()?;
     Ok(copied)
@@ -325,6 +334,7 @@ pub fn to_postgres(pg: &mut postgres::Client, file: &Path, copied: &[Copied], st
             .map(|r| r.get(0));
         if let Some(before) = there
             && before > c.tally.rows as i64
+            && !c.capped
             && !force
         {
             bail!("{table} held {before} rows and this run has {}: refused (--force to replace it)", c.tally.rows);
@@ -407,7 +417,7 @@ fn pg_tally(tx: &mut postgres::Transaction<'_>, table: &str, cols: &[Column]) ->
     Ok(t)
 }
 
-/// `path` and its directory flushed to disk.
+/// `path` and the directory holding it flushed to disk.
 fn sync(path: &Path) -> Result<()> {
     std::fs::File::open(path)?.sync_all()?;
     if let Some(dir) = path.parent() {
@@ -440,6 +450,11 @@ fn compress(file: &Path) -> Result<PathBuf> {
 pub fn run(args: &[String]) -> i32 {
     let has = |f: &str| args.iter().any(|a| a == f);
     let (apply, allow_missing, force) = (has("--apply"), has("--allow-missing"), has("--force"));
+    if apply && allow_missing {
+        // Postgres would hold the left-out tables from an earlier run beside this one's
+        println!("--allow-missing is for a dry run only: put the missing database back before --apply");
+        return 1;
+    }
     if crate::procs::indexer_alive() {
         println!("stop indexing first: what it writes meanwhile could be missed");
         return 1;
@@ -482,7 +497,10 @@ pub fn run(args: &[String]) -> i32 {
         .map_err(anyhow::Error::from)
         .and_then(|()| sync(&partial.join("manifest.json")))
         .and_then(|()| Ok(std::fs::rename(&partial, &dir)?))
-        .and_then(|()| sync(&dir.join("manifest.json")));
+        .and_then(|()| sync(&dir.join("manifest.json")))
+        // the rename's entry is in keep-export/, and keep-export/'s own in the folder above
+        .and_then(|()| sync(&dir))
+        .and_then(|()| sync(&root));
     if let Err(e) = written {
         println!("couldnt finish {}: {e:#}", dir.display());
         return 1;
@@ -617,7 +635,12 @@ mod tests {
         // fewer rows than the last run: refused, and nothing changed
         let fewer: Vec<Copied> = copied
             .iter()
-            .map(|c| Copied { name: c.name.clone(), columns: c.columns.clone(), tally: Tally { rows: 0, digest: 0 } })
+            .map(|c| Copied {
+                name: c.name.clone(),
+                columns: c.columns.clone(),
+                tally: Tally { rows: 0, digest: 0 },
+                capped: false,
+            })
             .collect();
         let empty = dir.path().join("empty.db");
         let e = Connection::open(&empty).unwrap();
