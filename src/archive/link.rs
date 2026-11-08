@@ -179,9 +179,6 @@ fn id_window(id: i64, cutover: i64, saves: i64) -> (i64, i64) {
 const BESIDE_SECS: i64 = 30 * 60;
 /// Rows checked, at most, for the small files one release's set names.
 const BESIDE_CHECKS: usize = 8;
-/// How long after it was posted a release looks again for small files not found yet: a file of the same upload is
-/// saved within hours of the rest, or by a backfill of the same days.
-const BESIDE_WAIT_DAYS: f64 = 2.0;
 /// How far apart in days an upload's files can say they were posted. Real ones are an hour or two; a slow or resumed
 /// upload a day or two.
 const DAY_WINDOW: f64 = 3.0;
@@ -439,7 +436,8 @@ impl LinkStep {
         ctx.allow_pictures();
         let posted = me.posted_date.clone().unwrap_or_default();
         if let Some((from, to)) = beside_window(&posted, BESIDE_SECS) {
-            'files: for want in missing.clone() {
+            // as many names looked up as rows may be checked: a set of hundreds of small files costs no more
+            'files: for want in missing.clone().into_iter().take(BESIDE_CHECKS) {
                 for candidate in Self::beside_candidates(ctx.conn(), me.id, &want.name, (&from, &to, &posted))? {
                     if checks >= BESIDE_CHECKS {
                         break 'files;
@@ -459,18 +457,11 @@ impl LinkStep {
                 }
             }
         }
-        let fresh = age_days(ctx, &me).is_some_and(|days| days < BESIDE_WAIT_DAYS);
         let now = chrono::Utc::now().timestamp();
-        // one not saved yet may turn up while the release is new; once one is found the run is done, soo the pictures
-        // step's rerun isn't lost to a wait
-        let wait_until = if !found.is_empty() || missing.is_empty() {
-            None
-        } else if out_of_bodies {
-            // the rest goes on soon, whatever the release's age
-            Some(now + RESUME_SECS)
-        } else {
-            fresh.then_some(now + LOOK_AGAIN_SECS)
-        };
+        // only a run cut short by the body budget goes on soon. Nothing waits for a file not saved yet: a wait holds
+        // back the release's later steps, and a row of a post cut across groups misses its siblings' small files for
+        // good. A release that grows is looked at again
+        let wait_until = (out_of_bodies && found.is_empty() && !missing.is_empty()).then_some(now + RESUME_SECS);
         let mut writes: Vec<StepWrite> =
             tried.iter().map(|other| StepWrite::new(TRIED, vec![me.id.into(), (*other).into()])).collect();
         if found.is_empty() {
