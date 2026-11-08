@@ -3384,6 +3384,17 @@ impl Pool {
                         self.xzver_works(&lease.server);
                         ("xzver", Err(e))
                     }
+                    // "400": the server is closing the connection, soo the slice goes again plain on another one
+                    Err(e) if e.code() == Some(400) => {
+                        self.xzver_failed(&lease.server, &e, probing, false);
+                        crate::profile::Load::add_since(&crate::profile::LOAD.xover_ns, sent);
+                        crate::profile::LOAD.xovers.fetch_add(1, Ordering::Relaxed);
+                        let _ = lease.check(Err::<(), _>(e));
+                        lease.collect_traffic();
+                        lease.conn = None;
+                        xzver_allowed = false;
+                        continue;
+                    }
                     // a status line alone, or a listing read to its end that wouldnt decode: the connection takes a
                     // plain XOVER of the slice
                     Err(e @ (NntpError::Reply { .. } | NntpError::Decompress(_))) => {
@@ -5485,6 +5496,18 @@ mod xzver_fallback_tests {
             let pool = pool(port, true);
             assert_eq!(numbers(&pool.xover_on(0, "g", 1, 2).await.unwrap()), [1, 2]);
             assert_eq!(connections.load(Ordering::SeqCst), 3);
+        });
+    }
+
+    /// a "400" to XZVER means the server is closing: the slice is read on another connection
+    #[test]
+    fn a_400_to_xzver_reads_the_slice_on_another_connection() {
+        run(async {
+            let (port, log) = serve(b"400 closing\r\n".to_vec()).await;
+            let pool = pool(port, true);
+            assert_eq!(numbers(&pool.xover_on(0, "g", 1, 2).await.unwrap()), [1, 2]);
+            assert_eq!(count(&log, "AUTHINFO"), 4, "two logins");
+            assert!(matches!(*pool.servers[0].xzver.lock().unwrap(), Xzver::Cooling(_)));
         });
     }
 }
