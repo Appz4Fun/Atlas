@@ -147,6 +147,7 @@ pub const SHARD_TABLES: &[&ShardTable] = &[
     &crate::probe::COVER,
     &crate::probe::opensubtitles::OPENSUBTITLES,
     &crate::probe::stills::STILLS,
+    &crate::images::step::IMAGES,
     &crate::probe::audio_print::AUDIO_PRINTS,
     &crate::probe::audio_print::AUDIO_ANCHORS,
     &crate::predb::step::MATCH,
