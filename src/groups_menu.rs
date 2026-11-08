@@ -56,6 +56,31 @@ fn load_groups(client: &BlockingPool, host: &str, pattern: Option<&str>) -> Resu
     Ok(groups)
 }
 
+/// Search the provider's binary groups using the same cache and filtering as the TUI.
+pub fn search_groups(config: &Config, query: &str) -> Result<Vec<String>, String> {
+    let query = query.trim();
+    if query.chars().count() < 3 {
+        return Err("Search at least 3 characters.".into());
+    }
+    if config.servers.is_empty() {
+        return Err("No Usenet server is configured.".into());
+    }
+    let client = BlockingPool::from_config(config);
+    client.connect().map_err(|e| e.to_string())?;
+    let pattern = format!("*{query}*");
+    let loaded = load_groups(&client, &config.servers_label(), Some(&pattern)).map_err(|e| e.to_string());
+    client.disconnect();
+    Ok(loaded?
+        .into_iter()
+        .filter(|group| {
+            let lower = group.to_lowercase();
+            lower.contains(&query.to_lowercase()) && lower.contains(".binaries.")
+        })
+        .filter(|group| !crate::filters::group_blocked(group))
+        .take(300)
+        .collect())
+}
+
 fn results_page(client: &BlockingPool, groups: &[String]) -> Option<String> {
     let total_pages = groups.len().div_ceil(PAGE_SIZE).max(1);
     let mut page = 0;
