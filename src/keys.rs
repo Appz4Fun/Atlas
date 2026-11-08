@@ -106,12 +106,17 @@ pub const RELEASE_KEYS: ShardTable = ShardTable {
             "release_keys_chapters",
             "create index if not exists release_keys_chapters on release_keys(chapters) where chapters is not null",
         ),
+        (
+            "release_keys_volumes",
+            "create index if not exists release_keys_volumes on release_keys(volumes) where volumes is not null",
+        ),
     ],
     release_key: Some("release_id"),
     // `video`: the first keyframe's key, from the probe's `keyframe_key`; `audio`: the first audio track's
     // `stream_key`
     // `mux`: SegmentUID and DateUTC; `encode`: the encoder's settings and the length; `thread`: the thread's root id
     // `subs`: the subtitle tracks' header keys; `fonts`: the attached fonts; `chapters`: the chapter start times
+    // `volumes`: an encrypted set's volume size, count and last size (`volumes_text`)
     added: &[
         ("file_crc", "INTEGER"),
         ("body_crc", "INTEGER"),
@@ -123,13 +128,14 @@ pub const RELEASE_KEYS: ShardTable = ShardTable {
         ("subs", "INTEGER"),
         ("fonts", "INTEGER"),
         ("chapters", "INTEGER"),
+        ("volumes", "INTEGER"),
     ],
 };
 
 const UPSERT: &str = "insert or replace into release_keys
     (release_id, account, host, layout, lines, file_crc, body_crc, video, audio, mux, encode, thread, subs, fonts,
-     chapters)
-    values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)";
+     chapters, volumes)
+    values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)";
 const DELETE: &str = "delete from release_keys where release_id = ?1";
 
 pub const KEYS_STEP: StepId = StepId(40);
@@ -175,10 +181,12 @@ pub enum Kind {
     Fonts,
     /// the same chapter times
     Chapters,
+    /// an encrypted archive set's volume size, count and last volume's size, from its PAR2 file list
+    Volumes,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 21] = [
+    pub const ALL: [Kind; 22] = [
         Kind::Account,
         Kind::Host,
         Kind::Layout,
@@ -200,6 +208,7 @@ impl Kind {
         Kind::Subs,
         Kind::Fonts,
         Kind::Chapters,
+        Kind::Volumes,
     ];
 
     /// The word in `/ui/same?kind=`.
@@ -226,6 +235,7 @@ impl Kind {
             Kind::Subs => "subs",
             Kind::Fonts => "fonts",
             Kind::Chapters => "chapters",
+            Kind::Volumes => "volumes",
         }
     }
 
@@ -257,6 +267,7 @@ impl Kind {
             Kind::Subs => "Same subtitle headers",
             Kind::Fonts => "Same attached fonts",
             Kind::Chapters => "Same chapter times",
+            Kind::Volumes => "Same encrypted volume sizes",
         }
     }
 
@@ -324,6 +335,9 @@ impl Kind {
             Kind::Chapters => {
                 "The same chapter start times, to the millisecond, three or more of them and not evenly spaced: chapters cut from the same disc or by the same hand. Episodes of one series rarely share them; another encode of the same disc often does."
             }
+            Kind::Volumes => {
+                "An encrypted archive set of the same volume size, volume count and last volume size, to the byte, as its PAR2 set lists them: a password-protected repost of the same files packed the same way often has exactly these, whatever the password, names or posting. Only a hint: many sets of one disc size or one volume cap share a count, soo check the names."
+            }
         }
     }
 
@@ -343,6 +357,7 @@ impl Kind {
             Kind::Subs => Some("subs"),
             Kind::Fonts => Some("fonts"),
             Kind::Chapters => Some("chapters"),
+            Kind::Volumes => Some("volumes"),
             Kind::Par2 | Kind::MovieHash | Kind::FileCrc | Kind::InnerFile => None,
             Kind::ArchiveTwin | Kind::Owner | Kind::Zone | Kind::AudioPrint => None,
         }
@@ -376,6 +391,7 @@ pub struct Keys {
     pub subs: Option<i64>,
     pub fonts: Option<i64>,
     pub chapters: Option<i64>,
+    pub volumes: Option<i64>,
 }
 
 impl Keys {
@@ -398,6 +414,7 @@ impl Keys {
             Kind::Subs => self.subs,
             Kind::Fonts => self.fonts,
             Kind::Chapters => self.chapters,
+            Kind::Volumes => self.volumes,
             _ => None,
         }
     }
@@ -696,6 +713,72 @@ pub(crate) fn chapters_text(media: &crate::probe::media::MediaInfo) -> Option<St
     Some(format!("chapters:{}", list.join(",")))
 }
 
+/// The fewest volumes a set must have for a volume key: two equal sizes and a last one say little.
+const MIN_VOLUMES: usize = 3;
+
+/// What the volume key is taken over: an archive set's format, its volume size, how many volumes and the last one's
+/// size, from `(name, size)` files as a PAR2 set lists them; the biggest set when there are several. None unless the
+/// RAR set has `MIN_VOLUMES` or more numbered from its first with none missing, every volume but the last the same
+/// size and the last smaller: the shape a packer's `-v` cut leaves, and the same whatever the password.
+pub(crate) fn volumes_text(files: &[(String, i64)]) -> Option<String> {
+    use crate::archive::select::{Kind as File, classify, set_name};
+    use std::collections::BTreeMap;
+    // (format, set) -> volumes, and whether the set is named the old way (`.rar`, `.r00`, ...), which starts at 0
+    let mut sets: BTreeMap<(&str, String), (Vec<(u32, i64)>, bool)> = BTreeMap::new();
+    for (name, size) in files {
+        // RAR only: the probe can't tell an encrypted 7z, and a `.001` split could be anything
+        let (format, volume) = match classify(name) {
+            File::Rar(n) => ("rar", n),
+            _ => continue,
+        };
+        let set = set_name(name, false).to_lowercase();
+        let entry = sets.entry((format, set)).or_default();
+        entry.0.push((volume, *size));
+        entry.1 |= !name.to_ascii_lowercase().ends_with(".rar");
+    }
+    let ((format, _), (mut vols, old)) =
+        sets.into_iter().max_by_key(|(_, (v, _))| v.iter().map(|(_, s)| *s).sum::<i64>())?;
+    vols.sort_unstable();
+    // one volume listed at two sizes is two sets under one name: no shape to go by
+    if vols.windows(2).any(|w| w[0].0 == w[1].0 && w[0].1 != w[1].1) {
+        return None;
+    }
+    vols.dedup_by_key(|(n, _)| *n);
+    // from the set's own first volume (`.rar` is 0, `.part1.rar` 1), none missing
+    let first = vols.first()?.0;
+    if first > 1
+        || (old && first != 0)
+        || vols.len() < MIN_VOLUMES
+        || vols.iter().enumerate().any(|(i, (n, _))| *n != first + i as u32)
+    {
+        return None;
+    }
+    let (body, last) = vols.split_at(vols.len() - 1);
+    let size = body.first()?.1;
+    let last = last.first()?.1;
+    // a last volume as big as the cut is more often a list cut short than a set that came out even
+    if size <= 0 || last <= 0 || last >= size || body.iter().any(|(_, s)| *s != size) {
+        return None;
+    }
+    Some(format!("volumes:{format}:{size}:{}:{last}", vols.len()))
+}
+
+/// The volume key of a release whose archive is encrypted (its probe says soo), from its PAR2 file list, read whole
+/// (`complete`): a list cut short would key the part of the set it saw. An unencrypted archive has its files' own
+/// CRCs to go by.
+pub fn volume_key(shard: &Connection, release_id: i64, probe: Option<&ProbeInfo>) -> Option<i64> {
+    let archive = probe?.archive.as_ref()?;
+    if !archive.encrypted && !archive.headers_encrypted {
+        return None;
+    }
+    let mut q = shard
+        .prepare_cached("select name, size from par2_files where release_id = ?1 and bound = 1 and complete = 1")
+        .ok()?;
+    let files: Vec<(String, i64)> =
+        q.query_map([release_id], |r| Ok((r.get(0)?, r.get(1)?))).ok()?.filter_map(Result::ok).collect();
+    volumes_text(&files).map(|t| as_key(digest8(t.as_bytes())))
+}
+
 /// The keys over what a release has: its probe and its `file_timing` rows.
 pub fn keys_of(
     probe: Option<&ProbeInfo>,
@@ -804,6 +887,7 @@ pub fn read_keys(shard: &Connection, release_id: i64, parts: Option<i64>, salt: 
     if keys.file_crc.is_none() {
         keys.file_crc = folded_files(shard, release_id).first().map(|f| f.key());
     }
+    keys.volumes = volume_key(shard, release_id, probe.as_ref());
     Ok(keys)
 }
 
@@ -1121,7 +1205,7 @@ fn stored(shard: &Connection, release_id: i64) -> rusqlite::Result<Option<Keys>>
     shard
         .prepare_cached(
             "select account, host, layout, lines, file_crc, body_crc, video, audio, mux, encode, thread, subs, fonts,
-             chapters from release_keys where release_id = ?1",
+             chapters, volumes from release_keys where release_id = ?1",
         )?
         .query_row([release_id], |r| {
             Ok(Keys {
@@ -1139,6 +1223,7 @@ fn stored(shard: &Connection, release_id: i64) -> rusqlite::Result<Option<Keys>>
                 subs: r.get(11)?,
                 fonts: r.get(12)?,
                 chapters: r.get(13)?,
+                volumes: r.get(14)?,
             })
         })
         .optional()
@@ -1408,9 +1493,9 @@ impl Step for KeysStep {
     }
     /// Bit 1: the file and first-article keys, soo every release already keyed is keyed again: the file key comes
     /// from probes made long before it. Bit 2: the mux, encode and thread keys, and file CRCs folded from articles.
-    /// Bit 4: the subtitle header, font and chapter keys.
+    /// Bit 4: the subtitle header, font and chapter keys. Bit 8: the encrypted volume sizes key.
     fn config_stamp(&self) -> u64 {
-        1 | 2 | 4
+        1 | 2 | 4 | 8
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let retry = |e: rusqlite::Error| StepError::Retry(e.to_string());
@@ -1441,6 +1526,7 @@ impl Step for KeysStep {
                     keys.subs.into(),
                     keys.fonts.into(),
                     keys.chapters.into(),
+                    keys.volumes.into(),
                 ],
             )],
         };
@@ -1451,6 +1537,39 @@ impl Step for KeysStep {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_volume_key_is_a_clean_v_cut() {
+        let set = |sizes: &[i64], name: &dyn Fn(usize) -> String| -> Vec<(String, i64)> {
+            sizes.iter().enumerate().map(|(i, s)| (name(i), *s)).collect()
+        };
+        let part = |i: usize| format!("x.part{:02}.rar", i + 1);
+        assert_eq!(
+            volumes_text(&set(&[100, 100, 100, 40], &part)).as_deref(),
+            Some("volumes:rar:100:4:40"),
+            "names play no part"
+        );
+        let old = |i: usize| if i == 0 { "Y.rar".to_string() } else { format!("Y.r{:02}", i - 1) };
+        assert_eq!(volumes_text(&set(&[100, 100, 100, 40], &old)).as_deref(), Some("volumes:rar:100:4:40"));
+        assert_eq!(volumes_text(&set(&[100, 100, 40], &part)).as_deref(), Some("volumes:rar:100:3:40"));
+        assert_eq!(volumes_text(&set(&[100, 40], &part)), None, "too few");
+        assert_eq!(volumes_text(&set(&[100, 90, 100, 40], &part)), None, "not one cut");
+        assert_eq!(volumes_text(&set(&[100, 100, 100, 140], &part)), None, "a last bigger than the cut");
+        assert_eq!(volumes_text(&set(&[100, 100, 100, 100], &part)), None, "a list cut short looks even");
+        let later = |i: usize| format!("x.part{:02}.rar", i + 2);
+        assert_eq!(volumes_text(&set(&[100, 100, 100, 40], &later)), None, "the first volume missing");
+        let no_rar = |i: usize| format!("Y.r{i:02}");
+        assert_eq!(volumes_text(&set(&[100, 100, 100, 40], &no_rar)), None, "an old set without its .rar");
+        let mut twice = set(&[100, 100, 100, 40], &part);
+        twice.push(("X.part02.rar".into(), 90));
+        assert_eq!(volumes_text(&twice), None, "two sets under one name");
+        let mut gap = set(&[100, 100, 100, 40], &part);
+        gap.remove(1);
+        assert_eq!(volumes_text(&gap), None, "a volume missing");
+        let mut with_par2 = set(&[100, 100, 100, 40], &part);
+        with_par2.push(("x.vol00+01.par2".into(), 7));
+        assert_eq!(volumes_text(&with_par2).as_deref(), Some("volumes:rar:100:4:40"));
+    }
 
     #[test]
     fn subtitle_font_and_chapter_keys_need_enough_to_tell_releases_apart() {
