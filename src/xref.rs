@@ -798,6 +798,22 @@ impl Store {
     /// Articles that came for a file since aren't in it, soo they wait for the next.
     pub fn ack(&mut self, ack: &Ack) -> Result<()> {
         let Ack { finished, widened, now } = ack;
+        if finished.is_empty() && widened.is_empty() {
+            return Ok(());
+        }
+        // the one write worth finishing on a stop: its releases are saved already. It waits as long as it takes
+        self.conn.busy_timeout(BUSY)?;
+        let noted = self.note(finished, widened, *now);
+        self.conn.busy_handler(Some(wait_unless_stopping))?;
+        noted
+    }
+
+    fn note(
+        &mut self,
+        finished: &[(String, Option<Place>, Taken)],
+        widened: &[(String, String, Seed, i64)],
+        now: i64,
+    ) -> Result<()> {
         // one transaction, whatever its size: a note half made would leave an upload's last files to be found again
         // as an upload of their own. It is key updates only, quick next to the recorder's chunks
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
