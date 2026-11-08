@@ -47,7 +47,7 @@ const FAILED_AGAIN: i64 = 1800;
 const CREATE: &str =
     "create table if not exists inferred_asked (release_id INTEGER PRIMARY KEY, next_at INTEGER NOT NULL);
      create table if not exists inferred_ids (
-        message_id TEXT PRIMARY KEY, release_id INTEGER NOT NULL, next_at INTEGER NOT NULL, tries INTEGER NOT NULL)";
+        message_id TEXT PRIMARY KEY, next_at INTEGER NOT NULL, tries INTEGER NOT NULL)";
 
 /// One part to ask for: its post (by the release it was found by), the group it's saved in unless its headers say
 /// another, and the row `nzb::inferred_segments` made for it.
@@ -56,7 +56,7 @@ pub struct Wanted {
     pub release_id: i64,
     pub group: String,
     /// every group of its post: where else it may be saved
-    pub groups: Vec<String>,
+    pub groups: Arc<[String]>,
     pub row: ArticleRow,
 }
 
@@ -74,12 +74,15 @@ pub struct Plan {
     pub wanted: Vec<Wanted>,
     pub nothing: Vec<i64>,
     pub waiting: Vec<(Vec<i64>, i64)>,
+    /// the rows of posts whose every due id is in `wanted`: none is due again before `FAILED_AGAIN`
+    pub asked: Vec<i64>,
 }
 
 /// What became of one id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome {
-    /// a server had it, and it was saved
+    /// a server had it, and it was saved. It waits like an absent one: a part saved that didn't join its file (its
+    /// subject read another way) would be asked for every round
     Found,
     /// every server said it hasn't it
     Absent,
@@ -129,12 +132,12 @@ async fn round(pool: &Arc<Pool>, db: &Db, stopping: &impl Fn() -> bool, stop: &A
     let plan = tokio::task::spawn_blocking(move || {
         crate::repair::reading_until(&scan_stop, |conn| {
             let post = |row: &ReleaseRow| {
-                let ids = match crate::release_info::whole_post_with(conn, row)? {
-                    Some(post) => post.ids,
-                    None => vec![row.id],
+                let (ids, size) = match crate::release_info::whole_post_with(conn, row)? {
+                    Some(post) => (post.ids, post.size),
+                    None => (vec![row.id], row.size.unwrap_or(0)),
                 };
                 let permille = crate::release_info::permille_of(conn, &ids)?;
-                Ok((ids, permille))
+                Ok((ids, permille, size))
             };
             let articles = |row: &ReleaseRow| {
                 crate::nzb::inventory_with(conn, row).map(|(articles, groups, _)| (articles, groups))
@@ -143,7 +146,8 @@ async fn round(pool: &Arc<Pool>, db: &Db, stopping: &impl Fn() -> bool, stop: &A
         })
     })
     .await??;
-    let Plan { wanted, nothing, waiting } = plan;
+    let Plan { wanted, nothing, mut waiting, asked } = plan;
+    waiting.push((asked, now + FAILED_AGAIN));
     on_db(db, move |conn| Ok(mark_posts(conn, &nothing, &waiting, now)?)).await?;
     if wanted.is_empty() {
         return Ok(());
@@ -183,6 +187,20 @@ async fn round(pool: &Arc<Pool>, db: &Db, stopping: &impl Fn() -> bool, stop: &A
         };
         outcomes.push((w, outcome));
     }
+    // a stop drops the rest of the round, as `repair`'s does (saves run whole on the writers): what wasn't marked is
+    // asked again next time
+    crate::nntp::unless_stopped(stop, finish(pool, db, outcomes, found, now)).await.transpose()?;
+    Ok(())
+}
+
+/// Saves what was found and marks what each id came to.
+async fn finish(
+    pool: &Arc<Pool>,
+    db: &Db,
+    mut outcomes: Vec<(Wanted, Outcome)>,
+    found: BTreeMap<String, Vec<(usize, Overview)>>,
+    now: i64,
+) -> anyhow::Result<()> {
     // saved like a listing's headers: each part joins its file by its subject. A group that couldn't be saved has its
     // ids asked again soon; the other groups are saved all the same
     for (group, headers) in found {
@@ -215,22 +233,21 @@ async fn round(pool: &Arc<Pool>, db: &Db, stopping: &impl Fn() -> bool, stop: &A
         counts.get("unusable").unwrap_or(&0),
         counts.get("failed").unwrap_or(&0)
     );
-    let marks: Vec<(String, i64, Outcome)> = outcomes.iter().map(|(w, o)| (w.key(), w.release_id, *o)).collect();
-    on_db(db, move |conn| Ok(mark_ids(conn, &marks, now)?)).await?;
-    Ok(())
+    let marks: Vec<(String, Outcome)> = outcomes.iter().map(|(w, o)| (w.key(), *o)).collect();
+    on_db(db, move |conn| Ok(mark_ids(conn, &marks, now)?)).await
 }
 
 /// The parts worth asking for this round, most nearly whole posts first, `budget` ids at most: the ids of each post
 /// that aren't waiting after an earlier try, the last post taken only in part when the budget ends in it (the rest
 /// next round). And the posts with nothing to ask, and those whose every id waits. `conn` has the shards attached
-/// and the tables in main; `post` gives a release's post (its rows) and how whole it is in thousandths, `articles`
-/// the articles its NZB is made of and its groups. A stop (the reader interrupted) ends the plan with that error; a
-/// release another error keeps from being read is left for a later round, unmarked.
+/// and the tables in main; `post` gives a release's post (its rows), how whole it is in thousandths and its size,
+/// `articles` the articles its NZB is made of and its groups. A stop (the reader interrupted) ends the plan with that
+/// error; a release another error keeps from being read has nothing to ask, for now.
 pub fn plan(
     conn: &Connection,
     now: i64,
     budget: usize,
-    post: impl Fn(&ReleaseRow) -> rusqlite::Result<(Vec<i64>, i64)>,
+    post: impl Fn(&ReleaseRow) -> rusqlite::Result<(Vec<i64>, i64, i64)>,
     articles: impl Fn(&ReleaseRow) -> rusqlite::Result<(Vec<ArticleRow>, Vec<String>)>,
 ) -> rusqlite::Result<Plan> {
     let has_table = conn.prepare("select 1 from main.sqlite_master where name = 'inferred_ids'")?.exists([])?;
@@ -264,11 +281,12 @@ pub fn plan(
                 out.nothing.push(row.id);
                 continue;
             }
-            let (mut ids, permille) = match post(&row) {
+            let (mut ids, permille, size) = match post(&row) {
                 Ok(p) => p,
                 Err(e) if interrupted(&e) => return Err(e),
                 Err(e) => {
                     eprintln!("inferred: release {}: {e}", row.id);
+                    out.nothing.push(row.id);
                     continue;
                 }
             };
@@ -277,7 +295,7 @@ pub fn plan(
             }
             seen.extend(ids.iter().copied());
             if (MIN_PERMILLE..1000).contains(&permille) {
-                posts.push((permille, row.size.unwrap_or(0), row, ids));
+                posts.push((permille, size, row, ids));
             } else {
                 out.nothing.extend(ids);
             }
@@ -295,9 +313,11 @@ pub fn plan(
             Err(e) if interrupted(&e) => return Err(e),
             Err(e) => {
                 eprintln!("inferred: release {}: {e}", row.id);
+                out.nothing.extend(ids);
                 continue;
             }
         };
+        let groups: Arc<[String]> = groups.into();
         let rows: Vec<ArticleRow> = crate::nzb::inferred_segments(&articles).into_iter().flat_map(|f| f.rows).collect();
         if rows.is_empty() {
             out.nothing.extend(ids);
@@ -314,7 +334,12 @@ pub fn plan(
         }
         match first_due {
             Some(at) if due.is_empty() => out.waiting.push((ids, at)),
-            _ => out.wanted.extend(due.into_iter().take(room)),
+            _ => {
+                if due.len() <= room {
+                    out.asked.extend(ids);
+                }
+                out.wanted.extend(due.into_iter().take(room));
+            }
         }
     }
     Ok(out)
@@ -348,27 +373,21 @@ fn mark_posts(conn: &mut Connection, nothing: &[i64], waiting: &[(Vec<i64>, i64)
     tx.commit()
 }
 
-/// What each id asked came to: one found is done with, one no server has (or whose headers were no use) waits longer
-/// with each try, one that couldn't be asked or saved waits `FAILED_AGAIN`, its tries as they were.
-fn mark_ids(conn: &mut Connection, marks: &[(String, i64, Outcome)], now: i64) -> rusqlite::Result<()> {
+/// What each id asked came to: one found, or that no server has (or whose headers were no use), waits longer with each
+/// try; one that couldn't be asked or saved waits `FAILED_AGAIN`, its tries as they were.
+fn mark_ids(conn: &mut Connection, marks: &[(String, Outcome)], now: i64) -> rusqlite::Result<()> {
     let tx = conn.transaction()?;
-    for (id, release_id, outcome) in marks {
+    for (id, outcome) in marks {
         let tries: i64 = tx
             .query_row("select tries from inferred_ids where message_id = ?1", [id], |r| r.get(0))
             .optional()?
             .unwrap_or(0);
         let (next, tries) = match outcome {
-            Outcome::Found => {
-                tx.execute("delete from inferred_ids where message_id = ?1", [id])?;
-                continue;
-            }
-            Outcome::Absent | Outcome::Unusable => (backoff(now, tries + 1), tries + 1),
+            Outcome::Found | Outcome::Absent | Outcome::Unusable => (backoff(now, tries + 1), tries + 1),
             Outcome::Failed => (now + FAILED_AGAIN, tries),
         };
-        tx.prepare_cached(
-            "insert or replace into inferred_ids (message_id, release_id, next_at, tries) values (?1, ?2, ?3, ?4)",
-        )?
-        .execute(params![id, release_id, next, tries])?;
+        tx.prepare_cached("insert or replace into inferred_ids (message_id, next_at, tries) values (?1, ?2, ?3)")?
+            .execute(params![id, next, tries])?;
     }
     tx.commit()
 }
@@ -396,12 +415,15 @@ pub fn overview_of(head: &[u8], w: &Wanted) -> Option<(String, Overview)> {
     let xref = value("Xref").unwrap_or_default();
     let numbers: Vec<(&str, &str)> = xref.split_whitespace().skip(1).filter_map(|e| e.split_once(':')).collect();
     let ours = numbers.iter().any(|(g, _)| *g == w.group);
-    let group = match numbers.iter().find(|(g, _)| !ours && w.groups.iter().any(|p| p == g)) {
+    let group = match numbers
+        .iter()
+        .find(|(g, _)| !ours && w.groups.iter().any(|p| p == g) && !crate::filters::group_blocked(g))
+    {
         Some((g, _)) => g.to_string(),
         None => w.group.clone(),
     };
     let row = Overview {
-        // the answering server's numbers aren't the listing's: none (0, which the store passes over)
+        // the answering server's numbers aren't the listing's: none (0, which the store's file timing passes over)
         number: 0,
         subject,
         from: listed(value("From").unwrap_or_default()),
@@ -423,7 +445,7 @@ mod tests {
         Wanted {
             release_id: 1,
             group: group.into(),
-            groups: vec![group.into()],
+            groups: vec![group.to_string()].into(),
             row: ArticleRow {
                 message_id: id.into(),
                 filename: Some("a.rar".into()),
@@ -457,7 +479,7 @@ Xref: news.example alt.binaries.movies:11666417361 alt.binaries.hdtv:42\r\n";
         assert_eq!(o.clone().into_article().bytes, 5022 * 130);
         // a post cut across groups: saved in the group of the post the article is in
         let mut cut = wanted("<part3of6.tok@bzh29>", "alt.binaries.teevee");
-        cut.groups.push("alt.binaries.movies".into());
+        cut.groups = vec!["alt.binaries.teevee".to_string(), "alt.binaries.movies".to_string()].into();
         assert_eq!(overview_of(HEAD, &cut).unwrap().0, "alt.binaries.movies");
         // but never in a group the post isn't in
         let alone = wanted("<part3of6.tok@bzh29>", "alt.binaries.teevee");
@@ -504,7 +526,7 @@ Xref: news.example alt.binaries.movies:11666417361 alt.binaries.hdtv:42\r\n";
             .unwrap()
         };
         let mark = |conn: &mut Connection, id: &str, o: Outcome, now: i64| {
-            mark_ids(conn, &[(id.to_string(), 7, o)], now).unwrap();
+            mark_ids(conn, &[(id.to_string(), o)], now).unwrap();
         };
         mark(&mut conn, "a", Outcome::Absent, 100);
         assert_eq!(row(&conn, "a"), Some((100 + ABSENT_AGAIN, 1)));
@@ -514,9 +536,9 @@ Xref: news.example alt.binaries.movies:11666417361 alt.binaries.hdtv:42\r\n";
         // a server that couldn't be asked isn't a try
         mark(&mut conn, "a", Outcome::Failed, 300);
         assert_eq!(row(&conn, "a"), Some((300 + FAILED_AGAIN, 2)));
-        // found: done with
+        // found waits too: should it not have joined its file, it isn't asked every round
         mark(&mut conn, "a", Outcome::Found, 400);
-        assert_eq!(row(&conn, "a"), None);
+        assert_eq!(row(&conn, "a"), Some((400 + 4 * ABSENT_AGAIN, 3)));
         mark(&mut conn, "b", Outcome::Failed, 500);
         assert_eq!(row(&conn, "b"), Some((500 + FAILED_AGAIN, 0)));
 
@@ -602,12 +624,15 @@ Xref: news.example alt.binaries.movies:11666417361 alt.binaries.hdtv:42\r\n";
             Ok((a, vec!["alt.binaries.movies".to_string()]))
         };
         // 1 and 11 are one post
-        let post = |r: &ReleaseRow| Ok((if r.id == 1 { vec![1, 11] } else { vec![r.id] }, permille(r.id)));
+        let post = |r: &ReleaseRow| Ok((if r.id == 1 { vec![1, 11] } else { vec![r.id] }, permille(r.id), 1 << 30));
         let p = plan(&conn, now, 100, post, articles).unwrap();
         let asked: Vec<(i64, &str)> = p.wanted.iter().map(|w| (w.release_id, w.row.message_id.as_str())).collect();
         assert_eq!(asked, [(2, "<part4of4.tok@bzh29>"), (1, "<part3of6.tok@bzh29>"), (1, "<part5of6.tok@bzh29>")]);
         assert!(p.wanted.iter().all(|w| w.group == "alt.binaries.movies"));
         assert!(p.waiting.is_empty());
+        let mut asked = p.asked.clone();
+        asked.sort();
+        assert_eq!(asked, [1, 2, 11]);
         let mut nothing = p.nothing.clone();
         nothing.sort();
         assert_eq!(nothing, [3, 4]);
@@ -616,14 +641,16 @@ Xref: news.example alt.binaries.movies:11666417361 alt.binaries.hdtv:42\r\n";
         let p = plan(&conn, now, 2, post, articles).unwrap();
         let asked: Vec<&str> = p.wanted.iter().map(|w| w.row.message_id.as_str()).collect();
         assert_eq!(asked, ["<part4of4.tok@bzh29>", "<part3of6.tok@bzh29>"]);
+        // 1 isn't asked whole: it isn't marked
+        assert_eq!(p.asked, [2]);
 
         // ids asked lately wait: 1's part 3 is skipped, and once part 5 waits too, the post waits for the first of them
         let mut conn = conn;
-        mark_ids(&mut conn, &[("part3of6.tok@bzh29".into(), 1, Outcome::Absent)], now).unwrap();
+        mark_ids(&mut conn, &[("part3of6.tok@bzh29".into(), Outcome::Absent)], now).unwrap();
         let p = plan(&conn, now, 100, post, articles).unwrap();
         let asked: Vec<&str> = p.wanted.iter().map(|w| w.row.message_id.as_str()).collect();
         assert_eq!(asked, ["<part4of4.tok@bzh29>", "<part5of6.tok@bzh29>"]);
-        mark_ids(&mut conn, &[("part5of6.tok@bzh29".into(), 1, Outcome::Failed)], now).unwrap();
+        mark_ids(&mut conn, &[("part5of6.tok@bzh29".into(), Outcome::Failed)], now).unwrap();
         let p = plan(&conn, now, 100, post, articles).unwrap();
         assert_eq!(p.waiting, [(vec![1, 11], now + FAILED_AGAIN)]);
 
