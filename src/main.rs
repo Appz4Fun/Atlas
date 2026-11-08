@@ -47,6 +47,8 @@ fn main() -> ExitCode {
         atlas::header_window::run_cli(&args)
     } else if has("--header-store") {
         atlas::nxv_store::tools::run_cli(&args)
+    } else if has("--save-replay") {
+        atlas::save_replay::run_cli(&args)
     } else if has("--export-keep") {
         atlas::keep_export::run(&args)
     } else if has("--merge-shards") {

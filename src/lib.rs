@@ -36,6 +36,7 @@ pub mod header_window;
 pub mod images;
 pub mod nxv_census;
 pub mod nxv_store;
+pub mod save_replay;
 pub mod keep_export;
 pub mod merge_shards;
 pub mod metrics;
