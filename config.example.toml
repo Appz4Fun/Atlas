@@ -72,7 +72,7 @@ probes_per_minute = 60
 # past either only its thumbnail or cover is, and the release page offers a Fetch button for each of the rest
 pictures_auto_max = 12
 pictures_auto_max_mb = 16
-# the most articles one picture fetched from the page may take (about 0.7 MB each)
+# the most articles one picture fetched from the page may take (about 0.7 MB each, 64 at most)
 picture_max_parts = 64
 
 [naming]

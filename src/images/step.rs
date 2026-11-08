@@ -365,7 +365,8 @@ pub fn requests(conn: &rusqlite::Connection, ids: &[i64]) -> Vec<Request> {
 }
 
 /// Asks for a picture of release `id` on a connection with its shard attached: the request, and the pictures step to
-/// run again on the release first thing in its shard's net lane.
+/// run again on the release first thing in its shard's net lane. Not through the database lane's queue: a visit there
+/// works the release's net rank out again, which would put it back in its old place.
 pub fn ask(conn: &rusqlite::Connection, id: i64, file: &str, now: i64) -> rusqlite::Result<()> {
     let s = store::shard_of_id(id);
     let bit = crate::postprocess::step::mask(IMAGES_STEP);
@@ -388,13 +389,6 @@ pub fn ask(conn: &rusqlite::Connection, id: i64, file: &str, now: i64) -> rusqli
         ),
         rusqlite::params![id, bit, ASKED_RANK],
     )?;
-    tx.execute(
-        &format!(
-            "insert into s{s}.pp_queue (release_id, due_at) values (?1, ?2)
-             on conflict(release_id) do update set due_at = min(due_at, excluded.due_at)"
-        ),
-        rusqlite::params![id, now],
-    )?;
     tx.commit()
 }
 
@@ -412,6 +406,9 @@ fn wanted<'a>(
             out.push((*f, true));
         }
     }
+    // what was asked for first: a picture read without asking that never comes to anything is fetched again on every
+    // run, and mustn't use up the articles a picture asked for needs
+    out.sort_by_key(|(_, asked)| !asked);
     out
 }
 
@@ -596,7 +593,8 @@ impl Step for ImagesStep {
             return Ok(Outcome { writes: answers, ..Outcome::default() });
         }
         let before = kept_before(ctx.conn(), release_id).map_err(|e| StepError::Retry(e.to_string()))?;
-        let mut left = RUN_PARTS;
+        // room for the biggest picture one may ask for, whatever `picture_max_parts` says
+        let mut left = RUN_PARTS.max(limits.picture_max_parts.max(1) as usize);
         let mut writes = vec![StepWrite::new(DROP_IMAGES, vec![release_id.into()])];
         let mut kept = 0i64;
         let mut row = |name: &str, body: &[u8], writes: &mut Vec<StepWrite>| -> bool {

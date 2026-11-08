@@ -21,7 +21,7 @@ use std::sync::LazyLock;
 
 use rusqlite::{OptionalExtension, params};
 
-use crate::postprocess::step::{Outcome, StepCtx, StepError, StepWrite, mask};
+use crate::postprocess::step::{BodyRequest, Got, Outcome, StepCtx, StepError, StepWrite, mask};
 use crate::store::{FileInfo, SegmentPick};
 
 use super::link::{BESIDE_SECS, RESUME_SECS, SET_BESIDE, beside_window, retry};
@@ -47,6 +47,8 @@ const PICTURE_NAMES: &[&str] = &[
     "screenshot.jpg",
     "screenshots.jpg",
 ];
+/// Files a post can be short of, at most, for a thumbnail to be looked for: the thumbnail and one more.
+const MAX_SHORT: usize = 2;
 /// Leading characters two posters' local parts share, at least, to be one upload's when they aren't the same.
 const POSTER_PREFIX: usize = 8;
 
@@ -81,9 +83,10 @@ pub fn by_name(ctx: &mut StepCtx<'_>, files: &[FileInfo], picture_found: bool) -
         }
         out.matched = true;
         if crate::probe::nfo_store::stored(ctx.conn(), me.id).is_none() {
-            match read_nfo(ctx, &file)? {
-                Some(text) => out.writes.push(crate::probe::nfo_store::keep(me.id, &file.filename, &text)),
-                None => out.wait_until = Some(chrono::Utc::now().timestamp() + RESUME_SECS),
+            // one that can't be read now is read on a later run: a wait here would hold back the release's later
+            // steps, and the reruns this run asks for
+            if let NfoRead::Text(text) = read_nfo(ctx, &file)? {
+                out.writes.push(crate::probe::nfo_store::keep(me.id, &file.filename, &text));
             }
         }
     }
@@ -95,9 +98,19 @@ pub fn by_name(ctx: &mut StepCtx<'_>, files: &[FileInfo], picture_found: bool) -
         && let Some(total) = me.file_total.filter(|n| *n >= 2)
         && let Some(posted) = me.posted_date.as_deref()
     {
-        let slots: HashSet<i64> = files.iter().filter_map(|f| counter(f.subject.as_deref()?)).map(|(k, _)| k).collect();
-        let posters = post_posters(ctx.conn(), &me.name, &stem, me.poster.as_deref(), posted)?;
-        if let Some(row) = thumbnail_beside(ctx.conn(), me.id, total, &slots, &posters, posted)? {
+        let (posters, rows) = post_posters(ctx.conn(), &me.name, &stem, me.poster.as_deref(), posted)?;
+        // the slots the whole post holds, across its groups' rows: only a post a file or two short is looked at
+        let mut slots: HashSet<i64> =
+            files.iter().filter_map(|f| counter(f.subject.as_deref()?)).map(|(k, _)| k).collect();
+        for row in rows {
+            for f in crate::store::release_files(ctx.conn(), row, 64).map_err(retry)? {
+                slots.extend(f.subject.as_deref().and_then(counter).map(|(k, _)| k));
+            }
+        }
+        let short = (1..=total).filter(|k| !slots.contains(k)).count();
+        if (1..=MAX_SHORT).contains(&short)
+            && let Some(row) = thumbnail_beside(ctx.conn(), me.id, total, &slots, &posters, posted)?
+        {
             out.writes.push(StepWrite::new(SET_BESIDE, vec![row.into(), me.id.into(), rusqlite::types::Value::Null]));
             out.matched = true;
             out.rerun |= mask(crate::images::step::IMAGES_STEP);
@@ -130,28 +143,50 @@ fn nfo_row(ctx: &mut StepCtx<'_>, file: &FileInfo) -> Result<Outcome, StepError>
     out.matched = true;
     if crate::probe::nfo_store::stored(ctx.conn(), owner).is_none() {
         match read_nfo(ctx, file)? {
-            Some(text) => out.writes.push(crate::probe::nfo_store::keep(owner, &file.filename, &text)),
-            None => out.wait_until = Some(chrono::Utc::now().timestamp() + RESUME_SECS),
+            NfoRead::Text(text) => out.writes.push(crate::probe::nfo_store::keep(owner, &file.filename, &text)),
+            // this row's own later steps are all it holds back
+            NfoRead::Later => out.wait_until = Some(chrono::Utc::now().timestamp() + RESUME_SECS),
+            NfoRead::Never => {}
         }
     }
     Ok(out)
 }
 
-/// An NFO's text, from its first article: None when it can't be read in this run.
-fn read_nfo(ctx: &mut StepCtx<'_>, file: &FileInfo) -> Result<Option<String>, StepError> {
+/// What reading an NFO came to.
+enum NfoRead {
+    Text(String),
+    /// not in this run: out of bodies, or the servers didn't answer
+    Later,
+    /// gone from the servers, too big for an NFO, or its first article not indexed
+    Never,
+}
+
+/// An NFO's text, from its first article.
+fn read_nfo(ctx: &mut StepCtx<'_>, file: &FileInfo) -> Result<NfoRead, StepError> {
     let Some(seg) = ctx.segments(file.id, &SegmentPick::First(1)).map_err(retry)?.into_iter().next() else {
-        return Ok(None);
+        return Ok(NfoRead::Never);
     };
     // a later article's text isn't the NFO's start, which the next readers go by
     if seg.part.is_some_and(|p| p > 1) {
-        return Ok(None);
+        return Ok(NfoRead::Never);
     }
-    let body = match super::steps::fetch_one(ctx, &seg, &file.filename) {
-        Ok(body) => body,
-        Err(StepError::OutOfBudget | StepError::Transient(_)) => None,
+    let wanted = [BodyRequest {
+        message_id: seg.message_id.clone(),
+        file: file.filename.clone(),
+        max_bytes: Some(super::ARTICLE_CAP),
+    }];
+    let got = match ctx.fetch_bodies(&wanted) {
+        Ok(got) => got.into_iter().next().map(|b| b.got),
+        Err(StepError::OutOfBudget | StepError::Transient(_)) => return Ok(NfoRead::Later),
         Err(e) => return Err(e),
     };
-    Ok(body.filter(|b| b.len() < crate::media::steps::NFO_READ).map(|b| crate::probe::nfo_text(&b)))
+    Ok(match got {
+        Some(Got::Body(body)) if body.len() < crate::media::steps::NFO_READ => {
+            NfoRead::Text(crate::probe::nfo_text(&body))
+        }
+        Some(Got::Refused(why)) if why == crate::postprocess::bodies::PAST_BUDGET => NfoRead::Later,
+        _ => NfoRead::Never,
+    })
 }
 
 /// The rows already found beside a release, with their one file each.
@@ -179,6 +214,7 @@ fn nfo_owner(conn: &rusqlite::Connection, me: i64, stem: &str, posted: Option<&s
     let rows = named_rows(conn, me, stem, (&from, &to, posted))?;
     for (id, name, _) in rows {
         let named = name == stem
+            || name.strip_prefix(stem).is_some_and(|rest| rest.starts_with(" ["))
             || crate::store::VIDEO_EXTENSIONS.iter().any(|ext| name.strip_suffix(ext).is_some_and(|s| s == stem));
         if !named {
             continue;
@@ -260,27 +296,33 @@ fn named_rows(
     rows.collect::<rusqlite::Result<_>>().map_err(retry)
 }
 
-/// The posters of a release's post: its own, and those of the rows of its name in other groups posted within a day,
-/// as a post cut across groups gives each group's row a poster of its own.
+/// The posters of a release's post, and its rows in other groups: its own poster, and those of the rows of its name
+/// posted within a day, as a post cut across groups gives each group's row a poster of its own.
 fn post_posters(
     conn: &rusqlite::Connection,
     name: &str,
     stem: &str,
     own: Option<&str>,
     posted: &str,
-) -> Result<Vec<String>, StepError> {
+) -> Result<(Vec<String>, Vec<i64>), StepError> {
     let mut posters: Vec<String> = own.map(str::to_string).into_iter().collect();
-    let Some((from, to)) = beside_window(posted, 24 * 3600) else { return Ok(posters) };
+    let mut rows = Vec::new();
+    let Some((from, to)) = beside_window(posted, 24 * 3600) else { return Ok((posters, rows)) };
     let names: Vec<&str> = if name == stem { vec![name] } else { vec![name, stem] };
     for look in names {
-        for (_, other, poster) in named_rows(conn, -1, look, (&from, &to, posted))? {
-            let same = other == name || other == stem;
-            if let Some(poster) = poster.filter(|p| same && !posters.contains(p)) {
+        for (id, other, poster) in named_rows(conn, -1, look, (&from, &to, posted))? {
+            if other != name && other != stem {
+                continue;
+            }
+            if !rows.contains(&id) {
+                rows.push(id);
+            }
+            if let Some(poster) = poster.filter(|p| !posters.contains(p)) {
                 posters.push(poster);
             }
         }
     }
-    Ok(posters)
+    Ok((posters, rows))
 }
 
 /// A row of one small picture, by a name posting tools give one, whose counter is the release's `/total` at a slot its
@@ -491,9 +533,10 @@ mod tests {
         );
         row(&conn, 4, "thumbnail.jpg [00000002]", "a.b.alias", "ZbivKJ385zX890Qq@x.y", "2026-11-08 20:58:30", &[other]);
         let posted = "2026-11-08 20:58:00";
-        let posters =
+        let (posters, rows) =
             post_posters(&conn, FILM, FILM, Some("ZbivKJ385zX890QucX2ivQLHn0h@5caaC6uY.W4f"), posted).unwrap();
         assert_eq!(posters.len(), 2, "its own and the rail row's: {posters:?}");
+        assert_eq!(rows.len(), 2, "both groups' rows");
         let slots: HashSet<i64> = [7, 1].into();
         assert_eq!(thumbnail_beside(&conn, 1, 8, &slots, &posters, posted).unwrap(), Some(2));
         let taken: HashSet<i64> = [7, 1, 8].into();

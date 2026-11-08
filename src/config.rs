@@ -985,7 +985,8 @@ pub struct ArchiveConfig {
     /// `pictures_auto_max_mb`; past either, only its thumbnail or cover is, and the page offers each of the rest
     pub pictures_auto_max: i64,
     pub pictures_auto_max_mb: i64,
-    /// the most articles one picture asked for on the page may take
+    /// the most articles one picture asked for on the page may take: at most 64, what one release's run may fetch
+    /// (`postprocess.bodies_per_release`) by default
     pub picture_max_parts: i64,
 }
 
@@ -1022,7 +1023,7 @@ impl ArchiveConfig {
         int("max_names_mb", 64, i64::MAX, &mut c.max_names_mb);
         int("pictures_auto_max", 0, 1_000, &mut c.pictures_auto_max);
         int("pictures_auto_max_mb", 0, 1_024, &mut c.pictures_auto_max_mb);
-        int("picture_max_parts", 1, 1_000, &mut c.picture_max_parts);
+        int("picture_max_parts", 1, 64, &mut c.picture_max_parts);
         c
     }
 }
@@ -2076,6 +2077,8 @@ mod tests {
         let v = serde_json::json!({"pictures_auto_max": 40, "pictures_auto_max_mb": 5000, "picture_max_parts": 0});
         let c = ArchiveConfig::from_value(Some(&v));
         assert_eq!((c.pictures_auto_max, c.pictures_auto_max_mb, c.picture_max_parts), (40, 1_024, 1));
+        let c = ArchiveConfig::from_value(Some(&serde_json::json!({"picture_max_parts": 500})));
+        assert_eq!(c.picture_max_parts, 64);
     }
 
     #[test]

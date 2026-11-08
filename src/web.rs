@@ -4250,16 +4250,17 @@ fn current_picture_state(conn: &rusqlite::Connection, id: i64, name: &str) -> Pi
     picture_state(name, &shown, &picture_requests_of(conn, &rows))
 }
 
-/// POST /ui/picture: a picture of release `id` asked for, read at its reader's next turn. Its cell, now queued.
+/// POST /ui/picture: a picture of release `id` asked for, read at its reader's next turn. Its cell, now queued. A
+/// refusal comes back as a 200 too, soo htmx swaps it in and the cell says why.
 fn ask_picture(body: &str, csrf: Option<&str>, api_key: &str) -> ApiResponse {
     let args = parse_query(body);
     if !crate::web_settings::csrf_ok(&args, csrf, api_key) {
-        return html(403, "<div class=\"picture-state\">The page is out of date: reload it.</div>".into());
+        return html(200, "<div class=\"picture-state\">The page is out of date: reload it.</div>".into());
     }
     let id = args.get("id").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
     let name = args.get("name").map(String::as_str).unwrap_or_default();
     if !crate::images::is_image_name(name) {
-        return html(400, "<div class=\"picture-state\">Not a picture.</div>".into());
+        return html(200, "<div class=\"picture-state\">Not a picture.</div>".into());
     }
     let main = crate::paths::database();
     let asked = crate::compact::hold_off_compaction(&main).and_then(|_writing| {
@@ -4273,10 +4274,10 @@ fn ask_picture(body: &str, csrf: Option<&str>, api_key: &str) -> ApiResponse {
             let state = current_picture_state(&conn, id, name);
             html(200, picture_state_html(id, name, &state, &crate::web_settings::csrf_token(api_key)))
         }
-        Ok(None) => html(404, "<div class=\"picture-state\">No such picture in this release.</div>".into()),
+        Ok(None) => html(200, "<div class=\"picture-state\">No such picture in this release.</div>".into()),
         Err(e) => {
             eprintln!("web picture {id} {name:?} failed: {e:#}");
-            html(500, "<div class=\"picture-state\">Couldn't be queued: the error is in Atlas's log.</div>".into())
+            html(200, "<div class=\"picture-state\">Couldn't be queued: the error is in Atlas's log.</div>".into())
         }
     }
 }
