@@ -201,7 +201,7 @@ struct Shared {
     dropped_repeats: AtomicU64,
     blocks_committed: AtomicU64,
     /// slabs handed to the sealers and not yet committed (or let go): (group, generation)
-    inflight: Mutex<HashSet<(String, u32)>>,
+    inflight: Mutex<HashMap<(String, u32), i64>>,
 }
 
 impl Shared {
@@ -220,6 +220,7 @@ impl Shared {
             *f = Some(format!("{e:#}"));
         }
         drop(f);
+        let _g = self.synced_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.synced.notify_all();
     }
 }
@@ -245,6 +246,9 @@ pub struct Store {
     seal_tx: Mutex<Option<Sender<SealJob>>>,
     /// expiry waits until the linker has finished a pass, soo days it hasn't linked aren't let go after a start
     expiry_armed: AtomicBool,
+    /// where a fresh keep set comes from (`live::keep_now`): housekeeping and a refused row ask it, soo a keep set set
+    /// earlier never wins over a newer one
+    keep_source: Mutex<Option<KeepSource>>,
     /// held while the store is open: a second process opening it would replay and append to the same files
     _lock: File,
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
@@ -296,6 +300,9 @@ pub fn decode_name(dir: &str) -> Option<String> {
 
 const STATE_DIR: &str = "_state";
 
+/// A function giving the keep set as of now.
+pub type KeepSource = Arc<dyn Fn() -> KeepSet + Send + Sync>;
+
 /// An exclusive lock on the store's `_state/lock`, refused when another process holds it.
 fn lock_store(root: &Path) -> Result<File> {
     use std::os::fd::AsRawFd;
@@ -344,7 +351,7 @@ impl Store {
             dropped_unkept: AtomicU64::new(0),
             dropped_repeats: AtomicU64::new(0),
             blocks_committed: AtomicU64::new(0),
-            inflight: Mutex::new(HashSet::new()),
+            inflight: Mutex::new(HashMap::new()),
         });
         let store = Arc::new(Store {
             cfg,
@@ -356,6 +363,7 @@ impl Store {
             threads: Mutex::new(Vec::new()),
             tick_lock: Mutex::new(()),
             expiry_armed: AtomicBool::new(false),
+            keep_source: Mutex::new(None),
             _lock: lock,
         });
         store.start();
@@ -401,6 +409,23 @@ impl Store {
 
     pub fn failure(&self) -> Option<String> {
         self.shared.failure()
+    }
+
+    /// Where fresh keep sets come from from now on.
+    pub fn set_keep_source(&self, f: KeepSource) {
+        *self.keep_source.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
+    }
+
+    /// The keep set as of now: from the source when there is one (kept, with the days claimed since added), else the
+    /// one set last.
+    fn current_keep(&self) -> KeepSet {
+        let source = self.keep_source.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let Some(f) = source else { return self.keep.read().unwrap_or_else(|e| e.into_inner()).clone() };
+        let fresh = f();
+        let mut k = self.keep.write().unwrap_or_else(|e| e.into_inner());
+        let claimed: BTreeSet<i64> = k.claimed.iter().chain(fresh.claimed.iter()).copied().collect();
+        *k = KeepSet { claimed, ..fresh };
+        k.clone()
     }
 
     /// A backfill day just claimed, kept at once (not at the next refresh): its rows are about to come.
@@ -478,15 +503,25 @@ impl Store {
             .collect();
         let dates: Vec<i64> = parsed.iter().filter_map(|p| p.and_then(|(_, d)| d)).collect();
         let (lo, hi) = clamp.bounds(&dates);
-        let keep = self.keep.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut keep = self.keep.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut refreshed = false;
         let mut s = g.slabs.lock().unwrap_or_else(|e| e.into_inner());
         for (line, p) in lines.iter().zip(&parsed) {
             let Some((art, date)) = *p else { continue };
             let ts = date.unwrap_or((lo + hi) / 2).clamp(lo, hi);
             let day = ts.div_euclid(DAY);
             if !keep.keeps(day) {
-                self.shared.dropped_unkept.fetch_add(1, Ordering::Relaxed);
-                continue;
+                // the keep set held may be older than a claim or the linker's last look: ask for a fresh one once
+                if !refreshed {
+                    refreshed = true;
+                    drop(s);
+                    keep = self.current_keep();
+                    s = g.slabs.lock().unwrap_or_else(|e| e.into_inner());
+                }
+                if !keep.keeps(day) {
+                    self.shared.dropped_unkept.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
             }
             push_row(&g, &mut s, sid, day, art, ts, line, self.cfg.seal_rows)?;
         }
@@ -524,7 +559,7 @@ impl Store {
             s.seal_days.extend(days);
         }
         // and those already handed to the sealers: whatever day, they're few
-        waiting.extend(self.shared.inflight.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned());
+        waiting.extend(self.shared.inflight.lock().unwrap_or_else(|e| e.into_inner()).keys().cloned());
         let deadline = Instant::now() + timeout;
         loop {
             if let Some(e) = self.failure() {
@@ -549,7 +584,7 @@ impl Store {
                     }
                 }
                 let inflight = self.shared.inflight.lock().unwrap_or_else(|e| e.into_inner());
-                waiting.retain(|k| still.contains(k) || inflight.contains(k));
+                waiting.retain(|k| still.contains(k) || inflight.contains_key(k));
                 waiting.len()
             };
             if left == 0 {
@@ -643,7 +678,7 @@ impl Store {
             let leaving: Vec<Slab> = leaving.into_iter().filter(|sl| !sl.is_empty()).collect();
             {
                 let mut inflight = self.shared.inflight.lock().unwrap_or_else(|e| e.into_inner());
-                inflight.extend(leaving.iter().map(|sl| (g.name.clone(), sl.slab_gen)));
+                inflight.extend(leaving.iter().map(|sl| ((g.name.clone(), sl.slab_gen), sl.day)));
             }
             to_seal.extend(leaving.into_iter().map(|sl| (Arc::clone(g), sl)));
         }
@@ -726,7 +761,10 @@ impl Store {
     pub fn housekeeping(&self) {
         // armed first, then the keep set: arming comes after the keep set took the linker's unlinked days
         let armed = self.expiry_armed.load(Ordering::Acquire);
-        let keep = self.keep.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let keep = self.current_keep();
+        // slabs on their way to the committer count as still filling their days
+        let inflight_days: BTreeSet<i64> =
+            self.shared.inflight.lock().unwrap_or_else(|e| e.into_inner()).values().copied().collect();
         for g in self.groups.read().unwrap_or_else(|e| e.into_inner()).values() {
             let open_days: BTreeSet<i64> = {
                 let s = g.slabs.lock().unwrap_or_else(|e| e.into_inner());
@@ -735,7 +773,13 @@ impl Store {
             let mut segs = g.segments.write().unwrap_or_else(|e| e.into_inner());
             let gone: Vec<i64> = segs
                 .iter()
-                .filter(|(day, seg)| armed && !keep.keeps(**day) && !open_days.contains(day) && seg.expire())
+                .filter(|(day, seg)| {
+                    armed
+                        && !keep.keeps(**day)
+                        && !open_days.contains(day)
+                        && !inflight_days.contains(day)
+                        && seg.expire()
+                })
                 .map(|(d, _)| *d)
                 .collect();
             for d in gone {

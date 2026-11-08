@@ -62,12 +62,18 @@ pub fn spawn(cfg: &crate::config::HeaderStoreConfig) {
     if STORE.set(Mutex::new(Some(Arc::clone(&store)))).is_err() {
         return;
     }
+    // housekeeping and refused rows ask for the keep set as of then
+    store.set_keep_source(Arc::new(keep_now));
     // the old linker's recording goes off only once the store's linker can read its state
     if cfg.linker {
         match super::linker::Linker::open(&store, now()) {
             Ok(_) => LINKS_ON.store(true, Ordering::Relaxed),
             Err(e) => eprintln!("header store: its linker couldnt read its state ({e:#}); the SQLite linker stays on"),
         }
+    }
+    // with no store linker to wait for, expiry follows the keep set from the start
+    if !LINKS_ON.load(Ordering::Relaxed) {
+        store.arm_expiry();
     }
     let weak = Arc::downgrade(&store);
     let _ = std::thread::Builder::new().name("nxv-keep".into()).spawn(move || {
@@ -82,7 +88,6 @@ pub fn spawn(cfg: &crate::config::HeaderStoreConfig) {
                 );
                 std::process::exit(70);
             }
-            s.set_keep(keep_now());
         }
     });
 }

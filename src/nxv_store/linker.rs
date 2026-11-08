@@ -427,7 +427,8 @@ pub fn ready(h: i64, now: i64, not_done: &HashSet<i64>, seen: &BTreeMap<i64, i64
     if end + LIVE_WAIT > now {
         return false;
     }
-    let (first_day, last_day) = ((h * HOUR - MARGIN).div_euclid(DAY), (end - 1 + MARGIN).div_euclid(DAY));
+    // the UTC days a row of this wall-clock hour can sit in, whatever the poster's zone, and two hours either side
+    let (first_day, last_day) = ((h * HOUR - MARGIN - ZONE).div_euclid(DAY), (end - 1 + MARGIN + ZONE).div_euclid(DAY));
     if !(first_day..=last_day).any(|d| not_done.contains(&d)) {
         return true;
     }
@@ -527,6 +528,20 @@ impl Linker {
                 (from..=to).any(|h| !self.state.linked.contains(&h))
             })
             .collect()
+    }
+
+    /// `unlinked_days` over everything `store` holds, and the days with blocks this linker hasn't read yet (late rows).
+    pub fn unlinked_in(&self, store: &Store) -> BTreeSet<i64> {
+        let segs = store.segments();
+        let mut days: BTreeSet<i64> = segs.iter().map(|x| x.1).collect();
+        days.extend(store.open_days());
+        let mut out = self.unlinked_days(&days);
+        for (g, d, n) in &segs {
+            if *n as u32 > self.state.counts.get(&(g.clone(), *d)).copied().unwrap_or(0) {
+                out.insert(*d);
+            }
+        }
+        out
     }
 
     /// One pass at `now`: None when no hour is ready and nothing came late. `not_done` is the backfill days still to
@@ -775,79 +790,91 @@ impl Linker {
                 continue;
             }
             let poster = &posters[pid];
-            let mut rows: &Vec<usize> = rows;
-            let new_rows: Vec<usize>;
+            // the poster's rows that go to new files, and whether they're a later upload of a poster already placed
+            let mut rest: Vec<usize> = rows.clone();
             let mut again = false;
             if let Some(pr) = links.places.get(poster) {
-                // a file already placed: its new articles (late, or of the hours linked now) are more of its parts
+                // a file already placed: its new articles (late, or of the hours linked now) within its upload's time
+                // are more of its parts; the rest, before or after it by more than `JOIN_GAP` (hours are linked out of
+                // order, live before backfill), are the poster uploading again under the same name
                 let new: Vec<usize> =
                     rows.iter().copied().filter(|&i| arts[i].late || new_hour(arts[i].posted)).collect();
                 if new.is_empty() {
                     continue;
                 }
-                // posted well after its upload ended: the poster uploading again under the same name, a new upload of
-                // its own made of the new articles only
-                let upload_last = links.uploads.get(&pr.place.release).map(|u| u.seed.last);
-                let first_new = new.iter().map(|&i| arts[i].posted).min().unwrap_or(i64::MAX);
-                if upload_last.is_none_or(|last| first_new > last + JOIN_GAP) {
-                    stats.posted_again += 1;
-                    new_rows = new;
-                    rows = &new_rows;
-                    again = true;
-                } else if pr.place.oldest < now - KEEP_SECS {
-                    // within its upload's time but its first articles left the window long ago: one read again
-                    // couldnt be told from a new one
+                let window =
+                    links.uploads.get(&pr.place.release).map(|u| (u.seed.first - JOIN_GAP, u.seed.last + JOIN_GAP));
+                let (join, others): (Vec<usize>, Vec<usize>) = new
+                    .iter()
+                    .partition(|&&i| window.is_some_and(|(lo, hi)| arts[i].posted >= lo && arts[i].posted <= hi));
+                // within its upload's time but its first articles left the window long ago: one read again couldnt be
+                // told from a new one, soo those are let go
+                if !join.is_empty() && pr.place.oldest >= now - KEEP_SECS {
+                    stats.late_files += 1;
+                    let mut file_rows = to_rows(&arts, &join, &msgid_of, now);
+                    for r in &mut file_rows {
+                        r.lead = r.lead && pr.firsts.get(&r.grp).is_none_or(|&n| r.number < n);
+                    }
+                    let parts = pr.place.parts + file_rows.len() as i64;
+                    let mut firsts = pr.firsts.clone();
+                    for r in &file_rows {
+                        let e = firsts.entry(r.grp).or_insert(r.number);
+                        *e = (*e).min(r.number);
+                    }
+                    let leads = crate::xref::with_leads(
+                        &pr.place.leads,
+                        crate::xref::add_file(&mut out, &pr.place, poster, file_rows, parts),
+                    );
+                    let rec = PlaceRec { place: Place { parts, leads, ..pr.place.clone() }, firsts, added: now };
+                    lines.push(Links::place_line(poster, &rec));
+                    if let Some(j) = saved.iter().position(|(r, _)| *r == pr.place.release) {
+                        let seed = &mut saved[j].1.seed;
+                        for &i in &join {
+                            seed.groups.insert(arts[i].grp);
+                            seed.first = seed.first.min(arts[i].posted);
+                            seed.last = seed.last.max(arts[i].posted);
+                        }
+                        grown.insert(j);
+                    }
+                }
+                if others.is_empty() {
                     continue;
                 }
+                stats.posted_again += 1;
+                rest = others;
+                again = true;
             }
-            if let (Some(pr), false) = (links.places.get(poster), again) {
-                let new: Vec<usize> =
-                    rows.iter().copied().filter(|&i| arts[i].late || new_hour(arts[i].posted)).collect();
-                stats.late_files += 1;
-                let mut file_rows = to_rows(&arts, &new, &msgid_of, now);
-                for r in &mut file_rows {
-                    r.lead = r.lead && pr.firsts.get(&r.grp).is_none_or(|&n| r.number < n);
-                }
-                let parts = pr.place.parts + file_rows.len() as i64;
-                let mut firsts = pr.firsts.clone();
-                for r in &file_rows {
-                    let e = firsts.entry(r.grp).or_insert(r.number);
-                    *e = (*e).min(r.number);
-                }
-                let leads = crate::xref::with_leads(
-                    &pr.place.leads,
-                    crate::xref::add_file(&mut out, &pr.place, poster, file_rows, parts),
-                );
-                let rec = PlaceRec { place: Place { parts, leads, ..pr.place.clone() }, firsts, added: now };
-                lines.push(Links::place_line(poster, &rec));
-                if let Some(j) = saved.iter().position(|(r, _)| *r == pr.place.release) {
-                    let seed = &mut saved[j].1.seed;
-                    for &i in &new {
-                        seed.groups.insert(arts[i].grp);
-                        seed.first = seed.first.min(arts[i].posted);
-                        seed.last = seed.last.max(arts[i].posted);
+            // runs apart by more than `JOIN_GAP` are separate files (separate uploads, when the poster is placed)
+            rest.sort_by_key(|&i| (arts[i].posted, i));
+            let mut runs: Vec<Vec<usize>> = Vec::new();
+            for i in rest {
+                match runs.last_mut() {
+                    Some(r) if again && arts[i].posted - arts[*r.last().expect("non-empty")].posted > JOIN_GAP => {
+                        runs.push(vec![i])
                     }
-                    grown.insert(j);
+                    Some(r) => r.push(i),
+                    None => runs.push(vec![i]),
                 }
-                continue;
             }
-            let mut f = FileSum {
-                poster: poster.clone(),
-                n: 0,
-                first: i64::MAX,
-                last: i64::MIN,
-                added: 0,
-                groups: BTreeSet::new(),
-            };
-            for &i in rows {
-                f.n += 1;
-                f.first = f.first.min(arts[i].posted);
-                f.last = f.last.max(arts[i].posted);
-                f.groups.insert(arts[i].grp);
+            for run in runs {
+                let mut f = FileSum {
+                    poster: poster.clone(),
+                    n: 0,
+                    first: i64::MAX,
+                    last: i64::MIN,
+                    added: 0,
+                    groups: BTreeSet::new(),
+                };
+                for &i in &run {
+                    f.n += 1;
+                    f.first = f.first.min(arts[i].posted);
+                    f.last = f.last.max(arts[i].posted);
+                    f.groups.insert(arts[i].grp);
+                }
+                fresh.push(f);
+                fresh_rows.push(run);
+                again_files.push(again);
             }
-            fresh.push(f);
-            fresh_rows.push(rows.clone());
-            again_files.push(again);
         }
         stats.files = fresh.len() as u64;
         let seeds: Vec<Seed> = saved.iter().map(|(_, u)| u.seed.clone()).collect();
@@ -1092,18 +1119,24 @@ pub async fn run(db: crate::indexer::Db, store: Arc<Store>, stopping: impl Fn() 
         }
     };
     let _ = ACTIVE.set(Mutex::new(Some(Arc::clone(&linker.links))));
+    // the keep set knows the unlinked days from the state read, before any pass
+    if let Ok(mut u) = UNLINKED.lock() {
+        *u = linker.unlinked_in(&store);
+    }
     let linker = Arc::new(Mutex::new(linker));
     while !stopping() {
         let (l, s) = (Arc::clone(&linker), Arc::clone(&store));
         let found = tokio::task::spawn_blocking(move || -> Result<Option<Found>> {
-            let not_done = not_done_days()?;
             let mut lk = l.lock().unwrap_or_else(|e| e.into_inner());
+            // refreshed before the pass too, soo a pass that fails still leaves the keep set current
+            if let Ok(mut u) = UNLINKED.lock() {
+                *u = lk.unlinked_in(&s);
+            }
+            let not_done = not_done_days()?;
             let stop = || crate::frozen::STOPPING.load(std::sync::atomic::Ordering::Relaxed);
             let found = lk.pass(&s, chrono::Utc::now().timestamp(), &not_done, &stop)?;
-            let mut days: BTreeSet<i64> = s.segments().into_iter().map(|x| x.1).collect();
-            days.extend(s.open_days());
             if let Ok(mut u) = UNLINKED.lock() {
-                *u = lk.unlinked_days(&days);
+                *u = lk.unlinked_in(&s);
             }
             Ok(found)
         })
@@ -1129,6 +1162,7 @@ pub async fn run(db: crate::indexer::Db, store: Arc<Store>, stopping: impl Fn() 
             }
         };
         let st = found.stats.clone();
+        let linked_hours = !found.hours.is_empty();
         let (count, articles) = (found.releases.len(), found.releases.iter().map(|r| r.articles.len()).sum::<usize>());
         let mut by_shard: HashMap<usize, Vec<Release>> = HashMap::new();
         for r in &found.releases {
@@ -1158,8 +1192,20 @@ pub async fn run(db: crate::indexer::Db, store: Arc<Store>, stopping: impl Fn() 
                     );
                 }
             }
-            Ok(Err(e)) => eprintln!("header store linker: couldnt note the pass: {e:#}"),
-            Err(e) => eprintln!("header store linker: noting the pass failed: {e}"),
+            // a note written in part (a torn record) mustn't be followed by more appends: fail-stop, and the next
+            // start reads the files back to their last whole record
+            Ok(Err(e)) => {
+                eprintln!("header store linker: couldnt note the pass: {e:#}; exiting soo recovery runs");
+                std::process::exit(70);
+            }
+            Err(e) => {
+                eprintln!("header store linker: noting the pass failed: {e}; exiting soo recovery runs");
+                std::process::exit(70);
+            }
+        }
+        // a pass that linked no new hour (late rows only) doesn't go round again at once
+        if !linked_hours {
+            sleep_unless(PASS_EVERY, &stopping).await;
         }
     }
 }
