@@ -724,7 +724,8 @@ pub(crate) fn volumes_text(files: &[(String, i64)]) -> Option<String> {
     use crate::archive::select::{Kind as File, classify, set_name};
     use std::collections::BTreeMap;
     // (format, set) -> volumes, and whether the set is named the old way (`.rar`, `.r00`, ...), which starts at 0
-    let mut sets: BTreeMap<(&str, String), (Vec<(u32, i64)>, bool)> = BTreeMap::new();
+    type Set = (Vec<(u32, i64)>, bool);
+    let mut sets: BTreeMap<(&str, String), Set> = BTreeMap::new();
     for (name, size) in files {
         // RAR only: the probe can't tell an encrypted 7z, and a `.001` split could be anything
         let (format, volume) = match classify(name) {
