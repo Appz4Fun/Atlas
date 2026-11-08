@@ -1290,19 +1290,7 @@ pub fn run() -> i32 {
     // would look missing. kept for indexing
     let writing = match db::create_db() {
         Ok(Some(held)) => match crate::compact::refuse_unresolved_backups(&paths::database()) {
-            Ok(()) => {
-                // forward backfill's first day, fixed once (a change in the config needs a restart)
-                let now = chrono::Utc::now().timestamp();
-                match db::open_at(&paths::database())
-                    .map_err(anyhow::Error::from)
-                    .and_then(|c| Ok(crate::chunks::set_forward_start(&c, config.backfill_start_days_back, now)?))
-                {
-                    Ok(day) if day > 0 => ui::print(&format!("backfill reads forward from day {day} to live")),
-                    Ok(_) => {}
-                    Err(e) => ui::warn(&format!("couldnt set the forward backfill's start: {e:#}")),
-                }
-                held
-            }
+            Ok(()) => held,
             Err(e) => {
                 ui::error(&format!("not indexing: {e:#}"));
                 write_status(false, "", &config.index_mode, false, "stopped", true, 1);
@@ -1335,6 +1323,19 @@ pub fn run() -> i32 {
             return 1;
         }
     };
+    {
+        // forward backfill's first day, fixed once, in the main database it indexes into (after any conversion); a
+        // change in the config needs a restart
+        let now = chrono::Utc::now().timestamp();
+        match db::open_at(&main)
+            .map_err(anyhow::Error::from)
+            .and_then(|c| Ok(crate::chunks::set_forward_start(&c, config.backfill_start_days_back, now)?))
+        {
+            Ok(day) if day > 0 => ui::print(&format!("backfill reads forward from day {day} to live")),
+            Ok(_) => {}
+            Err(e) => ui::warn(&format!("couldnt set the forward backfill's start: {e:#}")),
+        }
+    }
 
     let stop = Arc::new(AtomicBool::new(false));
 

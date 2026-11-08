@@ -181,7 +181,7 @@ pub struct Config {
     pub request_size: Option<u64>,
     /// None = SPLIT_MIN_BACKLOG
     pub split_min_backlog: Option<i64>,
-    /// backfill forward from this many days back (`chunks::FORWARD_FROM_DAYS`); None = newest day first
+    /// backfill forward from this many days back (`chunks::FORWARD_START_DAY`); None = newest day first
     pub backfill_start_days_back: Option<i64>,
     /// groups indexed at the same time, None = worked out from the connections
     pub parallel_groups: Option<usize>,

@@ -311,6 +311,8 @@ pub fn set_forward_start(conn: &Connection, back: Option<i64>, now: i64) -> Resu
 fn forward_start_day(conn: &Connection, back: Option<i64>, now: i64) -> Result<i64> {
     let back = back.filter(|b| *b > 0).unwrap_or(0);
     let day = if back == 0 {
+        // off: what was kept goes, soo turning it on again later starts from then, not from the old start
+        conn.execute("delete from meta where key in (?1, ?2)", [FORWARD_BACK_KEY, FORWARD_START_KEY])?;
         0
     } else {
         let kept_back = crate::store::get_meta(conn, FORWARD_BACK_KEY)?;
@@ -348,7 +350,7 @@ fn claim_any(conn: &Connection, groups: &[(String, i64)], host: &str, now: i64) 
     claim_with(conn, groups, host, now, forward_from(now))
 }
 
-/// `claim`, forward from day `start` when given (`FORWARD_FROM_DAYS`).
+/// `claim`, forward from day `start` when given (`FORWARD_START_DAY`).
 fn claim_with(
     conn: &Connection,
     groups: &[(String, i64)],
@@ -460,7 +462,7 @@ pub fn frontier(conn: &Connection, groups: &[(String, i64)], now: i64) -> Result
 }
 
 /// The oldest day any of `groups` still has to do or is doing, from each one's `oldest` on: (group, first day). The
-/// forward backfill's frontier (`FORWARD_FROM_DAYS`), as `frontier` is the usual one's.
+/// forward backfill's frontier (`FORWARD_START_DAY`), as `frontier` is the usual one's.
 pub fn frontier_oldest(conn: &Connection, groups: &[(String, i64)], now: i64) -> Result<Option<i64>> {
     if groups.is_empty() {
         return Ok(None);
@@ -1404,6 +1406,7 @@ mod tests {
         assert_eq!(forward_start_day(&c, Some(30), day(20_105)).unwrap(), 20_070, "a later start keeps it");
         assert_eq!(forward_start_day(&c, Some(10), day(20_105)).unwrap(), 20_095, "a new count, a new start");
         assert_eq!(forward_start_day(&c, None, day(20_105)).unwrap(), 0);
+        assert_eq!(forward_start_day(&c, Some(10), day(20_200)).unwrap(), 20_190, "on again: from then");
     }
 
     #[test]
