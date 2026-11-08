@@ -70,7 +70,10 @@ fn lookup_of(i: &MetaInputs<'_>, l: &Looked) -> crate::keys::Lookup {
     let timing: Vec<(Option<i64>, i64)> = l.timing.iter().map(|t| (t.lines, t.articles)).collect();
     let shard = shard_conn(i.release.id);
     crate::keys::Lookup {
-        keys: crate::keys::keys_of(i.probe, &timing, i.release.parts, l.salt),
+        keys: crate::keys::Keys {
+            volumes: shard.as_ref().and_then(|s| crate::keys::volume_key(s, i.release.id, i.probe)),
+            ..crate::keys::keys_of(i.probe, &timing, i.release.parts, l.salt)
+        },
         par2_sets: shard
             .as_ref()
             .map(|s| crate::keys::par2_sets(s, i.release.id).unwrap_or_default())
@@ -2251,6 +2254,11 @@ fn keys_panel(i: &MetaInputs<'_>, l: &Looked, compact: bool) -> Facts {
         "Chapter times key",
         media.and_then(crate::keys::chapters_text).map(|t| with_link(key16(t.as_bytes()), Kind::Chapters)),
     );
+    // an encrypted set's volume sizes: how many releases share them, the sizes are on the PAR2 panel
+    let link = same_link(l, id, Kind::Volumes);
+    if !link.is_empty() {
+        f.add_html("Encrypted volume sizes", Some(format!("Volume size, count and last size{link}")));
+    }
     f.add_html(
         "Thread key",
         i.probe

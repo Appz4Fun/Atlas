@@ -185,8 +185,8 @@ pub fn others(conn: &Connection, own: i64, limit: i64) -> Vec<i64> {
 }
 
 /// Kinds too common to say a print is needless: a stock subtitle header (ffmpeg's or HandBrake's ASS for a converted
-/// SRT) or a series' fonts ties releases that are not the same film.
-const TOO_COMMON: [Kind; 2] = [Kind::Subs, Kind::Fonts];
+/// SRT), a series' fonts or one volume cut ties releases that are not the same film.
+const TOO_COMMON: [Kind; 3] = [Kind::Subs, Kind::Fonts, Kind::Volumes];
 
 /// The first key that already ties a release to another one, other than who posted it, the too common ones and its
 /// own print: a print is only made when there's none. `conn` has every shard attached.
