@@ -988,6 +988,87 @@ thread_local! {
 /// The key of `release_ids`' hashes, the shard's own.
 pub(crate) struct IdKey(u64, u64);
 
+/// The secrets of the shards folded into this one (`merge_shards`), each a key their collections were hashed with.
+/// None before a merge.
+fn legacy_keys(conn: &Connection, schema: &str) -> Result<Vec<(i64, i64)>> {
+    let has: bool = conn
+        .prepare_cached(&format!(
+            "select 1 from {schema}.sqlite_master where type = 'table' and name = 'merge_shards'"
+        ))?
+        .exists([])?;
+    if !has {
+        return Ok(Vec::new());
+    }
+    conn.prepare_cached(&format!(
+        "select key0, key1 from {schema}.merge_shards where key0 is not null and key1 is not null"
+    ))?
+    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+    .collect()
+}
+
+/// A collection a folded shard hashed with its own secret, moved under this shard's (`key`) the first time it comes
+/// again: its live row (`legacy_collections`) and whether it was junk (`legacy_junk_collections`). The strings
+/// weren't kept, soo it can only be moved when it comes.
+fn adopt_legacy_collection(tx: &Connection, key: &IdKey, collection: &str) -> Result<()> {
+    let keys = legacy_keys(tx, "main")?;
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let hash = key.hash(collection);
+    for (k0, k1) in keys {
+        let old = IdKey(k0 as u64, k1 as u64).hash(collection);
+        let release: Option<i64> = tx
+            .prepare_cached("select release_id from legacy_collections where key0 = ?1 and key1 = ?2 and key = ?3")?
+            .query_row(params![k0, k1, old], |r| r.get(0))
+            .optional()?;
+        if let Some(release) = release {
+            tx.prepare_cached("insert or ignore into collections (key, release_id) values (?1, ?2)")?
+                .execute(params![hash, release])?;
+            tx.prepare_cached("delete from legacy_collections where key0 = ?1 and key1 = ?2 and key = ?3")?
+                .execute(params![k0, k1, old])?;
+        }
+        let junk = tx
+            .prepare_cached("delete from legacy_junk_collections where key0 = ?1 and key1 = ?2 and key = ?3")?
+            .execute(params![k0, k1, old])?;
+        if junk > 0 {
+            crate::junk::remember_collection(tx, hash)?;
+        }
+    }
+    Ok(())
+}
+
+/// `adopt_legacy_collection` for a frozen release's collection, in the frozen file (`frozen`): what
+/// `frozen::thaw_incoming` looks it up by.
+fn adopt_legacy_frozen_collection(tx: &Connection, key: &IdKey, collection: &str) -> Result<()> {
+    let has: bool = tx
+        .prepare_cached(
+            "select 1 from frozen.sqlite_master where type = 'table' and name = 'legacy_frozen_collections'",
+        )?
+        .exists([])?;
+    if !has {
+        return Ok(());
+    }
+    let hash = key.hash(collection);
+    for (k0, k1) in legacy_keys(tx, "main")? {
+        let old = IdKey(k0 as u64, k1 as u64).hash(collection);
+        let release: Option<i64> = tx
+            .prepare_cached(
+                "select release_id from frozen.legacy_frozen_collections where key0 = ?1 and key1 = ?2 and key = ?3",
+            )?
+            .query_row(params![k0, k1, old], |r| r.get(0))
+            .optional()?;
+        if let Some(release) = release {
+            tx.prepare_cached("insert or ignore into frozen.frozen_collections (key, release_id) values (?1, ?2)")?
+                .execute(params![hash, release])?;
+            tx.prepare_cached(
+                "delete from frozen.legacy_frozen_collections where key0 = ?1 and key1 = ?2 and key = ?3",
+            )?
+            .execute(params![k0, k1, old])?;
+        }
+    }
+    Ok(())
+}
+
 impl IdKey {
     pub(crate) fn of(conn: &Connection) -> Result<IdKey> {
         let get =
@@ -2514,6 +2595,9 @@ impl ShardWriter {
             for release in batches.into_iter().flatten().filter(|r| !crate::filters::group_blocked(&r.group)) {
                 // a frozen first upload's row comes back, with its routes, before they are read
                 if frozen {
+                    if let Some(c) = release.collection.as_deref() {
+                        adopt_legacy_frozen_collection(&tx, &key, c)?;
+                    }
                     let collection = release.collection.as_deref().map(|c| key.hash(c));
                     let articles: Vec<(&str, &str)> = release
                         .articles
@@ -2925,6 +3009,7 @@ struct CollectionRow {
 /// that, with 8 digits of the key's hash after it, as `a [4]` has its count.
 fn collection_row(tx: &Connection, key: &IdKey, collection: &str, release: &Release) -> Result<CollectionRow> {
     let hash = key.hash(collection);
+    adopt_legacy_collection(tx, key, collection)?;
     // a purge can leave a row here, whose release is gone: it finds nothing
     let known: Option<(String, bool)> = tx
         .prepare_cached(

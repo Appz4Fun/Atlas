@@ -540,22 +540,22 @@ Format                                   : Matroska
         }
         // the table as the shard has it, without its counter's triggers
         conn.execute_batch(
-            "create table s3.sidecars (release_id INTEGER PRIMARY KEY, name TEXT NOT NULL, group_name TEXT NOT NULL,
+            "create table s0.sidecars (release_id INTEGER PRIMARY KEY, name TEXT NOT NULL, group_name TEXT NOT NULL,
                 file TEXT, kind TEXT NOT NULL, release_name TEXT, segment_uid TEXT, text TEXT, at INTEGER NOT NULL)",
         )
         .unwrap();
         conn.execute_batch(
-            "insert into s3.sidecars values (11, 'mediainfo', 'g', 'mediainfo.txt', 'mediainfo', 'Some.Film.2024', '55f84b6aa194d59703ccab394da26cde', 'General', 1);
-             insert into s3.sidecars values (19, 'grp.nfo', 'g', 'grp.nfo', 'nfo', 'Some.Film.2024', null, 'NFO', 2);
-             insert into s3.sidecars values (27, 'other', 'g', 'x.nfo', 'nfo', 'Other.Film', null, 'x', 3);",
+            "insert into s0.sidecars values (11, 'mediainfo', 'g', 'mediainfo.txt', 'mediainfo', 'Some.Film.2024', '55f84b6aa194d59703ccab394da26cde', 'General', 1);
+             insert into s0.sidecars values (19, 'grp.nfo', 'g', 'grp.nfo', 'nfo', 'Some.Film.2024', null, 'NFO', 2);
+             insert into s0.sidecars values (27, 'other', 'g', 'x.nfo', 'nfo', 'Other.Film', null, 'x', 3);",
         )
         .unwrap();
         conn.execute_batch(
-            "create index s3.sidecars_release_name_nocase on sidecars(release_name collate nocase) where release_name is not null",
+            "create index s0.sidecars_release_name_nocase on sidecars(release_name collate nocase) where release_name is not null",
         )
         .unwrap();
         let mut stmt = conn
-            .prepare("explain query plan select release_id from s3.sidecars where release_name = ?1 collate nocase and release_id != ?2")
+            .prepare("explain query plan select release_id from s0.sidecars where release_name = ?1 collate nocase and release_id != ?2")
             .unwrap();
         let plan: Vec<String> =
             stmt.query_map(rusqlite::params!["x", 0], |r| r.get::<_, String>(3)).unwrap().map(Result::unwrap).collect();

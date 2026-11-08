@@ -920,7 +920,7 @@ mod tests {
         let main = dir.path().join("atlas.db");
         crate::db::create_db_at(&main).unwrap();
         let conn = crate::db::open_with_shards(&main).unwrap();
-        let s = 3;
+        let s = store::SHARDS - 1;
         for (i, rank) in [(1, 2), (2, 1), (3, 1), (4, 0), (5, 1)] {
             let id = i * store::SHARDS as i64 + s as i64;
             conn.execute(

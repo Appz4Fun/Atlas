@@ -532,9 +532,9 @@ mod tests {
             store::create_shard(&path).unwrap();
             conn.execute(&format!("attach database ?1 as s{s}"), [path.to_string_lossy()]).unwrap();
         }
-        let release = store::global_id(7, 3);
+        let release = store::global_id(7, 0);
         conn.execute(
-            "insert into s3.releases (id, name, group_name, size, complete, parts) values (?, 'r', 'g', 0, 0, 0)",
+            "insert into s0.releases (id, name, group_name, size, complete, parts) values (?, 'r', 'g', 0, 0, 0)",
             [release],
         )
         .unwrap();
@@ -549,13 +549,13 @@ mod tests {
             let encoded = blob.as_ref().map(|sizes| crate::blob::encode(&segs(sizes)));
             let bytes = blob.as_ref().filter(|_| counted).map(|sizes| sizes.iter().sum::<i64>());
             conn.execute(
-                "insert into s3.files (id, release_id, filename, seen, blob, blob_bytes) values (?, ?, ?, x'00', ?, ?)",
+                "insert into s0.files (id, release_id, filename, seen, blob, blob_bytes) values (?, ?, ?, x'00', ?, ?)",
                 params![id, release, name, encoded, bytes],
             )
             .unwrap();
             for (i, b) in rows.iter().enumerate() {
                 conn.execute(
-                    "insert into s3.segments (file_id, local, domain, part, bytes) values (?, ?, 0, ?, ?)",
+                    "insert into s0.segments (file_id, local, domain, part, bytes) values (?, ?, 0, ?, ?)",
                     params![id, store::pack_local(&format!("<r{id}.{i}@x>")), 50 + i as i64, b],
                 )
                 .unwrap();

@@ -1169,6 +1169,10 @@ mod tests {
 
     #[test]
     fn a_drain_writes_one_shard_at_a_time() {
+        // only with more than one shard
+        if store::SHARDS < 2 {
+            return;
+        }
         let f = fixture();
         // alt.binaries.c is in shard 0, alt.binaries.b in shard 3
         assert_eq!((store::shard_of("alt.binaries.c"), store::shard_of("alt.binaries.b")), (0, 3));

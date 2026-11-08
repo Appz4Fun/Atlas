@@ -1505,7 +1505,12 @@ mod tests {
                 .unwrap();
             }
         }
-        assert_eq!(domains(main), 120 + 5, "every made up domain has a row, ngPost one per shard used");
+        let shards_used = (0..5).map(|g| store::shard_of(&format!("alt.binaries.g{g}"))).collect::<HashSet<_>>().len();
+        assert_eq!(
+            domains(main),
+            120 + shards_used as i64,
+            "every made up domain has a row, ngPost one per shard used"
+        );
     }
 
     /// The sample is compared by digest, order aside; a copy that lost a
@@ -2364,6 +2369,10 @@ mod tests {
 
     #[test]
     fn a_failed_shard_doesnt_stop_the_others() {
+        // only with others: one shard is `a_corrupt_blob_stops_compacting_and_keeps_the_original`
+        if SHARDS < 2 {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let main = dir.path().join("atlas.db");
         legacy_fixture(&main);
@@ -2482,6 +2491,8 @@ mod tests {
         legacy_fixture(&main);
         let group = "alt.binaries.g3";
         let path = store::shard_path(&main, store::shard_of(group));
+        let kept = dir.path().join("kept.db");
+        std::fs::copy(&path, &kept).unwrap();
 
         // no backup at all
         remove_db(&path);
@@ -2491,7 +2502,7 @@ mod tests {
 
         // only a compacted copy, which may not have been checked: kept, still refused
         let copy = with_suffix(&path, "compact");
-        std::fs::copy(store::shard_path(&main, (store::shard_of(group) + 1) % SHARDS), &copy).unwrap();
+        std::fs::copy(&kept, &copy).unwrap();
         let err = format!("{:#}", db::create_db_at(&main).unwrap_err());
         assert!(err.contains(&copy.display().to_string()), "{err}");
         assert!(!path.exists() && copy.exists(), "the copy is left for whoever puts it back");

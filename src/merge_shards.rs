@@ -249,18 +249,25 @@ fn domains_not_unique(conn: &Connection) -> Result<()> {
 /// `atlas_shift_blob(blob, base)` on `conn`: a stored blob with its domains moved on by `base` (`blob::shift_blob`).
 fn register_shift(conn: &Connection) -> Result<()> {
     use rusqlite::functions::FunctionFlags;
-    conn.create_scalar_function("atlas_shift_blob", 2, FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC, |ctx| {
-        let base: i64 = ctx.get(1)?;
-        match ctx.get_raw(0) {
-            rusqlite::types::ValueRef::Null => Ok(rusqlite::types::Value::Null),
-            rusqlite::types::ValueRef::Blob(b) => crate::blob::shift_blob(b, base)
-                .map(rusqlite::types::Value::Blob)
-                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e))),
-            rusqlite::types::ValueRef::Integer(i) => Ok(rusqlite::types::Value::Integer(i)),
-            rusqlite::types::ValueRef::Real(f) => Ok(rusqlite::types::Value::Real(f)),
-            rusqlite::types::ValueRef::Text(t) => Ok(rusqlite::types::Value::Text(String::from_utf8_lossy(t).into_owned())),
-        }
-    })?;
+    conn.create_scalar_function(
+        "atlas_shift_blob",
+        2,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let base: i64 = ctx.get(1)?;
+            match ctx.get_raw(0) {
+                rusqlite::types::ValueRef::Null => Ok(rusqlite::types::Value::Null),
+                rusqlite::types::ValueRef::Blob(b) => crate::blob::shift_blob(b, base)
+                    .map(rusqlite::types::Value::Blob)
+                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e))),
+                rusqlite::types::ValueRef::Integer(i) => Ok(rusqlite::types::Value::Integer(i)),
+                rusqlite::types::ValueRef::Real(f) => Ok(rusqlite::types::Value::Real(f)),
+                rusqlite::types::ValueRef::Text(t) => {
+                    Ok(rusqlite::types::Value::Text(String::from_utf8_lossy(t).into_owned()))
+                }
+            }
+        },
+    )?;
     Ok(())
 }
 
@@ -700,7 +707,6 @@ fn merge_frozen(
     result
 }
 
-
 /// The directory of `path` flushed, soo a deletion in it holds after a power cut.
 fn sync_dir(path: &Path) {
     if let Some(dir) = path.parent()
@@ -895,27 +901,17 @@ mod tests {
         }
     }
 
-    /// a group name for each shard
+    /// a group name for each shard there was
     fn groups() -> Vec<String> {
-        let mut by_shard: Vec<Option<String>> = vec![None; LEGACY_SHARDS];
-        for i in 0.. {
-            let g = format!("alt.binaries.g{i}");
-            let s = store::shard_of(&g);
-            if by_shard[s].is_none() {
-                by_shard[s] = Some(g);
-            }
-            if by_shard.iter().all(Option::is_some) {
-                break;
-            }
-        }
-        by_shard.into_iter().map(Option::unwrap).collect()
+        (0..LEGACY_SHARDS).map(|s| format!("alt.binaries.g{s}")).collect()
     }
 
     fn count(conn: &Connection, sql: &str) -> i64 {
         conn.query_row(sql, [], |r| r.get(0)).unwrap()
     }
 
-    /// Eight shards with two releases each, their articles under a domain of their own and one shared by all.
+    /// Eight shards as there were, two releases each, their articles under a domain of their own and one rare: shard
+    /// 0 is `main`'s own, each other made as a database of its own (its own secret, its ids apart) and put in place.
     fn fixture(main: &Path) -> Vec<String> {
         crate::db::create_db_at(main).unwrap();
         let groups = groups();
@@ -934,7 +930,18 @@ mod tests {
                     ..Default::default()
                 })
                 .collect();
-            store::save(main, &releases).unwrap();
+            if s == 0 {
+                store::save(main, &releases).unwrap();
+                continue;
+            }
+            let other = tempfile::tempdir().unwrap();
+            let other_main = other.path().join("atlas.db");
+            crate::db::create_db_at(&other_main).unwrap();
+            store::set_next_seq(&crate::db::open_at(&other_main).unwrap(), 1000 * s as i64).unwrap();
+            store::save(&other_main, &releases).unwrap();
+            let made = legacy_shard_path(&other_main, 0);
+            crate::db::open_at(&made).unwrap().query_row("pragma wal_checkpoint(truncate)", [], |_| Ok(())).unwrap();
+            std::fs::copy(&made, legacy_shard_path(main, s)).unwrap();
         }
         groups
     }
@@ -987,23 +994,20 @@ mod tests {
         assert_eq!(count(&c, "select count(distinct id) from files"), before.1);
         assert_eq!(count(&c, "select count(*) from segments where file_id not in (select id from files)"), 0);
         // each source's domains kept apart, its articles pointing at them; a message-id stored whole stays so
-        assert_eq!(count(&c, "select count(*) from legacy_domains"), LEGACY_SHARDS as i64 - 1);
+        // each source's domains kept apart under its base, its articles pointing at them; a whole message-id stays so
+        assert_eq!(count(&c, "select count(*) from domains where id >= 4294967296"), LEGACY_SHARDS as i64 - 1);
         assert_eq!(
             count(
                 &c,
-                "select count(*) from segments s join files f on f.id = s.file_id
-                 where coalesce(f.domain_base, 0) != 0 and s.domain != 0
-                   and s.domain not in (select id from legacy_domains)"
+                "select count(*) from segments s where s.domain != 0 and s.domain not in (select id from domains)"
             ),
             0
         );
         assert_eq!(count(&c, "select count(*) from segments where domain = 0"), before_whole);
         let suffix_of = |name: &str| -> String {
             c.query_row(
-                "select coalesce((select suffix from domains where id = s.domain),
-                                 (select suffix from legacy_domains where id = s.domain))
-                 from segments s join files f on f.id = s.file_id join releases r on r.id = f.release_id
-                 where r.name = ?1 and s.part = 3",
+                "select d.suffix from segments s join files f on f.id = s.file_id join releases r on r.id = f.release_id
+                 join domains d on d.id = s.domain where r.name = ?1 and s.part = 3",
                 [name],
                 |r| r.get(0),
             )
@@ -1082,5 +1086,97 @@ mod tests {
         let c = crate::db::open_at(&target).unwrap();
         assert_eq!(count(&c, "select count(*) from merge_triggers"), 0, "triggers back");
         assert!(count(&c, "select count(*) from sqlite_master where type = 'trigger'") > 1);
+    }
+
+    /// A source's file sealed in a blob, the way the writer leaves a whole file: its rows packed and gone.
+    fn seal_first_file(shard: &Path) {
+        let c = crate::db::open_at(shard).unwrap();
+        let file: i64 = c.query_row("select min(id) from files", [], |r| r.get(0)).unwrap();
+        let segs: Vec<crate::blob::Seg> = c
+            .prepare("select part, bytes, domain, local from segments where file_id = ?1")
+            .unwrap()
+            .query_map([file], |r| {
+                Ok(crate::blob::Seg { part: r.get(0)?, bytes: r.get(1)?, domain: r.get(2)?, local: r.get(3)? })
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(segs.iter().any(|s| s.domain != 0), "a domain to move");
+        c.execute("update files set blob = ?1 where id = ?2", params![crate::blob::encode(&segs), file]).unwrap();
+        c.execute("delete from segments where file_id = ?1", [file]).unwrap();
+    }
+
+    #[test]
+    fn merged_releases_read_back_their_articles_and_take_their_posts_late_articles() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        let groups = fixture(&main);
+        seal_first_file(&legacy_shard_path(&main, 5));
+        let ids_of = |main: &Path, name: &str| -> Vec<String> {
+            let conn = crate::db::open_with_shards(main).unwrap();
+            let id: i64 = (0..LEGACY_SHARDS)
+                .filter(|s| legacy_shard_path(main, *s).exists())
+                .find_map(|s| {
+                    crate::db::open_at(&legacy_shard_path(main, s))
+                        .unwrap()
+                        .query_row("select id from releases where name = ?1", [name], |r| r.get(0))
+                        .ok()
+                })
+                .unwrap();
+            let _ = &conn;
+            let c = crate::db::open_at(&legacy_shard_path(main, 0)).unwrap();
+            let mut rows: Vec<String> = Vec::new();
+            let blob: Option<Vec<u8>> = c
+                .query_row("select blob from files where release_id = ?1 and blob is not null", [id], |r| r.get(0))
+                .optional()
+                .unwrap();
+            for seg in blob.map(|b| crate::blob::decode(&b).unwrap()).unwrap_or_default() {
+                let suffix: Option<String> = (seg.domain != 0).then(|| {
+                    c.query_row("select suffix from domains where id = ?1", [seg.domain], |r| r.get(0)).unwrap()
+                });
+                rows.push(store::decode(&seg.local, suffix.as_deref()));
+            }
+            rows.sort();
+            rows
+        };
+        let target = legacy_shard_path(&main, 0);
+        merge(&target, &sources(&main), true, None, &|_| {}).unwrap();
+        finish(&main, &target).unwrap();
+        // the sealed file of shard 5: its blob, read through the merged domains, gives the same message-ids
+        let read = ids_of(&main, "Rel.5.0");
+        assert_eq!(
+            read,
+            ["<s5r0a1@own5.example>", "<s5r0a2@own5.example>", "<s5r0a3@own5.example>", "<s5r0a4@rare.example>"]
+        );
+        // and the release's articles, as an NZB lists them
+        let conn = crate::db::open_with_shards(&main).unwrap();
+        let id: i64 = conn.query_row("select id from s0.releases where name = 'Rel.5.0'", [], |r| r.get(0)).unwrap();
+        let mut nzb: Vec<String> = store::articles(&conn, id).unwrap().into_iter().map(|a| a.message_id).collect();
+        nzb.sort();
+        assert_eq!(nzb, read);
+        // a late article of a source's post joins its release, under the target's secret from then on
+        let before = count(&crate::db::open_at(&target).unwrap(), "select count(*) from releases");
+        let late = Release {
+            name: "Rel.3.1".into(),
+            group: groups[3].clone(),
+            collection: Some("post 3 1".into()),
+            articles: vec![art("b.rar", 1, "s3r1b1", "own3.example")],
+            ..Default::default()
+        };
+        store::save(&main, &[late]).unwrap();
+        let c = crate::db::open_at(&target).unwrap();
+        assert_eq!(count(&c, "select count(*) from releases"), before, "no new release");
+        assert_eq!(
+            count(&c, "select count(*) from files f join releases r on r.id = f.release_id where r.name = 'Rel.3.1'"),
+            2
+        );
+        assert_eq!(
+            count(
+                &c,
+                "select count(*) from legacy_collections where release_id = (select id from releases where name = 'Rel.3.1')"
+            ),
+            0,
+            "moved"
+        );
     }
 }

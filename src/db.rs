@@ -509,7 +509,9 @@ pub fn create_db_holding(path: &Path) -> anyhow::Result<Option<WriteGuard>> {
 pub fn wipe(main: &Path) -> anyhow::Result<()> {
     let _exclusive = crate::compact::Lock::take_unchecked(main)?;
     let mut dbs = Vec::new();
-    for shard in store::shard_paths(main) {
+    // the shards from before one shard too, should a wipe come before their merge
+    for shard in (0..crate::merge_shards::LEGACY_SHARDS).map(|s| crate::merge_shards::legacy_shard_path(main, s)) {
+        dbs.push(crate::frozen::path(&shard));
         let copy = crate::compact::with_suffix(&shard, "compact");
         dbs.push(crate::compact::with_suffix(&copy, "check"));
         dbs.push(copy);
@@ -549,6 +551,15 @@ pub fn create_db_at(path: &Path) -> anyhow::Result<()> {
     // shards half merged: only `atlas --merge-shards --apply` may go on with them
     if crate::merge_shards::in_progress(&conn) {
         anyhow::bail!("a shard merge is in progress: run `atlas --merge-shards --apply` to finish it before indexing");
+    }
+    // the shards from before one shard: their releases would be out of sight, their ids handed out again
+    let legacy = crate::merge_shards::sources(path);
+    if !legacy.is_empty() {
+        anyhow::bail!(
+            "{} shards from before the move to one shard are still here ({}): run `atlas --merge-shards --apply` first",
+            legacy.len(),
+            legacy.iter().map(|s| s.path.display().to_string()).collect::<Vec<_>>().join(", ")
+        );
     }
 
     // wal soo the indexer can write while search reads
@@ -1187,7 +1198,7 @@ mod tests {
         assert!(!was_kept(&main));
         assert!(was_kept(&main));
 
-        let shard = &store::shard_paths(&main)[3];
+        let shard = &store::shard_paths(&main)[store::SHARDS - 1];
         let swapped = dir.path().join("swapped.db");
         fs::copy(shard, &swapped).unwrap();
         fs::rename(&swapped, shard).unwrap();
@@ -1387,7 +1398,7 @@ mod tests {
         assert!(next.unwrap() > 1);
 
         // what a compaction leaves behind, and the sidecars of a shard
-        let shard = store::shard_path(&main, 2);
+        let shard = store::shard_path(&main, store::SHARDS - 1);
         let leftovers = [
             crate::compact::with_suffix(&shard, "compact"),
             crate::compact::with_suffix(&shard, "precompact"),

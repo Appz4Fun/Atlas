@@ -317,4 +317,24 @@ mod tests {
             assert_eq!(count(&blob).unwrap(), decode(&blob).unwrap().len());
         }
     }
+
+    #[test]
+    fn a_merged_shards_blobs_read_their_domains_on_from_its_base() {
+        let segs = vec![
+            Seg { part: Some(1), bytes: 10, domain: 3, local: b"a".to_vec() },
+            Seg { part: Some(2), bytes: 10, domain: 0, local: b"<whole@x>".to_vec() },
+        ];
+        let base = 5i64 << 32;
+        // kept here: renumbered, a whole message-id left alone
+        let moved = decode(&shift_blob(&encode(&segs), base).unwrap()).unwrap();
+        assert_eq!(moved.iter().map(|s| s.domain).collect::<Vec<_>>(), [3 + base, 0]);
+        // a place in the sealed log: marked, still remote, its place unchanged
+        let mut place = sealed_log::REF_TAG.to_vec();
+        place.resize(sealed_log::REF_BYTES, 7);
+        let marked = shift_blob(&place, base).unwrap();
+        assert!(is_remote(&marked));
+        assert_eq!(inner(&marked), &place[..]);
+        assert_eq!(unshifted(&marked).0, base);
+        assert_eq!(unshifted(&shift_blob(&marked, 1).unwrap()).0, base + 1, "shifted again adds up");
+    }
 }

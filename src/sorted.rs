@@ -594,20 +594,23 @@ mod tests {
         Fixture { _dir: dir, main }
     }
 
-    /// one group in each shard
+    /// one group in each shard, then more to make eight (in shards with one already)
     fn groups() -> Vec<String> {
         let mut found: Vec<Option<String>> = vec![None; store::SHARDS];
-        for i in 0.. {
+        let mut extra = Vec::new();
+        for i in 0..100_000 {
             let group = format!("alt.binaries.t{i}");
             let slot = &mut found[store::shard_of(&group)];
             if slot.is_none() {
                 *slot = Some(group);
+            } else if extra.len() + store::SHARDS < 8 {
+                extra.push(group);
             }
-            if found.iter().all(Option::is_some) {
+            if found.iter().all(Option::is_some) && extra.len() + store::SHARDS >= 8 {
                 break;
             }
         }
-        found.into_iter().flatten().collect()
+        found.into_iter().flatten().chain(extra).collect()
     }
 
     fn release(name: &str, group: &str) -> crate::parser::Release {
@@ -884,9 +887,10 @@ mod tests {
         assert!(all_ready(&conn, Column::Size));
         assert!(all_ready(&conn, Column::Group) && all_ready(&conn, Column::Category), "no index of their own");
         // a shard from before the list of releases with no category: no sort ranks until it's listed
-        conn.execute("delete from s3.meta where key = 'uncategorized_listed'", []).unwrap();
+        let last = store::SHARDS - 1;
+        conn.execute(&format!("delete from s{last}.meta where key = 'uncategorized_listed'"), []).unwrap();
         assert!(!all_ready(&conn, Column::Size) && !all_ready(&conn, Column::Group));
-        crate::category::uncategorized::fill(&f.shard_at(3)).unwrap();
+        crate::category::uncategorized::fill(&f.shard_at(last)).unwrap();
         assert!(all_ready(&conn, Column::Size) && all_ready(&conn, Column::Group));
     }
 
