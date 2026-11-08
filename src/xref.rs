@@ -1191,11 +1191,9 @@ pub async fn run(db: crate::indexer::Db, stopping: impl Fn() -> bool) {
         }
         // the WAL written back before each pass, while no pass reads (`Store::checkpoint`)
         match tokio::task::spawn_blocking(|| with_store(|s| s.checkpoint())).await {
-            Ok(Ok(Some((blocked, frames, written)))) if blocked || frames > written => {
-                eprintln!(
-                    "xref: the WAL went back {written} of {frames} pages{}",
-                    if blocked { " (blocked)" } else { "" }
-                )
+            // blocked: another checkpoint (the parse path's own) was running, which is fine and says nothing more
+            Ok(Ok(Some((false, frames, written)))) if frames > written => {
+                eprintln!("xref: the WAL went back {written} of {frames} pages (a read still holds the rest)")
             }
             Ok(Ok(_)) => {}
             Ok(Err(e)) => eprintln!("xref: couldnt write the WAL back: {e:#}"),
