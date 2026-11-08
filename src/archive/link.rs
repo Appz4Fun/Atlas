@@ -179,6 +179,8 @@ fn id_window(id: i64, cutover: i64, saves: i64) -> (i64, i64) {
 const BESIDE_SECS: i64 = 30 * 60;
 /// Rows checked, at most, for the small files one release's set names.
 const BESIDE_CHECKS: usize = 8;
+/// Names looked up, at most, for one release's small files.
+const BESIDE_LOOKUPS: usize = 32;
 /// How far apart in days an upload's files can say they were posted. Real ones are an hour or two; a slow or resumed
 /// upload a day or two.
 const DAY_WINDOW: f64 = 3.0;
@@ -436,15 +438,20 @@ impl LinkStep {
         ctx.allow_pictures();
         let posted = me.posted_date.clone().unwrap_or_default();
         if let Some((from, to)) = beside_window(&posted, BESIDE_SECS) {
-            // as many names looked up as rows may be checked: a set of hundreds of small files costs no more
-            'files: for want in missing.clone().into_iter().take(BESIDE_CHECKS) {
+            // pictures first, then the set's order; a name with no row of its name costs a lookup and no check, and
+            // the lookups stop at `BESIDE_LOOKUPS` soo a set of hundreds of small files costs no more
+            let mut order = missing.clone();
+            order.sort_by_key(|f| !crate::images::is_image_name(&f.name));
+            'files: for want in order.into_iter().take(BESIDE_LOOKUPS) {
                 for candidate in Self::beside_candidates(ctx.conn(), me.id, &want.name, (&from, &to, &posted))? {
                     if checks >= BESIDE_CHECKS {
                         break 'files;
                     }
                     checks += 1;
                     let Some(seen) = self.check(ctx, &candidate)? else {
-                        out_of_bodies = true;
+                        // a run that finished no check at all goes on later only when one may: a budget too small
+                        // for a single check would look again for ever
+                        out_of_bodies = checks > 1;
                         break 'files;
                     };
                     if seen.md5_16k.is_some() && seen.is(want) {
