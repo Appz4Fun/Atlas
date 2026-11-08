@@ -294,6 +294,7 @@ pub fn claim(conn: &Connection, groups: &[(String, i64)], host: &str, now: i64) 
         return Ok(Some(claim));
     }
     let Some(frontier) = frontier(conn, groups, now)? else { return Ok(None) };
+    crate::header_window::BACKFILL_FRONTIER_DAY.store(frontier, std::sync::atomic::Ordering::Relaxed);
     let floor = frontier - LOCKSTEP_DAYS;
     let groups: Vec<(String, i64)> = groups.iter().map(|(g, oldest)| (g.clone(), (*oldest).max(floor))).collect();
     let media = media_groups(conn)?;
@@ -315,6 +316,7 @@ pub fn claim_turn(
         return Ok(Some(claim));
     }
     let Some(frontier) = frontier(conn, all, now)? else { return Ok(None) };
+    crate::header_window::BACKFILL_FRONTIER_DAY.store(frontier, std::sync::atomic::Ordering::Relaxed);
     let (g, oldest) = group;
     claim_newest(conn, &[(g, oldest.max(frontier - LOCKSTEP_DAYS))], &[], host, now)
 }

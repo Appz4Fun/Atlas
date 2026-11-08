@@ -1337,6 +1337,7 @@ pub fn run() -> i32 {
     crate::blob_bytes::spawn(&config.sealed_log, stop.clone());
     crate::shared_catalog::start(&config.shared_catalog, stop.clone());
     crate::overview_archive::spawn(&config.overview_archive);
+    crate::header_window::spawn(&config.header_window);
     if config.metrics.enabled {
         crate::metrics::catalog::spawn(Duration::from_secs(config.metrics.catalog_every_secs), stop.clone());
     }
@@ -1344,6 +1345,7 @@ pub fn run() -> i32 {
     let code = index(config, stop, Some(writing));
     // the batches still queued for the overview archive
     crate::overview_archive::finish(Duration::from_secs(30));
+    crate::header_window::finish(Duration::from_secs(30));
     code
 }
 
