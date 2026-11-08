@@ -634,8 +634,11 @@ impl Store {
         out
     }
 
+    /// The groups the store has, sorted (soo a pass over them goes the same way every run).
     pub fn group_names(&self) -> Vec<String> {
-        self.groups.read().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect()
+        let mut names: Vec<String> = self.groups.read().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect();
+        names.sort();
+        names
     }
 
     /// (rows refused because their day isn't kept, repeats dropped at seal, blocks committed)
