@@ -33,6 +33,8 @@ pub mod keys;
 pub mod media;
 pub mod merging;
 pub mod header_window;
+pub mod nxv_census;
+pub mod nxv_store;
 pub mod keep_export;
 pub mod merge_shards;
 pub mod metrics;

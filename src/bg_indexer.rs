@@ -1351,6 +1351,7 @@ pub fn run() -> i32 {
     crate::shared_catalog::start(&config.shared_catalog, stop.clone());
     crate::overview_archive::spawn(&config.overview_archive);
     crate::header_window::spawn(&config.header_window);
+    crate::nxv_store::live::spawn(&crate::config::header_store_config());
     if config.metrics.enabled {
         crate::metrics::catalog::spawn(Duration::from_secs(config.metrics.catalog_every_secs), stop.clone());
     }
@@ -1359,6 +1360,7 @@ pub fn run() -> i32 {
     // the batches still queued for the overview archive
     crate::overview_archive::finish(Duration::from_secs(30));
     crate::header_window::finish(Duration::from_secs(30));
+    crate::nxv_store::live::finish();
     // the obfuscated headers still queued for the cross-group store
     if !crate::xref::flush_recorder(Duration::from_secs(60)) {
         eprintln!("xref: headers still queued at exit weren't all written");

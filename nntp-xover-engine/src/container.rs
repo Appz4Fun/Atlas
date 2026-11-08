@@ -64,6 +64,20 @@ pub const MAX_HOT_BLOCK_BYTES: usize = 1 << 30;
 const BODY_HASH_LO: SectionId = SectionId::FsstTables;
 const BODY_HASH_HI: SectionId = SectionId::ReferencesData;
 
+/// The section entries whose `encoding_flags` hold the store's fields (`BlockMeta`): the server a block's rows came
+/// from and the slab it was sealed from. The header CRC covers the section table, soo it covers these too, and a
+/// block built without them reads as server 0, slab 0.
+const META_SLAB_GEN: SectionId = SectionId::SkipCheckpoints;
+const META_SERVER: SectionId = SectionId::MsgIdXor8;
+
+/// What a store keeps about a block besides its rows: which server sent them, and which slab they were sealed from
+/// (recovery tells a slab's leftover log was committed by it).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct BlockMeta {
+    pub server_id: u16,
+    pub slab_gen: u32,
+}
+
 /// The body hash a block's section table holds.
 fn stored_body_hash(sections: &[SectionEntry]) -> u64 {
     sections[BODY_HASH_LO as usize].encoding_flags as u64
@@ -596,6 +610,11 @@ impl NxvBlockBuilder {
     /// Builds a hot block from raw overview lines (no CR/LF). Rows are kept in
     /// article-number order (a stable sort, so equal numbers keep their order).
     pub fn build_hot_block(lines: &[&[u8]]) -> Result<Vec<u8>> {
+        Self::build_hot_block_meta(lines, BlockMeta::default())
+    }
+
+    /// `build_hot_block`, with the store's fields kept in the section table.
+    pub fn build_hot_block_meta(lines: &[&[u8]], meta: BlockMeta) -> Result<Vec<u8>> {
         ensure!(!lines.is_empty(), "a block needs at least one row");
         ensure!(lines.len() <= MAX_BLOCK_ROWS, "{} rows is more than a block holds", lines.len());
         let mut order: Vec<(u64, usize)> = Vec::with_capacity(lines.len());
@@ -642,7 +661,7 @@ impl NxvBlockBuilder {
         }
         tail_offsets.push(tail_data.len() as u32);
 
-        Self::assemble(rows, dicts, tail_offsets, tail_data, refs_pool, index_entries, xref_prefix)
+        Self::assemble(rows, dicts, tail_offsets, tail_data, refs_pool, index_entries, xref_prefix, meta)
     }
 
     /// Takes a line apart; None when some field won't write back as it was.
@@ -743,6 +762,7 @@ impl NxvBlockBuilder {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn assemble(
         rows: Vec<Row>,
         dicts: [Dict; NUM_DICTS],
@@ -751,6 +771,7 @@ impl NxvBlockBuilder {
         refs_pool: Vec<u8>,
         index_entries: Vec<(u64, u16)>,
         xref_prefix: bool,
+        meta: BlockMeta,
     ) -> Result<Vec<u8>> {
         let n = rows.len();
         // ---- numeric stream, references and checkpoints
@@ -967,6 +988,8 @@ impl NxvBlockBuilder {
         let body_hash = xxhash_rust::xxh3::xxh3_64(&out[DATA_START..]);
         table[BODY_HASH_LO as usize].encoding_flags = body_hash as u32;
         table[BODY_HASH_HI as usize].encoding_flags = (body_hash >> 32) as u32;
+        table[META_SLAB_GEN as usize].encoding_flags = meta.slab_gen;
+        table[META_SERVER as usize].encoding_flags = meta.server_id as u32;
         let total = u32::try_from(out.len()).context("block over 4 GiB")?;
         for (i, e) in table.iter().enumerate() {
             let at = HEADER_LEN + i * 16;
@@ -1204,6 +1227,21 @@ impl<'a> NxvBlockView<'a> {
             })
         };
         Ok(Self { data, header, sections, checkpoints, xor8, hot })
+    }
+
+    /// The store's fields (server, slab), from the section table.
+    #[inline]
+    pub fn store_meta(&self) -> BlockMeta {
+        BlockMeta {
+            server_id: self.sections[META_SERVER as usize].encoding_flags as u16,
+            slab_gen: self.sections[META_SLAB_GEN as usize].encoding_flags,
+        }
+    }
+
+    /// How many posters the block has (its author dictionary's size); 0 for a cold block.
+    #[inline]
+    pub fn poster_count(&self) -> u32 {
+        self.hot.map_or(0, |h| h.dicts[DICT_AUTHOR].entry_count)
     }
 
     /// The xxh3 hash of the hot body, from the section table.

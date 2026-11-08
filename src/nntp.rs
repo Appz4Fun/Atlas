@@ -1185,6 +1185,7 @@ impl Conn {
         if let Some(group) = &self.group {
             crate::overview_archive::record(&self.server, group, lines);
             crate::header_window::record(&self.server, group, lines);
+            crate::nxv_store::live::record(&self.server, group, lines);
         }
     }
 
@@ -1252,7 +1253,11 @@ impl Conn {
             true
         })
         .await?;
-        if self.group.is_some() && (crate::overview_archive::enabled() || crate::header_window::enabled()) {
+        if self.group.is_some()
+            && (crate::overview_archive::enabled()
+                || crate::header_window::enabled()
+                || crate::nxv_store::live::enabled())
+        {
             let lines = decode_xzver_raw(&raw_lines)?;
             self.archive(&lines);
             return Ok(lines.iter().filter_map(|l| parse_overview(l)).collect());
@@ -3965,6 +3970,11 @@ fn tls_config() -> Arc<rustls::ClientConfig> {
     });
 
     CONFIG.clone()
+}
+
+/// An overview line as the indexer reads it (`parse_overview`), for tools that read stored lines back.
+pub fn overview_of(line: &[u8]) -> Option<Overview> {
+    parse_overview(line)
 }
 
 fn parse_overview(line: &[u8]) -> Option<Overview> {

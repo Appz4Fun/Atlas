@@ -503,7 +503,7 @@ fn read_dirs(dir: &Path) -> Result<Vec<PathBuf>> {
 }
 
 /// A directory's name back to the server or group it stands for (`overview_archive`'s percent-encoding).
-fn decode(dir: &Path) -> Option<String> {
+pub(crate) fn decode(dir: &Path) -> Option<String> {
     let name = dir.file_name()?.to_str()?;
     let bytes = name.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -559,7 +559,7 @@ fn refresh_claimed(days: &[(i64, usize)], now: i64) {
 }
 
 /// The days claimed within `CLAIMED_KEEP` of `now`; older ones are forgotten.
-fn claimed_days(now: i64) -> Vec<i64> {
+pub(crate) fn claimed_days(now: i64) -> Vec<i64> {
     let keep = CLAIMED_KEEP.as_secs() as i64;
     let Ok(mut m) = CLAIMED.lock() else { return Vec::new() };
     m.retain(|_, at| now - *at <= keep);
@@ -735,7 +735,8 @@ fn run(mut window: Window, rx: Receiver<Msg>, keep_hours: i64) {
     }
 }
 
-/// `atlas --header-window [stats | POSTER FROM TO]`: reads the window, never a server. FROM and TO are unix seconds.
+/// `atlas --header-window [stats | census [BLOCKS] | POSTER FROM TO]`: reads the window, never a server. FROM and TO
+/// are unix seconds.
 pub fn run_cli(args: &[String]) -> i32 {
     let cfg = crate::config::header_window_config();
     let window = match Window::open_read_only(&cfg.root()) {
@@ -746,6 +747,16 @@ pub fn run_cli(args: &[String]) -> i32 {
         }
     };
     let rest: Vec<&String> = args.iter().skip_while(|a| *a != "--header-window").skip(1).collect();
+    if rest.first().is_some_and(|a| *a == "census") {
+        let want = rest.get(1).and_then(|n| n.parse().ok()).unwrap_or(400);
+        return match crate::nxv_census::run(&cfg.root(), want) {
+            Ok(()) => 0,
+            Err(e) => {
+                println!("census failed: {e:#}");
+                1
+            }
+        };
+    }
     match rest.as_slice() {
         [] | [_] if rest.first().is_none_or(|a| *a == "stats") => {
             let (lines, blocks, hours) = window.stats();
@@ -771,7 +782,7 @@ pub fn run_cli(args: &[String]) -> i32 {
             }
         }
         _ => {
-            println!("usage: atlas --header-window [stats | POSTER FROM TO]");
+            println!("usage: atlas --header-window [stats | census [BLOCKS] | POSTER FROM TO]");
             1
         }
     }

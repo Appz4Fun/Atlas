@@ -343,6 +343,11 @@ fn iso(posted: i64) -> String {
     DateTime::from_timestamp(posted, 0).map_or_else(String::new, |d| d.format("%Y-%m-%d %H:%M:%S").to_string())
 }
 
+/// `iso`, for tools outside this module.
+pub fn iso_pub(posted: i64) -> String {
+    iso(posted)
+}
+
 fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }

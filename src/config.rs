@@ -770,6 +770,45 @@ pub fn header_window_config() -> HeaderWindowConfig {
     read_file().map_or_else(HeaderWindowConfig::default, |v| HeaderWindowConfig::from_value(v.get("header_window")))
 }
 
+/// The `header_store` object of config.toml (`crate::nxv_store`): the day-segment header store, off by default while
+/// it's tried beside the header window.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HeaderStoreConfig {
+    pub enabled: bool,
+    /// where it lives, `header-store` next to the databases unless set (a relative path is taken from there too)
+    pub dir: String,
+}
+
+impl HeaderStoreConfig {
+    fn from_value(v: Option<&Value>) -> HeaderStoreConfig {
+        let mut c = HeaderStoreConfig::default();
+        let Some(v) = v else { return c };
+        if let Some(b) = v.get("enabled").and_then(as_bool) {
+            c.enabled = b;
+        }
+        if let Some(d) = v.get("dir").and_then(Value::as_str) {
+            c.dir = d.trim().to_string();
+        }
+        c
+    }
+
+    pub fn root(&self) -> std::path::PathBuf {
+        let dir = std::path::PathBuf::from(&self.dir);
+        if self.dir.is_empty() {
+            crate::paths::app_dir().join("header-store")
+        } else if dir.is_absolute() {
+            dir
+        } else {
+            crate::paths::app_dir().join(dir)
+        }
+    }
+}
+
+/// The file's `header_store` object: no keyring.
+pub fn header_store_config() -> HeaderStoreConfig {
+    read_file().map_or_else(HeaderStoreConfig::default, |v| HeaderStoreConfig::from_value(v.get("header_store")))
+}
+
 /// The file's `overview_archive` object: no keyring.
 pub fn overview_archive_config() -> OverviewArchiveConfig {
     read_file()
