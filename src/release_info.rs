@@ -2053,6 +2053,33 @@ mod tests {
     }
 
     #[test]
+    fn a_thumbnail_linked_beside_a_release_is_a_file_of_its_upload_not_a_volume() {
+        let (_dir, conn) = all_shards();
+        let g = "alt.binaries.a";
+        let (film, index) = ("Some.Film.2160p.mp4", "Some.Film.2160p.par2");
+        put_row(&conn, 1, "Some.Film.2160p", g, "a@x", &[(film, &[1, 2, 3], 3), (index, &[1], 1)]);
+        put_row(&conn, 2, "00-thumbnail.jpg", g, "b@x", &[("00-thumbnail.jpg", &[1], 1)]);
+        let (lead, thumb) = (store::global_id(1, store::shard_of(g)), store::global_id(2, store::shard_of(g)));
+        let s = store::shard_of(g);
+        // as the link step writes it: the release leads as a row of data, the thumbnail is a file of its set
+        conn.execute(
+            &format!(
+                "insert into s{s}.upload_link (release_id, lead_id, recovery, par2_file) values (?1, ?1, 0, null), (?2, ?1, 0, x'07')"
+            ),
+            rusqlite::params![lead, thumb],
+        )
+        .unwrap();
+        let post = linked_post_with(&conn, thumb).unwrap().unwrap();
+        assert_eq!(post.ids, [lead, thumb]);
+        assert_eq!(post.lead, Some(lead));
+        assert!(post.recovery.is_empty(), "the film isn't a recovery volume");
+        assert!(post.complete);
+        let contents = contents_of_split(&conn, &post).unwrap();
+        assert_eq!((contents.files, contents.par2_files, contents.recovery_volumes), (3, 1, 0));
+        assert!(contents.list.iter().any(|f| f.name == "00-thumbnail.jpg"), "in the NZB's list");
+    }
+
+    #[test]
     fn a_releases_counts_without_its_bytes_are_the_same_counts() {
         let (_dir, conn) = linked_shard();
         for id in [8, 16, 24] {

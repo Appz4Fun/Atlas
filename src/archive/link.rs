@@ -335,8 +335,8 @@ impl LinkStep {
         Ok(listed.then(|| files[0].clone()))
     }
 
-    /// The small files a release's own PAR2 set names that aren't among its files: a thumbnail or an NFO posted beside
-    /// it under a subject without the release's name, which no name or poster joins, soo it's a row of its own. The
+    /// The small files a release's own PAR2 set names that aren't among its files: a thumbnail posted beside it under
+    /// a subject without the release's name, which no name or poster joins, soo it's a row of its own. The
     /// set gives each file's exact size and the MD5 of its first 16 KiB, and a small file is one article: a row
     /// posted near this one, holding one file of that name, is fetched once and checked against both. One that
     /// matches is linked into this release's upload, which it leads.
@@ -353,9 +353,17 @@ impl LinkStep {
         if lead.is_some_and(|lead| lead != me.id) {
             return Ok(Outcome::default());
         }
-        // only a set the PAR2 step read and kept: nothing is fetched to find out whether there's anything to look for
+        // only a set the PAR2 step read and kept: nothing is fetched to find out whether there's anything to look for.
+        // In the visit that reads it, its writes aren't in yet: this looks again once they are, while the PAR2 step
+        // hasn't finished with the release
         let Some(inventory) = super::store::par2_inventory(ctx.conn(), "main", me.id) else {
-            return Ok(Outcome::default());
+            let par2_done: i64 = ctx
+                .conn()
+                .prepare_cached("select coalesce((select done from pp_state where release_id = ?1), 0) & ?2")
+                .and_then(|mut stmt| stmt.query_row(params![me.id, mask(super::steps::PAR2_STEP)], |r| r.get(0)))
+                .map_err(retry)?;
+            let wait_until = (par2_done == 0).then(|| chrono::Utc::now().timestamp() + RESUME_SECS);
+            return Ok(Outcome { wait_until, ..Default::default() });
         };
         let own: HashSet<String> = files.iter().map(|f| f.filename.to_ascii_lowercase()).collect();
         let outside = beside_wanted(&inventory.files, &own);
@@ -408,17 +416,12 @@ impl LinkStep {
         for (row, file_id) in &found {
             writes.push(StepWrite::new(LINK_DATA, vec![(*row).into(), me.id.into(), file_id.to_vec().into()]));
         }
-        // the release holds its set and the rest of the files: what its set looks for elsewhere is the small ones
-        let set = sealed_set(&inventory, &outside);
-        writes.push(StepWrite::new(
-            LINK_RECOVERY,
-            vec![me.id.into(), me.id.into(), (outside.len() as i64).into(), set.map(|id| id.to_vec()).into()],
-        ));
+        // the release leads as a row of data, not of recovery: its files stay its files, and the upload is whole when
+        // each of its rows is, soo a small file not found yet takes nothing from it
+        writes.push(StepWrite::new(LINK_LEAD, vec![me.id.into()]));
         // the pictures step reads what's linked in: run again, now there's more
-        let pictures = mask(crate::images::step::IMAGES_STEP);
-        writes.push(StepWrite::new(RERUN_LEAD, vec![me.id.into(), pictures.into(), pictures.into()]));
-        writes.push(StepWrite::new(QUEUE_LEAD, vec![me.id.into(), now.into()]));
-        Ok(Outcome { matched: true, writes, wait_until, ..Default::default() })
+        let rerun = mask(crate::images::step::IMAGES_STEP);
+        Ok(Outcome { matched: true, writes, rerun, wait_until, ..Default::default() })
     }
 
     /// Rows posted within `window` (from, to, and the release's own time) holding one file named `name` and nothing
@@ -1066,7 +1069,7 @@ mod tests {
         assert_eq!(ids, [2, 4], "nearest in time first, one file, not taken; the check against the set decides");
         // linked into this release, it's no other's to take, and stays this one's on the next run
         write(&conn, LINK_DATA, vec![2i64.into(), 1i64.into(), vec![7u8; 16].into()]);
-        write(&conn, LINK_RECOVERY, vec![1i64.into(), 1i64.into(), 1i64.into(), rusqlite::types::Value::Null]);
+        write(&conn, LINK_LEAD, vec![1i64.into()]);
         assert_eq!(links(&conn), [(1, 1), (2, 1), (6, 9)]);
         let posted = "2026-10-10 00:01:39";
         let again = LinkStep::beside_candidates(&conn, 1, "00-thumbnail.jpg", (&window.0, &window.1, posted)).unwrap();
