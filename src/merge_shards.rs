@@ -4,9 +4,10 @@
 //! What collides between shards is moved out of the way rather than rewritten:
 //! - file ids count from 1 in each shard: a source's are moved past the target's highest (`file_offset`);
 //! - message-id domains are numbered per shard, and sealed blobs (some kept in the sealed log, out of reach) hold
-//!   those numbers: a source's domains go to `legacy_domains` under `shard << 32`, its segments' domains move the
-//!   same (0, a message-id stored whole, stays 0), and each of its files records the move (`files.domain_base`) for
-//!   its blob's numbers;
+//!   those numbers: a source's domains go into the target's `domains` under `shard << 32` (a suffix may then have
+//!   several ids, all reading the same: `domains` loses its unique index), its segments' domains move the same (0, a
+//!   message-id stored whole, stays 0), a blob kept in the shard is renumbered as it's copied, and a sealed-log place
+//!   is marked to be read on from that base (`blob::shifted`);
 //! - collection keys and message-id hashes are keyed per shard, and their strings aren't kept: a source's collections
 //!   go to `legacy_collections` under its key pair, and the pair is kept (`merge_shards`) for what hashes its
 //!   releases' message-ids. Release ids already say which shard they came from (`id % 8`).
@@ -16,7 +17,6 @@
 //! source is deleted only once every table's copied rows match its count, soo at most one shard's worth of space is
 //! taken at a time.
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -49,7 +49,6 @@ create table if not exists merge_progress (
     primary key (shard, tbl)
 ) without rowid;
 create table if not exists merge_triggers (name TEXT PRIMARY KEY, sql TEXT NOT NULL);
-create table if not exists legacy_domains (id INTEGER PRIMARY KEY, suffix TEXT NOT NULL);
 create table if not exists legacy_collections (
     key0 INTEGER NOT NULL, key1 INTEGER NOT NULL, key INTEGER NOT NULL, release_id INTEGER NOT NULL,
     primary key (key0, key1, key)
@@ -145,7 +144,8 @@ pub fn merge(
         // every commit on disk before a source is deleted: there is nothing to copy again from after that
         conn.execute_batch("pragma synchronous = full;")?;
         conn.execute_batch(SCHEMA)?;
-        add_column(&conn, "files", "domain_base", "INTEGER")?;
+        domains_not_unique(&conn)?;
+        register_shift(&conn)?;
         park_triggers(&conn)?;
         let rows = merge_one(&conn, source, &mut budget, log)?;
         let Some(rows) = rows else { return Ok(merged) };
@@ -221,6 +221,46 @@ fn restore_triggers(conn: &Connection) -> Result<()> {
         tx.execute("delete from merge_triggers where name = ?1", [&name])?;
     }
     tx.commit()?;
+    Ok(())
+}
+
+/// The target's `domains` without its unique index on the suffix: a source's domains come in under their own ids
+/// (`shard << 32` on), beside the target's for the same suffix. A lookup by suffix takes the lowest id
+/// (`store::Domains`), and every id reads back the same message-id.
+fn domains_not_unique(conn: &Connection) -> Result<()> {
+    let sql: Option<String> = conn
+        .query_row("select sql from main.sqlite_master where type = 'table' and name = 'domains'", [], |r| r.get(0))
+        .optional()?;
+    if !sql.is_some_and(|s| s.to_ascii_uppercase().contains("UNIQUE")) {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "begin immediate;
+         create table domains_merged (id INTEGER PRIMARY KEY, suffix TEXT NOT NULL);
+         insert into domains_merged (id, suffix) select id, suffix from main.domains;
+         drop table main.domains;
+         alter table domains_merged rename to domains;
+         create index if not exists domains_suffix on domains (suffix, id);
+         commit;",
+    )?;
+    Ok(())
+}
+
+/// `atlas_shift_blob(blob, base)` on `conn`: a stored blob with its domains moved on by `base` (`blob::shift_blob`).
+fn register_shift(conn: &Connection) -> Result<()> {
+    use rusqlite::functions::FunctionFlags;
+    conn.create_scalar_function("atlas_shift_blob", 2, FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC, |ctx| {
+        let base: i64 = ctx.get(1)?;
+        match ctx.get_raw(0) {
+            rusqlite::types::ValueRef::Null => Ok(rusqlite::types::Value::Null),
+            rusqlite::types::ValueRef::Blob(b) => crate::blob::shift_blob(b, base)
+                .map(rusqlite::types::Value::Blob)
+                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e))),
+            rusqlite::types::ValueRef::Integer(i) => Ok(rusqlite::types::Value::Integer(i)),
+            rusqlite::types::ValueRef::Real(f) => Ok(rusqlite::types::Value::Real(f)),
+            rusqlite::types::ValueRef::Text(t) => Ok(rusqlite::types::Value::Text(String::from_utf8_lossy(t).into_owned())),
+        }
+    })?;
     Ok(())
 }
 
@@ -395,7 +435,7 @@ fn plan(conn: &Connection, table: &str, m: &Moves) -> Result<Copy> {
     let lit = |v: i64| v.to_string();
     let copy = match table {
         "domains" => Copy {
-            into: "legacy_domains".into(),
+            into: "domains".into(),
             cols: vec!["id".into(), "suffix".into()],
             exprs: vec![format!("id + {}", m.domain_offset), "suffix".into()],
             key: Some("id".into()),
@@ -446,7 +486,7 @@ fn plan(conn: &Connection, table: &str, m: &Moves) -> Result<Copy> {
                 let q = quote(c);
                 let expr = match (table, c.as_str()) {
                     ("files", "id") => format!("{q} + {}", m.file_offset),
-                    ("files", "domain_base") => continue,
+                    ("files", "blob") => format!("atlas_shift_blob({q}, {})", m.domain_offset),
                     // 0 is a message-id stored whole, no domain
                     ("segments", "domain") => format!("case when {q} = 0 then 0 else {q} + {} end", m.domain_offset),
                     // a release's own row in `release_ids` has file 0, no file
@@ -456,10 +496,6 @@ fn plan(conn: &Connection, table: &str, m: &Moves) -> Result<Copy> {
                 };
                 cols.push(q);
                 exprs.push(expr);
-            }
-            if table == "files" {
-                cols.push("domain_base".into());
-                exprs.push(lit(m.domain_offset));
             }
             // the keys a range could go by, best first: the first that leads an index is taken (`plan` below)
             let mut keys: Vec<String> = Vec::new();
@@ -664,13 +700,6 @@ fn merge_frozen(
     result
 }
 
-fn add_column(conn: &Connection, table: &str, column: &str, kind: &str) -> Result<()> {
-    let have: BTreeSet<String> = columns(conn, "main", table)?.into_iter().collect();
-    if !have.contains(column) {
-        conn.execute(&format!("alter table {table} add column {column} {kind}"), [])?;
-    }
-    Ok(())
-}
 
 /// The directory of `path` flushed, soo a deletion in it holds after a power cut.
 fn sync_dir(path: &Path) {

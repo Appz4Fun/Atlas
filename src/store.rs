@@ -32,7 +32,7 @@ use crate::postprocess::schema::ShardTable;
 use crate::profile;
 use crate::search::ArticleRow;
 
-pub const SHARDS: usize = 8;
+pub const SHARDS: usize = 1;
 
 /// the shard a group's releases live in
 pub fn shard_of(group: &str) -> usize {
@@ -496,7 +496,7 @@ impl Domains {
             return Ok((pack_local(local), *d));
         }
         let found: Option<i64> = conn
-            .prepare_cached("select id from domains where suffix = ?")?
+            .prepare_cached("select id from domains where suffix = ? order by id limit 1")?
             .query_row([suffix], |r| r.get(0))
             .optional()?;
         let domain = match found {
@@ -1856,7 +1856,7 @@ fn stored_forms(conn: &Connection, id: &str) -> Result<Vec<(Vec<u8>, i64)>> {
     let mut forms = vec![(whole(id), 0)];
     if let Some((local, suffix)) = split_message_id(id)
         && let Some(d) = conn
-            .prepare_cached("select id from domains where suffix = ?")?
+            .prepare_cached("select id from domains where suffix = ? order by id limit 1")?
             .query_row([suffix], |r| r.get::<_, i64>(0))
             .optional()?
     {

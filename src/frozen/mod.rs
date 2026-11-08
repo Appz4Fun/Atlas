@@ -746,7 +746,7 @@ pub fn restore(conn: &Connection, schema: &str, p: &Payload, how: Domains) -> Re
             continue;
         }
         let found: Option<i64> = conn
-            .prepare_cached(&format!("select id from {schema}.domains where suffix = ?1"))?
+            .prepare_cached(&format!("select id from {schema}.domains where suffix = ?1 order by id limit 1"))?
             .query_row([suffix], |r| r.get(0))
             .optional()?;
         let new = match found {

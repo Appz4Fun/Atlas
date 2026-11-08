@@ -166,7 +166,7 @@ pub fn count_batch(conn: &Connection, after: i64, stop: &AtomicBool) -> Result<B
 
 /// A blob in the sealed log, fetched: what it stands for.
 fn fetch(place: &[u8]) -> std::io::Result<Vec<u8>> {
-    let at = sealed_log::Locator::from_ref(place)
+    let at = sealed_log::Locator::from_ref(crate::blob::inner(place))
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "not a place in the sealed log"))?;
     crate::sealed_store::fetch(at)
 }
