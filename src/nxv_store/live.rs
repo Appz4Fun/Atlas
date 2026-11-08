@@ -2,12 +2,25 @@
 //! the slice's cursor held until its rows are durable, the keep set refreshed every minute, and everything sealed and
 //! committed at shutdown.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use super::store::{Clamp, DAY, KeepSet, Store, StoreConfig, Ticket};
 
 static STORE: OnceLock<Mutex<Option<Arc<Store>>>> = OnceLock::new();
+/// The store is open and its linker takes the place of the SQLite one (`[header_store] linker`).
+static LINKS_ON: AtomicBool = AtomicBool::new(false);
+
+/// Whether obfuscated headers go to the store's linker only (`xref::hold` keeps none in `atlas.xref.db`).
+pub fn links_on() -> bool {
+    LINKS_ON.load(Ordering::Relaxed)
+}
+
+/// The store the indexer records to, when it's on.
+pub fn handle() -> Option<Arc<Store>> {
+    store()
+}
 
 fn store() -> Option<Arc<Store>> {
     STORE.get().and_then(|m| m.lock().ok().and_then(|g| g.clone()))
@@ -18,14 +31,14 @@ fn now() -> i64 {
 }
 
 /// The days kept now: the live window (two days back, until cursors say where live reading stands), the days around
-/// each backfill day claimed lately (the header window's claims), and nothing yet for the linker, which doesn't read
-/// the store.
+/// each backfill day claimed lately (the header window's claims), and the days with an hour the store's linker hasn't
+/// linked (when it runs).
 pub fn keep_now() -> KeepSet {
     let now = now();
     KeepSet {
         live_from: (now - 2 * DAY).div_euclid(DAY),
         claimed: crate::header_window::claimed_days(now).into_iter().collect(),
-        unlinked: Default::default(),
+        unlinked: super::linker::unlinked_days(),
     }
 }
 
@@ -49,6 +62,7 @@ pub fn spawn(cfg: &crate::config::HeaderStoreConfig) {
     if STORE.set(Mutex::new(Some(Arc::clone(&store)))).is_err() {
         return;
     }
+    LINKS_ON.store(cfg.linker, Ordering::Relaxed);
     let weak = Arc::downgrade(&store);
     let _ = std::thread::Builder::new().name("nxv-keep".into()).spawn(move || {
         loop {

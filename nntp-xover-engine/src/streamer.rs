@@ -321,6 +321,10 @@ pub struct FieldCursor<'a> {
     subj: Vec<u8>,
     msgid: Vec<u8>,
     line: Vec<u8>,
+    /// rows whose wall clock falls outside this are passed over before any string is decoded
+    window: (i64, i64),
+    /// rows passed over for the window
+    pub skipped: u64,
 }
 
 impl<'a> FieldCursor<'a> {
@@ -337,18 +341,33 @@ impl<'a> FieldCursor<'a> {
             subj: Vec::with_capacity(256),
             msgid: Vec::with_capacity(128),
             line: Vec::with_capacity(512),
+            window: (i64::MIN, i64::MAX),
+            skipped: 0,
         })
+    }
+
+    /// Only rows whose wall clock is in `from..=to` (rows kept literal always come, their date unread).
+    pub fn with_wall_window(mut self, from: i64, to: i64) -> Self {
+        self.window = (from, to);
+        self
     }
 
     /// The next row's fields; None after the last.
     #[allow(clippy::should_implement_trait)]
     pub fn next_row(&mut self) -> Option<RowFields<'_>> {
-        if self.dec.row >= self.view.row_count() {
-            return None;
-        }
         let h = &self.h;
-        let d = self.dec.advance(&self.view, h);
-        let row = self.dec.row - 1;
+        let (d, row, off) = loop {
+            if self.dec.row >= self.view.row_count() {
+                return None;
+            }
+            let d = self.dec.advance(&self.view, h);
+            let off = style_offset_secs(d.style & !STYLE_FREE_BITS);
+            let wall = d.ts.wrapping_add(off);
+            if d.literal || (self.window.0..=self.window.1).contains(&wall) {
+                break (d, self.dec.row - 1, off);
+            }
+            self.skipped += 1;
+        };
         let c = &mut self.cache;
         if d.literal {
             self.line.clear();
@@ -424,7 +443,6 @@ impl<'a> FieldCursor<'a> {
                 &mut self.subj,
             );
         }
-        let off = style_offset_secs(d.style & !STYLE_FREE_BITS);
         Some(RowFields {
             art: d.art,
             utc: d.ts,

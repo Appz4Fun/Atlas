@@ -20,7 +20,7 @@ use anyhow::Result;
 use chrono::DateTime;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
-use crate::parser::{Article, Release, Shape, Unparsable, is_complete, parse_subject, unparsable_shape};
+use crate::parser::{Article, Release, Shape, Unparsable, is_complete, parse_subject};
 
 /// how long a header is kept after it arrives: the window an upload's files are linked in
 pub const KEEP_SECS: i64 = 24 * 3600;
@@ -265,7 +265,7 @@ fn chain_until(files: &[FileSum], seeds: &[Seed], stop: &dyn Fn() -> bool) -> Op
 }
 
 /// Stable, in decimal: a run of hex would read as a random name, and leave search (as `filters::per_article_name`).
-fn upload_name(poster: &str) -> String {
+pub(crate) fn upload_name(poster: &str) -> String {
     let key = format!("xref\0{poster}");
     let hash = key.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3));
     format!("{NAME_PREFIX}{}-{}", hash >> 32, hash & 0xffff_ffff)
@@ -285,6 +285,9 @@ pub fn tried(release: &str) -> Option<(i64, i64)> {
     if cfg!(test) {
         return None;
     }
+    if let Some(t) = crate::nxv_store::linker::tried(release) {
+        return t;
+    }
     open_rw()?
         .query_row("select probed, gen from uploads where release = ?1", [release], |r| Ok((r.get(0)?, r.get(1)?)))
         .optional()
@@ -294,7 +297,7 @@ pub fn tried(release: &str) -> Option<(i64, i64)> {
 /// The first `count` guesses of generation `generation` of the upload `release` were tried: a later run takes the ones after.
 /// Nothing when the upload has grown since, and its guesses started over.
 pub fn tried_through(release: &str, generation: i64, count: i64) {
-    if cfg!(test) {
+    if cfg!(test) || crate::nxv_store::linker::tried_through(release, generation, count) {
         return;
     }
     if let Some(conn) = open_rw() {
@@ -310,6 +313,9 @@ pub fn tried_through(release: &str, generation: i64, count: i64) {
 pub fn leads(release: &str, file: i64) -> Vec<i64> {
     if cfg!(test) {
         return Vec::new();
+    }
+    if let Some(l) = crate::nxv_store::linker::leads(release, file) {
+        return l;
     }
     let Ok(conn) = Connection::open_with_flags(
         path_for(&crate::paths::database()),
@@ -352,30 +358,32 @@ fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
-/// One article as the store keeps it.
-struct Row {
-    message_id: String,
-    added: i64,
+/// One article as the store keeps it (and as the day-segment store's linker reads it, `nxv_store::linker`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Row {
+    pub(crate) message_id: String,
+    pub(crate) added: i64,
     /// the first its group got of the file, of the rows taken together
-    lead: bool,
-    posted: i64,
-    grp: i64,
-    number: i64,
-    bytes: i64,
-    lines: i64,
+    pub(crate) lead: bool,
+    pub(crate) posted: i64,
+    pub(crate) grp: i64,
+    pub(crate) number: i64,
+    pub(crate) bytes: i64,
+    pub(crate) lines: i64,
 }
 
 /// Where a file goes: its release, that release's group, its place among the upload's files, and the parts it has.
-struct Place {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Place {
     /// the parts that were a group's first, comma separated (`leads`)
-    leads: String,
+    pub(crate) leads: String,
     /// when the oldest of its saved articles came
-    oldest: i64,
-    release: String,
-    group: String,
-    file: i64,
-    files: i64,
-    parts: i64,
+    pub(crate) oldest: i64,
+    pub(crate) release: String,
+    pub(crate) group: String,
+    pub(crate) file: i64,
+    pub(crate) files: i64,
+    pub(crate) parts: i64,
 }
 
 /// What a pass found: its releases to save, then `Store::ack`.
@@ -779,7 +787,7 @@ impl Store {
                     .into_iter()
                     .map(|r| Row { lead: r.lead && earliest.get(&r.grp).is_none_or(|&n| r.number < n), ..r })
                     .collect();
-                let leads = with_leads(&place.leads, self.add_file(&mut out, &place, &f.poster, rows, parts));
+                let leads = with_leads(&place.leads, add_file(&mut out, &place, &f.poster, rows, parts));
                 finished.push((f.poster, Some(Place { parts, leads, ..place }), ids));
             }
         }
@@ -858,7 +866,7 @@ impl Store {
                 }
                 None => {
                     // the release lives in the group most of its articles were posted to
-                    let home = by_group.iter().max_by_key(|&(g, n)| (*n, std::cmp::Reverse(*g))).map_or(0, |(g, _)| *g);
+                    let home = home_group(&by_group);
                     (upload_name(&fresh[files[0]].poster), self.group_name(home)?, 0)
                 }
             };
@@ -875,7 +883,7 @@ impl Store {
                     oldest: rows.iter().map(|r| r.added).min().unwrap_or(now),
                 };
                 let ids = Taken::Ids(rows.iter().map(|r| r.message_id.clone()).collect());
-                let leads = with_leads("", self.add_file(&mut out, &place, &fresh[i].poster, rows, parts));
+                let leads = with_leads("", add_file(&mut out, &place, &fresh[i].poster, rows, parts));
                 finished.push((fresh[i].poster.clone(), Some(Place { parts, leads, ..place }), ids));
             }
             widened.push((release, group, span, count));
@@ -888,15 +896,7 @@ impl Store {
             }
         }
 
-        let mut releases: Vec<Release> = out.into_values().collect();
-        for r in &mut releases {
-            r.complete = is_complete(&r.articles);
-            if let Some(first) = r.articles.first() {
-                r.poster = first.author.clone();
-                r.date = first.date.clone();
-            }
-        }
-        Ok(Found { releases, ack: Ack { finished, widened, now } })
+        Ok(Found { releases: finish_releases(out), ack: Ack { finished, widened, now } })
     }
 
     /// Note what `ack`'s pass took as done, once its releases are saved: until then the next pass finds them again.
@@ -964,57 +964,74 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+}
 
-    /// `rows` of one poster as a file of `place`'s release, parts numbered on from the ones it has, of `parts` in all.
-    /// The parts that were a group's first of them.
-    fn add_file(
-        &self,
-        out: &mut HashMap<String, Release>,
-        place: &Place,
-        poster: &str,
-        rows: Vec<Row>,
-        parts: i64,
-    ) -> Vec<i64> {
-        let mut leads = Vec::new();
-        let key = format!("{}\0{}", place.release, place.group);
-        let release = out.entry(key).or_insert_with(|| Release {
-            name: place.release.clone(),
-            is_obfuscated: true,
-            group: place.group.clone(),
-            collection: Some(format!("xref\0{}", place.release)),
-            ..Release::default()
-        });
-        // no count of files in it: files read later in other groups join the upload
-        let filename = format!("{}-{:05}", place.release, place.file);
-        for (k, row) in rows.into_iter().enumerate() {
-            let part = place.parts + k as i64 + 1;
-            if row.lead {
-                leads.push(part);
-            }
-            release.size += row.bytes.max(0);
-            release.articles.push(Article {
-                number: row.number.max(0) as u64,
-                subject: format!("[{}/{}] - \"{filename}\" yEnc ({part}/{parts})", place.file, place.files),
-                author: poster.to_string(),
-                date: iso(row.posted),
-                message_id: row.message_id,
-                bytes: row.bytes,
-                lines: row.lines,
-                filename: Some(filename.clone()),
-                release_name: Some(place.release.clone()),
-                part: Some(part),
-                total_parts: Some(parts),
-                file_index: Some(place.file),
-                file_total: Some(place.files),
-                ..Article::default()
-            });
+/// `rows` of one poster as a file of `place`'s release, parts numbered on from the ones it has, of `parts` in all.
+/// The parts that were a group's first of them. Shared with the day-segment store's linker (`nxv_store::linker`).
+pub(crate) fn add_file(
+    out: &mut HashMap<String, Release>,
+    place: &Place,
+    poster: &str,
+    rows: Vec<Row>,
+    parts: i64,
+) -> Vec<i64> {
+    let mut leads = Vec::new();
+    let key = format!("{}\0{}", place.release, place.group);
+    let release = out.entry(key).or_insert_with(|| Release {
+        name: place.release.clone(),
+        is_obfuscated: true,
+        group: place.group.clone(),
+        collection: Some(format!("xref\0{}", place.release)),
+        ..Release::default()
+    });
+    // no count of files in it: files read later in other groups join the upload
+    let filename = format!("{}-{:05}", place.release, place.file);
+    for (k, row) in rows.into_iter().enumerate() {
+        let part = place.parts + k as i64 + 1;
+        if row.lead {
+            leads.push(part);
         }
-        leads
+        release.size += row.bytes.max(0);
+        release.articles.push(Article {
+            number: row.number.max(0) as u64,
+            subject: format!("[{}/{}] - \"{filename}\" yEnc ({part}/{parts})", place.file, place.files),
+            author: poster.to_string(),
+            date: iso(row.posted),
+            message_id: row.message_id,
+            bytes: row.bytes,
+            lines: row.lines,
+            filename: Some(filename.clone()),
+            release_name: Some(place.release.clone()),
+            part: Some(part),
+            total_parts: Some(parts),
+            file_index: Some(place.file),
+            file_total: Some(place.files),
+            ..Article::default()
+        });
     }
+    leads
+}
+
+/// The group an upload's release lives in: the one most of its articles were posted to (the lowest id on a tie).
+pub(crate) fn home_group(by_group: &HashMap<i64, usize>) -> i64 {
+    by_group.iter().max_by_key(|&(g, n)| (*n, std::cmp::Reverse(*g))).map_or(0, |(g, _)| *g)
+}
+
+/// A pass's releases, each marked complete or not and named for its first article's poster and date.
+pub(crate) fn finish_releases(out: HashMap<String, Release>) -> Vec<Release> {
+    let mut releases: Vec<Release> = out.into_values().collect();
+    for r in &mut releases {
+        r.complete = is_complete(&r.articles);
+        if let Some(first) = r.articles.first() {
+            r.poster = first.author.clone();
+            r.date = first.date.clone();
+        }
+    }
+    releases
 }
 
 /// `before`, a comma separated list of parts, with `more` after them.
-fn with_leads(before: &str, more: Vec<i64>) -> String {
+pub(crate) fn with_leads(before: &str, more: Vec<i64>) -> String {
     before
         .split(',')
         .filter(|p| !p.is_empty())
@@ -1062,9 +1079,30 @@ fn in_store<T>(store: &Mutex<Option<Store>>, f: impl FnOnce(&mut Store) -> Resul
 /// Whether `article` is one this keeps: no subject rule reads it, its subject is one random token or its own
 /// Message-ID, and it names a poster.
 pub fn keeps(article: &Article) -> bool {
-    !article.author.is_empty()
-        && matches!(unparsable_shape(article), Shape::Token | Shape::IdSubject)
-        && parse_subject(&article.subject).is_none()
+    keeps_parts(&article.subject, &article.author, &article.message_id)
+}
+
+fn keeps_parts(subject: &str, author: &str, message_id: &str) -> bool {
+    !author.is_empty()
+        && matches!(crate::parser::shape_of(subject, message_id), Shape::Token | Shape::IdSubject)
+        && parse_subject(subject).is_none()
+}
+
+/// `keeps` of an overview row's raw subject, poster and message-id, as the indexer would read them into an article
+/// (`nntp::overview_of`: subject and poster with mojibake undone), without making the article: plain ASCII, the
+/// common case, is checked in place.
+pub fn keeps_fields(subject: &[u8], author: &[u8], message_id: &[u8]) -> bool {
+    if author.is_empty() {
+        return false;
+    }
+    if subject.is_ascii() && message_id.is_ascii() {
+        // ASCII: lossy decoding and undoing mojibake change nothing
+        let (Ok(s), Ok(m)) = (std::str::from_utf8(subject), std::str::from_utf8(message_id)) else { return false };
+        return keeps_parts(s, "x", m);
+    }
+    let s = crate::nntp::undo_mojibake(String::from_utf8_lossy(subject).into_owned());
+    let m = String::from_utf8_lossy(message_id);
+    keeps_parts(&s, "x", &m)
 }
 
 /// A slice's articles of `group` without the ones obfuscated per article, whose headers go to the store. They're
@@ -1082,6 +1120,10 @@ pub fn hold(group: &str, articles: Vec<Article>) -> Result<(Vec<Article>, Option
         unparsable.note(a);
     }
     crate::collections::count_unparsable(group, &unparsable);
+    // the store's linker reads them from the store's blocks, where the connection layer recorded the whole listing
+    if crate::nxv_store::live::links_on() {
+        return Ok((kept, None));
+    }
     let n = held.len();
     if cfg!(test) {
         in_store(&RECORDER, |s| s.record(group, &held, now()))
@@ -1592,6 +1634,33 @@ mod tests {
             lines: 5692,
             ..Article::default()
         }
+    }
+
+    #[test]
+    fn keeps_fields_agrees_with_keeps_on_overview_lines() {
+        let rows: Vec<Vec<u8>> = vec![
+            b"1\tabc123def456ghi789\tp@x\tSun, 08 Nov 2026 10:00:00 +0000\t<abc123def456ghi789@ngPost>\t\t1\t1"
+                .to_vec(),
+            b"2\tAbcdEfghIjklMnopQrst\tp@x\tSun, 08 Nov 2026 10:00:00 +0000\t<x@y>\t\t1\t1".to_vec(),
+            b"3\tAbcdEfghIjklMno\tp@x\tSun, 08 Nov 2026 10:00:00 +0000\t<x@y>\t\t1\t1".to_vec(),
+            b"4\tabcd.efgh.ijkl.mnop\tp@x\tSun, 08 Nov 2026 10:00:00 +0000\t<x@y>\t\t1\t1".to_vec(),
+            b"5\t  AbcdEfghIjklMnopQrst  \tp@x\tSun, 08 Nov 2026 10:00:00 +0000\t<x@y>\t\t1\t1".to_vec(),
+            b"6\tlocal[1]part\tp@x\tSun, 08 Nov 2026 10:00:00 +0000\t<local[1]part@h>\t\t1\t1".to_vec(),
+            b"7\tAbcdEfghIjklMnopQrst\t\tSun, 08 Nov 2026 10:00:00 +0000\t<x@y>\t\t1\t1".to_vec(),
+            "8\tAbcdEfgh\u{e9}IjklMnopQrst\tp@x\tSun, 08 Nov 2026 10:00:00 +0000\t<x@y>\t\t1\t1".as_bytes().to_vec(),
+            "9\tl\u{c3}\u{a9}cal\tp@x\tSun, 08 Nov 2026 10:00:00 +0000\t<l\u{e9}cal@y>\t\t1\t1".as_bytes().to_vec(),
+            b"10\t[1/9] - \"x.part01.rar\" yEnc (1/50)\tp@x\tSun, 08 Nov 2026 10:00:00 +0000\t<x@y>\t\t1\t1".to_vec(),
+            b"11\tlocal\tp@x\tSun, 08 Nov 2026 10:00:00 +0000\t<<local@a@b>>\t\t1\t1".to_vec(),
+            b"12\t\xff\xfeAbcdEfghIjklMnopQrst\tp@x\tSun, 08 Nov 2026 10:00:00 +0000\t<x@y>\t\t1\t1".to_vec(),
+        ];
+        let mut kept = 0;
+        for l in &rows {
+            let a = crate::nntp::overview_of(l).unwrap().into_article();
+            let f: Vec<&[u8]> = l.split(|&b| b == b'\t').collect();
+            assert_eq!(keeps_fields(f[1], f[2], f[4]), keeps(&a), "{}", String::from_utf8_lossy(l));
+            kept += keeps(&a) as usize;
+        }
+        assert!(kept >= 4, "the sample has kept rows: {kept}");
     }
 
     #[test]

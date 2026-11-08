@@ -111,3 +111,25 @@ fn a_wall_clock_is_the_written_time_with_its_zone_dropped() {
     assert_eq!(r2, 1_790_935_872);
     assert!(fc.next_row().is_none());
 }
+
+#[test]
+fn a_wall_window_passes_over_rows_outside_it_before_decoding_them() {
+    let l: Vec<Vec<u8>> = (0..300u64)
+        .map(|k| {
+            format!("{}\ts{k}\tp\tSun, 08 Nov 2026 10:{:02}:00 +0000\t<m{k}@x>\t\t1\t1", 1 + k, k % 60).into_bytes()
+        })
+        .collect();
+    let refs: Vec<&[u8]> = l.iter().map(|x| x.as_slice()).collect();
+    let block = NxvBlockBuilder::build_hot_block(&refs).unwrap();
+    let a = AlignedBytes::from_slice(&block);
+    let base = 1_794_132_000; // 10:00:00
+    let mut fc =
+        FieldCursor::new(NxvBlockView::from_mmap_slice(&a).unwrap()).unwrap().with_wall_window(base + 600, base + 1199);
+    let mut n = 0;
+    while let Some(r) = fc.next_row() {
+        assert!((base + 600..base + 1200).contains(&r.wall));
+        n += 1;
+    }
+    assert_eq!(n, 50, "minutes 10..19 of five rounds");
+    assert_eq!(fc.skipped, 250);
+}

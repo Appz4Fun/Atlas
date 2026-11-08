@@ -1084,10 +1084,21 @@ async fn run_servers(
         scans_stop.store(true, Ordering::Relaxed);
         crate::frozen::STOPPING.store(true, Ordering::Relaxed);
     });
-    // uploads whose every article has a random subject, linked across groups from the headers kept (`xref`)
+    // uploads whose every article has a random subject, linked across groups from the headers kept (`xref`), or from
+    // the day-segment store's blocks when its linker is on (`nxv_store::linker`)
     {
         let s = sched.clone();
-        tasks.spawn(named!("the xref linker".into(), crate::xref::run(db.clone(), move || s.stopping())));
+        match crate::nxv_store::live::handle().filter(|_| crate::nxv_store::live::links_on()) {
+            Some(store) => {
+                tasks.spawn(named!(
+                    "the header store linker".into(),
+                    crate::nxv_store::linker::run(db.clone(), store, move || s.stopping())
+                ));
+            }
+            None => {
+                tasks.spawn(named!("the xref linker".into(), crate::xref::run(db.clone(), move || s.stopping())));
+            }
+        }
     }
     tasks.spawn(named!("the config watcher".into(), watch_config(sched.clone(), servers)));
     tasks.spawn(named!("the status report".into(), report(sched.clone())));

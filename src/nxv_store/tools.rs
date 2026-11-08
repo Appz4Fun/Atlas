@@ -5,6 +5,9 @@
 //! - `link --store DIR --from UNIX --to UNIX`: one linker pass over the store's obfuscated rows posted in that span
 //!   (with two hours either side), grouped by poster and chained into uploads by the linker's own rule, and reports
 //!   what it found next to the uploads the SQLite linker saved for the same span.
+//! - `link-day --store DIR --day YYYY-MM-DD`: the store's own linker (`nxv_store::linker`) over one wall-clock day,
+//!   every hour of it taken as ready and every other hour as linked already, its state in a scratch folder beside the
+//!   store; reports the releases it would save (nothing is saved) and how long the day took.
 //! - `stats --store DIR`: segments, blocks, rows and bytes.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -26,10 +29,11 @@ pub fn run_cli(args: &[String]) -> i32 {
     let r = match rest.first().map(String::as_str) {
         Some("import") => import(&rest),
         Some("link") => link(&rest),
+        Some("link-day") => link_day(&rest),
         Some("stats") => stats(&rest),
         _ => {
             println!(
-                "usage: atlas --header-store import --to DIR [--files N] | link --store DIR --from UNIX --to UNIX | stats --store DIR"
+                "usage: atlas --header-store import --to DIR [--files N] | link --store DIR --from UNIX --to UNIX | link-day --store DIR --day YYYY-MM-DD | stats --store DIR"
             );
             return 1;
         }
@@ -373,4 +377,81 @@ fn chain_summary(arts: &[Art], from: i64, to: i64) -> Summary {
         }
     }
     s
+}
+
+fn link_day(args: &[String]) -> Result<()> {
+    use super::linker::{Linker, State};
+    let dir = PathBuf::from(arg(args, "--store").context("--store DIR")?);
+    let day_name = arg(args, "--day").context("--day YYYY-MM-DD")?;
+    let day = super::segment::parse_day_name(day_name).context("--day YYYY-MM-DD")?;
+    let (store, _) = Store::open(StoreConfig::new(&dir), keep_all())?;
+    let state_dir = dir.parent().unwrap_or(Path::new(".")).join(format!("linkstate-{day_name}"));
+    let _ = std::fs::remove_dir_all(&state_dir);
+    std::fs::create_dir_all(&state_dir)?;
+    // every hour but the day's linked already, every block read already: the passes take that day alone
+    let now = (day + 40) * DAY;
+    let mut state = State::default();
+    let segs = store.segments();
+    let (first_day, last_day) =
+        (segs.iter().map(|s| s.1).min().unwrap_or(day), segs.iter().map(|s| s.1).max().unwrap_or(day));
+    for h in (first_day - 2) * 24..(last_day + 3) * 24 {
+        if h < day * 24 || h >= (day + 1) * 24 {
+            state.linked.insert(h);
+        }
+    }
+    for (g, d, n) in &segs {
+        state.counts.insert((g.clone(), *d), *n as u32);
+        state.seen.insert(*d, now - 2 * DAY);
+    }
+    state.save(&state_dir)?;
+    let mut linker = Linker::open_in(&state_dir, now)?;
+    let t = Instant::now();
+    let (mut releases, mut uploads, mut late, mut articles, mut files, mut blocks, mut rows, mut kept, mut read) =
+        (0usize, 0u64, 0u64, 0usize, 0usize, 0u64, 0u64, 0u64, 0f64);
+    let mut bytes = 0i64;
+    let mut cross = 0usize;
+    let mut passes = 0;
+    while let Some(found) = linker.pass(&store, now, &HashSet::new(), &|| false)? {
+        passes += 1;
+        let st = found.stats.clone();
+        println!(
+            "  pass {passes}: hours {}..{}: {} blocks, {} rows in {:.1}s read, {:.1}s in all; {} kept, {} uploads, {} late files",
+            crate::xref::iso_pub(found.hours.first().copied().unwrap_or(0) * 3600),
+            crate::xref::iso_pub(found.hours.last().copied().unwrap_or(0) * 3600 + 3599),
+            st.blocks,
+            st.rows,
+            st.read_secs,
+            st.secs,
+            st.kept,
+            st.uploads,
+            st.late_files
+        );
+        releases += found.releases.len();
+        uploads += st.uploads;
+        late += st.late_files;
+        blocks += st.blocks;
+        rows += st.rows;
+        kept += st.kept;
+        read += st.read_secs;
+        for r in &found.releases {
+            articles += r.articles.len();
+            bytes += r.size;
+            let f: HashSet<&str> = r.articles.iter().filter_map(|a| a.filename.as_deref()).collect();
+            files += f.len();
+        }
+        let groups: HashSet<String> = found.releases.iter().map(|r| r.group.clone()).collect();
+        cross += groups.len();
+        linker.ack(found)?;
+    }
+    let _ = cross;
+    println!(
+        "{day_name}: {passes} passes in {:.1}s ({blocks} blocks, {rows} rows, {:.1}s reading, {kept} obfuscated articles kept)",
+        t.elapsed().as_secs_f64(),
+        read
+    );
+    println!(
+        "  releases {releases} ({uploads} uploads, {late} late files), {files} files, {articles} articles, {:.1} GB",
+        bytes as f64 / 1e9
+    );
+    store.close()
 }

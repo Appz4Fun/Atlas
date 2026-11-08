@@ -775,6 +775,9 @@ pub fn header_window_config() -> HeaderWindowConfig {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HeaderStoreConfig {
     pub enabled: bool,
+    /// the cross-group linker reads the store (`nxv_store::linker`) instead of `atlas.xref.db`, which then keeps no
+    /// headers; only with `enabled`
+    pub linker: bool,
     /// where it lives, `header-store` next to the databases unless set (a relative path is taken from there too)
     pub dir: String,
 }
@@ -785,6 +788,9 @@ impl HeaderStoreConfig {
         let Some(v) = v else { return c };
         if let Some(b) = v.get("enabled").and_then(as_bool) {
             c.enabled = b;
+        }
+        if let Some(b) = v.get("linker").and_then(as_bool) {
+            c.linker = b;
         }
         if let Some(d) = v.get("dir").and_then(Value::as_str) {
             c.dir = d.trim().to_string();

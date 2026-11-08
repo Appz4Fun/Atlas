@@ -13,7 +13,7 @@
 //! - Any write or sync error stops the store (`failed`): tickets error, nothing more is written, and recovery runs at
 //!   the next start.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
@@ -198,9 +198,15 @@ struct Shared {
     dropped_unkept: AtomicU64,
     dropped_repeats: AtomicU64,
     blocks_committed: AtomicU64,
+    /// slabs handed to the sealers and not yet committed (or let go): (group, generation)
+    inflight: Mutex<HashSet<(String, u32)>>,
 }
 
 impl Shared {
+    fn landed(&self, group: &str, slab_gen: u32) {
+        self.inflight.lock().unwrap_or_else(|e| e.into_inner()).remove(&(group.to_string(), slab_gen));
+    }
+
     fn failure(&self) -> Option<String> {
         self.failed.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
@@ -223,6 +229,7 @@ type SealJob = (Arc<Group>, Slab);
 struct Pending {
     group: Arc<Group>,
     day: i64,
+    slab_gen: u32,
     block: Vec<u8>,
     log: PathBuf,
 }
@@ -315,6 +322,7 @@ impl Store {
             dropped_unkept: AtomicU64::new(0),
             dropped_repeats: AtomicU64::new(0),
             blocks_committed: AtomicU64::new(0),
+            inflight: Mutex::new(HashSet::new()),
         });
         let store = Arc::new(Store {
             cfg,
@@ -456,6 +464,89 @@ impl Store {
         }
     }
 
+    /// A seal barrier: every row of `days` recorded before this call sealed and committed, waiting up to `timeout`. The
+    /// slabs of those days open now (and any on their way to the committer) are the ones waited for; slabs opened
+    /// after, for rows that come meanwhile, aren't, soo a day still being read doesn't hold the barrier up.
+    pub fn flush_days(&self, days: &[i64], timeout: Duration) -> Result<()> {
+        let mut waiting: HashSet<(String, u32)> = HashSet::new();
+        for g in self.groups.read().unwrap_or_else(|e| e.into_inner()).values() {
+            let mut s = g.slabs.lock().unwrap_or_else(|e| e.into_inner());
+            for sl in s.open.values().chain(s.full.iter()) {
+                if days.contains(&sl.day) {
+                    waiting.insert((g.name.clone(), sl.slab_gen));
+                }
+            }
+            s.seal_days.extend(days);
+        }
+        // and those already handed to the sealers: whatever day, they're few
+        waiting.extend(self.shared.inflight.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned());
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(e) = self.failure() {
+                bail!("the header store stopped: {e}");
+            }
+            let left: usize = {
+                let inflight = self.shared.inflight.lock().unwrap_or_else(|e| e.into_inner());
+                let groups = self.groups.read().unwrap_or_else(|e| e.into_inner());
+                waiting.retain(|(name, slab_gen)| {
+                    inflight.contains(&(name.clone(), *slab_gen))
+                        || groups.get(name).is_some_and(|g| {
+                            let s = g.slabs.lock().unwrap_or_else(|e| e.into_inner());
+                            s.open.values().chain(s.full.iter()).any(|sl| sl.slab_gen == *slab_gen)
+                        })
+                });
+                waiting.len()
+            };
+            if left == 0 {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                bail!("{left} slabs of the days asked for weren't committed in time");
+            }
+            // the batcher may be asleep for its whole interval (tests): a tick now cuts the seals asked for
+            if self.cfg.sync_every > Duration::from_secs(1) {
+                self.tick()?;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Every segment there is: (group, day, blocks published).
+    pub fn segments(&self) -> Vec<(String, i64, usize)> {
+        let mut out = Vec::new();
+        for (name, g) in self.groups.read().unwrap_or_else(|e| e.into_inner()).iter() {
+            for (day, seg) in g.segments.read().unwrap_or_else(|e| e.into_inner()).iter() {
+                out.push((name.clone(), *day, seg.block_count()));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Days some slab still holds rows of (not yet sealed and committed).
+    pub fn open_days(&self) -> BTreeSet<i64> {
+        let mut out = BTreeSet::new();
+        for g in self.groups.read().unwrap_or_else(|e| e.into_inner()).values() {
+            let s = g.slabs.lock().unwrap_or_else(|e| e.into_inner());
+            out.extend(s.open.values().chain(s.full.iter()).filter(|sl| !sl.is_empty()).map(|sl| sl.day));
+        }
+        out
+    }
+
+    /// The published blocks of `group`'s segment of `day`, with the map they point into.
+    pub fn day_blocks(&self, group: &str, day: i64) -> (Option<Arc<memmap2::Mmap>>, Vec<Entry>) {
+        let Some(g) = self.groups.read().unwrap_or_else(|e| e.into_inner()).get(group).cloned() else {
+            return (None, Vec::new());
+        };
+        let seg = g.segments.read().unwrap_or_else(|e| e.into_inner()).get(&day).cloned();
+        seg.map_or((None, Vec::new()), |s| s.snapshot())
+    }
+
+    /// Where the store lives.
+    pub fn root(&self) -> &Path {
+        &self.cfg.root
+    }
+
     /// One batcher tick, run by the batcher thread every `sync_every` (and by tests directly).
     pub fn tick(&self) -> Result<()> {
         let _one = self.tick_lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -494,7 +585,12 @@ impl Store {
             }
             s.epoch += 1;
             synced.push((Arc::clone(g), s.epoch, std::mem::take(&mut s.replaced)));
-            to_seal.extend(leaving.into_iter().filter(|sl| !sl.is_empty()).map(|sl| (Arc::clone(g), sl)));
+            let leaving: Vec<Slab> = leaving.into_iter().filter(|sl| !sl.is_empty()).collect();
+            {
+                let mut inflight = self.shared.inflight.lock().unwrap_or_else(|e| e.into_inner());
+                inflight.extend(leaving.iter().map(|sl| (g.name.clone(), sl.slab_gen)));
+            }
+            to_seal.extend(leaving.into_iter().map(|sl| (Arc::clone(g), sl)));
         }
         // outside the locks: write, then make it all durable with one full flush
         let result = (|| -> Result<()> {
@@ -790,7 +886,7 @@ fn sealer(rx: Arc<Mutex<Receiver<SealJob>>>, tx: SyncSender<Pending>, shared: Ar
         let refs: Vec<&[u8]> = lines.iter().map(|l| l.as_slice()).collect();
         match NxvBlockBuilder::build_hot_block_meta(&refs, BlockMeta { server_id: server, slab_gen }) {
             Ok(block) => {
-                if tx.send(Pending { group, day, block, log: log_path }).is_err() {
+                if tx.send(Pending { group, day, slab_gen, block, log: log_path }).is_err() {
                     return;
                 }
             }
@@ -816,6 +912,9 @@ fn committer(rx: Receiver<Pending>, shared: Arc<Shared>) {
         match commit(&batch) {
             Ok(n) => {
                 shared.blocks_committed.fetch_add(n as u64, Ordering::Relaxed);
+                for p in &batch {
+                    shared.landed(&p.group.name, p.slab_gen);
+                }
             }
             Err(e) => shared.fail(e),
         }

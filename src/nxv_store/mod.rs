@@ -5,6 +5,7 @@
 //!
 //! The design is written up in the architecture plan ("Atlas header store without SQLite").
 
+pub mod linker;
 pub mod live;
 pub mod segment;
 pub mod slab;
