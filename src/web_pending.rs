@@ -160,8 +160,9 @@ fn read_state(conn: &Connection, s: usize, id: i64) -> rusqlite::Result<State> {
         .query_row(
             &format!(
                 "select name, display_name, group_name, poster, posted_date, coalesce(size, 0), coalesce(complete, 0),
-                        coalesce(parts, 0), file_total, coalesce(is_obfuscated, 0), name_source
-                 from s{s}.releases where id = ?"
+                        coalesce(parts, 0), file_total, coalesce(is_obfuscated, 0), name_source,
+                        (select kind from s{s}.spots where release_id = ?1)
+                 from s{s}.releases where id = ?1"
             ),
             [id],
             |r| {
@@ -179,6 +180,7 @@ fn read_state(conn: &Connection, s: usize, id: i64) -> rusqlite::Result<State> {
                     file_total: r.get(8)?,
                     is_obfuscated: r.get::<_, i64>(9)? != 0,
                     name_source: r.get(10)?,
+                    spot_kind: crate::spotnet::Kind::parse(r.get::<_, Option<String>>(11)?.as_deref()),
                 })
             },
         )
