@@ -516,17 +516,21 @@ pub static BACKFILL_FRONTIER_DAY: AtomicI64 = AtomicI64::new(0);
 /// `BACKFILL_FRONTIER_DAY` when there's no backfill to keep days around.
 pub const NO_BACKFILL: i64 = -1;
 
+/// How far back hours stay while the backfill frontier isn't known.
+pub const UNKNOWN_KEEP_DAYS: i64 = 3;
+
 /// Posting-time ranges, seconds, both ends in.
 pub type Ranges = Vec<(i64, i64)>;
 
 /// The posting-time ranges the window takes lines in and keeps at `now`: the last `keep_hours` (live reading) and
-/// the days lockstep backfill reads around its frontier (`frontier_day`). While the frontier isn't known yet (0),
-/// only live lines are taken in and nothing older is dropped; with no backfill (`NO_BACKFILL`), only the live hours
-/// are kept: (record, keep).
+/// the days lockstep backfill reads around its frontier (`frontier_day`). While the frontier isn't known (0: no
+/// claim has said, as on an install with no backfill turn at all), only live lines are taken in, and older hours
+/// stay up to `UNKNOWN_KEEP_DAYS`, soo a store from before isn't dropped before a claim tells; with no backfill
+/// (`NO_BACKFILL`), only the live hours are kept: (record, keep).
 pub fn ranges(now: i64, keep_hours: i64, frontier_day: i64) -> (Ranges, Ranges) {
     let live = (now - keep_hours * HOUR, now + HOUR);
     if frontier_day == 0 {
-        return (vec![live], vec![(i64::MIN, now + HOUR)]);
+        return (vec![live], vec![(now - UNKNOWN_KEEP_DAYS * 86_400, now + HOUR)]);
     }
     if frontier_day < 0 {
         return (vec![live], vec![live]);
@@ -787,10 +791,10 @@ mod tests {
     }
 
     #[test]
-    fn without_a_known_frontier_only_live_lines_come_in_and_nothing_older_goes() {
+    fn without_a_known_frontier_only_live_lines_come_in_and_older_hours_stay_a_while() {
         let now = 20_400 * 86_400 + 5 * HOUR;
         let live = (now - 24 * HOUR, now + HOUR);
-        assert_eq!(ranges(now, 24, 0), (vec![live], vec![(i64::MIN, now + HOUR)]));
+        assert_eq!(ranges(now, 24, 0), (vec![live], vec![(now - UNKNOWN_KEEP_DAYS * 86_400, now + HOUR)]));
         assert_eq!(ranges(now, 24, NO_BACKFILL), (vec![live], vec![live]), "no backfill: the live hours only");
         let (take, keep) = ranges(now, 24, 20_000);
         assert_eq!(take, keep);
