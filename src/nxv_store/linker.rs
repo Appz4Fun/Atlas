@@ -648,7 +648,7 @@ impl Linker {
             }
             let poster = &posters[pid];
             let mut rows: &Vec<usize> = rows;
-            let mut new_rows: Vec<usize> = Vec::new();
+            let new_rows: Vec<usize>;
             let mut again = false;
             if let Some(pr) = links.places.get(poster) {
                 // a file already placed: its new articles (late, or of the hours linked now) are more of its parts
