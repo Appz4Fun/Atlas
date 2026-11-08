@@ -99,15 +99,14 @@ pub struct Source {
     pub path: PathBuf,
 }
 
-/// The shards to fold into shard 0 of `main`, smallest first.
+/// The shards to fold into shard 0 of `main`, in shard order: each source's domains come in from `shard << 32`, soo
+/// the lowest id of a suffix (the one its rows are renumbered to, `map_domains`) is the first source's that has it and
+/// stays so; merged in any other order, a suffix two sources share would end with rows under two ids.
 pub fn sources(main: &Path) -> Vec<Source> {
-    let mut found: Vec<(u64, Source)> = (1..LEGACY_SHARDS)
-        .map(|shard| (shard, legacy_shard_path(main, shard)))
-        .filter(|(_, p)| p.exists())
-        .map(|(shard, path)| (std::fs::metadata(&path).map_or(0, |m| m.len()), Source { shard, path }))
-        .collect();
-    found.sort_by_key(|(size, s)| (*size, s.shard));
-    found.into_iter().map(|(_, s)| s).collect()
+    (1..LEGACY_SHARDS)
+        .map(|shard| Source { shard, path: legacy_shard_path(main, shard) })
+        .filter(|s| s.path.exists())
+        .collect()
 }
 
 /// The files of the shards from before one shard still beside `main`: `atlas.s1.db` .. `atlas.s7.db`, and a
@@ -156,6 +155,15 @@ pub fn merge(
         conn.execute_batch(SCHEMA)?;
         refuse_an_earlier_builds_merge(&conn)?;
         domains_not_unique(&conn)?;
+        // in shard order only (`sources`): a source after a higher one would take its domains' lowest ids
+        let later: Option<i64> = conn.query_row(
+            "select max(shard) from merge_shards where shard > ?1 and done = 1",
+            [source.shard as i64],
+            |r| r.get(0),
+        )?;
+        if let Some(later) = later {
+            bail!("shard {} comes before shard {later}, merged already: shards merge in shard order", source.shard);
+        }
         park_triggers(&conn)?;
         let rows = merge_one(&conn, source, &mut budget, log)?;
         let Some(rows) = rows else { return Ok(merged) };
@@ -363,10 +371,10 @@ fn merge_one(
 /// Each source domain id and the target's id for its suffix, as a temp table (`temp.domain_map`) for the segment rows
 /// and a map for the blobs (`atlas_remap_blob`, registered on `conn`). A blob that won't decode is copied as it is,
 /// and counted.
-fn map_domains(
-    conn: &Connection,
-    base: i64,
-) -> Result<(std::sync::Arc<std::collections::HashMap<i64, i64>>, std::sync::Arc<std::sync::atomic::AtomicUsize>)> {
+/// A source's domain ids and the target's for the same suffix, and a count of blobs that wouldn't read.
+type DomainMap = (std::sync::Arc<std::collections::HashMap<i64, i64>>, std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+fn map_domains(conn: &Connection, base: i64) -> Result<DomainMap> {
     conn.execute_batch(
         "create temp table if not exists domain_map (old INTEGER PRIMARY KEY, new INTEGER NOT NULL);
          delete from temp.domain_map;
@@ -894,6 +902,17 @@ pub fn run(args: &[String]) -> i32 {
     }
     let main = crate::paths::database();
     let target = legacy_shard_path(&main, 0);
+    // a compaction's swap of a shard cut short: its backup is what holds the shard (the shard itself may be gone), and the merge doesn't put it
+    // back
+    let backups: Vec<String> = legacy_leftovers(&main)
+        .into_iter()
+        .filter(|p| p.to_string_lossy().ends_with(".precompact.db"))
+        .map(|p| p.display().to_string())
+        .collect();
+    if !backups.is_empty() {
+        println!("a compaction's backup is beside a shard: put it back or remove it first: {}", backups.join(", "));
+        return 1;
+    }
     let todo = sources(&main);
     if todo.is_empty() {
         // the last source went but its run stopped before `finish`: the marker says so, or the target does when the
@@ -938,20 +957,10 @@ pub fn run(args: &[String]) -> i32 {
         println!("nothing to merge: {} is the only shard", target.display());
         return 0;
     }
-    // a compaction's swap of a shard cut short: its backup is what holds the shard, and the merge doesn't put it back
-    let backups: Vec<String> = legacy_leftovers(&main)
-        .into_iter()
-        .filter(|p| p.to_string_lossy().ends_with(".precompact.db"))
-        .map(|p| p.display().to_string())
-        .collect();
-    if !backups.is_empty() {
-        println!("a compaction's backup is beside a shard: put it back or remove it first: {}", backups.join(", "));
-        return 1;
-    }
     let free = crate::frozen::free_bytes(&main).unwrap_or(0);
     let size = |p: &Path| std::fs::metadata(p).map_or(0, |m| m.len());
     let biggest = todo.iter().map(|s| size(&s.path) + size(&crate::frozen::path(&s.path))).max().unwrap_or(0);
-    println!("merging {} shards into {}, smallest first:", todo.len(), target.display());
+    println!("merging {} shards into {}:", todo.len(), target.display());
     for s in &todo {
         let size = std::fs::metadata(&s.path).map_or(0, |m| m.len());
         println!("  s{} {:.1} GB", s.shard, size as f64 / 1e9);
@@ -1037,21 +1046,33 @@ mod tests {
     /// Eight shards as there were, two releases each, their articles under a domain of their own and one rare: shard
     /// 0 is `main`'s own, each other made as a database of its own (its own secret, its ids apart) and put in place.
     fn fixture(main: &Path) -> Vec<String> {
+        fixture_sharing(main, &[])
+    }
+
+    /// `fixture`, with a second file in release 1 of each of `sharing`, its articles under `both.example`: a domain
+    /// those shards have and shard 0 hasn't.
+    fn fixture_sharing(main: &Path, sharing: &[usize]) -> Vec<String> {
         crate::db::create_db_at(main).unwrap();
         let groups = groups();
         for (s, g) in groups.iter().enumerate() {
             let releases: Vec<Release> = (0..2)
-                .map(|r| Release {
-                    name: format!("Rel.{s}.{r}"),
-                    group: g.clone(),
-                    collection: Some(format!("post {s} {r}")),
-                    articles: vec![
+                .map(|r| {
+                    let mut articles = vec![
                         art("a.rar", 1, &format!("s{s}r{r}a1"), &format!("own{s}.example")),
                         art("a.rar", 2, &format!("s{s}r{r}a2"), &format!("own{s}.example")),
                         art("a.rar", 3, &format!("s{s}r{r}a3"), &format!("own{s}.example")),
                         art("a.rar", 4, &format!("s{s}r{r}a4"), "rare.example"),
-                    ],
-                    ..Default::default()
+                    ];
+                    if r == 1 && sharing.contains(&s) {
+                        articles.extend((1..=4).map(|n| art("b.rar", n, &format!("s{s}r{r}b{n}"), "both.example")));
+                    }
+                    Release {
+                        name: format!("Rel.{s}.{r}"),
+                        group: g.clone(),
+                        collection: Some(format!("post {s} {r}")),
+                        articles,
+                        ..Default::default()
+                    }
                 })
                 .collect();
             if s == 0 {
@@ -1340,5 +1361,51 @@ mod tests {
         }
         assert_eq!(stats("Rel.3.0"), rows_before, "rows: seen again, not added");
         assert_eq!(stats("Rel.5.0"), sealed_before, "sealed: seen again, not added");
+    }
+
+    #[test]
+    fn a_domain_two_shards_share_ends_under_one_id_whatever_their_sizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        let groups = fixture_sharing(&main, &[2, 5]);
+        // shard 2 the bigger: merged by size, shard 5 would come first and its id for the domain stop being the lowest
+        crate::db::open_at(&legacy_shard_path(&main, 2))
+            .unwrap()
+            .execute_batch(
+                "insert into meta (key, value) values ('pad', randomblob(4000000));
+                 pragma wal_checkpoint(truncate);",
+            )
+            .unwrap();
+        let todo = sources(&main);
+        assert_eq!(todo.iter().map(|s| s.shard).collect::<Vec<_>>(), (1..LEGACY_SHARDS).collect::<Vec<_>>());
+        let target = legacy_shard_path(&main, 0);
+        merge(&target, &todo, true, None, &|_| {}).unwrap();
+        finish(&main, &target).unwrap();
+        let c = crate::db::open_at(&target).unwrap();
+        let shared = "select count(distinct s.domain) from segments s join domains d on d.id = s.domain
+                      where d.suffix = '@both.example>'";
+        assert_eq!(count(&c, shared), 1, "one id for the domain");
+        // shard 5's article again: found under that id, not added
+        let segments = "select count(*) from segments";
+        let before = count(&c, segments);
+        let again = Release {
+            name: "Rel.5.1".into(),
+            group: groups[5].clone(),
+            collection: Some("post 5 1".into()),
+            articles: (1..=4).map(|n| art("b.rar", n, &format!("s5r1b{n}"), "both.example")).collect(),
+            ..Default::default()
+        };
+        store::save(&main, &[again]).unwrap();
+        assert_eq!(count(&c, segments), before, "seen again, not added");
+        // and a merge given its sources out of order stops
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        fixture(&main);
+        let target = legacy_shard_path(&main, 0);
+        let mut todo = sources(&main);
+        todo.swap(0, 1);
+        merge(&target, &todo[..1], true, None, &|_| {}).unwrap();
+        let e = merge(&target, &todo[1..], true, None, &|_| {}).unwrap_err();
+        assert!(format!("{e:#}").contains("shard order"), "{e:#}");
     }
 }
