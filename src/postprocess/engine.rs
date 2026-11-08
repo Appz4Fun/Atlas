@@ -701,6 +701,7 @@ impl Inner {
             deadline: Instant::now() + STEP_DEADLINE,
             lane_can_fetch: false,
             crcs: Vec::new(),
+            pictures: false,
         };
         let mut failure = false;
         let mut queue_at: Option<i64> = None;
@@ -1080,6 +1081,7 @@ impl Inner {
                 deadline: Instant::now() + STEP_DEADLINE,
                 lane_can_fetch: step.needs() == Needs::Bodies,
                 crcs: Vec::new(),
+                pictures: false,
             };
             let ran = run_step(step.as_ref(), &mut ctx);
             let now = chrono::Utc::now().timestamp();
