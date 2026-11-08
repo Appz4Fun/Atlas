@@ -914,12 +914,15 @@ pub fn finish(main: &Path, target: &Path) -> Result<()> {
         let next = crate::store::get_meta(&main_conn, "next_seq")?.unwrap_or(0);
         highest = highest.max(next.saturating_mul(LEGACY_SHARDS as i64));
     }
+    // the first id in one-shard numbering, noted once (`one_shard_from`), before the counter's conversion is: a rerun
+    // after it reckons the same `highest`, one after the conversion couldn't
+    if !converted {
+        conn.execute("insert or ignore into meta (key, value) values (?1, ?2)", params![ONE_SHARD_FROM, highest + 1])?;
+    }
     let tx = main_conn.unchecked_transaction()?;
     crate::store::set_next_seq(&tx, highest + 1)?;
     tx.execute("insert or replace into meta (key, value) values (?1, 1)", [COUNTER_DONE])?;
     tx.commit()?;
-    // the first id in one-shard numbering, noted once (`one_shard_from`)
-    conn.execute("insert or ignore into meta (key, value) values (?1, ?2)", params![ONE_SHARD_FROM, highest + 1])?;
     // the copies' names, which no trigger indexed (`KEPT_TRIGGERS`): the index made again from `releases`
     if conn.prepare("select 1 from main.merge_triggers limit 1")?.exists([])? {
         conn.execute("insert into releases_fts(releases_fts) values ('rebuild')", [])?;
@@ -937,7 +940,9 @@ const ONE_SHARD_FROM: &str = "one_shard_from";
 
 /// The first release id in one-shard numbering, for the merged shard on `conn`: ids below it were handed out eight to
 /// a save (`seq * 8 + shard`), ids from it on one to a save. What `finish` noted, or for a shard a build that didn't
-/// note it finished, the highest id a source brought; 0 for a shard never merged.
+/// note it finished, the first id past the folded shards' that isn't a multiple of eight (shard 0's own ids from
+/// before all were; the cutover is within eight below it), or with none yet, no id is dense; 0 for a shard never
+/// merged.
 pub fn one_shard_from(conn: &Connection) -> Result<i64> {
     if let Some(v) = crate::store::get_meta(conn, ONE_SHARD_FROM)? {
         return Ok(v);
@@ -947,7 +952,10 @@ pub fn one_shard_from(conn: &Connection) -> Result<i64> {
     if !merged {
         return Ok(0);
     }
-    Ok(conn.query_row("select coalesce(max(max_release), -1) + 1 from merge_shards", [], |r| r.get(0))?)
+    let folded: i64 = conn.query_row("select coalesce(max(max_release), 0) from merge_shards", [], |r| r.get(0))?;
+    let dense: Option<i64> =
+        conn.query_row("select min(id) from releases where id > ?1 and id % 8 != 0", [folded], |r| r.get(0))?;
+    Ok(dense.map_or(i64::MAX, |id| id - id % 8))
 }
 
 /// The shards a merge into `target` has begun, and whether each is copied whole.
@@ -1510,5 +1518,29 @@ mod tests {
         merge(&target, &todo[..1], true, None, &|_| {}).unwrap();
         let e = merge(&target, &todo[1..], true, None, &|_| {}).unwrap_err();
         assert!(format!("{e:#}").contains("shard order"), "{e:#}");
+    }
+
+    #[test]
+    fn the_first_one_shard_id_is_noted_or_found_past_the_folded_ids() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "create table meta (key TEXT PRIMARY KEY, value INTEGER);
+             create table releases (id INTEGER PRIMARY KEY, name TEXT);",
+        )
+        .unwrap();
+        assert_eq!(one_shard_from(&c).unwrap(), 0, "never merged");
+        c.execute_batch(SCHEMA).unwrap();
+        c.execute(
+            "insert into merge_shards (shard, file_offset, domain_offset, max_release) values (3, 0, 0, 1003)",
+            [],
+        )
+        .unwrap();
+        // shard 0's own ids past the folded ones, all multiples of eight, and none dense yet
+        c.execute_batch("insert into releases (id) values (1000), (1008), (1016);").unwrap();
+        assert_eq!(one_shard_from(&c).unwrap(), i64::MAX);
+        c.execute_batch("insert into releases (id) values (1025), (1026);").unwrap();
+        assert_eq!(one_shard_from(&c).unwrap(), 1024);
+        c.execute("insert into meta (key, value) values (?1, 1017)", [ONE_SHARD_FROM]).unwrap();
+        assert_eq!(one_shard_from(&c).unwrap(), 1017, "noted");
     }
 }

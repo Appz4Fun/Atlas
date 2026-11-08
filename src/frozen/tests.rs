@@ -989,7 +989,9 @@ fn a_release_frozen_in_a_folded_shard_thaws_without_fetching_its_sealed_blobs() 
     let thawed = blob_of(8 * 1000 + 3);
     assert!(crate::blob::is_remote(&thawed), "still in the log");
     assert_eq!(crate::blob::inner(&thawed), &place[..]);
-    assert_ne!(thawed, place, "read on from the shard's base");
+    assert_eq!(thawed[..crate::blob::SHIFTED_TAG.len()], crate::blob::SHIFTED_TAG);
+    let at = crate::blob::SHIFTED_TAG.len();
+    assert_eq!(i64::from_le_bytes(thawed[at..at + 8].try_into().unwrap()), base, "read on from the shard's base");
     // frozen since the merge, its ids the merged shard's: the blob as it was
     restore(&conn, "main", &payload(8 * 1000 + 16, base + 3), Domains::Map).unwrap();
     assert_eq!(blob_of(8 * 1000 + 16), place);

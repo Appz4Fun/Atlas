@@ -3044,8 +3044,8 @@ struct CollectionRow {
 /// A new one takes the slice's name; when another release in the group has
 /// that, with 8 digits of the key's hash after it, as `a [4]` has its count.
 fn collection_row(tx: &Connection, key: &IdKey, collection: &str, release: &Release) -> Result<CollectionRow> {
+    // a folded shard's row was adopted already, at the top of the save loop
     let hash = key.hash(collection);
-    adopt_legacy_collection(tx, key, collection)?;
     // a purge can leave a row here, whose release is gone: it finds nothing
     let known: Option<(String, bool)> = tx
         .prepare_cached(
