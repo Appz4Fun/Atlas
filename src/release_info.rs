@@ -1001,19 +1001,12 @@ fn across_posters(conn: &Connection, anchor: i64, named: &[Named]) -> Result<Acr
             }
         }
         if !sharing_whole.is_empty() {
-            // the whole posts, and the rest of the rows grown again as before rows could share parts
-            posts.retain(|(c, u)| whole(c, u));
-            let mut taken: HashSet<i64> =
-                in_whole.into_iter().chain(sharing_whole.iter().flat_map(|(c, _)| c.iter().copied())).collect();
+            // the whole posts sharing parts, and every other post as before rows could share parts, unless a row of
+            // it joined one: its other rows are left with no post. One poster's other rows had no post across
+            // posters before, and have none now
+            let joined: HashSet<i64> = sharing_whole.iter().flat_map(|(c, _)| c.iter().copied()).collect();
+            posts.retain(|(c, _)| !one_poster && !c.iter().any(|id| joined.contains(id)));
             posts.extend(sharing_whole);
-            for seed in rest {
-                if taken.contains(&kept[seed].0.id) {
-                    continue;
-                }
-                let (chosen, union) = grow_post(conn, &kept, seed, &taken, false)?;
-                taken.extend(chosen.iter().copied());
-                posts.push((chosen, union));
-            }
         }
     }
     // one poster's rows are `same_poster_post`'s, unless they share parts
