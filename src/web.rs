@@ -91,6 +91,8 @@ pub fn get(path: &str, query: &str, cookies: Option<&str>, base: &str, api_key: 
         "/ui/poster" if signed_in => poster(&args),
         "/ui/cover" if signed_in => cover(&args),
         "/ui/still" if signed_in => still(&args),
+        "/ui/image" if signed_in => image(&args),
+        "/ui/samepicture" if signed_in => same_picture_panel(&args),
         "/ui/samefilm" if signed_in => same_film_panel(&args),
         "/ui/same" if signed_in => same_key_page(&args),
         "/ui/meta" if signed_in => crate::web_meta::fragment(&args),
@@ -100,7 +102,7 @@ pub fn get(path: &str, query: &str, cookies: Option<&str>, base: &str, api_key: 
         "/ui/nzb" if signed_in && args.get("fill").is_some_and(|v| v == "1") => filled_nzb(&args),
         "/ui/nzb" if signed_in => get_nzb(&args),
         "/ui/total" | "/ui/details" | "/ui/pending" | "/ui/poster" | "/ui/cover" | "/ui/still" | "/ui/samefilm"
-        | "/ui/meta" | "/ui/row" | "/ui/stats/live" | "/ui/stats/stored" => {
+        | "/ui/image" | "/ui/samepicture" | "/ui/meta" | "/ui/row" | "/ui/stats/live" | "/ui/stats/stored" => {
             ApiResponse { headers: vec![("HX-Redirect".into(), "/".into())], ..html(401, String::new()) }
         }
         "/ui/nzb"
@@ -3013,6 +3015,7 @@ fn release_html(
             Some(stills_html(shown, &crate::probe::stills::stills(conn, shown), from))
         })
         .unwrap_or_default();
+    let images = conn.as_ref().map(|c| images_html(r.id, &crate::images::step::images(c, r.id))).unwrap_or_default();
     let found = conn.as_ref().and_then(|c| crate::probe::read(c, r.id)).map(|p| seven_z_first_file(p, inner, contents));
     let probe = match (conn.as_ref(), found.as_ref()) {
         (Some(c), Some(found)) => probe_html(
@@ -3067,6 +3070,7 @@ fn release_html(
 <div id="pending" hx-get="/ui/pending?id={id}" hx-trigger="load" hx-swap="outerHTML"></div>
 {spot}
 {stills}
+{images}
 {copies}
 {meta}
 {probe}
@@ -3923,6 +3927,145 @@ fn stills_html(id: i64, stills: &[(u8, Option<i64>, u32, u32)], from: Option<(i6
     format!(
         "<h2>Stills</h2>{note}<div class=\"stills\">{figures}</div><div id=\"same-film\" hx-get=\"/ui/samefilm?id={id}\" hx-trigger=\"load\" hx-swap=\"outerHTML\"></div>"
     )
+}
+
+/// The pictures posted with a release, each with what its headers say.
+fn images_html(id: i64, images: &[crate::images::step::Image]) -> String {
+    if images.is_empty() {
+        return String::new();
+    }
+    let figures: String = images
+        .iter()
+        .map(|i| {
+            // the picture's hash in the address: a rerun that puts another picture at this place isn't served from cache
+            let src = format!("/ui/image?id={id}&amp;at={}&amp;v={}", i.position, &i.sha256[..i.sha256.len().min(12)]);
+            let facts = image_facts(i);
+            format!(
+                "<figure class=\"picture\"><a href=\"{src}\"><img src=\"{src}\" width=\"{}\" height=\"{}\" loading=\"lazy\" alt=\"{}\"></a><figcaption><b>{}</b><dl class=\"facts\">{facts}</dl></figcaption></figure>",
+                i.width,
+                i.height,
+                attr(&i.file),
+                escape(&i.file)
+            )
+        })
+        .collect();
+    format!(
+        "<h2>Pictures</h2><div class=\"pictures\">{figures}</div><div id=\"same-picture\" hx-get=\"/ui/samepicture?id={id}\" hx-trigger=\"load\" hx-swap=\"outerHTML\"></div>"
+    )
+}
+
+/// A picture's facts, as `<dt>`/`<dd>` pairs: its size and kind, then what a JPEG's headers add.
+fn image_facts(i: &crate::images::step::Image) -> String {
+    let mut facts: Vec<(&str, String)> = vec![
+        ("Size", format!("{} × {} · {}", i.width, i.height, fmt_size(Some(i.bytes)))),
+        ("Format", i.format.to_ascii_uppercase()),
+    ];
+    if let Some(j) = &i.jpeg {
+        let mut coding = j.process.clone();
+        if let Some(sampling) = &j.sampling {
+            coding.push_str(&format!(" · {sampling}"));
+        }
+        if j.precision != 8 {
+            coding.push_str(&format!(" · {} bit", j.precision));
+        }
+        facts.push(("Coding", coding));
+        if let Some(q) = j.quality {
+            facts.push(("Quality", if j.quality_exact { format!("{q}") } else { format!("about {q}") }));
+        }
+        if let Some(v) = &j.jfif {
+            facts.push(("JFIF", v.clone()));
+        }
+        if let Some((x, y)) = j.dpi {
+            facts.push(("Density", if x == y { format!("{x} dpi") } else { format!("{x} × {y} dpi") }));
+        }
+        if let Some(icc) = &j.icc {
+            facts.push(("Colour profile", icc.clone()));
+        }
+        let x = &j.exif;
+        let camera = match (&x.make, &x.model) {
+            (Some(make), Some(model)) if model.starts_with(make.as_str()) => Some(model.clone()),
+            (Some(make), Some(model)) => Some(format!("{make} {model}")),
+            (make, model) => make.clone().or_else(|| model.clone()),
+        };
+        let text = [
+            ("Camera", camera),
+            ("Lens", x.lens.clone()),
+            ("Taken", x.taken.clone()),
+            ("Software", x.software.clone().or_else(|| j.xmp.creator_tool.clone())),
+            ("Artist", x.artist.clone()),
+            ("Copyright", x.copyright.clone()),
+            ("Description", x.description.clone()),
+            ("Comment", j.comment.clone()),
+            ("Image id", x.unique_id.clone()),
+            ("Document id", j.xmp.original_document_id.clone().or_else(|| j.xmp.document_id.clone())),
+        ];
+        facts.extend(text.into_iter().filter_map(|(k, v)| v.map(|v| (k, v))));
+        if let Some((lat, lon)) = x.gps {
+            facts.push(("Location", format!("{lat:.5}, {lon:.5}")));
+        }
+        if let Some(n) = x.thumbnail_bytes {
+            facts.push(("Preview inside", fmt_size(Some(i64::from(n)))));
+        }
+        if j.after_end > 0 {
+            facts.push(("After its end", format!("{} bytes", thousands(j.after_end as i64))));
+        }
+    }
+    facts.iter().map(|(k, v)| format!("<dt>{k}</dt><dd>{}</dd>", escape(v))).collect()
+}
+
+/// Other releases that carry one of this release's pictures, by the same bytes or the same EXIF or XMP id.
+fn same_picture_panel(args: &HashMap<String, String>) -> ApiResponse {
+    let id = args.get("id").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
+    let Ok(conn) = crate::db::open() else { return html(200, String::new()) };
+    let rows: Vec<(ReleaseRow, crate::images::step::Tie)> = crate::images::step::same_pictures(&conn, id, 50)
+        .into_iter()
+        .filter_map(|(other, _, tie)| Some((crate::search::get_release_with(&conn, other).ok().flatten()?, tie)))
+        .collect();
+    html(200, same_picture_html(&rows))
+}
+
+fn same_picture_html(rows: &[(ReleaseRow, crate::images::step::Tie)]) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+    let items: String = rows
+        .iter()
+        .map(|(r, tie)| {
+            format!(
+                "<tr><td><a href=\"/ui/release?id={}\">{}</a></td><td>{}</td><td class=\"num\">{}</td><td>{}</td></tr>",
+                r.id,
+                escape(&r.name),
+                escape(&r.group_name),
+                escape(&fmt_size(r.size)),
+                tie.label()
+            )
+        })
+        .collect();
+    format!(
+        "<h2>The same picture elsewhere</h2><div class=\"table-wrap\"><table><thead><tr><th>Name</th><th>Group</th><th class=\"num\">Size</th><th>Tied by</th></tr></thead><tbody>{items}</tbody></table></div><p class=\"sort\">Releases posting one of these pictures: the same upload in another group, or a post that reused its thumbnail.</p>"
+    )
+}
+
+/// One picture posted with a release, as it was posted.
+fn image(args: &HashMap<String, String>) -> ApiResponse {
+    let number = |key: &str| args.get(key).and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
+    let (id, at) = (number("id"), number("at"));
+    let Some((bytes, format)) = crate::db::open().ok().and_then(|conn| crate::images::step::image(&conn, id, at))
+    else {
+        return ApiResponse::not_found();
+    };
+    ApiResponse {
+        status: 200,
+        content_type: Some(crate::images::content_type(&format)),
+        body: String::new(),
+        headers: vec![
+            ("Cache-Control".into(), "private, max-age=86400".into()),
+            ("X-Content-Type-Options".into(), "nosniff".into()),
+            ("Content-Security-Policy".into(), "default-src 'none'; img-src 'self'; sandbox".into()),
+        ],
+        bytes: Some(bytes),
+        failed: false,
+    }
 }
 
 /// Other releases whose stills match this one's: the same film, from another source or encode.

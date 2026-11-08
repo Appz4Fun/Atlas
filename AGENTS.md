@@ -42,7 +42,7 @@ Always preserve these schema-independent sidecar databases and content-addressed
   UPDATE media_titles SET fanout_done = 0 WHERE state = 1;
   ```
 - **`atlas.details.db`** (`-wal`, `-shm`): Rich movie/TV metadata, cast, genres, Blu-ray dates, and ratings keyed by `(kind, tmdb_id)`.
-- **`posters/`**, **`covers/`**, **`stills/`**: Content-addressed JPEG caches (`{kind}_{tmdb_id}.jpg` and `<sha256>`).
+- **`posters/`**, **`covers/`**, **`stills/`**, **`images/`**: Content-addressed picture caches (`{kind}_{tmdb_id}.jpg` and `<sha256>`); `images/` holds the pictures posted with releases (`release_images`).
 
 ### 3. Files That ARE Safe to Delete on a Shard Reset (After Harvesting to `atlas.raw.db`)
 Only delete the main header database, the 8 release shards, and sealed-log segment files:
