@@ -191,6 +191,9 @@ struct Shared {
     stopping: AtomicBool,
     synced_lock: Mutex<()>,
     synced: Condvar,
+    /// wakes the batcher early (to stop)
+    wake_lock: Mutex<()>,
+    wake: Condvar,
     /// rows refused because their day isn't kept, and repeats dropped at seal
     dropped_unkept: AtomicU64,
     dropped_repeats: AtomicU64,
@@ -213,6 +216,9 @@ impl Shared {
     }
 }
 
+/// A slab on its way to the sealers.
+type SealJob = (Arc<Group>, Slab);
+
 /// A block on its way to the committer.
 struct Pending {
     group: Arc<Group>,
@@ -227,8 +233,10 @@ pub struct Store {
     servers: Mutex<Vec<String>>,
     keep: RwLock<KeepSet>,
     shared: Arc<Shared>,
-    seal_tx: Mutex<Option<SyncSender<(Arc<Group>, Slab)>>>,
+    seal_tx: Mutex<Option<SyncSender<SealJob>>>,
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// one tick at a time: two would interleave their writes to a log
+    tick_lock: Mutex<()>,
 }
 
 /// What `open` found and did.
@@ -302,6 +310,8 @@ impl Store {
             stopping: AtomicBool::new(false),
             synced_lock: Mutex::new(()),
             synced: Condvar::new(),
+            wake_lock: Mutex::new(()),
+            wake: Condvar::new(),
             dropped_unkept: AtomicU64::new(0),
             dropped_repeats: AtomicU64::new(0),
             blocks_committed: AtomicU64::new(0),
@@ -314,13 +324,14 @@ impl Store {
             shared,
             seal_tx: Mutex::new(None),
             threads: Mutex::new(Vec::new()),
+            tick_lock: Mutex::new(()),
         });
         store.start();
         Ok((store, opened))
     }
 
     fn start(self: &Arc<Self>) {
-        let (seal_tx, seal_rx) = sync_channel::<(Arc<Group>, Slab)>(64);
+        let (seal_tx, seal_rx) = sync_channel::<SealJob>(64);
         let (commit_tx, commit_rx) = sync_channel::<Pending>(64);
         let seal_rx = Arc::new(Mutex::new(seal_rx));
         let mut threads = Vec::new();
@@ -447,6 +458,7 @@ impl Store {
 
     /// One batcher tick, run by the batcher thread every `sync_every` (and by tests directly).
     pub fn tick(&self) -> Result<()> {
+        let _one = self.tick_lock.lock().unwrap_or_else(|e| e.into_inner());
         let groups: Vec<Arc<Group>> = self.groups.read().unwrap_or_else(|e| e.into_inner()).values().cloned().collect();
         let mut writes: Vec<(Arc<File>, Vec<u8>)> = Vec::new();
         let mut dirs: Vec<PathBuf> = Vec::new();
@@ -522,7 +534,14 @@ impl Store {
     fn batcher(self: Arc<Self>) {
         let mut last_idle_close = Instant::now();
         loop {
-            std::thread::sleep(self.cfg.sync_every);
+            {
+                let g = self.shared.wake_lock.lock().unwrap_or_else(|e| e.into_inner());
+                let _ = self
+                    .shared
+                    .wake
+                    .wait_timeout_while(g, self.cfg.sync_every, |_| !self.shared.stopping.load(Ordering::Acquire))
+                    .unwrap_or_else(|e| e.into_inner());
+            }
             let stopping = self.shared.stopping.load(Ordering::Acquire);
             if self.failure().is_some() {
                 break;
@@ -578,6 +597,10 @@ impl Store {
     /// Seals and commits everything, then stops the threads. What `record` got after this isn't kept.
     pub fn close(&self) -> Result<()> {
         self.shared.stopping.store(true, Ordering::Release);
+        {
+            let _g = self.shared.wake_lock.lock().unwrap_or_else(|e| e.into_inner());
+            self.shared.wake.notify_all();
+        }
         let threads = std::mem::take(&mut *self.threads.lock().unwrap_or_else(|e| e.into_inner()));
         for t in threads {
             let _ = t.join();
@@ -667,12 +690,15 @@ fn push_row(
     {
         s.full.push(full);
     }
-    if !s.open.contains_key(&key) {
-        let slab_gen = g.next_gen.fetch_add(1, Ordering::Relaxed);
-        s.open.insert(key, Slab::create(&g.dir, sid, day, slab_gen)?);
-        s.dir_dirty = true;
-    }
-    s.open.get_mut(&key).expect("made above").push(art, ts, line);
+    let slab = match s.open.entry(key) {
+        std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
+        std::collections::hash_map::Entry::Vacant(v) => {
+            let slab_gen = g.next_gen.fetch_add(1, Ordering::Relaxed);
+            s.dir_dirty = true;
+            v.insert(Slab::create(&g.dir, sid, day, slab_gen)?)
+        }
+    };
+    slab.push(art, ts, line);
     Ok(())
 }
 
@@ -749,7 +775,7 @@ fn read_servers(root: &Path) -> Result<Vec<String>> {
     }
 }
 
-fn sealer(rx: Arc<Mutex<Receiver<(Arc<Group>, Slab)>>>, tx: SyncSender<Pending>, shared: Arc<Shared>) {
+fn sealer(rx: Arc<Mutex<Receiver<SealJob>>>, tx: SyncSender<Pending>, shared: Arc<Shared>) {
     loop {
         let next = rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
         let Ok((group, slab)) = next else { return };

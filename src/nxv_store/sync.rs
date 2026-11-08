@@ -90,15 +90,15 @@ pub fn raise_open_files(want: u64) -> io::Result<u64> {
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) != 0 {
             return Err(io::Error::last_os_error());
         }
-        let target = if rl.rlim_max == libc::RLIM_INFINITY { cap } else { cap.min(rl.rlim_max as u64) };
-        if (rl.rlim_cur as u64) < target {
-            rl.rlim_cur = target as libc::rlim_t;
+        let target = if rl.rlim_max == libc::RLIM_INFINITY { cap } else { cap.min(rl.rlim_max) };
+        if rl.rlim_cur < target {
+            rl.rlim_cur = target;
             if libc::setrlimit(libc::RLIMIT_NOFILE, &rl) != 0 {
                 return Err(io::Error::last_os_error());
             }
         }
     }
-    Ok(rl.rlim_cur as u64)
+    Ok(rl.rlim_cur)
 }
 
 #[cfg(test)]

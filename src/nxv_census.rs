@@ -150,7 +150,13 @@ fn tally_lines(server: Option<&str>, lines: &[Vec<u8>], t: &mut Tally, now: i64)
 }
 
 /// The rows of a sealed block, and its section sizes and literal count.
-pub(crate) fn read_block(path: &Path) -> anyhow::Result<(Vec<Vec<u8>>, Vec<(&'static str, u32)>, usize, u64)> {
+/// A sealed block read back: its rows, section sizes, literal row count and size on disk.
+pub(crate) type BlockRead = (Vec<Vec<u8>>, Vec<(&'static str, u32)>, usize, u64);
+
+/// Every block and tail under the window as (server dir name, path, size), and the totals of index and other files.
+pub(crate) type Walked = (Vec<(String, PathBuf, u64)>, Vec<(String, PathBuf, u64)>, Files, Files);
+
+pub(crate) fn read_block(path: &Path) -> anyhow::Result<BlockRead> {
     let raw = std::fs::read(path)?;
     let bytes = AlignedBytes::from_slice(&raw);
     let view = NxvBlockView::from_mmap_slice(&bytes)?;
@@ -212,7 +218,7 @@ pub(crate) fn read_tail(path: &Path) -> anyhow::Result<Vec<Vec<u8>>> {
 }
 
 /// Every file under the window: (server dir name, path, size), split into blocks and tails.
-pub(crate) fn walk(root: &Path) -> anyhow::Result<(Vec<(String, PathBuf, u64)>, Vec<(String, PathBuf, u64)>, Files, Files)> {
+pub(crate) fn walk(root: &Path) -> anyhow::Result<Walked> {
     let (mut blocks, mut tails) = (Vec::new(), Vec::new());
     let (mut idx, mut other) = (Files::default(), Files::default());
     for server in std::fs::read_dir(root)?.flatten() {
@@ -424,7 +430,7 @@ fn print_report(root: &Path, blocks: Files, tails: Files, idx: Files, other: Fil
     }
     println!("by server (rows in sampled blocks, raw bytes/row, stored bytes/row):");
     let mut servers: Vec<_> = t.servers.iter().collect();
-    servers.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+    servers.sort_by_key(|a| std::cmp::Reverse(a.1.0));
     for (s, (rows, raw, stored)) in servers {
         println!(
             "  {:<28} {:>11} rows  {:>6.1}  {:>6.1}",

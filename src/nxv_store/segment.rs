@@ -318,12 +318,12 @@ fn heal(arena: &File, index: &File, day: i64) -> Result<(Vec<Entry>, u64, Healed
     }
     let mut entries: Vec<Entry> = Vec::with_capacity(count);
     let mut end = 0u64;
-    for (seq, chunk) in raw.chunks_exact(ENTRY_LEN).enumerate() {
+    for (seq, chunk) in raw.as_chunks::<ENTRY_LEN>().0.iter().enumerate() {
         let e = Entry::from_bytes(chunk);
         let ok = e.offset == end
             && e.seq == seq as u32
             && e.len as usize >= nntp_xover_engine::container::DATA_START
-            && e.len % 64 == 0
+            && e.len.is_multiple_of(64)
             && e.offset + e.len as u64 <= arena_len;
         if !ok {
             break;

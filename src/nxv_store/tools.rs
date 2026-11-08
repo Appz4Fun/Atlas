@@ -74,7 +74,9 @@ fn import(args: &[String]) -> Result<()> {
         .chain(tails.into_iter().map(|(s, p, n)| (false, s, p, n)))
         .collect();
     // posting hour order, the way reading goes
-    files.sort_by_key(|f| f.2.file_stem().and_then(|s| s.to_str()).and_then(|s| s.split('-').next()?.parse::<i64>().ok()));
+    files.sort_by_key(|f| {
+        f.2.file_stem().and_then(|s| s.to_str()).and_then(|s| s.split('-').next()?.parse::<i64>().ok())
+    });
     files.truncate(limit);
     let in_bytes: u64 = files.iter().map(|f| f.3).sum();
     let (store, _) = Store::open(StoreConfig::new(&to), keep_all())?;
@@ -86,7 +88,11 @@ fn import(args: &[String]) -> Result<()> {
         let Some(group) = path.parent().and_then(crate::header_window::decode) else { continue };
         let Some(server) = crate::header_window::decode(Path::new(server)) else { continue };
         let r = Instant::now();
-        let lines = if *is_block { crate::nxv_census::read_block(path).map(|b| b.0) } else { crate::nxv_census::read_tail(path) };
+        let lines = if *is_block {
+            crate::nxv_census::read_block(path).map(|b| b.0)
+        } else {
+            crate::nxv_census::read_tail(path)
+        };
         read_ns += r.elapsed().as_nanos();
         let Ok(lines) = lines else { continue };
         rows += lines.len() as u64;
@@ -126,7 +132,14 @@ fn import(args: &[String]) -> Result<()> {
 fn stats(args: &[String]) -> Result<()> {
     let dir = PathBuf::from(arg(args, "--store").context("--store DIR")?);
     let (store, opened) = Store::open(StoreConfig::new(&dir), keep_all())?;
-    println!("{}: {} groups, {} segments, {} blocks, {:.2} GB", dir.display(), store.group_names().len(), opened.segments, opened.blocks, dir_bytes(&dir) as f64 / 1e9);
+    println!(
+        "{}: {} groups, {} segments, {} blocks, {:.2} GB",
+        dir.display(),
+        store.group_names().len(),
+        opened.segments,
+        opened.blocks,
+        dir_bytes(&dir) as f64 / 1e9
+    );
     let mut rows = 0u64;
     let mut sizes: Vec<u32> = Vec::new();
     for g in store.group_names() {
@@ -172,7 +185,8 @@ fn link(args: &[String]) -> Result<()> {
             let n = group_ids.len() as i64;
             *group_ids.entry(g.clone()).or_insert(n)
         };
-        for (map, e) in store.blocks(&g, lo, hi) {
+        // block ranges are UTC and the linker's times the poster's wall clock: a margin for any time zone
+        for (map, e) in store.blocks(&g, lo - 14 * 3600, hi + 14 * 3600) {
             blocks += 1;
             let view = NxvBlockView::from_mmap_slice(&map[e.offset as usize..])?;
             let mut cur = NxvRangeCursor::new_for_art_range(view, 0, u64::MAX)?;
@@ -188,10 +202,8 @@ fn link(args: &[String]) -> Result<()> {
                 if !crate::xref::keeps(&a) {
                     continue;
                 }
-                // the row's time clamped into its block's range (the store's rule for a stray date)
-                let Some(posted) = crate::dates::naive_timestamp(&a.date).map(|p| p.clamp(e.min_ts, e.max_ts)) else {
-                    continue;
-                };
+                // the poster's wall clock, as the SQLite linker keeps it (`Store::record_chunked`), soo the two compare
+                let Some(posted) = crate::dates::naive_timestamp(&a.date) else { continue };
                 if posted < lo || posted > hi {
                     continue;
                 }
@@ -240,7 +252,8 @@ fn link(args: &[String]) -> Result<()> {
         uploads += 1;
         up_files += members.len() as u64;
         up_articles += articles;
-        up_bytes += members.iter().map(|&i| bytes_by_poster.get(files[i].poster.as_str()).copied().unwrap_or(0)).sum::<i64>();
+        up_bytes +=
+            members.iter().map(|&i| bytes_by_poster.get(files[i].poster.as_str()).copied().unwrap_or(0)).sum::<i64>();
         let groups: BTreeSet<i64> = members.iter().flat_map(|&i| files[i].groups.iter().copied()).collect();
         if groups.len() > 1 {
             cross += 1;
