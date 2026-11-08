@@ -47,6 +47,9 @@ fn wait_unless_stopping(tries: i32) -> bool {
 
 /// rows one write transaction takes at most, soo no writer holds the file for long
 const WRITE_CHUNK: usize = 2000;
+/// Set while a pass waits to start the WAL over: the writer then pauses between its transactions, soo the wait is one
+/// transaction long rather than a whole run of them back to back.
+static TRUNCATE_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// how often a pass starts the WAL over between its reads (`Store::checkpoint_tick`)
 const RESTART_EVERY: Duration = Duration::from_secs(10);
 /// how often the linker runs
@@ -462,6 +465,13 @@ impl Store {
         let grp = self.group_id(group)?;
         let mut n = 0;
         for chunk in articles.chunks(chunk.max(1)) {
+            // a pass waiting to start the WAL over gets the gap between transactions (`checkpoint_tick`)
+            let paused = std::time::Instant::now();
+            while TRUNCATE_PENDING.load(std::sync::atomic::Ordering::Relaxed)
+                && paused.elapsed() < Duration::from_secs(5)
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
             let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             {
                 let mut insert = tx.prepare_cached(
@@ -503,13 +513,17 @@ impl Store {
     /// one only copies frames back; the WAL starts over only when a writer begins after a complete one, and while a
     /// pass reads back to back the parse path's writer always begins mid-read, soo the WAL grew by all it wrote for
     /// the length of a pass (13 GB in passes of minutes). The truncating one takes the write lock: it waits out the
-    /// writer's current transaction (a second or two), copies what's left and empties the file, and the writer goes
-    /// on into an empty WAL. Blocked (another checkpoint, or a reader that wouldn't leave) is tried next time.
+    /// writer's current transaction (which then pauses before its next, `TRUNCATE_PENDING`), copies what's left and
+    /// empties the file, and the writer goes on into an empty WAL. Blocked (another checkpoint, or a reader that wouldn't leave) is tried next time.
     pub fn checkpoint_tick(&self) -> Result<()> {
         self.checkpoint()?;
         if self.restarted.get().elapsed() >= RESTART_EVERY {
             self.restarted.set(std::time::Instant::now());
-            self.conn.query_row("pragma wal_checkpoint(truncate)", [], |_| Ok(()))?;
+            // the writer leaves a gap between its transactions while this waits (`record_chunked`)
+            TRUNCATE_PENDING.store(true, std::sync::atomic::Ordering::Relaxed);
+            let done = self.conn.query_row("pragma wal_checkpoint(truncate)", [], |_| Ok(()));
+            TRUNCATE_PENDING.store(false, std::sync::atomic::Ordering::Relaxed);
+            done?;
         }
         Ok(())
     }
