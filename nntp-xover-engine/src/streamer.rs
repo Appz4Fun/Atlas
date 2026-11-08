@@ -74,17 +74,24 @@ impl Default for RowCache {
 }
 
 impl RowCache {
-    /// Forgets cached ids when moving to another block.
+    /// Forgets cached ids when moving to another block. The tag is the block's address and its header CRC,
+    /// which covers the body hash: two blocks that differ anywhere differ in it, even when one is read from a
+    /// buffer the other was freed from.
     fn bind(&mut self, view: &NxvBlockView) {
         let tag = (view.data.as_ptr() as usize, view.header.header_crc32);
         if tag != self.block_tag {
             self.block_tag = tag;
-            self.cached_subj_tpl_id = NONE;
-            self.cached_xref_skel_id = NONE;
-            self.cached_author_id = NONE;
-            self.cached_domain_id = NONE;
-            self.cached_msgid_pfx_id = NONE;
+            self.invalidate();
         }
+    }
+
+    /// Forgets the cached dictionary strings, soo the next row decodes them afresh.
+    pub fn invalidate(&mut self) {
+        self.cached_subj_tpl_id = NONE;
+        self.cached_xref_skel_id = NONE;
+        self.cached_author_id = NONE;
+        self.cached_domain_id = NONE;
+        self.cached_msgid_pfx_id = NONE;
     }
 }
 

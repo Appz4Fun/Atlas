@@ -55,6 +55,17 @@ pub const PADMASK_LITERAL: u16 = 0x8000;
 pub const HEADER_LEN: usize = 64;
 pub const SECTION_TABLE_LEN: usize = 16 * 16;
 pub const DATA_START: usize = HEADER_LEN + SECTION_TABLE_LEN;
+/// The xxh3 hash of the hot body (everything after the cold prefix) is kept in the `encoding_flags` of
+/// these two section entries, low word then high word. The header CRC covers the section table, soo it
+/// covers this hash too.
+const BODY_HASH_LO: SectionId = SectionId::FsstTables;
+const BODY_HASH_HI: SectionId = SectionId::ReferencesData;
+
+/// The body hash a block's section table holds.
+fn stored_body_hash(sections: &[SectionEntry]) -> u64 {
+    sections[BODY_HASH_LO as usize].encoding_flags as u64
+        | ((sections[BODY_HASH_HI as usize].encoding_flags as u64) << 32)
+}
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 #[repr(C, align(64))]
@@ -947,6 +958,11 @@ impl NxvBlockBuilder {
         place(&mut out, SectionId::NumericVarints, &num, n, 8);
         place(&mut out, SectionId::ReferencesData, &refs, n, 8);
         out.resize(align_up(out.len(), 64), 0);
+        // the body's hash goes in the section table, which the header CRC covers: two blocks with the same
+        // layout but different contents then have different CRCs, and a reader can check a body against it
+        let body_hash = xxhash_rust::xxh3::xxh3_64(&out[cold_prefix..]);
+        table[BODY_HASH_LO as usize].encoding_flags = body_hash as u32;
+        table[BODY_HASH_HI as usize].encoding_flags = (body_hash >> 32) as u32;
         let total = u32::try_from(out.len()).context("block over 4 GiB")?;
         for (i, e) in table.iter().enumerate() {
             let at = HEADER_LEN + i * 16;
@@ -1046,6 +1062,10 @@ pub fn decompress_cold_block(cold: &[u8]) -> Result<AlignedBytes> {
     let frame = cold.get(prefix + 8..prefix + 8 + flen).context("cold block cut short")?;
     let body = zstd::bulk::decompress(frame, h.hot_block_bytes as usize - prefix)?;
     ensure!(body.len() == h.hot_block_bytes as usize - prefix, "cold block decompressed to the wrong length");
+    ensure!(
+        xxhash_rust::xxh3::xxh3_64(&body) == stored_body_hash(view.sections),
+        "cold block body does not match the hash in its header"
+    );
     let mut hot = Vec::with_capacity(h.hot_block_bytes as usize);
     hot.extend_from_slice(&cold[..prefix]);
     hot.extend_from_slice(&body);
@@ -1167,6 +1187,22 @@ impl<'a> NxvBlockView<'a> {
             })
         };
         Ok(Self { data, header, sections, checkpoints, xor8, hot })
+    }
+
+    /// The xxh3 hash of the hot body, from the section table.
+    #[inline]
+    pub fn body_hash(&self) -> u64 {
+        stored_body_hash(self.sections)
+    }
+
+    /// Whether a hot block's body still matches its hash. A cold block's body is checked when it is
+    /// decompressed, soo this is true for one.
+    pub fn verify_body(&self) -> bool {
+        if self.is_cold() {
+            return true;
+        }
+        let prefix = self.header.cold_prefix_bytes as usize;
+        xxhash_rust::xxh3::xxh3_64(&self.data[prefix..]) == self.body_hash()
     }
 
     #[inline]

@@ -238,3 +238,46 @@ fn equal_article_numbers_over_a_checkpoint_all_come_back() {
     assert_eq!(got, 135);
     assert_eq!(view.lower_bound_row(10).unwrap(), 5);
 }
+
+#[test]
+fn blocks_with_the_same_layout_but_different_bytes_dont_share_a_cache() {
+    // same lengths everywhere, one author byte apart: a cache keyed on layout alone would reuse author 0
+    let mk = |author: &str| -> Vec<Vec<u8>> {
+        (1..=300u64)
+            .map(|n| format!("{n}\tsubj\t{author}\tSat, 07 Nov 2026 12:00:00 +0000\t<{n:08x}@c>\t\t10\t2").into_bytes())
+            .collect()
+    };
+    let (a, b) = (mk("poster A <a@x>"), mk("poster B <a@x>"));
+    let ba = build(&a);
+    let bb = build(&b);
+    let va = NxvBlockView::from_mmap_slice(&ba).unwrap();
+    let vb = NxvBlockView::from_mmap_slice(&bb).unwrap();
+    assert_ne!(va.header.header_crc32, vb.header.header_crc32, "the body hash is in the CRC'd prefix");
+    assert_ne!(va.body_hash(), vb.body_hash());
+    assert!(va.verify_body() && vb.verify_body());
+    let mut cache = RowCache::default();
+    let mut out = Vec::new();
+    for (view, lines) in [(va, &a), (vb, &b), (va, &a)] {
+        for i in [0usize, 150, 299] {
+            out.clear();
+            view.reconstruct_row(i, &mut cache, &mut out).unwrap();
+            assert_eq!(&out, &lines[i]);
+        }
+    }
+    // a cold block decompressed into a buffer another block was freed from is told apart the same way
+    let ca = AlignedBytes::from_slice(&compress_block_to_cold(&ba, 3).unwrap());
+    let cb = AlignedBytes::from_slice(&compress_block_to_cold(&bb, 3).unwrap());
+    for (cold, lines) in [(&ca, &a), (&cb, &b), (&ca, &a)] {
+        let hot = decompress_cold_block(cold).unwrap();
+        let v = NxvBlockView::from_mmap_slice(&hot).unwrap();
+        out.clear();
+        v.reconstruct_row(7, &mut cache, &mut out).unwrap();
+        assert_eq!(&out, &lines[7]);
+    }
+    // a body changed under a valid header fails the check
+    let mut tampered = ba.to_vec();
+    let at = va.header.cold_prefix_bytes as usize + 100;
+    tampered[at] ^= 1;
+    let t = AlignedBytes::from_slice(&tampered);
+    assert!(!NxvBlockView::from_mmap_slice(&t).unwrap().verify_body());
+}

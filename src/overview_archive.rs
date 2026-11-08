@@ -103,14 +103,26 @@ pub fn finish(timeout: Duration) {
     let _ = done_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
 }
 
-/// A path component from a server or group name: anything outside `[A-Za-z0-9._+-]` becomes `_`, and a name
-/// that is all dots can't climb out of the archive.
+/// A path component from a server or group name, reversible: `[A-Za-z0-9._+-]` as it is, every other byte
+/// as `%XX` (so `%` itself is `%25`), and a name that is empty or all dots has its dots encoded too, soo it
+/// can't name the directory above. Two names never share a component.
 fn component(name: &str) -> String {
-    let s: String = name
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-') { c } else { '_' })
-        .collect();
-    if s.is_empty() || s.chars().all(|c| c == '.') { format!("_{s}") } else { s }
+    let plain = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'-');
+    let mut s = String::with_capacity(name.len());
+    for b in name.bytes() {
+        if plain(b) {
+            s.push(b as char);
+        } else {
+            s.push_str(&format!("%{b:02X}"));
+        }
+    }
+    if s.is_empty() || s.bytes().all(|b| b == b'.') {
+        s = s.replace('.', "%2E");
+        if s.is_empty() {
+            s.push_str("%00");
+        }
+    }
+    s
 }
 
 pub fn group_dir(root: &Path, server: &str, group: &str) -> PathBuf {
@@ -239,9 +251,20 @@ impl Writer {
                 n
             }
         };
-        let mut f = OpenOptions::new().create(true).append(true).open(dir.join(TAIL))?;
+        let mut blocks = Vec::new();
         for chunk in rows.chunks(SEGMENT_ROWS) {
-            f.write_all(&NxvBlockBuilder::build_hot_block(chunk)?)?;
+            blocks.extend_from_slice(&NxvBlockBuilder::build_hot_block(chunk)?);
+        }
+        let tail = dir.join(TAIL);
+        let mut f = OpenOptions::new().create(true).append(true).open(&tail)?;
+        let before = f.metadata()?.len();
+        if let Err(e) = f.write_all(&blocks) {
+            // a block written halfway (the disk filled) would hide every block after it: cut it off, and
+            // if even that fails, forget the tail soo the next batch recovers it first
+            if f.set_len(before).is_err() {
+                self.tails.remove(&dir);
+            }
+            return Err(e).with_context(|| format!("appending to {}", tail.display()));
         }
         drop(f);
         WRITTEN.fetch_add(rows.len() as u64, Ordering::Relaxed);
@@ -629,9 +652,14 @@ mod tests {
 
     #[test]
     fn names_stay_inside_the_archive() {
-        assert_eq!(component(".."), "_..");
-        assert_eq!(component("a/b"), "a_b");
+        assert_eq!(component(".."), "%2E%2E");
+        assert_eq!(component("."), "%2E");
+        assert_eq!(component(""), "%00");
+        assert_eq!(component("a/b"), "a%2Fb");
+        assert_eq!(component("a%2Fb"), "a%252Fb");
+        assert_ne!(component("account/a"), component("account_a"));
         assert_eq!(component("alt.binaries.x"), "alt.binaries.x");
+        assert_eq!(component("news.example:563"), "news.example%3A563");
         assert!(usable(&[b"12\tx".to_vec(), b"x\t1".to_vec(), b"".to_vec(), b"7".to_vec()]).len() == 2);
     }
 }
