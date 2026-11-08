@@ -999,8 +999,8 @@ fn in_store<T>(store: &Mutex<Option<Store>>, f: impl FnOnce(&mut Store) -> Resul
         }
         let opened = Store::open(&path_for(&crate::paths::database()))?;
         if std::ptr::eq(store_ref, &RECORDER) {
-            // the parse path's connection: each header goes into four B-trees by random keys (message-id, poster
-            // twice, arrival), and with the default 2 MB page cache nearly every insert read its pages from disk (it
+            // the parse path's connection: each header goes into three B-trees (message-id, the waiting rows' index by poster,
+            // arrival), and with the default 2 MB page cache nearly every insert read its pages from disk (it
             // kept about 4k headers a second). 512 MiB keeps the trees' upper levels and recent leaves in memory. The
             // linker's connection keeps the default: a commit on the other connection empties a WAL reader's cache
             // before its next read, and the linker reads after every one of the recorder's
