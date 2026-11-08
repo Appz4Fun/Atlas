@@ -715,8 +715,8 @@ fn with_beside(conn: &Connection, id: i64, post: Option<SplitPost>) -> Result<Op
         Some(post) => post,
         None => {
             let Some((group, size)) = group_and_size(conn, id)? else { return Ok(None) };
-            // whole as the release was, or by the PAR2 set's check that vouched for it
-            let complete = single_post_complete(conn, id)? || vouched_complete(conn, id)?;
+            // whole as the release was, by the PAR2 set's check that vouched for it, or repairable as it was listed
+            let complete = single_post_complete(conn, id)? || vouched_complete(conn, id)? || repair_needed(conn, id)?;
             SplitPost {
                 ids: vec![id],
                 groups: vec![group],
@@ -734,7 +734,7 @@ fn with_beside(conn: &Connection, id: i64, post: Option<SplitPost>) -> Result<Op
     let together = post.lead.is_none() && union_files(conn, &all)?.complete();
     for row in extra {
         let Some((group, bytes)) = group_and_size(conn, row)? else { continue };
-        post.complete &= union_files(conn, &[row])?.complete_by_files();
+        // an extra that isn't all here yet takes nothing from the post: it was found by its first article alone
         post.size += bytes;
         if !post.groups.contains(&group) {
             post.groups.push(group);
