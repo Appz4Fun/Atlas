@@ -122,11 +122,16 @@ impl Window {
     }
 
     fn open_with(root: &Path, writable: bool) -> Result<Window> {
-        fs::create_dir_all(root).with_context(|| format!("making {}", root.display()))?;
+        if writable {
+            fs::create_dir_all(root).with_context(|| format!("making {}", root.display()))?;
+        } else if !root.exists() {
+            return Ok(Window { root: root.to_path_buf(), groups: HashMap::new() });
+        }
         if let Ok(day) = fs::read_to_string(root.join(FRONTIER_FILE))
             && let Ok(day) = day.trim().parse::<i64>()
         {
-            BACKFILL_FRONTIER_DAY.fetch_max(day, Ordering::Relaxed);
+            // a frontier found since start wins over the one kept
+            let _ = BACKFILL_FRONTIER_DAY.compare_exchange(0, day, Ordering::Relaxed, Ordering::Relaxed);
         }
         let mut w = Window { root: root.to_path_buf(), groups: HashMap::new() };
         for server in read_dirs(root)? {
@@ -360,7 +365,15 @@ fn seal_hour(g: &mut Group, hour: i64) -> Result<usize> {
     let mut lines = read_tail(&tail)?;
     lines.sort_by_key(|l| art_of(l));
     lines.dedup_by(|a, b| art_of(a) == art_of(b));
-    let first_part = g.sealed.get(&hour).map_or(0, Vec::len);
+    // past the highest part there is, not the count: a part cleared after a power cut leaves a gap
+    let first_part = g
+        .sealed
+        .get(&hour)
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s.path.file_stem()?.to_str()?.rsplit('-').next()?.parse::<usize>().ok())
+        .max()
+        .map_or(0, |n| n + 1);
     let mut made = Vec::new();
     for (i, chunk) in lines.chunks(SEGMENT_ROWS).enumerate() {
         let stem = format!("{hour}-{}", first_part + i);
@@ -495,20 +508,28 @@ fn decode(dir: &Path) -> Option<String> {
 }
 
 /// The newest backfill day any group still has to do (`chunks::frontier`), set as claims are made and kept in the
-/// store, soo a restart knows it before the first claim; 0 when never known. Lockstep reads the groups' days around
+/// store, soo a restart knows it before the first claim; 0 while not known yet, `NO_BACKFILL` once a claim found
+/// no backfill day left. Lockstep reads the groups' days around
 /// it, soo the window keeps those.
 pub static BACKFILL_FRONTIER_DAY: AtomicI64 = AtomicI64::new(0);
+
+/// `BACKFILL_FRONTIER_DAY` when there's no backfill to keep days around.
+pub const NO_BACKFILL: i64 = -1;
 
 /// Posting-time ranges, seconds, both ends in.
 pub type Ranges = Vec<(i64, i64)>;
 
 /// The posting-time ranges the window takes lines in and keeps at `now`: the last `keep_hours` (live reading) and
-/// the days lockstep backfill reads around its frontier (`frontier_day`, 0 when not known). With no frontier known,
-/// only live lines are taken in, and nothing older is dropped: (record, keep).
+/// the days lockstep backfill reads around its frontier (`frontier_day`). While the frontier isn't known yet (0),
+/// only live lines are taken in and nothing older is dropped; with no backfill (`NO_BACKFILL`), only the live hours
+/// are kept: (record, keep).
 pub fn ranges(now: i64, keep_hours: i64, frontier_day: i64) -> (Ranges, Ranges) {
     let live = (now - keep_hours * HOUR, now + HOUR);
-    if frontier_day <= 0 {
+    if frontier_day == 0 {
         return (vec![live], vec![(i64::MIN, now + HOUR)]);
+    }
+    if frontier_day < 0 {
+        return (vec![live], vec![live]);
     }
     let lockstep = crate::chunks::LOCKSTEP_DAYS;
     let both = vec![live, ((frontier_day - lockstep) * 86_400, (frontier_day + 1) * 86_400)];
@@ -770,6 +791,7 @@ mod tests {
         let now = 20_400 * 86_400 + 5 * HOUR;
         let live = (now - 24 * HOUR, now + HOUR);
         assert_eq!(ranges(now, 24, 0), (vec![live], vec![(i64::MIN, now + HOUR)]));
+        assert_eq!(ranges(now, 24, NO_BACKFILL), (vec![live], vec![live]), "no backfill: the live hours only");
         let (take, keep) = ranges(now, 24, 20_000);
         assert_eq!(take, keep);
         assert_eq!(keep, vec![live, ((20_000 - crate::chunks::LOCKSTEP_DAYS) * 86_400, 20_001 * 86_400)]);
