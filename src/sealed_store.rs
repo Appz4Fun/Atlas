@@ -230,10 +230,18 @@ pub fn run_move() -> i32 {
         println!("stop the indexer first: it competes for the same locks, and it moves these anyway");
         return 1;
     }
-    if let Err(e) = crate::merge_shards::refuse_if_merging(&crate::paths::database()) {
-        println!("{e:#}");
-        return 1;
-    }
+    // held for the whole sweep: a merge or a compaction can't start under it, and it refuses a merge half done
+    let _held = match crate::compact::try_hold_off_compaction(&crate::paths::database()) {
+        Ok(Some(held)) => held,
+        Ok(None) => {
+            println!("the database is being compacted or merged; try again later");
+            return 1;
+        }
+        Err(e) => {
+            println!("{e:#}");
+            return 1;
+        }
+    };
     configure(&config.addr);
     let main = crate::paths::database();
     let started = Instant::now();

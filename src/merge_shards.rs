@@ -705,8 +705,17 @@ pub fn refuse_if_merging(main: &Path) -> Result<()> {
         return Ok(());
     }
     let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let Ok(conn) = Connection::open_with_flags(main, flags) else { return Ok(()) };
-    if in_progress(&conn) {
+    // a database that can't be read can't be told safe: refused, but for one with no `meta` yet (nothing merged)
+    let conn = Connection::open_with_flags(main, flags).context("reading whether a shard merge is in progress")?;
+    conn.busy_timeout(std::time::Duration::from_secs(30))?;
+    let has_meta: bool =
+        conn.prepare("select 1 from sqlite_master where type = 'table' and name = 'meta'")?.exists([])?;
+    if !has_meta {
+        return Ok(());
+    }
+    let marked: Option<i64> =
+        conn.query_row("select value from meta where key = ?1", [MERGING], |r| r.get(0)).optional()?;
+    if marked.is_some_and(|v| v != 0) {
         bail!("a shard merge is in progress: run `atlas --merge-shards --apply` to finish it first");
     }
     Ok(())
