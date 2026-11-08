@@ -1290,7 +1290,19 @@ pub fn run() -> i32 {
     // would look missing. kept for indexing
     let writing = match db::create_db() {
         Ok(Some(held)) => match crate::compact::refuse_unresolved_backups(&paths::database()) {
-            Ok(()) => held,
+            Ok(()) => {
+                // forward backfill's first day, fixed once (a change in the config needs a restart)
+                let now = chrono::Utc::now().timestamp();
+                match db::open_at(&paths::database())
+                    .map_err(anyhow::Error::from)
+                    .and_then(|c| Ok(crate::chunks::set_forward_start(&c, config.backfill_start_days_back, now)?))
+                {
+                    Ok(day) if day > 0 => ui::print(&format!("backfill reads forward from day {day} to live")),
+                    Ok(_) => {}
+                    Err(e) => ui::warn(&format!("couldnt set the forward backfill's start: {e:#}")),
+                }
+                held
+            }
             Err(e) => {
                 ui::error(&format!("not indexing: {e:#}"));
                 write_status(false, "", &config.index_mode, false, "stopped", true, 1);
@@ -1338,8 +1350,6 @@ pub fn run() -> i32 {
     crate::shared_catalog::start(&config.shared_catalog, stop.clone());
     crate::overview_archive::spawn(&config.overview_archive);
     crate::header_window::spawn(&config.header_window);
-    crate::chunks::FORWARD_FROM_DAYS
-        .store(config.backfill_start_days_back.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
     if config.metrics.enabled {
         crate::metrics::catalog::spawn(Duration::from_secs(config.metrics.catalog_every_secs), stop.clone());
     }

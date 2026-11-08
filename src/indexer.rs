@@ -1077,8 +1077,10 @@ where
 
     match settings.mode.as_str() {
         "live" => pass.live(state, last, progress).await,
+        // forward backfill reads day chunks only: a group that didn't split reads live meanwhile
+        "backfill" if crate::chunks::forward_on() => pass.live(state, last, progress).await,
         "backfill" => pass.backfill(state, first, last, progress).await,
-        _ if phase == Phase::Live => {
+        _ if phase == Phase::Live || crate::chunks::forward_on() => {
             let r = pass.live(state, last, progress).await;
             ctx.states.with(group, |st| st.phase = Phase::Backfill);
             r

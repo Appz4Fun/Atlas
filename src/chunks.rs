@@ -278,16 +278,48 @@ pub fn want(conn: &Connection, group: &str, day: i64, now: i64) -> Result<bool> 
 /// upload spread over several groups are then read together, and linked across them (`xref`).
 pub const LOCKSTEP_DAYS: i64 = 1;
 
-/// Backfill going forward from this many days back (`backfill_start_days_back` in the config), 0 for the usual
-/// newest day first. Forward, only days from then on are claimed, oldest first, in lockstep: no group goes more than
-/// `LOCKSTEP_DAYS` past the oldest day any of them still has to do from then, soo the backfill cursor walks toward
-/// live reading with every group together. Older days stay pending for a later backward run.
-pub static FORWARD_FROM_DAYS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+/// The first day forward backfill reads (`backfill_start_days_back` in the config, worked out once and kept: see
+/// `set_forward_start`), 0 for the usual newest day first. Forward, only days from then on are claimed, oldest
+/// first, in lockstep: no group goes more than `LOCKSTEP_DAYS` past the oldest day any of them still has to do from
+/// then, soo the backfill cursor walks toward live reading with every group together. Older days stay pending for a
+/// later backward run. Set at the indexer's start: a change needs a restart.
+pub static FORWARD_START_DAY: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
-/// The first day forward backfill reads at `now`, when it's on.
-fn forward_from(now: i64) -> Option<i64> {
-    let back = FORWARD_FROM_DAYS.load(std::sync::atomic::Ordering::Relaxed);
-    (back > 0).then(|| now.div_euclid(86_400) - back)
+const FORWARD_BACK_KEY: &str = "backfill_forward_back";
+const FORWARD_START_KEY: &str = "backfill_forward_start";
+
+/// Whether forward backfill is on.
+pub fn forward_on() -> bool {
+    FORWARD_START_DAY.load(std::sync::atomic::Ordering::Relaxed) > 0
+}
+
+fn forward_from(_now: i64) -> Option<i64> {
+    let day = FORWARD_START_DAY.load(std::sync::atomic::Ordering::Relaxed);
+    (day > 0).then_some(day)
+}
+
+/// The forward backfill's first day for `back` days back (None or 0: off), fixed the first time it's worked out
+/// and kept in the main database, soo it stays "30 days before it began" rather than moving on every midnight; worked
+/// out again only when `back` changes. Sets `FORWARD_START_DAY`. Returns the day, 0 when off.
+pub fn set_forward_start(conn: &Connection, back: Option<i64>, now: i64) -> Result<i64> {
+    let back = back.filter(|b| *b > 0).unwrap_or(0);
+    let day = if back == 0 {
+        0
+    } else {
+        let kept_back = crate::store::get_meta(conn, FORWARD_BACK_KEY)?;
+        let kept_start = crate::store::get_meta(conn, FORWARD_START_KEY)?;
+        match (kept_back, kept_start) {
+            (Some(b), Some(start)) if b == back => start,
+            _ => {
+                let start = now.div_euclid(86_400) - back;
+                crate::store::set_meta(conn, FORWARD_BACK_KEY, back)?;
+                crate::store::set_meta(conn, FORWARD_START_KEY, start)?;
+                start
+            }
+        }
+    };
+    FORWARD_START_DAY.store(day, std::sync::atomic::Ordering::Relaxed);
+    Ok(day)
 }
 
 /// Atomically claim the newest chunk that is pending or whose claim went
@@ -363,10 +395,22 @@ fn claim_turn_any(
     host: &str,
     now: i64,
 ) -> Result<Option<Claim>> {
+    claim_turn_with(conn, group, all, host, now, forward_from(now))
+}
+
+/// `claim_turn`, forward from day `start` when given.
+fn claim_turn_with(
+    conn: &Connection,
+    group: (String, i64),
+    all: &[(String, i64)],
+    host: &str,
+    now: i64,
+    start: Option<i64>,
+) -> Result<Option<Claim>> {
     if let Some(claim) = claim_wanted(conn, std::slice::from_ref(&group), host, now)? {
         return Ok(Some(claim));
     }
-    if let Some(start) = forward_from(now) {
+    if let Some(start) = start {
         let from: Vec<(String, i64)> = all.iter().map(|(g, oldest)| (g.clone(), (*oldest).max(start))).collect();
         let Some(frontier) = frontier_oldest(conn, &from, now)? else { return Ok(None) };
         let (g, oldest) = group;
@@ -1318,6 +1362,42 @@ mod tests {
         assert_eq!(read.iter().min(), Some(&20_000));
         // the days before the start are still to do, for a backward run
         assert_eq!(frontier(&c, &all, 0).unwrap(), Some(19_999));
+    }
+
+    #[test]
+    fn forward_backfill_on_a_groups_own_turn_waits_for_the_others_and_passes_a_resting_day() {
+        let c = conn();
+        add(&c, "a", 20_005, 19_995).unwrap();
+        add(&c, "b", 20_005, 19_995).unwrap();
+        let all: Vec<(String, i64)> = ["a", "b"].iter().map(|g| (g.to_string(), i64::MIN)).collect();
+        let turn =
+            |g: &str, now: i64| claim_turn_with(&c, (g.to_string(), i64::MIN), &all, "h", now, Some(20_000)).unwrap();
+        // `b` reads its first two days: then waits for `a`, a day past the oldest left
+        for d in [20_000, 20_001] {
+            let k = turn("b", 0).unwrap();
+            assert_eq!(k.day, d);
+            assert!(finish(&c, &k, 0).unwrap());
+        }
+        assert_eq!(turn("b", 0), None, "no further than a day past a's 20_000");
+        // `a`'s 20_000 fails and rests: the others go on past it, and it comes back first once rested
+        let k = turn("a", 0).unwrap();
+        assert_eq!(k.day, 20_000);
+        assert!(fail(&c, &k, 10).unwrap());
+        assert_eq!(turn("a", 10).map(|k| k.day), Some(20_001));
+        let later = 10 + FAIL_REST + 1;
+        assert_eq!(turn("a", later).map(|k| k.day), Some(20_000), "rested, the oldest again");
+    }
+
+    #[test]
+    fn the_forward_start_is_worked_out_once_and_kept() {
+        let c = conn();
+        crate::store::create_main(&c).unwrap();
+        let day = |d: i64| d * 86_400 + 5;
+        assert_eq!(set_forward_start(&c, Some(30), day(20_100)).unwrap(), 20_070);
+        assert_eq!(set_forward_start(&c, Some(30), day(20_105)).unwrap(), 20_070, "a later start keeps it");
+        assert_eq!(set_forward_start(&c, Some(10), day(20_105)).unwrap(), 20_095, "a new count, a new start");
+        assert_eq!(set_forward_start(&c, None, day(20_105)).unwrap(), 0);
+        FORWARD_START_DAY.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[test]
