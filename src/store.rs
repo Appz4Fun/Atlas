@@ -32,7 +32,7 @@ use crate::postprocess::schema::ShardTable;
 use crate::profile;
 use crate::search::ArticleRow;
 
-pub const SHARDS: usize = 8;
+pub const SHARDS: usize = 1;
 
 /// the shard a group's releases live in
 pub fn shard_of(group: &str) -> usize {
@@ -460,6 +460,10 @@ pub(crate) fn split_message_id(id: &str) -> Option<(&str, &str)> {
     Some((&inner[..at], &inner[at..]))
 }
 
+/// A new domain row, under the next id below `1 << 32`: ids from there on are a merged shard's own
+/// (`merge_shards`), and a small id keeps segment rows and blobs short.
+pub(crate) const NEW_DOMAIN: &str = "insert into domains (id, suffix) values ((select coalesce(max(id), 0) + 1 from domains where id < 4294967296), ?1)";
+
 /// The domains a shard's writer knows. Only domains shared by several
 /// articles get a row in `domains`: some posting tools make up a new domain
 /// for every article, and those message-ids are stored whole instead. A
@@ -496,7 +500,7 @@ impl Domains {
             return Ok((pack_local(local), *d));
         }
         let found: Option<i64> = conn
-            .prepare_cached("select id from domains where suffix = ?")?
+            .prepare_cached("select id from domains where suffix = ? order by id limit 1")?
             .query_row([suffix], |r| r.get(0))
             .optional()?;
         let domain = match found {
@@ -511,7 +515,7 @@ impl Domains {
                     return Ok((whole(id), 0));
                 }
                 self.seen.remove(suffix);
-                conn.prepare_cached("insert into domains (suffix) values (?)")?.execute([suffix])?;
+                conn.prepare_cached(NEW_DOMAIN)?.execute([suffix])?;
                 let domain = conn.last_insert_rowid();
                 self.staged.insert(suffix.to_string(), domain);
                 return Ok((pack_local(local), domain));
@@ -986,24 +990,118 @@ thread_local! {
 }
 
 /// The key of `release_ids`' hashes, the shard's own.
-pub(crate) struct IdKey(u64, u64);
+pub(crate) struct IdKey {
+    k0: u64,
+    k1: u64,
+    /// the secrets of the shards folded into this one (`merge_shards`), each a key their collections were hashed
+    /// with: none before a merge
+    legacy: Vec<(i64, i64)>,
+}
+
+/// SipHash of `text` under the pair, as `IdKey::hash`; never 0 (a release's own row in `release_ids`)
+fn keyed_hash(k0: u64, k1: u64, text: &str) -> i64 {
+    #[allow(deprecated)]
+    let mut h = std::hash::SipHasher::new_with_keys(k0, k1);
+    std::hash::Hasher::write(&mut h, text.as_bytes());
+    match std::hash::Hasher::finish(&h) as i64 {
+        0 => 1,
+        n => n,
+    }
+}
+
+/// The secrets of the shards folded into this one (`merge_shards`), each a key their collections were hashed with.
+/// None before a merge.
+fn legacy_keys(conn: &Connection, schema: &str) -> Result<Vec<(i64, i64)>> {
+    let has: bool = conn
+        .prepare_cached(&format!(
+            "select 1 from {schema}.sqlite_master where type = 'table' and name = 'merge_shards'"
+        ))?
+        .exists([])?;
+    if !has {
+        return Ok(Vec::new());
+    }
+    conn.prepare_cached(&format!(
+        "select key0, key1 from {schema}.merge_shards where key0 is not null and key1 is not null"
+    ))?
+    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+    .collect()
+}
+
+/// A collection a folded shard hashed with its own secret, moved under this shard's (`key`) the first time it comes
+/// again: its live row (`legacy_collections`) and whether it was junk (`legacy_junk_collections`). The strings
+/// weren't kept, soo it can only be moved when it comes.
+fn adopt_legacy_collection(tx: &Connection, key: &IdKey, collection: &str) -> Result<()> {
+    if key.legacy.is_empty() {
+        return Ok(());
+    }
+    let hash = key.hash(collection);
+    for &(k0, k1) in &key.legacy {
+        let old = keyed_hash(k0 as u64, k1 as u64, collection);
+        let release: Option<i64> = tx
+            .prepare_cached("select release_id from legacy_collections where key0 = ?1 and key1 = ?2 and key = ?3")?
+            .query_row(params![k0, k1, old], |r| r.get(0))
+            .optional()?;
+        if let Some(release) = release {
+            tx.prepare_cached("insert or ignore into collections (key, release_id) values (?1, ?2)")?
+                .execute(params![hash, release])?;
+            tx.prepare_cached("delete from legacy_collections where key0 = ?1 and key1 = ?2 and key = ?3")?
+                .execute(params![k0, k1, old])?;
+        }
+        let junk = tx
+            .prepare_cached("delete from legacy_junk_collections where key0 = ?1 and key1 = ?2 and key = ?3")?
+            .execute(params![k0, k1, old])?;
+        if junk > 0 {
+            crate::junk::remember_collection(tx, hash)?;
+        }
+    }
+    Ok(())
+}
+
+/// `adopt_legacy_collection` for a frozen release's collection, in the frozen file (`frozen`): what
+/// `frozen::thaw_incoming` looks it up by.
+fn adopt_legacy_frozen_collection(tx: &Connection, key: &IdKey, collection: &str) -> Result<()> {
+    if key.legacy.is_empty() {
+        return Ok(());
+    }
+    let has: bool = tx
+        .prepare_cached(
+            "select 1 from frozen.sqlite_master where type = 'table' and name = 'legacy_frozen_collections'",
+        )?
+        .exists([])?;
+    if !has {
+        return Ok(());
+    }
+    let hash = key.hash(collection);
+    for &(k0, k1) in &key.legacy {
+        let old = keyed_hash(k0 as u64, k1 as u64, collection);
+        let release: Option<i64> = tx
+            .prepare_cached(
+                "select release_id from frozen.legacy_frozen_collections where key0 = ?1 and key1 = ?2 and key = ?3",
+            )?
+            .query_row(params![k0, k1, old], |r| r.get(0))
+            .optional()?;
+        if let Some(release) = release {
+            tx.prepare_cached("insert or ignore into frozen.frozen_collections (key, release_id) values (?1, ?2)")?
+                .execute(params![hash, release])?;
+            tx.prepare_cached(
+                "delete from frozen.legacy_frozen_collections where key0 = ?1 and key1 = ?2 and key = ?3",
+            )?
+            .execute(params![k0, k1, old])?;
+        }
+    }
+    Ok(())
+}
 
 impl IdKey {
     pub(crate) fn of(conn: &Connection) -> Result<IdKey> {
         let get =
             |key: &str| -> Result<i64> { conn.query_row("select value from meta where key = ?", [key], |r| r.get(0)) };
-        Ok(IdKey(get("id_key0")? as u64, get("id_key1")? as u64))
+        Ok(IdKey { k0: get("id_key0")? as u64, k1: get("id_key1")? as u64, legacy: legacy_keys(conn, "main")? })
     }
 
     /// a message-id's hash, as `dedup_key` has it; never 0 (the release's own row)
     pub(crate) fn hash(&self, id: &str) -> i64 {
-        #[allow(deprecated)]
-        let mut h = std::hash::SipHasher::new_with_keys(self.0, self.1);
-        std::hash::Hasher::write(&mut h, id.as_bytes());
-        match std::hash::Hasher::finish(&h) as i64 {
-            0 => 1,
-            n => n,
-        }
+        keyed_hash(self.k0, self.k1, id)
     }
 }
 
@@ -1856,7 +1954,7 @@ fn stored_forms(conn: &Connection, id: &str) -> Result<Vec<(Vec<u8>, i64)>> {
     let mut forms = vec![(whole(id), 0)];
     if let Some((local, suffix)) = split_message_id(id)
         && let Some(d) = conn
-            .prepare_cached("select id from domains where suffix = ?")?
+            .prepare_cached("select id from domains where suffix = ? order by id limit 1")?
             .query_row([suffix], |r| r.get::<_, i64>(0))
             .optional()?
     {
@@ -2012,7 +2110,9 @@ const SEALED_CACHE_MAX_SEGMENTS: usize = 200_000;
 const SEALED_DECODE_BUDGET: usize = 20 * SEAL_MAX_SEGMENTS as usize;
 
 /// a sealed file's articles as (local, domain)
-type SegmentSet = HashSet<(Vec<u8>, i64)>;
+/// the message-ids of a sealed file's blob, as `dedup_key` writes them: by text, soo an article stored under another
+/// id of its domain (a shard folded into this one, `merge_shards`) is the same article
+type SegmentSet = HashSet<String>;
 
 /// Blobs of sealed files, decoded once each, for checking late articles.
 /// Holds at most `SEALED_CACHE_MAX_SEGMENTS` decoded segments, letting the
@@ -2035,6 +2135,8 @@ pub(crate) struct SealedCache {
     max_decoded: usize,
     /// the last `contains` was past the budget: its false only means not known
     pub(crate) guessed: bool,
+    /// each domain's suffix, looked up once (a domain's suffix never changes)
+    suffixes: HashMap<i64, Option<String>>,
 }
 
 impl SealedCache {
@@ -2053,6 +2155,7 @@ impl SealedCache {
             decoded: 0,
             max_decoded,
             guessed: false,
+            suffixes: HashMap::new(),
         }
     }
 
@@ -2060,7 +2163,14 @@ impl SealedCache {
     pub(crate) fn contains(&mut self, conn: &Connection, file_id: i64, local: &[u8], domain: i64) -> Result<bool> {
         self.uses += 1;
         self.guessed = false;
-        let key = (local.to_vec(), domain);
+        if self.suffixes.len() > 100_000 {
+            self.suffixes.clear();
+        }
+        let key = seg_key(
+            conn,
+            &mut self.suffixes,
+            &crate::blob::Seg { part: None, bytes: 0, domain, local: local.to_vec() },
+        )?;
         if let Some((used, set)) = self.files.get_mut(&file_id) {
             self.by_use.remove(used);
             *used = self.uses;
@@ -2071,8 +2181,11 @@ impl SealedCache {
             self.guessed = true;
             return Ok(false);
         }
-        let set: SegmentSet =
-            sealed_segments(conn, file_id)?.unwrap_or_default().into_iter().map(|s| (s.local, s.domain)).collect();
+        let set: SegmentSet = sealed_segments(conn, file_id)?
+            .unwrap_or_default()
+            .iter()
+            .map(|s| seg_key(conn, &mut self.suffixes, s))
+            .collect::<Result<_>>()?;
         self.decoded += set.len();
         let found = set.contains(&key);
         if set.len() > self.max_segments {
@@ -2514,6 +2627,9 @@ impl ShardWriter {
             for release in batches.into_iter().flatten().filter(|r| !crate::filters::group_blocked(&r.group)) {
                 // a frozen first upload's row comes back, with its routes, before they are read
                 if frozen {
+                    if let Some(c) = release.collection.as_deref() {
+                        adopt_legacy_frozen_collection(&tx, &key, c)?;
+                    }
                     let collection = release.collection.as_deref().map(|c| key.hash(c));
                     let articles: Vec<(&str, &str)> = release
                         .articles
@@ -2925,6 +3041,7 @@ struct CollectionRow {
 /// that, with 8 digits of the key's hash after it, as `a [4]` has its count.
 fn collection_row(tx: &Connection, key: &IdKey, collection: &str, release: &Release) -> Result<CollectionRow> {
     let hash = key.hash(collection);
+    adopt_legacy_collection(tx, key, collection)?;
     // a purge can leave a row here, whose release is gone: it finds nothing
     let known: Option<(String, bool)> = tx
         .prepare_cached(
@@ -3362,7 +3479,11 @@ mod tests {
     /// a table of sealed files for a `SealedCache`: file i holds `per` segments
     fn sealed_files(files: i64, per: i64) -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("create table files (id INTEGER PRIMARY KEY, blob BLOB)").unwrap();
+        conn.execute_batch(
+            "create table files (id INTEGER PRIMARY KEY, blob BLOB);
+             create table domains (id INTEGER PRIMARY KEY, suffix TEXT NOT NULL);",
+        )
+        .unwrap();
         for id in 1..=files {
             let segs: Vec<crate::blob::Seg> = (0..per)
                 .map(|p| crate::blob::Seg {
@@ -6155,5 +6276,32 @@ mod tests {
         assert_eq!(complete_of(&conn, episode), 1);
         let due: i64 = conn.query_row("select due_at from pp_queue where release_id = ?", [id], |r| r.get(0)).unwrap();
         assert_eq!(due, 1_000, "its gated body steps are looked at again");
+    }
+
+    /// A shard folded into this one (`merge_shards`) left a sealed blob whose articles are under its own ids of a
+    /// suffix this shard has an id for too: the same article, seen again under this shard's id, is in the blob.
+    #[test]
+    fn a_sealed_blob_under_another_id_of_the_domain_holds_the_same_article() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("atlas.s0.db");
+        create_shard(&path).unwrap();
+        let conn = db::open_at(&path).unwrap();
+        crate::merge_shards::domains_not_unique(&conn).unwrap();
+        let other = (5i64 << 32) + 1;
+        conn.execute_batch(&format!(
+            "insert into domains (id, suffix) values (1, '@x>'), ({other}, '@x>');
+             insert into releases (id, name, group_name) values (8, 'R', 'g');"
+        ))
+        .unwrap();
+        let segs = vec![crate::blob::Seg { part: Some(1), bytes: 10, domain: other, local: pack_local("abc") }];
+        conn.execute(
+            "insert into files (id, release_id, filename, seen, blob) values (3, 8, 'a.rar', x'02', ?1)",
+            [crate::blob::encode(&segs)],
+        )
+        .unwrap();
+        let mut cache = SealedCache::new();
+        assert!(cache.contains(&conn, 3, &pack_local("abc"), 1).unwrap(), "the same message-id, under this shard's id");
+        assert!(cache.contains(&conn, 3, &pack_local("abc"), other).unwrap());
+        assert!(!cache.contains(&conn, 3, &pack_local("abd"), 1).unwrap());
     }
 }

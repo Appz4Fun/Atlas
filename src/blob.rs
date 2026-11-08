@@ -70,6 +70,59 @@ pub fn encode(segs: &[Seg]) -> Vec<u8> {
     zstd::bulk::compress(&raw, LEVEL).expect("zstd compress of an in memory buffer")
 }
 
+/// A sealed-log place of a blob from a shard folded into another (`merge_shards`): the segments in the log carry
+/// that shard's domain numbers, which this one keeps on from `base`. `SHIFTED_TAG`, `base` (8 bytes, little endian),
+/// then the place. A blob kept here is renumbered as it's copied instead (`shift_blob`).
+pub const SHIFTED_TAG: [u8; 5] = *b"\xFFSHF1";
+
+/// `place` (a sealed-log place) with its segments' domains to be read on from `base`.
+pub fn shifted(place: &[u8], base: i64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(SHIFTED_TAG.len() + 8 + place.len());
+    out.extend_from_slice(&SHIFTED_TAG);
+    out.extend_from_slice(&base.to_le_bytes());
+    out.extend_from_slice(place);
+    out
+}
+
+/// The base a stored blob's domains are read on from (0 for most), and what is stored under it: a blob, or a place.
+fn unshifted(blob: &[u8]) -> (i64, &[u8]) {
+    match blob.strip_prefix(&SHIFTED_TAG[..]) {
+        Some(rest) if rest.len() > 8 => {
+            let base = i64::from_le_bytes(rest[..8].try_into().expect("8 bytes"));
+            (base, &rest[8..])
+        }
+        _ => (0, blob),
+    }
+}
+
+/// What is stored without the base a merge put on it: the blob, or its sealed-log place.
+pub fn inner(blob: &[u8]) -> &[u8] {
+    unshifted(blob).1
+}
+
+fn shift(segs: &mut [Seg], base: i64) {
+    if base != 0 {
+        for s in segs.iter_mut().filter(|s| s.domain != 0) {
+            s.domain = s.domain.wrapping_add(base);
+        }
+    }
+}
+
+/// A stored blob of a shard being folded into another: one kept here is written again with its domains taken from
+/// `map` (the id the target uses for the same suffix; one not in it moved on by `base`), a sealed-log place is marked
+/// to be read on from `base` (`shifted`), as what's in the log can't be rewritten. One shifted already is shifted again.
+pub fn remap_blob(blob: &[u8], base: i64, map: &std::collections::HashMap<i64, i64>) -> Result<Vec<u8>> {
+    let (had, rest) = unshifted(blob);
+    if sealed_log::Locator::from_ref(rest).is_some() {
+        return Ok(shifted(rest, had + base));
+    }
+    let mut segs = decode(blob)?;
+    for s in segs.iter_mut().filter(|s| s.domain != 0) {
+        s.domain = map.get(&s.domain).copied().unwrap_or(s.domain.wrapping_add(base));
+    }
+    Ok(encode(&segs))
+}
+
 /// The blob itself, fetched when what's stored is its place in the sealed log.
 fn resolved(blob: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>> {
     match sealed_log::Locator::from_ref(blob) {
@@ -80,18 +133,21 @@ fn resolved(blob: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>> {
 
 /// Whether this is a place in the sealed log rather than a blob.
 pub fn is_remote(blob: &[u8]) -> bool {
-    sealed_log::Locator::from_ref(blob).is_some()
+    sealed_log::Locator::from_ref(inner(blob)).is_some()
 }
 
 /// Unpacks a blob made by `encode`. Truncated or corrupt input is an error.
 pub fn decode(blob: &[u8]) -> Result<Vec<Seg>> {
-    parse(&zstd::stream::decode_all(&*resolved(blob)?)?, usize::MAX)
+    let (base, blob) = unshifted(blob);
+    let mut segs = parse(&zstd::stream::decode_all(&*resolved(blob)?)?, usize::MAX)?;
+    shift(&mut segs, base);
+    Ok(segs)
 }
 
 /// How many segments a blob holds, unpacking only its start.
 pub fn count(blob: &[u8]) -> Result<usize> {
     use std::io::Read;
-    let blob = resolved(blob)?;
+    let blob = resolved(inner(blob))?;
     let mut start = Vec::with_capacity(16);
     zstd::stream::read::Decoder::new(&*blob)?.take(16).read_to_end(&mut start)?;
     if start.first() != Some(&VERSION) {
@@ -120,12 +176,15 @@ pub fn decode_capped(blob: &[u8], max: usize) -> Result<Vec<Seg>> {
     use std::io::Read;
     let limit = (max as u64).saturating_mul(MAX_SEG_RAW as u64).saturating_add(16);
     let mut raw = Vec::new();
+    let (base, blob) = unshifted(blob);
     let blob = resolved(blob)?;
     zstd::stream::read::Decoder::new(&*blob)?.take(limit).read_to_end(&mut raw)?;
     if raw.len() as u64 >= limit {
         return Err(Error::new(ErrorKind::InvalidData, "blob unpacks to more than its cap"));
     }
-    parse(&raw, max)
+    let mut segs = parse(&raw, max)?;
+    shift(&mut segs, base);
+    Ok(segs)
 }
 
 fn parse(raw: &[u8], max: usize) -> Result<Vec<Seg>> {
@@ -260,5 +319,27 @@ mod tests {
             let blob = encode(&segs);
             assert_eq!(count(&blob).unwrap(), decode(&blob).unwrap().len());
         }
+    }
+
+    #[test]
+    fn a_merged_shards_blobs_take_the_targets_domains_or_read_theirs_on_from_a_base() {
+        let segs = vec![
+            Seg { part: Some(1), bytes: 10, domain: 3, local: b"a".to_vec() },
+            Seg { part: Some(2), bytes: 10, domain: 4, local: b"b".to_vec() },
+            Seg { part: Some(3), bytes: 10, domain: 0, local: b"<whole@x>".to_vec() },
+        ];
+        let base = 5i64 << 32;
+        let map = std::collections::HashMap::from([(3, 17)]);
+        // kept here: the target's id where the map has one, moved on by the base where not, a whole id left alone
+        let moved = decode(&remap_blob(&encode(&segs), base, &map).unwrap()).unwrap();
+        assert_eq!(moved.iter().map(|s| s.domain).collect::<Vec<_>>(), [17, 4 + base, 0]);
+        // a place in the sealed log: marked, still remote, its place unchanged
+        let mut place = sealed_log::REF_TAG.to_vec();
+        place.resize(sealed_log::REF_BYTES, 7);
+        let marked = remap_blob(&place, base, &map).unwrap();
+        assert!(is_remote(&marked));
+        assert_eq!(inner(&marked), &place[..]);
+        assert_eq!(unshifted(&marked).0, base);
+        assert_eq!(unshifted(&remap_blob(&marked, 1, &map).unwrap()).0, base + 1, "shifted again adds up");
     }
 }

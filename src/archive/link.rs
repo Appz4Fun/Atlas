@@ -358,7 +358,9 @@ impl LinkStep {
     ) -> Result<Vec<Candidate>, StepError> {
         let me = ctx.release();
         let Some(posted) = me.posted_date.clone() else { return Ok(Vec::new()) };
-        let span = ID_WINDOW * crate::store::SHARDS as i64;
+        // the ids of `ID_WINDOW` releases of one of the eight shards there were: the same stretch of posting, whether
+        // a release's id is from then (eight apart) or dense since
+        let span = ID_WINDOW * crate::merge_shards::LEGACY_SHARDS as i64;
         let mut stmt = ctx
             .conn()
             .prepare_cached(

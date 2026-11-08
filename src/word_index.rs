@@ -1168,6 +1168,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs more than one shard; store::SHARDS is 1"]
     fn a_drain_writes_one_shard_at_a_time() {
         let f = fixture();
         // alt.binaries.c is in shard 0, alt.binaries.b in shard 3

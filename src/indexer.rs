@@ -1742,11 +1742,21 @@ where
         Ok((None, _)) => return failed(anyhow!("{group} has no day chunks")).await,
         Err(e) => return failed(e).await,
     };
-    let (start, end) =
-        match chunk_range(&ctx.pool, server, group, (first, last), day, days, (cursor, settings.chunk_safety)).await {
-            Ok(range) => range,
-            Err(e) => return failed(e.into()).await,
-        };
+    let (start, end) = match chunk_range(
+        &ctx.pool,
+        server,
+        group,
+        (first, last),
+        day,
+        days,
+        (cursor, settings.chunk_safety),
+        chunk.reread,
+    )
+    .await
+    {
+        Ok(range) => range,
+        Err(e) => return failed(e.into()).await,
+    };
     // days only this server has are bounded all together, see `chunks::Speculative`
     let floor = match runner_up_day {
         Some(r) => {
@@ -1824,6 +1834,10 @@ where
 /// shift up to that many articles is covered, a forged run moving a search
 /// further can still leave a gap, for the carriers' sweeps once the
 /// chunks are done (see `run_pass` and `run_sweep`).
+///
+/// A day read again (`reread`, see `chunks::reopen_done`) is bounded by its dates alone, the newest day too: this
+/// server's cursor has moved down since the first read (its sweep), and would cut the day short or leave it empty.
+#[allow(clippy::too_many_arguments)]
 pub async fn chunk_range(
     pool: &Pool,
     server: usize,
@@ -1832,19 +1846,21 @@ pub async fn chunk_range(
     day: i64,
     (oldest_day, newest_day): (i64, i64),
     (cursor, safety): (u64, u64),
+    reread: bool,
 ) -> crate::nntp::Result<(u64, u64)> {
     let starts = |day: i64| pool.article_at(server, group, first, last, day * 86_400 - CHUNK_OVERLAP);
-    if day <= oldest_day && day >= newest_day {
+    if !reread && day <= oldest_day && day >= newest_day {
         return Ok((first, cursor));
     }
     let next = starts(day + 1).await?;
     // a start past the next day's (forged Dates) is moved down to it
     let start = if day <= oldest_day { first } else { starts(day).await?.min(next).saturating_sub(safety).max(first) };
-    let end = if day >= newest_day {
+    let end = if day >= newest_day && !reread {
         cursor
     } else {
         let past = pool.article_at(server, group, first, last, (day + 1) * 86_400 + CHUNK_OVERLAP).await?;
-        next.max(past).saturating_sub(1).saturating_add(safety).min(cursor)
+        let end = next.max(past).saturating_sub(1).saturating_add(safety);
+        if reread { end.min(last) } else { end.min(cursor) }
     };
     Ok((start, end))
 }

@@ -173,18 +173,18 @@ mod tests {
         let lanes = Lanes::default();
         let t0 = Instant::now();
         assert_eq!(lanes.rates(t0)["window_secs"], 0);
-        lanes.net_visits[2].fetch_add(240, Relaxed);
-        lanes.net_finished[2].fetch_add(60, Relaxed);
-        lanes.queue_taken[7].fetch_add(30, Relaxed);
+        let (a, b) = (SHARDS - 1, SHARDS / 2);
+        lanes.net_visits[a].fetch_add(240, Relaxed);
+        lanes.net_finished[a].fetch_add(60, Relaxed);
+        lanes.queue_taken[b].fetch_add(30, Relaxed);
         let r = lanes.rates(t0 + Duration::from_secs(120));
         assert_eq!(r["window_secs"], 120);
-        assert_eq!(r["net_visits"][2], 120.0);
-        assert_eq!(r["net_finished"][2], 30.0);
-        assert_eq!(r["queue_taken"][7], 15.0);
-        assert_eq!(r["net_visits"][0], 0.0);
+        assert_eq!(r["net_visits"][a], 120.0);
+        assert_eq!(r["net_finished"][a], 30.0);
+        assert_eq!(r["queue_taken"][b], 15.0);
         // a reading that old drops out once there's a newer one past the window
         let r = lanes.rates(t0 + Duration::from_secs(120 + RATE_WINDOW as u64));
         assert_eq!(r["window_secs"], RATE_WINDOW as i64);
-        assert_eq!(r["net_visits"][2], 0.0);
+        assert_eq!(r["net_visits"][a], 0.0);
     }
 }

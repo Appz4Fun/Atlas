@@ -2197,7 +2197,7 @@ impl Pool {
     /// Room for a slice of `numbers` article numbers partitioned for `shard`.
     pub async fn reserve_unsaved_shard(&self, shard: usize, numbers: u64) -> Unsaved {
         let budget = self.unsaved.clone();
-        let shard_idx = shard % crate::store::SHARDS;
+        let shard_idx = shard.checked_rem(crate::store::SHARDS).unwrap_or(0);
         if let Some(sb) = budget.shards.get(shard_idx).cloned() {
             let n = usize::try_from(numbers).unwrap_or(usize::MAX).clamp(1, sb.cap);
             let shard_permit = sb.permits.clone().acquire_many_owned(n as u32).await.expect("semaphore closed");
