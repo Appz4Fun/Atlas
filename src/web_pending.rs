@@ -74,6 +74,7 @@ pub(crate) fn label(name: &str) -> &str {
         "nfo" => "Name from the NFO",
         "sidecar" => "Sidecar text",
         "sidecar_image" => "Sidecar cover",
+        "images" => "Pictures",
         "predb_match" => "PreDB match",
         "category" => "Category",
         "media_parse" => "Title parse",
@@ -160,8 +161,9 @@ fn read_state(conn: &Connection, s: usize, id: i64) -> rusqlite::Result<State> {
         .query_row(
             &format!(
                 "select name, display_name, group_name, poster, posted_date, coalesce(size, 0), coalesce(complete, 0),
-                        coalesce(parts, 0), file_total, coalesce(is_obfuscated, 0), name_source
-                 from s{s}.releases where id = ?"
+                        coalesce(parts, 0), file_total, coalesce(is_obfuscated, 0), name_source,
+                        (select kind from s{s}.spots where release_id = ?1)
+                 from s{s}.releases where id = ?1"
             ),
             [id],
             |r| {
@@ -179,6 +181,7 @@ fn read_state(conn: &Connection, s: usize, id: i64) -> rusqlite::Result<State> {
                     file_total: r.get(8)?,
                     is_obfuscated: r.get::<_, i64>(9)? != 0,
                     name_source: r.get(10)?,
+                    spot_kind: crate::spotnet::Kind::parse(r.get::<_, Option<String>>(11)?.as_deref()),
                 })
             },
         )
@@ -804,7 +807,7 @@ mod tests {
         assert_eq!(*standing_of(&rows, "predb_match"), Standing::Skipped(None), "no queue row, no walk");
 
         let html = render(8, &state, &pace(), &rows, 1_000);
-        assert!(html.contains("2 of 18 steps still to run: Probe (tracks, codecs), Media lookup."), "{html}");
+        assert!(html.contains("2 of 19 steps still to run: Probe (tracks, codecs), Media lookup."), "{html}");
         assert!(html.contains("in about 2 h · 7,200 ahead in shard 0's net line"), "{html}");
     }
 
@@ -920,7 +923,7 @@ mod tests {
         let main = dir.path().join("atlas.db");
         crate::db::create_db_at(&main).unwrap();
         let conn = crate::db::open_with_shards(&main).unwrap();
-        let s = 3;
+        let s = store::SHARDS - 1;
         for (i, rank) in [(1, 2), (2, 1), (3, 1), (4, 0), (5, 1)] {
             let id = i * store::SHARDS as i64 + s as i64;
             conn.execute(

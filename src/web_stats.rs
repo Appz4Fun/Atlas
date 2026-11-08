@@ -1448,8 +1448,9 @@ atlas_indexer_up 1
         let at = 1_800_000_000.0;
         let fmt =
             |t: f64| chrono::DateTime::from_timestamp(t as i64, 0).unwrap().format("%Y-%m-%d %H:%M:%S").to_string();
-        for (i, path) in shards.iter().enumerate().take(2) {
-            let conn = crate::db::open_at(path).unwrap();
+        // two shards' worth, or both in one when there is one
+        for i in 0..2 {
+            let conn = crate::db::open_at(&shards[i % shards.len()]).unwrap();
             conn.execute_batch(&format!(
                 "create index if not exists {} on releases(posted_date);
                  create table if not exists release_category (release_id INTEGER PRIMARY KEY, category INTEGER NOT NULL);
@@ -1482,7 +1483,11 @@ atlas_indexer_up 1
         }
         let s = read_stored(&main, at, None);
         assert!(s.errors.is_empty(), "{:?}", s.errors);
-        assert_eq!(s.day_unindexed, shards.len() - 2, "shards without the index are left out, not scanned");
+        assert_eq!(
+            s.day_unindexed,
+            shards.len().saturating_sub(2),
+            "shards without the index are left out, not scanned"
+        );
         assert_eq!(s.day[&2040], DayRow { count: 2, complete: 2, bytes: 2000 });
         assert_eq!(s.day[&crate::category::UNCATEGORIZED].count, 2);
         assert_eq!((s.day_total, s.day_every, s.day_at), (4, 1, at));
@@ -1495,7 +1500,7 @@ atlas_indexer_up 1
         let out = stored_html(&s, at);
         assert!(out.contains("Posted in the last 24 hours") && out.contains("Uncategorized"));
         assert!(out.contains("/ui/release?id=8") && out.contains("X264 · exact"));
-        assert!(out.contains("no index on the posted date"));
+        assert_eq!(out.contains("no index on the posted date"), shards.len() > 2, "said only for shards without it");
         assert!(out.contains("hx-get=\"/ui/stats/stored\" hx-trigger=\"every 60s\""), "it keeps refreshing");
     }
 }

@@ -13,8 +13,9 @@ fn main() -> ExitCode {
 
     if has("--help") || has("-h") {
         println!(
-            "atlas {}\n\nusage: atlas [--selftest | --bg-indexer | --convert]\n\n  (no args)     interactive menu\n  --selftest    check the login on every usenet server and exit\n  --bg-indexer  run the indexing loop headless (the menu starts this for you)\n  --convert     move a database from before the shards into them, then exit\n                (the indexer does this on its own when it starts)\n  --compact     rewrite the shards smaller (stop indexing first), then exit\n  --purge       delete what no step can help, a dry run unless --apply. Alone it takes\n                fragments only: [--fragments] [--blocked] [--too-small [--below BYTES]]\n                [--image-only] [--rejected] [--dead] [--sample N] [--apply]\n  --reprocess   look at stored releases again, a dry run unless --apply:\n                [--step NAME]... [--group NAME]... [--failed] [--apply]\n  --reflag-obfuscated  flag old rows the current check calls random, a dry run unless\n                --apply: [--sample N] [--apply]\n  --unname      clear names taken from subjects and posted files, a dry run unless\n                --apply: [--sample N] [--apply]\n  --recount-articles  size and parts back to every article held, for rows with a file saved since:\n                --since UNIX_TIME, a dry run unless --apply: [--sample N] [--apply]\n  --undo-mojibake  rows named from a subject a server encoded twice (CultFilmsâ„¢): into the row of the\n                same articles under the right name, or renamed, a dry run unless --apply: [--sample N] [--apply]\n  --sealed-log-move  move sealed articles to the sealed log at full speed (stop indexing first)\n  --predb-import  read PreDB titles from a local file, a dry run unless --apply:\n                FILE [--apply]\n  --replay-raw-predb  re-parse all archived raw PreDB feed payloads in atlas.raw.db:\n                [--apply]\n  --reset-shards  harvest shard probes/hashes to atlas.raw.db and wipe only shards/headers:\n                [--apply]\n  --search-indexes  index poster, size, posted date and name, for searching and sorting
-                on them (stop indexing first),\n                a dry run unless --apply: [--apply]\n  --thaw        put frozen releases back into their shards: RELEASE_ID...\n  --frozen-stats  count frozen releases per shard and reason\n  --crc-links   count releases the file and first-article CRC keys link, reading only:\n                [--sample N]",
+            "atlas {}\n\nusage: atlas [--selftest | --bg-indexer | --convert]\n\n  (no args)     interactive menu\n  --selftest    check the login on every usenet server and exit\n  --bg-indexer  run the indexing loop headless (the menu starts this for you)\n  --convert     move a database from before the shards into them, then exit\n                (the indexer does this on its own when it starts)\n  --compact     rewrite the shards smaller (stop indexing first), then exit\n  --purge       delete what no step can help, a dry run unless --apply. Alone it takes\n                fragments only: [--fragments] [--blocked] [--too-small [--below BYTES]]\n                [--image-only] [--rejected] [--dead] [--sample N] [--apply]\n  --reprocess   look at stored releases again, a dry run unless --apply:\n                [--step NAME]... [--group NAME]... [--failed] [--apply]\n  --reflag-obfuscated  flag old rows the current check calls random, a dry run unless\n                --apply: [--sample N] [--apply]\n  --unname      clear names taken from subjects and posted files, a dry run unless\n                --apply: [--sample N] [--apply]\n  --recount-articles  size and parts back to every article held, for rows with a file saved since:\n                --since UNIX_TIME, a dry run unless --apply: [--sample N] [--apply]\n  --undo-mojibake  rows named from a subject a server encoded twice (CultFilmsâ„¢): into the row of the\n                same articles under the right name, or renamed, a dry run unless --apply: [--sample N] [--apply]\n  --count-repair-candidates  count the article bytes of releases a PAR2 repair may make whole, soo they
+                can show as NEEDS REPAIR; runs beside the indexer, a dry run unless --apply: [--sample N] [--apply]\n  --split-reposts  one release per upload of a post uploaded again under the same names: --list\n                [--sample N] (read only), or --id RELEASE_ID [--server HOST] [--apply]\n  --sealed-log-move  move sealed articles to the sealed log at full speed (stop indexing first)\n  --predb-import  read PreDB titles from a local file, a dry run unless --apply:\n                FILE [--apply]\n  --replay-raw-predb  re-parse all archived raw PreDB feed payloads in atlas.raw.db:\n                [--apply]\n  --reset-shards  harvest shard probes/hashes to atlas.raw.db and wipe only shards/headers:\n                [--apply]\n  --xref-reread  put backfill days read before the cross-group linker back to be read again, newest\n                first, soo their obfuscated uploads get linked; runs beside the indexer, a dry run unless\n                --apply: [--since YYYY-MM-DD] [--apply]\n  --export-keep  copy what re-indexing can't bring back (PreDB, media provider and OpenSubtitles answers, hand\n                thaws) to keep-export/<time>/keep.db, checked, and with --apply into Postgres's keep schema:\n                [--apply] [--force] (a table may shrink), or a dry run [--allow-missing]\n  --header-window  read the last day of overview lines kept for linking uploads across groups:\n                [stats | POSTER FROM TO] (unix seconds)\n  --merge-shards  fold atlas.s1..s7.db into atlas.s0.db one at a time, each deleted once its copy\n                checks out (stop indexing first), a dry run unless --apply: [--apply]\n  --search-indexes  index poster, size, posted date and name, for searching and sorting
+                on them (stop indexing first),\n                a dry run unless --apply: [--apply]\n  --thaw        put frozen releases back into their shards: RELEASE_ID...\n  --frozen-stats  count frozen releases per shard and reason\n  --overview    read the overview archive (no provider): SERVER GROUP [stats | verify | START-END | <message-id>]\n  --crc-links   count releases the file and first-article CRC keys link, reading only:\n                [--sample N]",
             env!("CARGO_PKG_VERSION")
         );
         return ExitCode::SUCCESS;
@@ -40,6 +41,14 @@ fn main() -> ExitCode {
         atlas::predb::file_import::run(&args)
     } else if has("--replay-raw-predb") {
         atlas::raw_store::run_replay_predb(&args)
+    } else if has("--xref-reread") {
+        atlas::xref::run_reread(&args)
+    } else if has("--header-window") {
+        atlas::header_window::run_cli(&args)
+    } else if has("--export-keep") {
+        atlas::keep_export::run(&args)
+    } else if has("--merge-shards") {
+        atlas::merge_shards::run(&args)
     } else if has("--reset-shards") {
         atlas::raw_store::run_reset_shards(&args)
     } else if has("--reflag-obfuscated") {
@@ -48,6 +57,10 @@ fn main() -> ExitCode {
         atlas::naming::unname::run(&args)
     } else if has("--recount-articles") {
         atlas::naming::recount::run(&args)
+    } else if has("--count-repair-candidates") {
+        atlas::repair_counts::run(&args)
+    } else if has("--split-reposts") {
+        atlas::repost_split::run(&args)
     } else if has("--undo-mojibake") {
         atlas::naming::mojibake::run(&args)
     } else if has("--sealed-log-move") {
@@ -62,6 +75,8 @@ fn main() -> ExitCode {
         atlas::frozen::run_thaw(&args)
     } else if has("--frozen-stats") {
         atlas::frozen::run_stats()
+    } else if has("--overview") {
+        atlas::overview_archive::run_cli(&args)
     } else if has("--crc-links") {
         atlas::keys::run_report(&args)
     } else if has("--selftest") {

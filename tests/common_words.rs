@@ -20,7 +20,9 @@ fn a_common_word_comes_back_newest_first() {
     db::create_db().unwrap();
     let main = home.path().join("atlas.db");
     let groups: Vec<String> = (0..64).map(|n| format!("alt.binaries.g{n}")).collect();
-    let in_shard = |s: usize| groups.iter().find(|g| store::shard_of(g) == s).unwrap().clone();
+    let in_shard = |s: usize| {
+        groups.iter().filter(|g| store::shard_of(g) == s % store::SHARDS).nth(s / store::SHARDS).unwrap().clone()
+    };
     let group = in_shard(0);
     for (name, group) in [
         ("Film.One.1080p-AAA", in_shard(0)),

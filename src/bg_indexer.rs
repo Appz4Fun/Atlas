@@ -1084,6 +1084,11 @@ async fn run_servers(
         scans_stop.store(true, Ordering::Relaxed);
         crate::frozen::STOPPING.store(true, Ordering::Relaxed);
     });
+    // uploads whose every article has a random subject, linked across groups from the headers kept (`xref`)
+    {
+        let s = sched.clone();
+        tasks.spawn(named!("the xref linker".into(), crate::xref::run(db.clone(), move || s.stopping())));
+    }
     tasks.spawn(named!("the config watcher".into(), watch_config(sched.clone(), servers)));
     tasks.spawn(named!("the status report".into(), report(sched.clone())));
     tasks.spawn(named!("the compaction timer".into(), compact_timer(sched.clone())));
@@ -1318,6 +1323,19 @@ pub fn run() -> i32 {
             return 1;
         }
     };
+    {
+        // forward backfill's first day, fixed once, in the main database it indexes into (after any conversion); a
+        // change in the config needs a restart
+        let now = chrono::Utc::now().timestamp();
+        match db::open_at(&main)
+            .map_err(anyhow::Error::from)
+            .and_then(|c| Ok(crate::chunks::set_forward_start(&c, config.backfill_start_days_back, now)?))
+        {
+            Ok(day) if day > 0 => ui::print(&format!("backfill reads forward from day {day} to live")),
+            Ok(_) => {}
+            Err(e) => ui::warn(&format!("couldnt set the forward backfill's start: {e:#}")),
+        }
+    }
 
     let stop = Arc::new(AtomicBool::new(false));
 
@@ -1329,12 +1347,27 @@ pub fn run() -> i32 {
 
     crate::metrics::start(&config, crate::metrics::Role::Indexer);
     crate::sealed_store::spawn_offload(&config.sealed_log, stop.clone());
+    crate::blob_bytes::spawn(&config.sealed_log, stop.clone());
     crate::shared_catalog::start(&config.shared_catalog, stop.clone());
+    crate::overview_archive::spawn(&config.overview_archive);
+    crate::header_window::spawn(&config.header_window);
     if config.metrics.enabled {
         crate::metrics::catalog::spawn(Duration::from_secs(config.metrics.catalog_every_secs), stop.clone());
     }
 
-    index(config, stop, Some(writing))
+    let code = index(config, stop, Some(writing));
+    // the batches still queued for the overview archive
+    crate::overview_archive::finish(Duration::from_secs(30));
+    crate::header_window::finish(Duration::from_secs(30));
+    // the obfuscated headers still queued for the cross-group store
+    if !crate::xref::flush_recorder(Duration::from_secs(60)) {
+        eprintln!("xref: headers still queued at exit weren't all written");
+    }
+    let lost = crate::xref::recorder_failures();
+    if lost > 0 {
+        eprintln!("xref: {lost} headers' writes failed this run (their slices are read again)");
+    }
+    code
 }
 
 /// The one time move into the shards at start, if `main` needs it, with

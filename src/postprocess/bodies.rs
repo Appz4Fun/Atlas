@@ -90,7 +90,9 @@ impl BodyFetcher {
 
     /// Why this body mustnt be fetched, all before any bytes move. Part 4's
     /// `fetch_prefix` asks too.
-    pub(crate) fn refusal(&self, release: &ReleaseInfo, file: &str, used: i64) -> Option<&'static str> {
+    /// A picture is refused unless `pictures`: a step that reads pictures on purpose asks for them
+    /// (`StepCtx::allow_pictures`).
+    pub(crate) fn refusal(&self, release: &ReleaseInfo, file: &str, used: i64, pictures: bool) -> Option<&'static str> {
         let c = self.config.read().unwrap();
         if filters::group_blocked(&release.group) {
             Some("blocked group")
@@ -98,7 +100,7 @@ impl BodyFetcher {
             || (c.body_max_size_bytes > 0 && release.size > c.body_max_size_bytes)
         {
             Some("outside the size bounds")
-        } else if IMAGE.is_match(file) {
+        } else if !pictures && IMAGE.is_match(file) {
             Some("an image")
         } else if used >= c.bodies_per_release {
             Some(PAST_BUDGET)
@@ -129,6 +131,7 @@ impl BodyFetcher {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn fetch(
         &self,
         release: &ReleaseInfo,
@@ -137,10 +140,23 @@ impl BodyFetcher {
         deadline: Instant,
         read: BackgroundRead,
     ) -> Result<Got, StepError> {
+        self.fetch_with(release, request, used, deadline, read, false)
+    }
+
+    /// `fetch`, with pictures let through when `pictures`.
+    pub(crate) fn fetch_with(
+        &self,
+        release: &ReleaseInfo,
+        request: &BodyRequest,
+        used: &mut i64,
+        deadline: Instant,
+        read: BackgroundRead,
+        pictures: bool,
+    ) -> Result<Got, StepError> {
         if self.stopping() {
             return Err(StepError::Stopped);
         }
-        if let Some(why) = self.refusal(release, &request.file, *used) {
+        if let Some(why) = self.refusal(release, &request.file, *used, pictures) {
             return Ok(Got::Refused(why));
         }
         let token_at = Instant::now();
@@ -254,6 +270,16 @@ mod tests {
         let ask = BodyRequest { message_id: "<a@x>".into(), file: "a.bin".into(), max_bytes: Some(64) };
         let got = f.fetch(&release, &ask, &mut 0, Instant::now() + Duration::from_secs(5), BackgroundRead::Prefix);
         assert_eq!(got.unwrap(), Got::Refused("blocked group"));
+    }
+
+    #[test]
+    fn a_picture_is_refused_unless_the_step_asks_for_pictures() {
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let f = fetcher(1, &runtime);
+        let release = ReleaseInfo { group: "alt.binaries.t".into(), size: 4 << 30, ..Default::default() };
+        assert_eq!(f.refusal(&release, "00-thumbnail.jpg", 0, false), Some("an image"));
+        assert_eq!(f.refusal(&release, "00-thumbnail.jpg", 0, true), None);
+        assert_eq!(f.refusal(&release, "Some.Film.mkv", 0, false), None);
     }
 
     #[test]

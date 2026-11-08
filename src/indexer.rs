@@ -465,7 +465,9 @@ fn writer(
             Duration::ZERO
         } else if stage.is_empty() {
             // a writer with nothing to do wakes for idle freezing too, and does the rest of its housekeeping every `idle`
-            if crate::frozen::idle_ticks_on() { idle.min(crate::frozen::IDLE_TICK_EVERY) } else { idle }
+            // (and for pruning the message-id index while its walk isnt resting)
+            let pruning = store.prune_ids_awake(chrono::Utc::now().timestamp());
+            if crate::frozen::idle_ticks_on() || pruning { idle.min(crate::frozen::IDLE_TICK_EVERY) } else { idle }
         } else if bank > 0.0 || since_save >= STAGE_QUIET {
             Duration::ZERO
         } else {
@@ -490,7 +492,7 @@ fn writer(
                 }
                 Err(RecvTimeoutError::Timeout) if stage.is_empty() => {
                     if let Ok(conn) = &mut opened {
-                        housekeeping(conn, &mut store, &mut checkpoints, true, true);
+                        housekeeping(conn, &mut store, &mut checkpoints, true, true, false, true);
                     }
                     last_housekeeping = std::time::Instant::now();
                     continue;
@@ -503,7 +505,7 @@ fn writer(
                     }
                     if last_housekeeping.elapsed() >= Duration::from_secs(1) {
                         if let Ok(conn) = &mut opened {
-                            housekeeping(conn, &mut store, &mut checkpoints, true, false);
+                            housekeeping(conn, &mut store, &mut checkpoints, true, false, false, false);
                         }
                         last_housekeeping = std::time::Instant::now();
                     }
@@ -533,7 +535,9 @@ fn writer(
         let span = crate::metrics::span("db.save_batch");
         let result = match &mut opened {
             Ok(conn) => {
-                store.save(conn, ids, batch.iter().map(|job| job.releases.as_slice())).map_err(|e| e.to_string())
+                db::with_full_flush(conn, |conn| store.save(conn, ids, batch.iter().map(|job| job.releases.as_slice())))
+                    .and_then(|saved| saved)
+                    .map_err(|e| e.to_string())
             }
             Err(e) => Err(format!("couldnt open {}: {e}", path.display())),
         };
@@ -581,7 +585,7 @@ fn writer(
             }
             // nothing came in meanwhile and no stage work waits: the writer would sit idle
             let idle = next.is_none() && stage.is_empty() && saved;
-            housekeeping(conn, &mut store, &mut checkpoints, seal, idle);
+            housekeeping(conn, &mut store, &mut checkpoints, seal, idle, next.is_some(), false);
             last_housekeeping = std::time::Instant::now();
         }
     }
@@ -651,28 +655,49 @@ fn stage_transaction(conn: &Connection, work: StageWork) -> rusqlite::Result<()>
     }
 }
 
-/// Only the idle freezing of `housekeeping`, for a writer woken with nothing to do between its housekeepings.
+/// The idle freezing and pruning steps of `housekeeping`, for a writer woken with nothing to do between its
+/// housekeepings.
 fn freeze_idle(conn: &mut Connection, store: &mut crate::store::ShardWriter) {
     let t = std::time::Instant::now();
-    let span = crate::metrics::span("db.freeze");
-    if let Err(e) = store.freezer.tick_idle(conn, chrono::Utc::now().timestamp()) {
-        span.failed();
-        eprintln!("freezing in shard {} failed: {e}", store.shard);
+    // (this wake may be the pruning walk's alone, with freezing's idle ticks off)
+    if crate::frozen::idle_ticks_on() {
+        let span = crate::metrics::span("db.freeze");
+        if let Err(e) = store.freezer.tick_idle(conn, chrono::Utc::now().timestamp()) {
+            span.failed();
+            eprintln!("freezing in shard {} failed: {e}", store.shard);
+        }
+        drop(span);
     }
-    drop(span);
+    prune_ids(conn, store, true, false);
     // the writer's time like any other housekeeping's
     crate::profile::Load::add_since(&crate::profile::LOAD.writer_busy_ns, t);
+}
+
+/// A pruning step of quiet releases' message-id index, when one is due (`ShardWriter::prune_ids_some`).
+fn prune_ids(conn: &mut Connection, store: &mut crate::store::ShardWriter, idle: bool, queued: bool) {
+    let now = chrono::Utc::now().timestamp();
+    if store.prune_ids_due(now, idle, queued) {
+        let span = crate::metrics::span("db.prune_ids");
+        if let Err(e) = store.prune_ids_some(conn, now, idle, queued) {
+            span.failed();
+            eprintln!("pruning release_ids in shard {} failed: {e}", store.shard);
+        }
+        drop(span);
+    }
 }
 
 /// A writer's work between saves: seal some of what is due (when `seal`),
 /// and copy the WAL into the shard once `checkpoints` says it is due.
 /// `idle`: nothing waits for the writer, soo freezing may take longer (`frozen::Ticker::tick_idle`).
+/// `queued`: another save is waiting already. `nothing_to_save`: the writer woke with nothing to do.
 fn housekeeping(
     conn: &mut Connection,
     store: &mut crate::store::ShardWriter,
     checkpoints: &mut db::Checkpoints,
     seal: bool,
     idle: bool,
+    queued: bool,
+    nothing_to_save: bool,
 ) {
     use crate::profile::{LOAD, Load};
     use std::sync::atomic::Ordering::Relaxed;
@@ -697,6 +722,11 @@ fn housekeeping(
         eprintln!("freezing in shard {} failed: {e}", store.shard);
     }
     drop(span);
+    // the index of quiet releases' message-ids, a cache that is made again when needed (`ShardWriter::prune_ids_some`);
+    // with more saves queued only a short step now and then
+    // the bigger idle steps only on a writer with nothing to save (here or in `freeze_idle`): after a save another
+    // may come any moment
+    prune_ids(conn, store, nothing_to_save, queued);
     // the shared catalog's sent changes, as far as Postgres has them (`shared_catalog::prune_acked`)
     let span = crate::metrics::span("db.catalog_prune");
     if crate::shared_catalog::prune_acked(conn).is_err() {
@@ -986,8 +1016,8 @@ where
         )
         .await?
     {
-        // a split group's backfill is day chunks, this server takes the next one: a day asked for, or one of the
-        // newest month any tracked split group still has to do (see `chunks::claim_turn`), else none
+        // a split group's backfill is day chunks, this server takes the next one: a day asked for, or one no more than
+        // a day past the newest any tracked split group still has to do (see `chunks::claim_turn`), else none
         let host = ctx.pool.host(server);
         let wanted = (group.to_string(), ctx.states.keeps_from(group, &host));
         let (kept, running) = (ctx.states.kept_days(&host), ctx.states.groups());
@@ -1047,8 +1077,10 @@ where
 
     match settings.mode.as_str() {
         "live" => pass.live(state, last, progress).await,
+        // forward backfill reads day chunks only: a group that didn't split reads live meanwhile
+        "backfill" if crate::chunks::forward_on() => pass.live(state, last, progress).await,
         "backfill" => pass.backfill(state, first, last, progress).await,
-        _ if phase == Phase::Live => {
+        _ if phase == Phase::Live || crate::chunks::forward_on() => {
             let r = pass.live(state, last, progress).await;
             ctx.states.with(group, |st| st.phase = Phase::Backfill);
             r
@@ -1712,11 +1744,21 @@ where
         Ok((None, _)) => return failed(anyhow!("{group} has no day chunks")).await,
         Err(e) => return failed(e).await,
     };
-    let (start, end) =
-        match chunk_range(&ctx.pool, server, group, (first, last), day, days, (cursor, settings.chunk_safety)).await {
-            Ok(range) => range,
-            Err(e) => return failed(e.into()).await,
-        };
+    let (start, end) = match chunk_range(
+        &ctx.pool,
+        server,
+        group,
+        (first, last),
+        day,
+        days,
+        (cursor, settings.chunk_safety),
+        chunk.reread,
+    )
+    .await
+    {
+        Ok(range) => range,
+        Err(e) => return failed(e.into()).await,
+    };
     // days only this server has are bounded all together, see `chunks::Speculative`
     let floor = match runner_up_day {
         Some(r) => {
@@ -1794,6 +1836,10 @@ where
 /// shift up to that many articles is covered, a forged run moving a search
 /// further can still leave a gap, for the carriers' sweeps once the
 /// chunks are done (see `run_pass` and `run_sweep`).
+///
+/// A day read again (`reread`, see `chunks::reopen_done`) is bounded by its dates alone, the newest day too: this
+/// server's cursor has moved down since the first read (its sweep), and would cut the day short or leave it empty.
+#[allow(clippy::too_many_arguments)]
 pub async fn chunk_range(
     pool: &Pool,
     server: usize,
@@ -1802,19 +1848,21 @@ pub async fn chunk_range(
     day: i64,
     (oldest_day, newest_day): (i64, i64),
     (cursor, safety): (u64, u64),
+    reread: bool,
 ) -> crate::nntp::Result<(u64, u64)> {
     let starts = |day: i64| pool.article_at(server, group, first, last, day * 86_400 - CHUNK_OVERLAP);
-    if day <= oldest_day && day >= newest_day {
+    if !reread && day <= oldest_day && day >= newest_day {
         return Ok((first, cursor));
     }
     let next = starts(day + 1).await?;
     // a start past the next day's (forged Dates) is moved down to it
     let start = if day <= oldest_day { first } else { starts(day).await?.min(next).saturating_sub(safety).max(first) };
-    let end = if day >= newest_day {
+    let end = if day >= newest_day && !reread {
         cursor
     } else {
         let past = pool.article_at(server, group, first, last, (day + 1) * 86_400 + CHUNK_OVERLAP).await?;
-        next.max(past).saturating_sub(1).saturating_add(safety).min(cursor)
+        let end = next.max(past).saturating_sub(1).saturating_add(safety);
+        if reread { end.min(last) } else { end.min(cursor) }
     };
     Ok((start, end))
 }
@@ -2331,15 +2379,18 @@ async fn parse_and_save(
         let group = group.to_string();
         move || {
             let _span = crate::metrics::span("indexer.parse_slice");
-            let (articles, uploads, skipped) = crate::filters::gather_per_article(&group, headers_to_articles(headers));
+            // articles whose every subject is random go to the store that links them across groups (`xref`)
+            // the slice fails, and is read again, when their headers couldnt be kept
+            let (articles, written) = crate::xref::hold(&group, headers_to_articles(headers))?;
+            let (articles, uploads, skipped) = crate::filters::gather_per_article(&group, articles);
             let mut releases: Vec<Release> =
                 crate::collections::group_articles(&group, articles).into_values().collect();
             releases.extend(uploads);
-            (releases, skipped)
+            anyhow::Ok((releases, skipped, written))
         }
     };
-    let (mut releases, skipped) =
-        tokio::task::spawn_blocking(parsing).await.map_err(|e| anyhow!("parse task failed: {e}"))?;
+    let (mut releases, skipped, written) =
+        tokio::task::spawn_blocking(parsing).await.map_err(|e| anyhow!("parse task failed: {e}"))??;
     crate::profile::PARSE.add_since(t);
     crate::profile::Load::add_since(&crate::profile::LOAD.parse_ns, t);
 
@@ -2374,6 +2425,13 @@ async fn parse_and_save(
             span.failed();
         }
         saved?;
+    }
+    // the slice's obfuscated headers written too before it counts as read (`xref::hold`): one that failed is read
+    // again
+    if let Some(written) = written {
+        tokio::task::spawn_blocking(move || written.wait(Duration::from_secs(600)))
+            .await
+            .map_err(|e| anyhow!("waiting for the headers failed: {e}"))??;
     }
     // the parsed releases stood for these headers until they were committed: the room goes back only now, soo
     // slices waiting on a slow writer stay inside `max_unsaved_headers`

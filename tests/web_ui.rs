@@ -287,7 +287,7 @@ fn the_web_ui_end_to_end() {
     for fact in [
         "<dt>First and last article</dt><dd>2026-10-02 10:00 to 2026-10-02 10:05 by the poster's clock, 5 min</dd>",
         "<dt>Posting rate</dt><dd>0.6 articles a minute, 6.8 KB/s</dd>",
-        "<dt>Article numbers</dt><dd>500–502 where it was read, adjacent</dd>",
+        "<dt>Group article numbers</dt><dd>500 through 502, adjacent</dd>",
         "<dt>Threaded replies</dt><dd>none</dd>",
         "<dt>From variants</dt><dd>one From throughout</dd>",
         "<dt>Lines per article</dt><dd>4,000 lines an article, 175 bytes a line</dd>",
@@ -423,6 +423,30 @@ fn the_web_ui_end_to_end() {
     let lone = fetch(port, &format!("/ui/release?id={}", printed[2]), &cookie);
     assert!(!lone.body.contains("Audio fingerprint"), "no match, no line: {}", lone.body);
 
+    // until the word index has taken in every release queued for it: a search waits only so long (500 ms) for that,
+    // which a debug build's commit can outlast. A release build leaves it to the search's own catch-up, which is what
+    // makes a release saved a moment ago turn up (`WordIndex::catch_up`)
+    let drained = || {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        let waited = std::time::Instant::now();
+        loop {
+            let left: i64 = store::shard_paths(&main)
+                .iter()
+                .map(|p| {
+                    db::open_shard(p).unwrap().query_row("select count(*) from word_queue", [], |r| r.get::<_, i64>(0))
+                })
+                .sum::<rusqlite::Result<i64>>()
+                .unwrap();
+            if left == 0 {
+                break;
+            }
+            assert!(waited.elapsed() < std::time::Duration::from_secs(20), "the word index never took {left} in");
+            // a search asks for a drain now instead of at the next round
+            fetch(port, "/ui/results?q=drained", &cookie);
+        }
+    };
     // one post spread over two groups: one row, whole, and an NZB with all of it
     let posted = |name: &str, group: &str, one: Article, date: &str| {
         let size = one.bytes;
@@ -439,6 +463,7 @@ fn the_web_ui_end_to_end() {
             }],
         )
         .unwrap();
+        drained();
     };
     const DAY: &str = "2026-10-03 17:41:49";
     for (group, part) in [("alt.binaries.g1", 1), ("alt.binaries.g2", 2)] {
@@ -465,10 +490,11 @@ fn the_web_ui_end_to_end() {
     assert!(one_file.body.contains("split.1@x") && one_file.body.contains("split.2@x"), "{}", one_file.body);
 
     // its rows can share a fingerprint, and hiding copies doesn't lose the post
-    let spread_shards: Vec<_> = ["alt.binaries.g1", "alt.binaries.g2"]
-        .map(|group| db::open_shard(&store::shard_path(&main, store::shard_of(group))).unwrap())
-        .into_iter()
-        .collect();
+    // each shard once: with one shard, both groups' rows are in the same one
+    let mut spread_at = ["alt.binaries.g1", "alt.binaries.g2"].map(store::shard_of).to_vec();
+    spread_at.dedup();
+    let spread_shards: Vec<_> =
+        spread_at.into_iter().map(|shard| db::open_shard(&store::shard_path(&main, shard)).unwrap()).collect();
     for shard in &spread_shards {
         shard
             .execute(
@@ -593,6 +619,7 @@ fn the_web_ui_end_to_end() {
         )
         .unwrap();
     }
+    drained();
     let mut heart_ids = Vec::new();
     for (name, group) in [
         ("Heartsplit.1981.2160p-GRP", "alt.binaries.g1"),

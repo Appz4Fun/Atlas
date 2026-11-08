@@ -69,6 +69,7 @@ families! {
     NNTP_FAILURES "atlas_nntp_failures_total" Counter &[], "Failures per server, by kind.";
     NNTP_LAST_FAILURE "atlas_nntp_last_failure_timestamp_seconds" Gauge &[], "When each kind of failure last hit each server.";
     NNTP_HEADERS "atlas_nntp_headers_total" Counter &[], "Headers read per server.";
+    NNTP_OVERVIEW_ROWS "atlas_nntp_overview_rows_total" Counter &[], "Header listing rows read per server, by method: xover (plain), xover_gzip (XFEATURE COMPRESS GZIP), xzver.";
     NNTP_TRAFFIC "atlas_nntp_traffic_bytes_total" Counter &[], "Bytes per server: wire (off the socket), text (after decompression).";
 
     // indexing
@@ -94,6 +95,7 @@ families! {
     STEP_PANICS "atlas_step_panics_total" Counter &[], "Runs of each processing step that panicked; atlas_step_runs_total counts them as retry.";
     AUDIO_PRINTS "atlas_audio_prints_total" Counter &[], "Audio print step results: made, linked (another key ties the release), failed, or why none could be made: ac3, dts, truehd, opus, aac_profile, other (no pure-Rust decoder), container, packed, short, size, bit_rate, no_audio.";
     STILLS_SHARED "atlas_stills_shared_total" Counter &[], "Releases the stills step left to show another release's stills, by the key that proves the same video file: mux (Matroska SegmentUID and DateUTC) or moviehash (OpenSubtitles hash). No BODY was read for them.";
+    MEDIA_SHARED "atlas_mediainfo_shared_total" Counter &[], "Releases whose probe took the media info another release's probe had already read of the same video file, by the key that proves it: mux (Matroska SegmentUID and DateUTC). The rest of the file's start and its end were not read for them.";
     STAGE_QUEUE "atlas_stage_queue" Gauge &[], "Releases waiting for the processing stage: due, net_wanted, failed.";
     STAGE_WALK "atlas_stage_walk" Gauge &[], "How far the backlog walks have come, in release ids: done, total.";
     STAGE_NET_CLAIMS "atlas_stage_net_claims" Gauge &[], "Net lane claims running now, per shard.";
@@ -116,6 +118,7 @@ families! {
     RELEASE_SIZE "atlas_release_size_bytes" Histogram SIZES, "Size of releases as they are categorized, per root category.";
     JUNK_REMOVED "atlas_junk_releases_removed_total" Counter &[], "Releases deleted as junk (a program in them, or PC), by reason.";
     FROZEN "atlas_frozen_events_total" Counter &[], "Freezing, by event: frozen, backlog_queued, thawed, name_taken, too_big, thaw_failed, disk_short, busy (another connection held the lock: the tick tries again next time).";
+    RELEASE_IDS "atlas_release_ids_events_total" Counter &[], "The message-id index of multi-file releases, by event: indexed (a release's index made in full: its second file, or a late article after the index was pruned; rolled back saves count too), pruned_releases and pruned_rows (taken from releases gone quiet or down to one file), busy (a pruning step let go of a lock another connection held), per shard.";
 
     // predb
     PREDB_LOOKUPS "atlas_predb_lookups_total" Counter &[], "PreDB lookups, by result.";

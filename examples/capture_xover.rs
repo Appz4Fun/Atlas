@@ -7,6 +7,8 @@
 //!
 //! Read only (GROUP, XOVER). Rows are written tab separated, like XOVER
 //! itself, after a `#group <name> <ms>` line per slice. Prints no passwords.
+//! `--raw` writes the rows exactly as the server sent them, with no `#group`
+//! lines (for `nxv-bench`, which needs every byte of the original).
 
 use std::io::Write;
 use std::time::{Duration, Instant};
@@ -26,6 +28,7 @@ async fn run() {
     let out = arg("--out").expect("--out file");
     let groups: Vec<String> = arg("--groups").expect("--groups a,b").split(',').map(str::to_string).collect();
     let only = arg("--only");
+    let raw = std::env::args().any(|a| a == "--raw");
     let size: u64 = arg("--size").and_then(|v| v.parse().ok()).unwrap_or(10_000);
     let at: Vec<f64> =
         arg("--at").unwrap_or_else(|| "0.05,0.5,0.95".into()).split(',').filter_map(|s| s.parse().ok()).collect();
@@ -50,6 +53,19 @@ async fn run() {
             let start = first + ((last - first) as f64 * f) as u64;
             let end = (start + size - 1).min(last);
             let t = Instant::now();
+            if raw {
+                match conn.xover_raw(start, end).await {
+                    Ok(lines) => {
+                        eprintln!("{group} {start}-{end}: {} raw rows in {}ms", lines.len(), t.elapsed().as_millis());
+                        for l in lines {
+                            file.write_all(&l).unwrap();
+                            file.write_all(b"\n").unwrap();
+                        }
+                    }
+                    Err(e) => eprintln!("{group} {start}-{end}: {e}"),
+                }
+                continue;
+            }
             let rows = match conn.xover(start, end).await {
                 Ok(rows) => rows,
                 Err(e) => {

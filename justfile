@@ -47,6 +47,10 @@ build: build-release
 build-release:
     cargo build --release --locked
 
+# optimized build without the external AC-3 decoder (filmcraft-ac3): AC-3 and E-AC-3 tracks get no audio print
+build-no-ac3:
+    cargo build --release --locked --no-default-features
+
 # debug build -> target/debug/atlas
 build-debug:
     cargo build --locked

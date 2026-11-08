@@ -319,7 +319,7 @@ pub(crate) fn unread_file_total(base: &str) -> Option<i64> {
     c[2].parse().ok()
 }
 
-fn count_unparsable(group: &str, u: &crate::parser::Unparsable) {
+pub(crate) fn count_unparsable(group: &str, u: &crate::parser::Unparsable) {
     use crate::metrics::names::{UNPARSABLE_ARTICLES, UNPARSABLE_BYTES};
     for (kind, (n, bytes)) in [("id_subject", u.id_subject), ("token", u.token), ("other", u.other)] {
         if n > 0 {

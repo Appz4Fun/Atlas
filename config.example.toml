@@ -90,6 +90,8 @@ concurrency = 16
 comments = true
 comment_days = 60
 comments_per_pass = 2000
+# spotters known for spam and fakes, read once a day; "" for none
+blacklist_url = "https://spotlist.store/spotnet/blacklist.xml"
 
 [category]
 enabled = true
@@ -135,3 +137,12 @@ addr = ""
 # move sealed articles there while indexing
 offload = false
 offload_mb_per_second = 50
+
+[overview_archive]
+# keep every fetched XOVER row, byte for byte, in compressed .nxv files outside SQLite (nntp-xover-engine/)
+enabled = false
+# where: empty is `overview` next to the databases
+dir = ""
+# full segments per server and group kept hot (fast reads); older ones are zstd compressed
+keep_hot = 2
+zstd_level = 9

@@ -119,7 +119,8 @@ fn main() {
             let mine: Vec<&[Release]> =
                 chunk.iter().filter(|s| store::shard_of(&s[0].group) == shard).map(Vec::as_slice).collect();
             if !mine.is_empty() {
-                writer.save(conn, &ids, mine).unwrap();
+                // as the indexer's writers do
+                db::with_full_flush(conn, |conn| writer.save(conn, &ids, mine)).unwrap().unwrap();
                 if checkpoints {
                     due.checkpoint_if_due(conn).unwrap();
                 }

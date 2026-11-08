@@ -90,14 +90,14 @@ Source: [stream-metadata/FINAL-REPORT.md](stream-metadata/FINAL-REPORT.md) "Fram
 
 - [ ] Remux-proof alt key: hash of codec config + first keyframe (+ first 8 video and 16 audio payloads); script [container-metadata/tools/altkey.py](container-metadata/tools/altkey.py) matched 9 remux variants and rejected a re-encode.
 - [x] (stills keep a `phash` per frame in `release_stills` and look up close matches; check the recipe below against `src/probe/stills.rs`) Keyframe pHash at 25/50/75% (crop letterbox, equalise, match at 10 of 64 bits, 2 of 3 frames).
-- [x] (#223) Audio fingerprint (chromaprint) only for releases nothing else linked: `probe::audio_print`, up to 12 s at 25/50/75% of the film's time, in `release_audio_print` with an anchor index, `Kind::AudioPrint` on the release page. Already there: AAC-LC, FLAC, MP3, MP2, Vorbis and PCM in Matroska, plain or stored in RAR. Not yet: AC-3, E-AC-3, DTS, TrueHD, Opus, 5.1 or HE-AAC (no pure-Rust decoder in the tree), MP4.
+- [x] (#223) Audio fingerprint (chromaprint) only for releases nothing else linked: `probe::audio_print`, up to 12 s at 25/50/75% of the film's time, in `release_audio_print` with an anchor index, `Kind::AudioPrint` on the release page. Already there: AAC-LC, FLAC, MP3, MP2, Vorbis and PCM in Matroska, plain or stored in RAR. AC-3 and E-AC-3 (5.1 downmixed, LFE left out) through `filmcraft-ac3`. Not yet: DTS, TrueHD, Opus, HE-AAC (no pure-Rust decoder in the tree), MP4.
 - [ ] AC-3 crc2 run as a same-track key.
 
 ## 7. Release page
 
 Source: [metadata-visibility/MAP.md](metadata-visibility/MAP.md) section 4 (visibility matrix). #65 and #67 built most of it.
 
-- [ ] Recheck the matrix against `main` and list which catalog fields are still `not_collected` or `stored_not_shown`.
+- [x] Recheck the matrix against `main` (2026-11-07, at `b11d3e7`): every item the matrix marks N1 (render only), and not already shown, is on the page now, through the fact panels and lazy fragments in `src/web_meta.rs` and the file list in `src/web.rs`. The list, with each item's label, is in the audit note at the top of [MAP.md](metadata-visibility/MAP.md) section 4. What the matrix still lists needs more than rendering: a stored column or walk (N2), a re-probe (N3), more articles (N4), XOVER columns kept at ingest (N5) or new NNTP commands (N6). Those items are under sections 1 to 6 above, not here.
 
 ## 8. Open questions to settle with real data
 

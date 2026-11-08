@@ -115,7 +115,8 @@ struct Row {
 const ROW_COLUMNS: &str = "r.id, r.name, r.display_name, r.group_name, r.poster, r.posted_date, coalesce(r.size, 0),
     coalesce(r.complete, 0), coalesce(r.parts, 0), r.file_total, coalesce(r.is_obfuscated, 0), r.name_source,
     s.release_id is not null, coalesce(s.done, 0), coalesce(s.failed, 0), coalesce(s.db_attempts, 0),
-    coalesce(s.net_attempts, 0), coalesce(s.parts_seen, 0), coalesce(s.rerun_gen, 0), coalesce(s.net_transient, 0)";
+    coalesce(s.net_attempts, 0), coalesce(s.parts_seen, 0), coalesce(s.rerun_gen, 0), coalesce(s.net_transient, 0),
+    (select kind from spots where release_id = r.id)";
 
 fn read_row(r: &SqlRow<'_>, at: usize, shard: usize) -> rusqlite::Result<Row> {
     let col = |i: usize| at + i;
@@ -134,6 +135,7 @@ fn read_row(r: &SqlRow<'_>, at: usize, shard: usize) -> rusqlite::Result<Row> {
             file_total: r.get(col(9))?,
             is_obfuscated: r.get::<_, i64>(col(10))? != 0,
             name_source: r.get(col(11))?,
+            spot_kind: crate::spotnet::Kind::parse(r.get::<_, Option<String>>(col(20))?.as_deref()),
         },
         has_state: r.get(col(12))?,
         done: r.get(col(13))?,
@@ -699,6 +701,7 @@ impl Inner {
             deadline: Instant::now() + STEP_DEADLINE,
             lane_can_fetch: false,
             crcs: Vec::new(),
+            pictures: false,
         };
         let mut failure = false;
         let mut queue_at: Option<i64> = None;
@@ -1078,6 +1081,7 @@ impl Inner {
                 deadline: Instant::now() + STEP_DEADLINE,
                 lane_can_fetch: step.needs() == Needs::Bodies,
                 crcs: Vec::new(),
+                pictures: false,
             };
             let ran = run_step(step.as_ref(), &mut ctx);
             let now = chrono::Utc::now().timestamp();

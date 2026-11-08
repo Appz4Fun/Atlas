@@ -155,7 +155,12 @@ pub fn hold_off_compaction(main: &Path) -> Result<WriteGuard> {
 pub fn try_hold_off_compaction(main: &Path) -> Result<Option<WriteGuard>> {
     let file = open_lock(main)?;
     match file.try_lock_shared() {
-        Ok(()) => Ok(Some(WriteGuard(file))),
+        Ok(()) => {
+            // every writer holds this: none may write to shards a merge left half done (checked once held, soo a
+            // merge that marked and let go just before is seen)
+            crate::merge_shards::refuse_if_merging(main)?;
+            Ok(Some(WriteGuard(file)))
+        }
         Err(std::fs::TryLockError::WouldBlock) => Ok(None),
         Err(std::fs::TryLockError::Error(e)) => Err(e).context("locking the database for a write"),
     }
@@ -172,7 +177,17 @@ impl Drop for WriteGuard {
 pub(crate) struct Lock(std::fs::File);
 
 impl Lock {
+    /// The lock, refused while a shard merge is half done (`merge_shards::MERGING`): what takes it writes to shards.
     pub(crate) fn take(main: &Path) -> Result<Lock> {
+        let lock = Lock::take_unchecked(main)?;
+        // after taking it: a merge that set its marker and let go just before is seen
+        crate::merge_shards::refuse_if_merging(main)?;
+        Ok(lock)
+    }
+
+    /// The lock whatever a merge left: for the merge itself, and for what removes the shards whole (wipe, reset) or
+    /// sets a database up (conversion), which goes through `db::create_db_at`'s own check after.
+    pub(crate) fn take_unchecked(main: &Path) -> Result<Lock> {
         let file = open_lock(main)?;
         match file.try_lock() {
             Ok(()) => Ok(Lock(file)),
@@ -339,6 +354,7 @@ pub fn run(main: &Path, progress: &(dyn Fn(&str) + Sync), stop: &Arc<AtomicBool>
 
 fn run_locked(main: &Path, progress: &(dyn Fn(&str) + Sync), stop: &Arc<AtomicBool>) -> Result<Shrunk> {
     let _lock = Lock::take(main)?;
+    crate::merge_shards::refuse_if_merging(main)?;
     // a conversion's swap cut short is finished (or undone) like at a start;
     // shards with no main database at all are refused: the main database
     // the next start made would hand out their ids again
@@ -679,11 +695,16 @@ fn compact_shard(
                 sealed += 1;
             }
             let blob = (old_blob.is_some() || seal).then(|| blob::encode(&segs));
+            // the blob was decoded here anyway: what it holds is counted, an old file's too
+            let blob_bytes = blob.as_ref().map(|_| crate::blob_bytes::of_segs(&segs));
 
             let mut values: Vec<Value> = (0..10).map(|i| f.get(i)).collect::<rusqlite::Result<_>>()?;
             values.push(blob.map_or(Value::Null, Value::Blob));
-            tx.prepare_cached(&format!("insert into files ({FILE_COLUMNS}) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))?
-                .execute(params_from_iter(values))?;
+            values.push(blob_bytes.map_or(Value::Null, Value::Integer));
+            tx.prepare_cached(&format!(
+                "insert into files ({FILE_COLUMNS}) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            ))?
+            .execute(params_from_iter(values))?;
             copied += segs.len() as i64;
             for row in &file_rows {
                 copied += insert_row(&tx, row)?;
@@ -887,9 +908,9 @@ fn attached(conn: &Connection) -> Vec<String> {
     conn.prepare("pragma database_list").and_then(|mut s| s.query_map([], |r| r.get(1))?.collect()).unwrap_or_default()
 }
 
-/// the files table's columns, blob last
-const FILE_COLUMNS: &str =
-    "id, release_id, filename, subject, subject_part, subject_mid, expected, file_total, seen, touched_at, blob";
+/// the files table's columns, blob and its byte count (`blob_bytes`) last
+const FILE_COLUMNS: &str = "id, release_id, filename, subject, subject_part, subject_mid, expected, file_total, seen, \
+     touched_at, blob, blob_bytes";
 
 /// the tables `compact_shard` copies its own way, with their exact columns.
 /// A new column on one of them would vanish, soo it stops the shard.
@@ -1484,7 +1505,12 @@ mod tests {
                 .unwrap();
             }
         }
-        assert_eq!(domains(main), 120 + 5, "every made up domain has a row, ngPost one per shard used");
+        let shards_used = (0..5).map(|g| store::shard_of(&format!("alt.binaries.g{g}"))).collect::<HashSet<_>>().len();
+        assert_eq!(
+            domains(main),
+            120 + shards_used as i64,
+            "every made up domain has a row, ngPost one per shard used"
+        );
     }
 
     /// The sample is compared by digest, order aside; a copy that lost a
@@ -1632,6 +1658,8 @@ mod tests {
                 .unwrap()
                 .execute_batch(
                     "drop table held_back;
+                     drop trigger files_blob_bytes_unknown;
+                     alter table files drop column blob_bytes;
                      alter table files drop column blob;
                      alter table files drop column touched_at;",
                 )
@@ -1642,6 +1670,20 @@ mod tests {
         assert_eq!(all_articles(&main), before, "every NZB reads back the same");
         assert_eq!(article_total(&main), count);
         assert_eq!(loose(&main), 0, "every file was due, so all are sealed");
+        // each blob's byte count written beside it
+        for path in store::shard_paths(&main) {
+            let conn = db::open_at(&path).unwrap();
+            let rows: Vec<(Vec<u8>, Option<i64>)> = conn
+                .prepare("select blob, blob_bytes from files where blob is not null")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            for (blob, bytes) in rows {
+                assert_eq!(bytes, Some(crate::blob_bytes::of_blob(&blob).unwrap()));
+            }
+        }
     }
 
     #[test]
@@ -1733,6 +1775,11 @@ mod tests {
         store::seal_file(&conn, file).unwrap();
         let expected: i64 = conn.query_row("select expected from files where id = ?", [file], |r| r.get(0)).unwrap();
         assert_eq!(expected, 3);
+        // sealing writes what the blob holds beside it
+        let (blob, bytes): (Vec<u8>, Option<i64>) = conn
+            .query_row("select blob, blob_bytes from files where id = ?", [file], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(bytes, Some(crate::blob_bytes::of_blob(&blob).unwrap()));
     }
 
     /// The stop hook goes with its guard: nothing is left in the registry for
@@ -2321,6 +2368,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs more than one shard; store::SHARDS is 1 (one shard is `a_corrupt_blob_stops_compacting_and_keeps_the_original`)"]
     fn a_failed_shard_doesnt_stop_the_others() {
         let dir = tempfile::tempdir().unwrap();
         let main = dir.path().join("atlas.db");
@@ -2440,6 +2488,8 @@ mod tests {
         legacy_fixture(&main);
         let group = "alt.binaries.g3";
         let path = store::shard_path(&main, store::shard_of(group));
+        let kept = dir.path().join("kept.db");
+        std::fs::copy(&path, &kept).unwrap();
 
         // no backup at all
         remove_db(&path);
@@ -2449,7 +2499,7 @@ mod tests {
 
         // only a compacted copy, which may not have been checked: kept, still refused
         let copy = with_suffix(&path, "compact");
-        std::fs::copy(store::shard_path(&main, (store::shard_of(group) + 1) % SHARDS), &copy).unwrap();
+        std::fs::copy(&kept, &copy).unwrap();
         let err = format!("{:#}", db::create_db_at(&main).unwrap_err());
         assert!(err.contains(&copy.display().to_string()), "{err}");
         assert!(!path.exists() && copy.exists(), "the copy is left for whoever puts it back");
