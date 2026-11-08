@@ -180,14 +180,14 @@ impl Window {
         self.record_days(server, group, lines, keep).map(|(skipped, _)| skipped)
     }
 
-    /// `record`, and the posting days of the lines taken in.
+    /// `record`, and the posting days of the lines taken in, with how many of each.
     pub fn record_days(
         &mut self,
         server: &str,
         group: &str,
         lines: &[Vec<u8>],
         keep: &[(i64, i64)],
-    ) -> Result<(usize, Vec<i64>)> {
+    ) -> Result<(usize, Vec<(i64, usize)>)> {
         let mut skipped = 0;
         let mut by_hour: BTreeMap<i64, Vec<&[u8]>> = BTreeMap::new();
         for line in lines {
@@ -201,8 +201,15 @@ impl Window {
         if by_hour.is_empty() {
             return Ok((skipped, Vec::new()));
         }
-        let mut days: Vec<i64> = by_hour.keys().map(|h| h.div_euclid(86_400)).collect();
-        days.dedup();
+        // each posting day's lines taken in, soo the caller can tell a day being read from a stray date
+        let mut days: Vec<(i64, usize)> = Vec::new();
+        for (h, ls) in &by_hour {
+            let d = h.div_euclid(86_400);
+            match days.last_mut() {
+                Some((last, n)) if *last == d => *n += ls.len(),
+                _ => days.push((d, ls.len())),
+            }
+        }
         let g = self.groups.entry((server.to_string(), group.to_string())).or_insert_with(|| Group {
             dir: crate::overview_archive::group_dir(&self.root, server, group),
             ..Group::default()
@@ -533,15 +540,20 @@ pub fn note_claimed_day(day: i64) {
     }
 }
 
-/// Lines of `days` were just taken in: a claimed day they fall in (or beside) is still being read, however long
-/// its chunk takes, soo it stays kept.
-fn refresh_claimed(days: &[i64], now: i64) {
+/// A batch was just taken in, `days` its posting days and how many lines of each: a claimed day that most of the
+/// batch falls in or beside is still being read, however long its chunk takes, soo it stays kept. A stray date or
+/// two in another batch doesn't keep a day read and gone. A timestamp moves only when minutes old, soo the store
+/// isn't written again for every batch.
+fn refresh_claimed(days: &[(i64, usize)], now: i64) {
+    let total: usize = days.iter().map(|(_, n)| n).sum();
+    if total == 0 {
+        return;
+    }
     let Ok(mut m) = CLAIMED.lock() else { return };
-    for d in days {
-        for near in d - 1..=d + 1 {
-            if let Some(at) = m.get_mut(&near) {
-                *at = now;
-            }
+    for (claimed, at) in m.iter_mut() {
+        let near: usize = days.iter().filter(|(d, _)| (d - claimed).abs() <= 1).map(|(_, n)| n).sum();
+        if near * 2 > total && now - *at >= 300 {
+            *at = now;
         }
     }
 }
@@ -868,8 +880,13 @@ mod tests {
         let day = 1_000_003;
         note_claimed_day(day);
         assert!(claimed_days(now_secs()).contains(&day));
-        // still being read: lines of the day keep it
-        refresh_claimed(&[day + 1], now_secs() + 100);
+        // a stray line beside it in a batch of other days doesn't keep it
+        let later = now_secs() + 1000;
+        refresh_claimed(&[(day + 1, 1), (day + 40, 99)], later);
+        assert!(!claimed_days(now_secs() + CLAIMED_KEEP.as_secs() as i64 + 50).contains(&day), "a stray date");
+        note_claimed_day(day);
+        // still being read: a batch mostly of the day keeps it
+        refresh_claimed(&[(day, 90), (day + 40, 10)], later);
         assert!(claimed_days(now_secs() + CLAIMED_KEEP.as_secs() as i64 + 50).contains(&day), "kept while read");
         save_claimed(dir.path(), "").unwrap();
         CLAIMED.lock().unwrap().remove(&day);
