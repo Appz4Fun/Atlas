@@ -2381,15 +2381,15 @@ async fn parse_and_save(
             let _span = crate::metrics::span("indexer.parse_slice");
             // articles whose every subject is random go to the store that links them across groups (`xref`)
             // the slice fails, and is read again, when their headers couldnt be kept
-            let articles = crate::xref::hold(&group, headers_to_articles(headers))?;
+            let (articles, written) = crate::xref::hold(&group, headers_to_articles(headers))?;
             let (articles, uploads, skipped) = crate::filters::gather_per_article(&group, articles);
             let mut releases: Vec<Release> =
                 crate::collections::group_articles(&group, articles).into_values().collect();
             releases.extend(uploads);
-            anyhow::Ok((releases, skipped))
+            anyhow::Ok((releases, skipped, written))
         }
     };
-    let (mut releases, skipped) =
+    let (mut releases, skipped, written) =
         tokio::task::spawn_blocking(parsing).await.map_err(|e| anyhow!("parse task failed: {e}"))??;
     crate::profile::PARSE.add_since(t);
     crate::profile::Load::add_since(&crate::profile::LOAD.parse_ns, t);
@@ -2425,6 +2425,13 @@ async fn parse_and_save(
             span.failed();
         }
         saved?;
+    }
+    // the slice's obfuscated headers written too before it counts as read (`xref::hold`): one that failed is read
+    // again
+    if let Some(written) = written {
+        tokio::task::spawn_blocking(move || written.wait(Duration::from_secs(600)))
+            .await
+            .map_err(|e| anyhow!("waiting for the headers failed: {e}"))??;
     }
     // the parsed releases stood for these headers until they were committed: the room goes back only now, soo
     // slices waiting on a slow writer stay inside `max_unsaved_headers`
