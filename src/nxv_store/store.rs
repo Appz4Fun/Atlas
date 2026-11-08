@@ -128,6 +128,9 @@ pub struct Ticket {
     group: Arc<Group>,
     epoch: u64,
     shared: Arc<Shared>,
+    /// the slice's rows by posting day, kept or not (empty for a `sync_point`): what tells a backfill day is still
+    /// being read (`live::record`)
+    pub days: Vec<(i64, usize)>,
 }
 
 impl Ticket {
@@ -530,10 +533,12 @@ impl Store {
         let mut keep = self.keep.read().unwrap_or_else(|e| e.into_inner()).clone();
         let mut refreshed = false;
         let mut s = g.slabs.lock().unwrap_or_else(|e| e.into_inner());
+        let mut days: BTreeMap<i64, usize> = BTreeMap::new();
         for (line, p) in lines.iter().zip(&parsed) {
             let Some((art, date)) = *p else { continue };
             let ts = date.unwrap_or((lo + hi) / 2).clamp(lo, hi);
             let day = ts.div_euclid(DAY);
+            *days.entry(day).or_default() += 1;
             if !keep.keeps(day) {
                 // the keep set held may be older than a claim or the linker's last look: ask for a fresh one once
                 if !refreshed {
@@ -552,14 +557,14 @@ impl Store {
         }
         let epoch = s.epoch + 1;
         drop(s);
-        Ok(Ticket { group: g, epoch, shared: Arc::clone(&self.shared) })
+        Ok(Ticket { group: g, epoch, shared: Arc::clone(&self.shared), days: days.into_iter().collect() })
     }
 
     /// A ticket for every row recorded for `group` so far. None when the group has none.
     pub fn sync_point(&self, group: &str) -> Option<Ticket> {
         let g = self.groups.read().unwrap_or_else(|e| e.into_inner()).get(group).cloned()?;
         let epoch = g.slabs.lock().unwrap_or_else(|e| e.into_inner()).epoch + 1;
-        Some(Ticket { group: g, epoch, shared: Arc::clone(&self.shared) })
+        Some(Ticket { group: g, epoch, shared: Arc::clone(&self.shared), days: Vec::new() })
     }
 
     /// Asks for every slab of `days` to be sealed at the next tick (the linker's barrier before it links an hour).

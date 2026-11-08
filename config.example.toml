@@ -138,6 +138,13 @@ addr = ""
 offload = false
 offload_mb_per_second = 50
 
+[header_store]
+# keep every fetched overview row for a while in per-day .nxv files, and link uploads whose every article has a random
+# subject back together across groups from them (src/nxv_store/). Off: such articles are counted and dropped
+enabled = false
+# where: empty is `header-store` next to the databases
+dir = ""
+
 [overview_archive]
 # keep every fetched XOVER row, byte for byte, in compressed .nxv files outside SQLite (nntp-xover-engine/)
 enabled = false
