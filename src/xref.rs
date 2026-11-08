@@ -33,6 +33,18 @@ pub const GAP_SECS: i64 = 5;
 pub const MIN_UPLOAD_ARTICLES: i64 = 10;
 /// how long a connection waits for another's write: the recorder, the linker and the archive step share the file
 const BUSY: Duration = Duration::from_secs(120);
+/// SQLite's wait for another connection's write, up to `BUSY`, given up at once when the indexer stops: a slice
+/// waiting to record its headers then fails and is read again later (its cursor didn't move), rather than holding
+/// the stop up.
+fn wait_unless_stopping(tries: i32) -> bool {
+    const STEP: Duration = Duration::from_millis(10);
+    if crate::frozen::STOPPING.load(std::sync::atomic::Ordering::Relaxed) || STEP * tries.max(0) as u32 > BUSY {
+        return false;
+    }
+    std::thread::sleep(STEP);
+    true
+}
+
 /// rows one write transaction takes at most, soo no writer holds the file for long
 const WRITE_CHUNK: usize = 2000;
 /// how often the linker runs
@@ -388,7 +400,7 @@ pub struct Store {
 impl Store {
     pub fn open(path: &Path) -> Result<Store> {
         let conn = Connection::open(path)?;
-        conn.busy_timeout(BUSY)?;
+        conn.busy_handler(Some(wait_unless_stopping))?;
         conn.execute_batch("pragma journal_mode = wal; pragma synchronous = normal;")?;
         conn.execute_batch(SCHEMA)?;
         let groups = {
