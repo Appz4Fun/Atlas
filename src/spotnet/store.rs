@@ -1026,13 +1026,14 @@ mod tests {
     #[test]
     fn spots_of_reads_each_shard() {
         let conn = main_db();
-        let (a, b) = (crate::store::global_id(1, 0), crate::store::global_id(1, 3));
-        for shard in [0, 3] {
+        let last = crate::store::SHARDS - 1;
+        let (a, b) = (crate::store::global_id(1, 0), crate::store::global_id(3, last));
+        for shard in std::collections::BTreeSet::from([0, last]) {
             conn.execute(&format!("attach ':memory:' as s{shard}"), []).unwrap();
             conn.execute_batch(&SPOTS.create.replace("exists spots", &format!("exists s{shard}.spots"))).unwrap();
         }
         conn.execute("insert into s0.spots (release_id, message_id, kind, title, poster) values (?, 'a@spot.net', 'movie', 'A', 'p')", [a]).unwrap();
-        conn.execute("insert into s3.spots (release_id, message_id, kind, title, imdb_id) values (?, 'b@spot.net', 'series', 'B', 'tt1')", [b]).unwrap();
+        conn.execute(&format!("insert into s{last}.spots (release_id, message_id, kind, title, imdb_id) values (?, 'b@spot.net', 'series', 'B', 'tt1')"), [b]).unwrap();
         let found = spots_of_with(&conn, &[a, b, crate::store::global_id(2, 0)]).unwrap();
         assert_eq!(found.len(), 2);
         assert_eq!(found[&a].poster, "p");
@@ -1156,13 +1157,13 @@ mod tests {
     #[test]
     fn the_page_reads_the_spot_whole_or_from_its_columns() {
         let conn = main_db();
-        let id = crate::store::global_id(4, 2);
-        conn.execute("attach ':memory:' as s2", []).unwrap();
-        conn.execute_batch(&SPOTS.create.replace("exists spots", "exists s2.spots")).unwrap();
+        let id = crate::store::global_id(4, 0);
+        conn.execute("attach ':memory:' as s0", []).unwrap();
+        conn.execute_batch(&SPOTS.create.replace("exists spots", "exists s0.spots")).unwrap();
         assert_eq!(detail_of_with(&conn, id).unwrap(), None);
         // saved before the XML was kept: what the columns say
         conn.execute(
-            "insert into s2.spots (release_id, message_id, kind, title, poster, category, subcats, size, imdb_id, created)
+            "insert into s0.spots (release_id, message_id, kind, title, poster, category, subcats, size, imdb_id, created)
              values (?, 'm@spot.net', 'movie', 'Old', 'p', 0, 'a9|d5|z0|', 42, 'tt1234567', 100)",
             [id],
         )
@@ -1190,9 +1191,9 @@ mod tests {
         assert!(set_xml(&shard, id, "m@spot.net", xml).unwrap());
         assert!(!set_xml(&shard, id, "m@spot.net", "").unwrap(), "only once");
         assert!(missing_xml(&shard, 10).unwrap().is_empty());
-        shard.execute("attach ':memory:' as s2", []).unwrap();
-        shard.execute_batch(&SPOTS.create.replace("exists spots", "exists s2.spots")).unwrap();
-        shard.execute("insert into s2.spots select * from main.spots", []).unwrap();
+        shard.execute("attach ':memory:' as s0", []).unwrap();
+        shard.execute_batch(&SPOTS.create.replace("exists spots", "exists s0.spots")).unwrap();
+        shard.execute("insert into s0.spots select * from main.spots", []).unwrap();
         shard.execute_batch("create table meta (key TEXT PRIMARY KEY, value INTEGER)").unwrap();
         create_main(&shard).unwrap();
         let d = detail_of_with(&shard, id).unwrap().unwrap();
@@ -1202,7 +1203,7 @@ mod tests {
         assert_eq!(d.spot.description, "Line one\npw: hunter2");
         assert_eq!(d.spot.newsreader, "SpotPost 2");
         // read again and gone: the columns, not tried again
-        shard.execute("update s2.spots set xml = ''", []).unwrap();
+        shard.execute("update s0.spots set xml = ''", []).unwrap();
         assert_eq!(detail_of_with(&shard, id).unwrap().unwrap().xml, Xml::Gone);
     }
 }

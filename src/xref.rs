@@ -107,6 +107,8 @@ create table if not exists uploads (
     added   INTEGER NOT NULL
 ) without rowid;
 create index if not exists uploads_added on uploads(added);
+-- `started`: when the store began keeping headers (`Store::open`), which the prune leaves no trace of in `headers`
+create table if not exists meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL) without rowid;
 ";
 
 /// `atlas.xref.db` beside the main database
@@ -403,6 +405,11 @@ impl Store {
         conn.busy_handler(Some(wait_unless_stopping))?;
         conn.execute_batch("pragma journal_mode = wal; pragma synchronous = normal;")?;
         conn.execute_batch(SCHEMA)?;
+        // once: a store made by a build from before this kept no start, soo its file's birth or oldest header says
+        if conn.query_row("select 1 from meta where key = 'started'", [], |_| Ok(())).optional()?.is_none() {
+            let started = started_by_its_file(&conn, path)?.unwrap_or_else(now);
+            conn.execute("insert or ignore into meta (key, value) values ('started', ?1)", [started])?;
+        }
         let groups = {
             let mut stmt = conn.prepare("select name, id from groups")?;
             stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
@@ -980,6 +987,153 @@ fn unread_days(main: &Connection, days: &mut HashMap<i64, bool>, first: i64, las
     })
 }
 
+/// `atlas --xref-reread [--since YYYY-MM-DD] [--done-before UNIX_TIME] [--apply]`: the backfill days read before
+/// this linker kept the headers of uploads obfuscated per article, put back to be read again whole
+/// (`chunks::reopen_done`). Lockstep then reads them newest first, beside the days still to do. Days finished since
+/// the linker started keeping headers (the start its store kept, `linker_since`, unless `--done-before` says) were
+/// read with it and are left alone, as are days of groups the config doesn't index. Runs beside the indexer.
+pub fn run_reread(args: &[String]) -> i32 {
+    let apply = args.iter().any(|a| a == "--apply");
+    let value_of = |flag: &str| -> std::result::Result<Option<&String>, String> {
+        match args.iter().position(|a| a == flag) {
+            None => Ok(None),
+            Some(i) => match args.get(i + 1) {
+                Some(v) if !v.starts_with("--") => Ok(Some(v)),
+                _ => Err(format!("{flag} needs a value")),
+            },
+        }
+    };
+    let since = match value_of("--since") {
+        Ok(None) => i64::MIN,
+        Ok(Some(day)) => match chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d") {
+            Ok(d) => d.and_hms_opt(0, 0, 0).expect("midnight").and_utc().timestamp() / 86_400,
+            Err(_) => {
+                println!("--since takes a day as YYYY-MM-DD, not {day}");
+                return 1;
+            }
+        },
+        Err(e) => {
+            println!("{e}");
+            return 1;
+        }
+    };
+    let main = crate::paths::database();
+    let done_before = match value_of("--done-before") {
+        Ok(Some(t)) => match t.parse::<i64>() {
+            Ok(t) => Some(t),
+            Err(_) => {
+                println!("--done-before takes a unix time in seconds, not {t}");
+                return 1;
+            }
+        },
+        Ok(None) => match linker_since(&main) {
+            Ok(t) => t,
+            Err(e) => {
+                println!("couldnt read when the linker started from {}: {e:#}", path_for(&main).display());
+                println!("pass --done-before to say");
+                return 1;
+            }
+        },
+        Err(e) => {
+            println!("{e}");
+            return 1;
+        }
+    };
+    let Some(groups) = crate::config::load_config().map(|cfg| cfg.tracked_groups()) else {
+        println!("couldnt read the config for the groups indexed");
+        return 1;
+    };
+    let conn = match crate::db::open_at(&main) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("couldnt open {}: {e:#}", main.display());
+            return 1;
+        }
+    };
+    let (chunks, over, untracked) = match crate::chunks::done_since(&conn, since, done_before, &groups) {
+        Ok(n) => n,
+        Err(e) => {
+            println!("couldnt count the days read: {e:#}");
+            return 1;
+        }
+    };
+    let span = match value_of("--since") {
+        Ok(Some(day)) => format!("the days read from {day} on"),
+        _ => "every day read".to_string(),
+    };
+    match done_before {
+        Some(t) => println!(
+            "{span}, finished before {} (when the linker started keeping headers; --done-before to change): {chunks} day chunks over {over} groups",
+            chrono::DateTime::from_timestamp(t, 0)
+                .map_or_else(|| t.to_string(), |d| d.format("%Y-%m-%d %H:%M:%SZ").to_string())
+        ),
+        None => println!(
+            "{span}, whenever finished (no header store to tell when the linker started; --done-before to say): {chunks} day chunks over {over} groups"
+        ),
+    }
+    if untracked > 0 {
+        println!("{untracked} day chunks of groups the config doesn't index are left alone");
+    }
+    if !apply {
+        println!("dry run: pass --apply to put them back to be read (the indexer may keep running)");
+        return 0;
+    }
+    // a write to the main database, beside the indexer: held off a compaction, refused on a merge half done
+    let _held = match crate::compact::hold_off_compaction(&main) {
+        Ok(h) => h,
+        Err(e) => {
+            println!("{e:#}");
+            return 1;
+        }
+    };
+    match crate::chunks::reopen_done(&conn, since, done_before, &groups) {
+        Ok(n) => {
+            println!("{n} day chunks put back to be read again");
+            0
+        }
+        Err(e) => {
+            println!("couldnt put them back: {e:#}");
+            1
+        }
+    }
+}
+
+/// When the linker started keeping headers: the start the store beside `main` kept, or for one a build from before
+/// that made and none since opened, its file's birth or oldest header. None without a store; an error when one is
+/// there but can't be read (not taken as none, which would put back the days read with the linker too).
+fn linker_since(main: &Path) -> Result<Option<i64>> {
+    let path = path_for(main);
+    if !path.try_exists()? {
+        return Ok(None);
+    }
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(&path, flags)?;
+    conn.busy_timeout(Duration::from_secs(30))?;
+    let has_meta: bool =
+        conn.prepare("select 1 from sqlite_master where type = 'table' and name = 'meta'")?.exists([])?;
+    if has_meta
+        && let Some(t) = conn.query_row("select value from meta where key = 'started'", [], |r| r.get(0)).optional()?
+    {
+        return Ok(Some(t));
+    }
+    started_by_its_file(&conn, &path)
+}
+
+/// When the store at `path` began, by what it holds: its file's birth (where the filesystem keeps one) or its oldest
+/// header, whichever is earlier. The headers alone don't say, as the prune drops them past a day or two.
+fn started_by_its_file(conn: &Connection, path: &Path) -> Result<Option<i64>> {
+    let born = std::fs::metadata(path)
+        .and_then(|m| m.created())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64);
+    let oldest: Option<i64> = conn.query_row("select min(added) from headers", [], |r| r.get(0))?;
+    Ok(match (born, oldest) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    })
+}
+
 /// Every `PASS_EVERY`, drop the headers past the window, then save what has settled.
 pub async fn run(db: crate::indexer::Db, stopping: impl Fn() -> bool) {
     // a pass whose releases or note didnt all go through: tried again as it was, before any new pass, soo a retry
@@ -1394,5 +1548,42 @@ mod tests {
         commits.store(0, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(store.record("a.b.one", &batch, 1000).unwrap(), batch.len());
         assert_eq!(commits.load(std::sync::atomic::Ordering::Relaxed), 6, "a commit every WRITE_CHUNK rows");
+    }
+
+    #[test]
+    fn the_linker_start_is_what_the_store_kept_not_its_oldest_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        assert_eq!(linker_since(&main).unwrap(), None, "no store, no start");
+        let path = path_for(&main);
+        // a store from a build that kept no start, its headers pruned to recent ones: the earlier of its file's birth
+        // and its oldest header
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(&SCHEMA.replace("create table if not exists meta", "create table if not exists unused"))
+                .unwrap();
+            conn.execute_batch("drop table unused; insert into groups (name) values ('a.b.one');").unwrap();
+            conn.execute(
+                "insert into headers (message_id, poster, posted, grp, number, bytes, lines, added)
+                 values ('<m@x>', 'p@x', 1, 1, 1, 1, 1, ?1)",
+                [now() + 3600],
+            )
+            .unwrap();
+        }
+        let born = linker_since(&main).unwrap().unwrap();
+        assert!(born <= now() && born > now() - 600, "its file's birth, before its oldest header: {born}");
+        // opened by this build: kept, and what's read from then on whatever the prune drops
+        drop(Store::open(&path).unwrap());
+        Connection::open(&path).unwrap().execute("update meta set value = 1000 where key = 'started'", []).unwrap();
+        let mut store = Store::open(&path).unwrap();
+        store.prune(now() + 30 * KEEP_SECS).unwrap();
+        drop(store);
+        assert_eq!(linker_since(&main).unwrap(), Some(1000), "kept once, not set again");
+        // a store that can't be read is an error, not taken as none
+        std::fs::write(&path, b"not a database, not at all, not even close to one, no").unwrap();
+        for side in ["-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{side}", path.display()));
+        }
+        assert!(linker_since(&main).is_err());
     }
 }

@@ -1842,23 +1842,24 @@ mod tests {
             ))
             .unwrap();
         }
-        // ids carry their shard: id = seq * 8 + shard
-        let id = |seq: i64, shard: i64| seq * 8 + shard;
+        // ids carry their shard; with one shard the second is the same, and the cap leaves its rows out
+        let (a, b) = (0usize, store::SHARDS - 1);
+        let id = |seq: i64, shard: usize| store::global_id(seq, shard);
         for i in 0..70 {
             conn.execute(
-                "insert into s1.releases values (?1, 'Post', ?2, 10, '2026-11-07 12:00:00', 'p@x')",
-                rusqlite::params![id(100 + (69 - i), 1), format!("a.b.g{i:03}")],
+                &format!("insert into s{a}.releases values (?1, 'Post', ?2, 10, '2026-11-07 12:00:00', 'p@x')"),
+                rusqlite::params![id(100 + (69 - i), a), format!("a.b.g{i:03}")],
             )
             .unwrap();
         }
         conn.execute_batch(&format!(
-            "insert into s2.releases values ({}, 'Post', 'a.b.other', 99, '2026-11-07 13:00:00', 'q@x');
-             insert into s2.releases values ({}, 'Post', '{}', 1, null, 'p@x');
-             insert into s2.releases values ({}, 'Renamed', 'a.b.moved', 1, null, 'p@x');",
-            id(500, 2),
-            id(600, 2),
+            "insert into s{b}.releases values ({}, 'Post', 'a.b.other', 99, '2026-11-07 13:00:00', 'q@x');
+             insert into s{b}.releases values ({}, 'Post', '{}', 1, null, 'p@x');
+             insert into s{b}.releases values ({}, 'Renamed', 'a.b.moved', 1, null, 'p@x');",
+            id(500, b),
+            id(600, b),
             "x".repeat(1_000),
-            id(700, 2)
+            id(700, b)
         ))
         .unwrap();
         let catalog_row = |i: i64| NamedRow {
@@ -1870,28 +1871,31 @@ mod tests {
             posted: None,
             poster: None,
         };
-        let mut candidates: Vec<NamedRow> = (100..170).map(|seq| catalog_row(id(seq, 1))).collect();
+        let mut candidates: Vec<NamedRow> = (100..170).map(|seq| catalog_row(id(seq, a))).collect();
         // a row the shard deleted, a blocked group, and one renamed since
         candidates.extend([
-            catalog_row(id(800, 2)),
-            catalog_row(id(500, 2)),
-            catalog_row(id(600, 2)),
-            catalog_row(id(700, 2)),
+            catalog_row(id(800, b)),
+            catalog_row(id(500, b)),
+            catalog_row(id(600, b)),
+            catalog_row(id(700, b)),
         ]);
         let rows = reread_candidates(&conn, &candidates, |name| name == "Post").unwrap();
         let named = first_per_shard(rows, 64);
-        let shard1: Vec<&str> =
-            named.iter().filter(|n| store::shard_of_id(n.id) == 1).map(|n| n.group.as_str()).collect();
-        assert_eq!(shard1.len(), 64, "the first 64 of the shard");
-        assert_eq!((shard1[0], shard1[63]), ("a.b.g000", "a.b.g063"), "by group name, as the (name, group) index");
-        let other = named.iter().find(|n| n.id == id(500, 2)).unwrap();
-        assert_eq!(
-            (other.group.as_str(), other.bytes, other.poster.as_deref()),
-            ("a.b.other", 99, Some("q@x")),
-            "the shard's row, not the catalog's"
-        );
-        assert!(other.date.is_some_and(|d| d > 2_461_000.0), "julianday from the shard's own sql");
-        for gone in [id(800, 2), id(600, 2), id(700, 2)] {
+        let first: Vec<&str> =
+            named.iter().filter(|n| store::shard_of_id(n.id) == a).map(|n| n.group.as_str()).collect();
+        assert_eq!(first.len(), 64, "the first 64 of the shard");
+        assert_eq!((first[0], first[63]), ("a.b.g000", "a.b.g063"), "by group name, as the (name, group) index");
+        assert!(named.iter().filter(|n| n.group.starts_with("a.b.g")).all(|n| n.bytes == 10), "the shard's rows");
+        if a != b {
+            let other = named.iter().find(|n| n.id == id(500, b)).unwrap();
+            assert_eq!(
+                (other.group.as_str(), other.bytes, other.poster.as_deref()),
+                ("a.b.other", 99, Some("q@x")),
+                "the shard's row, not the catalog's"
+            );
+            assert!(other.date.is_some_and(|d| d > 2_461_000.0), "julianday from the shard's own sql");
+        }
+        for gone in [id(800, b), id(600, b), id(700, b)] {
             assert!(!named.iter().any(|n| n.id == gone), "deleted, blocked or renamed: {gone}");
         }
     }

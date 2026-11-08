@@ -95,8 +95,14 @@ pub fn fetch(at: Locator) -> Result<Vec<u8>> {
 /// all back to rewrite them, so it stops there instead.
 pub fn has_places(conn: &rusqlite::Connection) -> rusqlite::Result<bool> {
     conn.query_row(
-        "select exists(select 1 from files where length(blob) = ? and substr(blob, 1, 5) = ?)",
-        params![sealed_log::REF_BYTES as i64, &sealed_log::REF_TAG[..]],
+        "select exists(select 1 from files where length(blob) = ? and substr(blob, 1, 5) = ?)
+             or exists(select 1 from files where length(blob) = ? and substr(blob, 1, 5) = ?)",
+        params![
+            sealed_log::REF_BYTES as i64,
+            &sealed_log::REF_TAG[..],
+            (crate::blob::SHIFTED_TAG.len() + 8 + sealed_log::REF_BYTES) as i64,
+            &crate::blob::SHIFTED_TAG[..]
+        ],
         |r| r.get(0),
     )
 }

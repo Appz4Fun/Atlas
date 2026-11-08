@@ -80,6 +80,7 @@ pub fn create(conn: &Connection) -> Result<()> {
     add_column(conn, "backfill_chunks", "done_at")?;
     add_column(conn, "backfill_chunks", "failures")?;
     add_column(conn, "backfill_chunks", "failed_at")?;
+    add_column(conn, "backfill_chunks", "reread")?;
     add_column(conn, "backfill_deepest", "oldest_at")?;
     add_column(conn, "backfill_deepest", "runner_up_at")
 }
@@ -254,6 +255,9 @@ pub struct Claim {
     pub day: i64,
     pub server: String,
     pub claimed_at: i64,
+    /// a day read before, put back by `reopen_done`: read whole again, not up to where this server's backfill
+    /// cursor has got since (`indexer::chunk_range`)
+    pub reread: bool,
 }
 
 /// Ask for a day of a group's backfill before the others: one a post found
@@ -387,7 +391,7 @@ fn claim_wanted(conn: &Connection, groups: &[(String, i64)], host: &str, now: i6
              join backfill_chunks c on c.grp = r.grp and c.day = r.day
              where c.day >= w.oldest and (c.state = {PENDING} or (c.state = {CLAIMED} and c.claimed_at < ?))
              order by c.day desc limit 1)
-         returning grp, day"
+         returning grp, day, coalesce(reread, 0)"
     );
     let mut values: Vec<rusqlite::types::Value> = Vec::with_capacity(groups.len() * 2 + 4);
     for (g, oldest) in groups {
@@ -395,9 +399,17 @@ fn claim_wanted(conn: &Connection, groups: &[(String, i64)], host: &str, now: i6
         values.push((*oldest).into());
     }
     values.extend([CLAIMED.into(), host.to_string().into(), now.into(), (now - CLAIM_TIMEOUT).into()]);
-    let found: Option<(String, i64)> =
-        conn.prepare(&sql)?.query_row(rusqlite::params_from_iter(values), |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
-    Ok(found.map(|(group, day)| Claim { group, day, server: host.to_string(), claimed_at: now }))
+    let found: Option<(String, i64, i64)> = conn
+        .prepare(&sql)?
+        .query_row(rusqlite::params_from_iter(values), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .optional()?;
+    Ok(found.map(|(group, day, reread)| Claim {
+        group,
+        day,
+        server: host.to_string(),
+        claimed_at: now,
+        reread: reread != 0,
+    }))
 }
 
 /// The chunk `claim` takes after the days asked for: of each group its newest day pending or with a stale claim, then
@@ -435,7 +447,7 @@ fn claim_newest(
          where (grp, day) = (
              select grp, day from best where day is not null
              order by day desc, media desc limit 1)
-         returning grp, day",
+         returning grp, day, coalesce(reread, 0)",
         resting = not_resting(now)
     );
     let mut values: Vec<rusqlite::types::Value> = Vec::with_capacity(groups.len() * 3 + 4);
@@ -446,9 +458,78 @@ fn claim_newest(
     }
     values.push((now - CLAIM_TIMEOUT).into());
     values.extend([CLAIMED.into(), host.to_string().into(), now.into()]);
-    let found: Option<(String, i64)> =
-        conn.prepare(&sql)?.query_row(rusqlite::params_from_iter(values), |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
-    Ok(found.map(|(group, day)| Claim { group, day, server: host.to_string(), claimed_at: now }))
+    let found: Option<(String, i64, i64)> = conn
+        .prepare(&sql)?
+        .query_row(rusqlite::params_from_iter(values), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .optional()?;
+    Ok(found.map(|(group, day, reread)| Claim {
+        group,
+        day,
+        server: host.to_string(),
+        claimed_at: now,
+        reread: reread != 0,
+    }))
+}
+
+/// The groups a reopen takes in, staged for its queries (`temp.reread_groups`).
+fn stage_groups(conn: &Connection, groups: &[String]) -> Result<()> {
+    conn.execute_batch(
+        "create temp table if not exists reread_groups (name TEXT PRIMARY KEY); delete from temp.reread_groups;",
+    )?;
+    let mut put = conn.prepare("insert or ignore into temp.reread_groups (name) values (?1)")?;
+    for g in groups {
+        put.execute([g])?;
+    }
+    Ok(())
+}
+
+/// SQL: the day chunks `reopen_done` takes: done, not put back before, from day `?1` on, finished before `?2` (null
+/// for any time), of a staged group
+const REOPENS: &str = "state = 2 and coalesce(reread, 0) = 0 and day >= ?1
+    and (?2 is null or done_at is null or done_at < ?2) and grp in (select name from temp.reread_groups)";
+
+/// Every day chunk of `groups` done from `since` on (a unix day; `i64::MIN` for all of them) and finished before
+/// `done_before` (unix seconds; None for any time) put back to pending, to be read again whole: for what the first
+/// read dropped and a later build keeps, as the headers of uploads obfuscated per article (`xref`). Articles saved
+/// already are passed over on the second read. A day put back once isn't put back again (`reread`). The count.
+pub fn reopen_done(conn: &Connection, since: i64, done_before: Option<i64>, groups: &[String]) -> Result<usize> {
+    let tx = conn.unchecked_transaction()?;
+    stage_groups(&tx, groups)?;
+    let n = tx.execute(
+        &format!(
+            "update backfill_chunks set state = {PENDING}, server = null, claimed_at = null, done_at = null,
+                    failures = null, failed_at = null, reread = 1
+             where {REOPENS}"
+        ),
+        params![since, done_before],
+    )?;
+    tx.commit()?;
+    Ok(n)
+}
+
+/// What `reopen_done` would put back: how many day chunks, over how many groups, and how many done chunks of the
+/// same days are left alone for being of a group not in `groups`.
+pub fn done_since(
+    conn: &Connection,
+    since: i64,
+    done_before: Option<i64>,
+    groups: &[String],
+) -> Result<(i64, i64, i64)> {
+    stage_groups(conn, groups)?;
+    let (chunks, over): (i64, i64) = conn.query_row(
+        &format!("select count(*), count(distinct grp) from backfill_chunks where {REOPENS}"),
+        params![since, done_before],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let untracked: i64 = conn.query_row(
+        &format!(
+            "select count(*) from backfill_chunks where state = {DONE} and coalesce(reread, 0) = 0 and day >= ?1
+             and (?2 is null or done_at is null or done_at < ?2) and grp not in (select name from temp.reread_groups)"
+        ),
+        params![since, done_before],
+        |r| r.get(0),
+    )?;
+    Ok((chunks, over, untracked))
 }
 
 /// Mark a claimed chunk as done at `now`. False when the claim was taken over.
@@ -760,7 +841,7 @@ mod tests {
         let groups = vec![("g".to_string(), i64::MIN)];
 
         let a = claim(&c, &groups, "a", 1000).unwrap().unwrap();
-        assert_eq!(a, Claim { group: "g".into(), day: 20_000, server: "a".into(), claimed_at: 1000 });
+        assert_eq!(a, Claim { group: "g".into(), day: 20_000, server: "a".into(), claimed_at: 1000, reread: false });
         let b = claim(&c, &groups, "b", 1000).unwrap().unwrap();
         assert_eq!(b.day, 19_999);
         assert!(finish(&c, &a, 1100).unwrap());
@@ -875,6 +956,38 @@ mod tests {
         // recent all read: `old`'s days are the newest left
         assert_eq!(turn("old", 0).map(|c| c.day), Some(19_095));
         assert_eq!(frontier(&c, &[], 0).unwrap(), None);
+    }
+
+    #[test]
+    fn days_done_are_put_back_to_be_read_again_from_a_day_on() {
+        let c = conn();
+        add(&c, "g", 20_010, 20_000).unwrap();
+        add(&c, "other", 20_010, 20_009).unwrap();
+        let groups = vec![("g".to_string(), i64::MIN), ("other".to_string(), i64::MIN)];
+        // g's five newest done at 1000, then other's two at 5000
+        for _ in 0..5 {
+            let k = claim(&c, &[groups[0].clone()], "a", 1000).unwrap().unwrap();
+            assert!(finish(&c, &k, 1000).unwrap());
+        }
+        for _ in 0..2 {
+            let k = claim(&c, &[groups[1].clone()], "a", 5000).unwrap().unwrap();
+            assert!(finish(&c, &k, 5000).unwrap());
+        }
+        let g = vec!["g".to_string()];
+        assert_eq!(done_since(&c, i64::MIN, None, &g).unwrap(), (5, 1, 2), "other's two aren't a group taken in");
+        assert_eq!(done_since(&c, 20_008, None, &g).unwrap(), (3, 1, 2));
+        let both = vec!["g".to_string(), "other".to_string()];
+        assert_eq!(done_since(&c, i64::MIN, Some(2000), &both).unwrap(), (5, 1, 0), "other's were finished after");
+        assert_eq!(reopen_done(&c, 20_008, None, &g).unwrap(), 3);
+        assert_eq!(progress(&c, "g").unwrap(), (2, 11), "20006 and 20007 stay done");
+        // read again newest first, before the days never read, and marked as read again
+        let k = claim(&c, &[groups[0].clone()], "a", 1000).unwrap().unwrap();
+        assert_eq!((k.day, k.reread), (20_010, true));
+        assert!(finish(&c, &k, 1000).unwrap());
+        // put back again: the rest of g, not what was put back once (done again or not)
+        assert_eq!(reopen_done(&c, i64::MIN, None, &g).unwrap(), 2);
+        assert_eq!(reopen_done(&c, i64::MIN, None, &g).unwrap(), 0);
+        assert_eq!(progress(&c, "g").unwrap(), (1, 11), "only the day read again is done");
     }
 
     #[test]
@@ -1055,7 +1168,7 @@ mod tests {
         .unwrap();
         create(&c).unwrap();
         create(&c).unwrap();
-        let a = Claim { group: "g".into(), day: 5, server: "a".into(), claimed_at: 1000 };
+        let a = Claim { group: "g".into(), day: 5, server: "a".into(), claimed_at: 1000, reread: false };
         assert!(finish(&c, &a, 1100).unwrap(), "the chunk claimed before is still there");
         let done_at: Option<i64> = c.query_row("select done_at from backfill_chunks", [], |r| r.get(0)).unwrap();
         assert_eq!(done_at, Some(1100));

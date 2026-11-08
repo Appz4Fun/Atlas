@@ -3015,8 +3015,9 @@ pub fn harvest_from_shards(main: &Path, log: &dyn Fn(&str)) -> anyhow::Result<()
         res.with_context(|| format!("harvesting {}", main.display()))?;
         detach_res.with_context(|| format!("detaching {}", main.display()))?;
     }
-    for shard_idx in 0..crate::store::SHARDS {
-        let shard_path = crate::store::shard_path(main, shard_idx);
+    // the shards from before one shard too, should a reset come before their merge
+    for shard_idx in 0..crate::merge_shards::LEGACY_SHARDS {
+        let shard_path = crate::merge_shards::legacy_shard_path(main, shard_idx);
         if shard_path.exists() {
             log(&format!("harvesting shard s{shard_idx} ({})...", shard_path.display()));
             conn.execute("ATTACH DATABASE ?1 AS sh", [shard_path.to_string_lossy().as_ref()])
@@ -3153,7 +3154,7 @@ pub fn reset_shards_at(main: &Path, log: &dyn Fn(&str)) -> anyhow::Result<()> {
         }
     }
     let remove_db_family = |base: &Path| -> anyhow::Result<()> {
-        for suffix in ["", "-wal", "-shm", "-journal", ".sealed-log-cursor"] {
+        for suffix in ["-wal", "-shm", "-journal", ".sealed-log-cursor", ".catalog-cursor", ".blob-bytes-cursor", ""] {
             let p = PathBuf::from(format!("{}{suffix}", base.display()));
             match std::fs::remove_file(&p) {
                 Ok(()) => {}
@@ -3163,7 +3164,8 @@ pub fn reset_shards_at(main: &Path, log: &dyn Fn(&str)) -> anyhow::Result<()> {
         }
         Ok(())
     };
-    for shard in crate::store::shard_paths(main) {
+    // the shards from before one shard too, should a reset come before their merge
+    for shard in (0..crate::merge_shards::LEGACY_SHARDS).map(|s| crate::merge_shards::legacy_shard_path(main, s)) {
         let copy = crate::compact::with_suffix(&shard, "compact");
         remove_db_family(&crate::compact::with_suffix(&copy, "check"))?;
         remove_db_family(&copy)?;
@@ -3937,6 +3939,8 @@ mod tests {
 
         // 2. If a shard is corrupt (missing releases table), reset_shards_at aborts without deleting anything.
         let s0 = crate::store::shard_path(&main, 0);
+        let good = dir.path().join("good.db");
+        std::fs::copy(&s0, &good).unwrap();
         let conn = Connection::open(&s0).unwrap();
         conn.execute_batch("DROP TABLE releases;").unwrap();
         drop(conn);
@@ -3946,11 +3950,11 @@ mod tests {
         assert!(main.exists(), "main db must not be deleted on failed harvest");
         assert!(s0.exists(), "shard s0 must not be deleted on failed harvest");
 
-        // 3. Restore valid s0, plant compaction/conversion leftovers, and verify clean reset.
-        std::fs::copy(crate::store::shard_path(&main, 1), &s0).unwrap();
-        let precompact_s1 = crate::compact::with_suffix(&crate::store::shard_path(&main, 1), "precompact");
-        std::fs::remove_file(crate::store::shard_path(&main, 1)).unwrap();
-        std::fs::copy(crate::store::shard_path(&main, 2), &precompact_s1).unwrap();
+        // 3. A compaction's swap cut short (no shard, its backup there) and a conversion's leftovers: put back, then a
+        // clean reset
+        let precompact_s1 = crate::compact::with_suffix(&s0, "precompact");
+        std::fs::remove_file(&s0).unwrap();
+        std::fs::copy(&good, &precompact_s1).unwrap();
         let old_main = main.with_file_name("atlas.old.db");
         std::fs::write(&old_main, b"old").unwrap();
 

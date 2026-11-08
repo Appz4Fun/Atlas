@@ -4,9 +4,10 @@
 //! What collides between shards is moved out of the way rather than rewritten:
 //! - file ids count from 1 in each shard: a source's are moved past the target's highest (`file_offset`);
 //! - message-id domains are numbered per shard, and sealed blobs (some kept in the sealed log, out of reach) hold
-//!   those numbers: a source's domains go to `legacy_domains` under `shard << 32`, its segments' domains move the
-//!   same (0, a message-id stored whole, stays 0), and each of its files records the move (`files.domain_base`) for
-//!   its blob's numbers;
+//!   those numbers: a source's domains go into the target's `domains` under `shard << 32` too (a suffix may then
+//!   have several ids, all reading the same: `domains` loses its unique index), its segment rows and the blobs kept
+//!   in the shard take the target's id for each suffix (the lowest), and a sealed-log place is marked to be read on
+//!   from that base (`blob::shifted`), soo only what's in the log keeps a source's numbers;
 //! - collection keys and message-id hashes are keyed per shard, and their strings aren't kept: a source's collections
 //!   go to `legacy_collections` under its key pair, and the pair is kept (`merge_shards`) for what hashes its
 //!   releases' message-ids. Release ids already say which shard they came from (`id % 8`).
@@ -16,7 +17,6 @@
 //! source is deleted only once every table's copied rows match its count, soo at most one shard's worth of space is
 //! taken at a time.
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -49,7 +49,6 @@ create table if not exists merge_progress (
     primary key (shard, tbl)
 ) without rowid;
 create table if not exists merge_triggers (name TEXT PRIMARY KEY, sql TEXT NOT NULL);
-create table if not exists legacy_domains (id INTEGER PRIMARY KEY, suffix TEXT NOT NULL);
 create table if not exists legacy_collections (
     key0 INTEGER NOT NULL, key1 INTEGER NOT NULL, key INTEGER NOT NULL, release_id INTEGER NOT NULL,
     primary key (key0, key1, key)
@@ -100,15 +99,24 @@ pub struct Source {
     pub path: PathBuf,
 }
 
-/// The shards to fold into shard 0 of `main`, smallest first.
+/// The shards to fold into shard 0 of `main`, in shard order: each source's domains come in from `shard << 32`, soo
+/// the lowest id of a suffix (the one its rows are renumbered to, `map_domains`) is the first source's that has it and
+/// stays so; merged in any other order, a suffix two sources share would end with rows under two ids.
 pub fn sources(main: &Path) -> Vec<Source> {
-    let mut found: Vec<(u64, Source)> = (1..LEGACY_SHARDS)
-        .map(|shard| (shard, legacy_shard_path(main, shard)))
-        .filter(|(_, p)| p.exists())
-        .map(|(shard, path)| (std::fs::metadata(&path).map_or(0, |m| m.len()), Source { shard, path }))
-        .collect();
-    found.sort_by_key(|(size, s)| (*size, s.shard));
-    found.into_iter().map(|(_, s)| s).collect()
+    (1..LEGACY_SHARDS)
+        .map(|shard| Source { shard, path: legacy_shard_path(main, shard) })
+        .filter(|s| s.path.exists())
+        .collect()
+}
+
+/// The files of the shards from before one shard still beside `main`: `atlas.s1.db` .. `atlas.s7.db`, and a
+/// compaction's backup of one (`.precompact.db`). None once merged.
+pub fn legacy_leftovers(main: &Path) -> Vec<PathBuf> {
+    (1..LEGACY_SHARDS)
+        .map(|s| legacy_shard_path(main, s))
+        .flat_map(|p| [crate::compact::with_suffix(&p, "precompact"), p])
+        .filter(|p| p.exists())
+        .collect()
 }
 
 /// `atlas.db` -> `atlas.s3.db`, whatever the shard count now
@@ -145,7 +153,17 @@ pub fn merge(
         // every commit on disk before a source is deleted: there is nothing to copy again from after that
         conn.execute_batch("pragma synchronous = full;")?;
         conn.execute_batch(SCHEMA)?;
-        add_column(&conn, "files", "domain_base", "INTEGER")?;
+        refuse_an_earlier_builds_merge(&conn)?;
+        domains_not_unique(&conn)?;
+        // in shard order only (`sources`): a source after a higher one would take its domains' lowest ids
+        let later: Option<i64> = conn.query_row(
+            "select max(shard) from merge_shards where shard > ?1 and done = 1",
+            [source.shard as i64],
+            |r| r.get(0),
+        )?;
+        if let Some(later) = later {
+            bail!("shard {} comes before shard {later}, merged already: shards merge in shard order", source.shard);
+        }
         park_triggers(&conn)?;
         let rows = merge_one(&conn, source, &mut budget, log)?;
         let Some(rows) = rows else { return Ok(merged) };
@@ -179,10 +197,11 @@ pub fn merge(
     Ok(merged)
 }
 
-/// The full text index's insert trigger is all that runs while rows are copied. The rest would queue the copies again
-/// (word index, uncategorized list), count them again (sidecar bytes) or send every row to the shared catalog's
-/// outbox, where they already are. Each is kept (`merge_triggers`) and made again by `finish`.
-const KEPT_TRIGGERS: [&str; 1] = ["releases_ai"];
+/// No trigger runs while rows are copied. They would queue the copies again (word index, uncategorized list), count
+/// them again (sidecar bytes), send every row to the shared catalog's outbox, where they already are, or index each
+/// release's name one at a time: on a trial that took two hours for one shard's 12M releases, where `finish` rebuilds
+/// the full text index in one go. Each is kept (`merge_triggers`) and made again by `finish`.
+const KEPT_TRIGGERS: [&str; 0] = [];
 
 fn park_triggers(conn: &Connection) -> Result<()> {
     let triggers: Vec<(String, String)> = conn
@@ -221,6 +240,28 @@ fn restore_triggers(conn: &Connection) -> Result<()> {
         tx.execute("delete from merge_triggers where name = ?1", [&name])?;
     }
     tx.commit()?;
+    Ok(())
+}
+
+/// The target's `domains` without its unique index on the suffix: a source's domains come in under their own ids
+/// (`shard << 32` on), beside the target's for the same suffix. A lookup by suffix takes the lowest id
+/// (`store::Domains`), and every id reads back the same message-id.
+pub(crate) fn domains_not_unique(conn: &Connection) -> Result<()> {
+    let sql: Option<String> = conn
+        .query_row("select sql from main.sqlite_master where type = 'table' and name = 'domains'", [], |r| r.get(0))
+        .optional()?;
+    if !sql.is_some_and(|s| s.to_ascii_uppercase().contains("UNIQUE")) {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "begin immediate;
+         create table domains_merged (id INTEGER PRIMARY KEY, suffix TEXT NOT NULL);
+         insert into domains_merged (id, suffix) select id, suffix from main.domains;
+         drop table main.domains;
+         alter table domains_merged rename to domains;
+         create index if not exists domains_suffix on domains (suffix, id);
+         commit;",
+    )?;
     Ok(())
 }
 
@@ -298,20 +339,91 @@ fn merge_one(
         )?;
         let moves = Moves { file_offset, domain_offset, key0, key1 };
         let mut rows = 0;
+        // the source's domains first: the rest take the target's id for each suffix (`domain_map`)
+        match copy_table(conn, shard, "domains", &moves, budget, log)? {
+            Some(n) => rows += n,
+            None => return Ok(None),
+        }
+        let (map, unreadable) = map_domains(conn, domain_offset)?;
         for table in tables(conn, "src")? {
-            if skipped(&table) {
+            if skipped(&table) || table == "domains" {
                 continue;
             }
             match copy_table(conn, shard, &table, &moves, budget, log)? {
                 Some(n) => rows += n,
                 None => return Ok(None),
             }
+            if table == "files" {
+                let n = unreadable.load(std::sync::atomic::Ordering::Relaxed);
+                if n > 0 {
+                    log(&format!("shard {shard}: {n} blobs that won't decode were copied as they are"));
+                }
+            }
         }
+        drop(map);
         merge_meta(conn, shard)?;
         Ok(Some(rows))
     })();
     let _ = conn.execute("detach database src", []);
     result
+}
+
+/// Each source domain id and the target's id for its suffix, as a temp table (`temp.domain_map`) for the segment rows
+/// and a map for the blobs (`atlas_remap_blob`, registered on `conn`). A blob that won't decode is copied as it is,
+/// and counted.
+/// A source's domain ids and the target's for the same suffix, and a count of blobs that wouldn't read.
+type DomainMap = (std::sync::Arc<std::collections::HashMap<i64, i64>>, std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+fn map_domains(conn: &Connection, base: i64) -> Result<DomainMap> {
+    conn.execute_batch(
+        "create temp table if not exists domain_map (old INTEGER PRIMARY KEY, new INTEGER NOT NULL);
+         delete from temp.domain_map;
+         insert into temp.domain_map (old, new)
+             select s.id, (select min(d.id) from main.domains d where d.suffix = s.suffix) from src.domains s;",
+    )?;
+    let map: std::collections::HashMap<i64, i64> = conn
+        .prepare("select old, new from temp.domain_map")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let map = std::sync::Arc::new(map);
+    let unreadable = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (m, bad) = (map.clone(), unreadable.clone());
+    use rusqlite::functions::FunctionFlags;
+    conn.create_scalar_function(
+        "atlas_remap_blob",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        move |ctx| match ctx.get_raw(0) {
+            rusqlite::types::ValueRef::Blob(b) => Ok(match crate::blob::remap_blob(b, base, &m) {
+                Ok(moved) => rusqlite::types::Value::Blob(moved),
+                Err(_) => {
+                    bad.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    rusqlite::types::Value::Blob(b.to_vec())
+                }
+            }),
+            rusqlite::types::ValueRef::Null => Ok(rusqlite::types::Value::Null),
+            rusqlite::types::ValueRef::Integer(i) => Ok(rusqlite::types::Value::Integer(i)),
+            rusqlite::types::ValueRef::Real(f) => Ok(rusqlite::types::Value::Real(f)),
+            rusqlite::types::ValueRef::Text(t) => {
+                Ok(rusqlite::types::Value::Text(String::from_utf8_lossy(t).into_owned()))
+            }
+        },
+    )?;
+    Ok((map, unreadable))
+}
+
+/// A target an earlier build started merging (`legacy_domains`, `files.domain_base`) isn't gone on with: its sources'
+/// blobs weren't renumbered. Merge from copies of the shards as they were.
+fn refuse_an_earlier_builds_merge(conn: &Connection) -> Result<()> {
+    let table: bool =
+        conn.prepare("select 1 from main.sqlite_master where type = 'table' and name = 'legacy_domains'")?.exists([])?;
+    let column = columns(conn, "main", "files")?.iter().any(|c| c == "domain_base");
+    if table || column {
+        bail!(
+            "this shard was merged into by an earlier build (legacy_domains or files.domain_base): start again from the shards as they were"
+        );
+    }
+    Ok(())
 }
 
 /// What a source's rows are moved by.
@@ -395,7 +507,7 @@ fn plan(conn: &Connection, table: &str, m: &Moves) -> Result<Copy> {
     let lit = |v: i64| v.to_string();
     let copy = match table {
         "domains" => Copy {
-            into: "legacy_domains".into(),
+            into: "domains".into(),
             cols: vec!["id".into(), "suffix".into()],
             exprs: vec![format!("id + {}", m.domain_offset), "suffix".into()],
             key: Some("id".into()),
@@ -446,9 +558,12 @@ fn plan(conn: &Connection, table: &str, m: &Moves) -> Result<Copy> {
                 let q = quote(c);
                 let expr = match (table, c.as_str()) {
                     ("files", "id") => format!("{q} + {}", m.file_offset),
-                    ("files", "domain_base") => continue,
-                    // 0 is a message-id stored whole, no domain
-                    ("segments", "domain") => format!("case when {q} = 0 then 0 else {q} + {} end", m.domain_offset),
+                    ("files", "blob") => format!("atlas_remap_blob({q})"),
+                    // 0 is a message-id stored whole, no domain; the target's id for the suffix (`map_domains`)
+                    ("segments", "domain") => format!(
+                        "case when {q} = 0 then 0 else coalesce((select new from temp.domain_map where old = {q}), {q} + {}) end",
+                        m.domain_offset
+                    ),
                     // a release's own row in `release_ids` has file 0, no file
                     ("release_ids", "file_id") => format!("case when {q} = 0 then 0 else {q} + {} end", m.file_offset),
                     (t, "file_id") if FILE_KEYED.contains(&t) => format!("{q} + {}", m.file_offset),
@@ -456,10 +571,6 @@ fn plan(conn: &Connection, table: &str, m: &Moves) -> Result<Copy> {
                 };
                 cols.push(q);
                 exprs.push(expr);
-            }
-            if table == "files" {
-                cols.push("domain_base".into());
-                exprs.push(lit(m.domain_offset));
             }
             // the keys a range could go by, best first: the first that leads an index is taken (`plan` below)
             let mut keys: Vec<String> = Vec::new();
@@ -664,14 +775,6 @@ fn merge_frozen(
     result
 }
 
-fn add_column(conn: &Connection, table: &str, column: &str, kind: &str) -> Result<()> {
-    let have: BTreeSet<String> = columns(conn, "main", table)?.into_iter().collect();
-    if !have.contains(column) {
-        conn.execute(&format!("alter table {table} add column {column} {kind}"), [])?;
-    }
-    Ok(())
-}
-
 /// The directory of `path` flushed, soo a deletion in it holds after a power cut.
 fn sync_dir(path: &Path) {
     if let Some(dir) = path.parent()
@@ -684,7 +787,7 @@ fn sync_dir(path: &Path) {
 /// A database file and everything beside it that belongs to it.
 fn remove_family(base: &Path) -> Result<()> {
     // the database last: a -wal left beside no file would be replayed into a new file of that name
-    for suffix in ["-wal", "-shm", "-journal", ".sealed-log-cursor", ".catalog-cursor", ""] {
+    for suffix in ["-wal", "-shm", "-journal", ".sealed-log-cursor", ".catalog-cursor", ".blob-bytes-cursor", ""] {
         let p = PathBuf::from(format!("{}{suffix}", base.display()));
         match std::fs::remove_file(&p) {
             Ok(()) => {}
@@ -724,16 +827,36 @@ pub fn refuse_if_merging(main: &Path) -> Result<()> {
 /// Set in `atlas.db` once `finish` has put the id counter in one-shard numbering.
 const COUNTER_DONE: &str = "merge_counter_done";
 
-/// Whether a merge started on `main` hasn't finished.
-pub fn in_progress(main: &Connection) -> bool {
-    crate::store::get_meta(main, MERGING).ok().flatten().is_some_and(|v| v != 0)
+/// Whether a merge started on `main` hasn't finished. An error when that can't be read: not taken as no.
+pub fn in_progress(main: &Connection) -> Result<bool> {
+    // a database with no `meta` yet (being set up) has had no merge
+    let has_meta: bool =
+        main.prepare("select 1 from main.sqlite_master where type = 'table' and name = 'meta'")?.exists([])?;
+    Ok(has_meta && crate::store::get_meta(main, MERGING)?.is_some_and(|v| v != 0))
 }
 
-/// After the last source: the triggers back, the id counter past every id handed out (live, frozen, a source's
-/// highest, and what the eight-shard numbering would hand out next), as one shard numbers them (`seq` is the id),
-/// and the merge marked finished. Safe to run again.
+/// Whether the target `target` is left as a merge leaves it before `finish`: its triggers parked. The target's own
+/// word on it, for when the marker in `atlas.db` was lost (a power cut between the two files' writes).
+pub fn needs_finish(target: &Path) -> Result<bool> {
+    if !target.exists() {
+        return Ok(false);
+    }
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(target, flags)?;
+    conn.busy_timeout(std::time::Duration::from_secs(30))?;
+    let has: bool =
+        conn.prepare("select 1 from sqlite_master where type = 'table' and name = 'merge_triggers'")?.exists([])?;
+    Ok(has && conn.prepare("select 1 from merge_triggers limit 1")?.exists([])?)
+}
+
+/// After the last source: the id counter past every id handed out (live, frozen, a source's highest, and once, what
+/// the eight-shard numbering would hand out next), as one shard numbers them (`seq` is the id); the full text index
+/// made again; the triggers back; the merge marked finished, once the target's changes are on disk. Safe to run
+/// again: each run raises the counter past what's there.
 pub fn finish(main: &Path, target: &Path) -> Result<()> {
     let conn = crate::db::open_at(target)?;
+    // on disk before the marker says the merge is finished
+    conn.execute_batch("pragma synchronous = full;")?;
     conn.execute_batch(SCHEMA)?;
     let mut highest: i64 = conn.query_row(
         "select max(coalesce((select max(id) from releases), 0), coalesce((select max(max_release) from merge_shards), 0))",
@@ -746,18 +869,27 @@ pub fn finish(main: &Path, target: &Path) -> Result<()> {
         highest = highest.max(f.query_row("select coalesce(max(id), 0) from frozen_releases", [], |r| r.get(0))?);
     }
     let main_conn = crate::db::open_at(main)?;
-    // the counter in one-shard numbering once, with a note that it is: a rerun doesn't take it for eight-shard again
-    if crate::store::get_meta(&main_conn, COUNTER_DONE)?.unwrap_or(0) == 0 {
+    main_conn.execute_batch("pragma synchronous = full;")?;
+    // the eight-shard counter counted sequences, each worth eight ids: taken into account once, with a note that it
+    // was, soo a rerun doesn't take the one-shard counter for eight-shard again
+    let converted = crate::store::get_meta(&main_conn, COUNTER_DONE)?.unwrap_or(0) != 0;
+    if !converted {
         let next = crate::store::get_meta(&main_conn, "next_seq")?.unwrap_or(0);
         highest = highest.max(next.saturating_mul(LEGACY_SHARDS as i64));
-        let tx = main_conn.unchecked_transaction()?;
-        crate::store::set_next_seq(&tx, highest + 1)?;
-        tx.execute("insert or replace into meta (key, value) values (?1, 1)", [COUNTER_DONE])?;
-        tx.commit()?;
+    }
+    let tx = main_conn.unchecked_transaction()?;
+    crate::store::set_next_seq(&tx, highest + 1)?;
+    tx.execute("insert or replace into meta (key, value) values (?1, 1)", [COUNTER_DONE])?;
+    tx.commit()?;
+    // the copies' names, which no trigger indexed (`KEPT_TRIGGERS`): the index made again from `releases`
+    if conn.prepare("select 1 from main.merge_triggers limit 1")?.exists([])? {
+        conn.execute("insert into releases_fts(releases_fts) values ('rebuild')", [])?;
     }
     restore_triggers(&conn)?;
     crate::sidecar::recount(&conn)?;
+    conn.query_row("pragma wal_checkpoint(truncate)", [], |_| Ok(()))?;
     main_conn.execute("insert or replace into meta (key, value) values (?1, 0)", [MERGING])?;
+    main_conn.query_row("pragma wal_checkpoint(truncate)", [], |_| Ok(()))?;
     Ok(())
 }
 
@@ -770,11 +902,47 @@ pub fn run(args: &[String]) -> i32 {
     }
     let main = crate::paths::database();
     let target = legacy_shard_path(&main, 0);
+    // a compaction's swap of a shard cut short: its backup is what holds the shard (the shard itself may be gone), and the merge doesn't put it
+    // back
+    let backups: Vec<String> = legacy_leftovers(&main)
+        .into_iter()
+        .filter(|p| p.to_string_lossy().ends_with(".precompact.db"))
+        .map(|p| p.display().to_string())
+        .collect();
+    if !backups.is_empty() {
+        println!("a compaction's backup is beside a shard: put it back or remove it first: {}", backups.join(", "));
+        return 1;
+    }
     let todo = sources(&main);
     if todo.is_empty() {
-        // the last source went but its run stopped before `finish`
-        let unfinished = crate::db::open_at(&main).map(|c| in_progress(&c)).unwrap_or(false);
-        if unfinished && apply {
+        // the last source went but its run stopped before `finish`: the marker says so, or the target does when the
+        // marker was lost with it
+        let marked = match crate::db::open_at(&main).map_err(anyhow::Error::from).and_then(|c| in_progress(&c)) {
+            Ok(m) => m,
+            Err(e) => {
+                println!("couldnt read {}: {e:#}", main.display());
+                return 1;
+            }
+        };
+        let left = match needs_finish(&target) {
+            Ok(n) => n,
+            Err(e) => {
+                println!("couldnt read {}: {e:#}", target.display());
+                return 1;
+            }
+        };
+        if marked || left {
+            if !apply {
+                println!("the merge's last step is still to do (its shards are gone): pass --apply to finish it");
+                return 0;
+            }
+            let _lock = match crate::compact::Lock::take_unchecked(&main) {
+                Ok(lock) => lock,
+                Err(e) => {
+                    println!("couldnt take the database lock: {e:#}");
+                    return 1;
+                }
+            };
             return match finish(&main, &target) {
                 Ok(()) => {
                     println!("finished the merge that stopped after its last shard");
@@ -792,7 +960,7 @@ pub fn run(args: &[String]) -> i32 {
     let free = crate::frozen::free_bytes(&main).unwrap_or(0);
     let size = |p: &Path| std::fs::metadata(p).map_or(0, |m| m.len());
     let biggest = todo.iter().map(|s| size(&s.path) + size(&crate::frozen::path(&s.path))).max().unwrap_or(0);
-    println!("merging {} shards into {}, smallest first:", todo.len(), target.display());
+    println!("merging {} shards into {}:", todo.len(), target.display());
     for s in &todo {
         let size = std::fs::metadata(&s.path).map_or(0, |m| m.len());
         println!("  s{} {:.1} GB", s.shard, size as f64 / 1e9);
@@ -866,46 +1034,59 @@ mod tests {
         }
     }
 
-    /// a group name for each shard
+    /// a group name for each shard there was
     fn groups() -> Vec<String> {
-        let mut by_shard: Vec<Option<String>> = vec![None; LEGACY_SHARDS];
-        for i in 0.. {
-            let g = format!("alt.binaries.g{i}");
-            let s = store::shard_of(&g);
-            if by_shard[s].is_none() {
-                by_shard[s] = Some(g);
-            }
-            if by_shard.iter().all(Option::is_some) {
-                break;
-            }
-        }
-        by_shard.into_iter().map(Option::unwrap).collect()
+        (0..LEGACY_SHARDS).map(|s| format!("alt.binaries.g{s}")).collect()
     }
 
     fn count(conn: &Connection, sql: &str) -> i64 {
         conn.query_row(sql, [], |r| r.get(0)).unwrap()
     }
 
-    /// Eight shards with two releases each, their articles under a domain of their own and one shared by all.
+    /// Eight shards as there were, two releases each, their articles under a domain of their own and one rare: shard
+    /// 0 is `main`'s own, each other made as a database of its own (its own secret, its ids apart) and put in place.
     fn fixture(main: &Path) -> Vec<String> {
+        fixture_sharing(main, &[])
+    }
+
+    /// `fixture`, with a second file in release 1 of each of `sharing`, its articles under `both.example`: a domain
+    /// those shards have and shard 0 hasn't.
+    fn fixture_sharing(main: &Path, sharing: &[usize]) -> Vec<String> {
         crate::db::create_db_at(main).unwrap();
         let groups = groups();
         for (s, g) in groups.iter().enumerate() {
             let releases: Vec<Release> = (0..2)
-                .map(|r| Release {
-                    name: format!("Rel.{s}.{r}"),
-                    group: g.clone(),
-                    collection: Some(format!("post {s} {r}")),
-                    articles: vec![
+                .map(|r| {
+                    let mut articles = vec![
                         art("a.rar", 1, &format!("s{s}r{r}a1"), &format!("own{s}.example")),
                         art("a.rar", 2, &format!("s{s}r{r}a2"), &format!("own{s}.example")),
                         art("a.rar", 3, &format!("s{s}r{r}a3"), &format!("own{s}.example")),
                         art("a.rar", 4, &format!("s{s}r{r}a4"), "rare.example"),
-                    ],
-                    ..Default::default()
+                    ];
+                    if r == 1 && sharing.contains(&s) {
+                        articles.extend((1..=4).map(|n| art("b.rar", n, &format!("s{s}r{r}b{n}"), "both.example")));
+                    }
+                    Release {
+                        name: format!("Rel.{s}.{r}"),
+                        group: g.clone(),
+                        collection: Some(format!("post {s} {r}")),
+                        articles,
+                        ..Default::default()
+                    }
                 })
                 .collect();
-            store::save(main, &releases).unwrap();
+            if s == 0 {
+                store::save(main, &releases).unwrap();
+                continue;
+            }
+            let other = tempfile::tempdir().unwrap();
+            let other_main = other.path().join("atlas.db");
+            crate::db::create_db_at(&other_main).unwrap();
+            store::set_next_seq(&crate::db::open_at(&other_main).unwrap(), 1000 * s as i64).unwrap();
+            store::save(&other_main, &releases).unwrap();
+            let made = legacy_shard_path(&other_main, 0);
+            crate::db::open_at(&made).unwrap().query_row("pragma wal_checkpoint(truncate)", [], |_| Ok(())).unwrap();
+            std::fs::copy(&made, legacy_shard_path(main, s)).unwrap();
         }
         groups
     }
@@ -958,23 +1139,20 @@ mod tests {
         assert_eq!(count(&c, "select count(distinct id) from files"), before.1);
         assert_eq!(count(&c, "select count(*) from segments where file_id not in (select id from files)"), 0);
         // each source's domains kept apart, its articles pointing at them; a message-id stored whole stays so
-        assert_eq!(count(&c, "select count(*) from legacy_domains"), LEGACY_SHARDS as i64 - 1);
+        // each source's domains kept apart under its base, its articles pointing at them; a whole message-id stays so
+        assert_eq!(count(&c, "select count(*) from domains where id >= 4294967296"), LEGACY_SHARDS as i64 - 1);
         assert_eq!(
             count(
                 &c,
-                "select count(*) from segments s join files f on f.id = s.file_id
-                 where coalesce(f.domain_base, 0) != 0 and s.domain != 0
-                   and s.domain not in (select id from legacy_domains)"
+                "select count(*) from segments s where s.domain != 0 and s.domain not in (select id from domains)"
             ),
             0
         );
         assert_eq!(count(&c, "select count(*) from segments where domain = 0"), before_whole);
         let suffix_of = |name: &str| -> String {
             c.query_row(
-                "select coalesce((select suffix from domains where id = s.domain),
-                                 (select suffix from legacy_domains where id = s.domain))
-                 from segments s join files f on f.id = s.file_id join releases r on r.id = f.release_id
-                 where r.name = ?1 and s.part = 3",
+                "select d.suffix from segments s join files f on f.id = s.file_id join releases r on r.id = f.release_id
+                 join domains d on d.id = s.domain where r.name = ?1 and s.part = 3",
                 [name],
                 |r| r.get(0),
             )
@@ -1039,12 +1217,23 @@ mod tests {
         assert!(format!("{e:#}").contains("merge"), "{e:#}");
         assert!(crate::compact::try_hold_off_compaction(&main).is_err(), "nor any other writer");
         assert!(crate::compact::Lock::take(&main).is_err(), "nor purge, the walks or a compaction");
+        // the target itself says the last step is to do, marker or no marker
+        assert!(needs_finish(&target).unwrap());
+        m.execute("insert or replace into meta (key, value) values (?1, 0)", [MERGING]).unwrap();
+        assert!(!in_progress(&m).unwrap() && needs_finish(&target).unwrap(), "the marker lost, the target still knows");
         // the run stopped before finishing: finishing again is safe
         finish(&main, &target).unwrap();
+        assert!(!needs_finish(&target).unwrap(), "finished");
         let next = |m: &Connection| store::get_meta(m, "next_seq").unwrap().unwrap();
         let once = next(&m);
         finish(&main, &target).unwrap();
         assert_eq!(next(&m), once, "the counter converted once");
+        // an id handed out in between (eight-shard numbering, a split before the cutover): a rerun goes past it
+        let c = crate::db::open_at(&target).unwrap();
+        let high = once * 8 + 40;
+        c.execute("insert into releases (id, name, group_name) values (?1, 'Late', 'g')", [high]).unwrap();
+        finish(&main, &target).unwrap();
+        assert!(next(&m) > high, "{} past {high}", next(&m));
         assert!(crate::compact::try_hold_off_compaction(&main).unwrap().is_some());
         // past the merge guard (the eight-shard layout's own check of its files is the next PR's)
         if let Err(e) = crate::db::create_db_at(&main) {
@@ -1053,5 +1242,170 @@ mod tests {
         let c = crate::db::open_at(&target).unwrap();
         assert_eq!(count(&c, "select count(*) from merge_triggers"), 0, "triggers back");
         assert!(count(&c, "select count(*) from sqlite_master where type = 'trigger'") > 1);
+    }
+
+    /// A source's file sealed in a blob, the way the writer leaves a whole file: its rows packed and gone.
+    fn seal_first_file(shard: &Path) {
+        let c = crate::db::open_at(shard).unwrap();
+        let file: i64 = c.query_row("select min(id) from files", [], |r| r.get(0)).unwrap();
+        let segs: Vec<crate::blob::Seg> = c
+            .prepare("select part, bytes, domain, local from segments where file_id = ?1")
+            .unwrap()
+            .query_map([file], |r| {
+                Ok(crate::blob::Seg { part: r.get(0)?, bytes: r.get(1)?, domain: r.get(2)?, local: r.get(3)? })
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(segs.iter().any(|s| s.domain != 0), "a domain to move");
+        c.execute("update files set blob = ?1 where id = ?2", params![crate::blob::encode(&segs), file]).unwrap();
+        c.execute("delete from segments where file_id = ?1", [file]).unwrap();
+    }
+
+    #[test]
+    fn merged_releases_read_back_their_articles_and_take_their_posts_late_articles() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        let groups = fixture(&main);
+        seal_first_file(&legacy_shard_path(&main, 5));
+        let ids_of = |main: &Path, name: &str| -> Vec<String> {
+            let id: i64 = (0..LEGACY_SHARDS)
+                .filter(|s| legacy_shard_path(main, *s).exists())
+                .find_map(|s| {
+                    crate::db::open_at(&legacy_shard_path(main, s))
+                        .unwrap()
+                        .query_row("select id from releases where name = ?1", [name], |r| r.get(0))
+                        .ok()
+                })
+                .unwrap();
+            let c = crate::db::open_at(&legacy_shard_path(main, 0)).unwrap();
+            let mut rows: Vec<String> = Vec::new();
+            let blob: Option<Vec<u8>> = c
+                .query_row("select blob from files where release_id = ?1 and blob is not null", [id], |r| r.get(0))
+                .optional()
+                .unwrap();
+            for seg in blob.map(|b| crate::blob::decode(&b).unwrap()).unwrap_or_default() {
+                let suffix: Option<String> = (seg.domain != 0).then(|| {
+                    c.query_row("select suffix from domains where id = ?1", [seg.domain], |r| r.get(0)).unwrap()
+                });
+                rows.push(store::decode(&seg.local, suffix.as_deref()));
+            }
+            rows.sort();
+            rows
+        };
+        let target = legacy_shard_path(&main, 0);
+        merge(&target, &sources(&main), true, None, &|_| {}).unwrap();
+        finish(&main, &target).unwrap();
+        // the sealed file of shard 5: its blob, read through the merged domains, gives the same message-ids
+        let read = ids_of(&main, "Rel.5.0");
+        assert_eq!(
+            read,
+            ["<s5r0a1@own5.example>", "<s5r0a2@own5.example>", "<s5r0a3@own5.example>", "<s5r0a4@rare.example>"]
+        );
+        // and the release's articles, as an NZB lists them
+        let conn = crate::db::open_with_shards(&main).unwrap();
+        let id: i64 = conn.query_row("select id from s0.releases where name = 'Rel.5.0'", [], |r| r.get(0)).unwrap();
+        let mut nzb: Vec<String> = store::articles(&conn, id).unwrap().into_iter().map(|a| a.message_id).collect();
+        nzb.sort();
+        assert_eq!(nzb, read);
+        // a late article of a source's post joins its release, under the target's secret from then on
+        let before = count(&crate::db::open_at(&target).unwrap(), "select count(*) from releases");
+        let late = Release {
+            name: "Rel.3.1".into(),
+            group: groups[3].clone(),
+            collection: Some("post 3 1".into()),
+            articles: vec![art("b.rar", 1, "s3r1b1", "own3.example")],
+            ..Default::default()
+        };
+        store::save(&main, &[late]).unwrap();
+        let c = crate::db::open_at(&target).unwrap();
+        assert_eq!(count(&c, "select count(*) from releases"), before, "no new release");
+        assert_eq!(
+            count(&c, "select count(*) from files f join releases r on r.id = f.release_id where r.name = 'Rel.3.1'"),
+            2
+        );
+        assert_eq!(
+            count(
+                &c,
+                "select count(*) from legacy_collections where release_id = (select id from releases where name = 'Rel.3.1')"
+            ),
+            0,
+            "moved"
+        );
+        // the same articles again, of a file kept as rows (Rel.3.0) and of one sealed in a blob (Rel.5.0): nothing added
+        let stats = |name: &str| -> (i64, i64, i64) {
+            c.query_row(
+                "select r.size, r.parts,
+                        (select count(*) from segments s join files f on f.id = s.file_id where f.release_id = r.id)
+                 from releases r where r.name = ?1",
+                [name],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+        };
+        let (rows_before, sealed_before) = (stats("Rel.3.0"), stats("Rel.5.0"));
+        for (s, name) in [(3usize, "Rel.3.0"), (5, "Rel.5.0")] {
+            let again = Release {
+                name: name.into(),
+                group: groups[s].clone(),
+                collection: Some(format!("post {s} 0")),
+                articles: vec![
+                    art("a.rar", 1, &format!("s{s}r0a1"), &format!("own{s}.example")),
+                    art("a.rar", 2, &format!("s{s}r0a2"), &format!("own{s}.example")),
+                    art("a.rar", 3, &format!("s{s}r0a3"), &format!("own{s}.example")),
+                    art("a.rar", 4, &format!("s{s}r0a4"), "rare.example"),
+                ],
+                ..Default::default()
+            };
+            store::save(&main, &[again]).unwrap();
+        }
+        assert_eq!(stats("Rel.3.0"), rows_before, "rows: seen again, not added");
+        assert_eq!(stats("Rel.5.0"), sealed_before, "sealed: seen again, not added");
+    }
+
+    #[test]
+    fn a_domain_two_shards_share_ends_under_one_id_whatever_their_sizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        let groups = fixture_sharing(&main, &[2, 5]);
+        // shard 2 the bigger: merged by size, shard 5 would come first and its id for the domain stop being the lowest
+        crate::db::open_at(&legacy_shard_path(&main, 2))
+            .unwrap()
+            .execute_batch(
+                "insert into meta (key, value) values ('pad', randomblob(4000000));
+                 pragma wal_checkpoint(truncate);",
+            )
+            .unwrap();
+        let todo = sources(&main);
+        assert_eq!(todo.iter().map(|s| s.shard).collect::<Vec<_>>(), (1..LEGACY_SHARDS).collect::<Vec<_>>());
+        let target = legacy_shard_path(&main, 0);
+        merge(&target, &todo, true, None, &|_| {}).unwrap();
+        finish(&main, &target).unwrap();
+        let c = crate::db::open_at(&target).unwrap();
+        let shared = "select count(distinct s.domain) from segments s join domains d on d.id = s.domain
+                      where d.suffix = '@both.example>'";
+        assert_eq!(count(&c, shared), 1, "one id for the domain");
+        // shard 5's article again: found under that id, not added
+        let segments = "select count(*) from segments";
+        let before = count(&c, segments);
+        let again = Release {
+            name: "Rel.5.1".into(),
+            group: groups[5].clone(),
+            collection: Some("post 5 1".into()),
+            articles: (1..=4).map(|n| art("b.rar", n, &format!("s5r1b{n}"), "both.example")).collect(),
+            ..Default::default()
+        };
+        store::save(&main, &[again]).unwrap();
+        assert_eq!(count(&c, segments), before, "seen again, not added");
+        // and a merge given its sources out of order stops
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        fixture(&main);
+        let target = legacy_shard_path(&main, 0);
+        let mut todo = sources(&main);
+        todo.swap(0, 1);
+        merge(&target, &todo[..1], true, None, &|_| {}).unwrap();
+        let e = merge(&target, &todo[1..], true, None, &|_| {}).unwrap_err();
+        assert!(format!("{e:#}").contains("shard order"), "{e:#}");
     }
 }

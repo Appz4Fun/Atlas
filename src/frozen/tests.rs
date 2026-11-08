@@ -642,7 +642,13 @@ fn a_reset_harvests_what_frozen_releases_hold() {
     remove_family(&copy).unwrap();
     crate::raw_store::harvest_from_shards(&f.main, &|_| {}).unwrap();
     assert!(!copy.exists(), "the harvest's copy is gone after");
-    assert_eq!(unfrozen_copy(&f.main, (shard + 1) % store::SHARDS).unwrap(), None, "no frozen file, nothing to read");
+    if store::SHARDS > 1 {
+        assert_eq!(
+            unfrozen_copy(&f.main, (shard + 1).checked_rem(store::SHARDS).unwrap_or(0)).unwrap(),
+            None,
+            "no frozen file, nothing to read"
+        );
+    }
 }
 
 #[test]
@@ -791,7 +797,11 @@ fn a_backlog_step_stops_after_a_chunk_once_its_time_is_up() {
     let conn = f.writer();
     let step = |budget| rules::backlog_some(&conn, 1_000, budget, NOW).unwrap();
     assert_eq!(step(Duration::ZERO), rules::Backlog { looked_at: 50, queued: 50 }, "one chunk");
-    assert_eq!(step(Duration::from_secs(60)), rules::Backlog { looked_at: 250, queued: 250 }, "on from where it got to");
+    assert_eq!(
+        step(Duration::from_secs(60)),
+        rules::Backlog { looked_at: 250, queued: 250 },
+        "on from where it got to"
+    );
     assert_eq!(meta(&conn, "freeze_backlog_below"), 0);
 }
 
@@ -877,4 +887,72 @@ fn a_split_uploads_frozen_rows_thaw_for_their_own_articles() {
     let parts =
         |rid: i64| -> i64 { conn.query_row("select parts from releases where id = ?1", [rid], |r| r.get(0)).unwrap() };
     assert_eq!((parts(id), parts(twin)), (2, 4));
+}
+
+#[test]
+fn payloads_of_shards_folded_into_one_keep_their_message_ids_in_a_scratch_copy() {
+    // id 3 is one suffix in the first payload's shard and another in the second's; each has a file sealed in a blob
+    // and one kept as rows
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute("attach database ':memory:' as s0", []).unwrap();
+    conn.execute_batch(&SCRATCH.replace("{s}", "s0")).unwrap();
+    let payload = |release: i64, suffix: &str| {
+        let blob = crate::blob::encode(&[crate::blob::Seg {
+            part: Some(1),
+            bytes: 10,
+            domain: 3,
+            local: store::pack_local(&format!("r{release}blob")),
+        }]);
+        let mut releases = payload::Table::new("releases", vec!["id".into(), "name".into(), "parts".into()]);
+        releases.rows.push(vec![Value::Integer(release), Value::Text(format!("R{release}")), Value::Integer(2)]);
+        let mut files =
+            payload::Table::new("files", ["id", "release_id", "filename", "seen", "blob"].map(String::from).to_vec());
+        files.rows.push(vec![
+            Value::Integer(1),
+            Value::Integer(release),
+            Value::Text("a.rar".into()),
+            Value::Blob(vec![]),
+            Value::Blob(blob),
+        ]);
+        files.rows.push(vec![
+            Value::Integer(2),
+            Value::Integer(release),
+            Value::Text("b.rar".into()),
+            Value::Blob(vec![]),
+            Value::Null,
+        ]);
+        let mut segments =
+            payload::Table::new("segments", ["file_id", "local", "domain", "part", "bytes"].map(String::from).to_vec());
+        segments.rows.push(vec![
+            Value::Integer(2),
+            Value::Blob(store::pack_local(&format!("r{release}row"))),
+            Value::Integer(3),
+            Value::Integer(1),
+            Value::Integer(10),
+        ]);
+        Payload { domains: vec![(3, suffix.to_string())], tables: vec![releases, files, segments] }
+    };
+    for (release, suffix) in [(8, "@one>"), (9, "@two>"), (10, "@one>")] {
+        restore(&conn, "s0", &payload(release, suffix), Domains::Keep).unwrap();
+    }
+    let suffix_of = |d: i64| -> String {
+        conn.query_row("select suffix from s0.domains where id = ?1", [d], |r| r.get(0)).unwrap()
+    };
+    for (release, suffix) in [(8, "@one>"), (9, "@two>"), (10, "@one>")] {
+        let blob: Vec<u8> = conn
+            .query_row("select blob from s0.files where release_id = ?1 and blob is not null", [release], |r| r.get(0))
+            .unwrap();
+        let seg = crate::blob::decode(&blob).unwrap().remove(0);
+        assert_eq!(store::decode(&seg.local, Some(&suffix_of(seg.domain))), format!("<r{release}blob{suffix}"));
+        let (local, domain): (Vec<u8>, i64) = conn
+            .query_row(
+                "select s.local, s.domain from s0.segments s join s0.files f on f.id = s.file_id
+                 where f.release_id = ?1",
+                [release],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(store::decode(&local, Some(&suffix_of(domain))), format!("<r{release}row{suffix}"));
+    }
+    assert_eq!(count(&conn, "select count(*) from s0.domains"), 2, "a payload whose ids fit takes them as they are");
 }
