@@ -2,12 +2,13 @@
 //! Howard Hinnant's `civil_from_days` (no chrono on the read path).
 //!
 //! Handled shapes, which cover what posting tools put in `Date:`:
-//! `[Dow, ]D[D] Mon YY[YY] HH:MM:SS (+|-)HHMM|GMT|UTC`. Anything else is
+//! `[Dow, ]D[D] Mon YY[YY] HH:MM:SS (+|-)HHMM|GMT|UTC[ (UTC)]`. Anything else is
 //! not parsed and the row is kept whole.
 //!
 //! Style word: bit 0 = no weekday, bit 1 = day not zero-padded, bits 2..4 =
 //! zone (0 numeric, 1 `GMT`, 2 `UTC`), bit 4 = two-digit year (1970..2069),
-//! bits 5..8 are the container's row flags (see `container`), bits 8.. =
+//! bits 5..8 are the container's row flags (see `container`), bit 8 = a
+//! trailing ` (UTC)` comment, bits 9.. =
 //! zigzag of the offset in minutes. The commonest shape,
 //! `Sat, 07 Nov 2026 12:00:00 +0000`, is 0.
 
@@ -23,7 +24,9 @@ const ZONE_SHIFT: u32 = 2;
 const YEAR2: u32 = 1 << 4;
 /// Bits of the style word the date doesn't use, free for row flags.
 pub const STYLE_FREE_BITS: u32 = 0b111 << 5;
-const OFFSET_SHIFT: u32 = 8;
+/// Followed by ` (UTC)`, the RFC 5322 comment some posting tools add after the zone.
+pub const COMMENT_UTC: u32 = 1 << 8;
+const OFFSET_SHIFT: u32 = 9;
 
 /// Days since 1970-01-01 to (year, month 1..=12, day 1..=31).
 #[inline(always)]
@@ -66,7 +69,7 @@ pub fn style_offset_secs(style: u32) -> i64 {
 /// Writes the date for UTC second `ts` in `style` into `buf`, returning its length.
 pub fn format_date(ts: i64, style: u32, buf: &mut [u8; DATE_BUF]) -> usize {
     let off_min = crate::varint::zigzag_decode((style >> OFFSET_SHIFT) as u64);
-    let local = ts + off_min * 60;
+    let local = ts.saturating_add(off_min * 60);
     let days = local.div_euclid(86_400);
     let secs = local.rem_euclid(86_400) as u32;
     let (y, m, d) = civil_from_days(days);
@@ -122,6 +125,10 @@ pub fn format_date(ts: i64, style: u32, buf: &mut [u8; DATE_BUF]) -> usize {
             two(buf, n + 3, a % 60);
             n += 5;
         }
+    }
+    if style & COMMENT_UTC != 0 {
+        buf[n..n + 6].copy_from_slice(b" (UTC)");
+        n += 6;
     }
     n
 }
@@ -182,7 +189,11 @@ pub fn parse_date(s: &[u8]) -> Option<(i64, u32)> {
         return None;
     }
     p += 10;
-    let zone = s.get(p..)?;
+    let mut zone = s.get(p..)?;
+    if let Some(z) = zone.strip_suffix(b" (UTC)") {
+        style |= COMMENT_UTC;
+        zone = z;
+    }
     let off_min: i64 = match zone {
         b"GMT" => {
             style |= 1 << ZONE_SHIFT;
@@ -253,6 +264,8 @@ mod tests {
             b"Fri, 12 Jul 24 21:31:07 UTC",
             b"Thu, 10 Oct 24 00:00:14 UTC",
             b"1 Jan 99 00:00:00 GMT",
+            b"Wed, 14 Oct 2026 14:59:32 -0700 (UTC)",
+            b"14 Oct 2026 14:59:32 GMT (UTC)",
             b"Tue, 29 Feb 2000 10:00:00 +0530",
         ] {
             let (ts, style) = parse_date(s).unwrap_or_else(|| panic!("{}", String::from_utf8_lossy(s)));

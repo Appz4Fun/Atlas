@@ -194,6 +194,10 @@ fn half_hour_zones_come_back_across_consecutive_seconds() {
         "Sat, 07 Nov 2026 13:29:59 -0930",
         "Sat, 07 Nov 2026 13:30:00 -0930",
         "Sat, 07 Nov 2026 13:30:01 -0930",
+        "Sat, 07 Nov 2026 13:30:01 -0700 (UTC)",
+        "Sat, 07 Nov 2026 13:30:02 -0700 (UTC)",
+        "Sat, 07 Nov 2026 13:59:59 -0700 (UTC)",
+        "Sat, 07 Nov 2026 14:00:00 -0700 (UTC)",
     ]
     .iter()
     .enumerate()

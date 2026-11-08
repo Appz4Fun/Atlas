@@ -219,7 +219,8 @@ pub fn unpack_msgid_tail_into(packed: &[u8], out: &mut Vec<u8>) {
             let mut acc = 0u32;
             let mut bits = 0u32;
             let mut bi = 0usize;
-            for _ in 0..len {
+            // never more chars than the bytes there can hold: a damaged length can't run away
+            for _ in 0..len.min(body.len() * 8 / 6) {
                 while bits < 6 {
                     acc = (acc << 8) | body.get(bi).copied().unwrap_or(0) as u32;
                     bi += 1;

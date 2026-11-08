@@ -55,6 +55,9 @@ pub const PADMASK_LITERAL: u16 = 0x8000;
 pub const HEADER_LEN: usize = 64;
 pub const SECTION_TABLE_LEN: usize = 16 * 16;
 pub const DATA_START: usize = HEADER_LEN + SECTION_TABLE_LEN;
+/// The most a hot block can be: 65,536 rows of the longest lines servers send, with room to spare. A
+/// header claiming more is damaged.
+pub const MAX_HOT_BLOCK_BYTES: usize = 1 << 30;
 /// The xxh3 hash of the hot body (everything after the cold prefix) is kept in the `encoding_flags` of
 /// these two section entries, low word then high word. The header CRC covers the section table, soo it
 /// covers this hash too.
@@ -1036,7 +1039,8 @@ pub fn compress_block_to_cold(hot_block: &[u8], zstd_level: i32) -> Result<Vec<u
     let h = *view.header;
     let prefix = h.cold_prefix_bytes as usize;
     let hot_len = h.hot_block_bytes as usize;
-    let frame = zstd::bulk::compress(&hot_block[prefix..hot_len], zstd_level)?;
+    let body = hot_block.get(prefix..hot_len).context("hot block cut short")?;
+    let frame = zstd::bulk::compress(body, zstd_level)?;
     let mut out = Vec::with_capacity(prefix + 8 + frame.len() + 64);
     out.extend_from_slice(&hot_block[..prefix]);
     out.extend_from_slice(&(frame.len() as u32).to_le_bytes());
@@ -1124,13 +1128,20 @@ impl<'a> NxvBlockView<'a> {
         ensure!(header_crc(slice) == header.header_crc32, "block header checksum mismatch");
         let total = header.total_block_bytes as usize;
         ensure!(total <= slice.len() && total.is_multiple_of(64), "block cut short");
+        ensure!(total >= DATA_START, "block shorter than its header");
+        ensure!(header.hot_block_bytes as usize <= MAX_HOT_BLOCK_BYTES, "block claims an implausible size");
         let data = &slice[..total];
         let sections = cast_slice::<SectionEntry>(&data[HEADER_LEN..DATA_START]).context("section table cast")?;
         let rows = header.row_count as usize;
         ensure!((1..=MAX_BLOCK_ROWS).contains(&rows), "bad row count {rows}");
         let cold = header.flags & FLAG_COLD != 0;
         let prefix = header.cold_prefix_bytes as usize;
-        ensure!(prefix <= total && prefix.is_multiple_of(64), "bad cold prefix");
+        ensure!(prefix >= DATA_START && prefix <= total && prefix.is_multiple_of(64), "bad cold prefix");
+        if cold {
+            ensure!(prefix <= header.hot_block_bytes as usize, "cold prefix past the hot block");
+        } else {
+            ensure!(header.hot_block_bytes as usize == total, "hot block size mismatch");
+        }
         let sec = |id: SectionId| -> Result<&'a [u8]> {
             let e = sections[id as usize];
             let (o, l) = (e.offset as usize, e.byte_len as usize);
@@ -1154,10 +1165,10 @@ impl<'a> NxvBlockView<'a> {
                 &cast_slice::<FsstDirectory>(fsst_sec.get(..FSST_DIR_LEN).context("short dictionary directory")?)
                     .context("directory cast")?[0];
             let slot_counts = fsst_sec
-                .get(dir.slot_counts_offset as usize..(dir.slot_counts_offset + dir.slot_counts_len) as usize)
+                .get(dir.slot_counts_offset as usize..dir.slot_counts_offset as usize + dir.slot_counts_len as usize)
                 .context("slot counts out of bounds")?;
             let subj_masks = fsst_sec
-                .get(dir.subj_masks_offset as usize..(dir.subj_masks_offset + dir.subj_masks_len) as usize)
+                .get(dir.subj_masks_offset as usize..dir.subj_masks_offset as usize + dir.subj_masks_len as usize)
                 .context("subject masks out of bounds")?;
             let tail_off = cast_slice::<u32>(sec(SectionId::MsgIdTailOffsets)?).context("tail offsets cast")?;
             ensure!(tail_off.len() == rows + 1, "tail offsets count mismatch");
@@ -1262,7 +1273,7 @@ impl HotSections<'_> {
         if id >= d.entry_count {
             return;
         }
-        let e = (d.first_entry + id) as usize;
+        let e = d.first_entry as usize + id as usize;
         let (Some(&s), Some(&t)) = (self.pool_off.get(e), self.pool_off.get(e + 1)) else { return };
         let Some(coded) = self.pool.get(s as usize..t as usize) else { return };
         match d.mode {
@@ -1288,7 +1299,6 @@ impl HotSections<'_> {
 /// FSST decode: code 255 escapes the next byte, any other code is a symbol.
 #[inline]
 fn fsst_decode(coded: &[u8], syms: &[u64], lens: &[u8], out: &mut Vec<u8>) {
-    out.reserve(coded.len() * 8 + 8);
     let mut i = 0;
     while i < coded.len() {
         let c = coded[i] as usize;
@@ -1396,7 +1406,7 @@ impl RowDecoder {
         d.nx = nx;
         let len = read_varint_unchecked(h.refs, &mut self.rpos) as usize;
         let start = self.rpos.min(h.refs.len());
-        self.rpos = (self.rpos + len).min(h.refs.len());
+        self.rpos = self.rpos.saturating_add(len).min(h.refs.len());
         d.refs = (start, self.rpos);
         d
     }

@@ -46,6 +46,9 @@ fn per_call(budget: f64, mut f: impl FnMut()) -> f64 {
 }
 
 fn run(label: &str, lines: &[Vec<u8>]) -> Result<()> {
+    anyhow::ensure!(!lines.is_empty(), "{label}: no overview lines");
+    // room for the longest row when decompressing one
+    let cap = lines.iter().map(|l| l.len()).max().unwrap_or(0) + 16;
     let raw: usize = lines.iter().map(|l| l.len() + 2).sum();
     let refs: Vec<&[u8]> = lines.iter().map(|l| l.as_slice()).collect();
     let n = lines.len();
@@ -58,12 +61,12 @@ fn run(label: &str, lines: &[Vec<u8>]) -> Result<()> {
     let zsize: usize = z.iter().map(|c| c.len()).sum();
     let art = per_call(0.3, || {
         for &i in &picks[..1000] {
-            black_box(zstd::bulk::decompress(&z[i], 4096).unwrap());
+            black_box(zstd::bulk::decompress(&z[i], cap).unwrap());
         }
     }) / 1000.0;
     let (_, st) = time(|| {
         for c in &z {
-            black_box(zstd::bulk::decompress(c, 4096).unwrap());
+            black_box(zstd::bulk::decompress(c, cap).unwrap());
         }
     });
     rows.push(Row {
@@ -83,12 +86,12 @@ fn run(label: &str, lines: &[Vec<u8>]) -> Result<()> {
     let mut dec = zstd::bulk::Decompressor::with_dictionary(&dict)?;
     let art = per_call(0.3, || {
         for &i in &picks[..1000] {
-            black_box(dec.decompress(&zd[i], 4096).unwrap());
+            black_box(dec.decompress(&zd[i], cap).unwrap());
         }
     }) / 1000.0;
     let (_, st) = time(|| {
         for c in &zd {
-            black_box(dec.decompress(c, 4096).unwrap());
+            black_box(dec.decompress(c, cap).unwrap());
         }
     });
     rows.push(Row {

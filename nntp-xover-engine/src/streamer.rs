@@ -13,7 +13,7 @@ use crate::container::{
     PADMASK_LITERAL, RowDecoder, RowParts, SUB_BLOCK_ROWS, msgid_field, render_row,
 };
 use crate::container::{STYLE_NO_BYTES, STYLE_NO_LINES, STYLE_SUBJ_IS_LOCAL};
-use crate::date::{DATE_BUF, STYLE_FREE_BITS, format_date, style_offset_secs};
+use crate::date::{COMMENT_UTC, DATE_BUF, STYLE_FREE_BITS, format_date, style_offset_secs};
 use crate::msgid_codec::unpack_msgid_tail_into;
 use crate::msgid_index::msgid_hash;
 use crate::subject_codec::{PadMask, SubjectNums};
@@ -152,7 +152,7 @@ pub(crate) fn write_row(
     if d.ts != c.cached_timestamp || date_style != c.cached_style {
         // the hour as written is the local one: compare and patch in local time (offsets can be +0530)
         let off = style_offset_secs(date_style);
-        let (local, cached_local) = (d.ts + off, c.cached_timestamp + off);
+        let (local, cached_local) = (d.ts.wrapping_add(off), c.cached_timestamp.wrapping_add(off));
         let same_hour = date_style == c.cached_style && local.div_euclid(3600) == cached_local.div_euclid(3600);
         if same_hour {
             // only MM:SS changed: patch those four digits
@@ -165,7 +165,8 @@ pub(crate) fn write_row(
             b[at + 4] = b'0' + (s % 10) as u8;
         } else {
             c.cached_date_len = format_date(d.ts, date_style, &mut c.cached_date_bytes);
-            c.zone_len = if (date_style >> 2) & 3 == 0 { 5 } else { 3 };
+            c.zone_len =
+                if (date_style >> 2) & 3 == 0 { 5 } else { 3 } + if date_style & COMMENT_UTC != 0 { 6 } else { 0 };
         }
         c.cached_timestamp = d.ts;
         c.cached_style = date_style;

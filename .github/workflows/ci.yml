@@ -20,6 +20,10 @@ jobs:
         run: rustup toolchain install
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            nntp-xover-engine -> target
 
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings

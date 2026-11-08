@@ -30,11 +30,11 @@ Each field and how it is stored:
 | article number | delta from the previous row |
 | subject | template with `[n/m]`, `(n/m)` and `.NN.` lifted out. Dictionary id, plus a PadMask of leading-zero widths, plus only the counters the template has, as deltas. If the subject is the message-id's local part (obfuscating posters do that), only a flag is stored. |
 | from | dictionary id |
-| date | UTC second as a delta, plus a style word for weekday, day padding, 2- or 4-digit year and zone, written back with Hinnant's `civil_from_days`. The style word is stored only when it changes. |
-| message-id | domain id and local-prefix id (dictionaries), plus the tail packed by alphabet: hex 4 bits a char, Usenet base64 6 bits, otherwise raw |
+| date | UTC second as a delta, plus a style word for weekday, day padding, 2- or 4-digit year, zone and a trailing ` (UTC)` comment, written back with Hinnant's `civil_from_days`. The style word is stored only when it changes. |
+| message-id | domain id and local-prefix id (dictionaries), plus the tail packed by alphabet: hex 4 bits a char, Usenet base64 6 bits, otherwise raw. The tail header's 2-bit mode has a fourth value, `0b11`, for hex with no dot (no dot-position byte follows). |
 | references | length and bytes |
 | bytes, lines | deltas. An empty field is a style flag and stores no value. |
-| Xref | skeleton id with each `group:N` number lifted out. Slot 0 is stored against the row's own article number. Every slot is a delta from the last row in the sub-block with the same skeleton, so a cross-posted post moves each group's number only a little. |
+| Xref | skeleton id with each `group:N` number lifted out. Slot 0 is stored against the row's own article number. Every slot is a delta from the last row in the sub-block with the same skeleton (for the 16 skeletons seen most recently in it; otherwise from the previous row), so a cross-posted post moves each group's number only a little. |
 
 Each dictionary is stored raw, FSST-coded, or alphabet-packed (for random strings FSST can't shrink), whichever is smallest.
 
@@ -67,6 +67,13 @@ Against the targets in the brief:
 `cargo test` runs the unit tests in each module, `tests/roundtrip.rs`, and the eight gate suites `plan.md` lays out, one file per phase (`tests/gate0_corpus.rs` to `tests/gate7_streamer.rs`): the corpus shape and determinism, varints and the date formatter against chrono on 50,000 timestamps, every corpus subject, message-id and Xref through its codec and back, the packed sizes, the filter and buckets over the corpus, a block written to a file and mapped back with rows found by article number at the sub-block edges, and the streamer. Two of the plan's numbers are not met and the tests say so where they measure them: the Xref column for 10,000 rows is about 39 KB, not under 25 KB, because a varint is a byte at least and the corpus has one to three cross-posted numbers a row; and the template cache hits on about 78% of rows, not 99%, because three posters are active at once.
 
 ## Format notes
+
+- The header's last 8 bytes (56..64) hold `cold_prefix_bytes` and `hot_block_bytes`. The section table's `encoding_flags` of sections 0 and 15 hold the low and high words of the xxh3 hash of the hot body; the header CRC covers the table, so it covers that hash. `verify_body()` checks a hot body, and decompressing a cold one checks it.
+- A checkpoint is 64 bytes: `base_art_num`, `base_timestamp`, `base_xref_slot1` (i64), `base_bytes`, `base_lines` (i32), `base_subj_nums` (5 x i32), `base_xref_slot0_delta` (i32), `varint_byte_offset`, `refs_byte_offset` (u32). The i64s come first for alignment, and the references stream gets its own offset.
+- PadMask bit 15 marks a literal row, kept whole in the literal dictionary.
+- `min_timestamp` and `max_timestamp` cover structured rows only; a block with none stores 0 for both.
+- The wire buffer never grows for rows up to about 4 KB (the flush happens at 60 KB, before a row is written); one longer row can grow it once.
+- `find_row_by_msgid` allocates a buffer when the filter passes; `find_row_by_msgid_with` uses the caller's `RowCache` and doesn't.
 
 - Blocks hold up to 65,536 rows, sorted by article number. The CSR bucket offsets are u32, because 65,536 doesn't fit a u16.
 - Dates take more shapes than the fixed 31-byte `Dow, DD Mon YYYY HH:MM:SS +0000`, so the formatter writes into a 40-byte buffer. The cache patches only MM:SS while the hour is unchanged.

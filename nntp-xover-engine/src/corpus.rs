@@ -139,18 +139,22 @@ fn pad(v: u32, w: usize) -> String {
 
 fn date(ts: i64, style: u8) -> String {
     let (off, zone) = match style {
-        0..=6 => (0, None),
+        0..=5 => (0, None),
+        6 => (-420, Some("(UTC)")),
         7 => (0, Some("GMT")),
         8 => (330, None),
         _ => (-300, None),
     };
     let mut buf = [0u8; crate::date::DATE_BUF];
-    // the style word for these shapes: no weekday and an unpadded day for the GMT ones
+    // the style word for these shapes: no weekday and an unpadded day for the GMT ones, a trailing ` (UTC)`
+    // comment after -0700 for another posting tool
     let mut s = 0u32;
-    if zone.is_some() {
-        s |= 1 | 2 | (1 << 2);
+    match zone {
+        Some("GMT") => s |= 1 | 2 | (1 << 2),
+        Some(_) => s |= crate::date::COMMENT_UTC,
+        None => {}
     }
-    s |= (crate::varint::zigzag_encode(off) as u32) << 8;
+    s |= (crate::varint::zigzag_encode(off) as u32) << 9;
     let n = crate::date::format_date(ts, s, &mut buf);
     String::from_utf8_lossy(&buf[..n]).into_owned()
 }

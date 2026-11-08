@@ -53,9 +53,6 @@ fn group_counts() {
     let (skel, _, n) = roundtrip(b"h a:1 b:2 c:3 d:4 e:5 f:6 g:7 h:8 i:9 j:10");
     assert_eq!(n, 8);
     assert!(skel.ends_with(b"i:9 j:10"));
-    // slot 0 off the article number is just another number
-    let (_, nums, _) = roundtrip(b"Xref: news.example.com alt.binaries.teevee:91500123 alt.binaries.misc:5");
-    assert_ne!(nums[0], 84_500_123);
 }
 
 #[test]
@@ -110,4 +107,33 @@ fn the_column_is_small() {
         runs.len(),
         deltas.len()
     );
+}
+
+#[test]
+fn slot_zero_off_the_article_number_in_a_block() {
+    use nntp_xover_engine::*;
+    // slot 0 equal to the number, far above it, and below it, over a checkpoint, all through the block
+    let lines: Vec<Vec<u8>> = (0..300u64)
+        .map(|i| {
+            let n = 1_000_000 + i;
+            let slot0 = match i % 3 {
+                0 => n,
+                1 => n + 7_000_000,
+                _ => n - 999_000,
+            };
+            format!(
+                "{n}\tsubj\ta\tSat, 07 Nov 2026 12:00:00 +0000\t<x{i}@c>\t\t10\t2\tXref: h a.b:{slot0} c.d:{}",
+                50 + i * 2
+            )
+            .into_bytes()
+        })
+        .collect();
+    let refs: Vec<&[u8]> = lines.iter().map(|l| l.as_slice()).collect();
+    let block = AlignedBytes::from_slice(&NxvBlockBuilder::build_hot_block(&refs).unwrap());
+    let view = NxvBlockView::from_mmap_slice(&block).unwrap();
+    assert_eq!(view.literal_rows(), 0);
+    for (i, l) in lines.iter().enumerate() {
+        assert_eq!(&view.reconstruct_row_vec(i).unwrap(), l, "row {i}");
+        assert_eq!(view.find_row_by_art_num(1_000_000 + i as u64), Some(i));
+    }
 }

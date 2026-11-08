@@ -649,7 +649,7 @@ impl SealedLogConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OverviewArchiveConfig {
     pub enabled: bool,
-    /// where it lives, `overview` next to the databases unless set
+    /// where it lives, `overview` next to the databases unless set (a relative path is taken from there too)
     pub dir: String,
     /// segments per group kept hot (fast to read); older ones are zstd compressed
     pub keep_hot: usize,
@@ -682,7 +682,15 @@ impl OverviewArchiveConfig {
     }
 
     pub fn root(&self) -> std::path::PathBuf {
-        if self.dir.is_empty() { crate::paths::app_dir().join("overview") } else { std::path::PathBuf::from(&self.dir) }
+        // a relative dir is next to the databases, soo the indexer and the CLI agree whatever their cwd
+        let dir = std::path::PathBuf::from(&self.dir);
+        if self.dir.is_empty() {
+            crate::paths::app_dir().join("overview")
+        } else if dir.is_absolute() {
+            dir
+        } else {
+            crate::paths::app_dir().join(dir)
+        }
     }
 }
 
