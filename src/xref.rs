@@ -1112,7 +1112,7 @@ fn record_queued(rx: std::sync::mpsc::Receiver<Queued>, write: &mut WriteHeaders
         let mut rows = 0;
         let mut next = Some(first);
         let mut closed = false;
-        // gathered until enough rows, the time's up, or a barrier: one is answered once what came before it is written
+        // gathered until the queue is empty, enough rows, or a barrier: one is answered once what came before it is written
         while let Some(q) = next.take() {
             match q {
                 Queued::Slice(g, a, at, done) => {
