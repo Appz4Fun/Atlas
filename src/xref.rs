@@ -980,22 +980,55 @@ fn unread_days(main: &Connection, days: &mut HashMap<i64, bool>, first: i64, las
     })
 }
 
-/// `atlas --xref-reread [--since YYYY-MM-DD] [--apply]`: the backfill days read before this linker kept the headers
-/// of uploads obfuscated per article, put back to be read again (`chunks::reopen_done`). Lockstep then reads them
-/// newest first, beside the days still to do. Runs beside the indexer.
+/// `atlas --xref-reread [--since YYYY-MM-DD] [--done-before UNIX_TIME] [--apply]`: the backfill days read before
+/// this linker kept the headers of uploads obfuscated per article, put back to be read again whole
+/// (`chunks::reopen_done`). Lockstep then reads them newest first, beside the days still to do. Days finished since
+/// the linker started keeping headers (the store's oldest header, unless `--done-before` says) were read with it and
+/// are left alone, as are days of groups the config doesn't index. Runs beside the indexer.
 pub fn run_reread(args: &[String]) -> i32 {
     let apply = args.iter().any(|a| a == "--apply");
-    let since = match args.iter().position(|a| a == "--since").and_then(|i| args.get(i + 1)) {
-        None => i64::MIN,
-        Some(day) => match chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d") {
+    let value_of = |flag: &str| -> std::result::Result<Option<&String>, String> {
+        match args.iter().position(|a| a == flag) {
+            None => Ok(None),
+            Some(i) => match args.get(i + 1) {
+                Some(v) if !v.starts_with("--") => Ok(Some(v)),
+                _ => Err(format!("{flag} needs a value")),
+            },
+        }
+    };
+    let since = match value_of("--since") {
+        Ok(None) => i64::MIN,
+        Ok(Some(day)) => match chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d") {
             Ok(d) => d.and_hms_opt(0, 0, 0).expect("midnight").and_utc().timestamp() / 86_400,
             Err(_) => {
                 println!("--since takes a day as YYYY-MM-DD, not {day}");
                 return 1;
             }
         },
+        Err(e) => {
+            println!("{e}");
+            return 1;
+        }
     };
     let main = crate::paths::database();
+    let done_before = match value_of("--done-before") {
+        Ok(Some(t)) => match t.parse::<i64>() {
+            Ok(t) => Some(t),
+            Err(_) => {
+                println!("--done-before takes a unix time in seconds, not {t}");
+                return 1;
+            }
+        },
+        Ok(None) => linker_since(&main),
+        Err(e) => {
+            println!("{e}");
+            return 1;
+        }
+    };
+    let Some(groups) = crate::config::load_config().map(|cfg| cfg.tracked_groups()) else {
+        println!("couldnt read the config for the groups indexed");
+        return 1;
+    };
     let conn = match crate::db::open_at(&main) {
         Ok(c) => c,
         Err(e) => {
@@ -1003,19 +1036,30 @@ pub fn run_reread(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let (chunks, groups) = match crate::chunks::done_since(&conn, since) {
+    let (chunks, over, untracked) = match crate::chunks::done_since(&conn, since, done_before, &groups) {
         Ok(n) => n,
         Err(e) => {
             println!("couldnt count the days read: {e:#}");
             return 1;
         }
     };
-    let span = if since == i64::MIN {
-        "every day read".to_string()
-    } else {
-        format!("the days read from {} on", args[args.iter().position(|a| a == "--since").expect("checked") + 1])
+    let span = match value_of("--since") {
+        Ok(Some(day)) => format!("the days read from {day} on"),
+        _ => "every day read".to_string(),
     };
-    println!("{span}: {chunks} day chunks over {groups} groups would be read again");
+    match done_before {
+        Some(t) => println!(
+            "{span}, finished before {} (when the linker started keeping headers; --done-before to change): {chunks} day chunks over {over} groups",
+            chrono::DateTime::from_timestamp(t, 0)
+                .map_or_else(|| t.to_string(), |d| d.format("%Y-%m-%d %H:%M:%SZ").to_string())
+        ),
+        None => println!(
+            "{span}, whenever finished (no header store to tell when the linker started; --done-before to say): {chunks} day chunks over {over} groups"
+        ),
+    }
+    if untracked > 0 {
+        println!("{untracked} day chunks of groups the config doesn't index are left alone");
+    }
     if !apply {
         println!("dry run: pass --apply to put them back to be read (the indexer may keep running)");
         return 0;
@@ -1028,7 +1072,7 @@ pub fn run_reread(args: &[String]) -> i32 {
             return 1;
         }
     };
-    match crate::chunks::reopen_done(&conn, since) {
+    match crate::chunks::reopen_done(&conn, since, done_before, &groups) {
         Ok(n) => {
             println!("{n} day chunks put back to be read again");
             0
@@ -1038,6 +1082,13 @@ pub fn run_reread(args: &[String]) -> i32 {
             1
         }
     }
+}
+
+/// When the linker started keeping headers: the oldest in the store beside `main`. None without one.
+fn linker_since(main: &Path) -> Option<i64> {
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(path_for(main), flags).ok()?;
+    conn.query_row("select min(added) from headers", [], |r| r.get::<_, Option<i64>>(0)).ok().flatten()
 }
 
 /// Every `PASS_EVERY`, drop the headers past the window, then save what has settled.
