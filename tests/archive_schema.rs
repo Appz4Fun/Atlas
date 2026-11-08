@@ -17,7 +17,7 @@ fn database() -> (tempfile::TempDir, std::path::PathBuf) {
 }
 
 fn shard(main: &std::path::Path, i: usize) -> Connection {
-    db::open_shard(&shards::shard_path(main, i)).unwrap()
+    db::open_shard(&shards::shard_path(main, i % shards::SHARDS)).unwrap()
 }
 
 fn file(conn: &Connection, release: i64, seq: i64, name: &str, size: Option<i64>, source: i64) {
@@ -26,7 +26,8 @@ fn file(conn: &Connection, release: i64, seq: i64, name: &str, size: Option<i64>
 
 /// an id that lands in shard `i`
 fn id_in(i: usize) -> i64 {
-    (1..1_000).find(|id| shards::shard_of_id(*id) == i).unwrap()
+    // past the shards there are, the next ids of the same shard: distinct ids however few shards there are
+    (1..1_000).filter(|id| shards::shard_of_id(*id) == i % shards::SHARDS).nth(i / shards::SHARDS).unwrap()
 }
 
 #[test]

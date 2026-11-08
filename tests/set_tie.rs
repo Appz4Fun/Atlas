@@ -24,7 +24,9 @@ fn a_volume_in_another_shard_joins_its_poster_s_upload_only() {
     db::create_db().unwrap();
     let main = home.path().join("atlas.db");
     let groups: Vec<String> = (0..64).map(|n| format!("alt.binaries.g{n}")).collect();
-    let in_shard = |s: usize| groups.iter().find(|g| store::shard_of(g) == s).unwrap().as_str();
+    let in_shard = |s: usize| {
+        groups.iter().filter(|g| store::shard_of(g) == s % store::SHARDS).nth(s / store::SHARDS).unwrap().as_str()
+    };
     let uploader = "uploader <u@x>".to_string();
     // the upload: a data file and a volume in shard 0, linked by the link step; its second volume went to shard 3
     let lead = Release { group: in_shard(0).into(), poster: uploader.clone(), ..release_of("Lead", "Movie.mkv", 3, 3) };
@@ -47,7 +49,7 @@ fn a_volume_in_another_shard_joins_its_poster_s_upload_only() {
     for release in [lead, vol1, vol2, forged] {
         store::save(&main, &[release]).unwrap();
     }
-    let shard = |s: usize| db::open_shard(&store::shard_path(&main, s)).unwrap();
+    let shard = |s: usize| db::open_shard(&store::shard_path(&main, s % store::SHARDS)).unwrap();
     let id = |s: usize, name: &str| -> i64 {
         shard(s).query_row("select id from releases where name = ?", [name], |r| r.get(0)).unwrap()
     };
