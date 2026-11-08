@@ -484,7 +484,11 @@ fn look(conn: &Connection, row: &ReleaseRow, days: bool, seen: &mut HashSet<i64>
 }
 
 /// The release rows `sql` selects, its columns those of `find`'s query.
-fn release_rows(conn: &Connection, sql: &str, params: impl rusqlite::Params) -> rusqlite::Result<Vec<ReleaseRow>> {
+pub(crate) fn release_rows(
+    conn: &Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+) -> rusqlite::Result<Vec<ReleaseRow>> {
     conn.prepare(sql)?
         .query_map(params, |r| {
             Ok(ReleaseRow {

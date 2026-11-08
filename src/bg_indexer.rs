@@ -1078,7 +1078,7 @@ async fn run_servers(
         let s = sched.clone();
         tasks.spawn(named!(
             "inferred parts".into(),
-            crate::inferred::run(sched.ctx.clone(), db.clone(), move || s.stopping())
+            crate::inferred::run(sched.ctx.clone(), db.clone(), move || s.stopping(), scans_stop.clone())
         ));
     }
     // once stopping, the writers do no freezing: their queues of saves drain as fast as they did before it
