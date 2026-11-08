@@ -73,7 +73,9 @@ create table if not exists headers (
     done       INTEGER NOT NULL DEFAULT 0
 ) without rowid;
 create index if not exists headers_poster on headers(poster);
-create index if not exists headers_waiting on headers(poster) where done = 0;
+-- covering, soo a pass's read of what waits reads the index alone (`waiting_placed`)
+create index if not exists headers_waiting_by on headers(poster, posted, added, grp) where done = 0;
+drop index if exists headers_waiting;
 create index if not exists headers_added on headers(added);
 -- the file a poster's articles went to, soo ones that come later join it
 create table if not exists linked (
@@ -479,7 +481,7 @@ impl Store {
     /// many times over (hundreds of GB in hours), slowing every write and read through it. Run between this
     /// connection's statements (before each pass, and every few hundred posters in one), it lets the next write
     /// start the WAL over, and `journal_size_limit` cut its file back. Returns (blocked, frames, written back).
-    pub fn checkpoint(&mut self) -> Result<(bool, i64, i64)> {
+    pub fn checkpoint(&self) -> Result<(bool, i64, i64)> {
         Ok(self.conn.query_row("pragma wal_checkpoint(passive)", [], |r| {
             Ok((r.get::<_, i64>(0)? != 0, r.get(1)?, r.get(2)?))
         })?)
@@ -552,45 +554,65 @@ impl Store {
         Ok(self.waiting_placed()?.into_iter().map(|(f, _)| f).collect())
     }
 
-    /// Each poster's articles waiting, and its file's place when it has one: one read for the pass, rather than one
-    /// a poster (most are one-article noise).
+    /// Each poster's articles waiting, and its file's place when it has one: read in pages of posters (all of one
+    /// poster's rows in one page), each its own statement with a checkpoint between, soo no single read holds the WAL
+    /// for the whole of a big store (`checkpoint`). A poster that sorts before the page read when it first comes is
+    /// read next pass; it's too new to settle anyway.
     fn waiting_placed(&self) -> Result<Vec<(FileSum, Option<Place>)>> {
-        let mut stmt = self.conn.prepare(
+        // small in tests, soo they read over several pages
+        const PAGE: i64 = if cfg!(test) { 3 } else { 20_000 };
+        let mut stmt = self.conn.prepare_cached(
             "select w.poster, w.n, w.first, w.last, w.added, w.groups,
                     l.release, l.grp, l.file, l.files, l.parts, l.leads, l.oldest
              from (select poster, count(*) n, min(posted) first, max(posted) last, max(added) added,
                           group_concat(distinct grp) groups
-                   from headers where done = 0 group by poster) w
-             left join linked l on l.poster = w.poster",
+                   from headers where done = 0 and poster > ?1
+                   group by poster order by poster limit ?2) w
+             left join linked l on l.poster = w.poster
+             order by w.poster",
         )?;
-        let rows = stmt.query_map([], |r| {
-            let groups: String = r.get(5)?;
-            let release: Option<String> = r.get(6)?;
-            let place = match release {
-                Some(release) => Some(Place {
-                    release,
-                    group: r.get(7)?,
-                    file: r.get(8)?,
-                    files: r.get(9)?,
-                    parts: r.get(10)?,
-                    leads: r.get(11)?,
-                    oldest: r.get(12)?,
-                }),
-                None => None,
-            };
-            Ok((
-                FileSum {
-                    poster: r.get(0)?,
-                    n: r.get(1)?,
-                    first: r.get(2)?,
-                    last: r.get(3)?,
-                    added: r.get(4)?,
-                    groups: groups.split(',').filter_map(|g| g.parse().ok()).collect(),
-                },
-                place,
-            ))
-        })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        let mut out = Vec::new();
+        let mut after = String::new();
+        loop {
+            let page = stmt
+                .query_map(params![after, PAGE], |r| {
+                    let groups: String = r.get(5)?;
+                    let release: Option<String> = r.get(6)?;
+                    let place = match release {
+                        Some(release) => Some(Place {
+                            release,
+                            group: r.get(7)?,
+                            file: r.get(8)?,
+                            files: r.get(9)?,
+                            parts: r.get(10)?,
+                            leads: r.get(11)?,
+                            oldest: r.get(12)?,
+                        }),
+                        None => None,
+                    };
+                    Ok((
+                        FileSum {
+                            poster: r.get(0)?,
+                            n: r.get(1)?,
+                            first: r.get(2)?,
+                            last: r.get(3)?,
+                            added: r.get(4)?,
+                            groups: groups.split(',').filter_map(|g| g.parse().ok()).collect(),
+                        },
+                        place,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let n = page.len() as i64;
+            let Some(last) = page.last().map(|(f, _)| f.poster.clone()) else { break };
+            out.extend(page);
+            if n < PAGE {
+                break;
+            }
+            after = last;
+            self.checkpoint()?;
+        }
+        Ok(out)
     }
 
     /// The uploads saved within `KEEP_SECS` of `now`.
@@ -1581,10 +1603,21 @@ mod tests {
         let (blocked, frames, written) = store.checkpoint().unwrap();
         assert!(!blocked);
         assert_eq!(frames, written, "all of it written back once no read holds it");
-        // the next write starts the WAL over, and its file is cut back
-        store.record("a.b.one", &batch[..10], 1001).unwrap();
-        assert!(std::fs::metadata(&wal).unwrap().len() < 1 << 28);
+        // the next write starts the WAL over (its file cut back, with no slack allowed here)
+        store.conn.execute_batch("pragma journal_size_limit = 0").unwrap();
+        let before = std::fs::metadata(&wal).unwrap().len();
+        let more: Vec<Article> =
+            (0..10u64).map(|k| article(&format!("z{k:023}"), "p1@x.y", "2023-12-03 16:23:23", 9000 + k)).collect();
+        store.record("a.b.one", &more, 1001).unwrap();
+        assert!(std::fs::metadata(&wal).unwrap().len() < before, "started over");
+        let (_, again, _) = store.checkpoint().unwrap();
+        assert!(again < frames, "a short WAL now: {again} vs {frames}");
         assert_eq!(store.waiting().unwrap().len(), 7, "nothing lost");
+        // read in pages: every poster once, whatever the page size
+        let all = store.waiting().unwrap();
+        let mut names: Vec<_> = all.iter().map(|f| f.poster.clone()).collect();
+        names.dedup();
+        assert_eq!(names.len(), all.len());
     }
 
     #[test]
