@@ -956,3 +956,43 @@ fn payloads_of_shards_folded_into_one_keep_their_message_ids_in_a_scratch_copy()
     }
     assert_eq!(count(&conn, "select count(*) from s0.domains"), 2, "a payload whose ids fit takes them as they are");
 }
+
+#[test]
+fn a_release_frozen_in_a_folded_shard_thaws_without_fetching_its_sealed_blobs() {
+    // frozen in shard 3 before the merge: its domain 3 is that shard's, which the merged shard keeps at 3 << 32, and
+    // its file's blob is a place in the sealed log (which this test has no address for, soo a fetch would fail)
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(&SCRATCH.replace("{s}.", "")).unwrap();
+    let base = 3i64 << 32;
+    conn.execute("insert into domains (id, suffix) values (1, '@x>'), (3, '@other>'), (?1, '@x>')", [base + 3])
+        .unwrap();
+    let mut place = sealed_log::REF_TAG.to_vec();
+    place.resize(sealed_log::REF_BYTES, 7);
+    let payload = |release: i64, domain: i64| {
+        let mut releases = payload::Table::new("releases", vec!["id".into(), "name".into(), "parts".into()]);
+        releases.rows.push(vec![Value::Integer(release), Value::Text(format!("R{release}")), Value::Integer(1)]);
+        let mut files =
+            payload::Table::new("files", ["id", "release_id", "filename", "seen", "blob"].map(String::from).to_vec());
+        files.rows.push(vec![
+            Value::Integer(1),
+            Value::Integer(release),
+            Value::Text("a.rar".into()),
+            Value::Blob(vec![]),
+            Value::Blob(place.clone()),
+        ]);
+        Payload { domains: vec![(domain, "@x>".to_string())], tables: vec![releases, files] }
+    };
+    let blob_of = |release: i64| -> Vec<u8> {
+        conn.query_row("select blob from files where release_id = ?1", [release], |r| r.get(0)).unwrap()
+    };
+    restore(&conn, "main", &payload(8 * 1000 + 3, 3), Domains::Map).unwrap();
+    let thawed = blob_of(8 * 1000 + 3);
+    assert!(crate::blob::is_remote(&thawed), "still in the log");
+    assert_eq!(crate::blob::inner(&thawed), &place[..]);
+    assert_eq!(thawed[..crate::blob::SHIFTED_TAG.len()], crate::blob::SHIFTED_TAG);
+    let at = crate::blob::SHIFTED_TAG.len();
+    assert_eq!(i64::from_le_bytes(thawed[at..at + 8].try_into().unwrap()), base, "read on from the shard's base");
+    // frozen since the merge, its ids the merged shard's: the blob as it was
+    restore(&conn, "main", &payload(8 * 1000 + 16, base + 3), Domains::Map).unwrap();
+    assert_eq!(blob_of(8 * 1000 + 16), place);
+}

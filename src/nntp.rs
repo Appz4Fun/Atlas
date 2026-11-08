@@ -1175,15 +1175,33 @@ impl Conn {
     }
 
     async fn xover_unmeasured(&mut self, start: u64, end: u64) -> Result<Vec<Overview>> {
-        let (code, message) = self.command("XOVER", Some(&format!("{start}-{end}"))).await?;
+        let lines = self.xover_raw_unmeasured(start, end).await?;
+        self.archive(&lines);
+        Ok(lines.iter().filter_map(|l| parse_overview(l)).collect())
+    }
 
+    /// A fetched listing to the overview archive, when it's on (`overview_archive`).
+    fn archive(&self, lines: &[Vec<u8>]) {
+        if let Some(group) = &self.group {
+            crate::overview_archive::record(&self.server, group, lines);
+        }
+    }
+
+    /// XOVER rows as the server sent them: dot-unstuffed, without the line
+    /// ending, nothing undone or dropped (the overview archive keeps them so).
+    pub async fn xover_raw(&mut self, start: u64, end: u64) -> Result<Vec<Vec<u8>>> {
+        let measure = self.measure("XOVER", "nntp.xover");
+        let r = self.xover_raw_unmeasured(start, end).await;
+        self.measured(measure, &r);
+        r
+    }
+
+    async fn xover_raw_unmeasured(&mut self, start: u64, end: u64) -> Result<Vec<Vec<u8>>> {
+        let (code, message) = self.command("XOVER", Some(&format!("{start}-{end}"))).await?;
         if code != 224 {
             return Err(NntpError::Reply { code, message });
         }
-
-        let lines = self.read_response_body(&message).await?;
-
-        Ok(lines.iter().filter_map(|l| parse_overview(l)).collect())
+        self.read_response_body(&message).await
     }
 
     /// Queries the NNTP server's UTC clock via `DATE` (`111 YYYYMMDDhhmmss`).
@@ -1233,6 +1251,11 @@ impl Conn {
             true
         })
         .await?;
+        if self.group.is_some() && crate::overview_archive::enabled() {
+            let lines = decode_xzver_raw(&raw_lines)?;
+            self.archive(&lines);
+            return Ok(lines.iter().filter_map(|l| parse_overview(l)).collect());
+        }
         decode_xzver_lines(&raw_lines)
     }
 
@@ -4108,6 +4131,26 @@ pub fn is_highwinds_xzver_hang_host(host: &str) -> bool {
 /// Decodes an `XZVER` multi-line response body (yEnc-wrapped or headerless yEnc lines
 /// containing a raw-deflate, zlib, or gzip overview stream) into `Overview` records.
 pub fn decode_xzver_lines(lines: &[Vec<u8>]) -> Result<Vec<Overview>> {
+    let inflated = inflate_xzver(lines)?;
+    Ok(xzver_rows(&inflated).filter_map(parse_overview).collect())
+}
+
+/// The overview rows of an `XZVER` body as the server compressed them, before any parsing (for the archive).
+pub fn decode_xzver_raw(lines: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
+    let inflated = inflate_xzver(lines)?;
+    Ok(xzver_rows(&inflated).map(<[u8]>::to_vec).collect())
+}
+
+/// The rows of an inflated `XZVER` stream: CR stripped, empty lines and the terminating dot left out.
+fn xzver_rows(inflated: &[u8]) -> impl Iterator<Item = &[u8]> {
+    inflated
+        .split(|&b| b == b'\n')
+        .map(|l| l.strip_suffix(b"\r").unwrap_or(l))
+        .filter(|l| !l.is_empty() && *l != b".")
+}
+
+/// The overview stream an `XZVER` body carries, inflated.
+fn inflate_xzver(lines: &[Vec<u8>]) -> Result<Vec<u8>> {
     if lines.is_empty() {
         return Ok(Vec::new());
     }
@@ -4129,17 +4172,7 @@ pub fn decode_xzver_lines(lines: &[Vec<u8>]) -> Result<Vec<Overview>> {
     if !inflater.finished() {
         return Err(NntpError::Decompress("truncated XZVER deflate stream".into()));
     }
-    Ok(inflated
-        .split(|&b| b == b'\n')
-        .map(|mut l| {
-            if l.last() == Some(&b'\r') {
-                l = &l[..l.len() - 1];
-            }
-            l
-        })
-        .filter(|l| !l.is_empty() && *l != b".")
-        .filter_map(parse_overview)
-        .collect())
+    Ok(inflated)
 }
 
 #[cfg(test)]

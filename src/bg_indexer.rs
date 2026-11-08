@@ -1336,11 +1336,15 @@ pub fn run() -> i32 {
     crate::sealed_store::spawn_offload(&config.sealed_log, stop.clone());
     crate::blob_bytes::spawn(&config.sealed_log, stop.clone());
     crate::shared_catalog::start(&config.shared_catalog, stop.clone());
+    crate::overview_archive::spawn(&config.overview_archive);
     if config.metrics.enabled {
         crate::metrics::catalog::spawn(Duration::from_secs(config.metrics.catalog_every_secs), stop.clone());
     }
 
-    index(config, stop, Some(writing))
+    let code = index(config, stop, Some(writing));
+    // the batches still queued for the overview archive
+    crate::overview_archive::finish(Duration::from_secs(30));
+    code
 }
 
 /// The one time move into the shards at start, if `main` needs it, with

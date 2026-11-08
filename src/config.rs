@@ -196,6 +196,7 @@ pub struct Config {
     pub media: MediaConfig,
     pub metrics: MetricsConfig,
     pub sealed_log: SealedLogConfig,
+    pub overview_archive: OverviewArchiveConfig,
     pub freeze: FreezeConfig,
     pub shared_catalog: SharedCatalogConfig,
 }
@@ -666,6 +667,62 @@ impl SealedLogConfig {
     }
 }
 
+/// The `overview_archive` object of config.toml (`crate::overview_archive`): every fetched XOVER row kept outside
+/// SQLite, compressed. Off unless enabled.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OverviewArchiveConfig {
+    pub enabled: bool,
+    /// where it lives, `overview` next to the databases unless set (a relative path is taken from there too)
+    pub dir: String,
+    /// segments per group kept hot (fast to read); older ones are zstd compressed
+    pub keep_hot: usize,
+    pub zstd_level: i32,
+}
+
+impl Default for OverviewArchiveConfig {
+    fn default() -> Self {
+        OverviewArchiveConfig { enabled: false, dir: String::new(), keep_hot: 2, zstd_level: 9 }
+    }
+}
+
+impl OverviewArchiveConfig {
+    fn from_value(v: Option<&Value>) -> OverviewArchiveConfig {
+        let mut c = OverviewArchiveConfig::default();
+        let Some(v) = v else { return c };
+        if let Some(b) = v.get("enabled").and_then(as_bool) {
+            c.enabled = b;
+        }
+        if let Some(d) = v.get("dir").and_then(Value::as_str) {
+            c.dir = d.trim().to_string();
+        }
+        if let Some(n) = v.get("keep_hot").and_then(as_int).and_then(|n| usize::try_from(n).ok()) {
+            c.keep_hot = n.min(1_000_000);
+        }
+        if let Some(n) = v.get("zstd_level").and_then(as_int) {
+            c.zstd_level = n.clamp(1, 22) as i32;
+        }
+        c
+    }
+
+    pub fn root(&self) -> std::path::PathBuf {
+        // a relative dir is next to the databases, soo the indexer and the CLI agree whatever their cwd
+        let dir = std::path::PathBuf::from(&self.dir);
+        if self.dir.is_empty() {
+            crate::paths::app_dir().join("overview")
+        } else if dir.is_absolute() {
+            dir
+        } else {
+            crate::paths::app_dir().join(dir)
+        }
+    }
+}
+
+/// The file's `overview_archive` object: no keyring.
+pub fn overview_archive_config() -> OverviewArchiveConfig {
+    read_file()
+        .map_or_else(OverviewArchiveConfig::default, |v| OverviewArchiveConfig::from_value(v.get("overview_archive")))
+}
+
 /// The `shared_catalog` object of config.toml: a Postgres copy of every shard's release-level tables
 /// (`crate::shared_catalog`). Off unless it's enabled and has a url.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -998,6 +1055,7 @@ impl Default for Config {
             naming: NamingConfig::default(),
             metrics: MetricsConfig::default(),
             sealed_log: SealedLogConfig::default(),
+            overview_archive: OverviewArchiveConfig::default(),
             shared_catalog: SharedCatalogConfig::default(),
             predb: PredbConfig::default(),
             spots: SpotsConfig::default(),
@@ -1180,6 +1238,7 @@ impl Config {
             naming: NamingConfig::from_value(v.get("naming")),
             metrics: MetricsConfig::from_value(v.get("metrics")),
             sealed_log: SealedLogConfig::from_value(v.get("sealed_log")),
+            overview_archive: OverviewArchiveConfig::from_value(v.get("overview_archive")),
             shared_catalog: SharedCatalogConfig::from_value(v.get("shared_catalog")),
             predb: PredbConfig::from_value(v.get("predb")),
             spots: SpotsConfig::from_value(v.get("spots")),
