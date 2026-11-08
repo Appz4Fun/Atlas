@@ -20,6 +20,8 @@ struct Kept {
     db: fn(&Path) -> PathBuf,
     table: &'static str,
     name: &'static str,
+    /// the rows kept, when not all of them
+    filter: Option<&'static str>,
 }
 
 fn kept() -> Vec<Kept> {
@@ -29,17 +31,24 @@ fn kept() -> Vec<Kept> {
     let raw = crate::raw_store::path_for;
     vec![
         // PreDB titles and where each feed stands (`title_keys` is built from the titles)
-        Kept { db: predb, table: "titles", name: "predb_titles" },
-        Kept { db: predb, table: "feeds", name: "predb_feeds" },
-        Kept { db: predb, table: "meta", name: "predb_meta" },
+        Kept { db: predb, table: "titles", name: "predb_titles", filter: None },
+        Kept { db: predb, table: "feeds", name: "predb_feeds", filter: None },
+        Kept { db: predb, table: "meta", name: "predb_meta", filter: None },
         // the media providers' answers: ids per title, and TMDB's details
-        Kept { db: media, table: "media_titles", name: "media_titles" },
-        Kept { db: details, table: "details", name: "media_details" },
-        Kept { db: details, table: "details_lookups", name: "media_details_lookups" },
+        Kept { db: media, table: "media_titles", name: "media_titles", filter: None },
+        Kept { db: details, table: "details", name: "media_details", filter: None },
+        Kept { db: details, table: "details_lookups", name: "media_details_lookups", filter: None },
         // OpenSubtitles' answers, and the PreDB feeds' pages as fetched
-        Kept { db: raw, table: "raw_opensubtitles", name: "opensubtitles" },
-        Kept { db: raw, table: "raw_predb_log", name: "predb_pages" },
-        Kept { db: raw, table: "raw_predb_events", name: "predb_page_events" },
+        Kept { db: raw, table: "raw_opensubtitles", name: "opensubtitles", filter: None },
+        Kept { db: raw, table: "raw_predb_log", name: "predb_pages", filter: None },
+        Kept { db: raw, table: "raw_predb_events", name: "predb_page_events", filter: None },
+        // historical PreDB snapshots, downloaded once and pinned (the rest of the HTTP cache lives 12 hours)
+        Kept {
+            db: raw,
+            table: "raw_http_cache",
+            name: "predb_snapshots",
+            filter: Some("source in ('nzedb_archive', 'dats_pciso_1998')"),
+        },
     ]
 }
 
@@ -97,9 +106,9 @@ impl PgKind {
 }
 
 fn columns(conn: &Connection, schema: &str, table: &str) -> Result<Vec<Column>> {
-    let mut stmt = conn.prepare(&format!("select name, type from {schema}.pragma_table_info(?1) order by cid"))?;
+    let mut stmt = conn.prepare("select name, type from pragma_table_info(?1, ?2) order by cid")?;
     let cols = stmt
-        .query_map([table], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .query_map([table, schema], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(cols.into_iter().map(|(name, decl)| Column { pg: PgKind::of(&decl), name, decl }).collect())
 }
@@ -152,16 +161,30 @@ impl Tally {
     }
 }
 
-fn tally_sql(conn: &Connection, sql: &str, width: usize) -> Result<Tally> {
+/// The tally of `sql`'s rows, each value checked to be of its column's kind (as Postgres will take it), soo a dry
+/// run finds what `--apply` would refuse.
+fn tally_sql(conn: &Connection, sql: &str, cols: &[Column]) -> Result<Tally> {
     let mut t = Tally::default();
     let mut buf = Vec::new();
     let mut stmt = conn.prepare(sql)?;
     let mut rows = stmt.query([])?;
-    let mut row: Vec<Value> = Vec::with_capacity(width);
+    let mut row: Vec<Value> = Vec::with_capacity(cols.len());
     while let Some(r) = rows.next()? {
         row.clear();
-        for i in 0..width {
-            row.push(r.get::<_, Value>(i)?);
+        for (i, col) in cols.iter().enumerate() {
+            let v = r.get::<_, Value>(i)?;
+            let fits = matches!(
+                (col.pg, &v),
+                (_, Value::Null)
+                    | (PgKind::Int, Value::Integer(_))
+                    | (PgKind::Real, Value::Real(_))
+                    | (PgKind::Text, Value::Text(_))
+                    | (PgKind::Blob, Value::Blob(_))
+            );
+            if !fits {
+                bail!("{}: a {v:?} in a {:?} column can't go to Postgres as it is", col.name, col.pg);
+            }
+            row.push(v);
         }
         t.add(&row, &mut buf);
     }
@@ -204,7 +227,7 @@ pub struct Copied {
 }
 
 /// `keep.db` at `out`, every kept table copied from beside `main` and checked against its source.
-pub fn build(main: &Path, out: &Path) -> Result<Vec<Copied>> {
+pub fn build(main: &Path, out: &Path, allow_missing: bool) -> Result<Vec<Copied>> {
     if out.exists() {
         bail!("{} is there already", out.display());
     }
@@ -213,27 +236,35 @@ pub fn build(main: &Path, out: &Path) -> Result<Vec<Copied>> {
     let mut copied = Vec::new();
     for k in kept() {
         let src = (k.db)(main);
+        // a database or table that isn't there is most likely the wrong directory: refused, unless told
         if !src.try_exists()? {
-            println!("  {}: no {} (nothing to keep)", k.name, src.display());
+            if !allow_missing {
+                bail!("{}: no {} (--allow-missing to go on without it)", k.name, src.display());
+            }
+            println!("  {}: no {} (left out)", k.name, src.display());
             continue;
         }
         attach_ro(&conn, &src, "src")?;
         let cols = columns(&conn, "src", k.table)?;
         if cols.is_empty() {
             conn.execute("detach database src", [])?;
-            println!("  {}: no {} table in {}", k.name, k.table, src.display());
+            if !allow_missing {
+                bail!("{}: no {} table in {} (--allow-missing to go on without it)", k.name, k.table, src.display());
+            }
+            println!("  {}: no {} table in {} (left out)", k.name, k.table, src.display());
             continue;
         }
+        let filter = k.filter.map_or(String::new(), |f| format!(" where {f}"));
         let defs = cols.iter().map(|c| format!("{} {}", quoted(&c.name), c.decl)).collect::<Vec<_>>().join(", ");
         let list = select_list(&cols);
         conn.execute_batch(&format!(
             "create table main.{name} ({defs});
-             insert into main.{name} ({list}) select {list} from src.{table};",
+             insert into main.{name} ({list}) select {list} from src.{table}{filter};",
             name = quoted(k.name),
             table = quoted(k.table)
         ))?;
-        let theirs = tally_sql(&conn, &format!("select {list} from src.{}", quoted(k.table)), cols.len())?;
-        let ours = tally_sql(&conn, &format!("select {list} from main.{}", quoted(k.name)), cols.len())?;
+        let theirs = tally_sql(&conn, &format!("select {list} from src.{}{filter}", quoted(k.table)), &cols)?;
+        let ours = tally_sql(&conn, &format!("select {list} from main.{}", quoted(k.name)), &cols)?;
         conn.execute("detach database src", [])?;
         if theirs != ours {
             bail!("{}: the copy differs from {} ({theirs:?} vs {ours:?})", k.name, src.display());
@@ -256,29 +287,49 @@ pub fn build(main: &Path, out: &Path) -> Result<Vec<Copied>> {
                  left join src.releases r on r.id = f.release_id"
             );
             conn.execute(&format!("insert into main.{FREEZE_EXEMPT} {select}"), [])?;
-            let t = tally_sql(&conn, &select, 4)?;
+            let t = tally_sql(&conn, &select, &cols)?;
             theirs.rows += t.rows;
             theirs.digest = theirs.digest.wrapping_add(t.digest);
         }
         conn.execute("detach database src", [])?;
     }
-    let ours = tally_sql(&conn, &format!("select release_id, at, name, group_name from main.{FREEZE_EXEMPT}"), 4)?;
+    let ours = tally_sql(&conn, &format!("select release_id, at, name, group_name from main.{FREEZE_EXEMPT}"), &cols)?;
     if theirs != ours {
         bail!("{FREEZE_EXEMPT}: the copy differs from the shards ({theirs:?} vs {ours:?})");
     }
     copied.push(Copied { name: FREEZE_EXEMPT.into(), columns: cols, tally: ours });
+    drop(conn);
+    std::fs::File::open(out)?.sync_all()?;
     Ok(copied)
 }
 
-/// Every table of `keep.db` (at `file`) into the Postgres `keep` schema, each replaced whole, then read back and
-/// checked against what went in.
-pub fn to_postgres(pg: &mut postgres::Client, file: &Path, copied: &[Copied]) -> Result<()> {
+/// Every table of `keep.db` (at `file`) into the Postgres `keep` schema in one transaction: each replaced whole,
+/// read back and checked against what went in, and the run noted in `keep.runs` last, soo Postgres holds one whole
+/// run or the one before. A table that would shrink (a run after a wipe, or against the wrong directory) is refused
+/// unless `force`.
+pub fn to_postgres(pg: &mut postgres::Client, file: &Path, copied: &[Copied], stamp: &str, force: bool) -> Result<()> {
     let conn = Connection::open_with_flags(file, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    pg.batch_execute("create schema if not exists keep")?;
+    let mut tx = pg.transaction()?;
+    tx.batch_execute(
+        "create schema if not exists keep;
+         create table if not exists keep.runs (stamp text not null, name text not null, rows bigint not null,
+             digest text not null, primary key (stamp, name));",
+    )?;
     for c in copied {
         let table = format!("keep.{}", quoted(&c.name));
+        let there: Option<i64> = tx
+            .query_opt(
+                "select coalesce((select rows from keep.runs where name = $1 order by stamp desc limit 1), 0)",
+                &[&c.name],
+            )?
+            .map(|r| r.get(0));
+        if let Some(before) = there
+            && before > c.tally.rows as i64
+            && !force
+        {
+            bail!("{table} held {before} rows and this run has {}: refused (--force to replace it)", c.tally.rows);
+        }
         let defs = c.columns.iter().map(|col| format!("{} {}", quoted(&col.name), col.pg.sql())).collect::<Vec<_>>();
-        let mut tx = pg.transaction()?;
         tx.batch_execute(&format!("drop table if exists {table}; create table {table} ({});", defs.join(", ")))?;
         let types: Vec<postgres::types::Type> = c
             .columns
@@ -324,18 +375,24 @@ pub fn to_postgres(pg: &mut postgres::Client, file: &Path, copied: &[Copied]) ->
         if back != c.tally {
             bail!("{table}: Postgres holds something else ({back:?} vs {:?})", c.tally);
         }
-        tx.commit()?;
+        tx.execute(
+            "insert into keep.runs (stamp, name, rows, digest) values ($1, $2, $3, $4)",
+            &[&stamp, &c.name, &(back.rows as i64), &back.hex()],
+        )?;
         println!("  {table}: {} rows, digest {}", back.rows, back.hex());
     }
+    tx.commit()?;
     Ok(())
 }
 
+/// The tally of a Postgres table, its rows streamed.
 fn pg_tally(tx: &mut postgres::Transaction<'_>, table: &str, cols: &[Column]) -> Result<Tally> {
+    use postgres::fallible_iterator::FallibleIterator;
     let mut t = Tally::default();
     let mut buf = Vec::new();
     let mut row: Vec<Value> = Vec::with_capacity(cols.len());
-    let rows = tx.query(&format!("select {} from {table}", select_list(cols)), &[])?;
-    for r in rows {
+    let mut rows = tx.query_raw(&format!("select {} from {table}", select_list(cols)), std::iter::empty::<i32>())?;
+    while let Some(r) = rows.next()? {
         row.clear();
         for (i, col) in cols.iter().enumerate() {
             row.push(match col.pg {
@@ -348,6 +405,15 @@ fn pg_tally(tx: &mut postgres::Transaction<'_>, table: &str, cols: &[Column]) ->
         t.add(&row, &mut buf);
     }
     Ok(t)
+}
+
+/// `path` and its directory flushed to disk.
+fn sync(path: &Path) -> Result<()> {
+    std::fs::File::open(path)?.sync_all()?;
+    if let Some(dir) = path.parent() {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
 }
 
 /// `keep.db` zstd compressed beside it, read back and checked byte for byte.
@@ -370,19 +436,31 @@ fn compress(file: &Path) -> Result<PathBuf> {
     Ok(out)
 }
 
-/// `atlas --export-keep [--apply]`.
+/// `atlas --export-keep [--apply] [--allow-missing] [--force]`.
 pub fn run(args: &[String]) -> i32 {
-    let apply = args.iter().any(|a| a == "--apply");
-    let main = crate::paths::database();
-    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-    let dir = main.with_file_name("keep-export").join(&stamp);
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        println!("couldnt make {}: {e}", dir.display());
+    let has = |f: &str| args.iter().any(|a| a == f);
+    let (apply, allow_missing, force) = (has("--apply"), has("--allow-missing"), has("--force"));
+    if crate::procs::indexer_alive() {
+        println!("stop indexing first: what it writes meanwhile could be missed");
         return 1;
     }
-    let file = dir.join("keep.db");
-    println!("keeping what re-indexing can't bring back, in {}:", file.display());
-    let copied = match build(&main, &file) {
+    let main = crate::paths::database();
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let root = main.with_file_name("keep-export");
+    // built under a .partial name and renamed once checked: a directory without it is a whole copy
+    let partial = root.join(format!("{stamp}.partial"));
+    let dir = root.join(&stamp);
+    if dir.exists() || partial.exists() {
+        println!("{} is there already: run again in a second", dir.display());
+        return 1;
+    }
+    if let Err(e) = std::fs::create_dir_all(&partial) {
+        println!("couldnt make {}: {e}", partial.display());
+        return 1;
+    }
+    let file = partial.join("keep.db");
+    println!("keeping what re-indexing can't bring back:");
+    let copied = match build(&main, &file, allow_missing) {
         Ok(c) => c,
         Err(e) => {
             println!("couldnt copy: {e:#}");
@@ -394,18 +472,23 @@ pub fn run(args: &[String]) -> i32 {
         println!("  {}: {} rows, digest {}", c.name, c.tally.rows, c.tally.hex());
         manifest.insert(c.name.clone(), serde_json::json!({"rows": c.tally.rows, "digest": c.tally.hex()}));
     }
-    match compress(&file) {
-        Ok(z) => println!("compressed copy: {}", z.display()),
-        Err(e) => {
-            println!("couldnt compress: {e:#}");
-            return 1;
-        }
-    }
-    if let Err(e) = std::fs::write(dir.join("manifest.json"), serde_json::Value::Object(manifest).to_string()) {
-        println!("couldnt write the manifest: {e}");
+    let left_out: Vec<&str> = kept().iter().map(|k| k.name).filter(|n| !copied.iter().any(|c| c.name == *n)).collect();
+    manifest.insert("_left_out".into(), serde_json::json!(left_out));
+    if let Err(e) = compress(&file) {
+        println!("couldnt compress: {e:#}");
         return 1;
     }
-    println!("the poster images (posters/) stay as files beside the database");
+    let written = std::fs::write(partial.join("manifest.json"), serde_json::Value::Object(manifest).to_string())
+        .map_err(anyhow::Error::from)
+        .and_then(|()| sync(&partial.join("manifest.json")))
+        .and_then(|()| Ok(std::fs::rename(&partial, &dir)?))
+        .and_then(|()| sync(&dir.join("manifest.json")));
+    if let Err(e) = written {
+        println!("couldnt finish {}: {e:#}", dir.display());
+        return 1;
+    }
+    println!("checked copy: {} (and keep.db.zst, manifest.json)", dir.join("keep.db").display());
+    println!("the poster, cover and still images stay as files beside the database");
     if !apply {
         println!("dry run: pass --apply to put these tables in the shared Postgres's keep schema too");
         return 0;
@@ -422,14 +505,14 @@ pub fn run(args: &[String]) -> i32 {
             return 1;
         }
     };
-    println!("into Postgres, each read back and checked:");
-    match to_postgres(&mut pg, &file, &copied) {
+    println!("into Postgres, in one transaction, each table read back and checked:");
+    match to_postgres(&mut pg, &dir.join("keep.db"), &copied, &stamp, force) {
         Ok(()) => {
-            println!("kept: every table checks out in {} and in Postgres", file.display());
+            println!("kept: every table checks out in {} and in Postgres (keep.runs {stamp})", dir.display());
             0
         }
         Err(e) => {
-            println!("couldnt put them in Postgres: {e:#}");
+            println!("couldnt put them in Postgres (nothing there changed): {e:#}");
             1
         }
     }
@@ -480,7 +563,7 @@ mod tests {
         .unwrap();
         s.execute("insert into freeze_exempt (release_id, at) values (40, 5)", []).unwrap();
         let out = dir.path().join("keep.db");
-        let copied = build(&main, &out).unwrap();
+        let copied = build(&main, &out, true).unwrap();
         let rows = |name: &str| copied.iter().find(|c| c.name == name).map(|c| c.tally.rows);
         assert_eq!(rows("predb_titles"), Some(2));
         assert_eq!(rows("predb_feeds"), Some(1));
@@ -497,7 +580,8 @@ mod tests {
         assert_eq!(blob, [1, 2]);
         let z = compress(&out).unwrap();
         assert!(z.exists());
-        assert!(build(&main, &out).is_err(), "never over an earlier copy");
+        assert!(build(&main, &out, true).is_err(), "never over an earlier copy");
+        assert!(build(&main, &dir.path().join("strict.db"), false).is_err(), "a missing table stops it unless allowed");
     }
 
     #[test]
@@ -525,10 +609,25 @@ mod tests {
             )
             .unwrap();
         let out = dir.path().join("keep.db");
-        let copied = build(&main, &out).unwrap();
+        let copied = build(&main, &out, true).unwrap();
         let mut pg = postgres::Client::connect(&url, postgres::NoTls).unwrap();
-        to_postgres(&mut pg, &out, &copied).unwrap();
-        to_postgres(&mut pg, &out, &copied).unwrap();
+        pg.batch_execute("drop schema if exists keep cascade").unwrap();
+        to_postgres(&mut pg, &out, &copied, "1", false).unwrap();
+        to_postgres(&mut pg, &out, &copied, "2", false).unwrap();
+        // fewer rows than the last run: refused, and nothing changed
+        let fewer: Vec<Copied> = copied
+            .iter()
+            .map(|c| Copied { name: c.name.clone(), columns: c.columns.clone(), tally: Tally { rows: 0, digest: 0 } })
+            .collect();
+        let empty = dir.path().join("empty.db");
+        let e = Connection::open(&empty).unwrap();
+        for c in &fewer {
+            let defs = c.columns.iter().map(|col| format!("{} {}", quoted(&col.name), col.decl)).collect::<Vec<_>>();
+            e.execute_batch(&format!("create table {} ({});", quoted(&c.name), defs.join(", "))).unwrap();
+        }
+        assert!(to_postgres(&mut pg, &empty, &fewer, "3", false).is_err());
+        let runs: i64 = pg.query_one("select count(distinct stamp) from keep.runs", &[]).unwrap().get(0);
+        assert_eq!(runs, 2, "the refused run left nothing");
         let n: i64 = pg.query_one("select count(*) from keep.predb_titles", &[]).unwrap().get(0);
         assert_eq!(n, 3);
         pg.batch_execute("drop schema keep cascade").unwrap();
