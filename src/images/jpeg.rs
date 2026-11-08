@@ -47,7 +47,7 @@ pub struct JpegInfo {
     pub quality_exact: bool,
     /// the quantization tables as found, hashed: one encoder at one setting gives the same
     pub tables_hash: Option<u64>,
-    /// bytes after the last EOI marker: zero for a clean file, more when something was stuck on the end
+    /// bytes after the first EOI past the first scan: zero for a clean file, more when something was stuck on the end
     pub after_end: usize,
 }
 
@@ -581,10 +581,12 @@ fn icc_description(profile: &[u8]) -> Option<String> {
     None
 }
 
-/// Bytes after the last EOI past the first scan. A file with none there (cut short) has nothing after its end, even
+/// Bytes after the first EOI past the first scan. A file with none there (cut short) has nothing after its end, even
 /// when an EXIF preview's EOI sits in its headers.
 fn after_end(bytes: &[u8]) -> usize {
-    bytes.windows(2).rposition(|w| w == [0xFF, 0xD9]).map_or(0, |at| bytes.len() - at - 2)
+    // the first EOI: coded data stuffs every 0xFF it holds, soo the first one there is the picture's end, and what's
+    // stuck on after it can hold any bytes at all
+    bytes.windows(2).position(|w| w == [0xFF, 0xD9]).map_or(0, |at| bytes.len() - at - 2)
 }
 
 #[cfg(test)]
@@ -769,7 +771,7 @@ mod tests {
         let adobe = b"Adobe\0\x64\0\0\0\0\x01".to_vec();
         let info = read(&with(
             &[(0xE0, jfif), (0xE1, xmp), (0xE2, chunk(2, two)), (0xE2, chunk(1, one)), (0xEE, adobe)],
-            b"PK\x03\x04 stuck on",
+            b"PK\x03\x04 stuck on \xFF\xD9 x",
         ))
         .unwrap();
         assert_eq!(info.jfif.as_deref(), Some("1.02"));
@@ -780,7 +782,7 @@ mod tests {
         assert_eq!(info.xmp.instance_id.as_deref(), Some("xmp.iid:def"));
         assert_eq!(info.icc.as_deref(), Some("sRGB IEC61966-2.1"));
         assert_eq!(info.adobe_transform, Some(1));
-        assert_eq!(info.after_end, 13);
+        assert_eq!(info.after_end, 18, "an EOI in what's stuck on isn't the end");
     }
 
     #[test]

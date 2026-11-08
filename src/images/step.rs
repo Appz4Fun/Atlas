@@ -47,14 +47,17 @@ pub const IMAGES: ShardTable = ShardTable {
         PRIMARY KEY (release_id, position)
     )",
     indexes: &[
-        ("release_images_sha256", "create index if not exists release_images_sha256 on release_images(sha256)"),
+        (
+            "release_images_sha256",
+            "create index if not exists release_images_sha256 on release_images(sha256, release_id)",
+        ),
         (
             "release_images_exif_id",
-            "create index if not exists release_images_exif_id on release_images(exif_id) where exif_id is not null",
+            "create index if not exists release_images_exif_id on release_images(exif_id, release_id) where exif_id is not null",
         ),
         (
             "release_images_document_id",
-            "create index if not exists release_images_document_id on release_images(document_id)
+            "create index if not exists release_images_document_id on release_images(document_id, release_id)
                 where document_id is not null",
         ),
     ],
