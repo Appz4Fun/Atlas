@@ -2022,14 +2022,15 @@ fn spot_html(d: &crate::spotnet::store::Detail, said: &SpotSaid) -> String {
 fn spot_removed(removed: crate::spotnet::store::Removed) -> String {
     let when =
         chrono::DateTime::from_timestamp(removed.at, 0).map_or(String::new(), |t| t.format(" on %Y-%m-%d").to_string());
-    let body = if removed.by_moderator {
-        format!(
+    use crate::spotnet::store::RemovedBy;
+    let body = match removed.by {
+        RemovedBy::Moderator => format!(
             "A Spotnet moderator removed this spot{when}, which they do for fakes, spam and spots in the wrong category. The release is still here, but the spot no longer vouches for what it is."
-        )
-    } else {
-        format!(
+        ),
+        RemovedBy::Spotter => format!(
             "Its spotter removed this spot{when}, which they do when they repost it or it was wrong. The release is still here, but the spot no longer vouches for what it is."
-        )
+        ),
+        RemovedBy::Blacklist => "Its spotter is on the Spotnet blacklist, which lists spotters known for spam and fakes. The release is still here, but the spot no longer vouches for what it is.".to_string(),
     };
     diag("caution", "this spot was removed", &body)
 }
@@ -4652,16 +4653,28 @@ mod tests {
         assert!(!h.contains("<dt>Rating</dt>"), "{h}");
         assert!(!h.contains("<dt>Key</dt>") && !h.contains("<dt>Sender</dt>"), "{h}");
         let removed = crate::spotnet::store::Detail {
-            removed: Some(crate::spotnet::store::Removed { at: 1_793_000_000, by_moderator: true }),
+            removed: Some(crate::spotnet::store::Removed {
+                at: 1_793_000_000,
+                by: crate::spotnet::store::RemovedBy::Moderator,
+            }),
             ..bare.clone()
         };
         let h = super::spot_html(&removed, &super::SpotSaid::default());
         assert!(h.contains("A Spotnet moderator removed this spot on 2026-10-26"), "{h}");
         let own = crate::spotnet::store::Detail {
-            removed: Some(crate::spotnet::store::Removed { at: 1_793_000_000, by_moderator: false }),
+            removed: Some(crate::spotnet::store::Removed {
+                at: 1_793_000_000,
+                by: crate::spotnet::store::RemovedBy::Spotter,
+            }),
             ..bare.clone()
         };
         assert!(super::spot_html(&own, &super::SpotSaid::default()).contains("Its spotter removed this spot"));
+        let listed = crate::spotnet::store::Detail {
+            removed: Some(crate::spotnet::store::Removed { at: 0, by: crate::spotnet::store::RemovedBy::Blacklist }),
+            ..bare.clone()
+        };
+        let h = super::spot_html(&listed, &super::SpotSaid::default());
+        assert!(h.contains("Its spotter is on the Spotnet blacklist") && !h.contains("1970"), "{h}");
         assert!(!super::spot_html(&bare, &super::SpotSaid::default()).contains("removed"));
         let gone = crate::spotnet::store::Detail { xml: crate::spotnet::store::Xml::Gone, ..bare };
         assert!(super::spot_html(&gone, &super::SpotSaid::default()).contains("could no longer be read"));

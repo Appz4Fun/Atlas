@@ -347,6 +347,17 @@ pub fn repair_needed(conn: &Connection, id: i64) -> Result<bool> {
     Ok(c.repairable())
 }
 
+/// Whether `repair_needed`'s answer for this release waits on byte counts its files don't have yet: data missing,
+/// recovery there, every file here, no PAR2 set read, and a sealed blob uncounted. Counting its blobs
+/// (`blob_bytes::count_release`) settles it.
+pub fn repair_waits_on_counts(conn: &Connection, id: i64) -> Result<bool> {
+    let c = contents_of(conn, &[id], &[], Bytes::None)?;
+    if c.data_articles_seen >= c.data_articles_expected || c.recovery_articles_seen == 0 || !verdict_needs_bytes(&c) {
+        return Ok(false);
+    }
+    Ok(union_files(conn, &[id])?.every_file_here() && crate::blob_bytes::counted_of_release(conn, id)?.is_none())
+}
+
 /// The ones of `ids` that need a repair to be whole (`repair_needed`).
 pub fn repair_needed_of(conn: &Connection, ids: &[i64]) -> HashSet<i64> {
     ids.iter().copied().filter(|id| repair_needed(conn, *id).unwrap_or(false)).collect()
@@ -2127,10 +2138,13 @@ mod tests {
         assert!(!repair_needed(&conn, enough).unwrap(), "a whole file missing");
         conn.execute(&format!("update s{s}.files set file_total = 2 where release_id = ?1"), [enough]).unwrap();
         assert!(repair_needed(&conn, enough).unwrap(), "both files the counter says");
+        assert!(!repair_waits_on_counts(&conn, enough).unwrap(), "its bytes are all counted");
         // a sealed blob not counted yet: the bytes aren't known without the sealed log, soo no
         conn.execute(&format!("update s{s}.files set blob = x'00', blob_bytes = null where release_id = ?1"), [enough])
             .unwrap();
         assert!(!repair_needed(&conn, enough).unwrap());
+        assert!(repair_waits_on_counts(&conn, enough).unwrap(), "counting its blob settles it");
+        assert!(!repair_waits_on_counts(&conn, short).unwrap(), "no recovery: nothing to wait on");
     }
 
     #[test]

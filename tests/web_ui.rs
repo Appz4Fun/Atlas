@@ -287,7 +287,7 @@ fn the_web_ui_end_to_end() {
     for fact in [
         "<dt>First and last article</dt><dd>2026-10-02 10:00 to 2026-10-02 10:05 by the poster's clock, 5 min</dd>",
         "<dt>Posting rate</dt><dd>0.6 articles a minute, 6.8 KB/s</dd>",
-        "<dt>Article numbers</dt><dd>500–502 where it was read, adjacent</dd>",
+        "<dt>Group article numbers</dt><dd>500 through 502, adjacent</dd>",
         "<dt>Threaded replies</dt><dd>none</dd>",
         "<dt>From variants</dt><dd>one From throughout</dd>",
         "<dt>Lines per article</dt><dd>4,000 lines an article, 175 bytes a line</dd>",

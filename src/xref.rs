@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use chrono::DateTime;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::parser::{Article, Release, Shape, Unparsable, is_complete, parse_subject, unparsable_shape};
 
@@ -31,6 +31,10 @@ pub const SETTLE_SECS: i64 = 15 * 60;
 pub const GAP_SECS: i64 = 5;
 /// an upload of fewer articles is noise: a random poster for each article makes uploads of one
 pub const MIN_UPLOAD_ARTICLES: i64 = 10;
+/// how long a connection waits for another's write: the recorder, the linker and the archive step share the file
+const BUSY: Duration = Duration::from_secs(120);
+/// rows one write transaction takes at most, soo no writer holds the file for long
+const WRITE_CHUNK: usize = 2000;
 /// how often the linker runs
 const PASS_EVERY: Duration = Duration::from_secs(60);
 /// what the name of every upload saved here starts with (`is_upload`)
@@ -243,9 +247,10 @@ fn upload_name(poster: &str) -> String {
     format!("{NAME_PREFIX}{}-{}", hash >> 32, hash & 0xffff_ffff)
 }
 
+/// The archive step's connection: its notes are best effort, soo it waits briefly rather than hold up a run
 fn open_rw() -> Option<Connection> {
     let conn = Connection::open(path_for(&crate::paths::database())).ok()?;
-    conn.busy_timeout(Duration::from_secs(30)).ok()?;
+    conn.busy_timeout(Duration::from_secs(5)).ok()?;
     Some(conn)
 }
 
@@ -383,7 +388,7 @@ pub struct Store {
 impl Store {
     pub fn open(path: &Path) -> Result<Store> {
         let conn = Connection::open(path)?;
-        conn.busy_timeout(Duration::from_secs(30))?;
+        conn.busy_timeout(BUSY)?;
         conn.execute_batch("pragma journal_mode = wal; pragma synchronous = normal;")?;
         conn.execute_batch(SCHEMA)?;
         let groups = {
@@ -413,31 +418,36 @@ impl Store {
         Ok(name)
     }
 
-    /// Keep the headers of `articles` of `group`, unless another server's listing brought them already.
+    /// Keep the headers of `articles` of `group`, unless another server's listing brought them already. In
+    /// transactions of `WRITE_CHUNK` rows, soo the linker's writes go between them. An error part way leaves the
+    /// chunks before it kept, and the slice is read again; should the linker settle those first (only after
+    /// `SETTLE_SECS`), the rest come as late articles or files of their upload.
     pub fn record(&mut self, group: &str, articles: &[Article], added: i64) -> Result<usize> {
         let grp = self.group_id(group)?;
-        let tx = self.conn.transaction()?;
         let mut n = 0;
-        {
-            let mut insert = tx.prepare_cached(
-                "insert or ignore into headers (message_id, poster, posted, grp, number, bytes, lines, added)
-                 values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            )?;
-            for a in articles {
-                let Some(posted) = crate::dates::naive_timestamp(&a.date) else { continue };
-                n += insert.execute(params![
-                    a.message_id,
-                    a.author,
-                    posted,
-                    grp,
-                    a.number as i64,
-                    a.bytes,
-                    a.lines,
-                    added
-                ])?;
+        for chunk in articles.chunks(WRITE_CHUNK) {
+            let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            {
+                let mut insert = tx.prepare_cached(
+                    "insert or ignore into headers (message_id, poster, posted, grp, number, bytes, lines, added)
+                     values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                )?;
+                for a in chunk {
+                    let Some(posted) = crate::dates::naive_timestamp(&a.date) else { continue };
+                    n += insert.execute(params![
+                        a.message_id,
+                        a.author,
+                        posted,
+                        grp,
+                        a.number as i64,
+                        a.bytes,
+                        a.lines,
+                        added
+                    ])?;
+                }
             }
+            tx.commit()?;
         }
-        tx.commit()?;
         Ok(n)
     }
 
@@ -445,10 +455,35 @@ impl Store {
     pub fn prune(&mut self, now: i64) -> Result<usize> {
         let before = now - KEEP_SECS;
         // what waits for a group to be read is let go at the latest a day after it would settle (see `pass_with`)
-        let n = self.conn.execute(
-            "delete from headers where added < ?1 and (done = 1 or added < ?2)",
-            params![before, before - KEEP_SECS],
-        )?;
+        // a cursor over (added, message_id), soo the rows that stay (waiting for a group) are passed once, not again
+        // for every batch
+        let mut n = 0;
+        let mut after: (i64, String) = (i64::MIN, String::new());
+        loop {
+            let batch: Vec<(i64, String)> = self
+                .conn
+                .prepare_cached(&format!(
+                    "select added, message_id from headers
+                     where added < ?1 and (done = 1 or added < ?2) and (added, message_id) > (?3, ?4)
+                     order by added, message_id limit {WRITE_CHUNK}"
+                ))?
+                .query_map(params![before, before - KEEP_SECS, after.0, after.1], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            let Some(last) = batch.last().cloned() else { break };
+            let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            {
+                let mut delete = tx.prepare_cached("delete from headers where message_id = ?1")?;
+                for (_, id) in &batch {
+                    n += delete.execute([id])?;
+                }
+            }
+            tx.commit()?;
+            // the rest waits for the next pass once the indexer stops
+            if batch.len() < WRITE_CHUNK || crate::frozen::STOPPING.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            after = last;
+        }
         // a file's place outlasts the window too: its leads are what the archive step guesses from
         self.conn.execute("delete from linked where added < ?1", [before - 7 * KEEP_SECS])?;
         // an upload outlasts the linking window by a week: the archive step may still be taking its rounds
@@ -751,7 +786,9 @@ impl Store {
     /// Articles that came for a file since aren't in it, soo they wait for the next.
     pub fn ack(&mut self, ack: &Ack) -> Result<()> {
         let Ack { finished, widened, now } = ack;
-        let tx = self.conn.transaction()?;
+        // one transaction, whatever its size: a note half made would leave an upload's last files to be found again
+        // as an upload of their own. It is key updates only, quick next to the recorder's chunks
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         {
             let mut done = tx.prepare_cached("update headers set done = 1 where message_id = ?1")?;
             let mut keep = tx.prepare_cached(
@@ -1306,5 +1343,28 @@ mod tests {
         store.record("a.b.one", &[later], 2000).unwrap();
         store.ack(&found.ack).unwrap();
         assert_eq!(store.waiting().unwrap().len(), 1, "the later article waits");
+    }
+
+    #[test]
+    fn a_big_slice_is_recorded_in_short_transactions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("atlas.xref.db");
+        let mut store = Store::open(&path).unwrap();
+        let commits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = commits.clone();
+        store
+            .conn
+            .commit_hook(Some(move || {
+                seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                false
+            }))
+            .unwrap();
+        let batch: Vec<Article> = (0..(WRITE_CHUNK * 5 + 1) as u64)
+            .map(|k| article(&format!("y{k:023}"), &format!("p{}@x.y", k % 7), "2023-12-03 16:23:23", k))
+            .collect();
+        store.group_id("a.b.one").unwrap();
+        commits.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(store.record("a.b.one", &batch, 1000).unwrap(), batch.len());
+        assert_eq!(commits.load(std::sync::atomic::Ordering::Relaxed), 6, "a commit every WRITE_CHUNK rows");
     }
 }
