@@ -96,7 +96,8 @@ fn pad(v: u32, w: usize) -> String {
 fn date(ts: i64, style: u8) -> String {
     let (off, zone) = match style {
         0..=6 => (0, None),
-        7 | 8 => (0, Some("GMT")),
+        7 => (0, Some("GMT")),
+        8 => (330, None),
         _ => (-300, None),
     };
     let mut buf = [0u8; crate::date::DATE_BUF];

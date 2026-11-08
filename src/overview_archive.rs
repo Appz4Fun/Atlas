@@ -86,10 +86,21 @@ pub fn finish(timeout: Duration) {
     let Some(lock) = SENDER.get() else { return };
     let tx = lock.lock().ok().and_then(|mut g| g.take());
     let Some(tx) = tx else { return };
+    let deadline = std::time::Instant::now() + timeout;
     let (done_tx, done_rx) = sync_channel(1);
-    if tx.send(Msg::Finish(done_tx)).is_ok() {
-        let _ = done_rx.recv_timeout(timeout);
+    // a full queue is waited on only until the deadline: the writer may be stuck on a slow disk
+    let mut msg = Msg::Finish(done_tx);
+    loop {
+        match tx.try_send(msg) {
+            Ok(()) => break,
+            Err(TrySendError::Full(m)) if std::time::Instant::now() < deadline => {
+                msg = m;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => return,
+        }
     }
+    let _ = done_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
 }
 
 /// A path component from a server or group name: anything outside `[A-Za-z0-9._+-]` becomes `_`, and a name
@@ -307,11 +318,35 @@ pub fn seal(dir: &Path, keep_hot: usize, zstd_level: i32) -> Result<usize> {
     Ok(rest.len())
 }
 
+/// Whether a segment file's blocks are all cold, from their headers (a segment holds one block, soo this
+/// usually reads 320 bytes).
+fn is_cold_file(path: &Path) -> Result<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = File::open(path)?;
+    let len = f.metadata()?.len();
+    let mut off = 0u64;
+    let mut head = [0u8; DATA_START];
+    while off < len {
+        f.seek(SeekFrom::Start(off))?;
+        f.read_exact(&mut head)?;
+        let h = peek_header(&head)?;
+        if h.flags & nntp_xover_engine::container::FLAG_COLD == 0 {
+            return Ok(false);
+        }
+        off += h.total_block_bytes.max(64) as u64;
+    }
+    Ok(true)
+}
+
 /// Makes every segment but the `keep_hot` with the highest article numbers cold.
 pub fn cool(dir: &Path, keep_hot: usize, zstd_level: i32) -> Result<()> {
     let segs = segment_files(dir);
     let n = segs.len().saturating_sub(keep_hot);
     for (_, path) in &segs[..n] {
+        // a cold segment stays as it is: look at its header only, not the whole file
+        if is_cold_file(path)? {
+            continue;
+        }
         let bytes = fs::read(path)?;
         let (blocks, good) = scan_blocks(&bytes);
         if good != bytes.len() {

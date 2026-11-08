@@ -182,3 +182,59 @@ fn rejects_bad_input_and_misaligned_slices() {
     broken[100] ^= 1;
     assert!(NxvBlockView::from_mmap_slice(&AlignedBytes::from_slice(&broken)).is_err());
 }
+
+#[test]
+fn half_hour_zones_come_back_across_consecutive_seconds() {
+    let mut lines = Vec::new();
+    for (i, s) in [
+        "Sat, 07 Nov 2026 12:00:00 +0530",
+        "Sat, 07 Nov 2026 12:00:01 +0530",
+        "Sat, 07 Nov 2026 12:59:59 +0530",
+        "Sat, 07 Nov 2026 13:00:00 +0530",
+        "Sat, 07 Nov 2026 13:29:59 -0930",
+        "Sat, 07 Nov 2026 13:30:00 -0930",
+        "Sat, 07 Nov 2026 13:30:01 -0930",
+    ]
+    .iter()
+    .enumerate()
+    {
+        lines.push(format!("{}\tx\ta\t{s}\t<m{i}@c>\t\t10\t2", i + 1).into_bytes());
+    }
+    let block = build(&lines);
+    let view = NxvBlockView::from_mmap_slice(&block).unwrap();
+    let mut scratch = XoverStreamScratch::new();
+    let mut cur = NxvRangeCursor::new_for_art_range(view, 0, u64::MAX).unwrap();
+    let mut i = 0;
+    while cur.format_next_row(&mut scratch) {
+        assert_eq!(scratch.wire_buf.strip_suffix(b"\r\n").unwrap(), lines[i].as_slice(), "row {i}");
+        scratch.wire_buf.clear();
+        i += 1;
+    }
+    assert_eq!(i, lines.len());
+}
+
+#[test]
+fn equal_article_numbers_over_a_checkpoint_all_come_back() {
+    let lines: Vec<Vec<u8>> = (0..300u32)
+        .map(|i| {
+            let n = if (5..140).contains(&i) {
+                10
+            } else if i < 5 {
+                i as u64
+            } else {
+                10 + i as u64
+            };
+            format!("{n}\tsubj {i}\ta\tSat, 07 Nov 2026 12:00:00 +0000\t<d{i}@c>\t\t10\t2").into_bytes()
+        })
+        .collect();
+    let block = build(&lines);
+    let view = NxvBlockView::from_mmap_slice(&block).unwrap();
+    let mut scratch = XoverStreamScratch::new();
+    let mut cur = NxvRangeCursor::new_for_art_range(view, 10, 10).unwrap();
+    let mut got = 0;
+    while cur.format_next_row(&mut scratch) {
+        got += 1;
+    }
+    assert_eq!(got, 135);
+    assert_eq!(view.lower_bound_row(10).unwrap(), 5);
+}

@@ -1204,8 +1204,8 @@ impl<'a> NxvBlockView<'a> {
     pub fn lower_bound_row(&self, art: u64) -> Result<usize> {
         let h = self.hot()?;
         let cps = self.checkpoints;
-        // last sub-block starting at or below art
-        let sb = cps.partition_point(|c| (c.base_art_num as u64) <= art).saturating_sub(1);
+        // the sub-block before the first one starting at art or above (equal numbers can straddle a checkpoint)
+        let sb = cps.partition_point(|c| (c.base_art_num as u64) < art).saturating_sub(1);
         let mut cur = RowDecoder::at_sub_block(self, sb);
         let end = self.row_count();
         while cur.row < end {

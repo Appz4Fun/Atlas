@@ -57,6 +57,12 @@ fn two(buf: &mut [u8], at: usize, v: u32) {
     buf[at + 1] = b'0' + (v % 10) as u8;
 }
 
+/// The zone offset a style word carries, in seconds east of UTC.
+#[inline(always)]
+pub fn style_offset_secs(style: u32) -> i64 {
+    crate::varint::zigzag_decode((style >> OFFSET_SHIFT) as u64) * 60
+}
+
 /// Writes the date for UTC second `ts` in `style` into `buf`, returning its length.
 pub fn format_date(ts: i64, style: u32, buf: &mut [u8; DATE_BUF]) -> usize {
     let off_min = crate::varint::zigzag_decode((style >> OFFSET_SHIFT) as u64);

@@ -184,10 +184,13 @@ fn run(label: &str, lines: &[Vec<u8>]) -> Result<()> {
     }) / 50.0;
     let msgid_cold = per_call(0.5, || {
         for m in &ids[..50] {
-            let b = cold_views.iter().position(|v| v.may_contain_msgid(m)).unwrap();
-            let hotb = decompress_cold_block(&cold_al[b]).unwrap();
-            let v = NxvBlockView::from_mmap_slice(&hotb).unwrap();
-            black_box(v.find_row_by_msgid_with(m, &mut cache).unwrap());
+            // every block whose filter says maybe, until one really has it (filters give false positives)
+            let found = cold_views.iter().enumerate().filter(|(_, v)| v.may_contain_msgid(m)).find_map(|(b, _)| {
+                let hotb = decompress_cold_block(&cold_al[b]).unwrap();
+                let v = NxvBlockView::from_mmap_slice(&hotb).unwrap();
+                v.find_row_by_msgid_with(m, &mut cache)
+            });
+            black_box(found.expect("message-id not found"));
         }
     }) / 50.0;
     let stream_cold = per_call(1.0, || {

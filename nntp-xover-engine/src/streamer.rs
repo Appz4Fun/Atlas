@@ -13,7 +13,7 @@ use crate::container::{
     PADMASK_LITERAL, RowDecoder, RowParts, SUB_BLOCK_ROWS, msgid_field, render_row,
 };
 use crate::container::{STYLE_NO_BYTES, STYLE_NO_LINES, STYLE_SUBJ_IS_LOCAL};
-use crate::date::{DATE_BUF, STYLE_FREE_BITS, format_date};
+use crate::date::{DATE_BUF, STYLE_FREE_BITS, format_date, style_offset_secs};
 use crate::msgid_codec::unpack_msgid_tail_into;
 use crate::msgid_index::msgid_hash;
 use crate::subject_codec::{PadMask, SubjectNums};
@@ -143,10 +143,13 @@ pub(crate) fn write_row(
     refresh(h, DICT_PFX, h.pfx[row] as u32, &mut c.cached_msgid_pfx_id, &mut c.cached_msgid_pfx);
     let date_style = d.style & !STYLE_FREE_BITS;
     if d.ts != c.cached_timestamp || date_style != c.cached_style {
-        let same_hour = date_style == c.cached_style && d.ts.div_euclid(3600) == c.cached_timestamp.div_euclid(3600);
+        // the hour as written is the local one: compare and patch in local time (offsets can be +0530)
+        let off = style_offset_secs(date_style);
+        let (local, cached_local) = (d.ts + off, c.cached_timestamp + off);
+        let same_hour = date_style == c.cached_style && local.div_euclid(3600) == cached_local.div_euclid(3600);
         if same_hour {
-            // only MM:SS changed: patch those four digits (offsets are whole minutes, so the hour is the local hour)
-            let s = d.ts.rem_euclid(3600) as u32;
+            // only MM:SS changed: patch those four digits
+            let s = local.rem_euclid(3600) as u32;
             let at = c.cached_date_len - c.zone_len - 6;
             let b = &mut c.cached_date_bytes;
             b[at] = b'0' + (s / 600) as u8;
@@ -261,7 +264,9 @@ impl<'a> NxvRangeCursor<'a> {
     pub fn new_for_art_range(view: NxvBlockView<'a>, min_art: u64, max_art: u64) -> Result<Self> {
         let h = *view.hot()?;
         let cps = view.checkpoints;
-        let sb = cps.partition_point(|c| (c.base_art_num as u64) <= min_art).saturating_sub(1);
+        // the sub-block before the first one starting at min_art or above: rows equal to min_art can run back over
+        // a checkpoint
+        let sb = cps.partition_point(|c| (c.base_art_num as u64) < min_art).saturating_sub(1);
         let mut dec = RowDecoder::at_sub_block(&view, sb);
         let rows = view.row_count();
         let mut pending = None;
