@@ -710,11 +710,13 @@ fn with_beside(conn: &Connection, id: i64, post: Option<SplitPost>) -> Result<Op
     if extra.is_empty() {
         return Ok(post);
     }
+    let alone = post.is_none();
     let mut post = match post {
         Some(post) => post,
         None => {
             let Some((group, size)) = group_and_size(conn, id)? else { return Ok(None) };
-            let complete = single_post_complete(conn, id)?;
+            // whole as the release was, or by the PAR2 set's check that vouched for it
+            let complete = single_post_complete(conn, id)? || vouched_complete(conn, id)?;
             SplitPost {
                 ids: vec![id],
                 groups: vec![group],
@@ -726,6 +728,10 @@ fn with_beside(conn: &Connection, id: i64, post: Option<SplitPost>) -> Result<Op
             }
         }
     };
+    // the files of a release counted with the one found beside it can be whole together: `[5/6]` posted apart
+    let mut all = post.ids.clone();
+    all.extend(&extra);
+    let together = post.lead.is_none() && union_files(conn, &all)?.complete();
     for row in extra {
         let Some((group, bytes)) = group_and_size(conn, row)? else { continue };
         post.complete &= union_files(conn, &[row])?.complete_by_files();
@@ -739,7 +745,20 @@ fn with_beside(conn: &Connection, id: i64, post: Option<SplitPost>) -> Result<Op
         }
         post.beside.push(row);
     }
+    if together && (alone || post.recovery.is_empty()) {
+        post.complete = true;
+    }
     Ok(Some(post))
+}
+
+/// Whether a release's own row says it's whole (`releases.complete`), as the PAR2 set's check can vouch.
+fn vouched_complete(conn: &Connection, id: i64) -> Result<bool> {
+    let s = store::shard_of_id(id);
+    Ok(conn
+        .prepare_cached(&format!("select coalesce(complete, 0) from s{s}.releases where id = ?1"))?
+        .query_row([id], |r| r.get::<_, i64>(0))
+        .optional()?
+        .is_some_and(|c| c != 0))
 }
 
 fn post_alone(conn: &Connection, release: &crate::search::ReleaseRow, catalog: bool) -> Result<Option<SplitPost>> {
@@ -2751,6 +2770,47 @@ mod tests {
             assert!(post.complete);
             assert_eq!(post.groups, [a, b, c, d]);
         }
+    }
+
+    #[test]
+    fn a_release_counted_with_its_thumbnail_is_whole_once_the_thumbnail_is_found() {
+        let (_dir, conn) = all_shards();
+        let g = "alt.binaries.a";
+        // `[n/4]`: a film not named as the post and two volumes here, the thumbnail posted apart as one of the four
+        put_row_counted(
+            &conn,
+            1,
+            "Some.Album.2026",
+            g,
+            "a@x",
+            &[
+                ("Some.Film.2160p.mkv", &[1, 2], 2),
+                ("Some.Film.2160p.par2", &[1], 1),
+                ("Some.Film.2160p.vol0+1.par2", &[1], 1),
+            ],
+            "2026-11-03 07:36:18",
+            4,
+        );
+        let lead = row_of(&conn, 1, g).id;
+        assert!(!single_post_complete(&conn, lead).unwrap(), "three of the four files");
+        put_row_counted(
+            &conn,
+            2,
+            "00-thumbnail.jpg",
+            g,
+            "b@x",
+            &[("00-thumbnail.jpg", &[1], 1)],
+            "2026-11-03 07:36:19",
+            4,
+        );
+        let thumb = row_of(&conn, 2, g).id;
+        conn.execute(
+            &format!("insert into s{}.beside_files (row_id, release_id) values (?2, ?1)", store::shard_of(g)),
+            rusqlite::params![lead, thumb],
+        )
+        .unwrap();
+        let post = whole_post_with(&conn, &row_of(&conn, 1, g)).unwrap().unwrap();
+        assert!(post.complete, "the four files together");
     }
 
     #[test]

@@ -25,7 +25,7 @@ pub const NOT_TV_MOVIES: &str = "not_tv_movies";
 /// hold obfuscated movies and TV), complete or not; an uncategorized release stays live, since a later step may still
 /// find it is a movie or an episode.
 /// Never an obfuscated row (the files of one upload sit in rows of their own until the link step joins them), a row of
-/// a linked upload, a small file found beside a release (its post's NZB takes it in), one with an NZB among its files
+/// a linked upload, a small file found beside a release or the release (its post's NZB takes the file in), one with an NZB among its files
 /// or one a stored NZB points to (the NZB chain needs them), nor one
 /// thawed by hand.
 macro_rules! matching {
@@ -59,7 +59,7 @@ macro_rules! matching {
             and not exists (select 1 from freeze_exempt e where e.release_id = r.id)
             and not exists (select 1 from upload_link u where u.release_id = r.id)
             and not exists (select 1 from upload_link u where u.lead_id = r.id)
-            and not exists (select 1 from beside_files b where b.row_id = r.id)
+            and not exists (select 1 from beside_files b where b.row_id = r.id or b.release_id = r.id)
             and not exists (select 1 from nzb_pointed p where p.release_id = r.id)
             and not exists (select 1 from files f where f.release_id = r.id and f.filename like '%.nzb')"
     };

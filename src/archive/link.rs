@@ -406,9 +406,8 @@ impl LinkStep {
                 .prepare_cached("select coalesce((select done | failed from pp_state where release_id = ?1), 0) & ?2")
                 .and_then(|mut stmt| stmt.query_row(params![me.id, mask(super::steps::PAR2_STEP)], |r| r.get(0)))
                 .map_err(retry)?;
-            // a release the PAR2 step passes over, or one long settled, isn't waited on
-            let fresh = age_days(ctx, &me).is_some_and(|days| days < BESIDE_WAIT_DAYS);
-            let wait_until = (par2_done == 0 && fresh).then(|| chrono::Utc::now().timestamp() + RESUME_SECS);
+            // the PAR2 step finishes or gives up on every release it applies to; one it passes over isn't waited on
+            let wait_until = (par2_done == 0).then(|| chrono::Utc::now().timestamp() + RESUME_SECS);
             return Ok(Outcome { wait_until, ..Default::default() });
         };
         let own: HashSet<String> = files.iter().map(|f| f.filename.to_ascii_lowercase()).collect();
@@ -435,6 +434,9 @@ impl LinkStep {
         let mut found: Vec<(i64, [u8; 16])> = Vec::new();
         let mut tried: Vec<i64> = Vec::new();
         let mut checks = 0;
+        let mut out_of_bodies = false;
+        // a small file the set names is a picture, often: the fetcher lets this step read one
+        ctx.allow_pictures();
         let posted = me.posted_date.clone().unwrap_or_default();
         if let Some((from, to)) = beside_window(&posted, BESIDE_SECS) {
             'files: for want in missing.clone() {
@@ -443,7 +445,10 @@ impl LinkStep {
                         break 'files;
                     }
                     checks += 1;
-                    let Some(seen) = self.check(ctx, &candidate)? else { break 'files };
+                    let Some(seen) = self.check(ctx, &candidate)? else {
+                        out_of_bodies = true;
+                        break 'files;
+                    };
                     if seen.md5_16k.is_some() && seen.is(want) {
                         found.push((candidate.id, want.file_id));
                         missing.retain(|f| f.file_id != want.file_id);
@@ -458,7 +463,14 @@ impl LinkStep {
         let now = chrono::Utc::now().timestamp();
         // one not saved yet may turn up while the release is new; once one is found the run is done, soo the pictures
         // step's rerun isn't lost to a wait
-        let wait_until = (!missing.is_empty() && fresh && found.is_empty()).then_some(now + LOOK_AGAIN_SECS);
+        let wait_until = if !found.is_empty() || missing.is_empty() {
+            None
+        } else if out_of_bodies {
+            // the rest goes on soon, whatever the release's age
+            Some(now + RESUME_SECS)
+        } else {
+            fresh.then_some(now + LOOK_AGAIN_SECS)
+        };
         let mut writes: Vec<StepWrite> =
             tried.iter().map(|other| StepWrite::new(TRIED, vec![me.id.into(), (*other).into()])).collect();
         if found.is_empty() {

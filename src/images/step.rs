@@ -247,7 +247,11 @@ fn linked_files(conn: &rusqlite::Connection, lead: i64) -> rusqlite::Result<Vec<
         .collect::<rusqlite::Result<_>>()?;
     let mut files = Vec::new();
     // and the small files found beside it
-    let beside = crate::archive::link::beside_rows(conn, lead)?;
+    // this shard's own table, by its bare name: a step's connection has no other shard attached
+    let beside: Vec<i64> = conn
+        .prepare_cached("select row_id from beside_files where release_id = ?1 limit 16")?
+        .query_map([lead], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
     for member in members.into_iter().chain(beside) {
         files.extend(store::release_files(conn, member, 50)?);
     }
@@ -339,6 +343,8 @@ impl Step for ImagesStep {
         Reruns { on_rename: false, on_growth: true }
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
+        // pictures are what this step reads: the fetcher refuses them to every other
+        ctx.allow_pictures();
         let mut files = ctx.files().map_err(|e| StepError::Retry(e.to_string()))?;
         // the small files found beside this release, as a thumbnail posted under a subject of its own, and the rows
         // of an upload it leads (`archive::link`)
