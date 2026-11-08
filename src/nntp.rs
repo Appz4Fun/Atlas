@@ -3336,6 +3336,7 @@ impl Pool {
                 _ => Ask::No,
             };
             let probing = matches!(ask, Ask::Probe(_));
+            let wide = end.saturating_sub(start) + 1 >= 2 * MIN_CHUNK;
             let mut requests = 1;
             let (method, r) = if matches!(ask, Ask::No) {
                 let compressed = lease.conn.as_ref().is_some_and(|c| c.compressed);
@@ -3372,13 +3373,13 @@ impl Pool {
                         requests = 2;
                         ("xover", within(self.xover_deadline, "XOVER", lease.begin().xover(start, end)).await)
                     }
-                    // a wide slice that times out is halved like an XOVER's (see `xover_on`): XOVER would likely time
-                    // out too, soo it says nothing against XZVER, and a probe stays untried
-                    Err(e) if e.is_timeout() && end.saturating_sub(start) + 1 >= 2 * MIN_CHUNK => ("xzver", Err(e)),
+                    // where it works, a wide slice that times out is halved like an XOVER's (see `xover_on`)
+                    Err(e) if !probing && e.is_timeout() && wide => ("xzver", Err(e)),
                     // hung, hung up on, or garbled: the slice again with plain XOVER on another connection (this one
-                    // may still have the reply coming)
+                    // may still have the reply coming). A wide probe that timed out may only have been slow: it
+                    // counts toward `GROUP_REFUSALS` (see `xzver_failed`), and XOVER is halved in turn if it times out too
                     Err(e) => {
-                        self.xzver_failed(&lease.server, &e, probing);
+                        self.xzver_failed(&lease.server, &e, probing && !(e.is_timeout() && wide));
                         crate::profile::Load::add_since(&crate::profile::LOAD.xover_ns, sent);
                         crate::profile::LOAD.xovers.fetch_add(1, Ordering::Relaxed);
                         let _ = lease.check(Err::<(), _>(e));
@@ -3433,16 +3434,13 @@ impl Pool {
         }
     }
 
-    /// `XZVER` failed on server `i`: plain XOVER until `COMPRESS_RETRY` when the server refused it (5xx), the probe
-    /// failed other than by a dropped connection or a `400` (which say nothing about `XZVER`), or it failed
-    /// `GROUP_REFUSALS` listings in a row (one odd group or a dropped connection doesnt cost an hour of plain headers).
-    fn xzver_failed(&self, server: &Server, e: &NntpError, probing: bool) {
-        let refused = e.code().is_some_and(|c| (500..600).contains(&c));
+    /// `XZVER` failed on server `i`: plain XOVER until `COMPRESS_RETRY` when a probe that settles it (`decisive`)
+    /// failed other than by a dropped connection or a `400` (which say nothing about `XZVER`), or after
+    /// `GROUP_REFUSALS` failures in a row (one odd group, a dropped connection or a backend 502 where it works
+    /// doesnt cost an hour of plain headers).
+    fn xzver_failed(&self, server: &Server, e: &NntpError, decisive: bool) {
         let transient = e.is_closed() || e.code() == Some(400);
-        if refused
-            || (probing && !transient)
-            || server.xzver_failures.fetch_add(1, Ordering::Relaxed) + 1 >= GROUP_REFUSALS
-        {
+        if (decisive && !transient) || server.xzver_failures.fetch_add(1, Ordering::Relaxed) + 1 >= GROUP_REFUSALS {
             self.xzver_refused(server, e);
         }
     }
@@ -5309,15 +5307,21 @@ mod xzver_fallback_tests {
         });
     }
 
-    /// a wide probe that times out is halved like an XOVER, and only a narrow one that times out refuses XZVER
+    /// a wide probe that times out may only have been slow: the slice is read with XOVER, and XZVER is refused
+    /// after `GROUP_REFUSALS` of them, not the first
     #[test]
-    fn a_wide_probe_that_times_out_is_halved() {
+    fn a_wide_probe_that_times_out_is_read_with_xover() {
         run(async {
             let (port, log) = serve_with(Answer::Hang).await;
             let mut pool = pool(port, true);
             pool.xover_deadline = Duration::from_millis(300);
             assert!(pool.xover_on(0, "g", 1, 2 * MIN_CHUNK).await.is_ok());
-            assert_eq!(count(&log, "XZVER"), 2, "the wide one, then its left half");
+            assert_eq!(count(&log, "XZVER"), 1);
+            assert_eq!(count(&log, "XOVER"), 1, "the whole slice, not halves");
+            assert_eq!(*pool.servers[0].xzver.lock().unwrap(), Xzver::Untried);
+            for _ in 1..GROUP_REFUSALS {
+                assert!(pool.xover_on(0, "g", 1, 2 * MIN_CHUNK).await.is_ok());
+            }
             assert!(matches!(*pool.servers[0].xzver.lock().unwrap(), Xzver::Refused(_)));
         });
     }
@@ -5336,7 +5340,7 @@ mod xzver_fallback_tests {
     }
 
     #[test]
-    fn any_5xx_refuses_xzver() {
+    fn a_5xx_to_the_probe_refuses_xzver() {
         run(async {
             let (port, log) = serve(b"502 not for you\r\n".to_vec()).await;
             let pool = pool(port, true);
