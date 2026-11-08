@@ -62,6 +62,11 @@ fn dir_bytes(dir: &Path) -> u64 {
     n
 }
 
+/// The posting hour (unix seconds) a header window file holds: `HOUR-PART.nxv` or `HOUR.tail`.
+fn file_hour(path: &Path) -> Option<i64> {
+    path.file_stem()?.to_str()?.split('-').next()?.parse().ok()
+}
+
 fn import(args: &[String]) -> Result<()> {
     let to = PathBuf::from(arg(args, "--to").context("--to DIR")?);
     let limit: usize = arg(args, "--files").and_then(|n| n.parse().ok()).unwrap_or(usize::MAX);
@@ -74,17 +79,33 @@ fn import(args: &[String]) -> Result<()> {
         .chain(tails.into_iter().map(|(s, p, n)| (false, s, p, n)))
         .collect();
     // posting hour order, the way reading goes
-    files.sort_by_key(|f| {
-        f.2.file_stem().and_then(|s| s.to_str()).and_then(|s| s.split('-').next()?.parse::<i64>().ok())
-    });
+    files.sort_by_key(|f| file_hour(&f.2));
     files.truncate(limit);
     let in_bytes: u64 = files.iter().map(|f| f.3).sum();
     let (store, _) = Store::open(StoreConfig::new(&to), keep_all())?;
     let now = chrono::Utc::now().timestamp();
     let t = Instant::now();
     let (mut rows, mut read_ns) = (0u64, 0u128);
-    let mut last_ticket = None;
+    let mut last_ticket: Option<super::store::Ticket> = None;
+    // days the import has moved two past get sealed, soo open slabs (and memory) stay a couple of days deep
+    let mut open_days: BTreeSet<i64> = BTreeSet::new();
     for (k, (is_block, server, path, _)) in files.iter().enumerate() {
+        if let Some(day) = file_hour(path).map(|h| h.div_euclid(DAY)) {
+            open_days.insert(day);
+            let done: Vec<i64> = open_days.range(..day - 1).copied().collect();
+            if !done.is_empty() {
+                store.seal_days(&done);
+                for d in &done {
+                    open_days.remove(d);
+                }
+            }
+        }
+        // the logs kept no more than a few hundred files behind
+        if k % 500 == 499
+            && let Some(t) = &last_ticket
+        {
+            t.wait(Duration::from_secs(600))?;
+        }
         let Some(group) = path.parent().and_then(crate::header_window::decode) else { continue };
         let Some(server) = crate::header_window::decode(Path::new(server)) else { continue };
         let r = Instant::now();
@@ -216,9 +237,80 @@ fn link(args: &[String]) -> Result<()> {
         }
     }
     let read = t.elapsed();
-    let mut by_poster: BTreeMap<String, crate::xref::FileSum> = BTreeMap::new();
-    for a in &arts {
-        let f = by_poster.entry(a.poster.clone()).or_insert_with(|| crate::xref::FileSum {
+    let mine = chain_summary(&arts, from, to);
+    let total = t.elapsed();
+    println!(
+        "store pass over {}..{} (±2h): {blocks} blocks, {rows} rows read in {:.1}s; {} obfuscated articles kept ({dup} repeats dropped), {} files",
+        crate::xref::iso_pub(from),
+        crate::xref::iso_pub(to),
+        read.as_secs_f64(),
+        arts.len(),
+        mine.files
+    );
+    println!("  {}; pass took {:.1}s", mine.line(), total.as_secs_f64());
+    // the SQLite linker's own store over the same span, read only: its headers chained the same way, and the uploads
+    // it saved
+    let xdb = crate::xref::path_for(&crate::paths::database());
+    if xdb.exists() {
+        let t = Instant::now();
+        let conn = rusqlite::Connection::open_with_flags(&xdb, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(Duration::from_secs(10))?;
+        let mut stmt = conn.prepare("select poster, posted, grp, bytes from headers where posted between ?1 and ?2")?;
+        let theirs: Vec<Art> = stmt
+            .query_map([lo, hi], |r| {
+                Ok(Art { poster: r.get(0)?, posted: r.get(1)?, group: r.get(2)?, bytes: r.get(3)? })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let sum = chain_summary(&theirs, from, to);
+        println!(
+            "SQLite store's headers over the same span: {} articles, {} files, read in {:.1}s",
+            theirs.len(),
+            sum.files,
+            t.elapsed().as_secs_f64()
+        );
+        println!("  {}", sum.line());
+        let (n, f): (i64, Option<i64>) = conn.query_row(
+            "select count(*), sum(files) from uploads where first between ?1 and ?2",
+            [from, to],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        println!("SQLite linker uploads saved starting in the span: {n}, {} files", f.unwrap_or(0));
+    }
+    store.close()
+}
+
+/// What one linker pass over a set of articles makes of the span `from..=to`.
+struct Summary {
+    files: usize,
+    uploads: u64,
+    cross: u64,
+    up_files: u64,
+    articles: i64,
+    bytes: i64,
+    noise: u64,
+}
+
+impl Summary {
+    fn line(&self) -> String {
+        format!(
+            "uploads starting in the span: {} ({} across groups), {} files, {} articles, {:.1} GB; {} too small",
+            self.uploads,
+            self.cross,
+            self.up_files,
+            self.articles,
+            self.bytes as f64 / 1e9,
+            self.noise
+        )
+    }
+}
+
+/// Articles grouped into files by poster and the files chained into uploads by the linker's rule (`xref::chain`);
+/// the uploads whose first article falls in the span are counted.
+fn chain_summary(arts: &[Art], from: i64, to: i64) -> Summary {
+    let mut by_poster: BTreeMap<&str, crate::xref::FileSum> = BTreeMap::new();
+    let mut bytes_by_poster: HashMap<&str, i64> = HashMap::new();
+    for a in arts {
+        let f = by_poster.entry(a.poster.as_str()).or_insert_with(|| crate::xref::FileSum {
             poster: a.poster.clone(),
             n: 0,
             first: i64::MAX,
@@ -230,15 +322,11 @@ fn link(args: &[String]) -> Result<()> {
         f.first = f.first.min(a.posted);
         f.last = f.last.max(a.posted);
         f.groups.insert(a.group);
+        *bytes_by_poster.entry(a.poster.as_str()).or_default() += a.bytes.max(0);
     }
     let files: Vec<crate::xref::FileSum> = by_poster.into_values().collect();
     let chains = crate::xref::chain(&files, &[]);
-    let mut bytes_by_poster: HashMap<&str, i64> = HashMap::new();
-    for a in &arts {
-        *bytes_by_poster.entry(a.poster.as_str()).or_default() += a.bytes.max(0);
-    }
-    let (mut uploads, mut up_files, mut up_articles, mut up_bytes, mut cross) = (0u64, 0u64, 0i64, 0i64, 0u64);
-    let mut noise = 0u64;
+    let mut s = Summary { files: files.len(), uploads: 0, cross: 0, up_files: 0, articles: 0, bytes: 0, noise: 0 };
     for (_, members) in &chains {
         let articles: i64 = members.iter().map(|&i| files[i].n).sum();
         let first = members.iter().map(|&i| files[i].first).min().unwrap_or(0);
@@ -246,46 +334,18 @@ fn link(args: &[String]) -> Result<()> {
             continue;
         }
         if articles < crate::xref::MIN_UPLOAD_ARTICLES {
-            noise += 1;
+            s.noise += 1;
             continue;
         }
-        uploads += 1;
-        up_files += members.len() as u64;
-        up_articles += articles;
-        up_bytes +=
+        s.uploads += 1;
+        s.up_files += members.len() as u64;
+        s.articles += articles;
+        s.bytes +=
             members.iter().map(|&i| bytes_by_poster.get(files[i].poster.as_str()).copied().unwrap_or(0)).sum::<i64>();
         let groups: BTreeSet<i64> = members.iter().flat_map(|&i| files[i].groups.iter().copied()).collect();
         if groups.len() > 1 {
-            cross += 1;
+            s.cross += 1;
         }
     }
-    let total = t.elapsed();
-    println!(
-        "store pass over {}..{} (±2h): {blocks} blocks, {rows} rows read in {:.1}s; {} obfuscated articles kept ({dup} repeats across servers dropped), {} files",
-        crate::xref::iso_pub(from),
-        crate::xref::iso_pub(to),
-        read.as_secs_f64(),
-        arts.len(),
-        files.len()
-    );
-    println!(
-        "uploads starting in the span: {uploads} ({cross} across groups), {up_files} files, {up_articles} articles, {:.1} GB; {noise} too small; pass took {:.1}s",
-        up_bytes as f64 / 1e9,
-        total.as_secs_f64()
-    );
-    // the SQLite linker's uploads for the same span, read only
-    let xdb = crate::xref::path_for(&crate::paths::database());
-    if xdb.exists() {
-        let conn = rusqlite::Connection::open_with_flags(&xdb, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        conn.busy_timeout(Duration::from_secs(10))?;
-        let (n, f): (i64, Option<i64>) = conn.query_row(
-            "select count(*), sum(files) from uploads where first between ?1 and ?2",
-            [from, to],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        println!("SQLite linker uploads starting in the span: {n}, {} files", f.unwrap_or(0));
-    }
-    store.close()?;
-    let _ = DAY;
-    Ok(())
+    s
 }
