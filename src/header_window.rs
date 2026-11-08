@@ -3,35 +3,49 @@
 //! and time without the rows living in a database.
 //!
 //! Lines go into one `.nxv` block per server, group and posting hour (`overview_archive`'s format). An hour still
-//! being read is held in memory and in a tail file beside it (length-prefixed lines), soo a restart loses nothing;
-//! it is sealed once it has had no new line for `SEAL_IDLE` or holds `SEGMENT_ROWS` lines. Each sealed block has an
-//! index file: its posting-time range and an Xor8 filter of its posters. A lookup by poster reads only the blocks
-//! of the hours asked for whose filter may hold that poster. An hour outside every window the caller keeps is
-//! deleted as files: nothing to vacuum.
+//! being read is a tail file (length-prefixed lines) appended to as batches come and held nowhere else, soo memory
+//! and open files stay flat however many groups and hours are being read. A tail is sealed into a block once its
+//! hour has had no new line for `SEAL_IDLE` (or holds `SEGMENT_ROWS` lines), a few at a time (`SEAL_BUDGET`) soo the
+//! turn of an hour doesn't stall the writer. Each block has an index file: its posting-time range and an Xor8 filter
+//! of its posters. A lookup by poster reads the tails of the hours asked for and only those blocks whose filter may
+//! hold that poster. An hour outside every window kept is deleted as files: nothing to vacuum; a line outside every
+//! window isn't written at all.
+//!
+//! The window is a cache of what the servers still have: nothing is flushed to disk on purpose, and a power cut can
+//! lose the last minutes, which reading again brings back. A cut between a block landing and its tail going leaves
+//! those lines in both; a lookup dedups them.
 //!
 //! The window is in posting time, which lockstep backfill keeps aligned across groups.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::io::{BufWriter, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
-use nntp_xover_engine::container::{NxvBlockBuilder, NxvBlockView};
+use nntp_xover_engine::container::{AlignedBytes, NxvBlockBuilder, NxvBlockView, decompress_cold_block};
 use nntp_xover_engine::date::parse_rfc2822_to_epoch;
 use nntp_xover_engine::msgid_index::{Xor8Builder, Xor8View, msgid_hash};
-use nntp_xover_engine::streamer::RowCache;
+use nntp_xover_engine::streamer::{NxvRangeCursor, XoverStreamScratch};
 
 pub const HOUR: i64 = 3600;
 /// lines in one block at most (the format's limit)
 pub const SEGMENT_ROWS: usize = nntp_xover_engine::container::MAX_BLOCK_ROWS;
 /// an hour with no new line for this long is sealed
 pub const SEAL_IDLE: Duration = Duration::from_secs(600);
+/// how long one sweep may spend sealing; the rest wait for the next
+pub const SEAL_BUDGET: Duration = Duration::from_secs(5);
 const IDX_MAGIC: [u8; 4] = *b"HWI1";
+const FRONTIER_FILE: &str = "backfill-frontier";
+
+/// The overview line's poster.
+fn poster_of(line: &[u8]) -> Option<&[u8]> {
+    line.split(|b| *b == b'\t').nth(2)
+}
 
 /// The overview fields this store reads: poster and posting time.
 fn fields(line: &[u8]) -> Option<(&[u8], i64)> {
@@ -70,11 +84,10 @@ impl Sealed {
     }
 }
 
-/// An hour still being read.
+/// An hour still being read: its tail file, how many lines it holds, and when one last came.
 struct Open {
-    lines: Vec<Vec<u8>>,
-    tail: BufWriter<fs::File>,
-    tail_path: PathBuf,
+    tail: PathBuf,
+    lines: usize,
     last: Instant,
 }
 
@@ -96,9 +109,14 @@ pub struct Window {
 pub type Found = (String, String, Vec<u8>);
 
 impl Window {
-    /// The store at `root`, its sealed blocks' indexes read and its tails taken back into memory.
+    /// The store at `root`: its blocks' indexes read, and its tails found (and cut back to their last whole line).
     pub fn open(root: &Path) -> Result<Window> {
         fs::create_dir_all(root).with_context(|| format!("making {}", root.display()))?;
+        if let Ok(day) = fs::read_to_string(root.join(FRONTIER_FILE))
+            && let Ok(day) = day.trim().parse::<i64>()
+        {
+            BACKFILL_FRONTIER_DAY.fetch_max(day, Ordering::Relaxed);
+        }
         let mut w = Window { root: root.to_path_buf(), groups: HashMap::new() };
         for server in read_dirs(root)? {
             for group_dir in read_dirs(&server)? {
@@ -111,15 +129,15 @@ impl Window {
                         let Some(hour) = stem.split('-').next().and_then(|h| h.parse::<i64>().ok()) else { continue };
                         let block = group_dir.join(format!("{stem}.nxv"));
                         if !block.exists() {
-                            // a seal cut short before its block landed: the tail still holds the lines
                             let _ = fs::remove_file(&path);
                             continue;
                         }
                         group.sealed.entry(hour).or_default().push(read_idx(&path, block)?);
                     } else if let Some(hour) = name.strip_suffix(".tail").and_then(|h| h.parse::<i64>().ok()) {
-                        let lines = read_tail(&path)?;
-                        let tail = BufWriter::new(fs::OpenOptions::new().append(true).open(&path)?);
-                        group.open.insert(hour, Open { lines, tail, tail_path: path, last: Instant::now() });
+                        let lines = repair_tail(&path)?;
+                        group.open.insert(hour, Open { tail: path, lines, last: Instant::now() });
+                    } else if name.ends_with(".tmp") {
+                        let _ = fs::remove_file(&path);
                     }
                 }
                 w.groups.insert((s, g), group);
@@ -128,41 +146,44 @@ impl Window {
         Ok(w)
     }
 
-    /// Overview lines of `group` read from `server`, each to its posting hour. A line whose date won't read, or
-    /// that isn't one overview line, is left out (the count of those comes back).
-    pub fn record(&mut self, server: &str, group: &str, lines: &[Vec<u8>]) -> Result<usize> {
+    /// Overview lines of `group` read from `server`, each appended to its posting hour's tail. A line outside every
+    /// range in `keep`, whose date won't read, or that isn't one overview line, is left out; the count of those comes
+    /// back.
+    pub fn record(&mut self, server: &str, group: &str, lines: &[Vec<u8>], keep: &[(i64, i64)]) -> Result<usize> {
         let mut skipped = 0;
-        let dir = crate::overview_archive::group_dir(&self.root, server, group);
-        let g = self
-            .groups
-            .entry((server.to_string(), group.to_string()))
-            .or_insert_with(|| Group { dir: dir.clone(), ..Group::default() });
-        fs::create_dir_all(&g.dir)?;
-        let mut full = Vec::new();
+        let mut by_hour: BTreeMap<i64, Vec<&[u8]>> = BTreeMap::new();
         for line in lines {
-            let Some((_, posted)) = fields(line).filter(|_| usable(line)) else {
-                skipped += 1;
-                continue;
-            };
-            let hour = posted.div_euclid(HOUR) * HOUR;
-            let open = match g.open.entry(hour) {
-                std::collections::btree_map::Entry::Occupied(o) => o.into_mut(),
-                std::collections::btree_map::Entry::Vacant(v) => {
-                    let tail_path = g.dir.join(format!("{hour}.tail"));
-                    let tail = BufWriter::new(fs::OpenOptions::new().create(true).append(true).open(&tail_path)?);
-                    v.insert(Open { lines: Vec::new(), tail, tail_path, last: Instant::now() })
+            match fields(line).filter(|_| usable(line)) {
+                Some((_, posted)) if in_ranges(posted, keep) => {
+                    by_hour.entry(posted.div_euclid(HOUR) * HOUR).or_default().push(line);
                 }
-            };
-            open.tail.write_all(&(line.len() as u32).to_le_bytes())?;
-            open.tail.write_all(line)?;
-            open.lines.push(line.clone());
-            open.last = Instant::now();
-            if open.lines.len() >= SEGMENT_ROWS {
-                full.push(hour);
+                _ => skipped += 1,
             }
         }
-        for open in g.open.values_mut() {
-            open.tail.flush()?;
+        if by_hour.is_empty() {
+            return Ok(skipped);
+        }
+        let g = self.groups.entry((server.to_string(), group.to_string())).or_insert_with(|| Group {
+            dir: crate::overview_archive::group_dir(&self.root, server, group),
+            ..Group::default()
+        });
+        fs::create_dir_all(&g.dir)?;
+        let mut full = Vec::new();
+        for (hour, lines) in by_hour {
+            let tail = g.dir.join(format!("{hour}.tail"));
+            let mut buf = Vec::with_capacity(lines.iter().map(|l| l.len() + 4).sum());
+            for l in &lines {
+                buf.extend_from_slice(&(l.len() as u32).to_le_bytes());
+                buf.extend_from_slice(l);
+            }
+            // opened per batch: one file per group and hour stays open only as long as a write
+            fs::OpenOptions::new().create(true).append(true).open(&tail)?.write_all(&buf)?;
+            let open = g.open.entry(hour).or_insert_with(|| Open { tail, lines: 0, last: Instant::now() });
+            open.lines += lines.len();
+            open.last = Instant::now();
+            if open.lines >= SEGMENT_ROWS {
+                full.push(hour);
+            }
         }
         for hour in full {
             seal_hour(g, hour)?;
@@ -170,12 +191,25 @@ impl Window {
         Ok(skipped)
     }
 
-    /// Seal every hour that has had no new line for `idle`. Returns the blocks written.
-    pub fn seal_idle(&mut self, idle: Duration) -> Result<usize> {
+    /// Seal hours that have had no new line for `idle`, the longest quiet first, for up to `budget`. Returns the
+    /// blocks written. A seal that fails leaves its tail as it was, to be tried again.
+    pub fn seal_idle(&mut self, idle: Duration, budget: Duration) -> Result<usize> {
+        let started = Instant::now();
+        let mut quiet: Vec<(Instant, (String, String), i64)> = Vec::new();
+        for (key, g) in &self.groups {
+            for (hour, o) in &g.open {
+                if o.last.elapsed() >= idle {
+                    quiet.push((o.last, key.clone(), *hour));
+                }
+            }
+        }
+        quiet.sort_by_key(|(last, _, _)| *last);
         let mut n = 0;
-        for g in self.groups.values_mut() {
-            let quiet: Vec<i64> = g.open.iter().filter(|(_, o)| o.last.elapsed() >= idle).map(|(h, _)| *h).collect();
-            for hour in quiet {
+        for (_, key, hour) in quiet {
+            if started.elapsed() >= budget {
+                break;
+            }
+            if let Some(g) = self.groups.get_mut(&key) {
                 n += seal_hour(g, hour)?;
             }
         }
@@ -199,8 +233,7 @@ impl Window {
             let gone: Vec<i64> = g.open.keys().copied().filter(|h| !kept(*h)).collect();
             for hour in gone {
                 if let Some(o) = g.open.remove(&hour) {
-                    drop(o.tail);
-                    remove(&o.tail_path)?;
+                    remove(&o.tail)?;
                 }
                 dropped += 1;
             }
@@ -208,17 +241,20 @@ impl Window {
         Ok(dropped)
     }
 
-    /// Every line by `poster` posted from `from` to `to` (seconds, inclusive), in any server's group.
+    /// Every line by `poster` posted from `from` to `to` (seconds, inclusive), in any server's group, oldest first.
     pub fn by_poster(&self, poster: &[u8], from: i64, to: i64) -> Result<Vec<Found>> {
+        if from > to {
+            return Ok(Vec::new());
+        }
         let hash = msgid_hash(poster);
         let first = from.div_euclid(HOUR) * HOUR;
         let mut out = Vec::new();
-        let mut cache = RowCache::default();
-        let mut line = Vec::new();
+        let mut scratch = XoverStreamScratch::new();
         for ((server, group), g) in &self.groups {
             let mut keep = |l: &[u8]| {
-                if let Some((p, t)) = fields(l)
-                    && p == poster
+                // the poster first: the date is the dear part
+                if poster_of(l) == Some(poster)
+                    && let Some((_, t)) = fields(l)
                     && t >= from
                     && t <= to
                 {
@@ -226,16 +262,32 @@ impl Window {
                 }
             };
             for (_, open) in g.open.range(first..=to) {
-                open.lines.iter().for_each(|l| keep(l));
+                for l in read_tail(&open.tail)? {
+                    keep(&l);
+                }
             }
             for (_, blocks) in g.sealed.range(first..=to) {
                 for s in blocks.iter().filter(|s| s.max >= from && s.min <= to && s.may_hold(hash)) {
-                    let bytes = read_aligned(&s.path)?;
-                    let view = NxvBlockView::from_mmap_slice(&bytes)?;
-                    for row in 0..view.row_count() {
-                        line.clear();
-                        view.reconstruct_row(row, &mut cache, &mut line)?;
-                        keep(&line);
+                    let bytes = AlignedBytes::from_slice(&fs::read(&s.path)?);
+                    let hot;
+                    let view = {
+                        let v = NxvBlockView::from_mmap_slice(&bytes)?;
+                        if v.is_cold() {
+                            hot = decompress_cold_block(v.data)?;
+                            NxvBlockView::from_mmap_slice(&hot)?
+                        } else {
+                            v
+                        }
+                    };
+                    // one pass over the block in order: each row decoded once
+                    let mut cur = NxvRangeCursor::new_for_art_range(view, 0, u64::MAX)?;
+                    loop {
+                        scratch.wire_buf.clear();
+                        if !cur.format_next_row(&mut scratch) {
+                            break;
+                        }
+                        let n = scratch.wire_buf.len().saturating_sub(2);
+                        keep(&scratch.wire_buf[..n]);
                     }
                 }
             }
@@ -251,7 +303,7 @@ impl Window {
         let mut blocks = 0;
         let mut hours = 0;
         for g in self.groups.values() {
-            lines += g.open.values().map(|o| o.lines.len()).sum::<usize>();
+            lines += g.open.values().map(|o| o.lines).sum::<usize>();
             lines += g.sealed.values().flatten().map(|s| s.rows).sum::<usize>();
             blocks += g.sealed.values().map(Vec::len).sum::<usize>();
             hours += g.open.len() + g.sealed.keys().filter(|h| !g.open.contains_key(h)).count();
@@ -260,23 +312,25 @@ impl Window {
     }
 }
 
-/// Seal `hour` of `g`: its lines into a block (several when over `SEGMENT_ROWS`), each with its index, then the
-/// tail goes. Written in that order, soo a cut leaves the tail to read again (`Window::open` drops an index whose
-/// block isn't there; lines a cut left both in a block and in the tail are found once, `Window::by_poster` dedups).
+fn in_ranges(t: i64, keep: &[(i64, i64)]) -> bool {
+    keep.iter().any(|(from, to)| t >= *from && t <= *to)
+}
+
+/// Seal `hour` of `g`: its tail's lines into a block (several when over `SEGMENT_ROWS`), each with its index, then
+/// the tail goes. On any error the tail stays and so does the hour, to be tried again.
 fn seal_hour(g: &mut Group, hour: i64) -> Result<usize> {
-    let Some(open) = g.open.remove(&hour) else { return Ok(0) };
-    drop(open.tail);
-    let mut lines = open.lines;
+    let Some(open) = g.open.get(&hour) else { return Ok(0) };
+    let tail = open.tail.clone();
+    let mut lines = read_tail(&tail)?;
     lines.sort_by_key(|l| art_of(l));
     lines.dedup_by(|a, b| art_of(a) == art_of(b));
     let first_part = g.sealed.get(&hour).map_or(0, Vec::len);
-    let mut written = 0;
+    let mut made = Vec::new();
     for (i, chunk) in lines.chunks(SEGMENT_ROWS).enumerate() {
         let stem = format!("{hour}-{}", first_part + i);
         let block_path = g.dir.join(format!("{stem}.nxv"));
         let refs: Vec<&[u8]> = chunk.iter().map(|l| l.as_slice()).collect();
         let block = NxvBlockBuilder::build_hot_block(&refs)?;
-        write_synced(&block_path, &block)?;
         let mut hashes = Vec::with_capacity(chunk.len());
         let (mut min, mut max) = (i64::MAX, i64::MIN);
         for l in chunk {
@@ -287,19 +341,26 @@ fn seal_hour(g: &mut Group, hour: i64) -> Result<usize> {
             }
         }
         let filter = Xor8Builder::build(&hashes);
-        let idx_path = block_path.with_extension("idx");
         let mut idx = Vec::with_capacity(28 + filter.len());
         idx.extend_from_slice(&IDX_MAGIC);
         idx.extend_from_slice(&min.to_le_bytes());
         idx.extend_from_slice(&max.to_le_bytes());
         idx.extend_from_slice(&(chunk.len() as u64).to_le_bytes());
         idx.extend_from_slice(&filter);
-        write_synced(&idx_path, &idx)?;
-        g.sealed.entry(hour).or_default().push(Sealed { path: block_path, min, max, rows: chunk.len(), filter });
-        written += 1;
+        made.push((block_path, block, idx, Sealed { path: PathBuf::new(), min, max, rows: chunk.len(), filter }));
     }
-    remove(&open.tail_path)?;
-    Ok(written)
+    let mut sealed = Vec::new();
+    for (block_path, block, idx, mut s) in made {
+        write_replace(&block_path, &block)?;
+        write_replace(&block_path.with_extension("idx"), &idx)?;
+        s.path = block_path;
+        sealed.push(s);
+    }
+    let n = sealed.len();
+    g.sealed.entry(hour).or_default().extend(sealed);
+    g.open.remove(&hour);
+    remove(&tail)?;
+    Ok(n)
 }
 
 fn read_idx(path: &Path, block: PathBuf) -> Result<Sealed> {
@@ -311,35 +372,49 @@ fn read_idx(path: &Path, block: PathBuf) -> Result<Sealed> {
     Ok(Sealed { path: block, min: num(4), max: num(12), rows: num(20) as usize, filter: b[28..].to_vec() })
 }
 
-fn read_tail(path: &Path) -> Result<Vec<Vec<u8>>> {
-    let mut bytes = Vec::new();
-    fs::File::open(path)?.read_to_end(&mut bytes)?;
+/// The whole lines of a tail and where they end: a line cut short by a crash, and anything after it, isn't one.
+fn parse_tail(bytes: &[u8]) -> (Vec<Vec<u8>>, usize) {
     let mut out = Vec::new();
     let mut at = 0;
-    // a line cut short by a crash ends the tail
     while at + 4 <= bytes.len() {
         let n = u32::from_le_bytes(bytes[at..at + 4].try_into().expect("4 bytes")) as usize;
         if at + 4 + n > bytes.len() {
             break;
         }
-        out.push(bytes[at + 4..at + 4 + n].to_vec());
+        let line = &bytes[at + 4..at + 4 + n];
+        if !usable(line) {
+            break;
+        }
+        out.push(line.to_vec());
         at += 4 + n;
     }
-    Ok(out)
+    (out, at)
 }
 
-/// A block read into memory aligned as the format wants it.
-fn read_aligned(path: &Path) -> Result<nntp_xover_engine::container::AlignedBytes> {
-    Ok(nntp_xover_engine::container::AlignedBytes::from_slice(&fs::read(path)?))
+fn read_tail(path: &Path) -> Result<Vec<Vec<u8>>> {
+    let mut bytes = Vec::new();
+    match fs::File::open(path) {
+        Ok(mut f) => f.read_to_end(&mut bytes)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    Ok(parse_tail(&bytes).0)
 }
 
-fn write_synced(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("tmp");
-    {
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
+/// A tail cut back to its last whole line, soo what's appended next follows it. Returns its lines.
+fn repair_tail(path: &Path) -> Result<usize> {
+    let bytes = fs::read(path)?;
+    let (lines, end) = parse_tail(&bytes);
+    if end < bytes.len() {
+        fs::OpenOptions::new().write(true).open(path)?.set_len(end as u64)?;
     }
+    Ok(lines.len())
+}
+
+/// `bytes` at `path`, whole or not at all (written beside it, then renamed over it).
+fn write_replace(path: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, bytes)?;
     fs::rename(&tmp, path)?;
     Ok(())
 }
@@ -383,20 +458,21 @@ fn decode(dir: &Path) -> Option<String> {
     Some(if s == "\0" { String::new() } else { s })
 }
 
-/// The newest backfill day any group still has to do (`chunks::frontier`), set as claims are made; 0 before any.
-/// Lockstep reads the groups' days around it, soo the window keeps those.
+/// The newest backfill day any group still has to do (`chunks::frontier`), set as claims are made and kept in the
+/// store, soo a restart knows it before the first claim; 0 when never known. Lockstep reads the groups' days around
+/// it, soo the window keeps those.
 pub static BACKFILL_FRONTIER_DAY: AtomicI64 = AtomicI64::new(0);
 
 /// The posting-time ranges the window keeps at `now`: the last `keep_hours` (live reading) and the days lockstep
-/// backfill reads around its frontier.
+/// backfill reads around its frontier. With no frontier known, everything before the live hours is kept rather
+/// than dropped.
 pub fn kept_ranges(now: i64, keep_hours: i64) -> Vec<(i64, i64)> {
-    let mut keep = vec![(now - keep_hours * HOUR, now + HOUR)];
     let day = BACKFILL_FRONTIER_DAY.load(Ordering::Relaxed);
-    if day > 0 {
-        let lockstep = crate::chunks::LOCKSTEP_DAYS;
-        keep.push(((day - lockstep) * 86_400, (day + 1) * 86_400));
+    if day <= 0 {
+        return vec![(i64::MIN, now + HOUR)];
     }
-    keep
+    let lockstep = crate::chunks::LOCKSTEP_DAYS;
+    vec![(now - keep_hours * HOUR, now + HOUR), ((day - lockstep) * 86_400, (day + 1) * 86_400)]
 }
 
 enum Msg {
@@ -441,11 +517,11 @@ pub fn spawn(cfg: &crate::config::HeaderWindowConfig) {
 }
 
 /// Hands one fetched XOVER batch to the window. Does nothing when it's off; drops the batch when the writer is
-/// behind (counted), rather than hold the fetch up.
+/// behind (counted, and said every sweep), rather than hold the fetch up.
 pub fn record(server: &str, group: &str, lines: &[Vec<u8>]) {
     let Some(lock) = SENDER.get() else { return };
-    let Ok(guard) = lock.lock() else { return };
-    let Some(tx) = guard.as_ref() else { return };
+    // the sender out of the lock, soo the copy below holds no other connection up
+    let Some(tx) = lock.lock().ok().and_then(|g| g.clone()) else { return };
     if lines.is_empty() {
         return;
     }
@@ -468,12 +544,18 @@ pub fn finish(timeout: Duration) {
     }
 }
 
+fn now_secs() -> i64 {
+    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
 fn run(mut window: Window, rx: Receiver<Msg>, keep_hours: i64) {
     let mut last_sweep = Instant::now();
+    let mut keep = kept_ranges(now_secs(), keep_hours);
+    let (mut said_dropped, mut said_failed) = (0, 0);
+    let mut frontier_saved = 0;
     loop {
-        let msg = rx.recv_timeout(Duration::from_secs(10));
-        match msg {
-            Ok(Msg::Batch { server, group, lines }) => match window.record(&server, &group, &lines) {
+        match rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(Msg::Batch { server, group, lines }) => match window.record(&server, &group, &lines, &keep) {
                 Ok(skipped) => {
                     RECORDED.fetch_add((lines.len() - skipped) as u64, Ordering::Relaxed);
                 }
@@ -489,13 +571,28 @@ fn run(mut window: Window, rx: Receiver<Msg>, keep_hours: i64) {
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
         }
-        if last_sweep.elapsed() >= Duration::from_secs(60) {
-            last_sweep = Instant::now();
-            let now = chrono::Utc::now().timestamp();
-            if let Err(e) = window.seal_idle(SEAL_IDLE).and_then(|_| window.expire(&kept_ranges(now, keep_hours))) {
-                FAILED.fetch_add(1, Ordering::Relaxed);
-                eprintln!("header window: couldnt seal or expire: {e:#}");
-            }
+        if last_sweep.elapsed() < Duration::from_secs(10) {
+            continue;
+        }
+        last_sweep = Instant::now();
+        keep = kept_ranges(now_secs(), keep_hours);
+        let day = BACKFILL_FRONTIER_DAY.load(Ordering::Relaxed);
+        if day != frontier_saved && fs::write(window.root.join(FRONTIER_FILE), day.to_string()).is_ok() {
+            frontier_saved = day;
+        }
+        // expired first: what's going needn't be sealed
+        if let Err(e) = window.expire(&keep).and_then(|_| window.seal_idle(SEAL_IDLE, SEAL_BUDGET)) {
+            FAILED.fetch_add(1, Ordering::Relaxed);
+            eprintln!("header window: couldnt seal or expire: {e:#}");
+        }
+        let (dropped, _, failed) = counters();
+        if dropped > said_dropped || failed > said_failed {
+            eprintln!(
+                "header window: {} batches dropped (writer behind) and {} writes failed since the last word",
+                dropped - said_dropped,
+                failed - said_failed
+            );
+            (said_dropped, said_failed) = (dropped, failed);
         }
     }
 }
@@ -546,6 +643,8 @@ pub fn run_cli(args: &[String]) -> i32 {
 mod tests {
     use super::*;
 
+    const ALL: &[(i64, i64)] = &[(i64::MIN, i64::MAX)];
+
     fn line(art: u64, poster: &str, date: &str, msgid: &str) -> Vec<u8> {
         format!("{art}\t[1/9] - \"x.part{art:02}.rar\" yEnc (1/50)\t{poster}\t{date}\t<{msgid}>\t\t700000\t5000")
             .into_bytes()
@@ -562,19 +661,21 @@ mod tests {
             let lines: Vec<Vec<u8>> = (0..5)
                 .map(|i| line(base + i, if i == 4 { "other@x.y" } else { ours }, date, &format!("m{g}{i}@x")))
                 .collect();
-            assert_eq!(w.record("news.example", g, &lines).unwrap(), 0);
+            assert_eq!(w.record("news.example", g, &lines, ALL).unwrap(), 0);
         }
-        // a line that isn't one is left out
-        assert_eq!(w.record("news.example", "alt.binaries.one", &[b"junk".to_vec()]).unwrap(), 1);
+        // a line that isn't one, or outside every window, is left out
+        assert_eq!(w.record("news.example", "alt.binaries.one", &[b"junk".to_vec()], ALL).unwrap(), 1);
+        assert_eq!(w.record("news.example", "alt.binaries.one", &[line(7, ours, date, "o@x")], &[(0, 1)]).unwrap(), 1);
         let open = w.by_poster(ours.as_bytes(), t - 5, t + 5).unwrap();
         assert_eq!(open.len(), 8, "4 in each group while open");
-        assert_eq!(w.seal_idle(Duration::ZERO).unwrap(), 2);
+        assert_eq!(w.seal_idle(Duration::ZERO, Duration::from_secs(60)).unwrap(), 2);
         let sealed = w.by_poster(ours.as_bytes(), t - 5, t + 5).unwrap();
         assert_eq!(sealed, open, "the same once sealed");
         assert!(w.by_poster(ours.as_bytes(), t + 10, t + 20).unwrap().is_empty(), "outside the time asked");
+        assert!(w.by_poster(ours.as_bytes(), t + 5, t - 5).unwrap().is_empty(), "a range back to front");
         assert!(w.by_poster(b"nobody@x.y", t - 5, t + 5).unwrap().is_empty());
         // back after a restart, sealed and open alike
-        w.record("news.example", "alt.binaries.one", &[line(200, ours, date, "late@x")]).unwrap();
+        w.record("news.example", "alt.binaries.one", &[line(200, ours, date, "late@x")], ALL).unwrap();
         drop(w);
         let w = Window::open(dir.path()).unwrap();
         assert_eq!(w.by_poster(ours.as_bytes(), t - 5, t + 5).unwrap().len(), 9);
@@ -588,13 +689,12 @@ mod tests {
         let dates =
             ["Sun, 01 Nov 2026 10:30:00 +0000", "Sat, 07 Nov 2026 10:30:00 +0000", "Sun, 08 Nov 2026 07:30:00 +0000"];
         for (i, d) in dates.iter().enumerate() {
-            w.record("s", "g", &[line(i as u64 + 1, "p@x", d, &format!("e{i}@x"))]).unwrap();
+            w.record("s", "g", &[line(i as u64 + 1, "p@x", d, &format!("e{i}@x"))], ALL).unwrap();
         }
-        w.seal_idle(Duration::ZERO).unwrap();
-        w.record("s", "g", &[line(10, "p@x", dates[0], "open@x")]).unwrap();
+        w.seal_idle(Duration::ZERO, Duration::from_secs(60)).unwrap();
+        w.record("s", "g", &[line(10, "p@x", dates[0], "open@x")], ALL).unwrap();
         let now = parse_rfc2822_to_epoch(dates[2].as_bytes()).unwrap();
         let backfill = parse_rfc2822_to_epoch(dates[1].as_bytes()).unwrap();
-        // the live day and a day around the backfill frontier
         let dropped = w.expire(&[(now - 24 * HOUR, now), (backfill - 12 * HOUR, backfill + 12 * HOUR)]).unwrap();
         assert_eq!(dropped, 2, "the old hour, sealed and open");
         assert_eq!(w.stats().2, 2);
@@ -603,35 +703,42 @@ mod tests {
     }
 
     #[test]
-    fn the_window_keeps_the_live_day_and_the_days_around_the_backfill_frontier() {
+    fn a_tail_cut_short_is_cut_back_before_more_is_appended() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = Window::open(dir.path()).unwrap();
+        let date = "Sun, 08 Nov 2026 07:00:01 +0000";
+        let t = parse_rfc2822_to_epoch(date.as_bytes()).unwrap();
+        w.record("s", "g", &[line(1, "p@x", date, "a@x")], ALL).unwrap();
+        drop(w);
+        // a crash in the middle of the next line
+        let tail = crate::overview_archive::group_dir(dir.path(), "s", "g").join(format!("{}.tail", t / HOUR * HOUR));
+        let mut f = fs::OpenOptions::new().append(true).open(&tail).unwrap();
+        f.write_all(&500u32.to_le_bytes()).unwrap();
+        f.write_all(b"12\tcut").unwrap();
+        drop(f);
+        let mut w = Window::open(dir.path()).unwrap();
+        w.record("s", "g", &[line(2, "p@x", date, "b@x")], ALL).unwrap();
+        drop(w);
+        let w = Window::open(dir.path()).unwrap();
+        assert_eq!(w.by_poster(b"p@x", t - 5, t + 5).unwrap().len(), 2, "both whole lines, the cut one gone");
+    }
+
+    #[test]
+    fn without_a_known_frontier_nothing_before_the_live_day_is_dropped() {
         let now = 20_400 * 86_400 + 5 * HOUR;
         BACKFILL_FRONTIER_DAY.store(0, Ordering::Relaxed);
-        assert_eq!(kept_ranges(now, 24), vec![(now - 24 * HOUR, now + HOUR)]);
+        assert_eq!(kept_ranges(now, 24), vec![(i64::MIN, now + HOUR)]);
         BACKFILL_FRONTIER_DAY.store(20_000, Ordering::Relaxed);
         let ranges = kept_ranges(now, 24);
+        assert_eq!(ranges[0], (now - 24 * HOUR, now + HOUR));
         assert_eq!(ranges[1], ((20_000 - crate::chunks::LOCKSTEP_DAYS) * 86_400, 20_001 * 86_400));
         BACKFILL_FRONTIER_DAY.store(0, Ordering::Relaxed);
     }
 
     #[test]
-    fn a_tail_cut_short_keeps_its_whole_lines() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("1.tail");
-        let mut b = Vec::new();
-        for l in [b"one".as_slice(), b"two"] {
-            b.extend_from_slice(&(l.len() as u32).to_le_bytes());
-            b.extend_from_slice(l);
-        }
-        b.extend_from_slice(&9u32.to_le_bytes());
-        b.extend_from_slice(b"cut");
-        fs::write(&p, b).unwrap();
-        assert_eq!(read_tail(&p).unwrap(), [b"one".to_vec(), b"two".to_vec()]);
-    }
-
-    #[test]
     fn names_decode_as_the_archive_encodes_them() {
         let root = Path::new("/r");
-        for name in ["alt.binaries.x", "news.example:563#2", "a b/c"] {
+        for name in ["alt.binaries.x", "news.example:563#2", "a b/c", ""] {
             let d = crate::overview_archive::group_dir(root, "s", name);
             assert_eq!(decode(&d).as_deref(), Some(name), "{}", d.display());
         }
