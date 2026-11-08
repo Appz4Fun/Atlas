@@ -1133,9 +1133,7 @@ mod tests {
         assert!(r.articles.iter().any(|a| a.subject.starts_with("[1/6] - ")), "the index is the first of six files");
         assert_eq!(r.collection.as_deref(), Some(format!("xref\0{}", r.name).as_str()));
         // nothing again
-        assert!(
-            lk.pass(&store, now + 3600, &HashSet::new(), &|| false).unwrap().map_or(true, |f| f.releases.is_empty())
-        );
+        assert!(lk.pass(&store, now + 3600, &HashSet::new(), &|| false).unwrap().is_none_or(|f| f.releases.is_empty()));
         // a late block: two more parts of the second file, from another server
         let date_t = T0 + 900;
         let late: Vec<Vec<u8>> = (0..2u64)
