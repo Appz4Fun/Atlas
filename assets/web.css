@@ -123,7 +123,7 @@ kbd { padding: .1em .45em; font-size: .75em; color: var(--muted); background: va
 .icon-button { width: 36px; height: 36px; padding: 0; color: var(--muted); }
 .icon-button svg { width: 16px; height: 16px; }
 
-.layout { flex: 1; width: 100%; display: grid; grid-template-columns: 230px minmax(0, 1fr); align-items: start; max-width: 1500px; margin: 0 auto; }
+.layout { flex: 1; width: 100%; display: grid; grid-template-columns: 230px minmax(0, 1fr); align-items: start; }
 .sidebar { position: sticky; top: var(--masthead); max-height: calc(100vh - var(--masthead)); padding: 20px 8px 24px 24px; overflow-y: auto; }
 .navigation summary { display: none; }
 .nav-group { margin-bottom: 16px; }
@@ -294,7 +294,7 @@ tr.drawer-row code.key, .drawer-card code.key { background: var(--surface); }
 .setup h2 { margin-top: 0; }
 .setup ul { margin: 0; padding-left: 18px; }
 
-.detail, .release { flex: 1; width: 100%; max-width: 1100px; margin: 0 auto; }
+.detail, .release { flex: 1; width: 100%; }
 
 .askbar { margin-top: -8px; }
 .askbar input { border-style: dashed; }
@@ -344,7 +344,7 @@ details.add summary .host { color: var(--rust); }
 }
 .site-footer-inner {
   display: flex; flex-wrap: wrap; align-items: center; justify-content: center;
-  gap: 4px 12px; max-width: 1500px; margin: 0 auto; text-align: center;
+  gap: 4px 12px; text-align: center;
 }
 .site-footer code { padding: .05em .35em; font-size: .84em; }
 .patreon-link {
