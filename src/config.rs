@@ -762,6 +762,64 @@ pub fn header_store_config() -> HeaderStoreConfig {
     read_file().map_or_else(HeaderStoreConfig::default, |v| HeaderStoreConfig::from_value(v.get("header_store")))
 }
 
+/// The `indexing` object of config.toml: which servers a group is read from. With `ranked` (or a `prefer` list) a group
+/// goes to the best server that carries it and fails over down the list, instead of being spread over every server
+/// by a hash; `time_cursors` starts a group on a server it hasn't been reading at the time already read, not at the
+/// newest article. All off by default.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IndexingConfig {
+    pub ranked: bool,
+    /// hosts best first; servers not named follow, the most connections first
+    pub prefer: Vec<String>,
+    /// group -> hosts never asked for it
+    pub ban: Vec<(String, Vec<String>)>,
+    pub time_cursors: bool,
+}
+
+impl IndexingConfig {
+    fn from_value(v: Option<&Value>) -> IndexingConfig {
+        let mut c = IndexingConfig::default();
+        let Some(v) = v else { return c };
+        if let Some(b) = v.get("ranked").and_then(as_bool) {
+            c.ranked = b;
+        }
+        if let Some(list) = v.get("prefer").and_then(Value::as_array) {
+            c.prefer = list
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|h| h.trim().to_lowercase())
+                .filter(|h| !h.is_empty())
+                .collect();
+        }
+        if let Some(map) = v.get("ban").and_then(Value::as_object) {
+            for (group, hosts) in map {
+                let hosts: Vec<String> = match hosts {
+                    Value::Array(a) => a.iter().filter_map(Value::as_str).map(|h| h.trim().to_lowercase()).collect(),
+                    Value::String(h) => vec![h.trim().to_lowercase()],
+                    _ => Vec::new(),
+                };
+                if !hosts.is_empty() {
+                    c.ban.push((group.trim().to_string(), hosts));
+                }
+            }
+        }
+        if let Some(b) = v.get("time_cursors").and_then(as_bool) {
+            c.time_cursors = b;
+        }
+        c
+    }
+
+    /// whether groups go to servers by rank (`ranked`, or a `prefer` list given)
+    pub fn ranks(&self) -> bool {
+        self.ranked || !self.prefer.is_empty()
+    }
+}
+
+/// The file's `indexing` object: no keyring.
+pub fn indexing_config() -> IndexingConfig {
+    read_file().map_or_else(IndexingConfig::default, |v| IndexingConfig::from_value(v.get("indexing")))
+}
+
 /// The file's `overview_archive` object: no keyring.
 pub fn overview_archive_config() -> OverviewArchiveConfig {
     read_file()
@@ -2415,5 +2473,30 @@ mod tests {
     fn a_config_without_provider_keys_gets_no_media_table() {
         let (value, _) = config_value(&Config::default(), None, false, &no_store);
         assert!(value.get("media").is_none(), "{value}");
+    }
+
+    #[test]
+    fn indexing_reads_its_ranking_bans_and_time_cursors() {
+        let v: Value = serde_json::json!({
+            "ranked": false,
+            "prefer": ["News.Newshosting.com", " news.eweka.nl "],
+            "ban": { "alt.binaries.x": ["farm.example"], "alt.binaries.y": "viper.example" },
+            "time_cursors": true
+        });
+        let c = IndexingConfig::from_value(Some(&v));
+        assert_eq!(c.prefer, vec!["news.newshosting.com".to_string(), "news.eweka.nl".to_string()]);
+        assert!(c.ranks(), "a prefer list ranks");
+        assert!(c.time_cursors);
+        let mut ban = c.ban.clone();
+        ban.sort();
+        assert_eq!(
+            ban,
+            vec![
+                ("alt.binaries.x".to_string(), vec!["farm.example".to_string()]),
+                ("alt.binaries.y".to_string(), vec!["viper.example".to_string()])
+            ]
+        );
+        assert_eq!(IndexingConfig::from_value(None), IndexingConfig::default());
+        assert!(!IndexingConfig::default().ranks());
     }
 }

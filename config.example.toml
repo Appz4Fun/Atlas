@@ -42,6 +42,18 @@ ssl = true
 connections = 20
 priority = 4
 
+# Which server a group is read from (all off by default). With `ranked` or a `prefer` list a group goes to the
+# best server that carries it, the hosts in `prefer` first and the rest by connections, and falls to the next when
+# that one is down, failing it, banned from it or has no worker free. `ban` keeps groups off servers for good;
+# a server that says it lacks a group, or fails it three times in a day, is left out of it for a day.
+# `time_cursors` starts a group on a server it hasn't been reading about an hour before the time it's read through
+# on any server, found by date, instead of at the newest article.
+[indexing]
+ranked = false
+# prefer = ["news.example.com", "fill.example.net"]
+# ban = { "alt.binaries.example" = ["fill.example.net"] }
+time_cursors = false
+
 [postprocess]
 enabled = true
 workers = 2

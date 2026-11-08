@@ -511,6 +511,25 @@ struct Home {
 const HOME_RETRY: Duration = Duration::from_secs(30 * 60);
 /// GROUPs in a row a server that indexed a group before has to say it doesnt carry it before the group moves
 const MOVE_AFTER: u32 = 3;
+/// With groups going to servers by rank: strikes against a server for a group (`Pool::strike`, a pass parked there)
+/// within `BAN_FOR` that ban it from the group for `BAN_FOR`, after which it's asked again
+const BAN_STRIKES: u32 = 3;
+const BAN_FOR: i64 = 24 * 3600;
+
+/// The (group, server) pairs a group isn't read from, when groups go by rank: from config for good, and learned (a
+/// server that said it doesnt carry the group, or kept failing it) for `BAN_FOR`, kept in a file soo a restart keeps
+/// them. Servers are named in the file by `Pool::host`.
+#[derive(Default)]
+struct Bans {
+    fixed: std::collections::HashSet<(String, usize)>,
+    /// (group, server) -> (strikes, last strike, banned until), unix seconds
+    learned: HashMap<(String, usize), (u32, i64, i64)>,
+    path: Option<std::path::PathBuf>,
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
 
 /// how long to wait for the end of a compressed stream once its last line arrived
 const STREAM_END_WAIT: Duration = Duration::from_secs(2);
@@ -1871,6 +1890,14 @@ pub struct Pool {
     timeout: Duration,
     /// groups their first choice server doesnt carry: the server that does
     homes: Mutex<HashMap<String, Home>>,
+    /// servers best first when groups go by rank (`with_ranking`); empty: groups are spread over them by hash
+    rank: Vec<usize>,
+    /// groups not read from some servers (`Bans`), when groups go by rank
+    bans: Mutex<Bans>,
+    /// with `rank`: the server each group was given and since when, soo it stays there while that one serves it
+    assigned: Mutex<HashMap<String, (usize, Instant)>>,
+    /// a group starts on a server it hasn't been reading at the time already read (`IndexingConfig::time_cursors`)
+    time_cursors: bool,
     /// (group, server): GROUPs in a row the server said it doesnt carry the group although it indexed it before
     misses: Mutex<HashMap<(String, usize), u32>>,
     /// `HOME_RETRY`, shorter in tests
@@ -2090,6 +2117,10 @@ impl Pool {
             failed_over_at: Mutex::new(None),
             timeout: DEFAULT_TIMEOUT,
             homes: Mutex::new(HashMap::new()),
+            rank: Vec::new(),
+            bans: Mutex::new(Bans::default()),
+            assigned: Mutex::new(HashMap::new()),
+            time_cursors: false,
             misses: Mutex::new(HashMap::new()),
             home_retry: HOME_RETRY,
             limit_heal: LIMIT_HEAL,
@@ -2117,6 +2148,154 @@ impl Pool {
     pub fn with_home_retry(mut self, after: Duration) -> Self {
         self.home_retry = after;
         self
+    }
+
+    /// Groups go to servers by rank (`IndexingConfig`): the hosts `prefer` names first in its order, the rest after by
+    /// connections, most first; `ban` keeps groups off servers for good, and what's learned is kept in `bans_file`.
+    /// Nothing changes when the config doesnt rank.
+    pub fn with_ranking(mut self, cfg: &crate::config::IndexingConfig, bans_file: Option<std::path::PathBuf>) -> Self {
+        self.time_cursors = cfg.time_cursors;
+        if !cfg.ranks() {
+            return self;
+        }
+        let mut order: Vec<usize> = (0..self.servers.len()).collect();
+        let place = |i: usize| cfg.prefer.iter().position(|h| self.is_host(i, h)).unwrap_or(usize::MAX);
+        order.sort_by_key(|&i| (place(i), std::cmp::Reverse(self.servers[i].cfg.connections()), i));
+        self.rank = order;
+        let mut bans = Bans { path: bans_file.clone(), ..Bans::default() };
+        for (group, hosts) in &cfg.ban {
+            for h in hosts {
+                if let Some(i) = (0..self.servers.len()).find(|&i| self.is_host(i, h)) {
+                    bans.fixed.insert((group.clone(), i));
+                }
+            }
+        }
+        if let Some(text) = bans_file.and_then(|p| std::fs::read_to_string(p).ok()) {
+            for line in text.lines() {
+                let f: Vec<&str> = line.split('\t').collect();
+                let [group, host, strikes, last, until] = f.as_slice() else { continue };
+                let (Ok(strikes), Ok(last), Ok(until)) = (strikes.parse(), last.parse(), until.parse()) else { continue };
+                if let Some(i) = (0..self.servers.len()).find(|&i| self.host(i) == *host) {
+                    bans.learned.insert((group.to_string(), i), (strikes, last, until));
+                }
+            }
+        }
+        self.bans = Mutex::new(bans);
+        self
+    }
+
+    /// whether server `i` is the one named `host` (its host, or its key in stored state), case aside
+    fn is_host(&self, i: usize, host: &str) -> bool {
+        let h = host.to_lowercase();
+        self.servers[i].cfg.host.to_lowercase() == h || self.host(i).to_lowercase() == h
+    }
+
+    /// whether groups go to servers by rank (`with_ranking`)
+    pub fn ranks(&self) -> bool {
+        !self.rank.is_empty()
+    }
+
+    /// whether a group starts on a server it hasn't been reading at the time already read (`time_cursors`)
+    pub fn time_cursors(&self) -> bool {
+        self.time_cursors
+    }
+
+    /// whether `group` isn't read from server `i` (`Bans`)
+    pub fn banned(&self, group: &str, i: usize) -> bool {
+        let bans = self.bans.lock().unwrap();
+        let key = (group.to_string(), i);
+        bans.fixed.contains(&key) || bans.learned.get(&key).is_some_and(|&(_, _, until)| until > unix_now())
+    }
+
+    /// A strike against server `i` for `group` (a pass there parked): `BAN_STRIKES` within `BAN_FOR` ban it from the
+    /// group for `BAN_FOR`. Only when groups go by rank.
+    pub fn strike(&self, group: &str, i: usize, why: &str) {
+        if !self.ranks() {
+            return;
+        }
+        let now = unix_now();
+        let mut bans = self.bans.lock().unwrap();
+        let e = bans.learned.entry((group.to_string(), i)).or_insert((0, 0, 0));
+        if now - e.1 > BAN_FOR {
+            e.0 = 0;
+        }
+        e.0 += 1;
+        e.1 = now;
+        if e.0 >= BAN_STRIKES {
+            e.0 = 0;
+            e.2 = now + BAN_FOR;
+            println!("{group}: {} {why} again, not read from it for a day", self.host(i));
+        }
+        self.save_bans(&bans);
+    }
+
+    /// Server `i` isn't asked for `group` for `BAN_FOR` (it said it doesnt carry it), when groups go by rank.
+    fn ban_for_a_day(&self, group: &str, i: usize) {
+        let now = unix_now();
+        let mut bans = self.bans.lock().unwrap();
+        bans.learned.insert((group.to_string(), i), (0, now, now + BAN_FOR));
+        self.save_bans(&bans);
+    }
+
+    /// The learned bans written over their file, those long over left out. A write that fails is said and the bans
+    /// held in memory still count.
+    fn save_bans(&self, bans: &Bans) {
+        let Some(path) = &bans.path else { return };
+        let now = unix_now();
+        let mut out = String::new();
+        for ((group, i), (strikes, last, until)) in &bans.learned {
+            if *until > now || now - *last <= BAN_FOR {
+                out.push_str(&format!("{group}\t{}\t{strikes}\t{last}\t{until}\n", self.host(*i)));
+            }
+        }
+        let tmp = path.with_extension("tmp");
+        if let Err(e) = std::fs::write(&tmp, out).and_then(|()| std::fs::rename(&tmp, path)) {
+            eprintln!("couldnt keep the server bans in {}: {e}", path.display());
+        }
+    }
+
+    /// `candidates` in rank order, servers `group` is banned from left out (all of them, in the hashed order, when
+    /// every one is banned: a group is never left with none)
+    pub fn rank_order(&self, candidates: &[usize], group: &str) -> Vec<usize> {
+        let order: Vec<usize> =
+            self.rank.iter().copied().filter(|i| candidates.contains(i) && !self.banned(group, *i)).collect();
+        if order.is_empty() { self.ranked(candidates, group) } else { order }
+    }
+
+    /// `group` goes to server `i` and stays there while it serves it, `HOME_RETRY` at most when it isn't the best
+    /// (`ranked_pick`): a group taken by a server down its list because the ones above had no worker free.
+    pub fn assign(&self, group: &str, i: usize) {
+        self.assigned.lock().unwrap().insert(group.to_string(), (i, Instant::now()));
+    }
+
+    /// whether server `i` is short of connections: more requests waiting for one than a tenth of its limit (two at
+    /// least), soo a group the best server can't serve now goes to the next
+    fn saturated(&self, i: usize) -> bool {
+        let s = &self.servers[i];
+        s.waiting.load(Ordering::Relaxed) > (s.limit.load(Ordering::Relaxed) / 10).max(2)
+    }
+
+    /// With groups going by rank: the best server among `tier` for `group` that isn't short of connections. A group
+    /// stays on the server it was given while that one serves it, and goes back to the best after `HOME_RETRY`
+    /// elsewhere, soo it doesnt flap between servers (each move costs a date search, see `time_cursors`).
+    fn ranked_pick(&self, tier: &[usize], group: &str) -> usize {
+        let order = self.rank_order(tier, group);
+        let mut assigned = self.assigned.lock().unwrap();
+        if let Some(&(s, since)) = assigned.get(group)
+            && order.contains(&s)
+            && !self.saturated(s)
+            && (order.first() == Some(&s) || since.elapsed() < self.home_retry)
+        {
+            return s;
+        }
+        let pick = order
+            .iter()
+            .copied()
+            .find(|&i| !self.saturated(i))
+            .or_else(|| order.first().copied())
+            .unwrap_or_else(|| tier.first().copied().unwrap_or(0));
+        assigned.insert(group.to_string(), (pick, Instant::now()));
+        pick
     }
 
     /// how long compressed headers stay off after they couldnt be read (`COMPRESS_RETRY`)
@@ -2311,6 +2490,9 @@ impl Pool {
     /// in proportion to each server's connections, and a group keeps its
     /// server (its cursors are per server) as long as that server is healthy.
     pub fn pick_server_in(&self, tier: &[usize], group: &str) -> usize {
+        if self.ranks() {
+            return self.ranked_pick(tier, group);
+        }
         // a group its first choice doesnt carry lives where it was found, and goes back to a home it left for a while
         // (one that indexed it before) once that is due to be asked again
         {
@@ -2362,6 +2544,10 @@ impl Pool {
     /// The servers whose cursors on `group` are its own: where `pick_server_in` puts it with every indexing server up,
     /// and the home it left for a while and goes back to (`Home::back`).
     pub fn homes_of(&self, group: &str) -> Vec<usize> {
+        // by rank its home is the best server not banned from it, whichever it was given meanwhile
+        if self.ranks() {
+            return self.rank_order(&self.indexing_servers(), group).into_iter().take(1).collect();
+        }
         let home = self.pick_server_in(&self.indexing_servers(), group);
         let back = self.homes.lock().unwrap().get(group).and_then(|h| h.back);
         std::iter::once(home).chain(back.filter(|&b| b != home)).collect()
@@ -2371,6 +2557,9 @@ impl Pool {
     /// rest of `tier`, none when no other is left.
     pub fn fallback_in(&self, tier: &[usize], group: &str, not: &[usize]) -> Option<usize> {
         let rest: Vec<usize> = tier.iter().copied().filter(|i| !not.contains(i)).collect();
+        if self.ranks() {
+            return self.rank_order(&rest, group).first().copied();
+        }
         self.ranked(&rest, group).first().copied()
     }
 
@@ -2903,13 +3092,22 @@ impl Pool {
             }
             misses.remove(&key);
         }
+        // by rank the server that lacks it is banned from the group for a day, and the next best that has it reads it
+        if self.ranks() {
+            self.ban_for_a_day(group, prefer);
+        }
 
         // indexing servers only: one with `index: false` (a metered block
         // account) is for article lookups, never a group's home
         let indexing: Vec<usize> = self.indexing_servers().into_iter().filter(|&i| i != prefer).collect();
-        for i in self.ranked(&indexing, group) {
+        let order = if self.ranks() { self.rank_order(&indexing, group) } else { self.ranked(&indexing, group) };
+        for i in order {
             if let Ok(r) = self.select_on(i, group).await {
                 println!("{group} not on {}, using {}", self.servers[prefer].cfg.host, self.servers[i].cfg.host);
+                if self.ranks() {
+                    self.assigned.lock().unwrap().insert(group.to_string(), (i, Instant::now()));
+                    return Ok((i, r));
+                }
                 let mut homes = self.homes.lock().unwrap();
                 // leaving a home it was only on for a while, it still goes back to the one it left first
                 let back = match homes.get(group) {
@@ -5620,5 +5818,125 @@ mod xzver_fallback_tests {
             assert_eq!(count(&log, "AUTHINFO"), 4, "two logins");
             assert!(matches!(*pool.servers[0].xzver.lock().unwrap(), Xzver::Cooling(_)));
         });
+    }
+}
+
+#[cfg(test)]
+mod ranked_tests {
+    use super::*;
+    use crate::config::IndexingConfig;
+
+    fn server(host: &str, conns: u32) -> UsenetServer {
+        let mut s = UsenetServer::new(host, "u", "p", 563);
+        s.connections = Some(conns);
+        s
+    }
+
+    fn pool(cfg: &IndexingConfig, bans: Option<std::path::PathBuf>) -> Pool {
+        Pool::new(&[server("a.example", 10), server("b.example", 50), server("c.example", 20)]).with_ranking(cfg, bans)
+    }
+
+    fn prefer(hosts: &[&str]) -> IndexingConfig {
+        IndexingConfig { prefer: hosts.iter().map(|h| h.to_string()).collect(), ..Default::default() }
+    }
+
+    #[test]
+    fn servers_rank_by_the_prefer_list_then_by_connections() {
+        let p = pool(&prefer(&["c.example"]), None);
+        let all = p.indexing_servers();
+        assert_eq!(p.rank_order(&all, "g"), vec![2, 1, 0], "c named, then b (50) before a (10)");
+        for i in 0..200 {
+            assert_eq!(p.pick_server(&format!("alt.binaries.g{i}")), 2, "every group on the best server");
+        }
+        assert_eq!(p.homes_of("g"), vec![2]);
+        assert_eq!(p.fallback_in(&all, "g", &[2]), Some(1), "failing over goes down the list");
+        assert_eq!(p.fallback_in(&all, "g", &[2, 1]), Some(0));
+
+        let by_conns = pool(&IndexingConfig { ranked: true, ..Default::default() }, None);
+        assert_eq!(by_conns.rank_order(&all, "g"), vec![1, 2, 0]);
+        let off = pool(&IndexingConfig::default(), None);
+        assert!(!off.ranks(), "nothing changes without ranking");
+    }
+
+    #[test]
+    fn a_best_server_that_goes_down_hands_its_groups_to_the_next() {
+        let p = pool(&prefer(&["c.example"]), None).with_home_retry(Duration::from_millis(50));
+        *p.servers[2].down_until.lock().unwrap() = Some(Instant::now() + DOWN_FOR);
+        assert_eq!(p.pick_server("g"), 1);
+        *p.servers[2].down_until.lock().unwrap() = None;
+        assert_eq!(p.pick_server("g"), 1, "up again, it stays on the next a while (no flapping)");
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(p.pick_server("g"), 2, "then back on the best");
+    }
+
+    #[test]
+    fn a_best_server_short_of_connections_overflows_and_the_group_stays_a_while() {
+        let p = pool(&prefer(&["c.example"]), None).with_home_retry(Duration::from_millis(50));
+        p.servers[2].waiting.store(100, Ordering::Relaxed);
+        assert_eq!(p.pick_server("g"), 1, "c has requests waiting for connections: the next");
+        p.servers[2].waiting.store(0, Ordering::Relaxed);
+        assert_eq!(p.pick_server("g"), 1, "it stays on b for a while, not back and forth");
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(p.pick_server("g"), 2, "and goes back to the best after that");
+        p.assign("g", 0);
+        assert_eq!(p.pick_server("g"), 0, "one handed to another server stays there for a while too");
+    }
+
+    #[test]
+    fn strikes_ban_a_server_from_a_group_for_a_day_kept_over_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("server-bans");
+        let cfg = prefer(&["c.example"]);
+        let p = pool(&cfg, Some(file.clone()));
+        p.strike("g", 2, "failed");
+        p.strike("g", 2, "failed");
+        assert!(!p.banned("g", 2), "two strikes");
+        p.strike("g", 2, "failed");
+        assert!(p.banned("g", 2), "three in a day");
+        assert!(!p.banned("other", 2), "only from that group");
+        assert_eq!(p.pick_server("g"), 1);
+        assert_eq!(p.homes_of("g"), vec![1]);
+
+        let again = pool(&cfg, Some(file.clone()));
+        assert!(again.banned("g", 2), "kept over a restart");
+
+        // a day on it's asked again
+        let text = std::fs::read_to_string(&file).unwrap();
+        let old = unix_now() - BAN_FOR - 10;
+        let past: String = text
+            .lines()
+            .map(|l| {
+                let f: Vec<&str> = l.split('\t').collect();
+                format!("{}\t{}\t0\t{old}\t{}\n", f[0], f[1], old + 5)
+            })
+            .collect();
+        std::fs::write(&file, past).unwrap();
+        let later = pool(&cfg, Some(file));
+        assert!(!later.banned("g", 2));
+        assert_eq!(later.pick_server("g"), 2);
+    }
+
+    #[test]
+    fn config_bans_keep_a_group_off_a_server_for_good() {
+        let cfg = IndexingConfig { ban: vec![("g".into(), vec!["c.example".into()])], ..prefer(&["c.example"]) };
+        let p = pool(&cfg, None);
+        assert!(p.banned("g", 2));
+        assert_eq!(p.pick_server("g"), 1);
+        assert_eq!(p.pick_server("h"), 2, "other groups stay on the best");
+        // banned from every server, a group still gets one
+        let all = IndexingConfig {
+            ban: vec![("g".into(), vec!["a.example".into(), "b.example".into(), "c.example".into()])],
+            ..prefer(&["c.example"])
+        };
+        assert_eq!(pool(&all, None).rank_order(&[0, 1, 2], "g").len(), 3);
+    }
+
+    #[test]
+    fn strikes_dont_count_without_ranking() {
+        let p = pool(&IndexingConfig::default(), None);
+        for _ in 0..5 {
+            p.strike("g", 0, "failed");
+        }
+        assert!(!p.banned("g", 0));
     }
 }

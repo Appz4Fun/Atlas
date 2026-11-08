@@ -120,9 +120,23 @@ impl Default for GroupRunState {
 /// Run state of every group, shared by passes running at the same time, and the groups config.toml tracks now (see
 /// `groups`).
 #[derive(Clone, Default)]
-pub struct RunStates(Arc<Mutex<HashMap<String, GroupRunState>>>, Arc<Mutex<Option<HashSet<String>>>>);
+pub struct RunStates(
+    Arc<Mutex<HashMap<String, GroupRunState>>>,
+    Arc<Mutex<Option<HashSet<String>>>>,
+    /// cursor key -> the time read through elsewhere its cursor was last moved up to (`time_cursor_start`)
+    Arc<Mutex<HashMap<String, i64>>>,
+);
 
 impl RunStates {
+    /// The time read through elsewhere the cursor `key` was last moved up to by date (`time_cursor_start`).
+    fn aligned(&self, key: &str) -> Option<i64> {
+        self.2.lock().unwrap().get(key).copied()
+    }
+
+    fn set_aligned(&self, key: &str, through: i64) {
+        self.2.lock().unwrap().insert(key.to_string(), through);
+    }
+
     fn with<R>(&self, group: &str, f: impl FnOnce(&mut GroupRunState) -> R) -> R {
         f(self.0.lock().unwrap().entry(group.to_string()).or_default())
     }
@@ -936,6 +950,71 @@ fn cursors_or_adopted(
     Ok(None)
 }
 
+/// With time cursors: where `group`'s live reading on `server` goes on from (its live cursor, the article before the
+/// first one read). That's found by date when another server read the group further than `server` did
+/// (`read_through`): the first article posted `TIME_CURSOR_MARGIN` before the time it's read through, never before
+/// `own`, the server's own cursor. `own` as it is when `server` is about as far, or it was already moved up to that
+/// time (`RunStates::aligned`, soo a server where nothing new turns up isn't searched again every pass). None with
+/// time cursors off, or when no other server read the group: then a cursor starts at the newest article as always.
+async fn time_cursor_start(
+    ctx: &PassContext,
+    db: &Db,
+    group: &str,
+    key: &str,
+    server: usize,
+    (first, last): (i64, i64),
+    own: Option<i64>,
+) -> Result<Option<i64>> {
+    if !ctx.pool.time_cursors() || last < first.max(1) {
+        return Ok(None);
+    }
+    let (g, k) = (group.to_string(), key.to_string());
+    let (others, here) = on_db(db, move |conn| Ok(read_through(conn, &g, &k)?)).await?;
+    let Some(through) = others else { return Ok(None) };
+    let target = through - TIME_CURSOR_MARGIN;
+    if let Some(own) = own
+        && (here.is_some_and(|h| h >= target) || ctx.states.aligned(key) == Some(through))
+    {
+        return Ok(Some(own));
+    }
+    let at = ctx.pool.article_at(server, group, first as u64, last as u64, target).await? as i64;
+    ctx.states.set_aligned(key, through);
+    let found = (at - 1).clamp(first - 1, last);
+    let start = own.map_or(found, |own| own.max(found));
+    if Some(start) != own {
+        let when = chrono::DateTime::from_timestamp(through, 0).map(|d| d.format("%Y-%m-%d %H:%M").to_string());
+        println!(
+            "[CURSOR] {group}: {} goes on from {start}, where it's read through elsewhere ({} UTC){}",
+            ctx.pool.host(server),
+            when.unwrap_or_default(),
+            own.map(|o| format!(", its own cursor was {o}")).unwrap_or_default(),
+        );
+    }
+    Ok(Some(start))
+}
+
+/// How far before the time a group is read through a server that hasn't been reading it starts
+/// (`time_cursor_start`): posting times are only roughly in the order of article numbers, and what's read twice is
+/// dropped by message-id.
+pub const TIME_CURSOR_MARGIN: i64 = 3600;
+
+/// The time `group` is read through, from its rows in `groups` (one per server, `group@server`, and the plain name
+/// a lone server kept): (the newest on any server but the one `key` names, on that one). A row's time is the posting
+/// time of the newest slice its passes saved (`db::save_group_dates`), and it counts only when its live cursor is past
+/// that slice: a pass cut short saves the newest slices first, and those aren't read through until the ones before
+/// them are.
+pub fn read_through(conn: &Connection, group: &str, key: &str) -> Result<(Option<i64>, Option<i64>)> {
+    let prefix = format!("{group}@");
+    Ok(conn.query_row(
+        "select max(case when name != ?3 then high_posted end), max(case when name = ?3 then high_posted end)
+         from groups
+         where (name = ?2 or substr(name, 1, length(?1)) = ?1)
+           and high_posted is not null and live_cursor is not null and high_article <= live_cursor",
+        rusqlite::params![prefix, group, key],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?)
+}
+
 /// One pass over `group`: a batch of live or backfill articles depending on
 /// the mode, on server `prefer` (or whichever server carries the group).
 /// `progress` hears about every slice as it is saved. Safe to run for many
@@ -985,23 +1064,39 @@ where
     let (first, last) = (first as i64, last as i64);
     let key = cursor_key(&ctx.pool, server, group);
 
+    // with time cursors a group's live position is the time it's read through on any server (`time_cursor_start`):
+    // a server that hasn't been reading it starts there, a stand-in too, rather than at the newest article, and one
+    // whose own cursor fell behind while others read it moves up to it
     let state = match load_cursors(ctx, db, &key, group, server).await? {
         Some(mut s) if settings.fallback && settings.from_top && last >= s.live_cursor => {
+            let to = time_cursor_start(ctx, db, group, &key, server, (first, last), Some(s.live_cursor)).await?;
+            let to = to.unwrap_or(last);
             let k = key.clone();
-            on_db(db, move |conn| Ok(db::update_live_cursor(conn, &k, last)?)).await?;
-            s.live_cursor = last;
+            on_db(db, move |conn| Ok(db::update_live_cursor(conn, &k, to)?)).await?;
+            s.live_cursor = to;
             s
         }
-        Some(s) if last >= s.live_cursor => s,
-        // first time both cursors start at the top. if the server renumbered
-        // (last went backwards) the group got reset soo start over the same way
+        Some(mut s) if last >= s.live_cursor => {
+            if let Some(to) =
+                time_cursor_start(ctx, db, group, &key, server, (first, last), Some(s.live_cursor)).await?
+                && to > s.live_cursor
+            {
+                let k = key.clone();
+                on_db(db, move |conn| Ok(db::update_live_cursor(conn, &k, to)?)).await?;
+                s.live_cursor = to;
+            }
+            s
+        }
+        // first time both cursors start at the top (or where it's read through, with time cursors). if the server
+        // renumbered (last went backwards) the group got reset soo start over the same way
         _ => {
+            let start = time_cursor_start(ctx, db, group, &key, server, (first, last), None).await?.unwrap_or(last);
             let k = key.clone();
-            on_db(db, move |conn| Ok(db::init_group_state(conn, &k, last)?)).await?;
+            on_db(db, move |conn| Ok(db::init_group_state(conn, &k, start)?)).await?;
             if !settings.fallback {
                 ctx.states.with(group, |st| st.phase = Phase::Backfill);
             }
-            db::GroupState { live_cursor: last, backfill_cursor: last }
+            db::GroupState { live_cursor: start, backfill_cursor: start }
         }
     };
 
