@@ -1067,6 +1067,11 @@ const RECORD_QUEUE: usize = 32;
 const RECORD_BATCH: usize = 200_000;
 const RECORD_GATHER: Duration = Duration::from_secs(2);
 
+/// A slice the recorder's thread gathered: group, headers, when, and who waits to hear they're written.
+type SliceIn = (String, Vec<Article>, i64, Option<std::sync::mpsc::SyncSender<bool>>);
+/// One group's headers of a batch, its latest time, and the slices waiting on them.
+type GroupOut = (Vec<Article>, i64, Vec<std::sync::mpsc::SyncSender<bool>>);
+
 /// How the recorder's thread writes a group's headers (group, headers, when): to the store, or in a test anywhere.
 type WriteHeaders<'a> = dyn FnMut(&str, &[Article], i64) -> Result<()> + 'a;
 
@@ -1104,7 +1109,7 @@ fn record_queued(rx: std::sync::mpsc::Receiver<Queued>, write: &mut WriteHeaders
     };
     loop {
         let started = std::time::Instant::now();
-        let mut slices: Vec<(String, Vec<Article>, i64, Option<std::sync::mpsc::SyncSender<bool>>)> = Vec::new();
+        let mut slices: Vec<SliceIn> = Vec::new();
         let mut barriers = Vec::new();
         let mut rows = 0;
         let mut next = Some(first);
@@ -1130,7 +1135,7 @@ fn record_queued(rx: std::sync::mpsc::Receiver<Queued>, write: &mut WriteHeaders
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => closed = true,
             }
         }
-        let mut by_group: HashMap<String, (Vec<Article>, i64, Vec<std::sync::mpsc::SyncSender<bool>>)> = HashMap::new();
+        let mut by_group: HashMap<String, GroupOut> = HashMap::new();
         for (group, articles, at, done) in slices {
             let e = by_group.entry(group).or_insert_with(|| (Vec::new(), at, Vec::new()));
             e.0.extend(articles);
