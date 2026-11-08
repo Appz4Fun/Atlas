@@ -65,6 +65,46 @@ pub const UPLOAD_LINK_TRIED: ShardTable = ShardTable {
     added: &[],
 };
 
+/// A row of one small file found beside a release by the release's PAR2 set (`LinkStep::small_beside`): a
+/// thumbnail posted under a subject of its own. The release's whole post takes it in (`release_info::whole_post_with`)
+/// whichever of its rows is asked for, and it isn't an upload's lead, soo nothing else about the post changes.
+pub const BESIDE_FILES: ShardTable = ShardTable {
+    name: "beside_files",
+    create: "create table if not exists beside_files (
+        row_id     INTEGER PRIMARY KEY,
+        release_id INTEGER NOT NULL,
+        par2_file  BLOB
+    )",
+    indexes: &[("beside_files_release", "create index if not exists beside_files_release on beside_files(release_id)")],
+    release_key: Some("row_id"),
+    added: &[],
+};
+
+/// ?1 the small file's row, ?2 the release it was found beside, ?3 its file id in the set
+const SET_BESIDE: &str = "insert into beside_files (row_id, release_id, par2_file) values (?1, ?2, ?3)
+    on conflict(row_id) do update set release_id = excluded.release_id, par2_file = excluded.par2_file";
+
+/// The release a small file's row was found beside, if any.
+pub fn beside_owner(conn: &rusqlite::Connection, row: i64) -> rusqlite::Result<Option<i64>> {
+    let s = crate::store::shard_of_id(row);
+    // a shard that hasn't got the table yet has found nothing
+    let Ok(mut stmt) = conn.prepare_cached(&format!("select release_id from s{s}.beside_files where row_id = ?1"))
+    else {
+        return Ok(None);
+    };
+    stmt.query_row([row], |r| r.get(0)).optional()
+}
+
+/// The rows of small files found beside release `id`.
+pub fn beside_rows(conn: &rusqlite::Connection, id: i64) -> rusqlite::Result<Vec<i64>> {
+    let s = crate::store::shard_of_id(id);
+    let Ok(mut stmt) = conn.prepare_cached(&format!("select row_id from s{s}.beside_files where release_id = ?1"))
+    else {
+        return Ok(Vec::new());
+    };
+    stmt.query_map([id], |r| r.get(0))?.collect()
+}
+
 /// Where a lead's rows are now: another run may have moved them on to a bigger file since this one read them.
 macro_rules! lead_now {
     ($lead:literal) => {
@@ -342,18 +382,19 @@ impl LinkStep {
     /// a subject without the release's name, which no name or poster joins, soo it's a row of its own. The
     /// set gives each file's exact size and the MD5 of its first 16 KiB, and a small file is one article: a row
     /// posted near this one, holding one file of that name, is fetched once and checked against both. One that
-    /// matches is linked into this release's upload, which it leads.
+    /// matches is kept as found beside the release (`BESIDE_FILES`), and its post takes it in.
     fn small_beside(&self, ctx: &mut StepCtx<'_>, files: &[FileInfo]) -> Result<Outcome, StepError> {
         let me = ctx.release().clone();
         if files.iter().all(|f| is_par2_name(&f.filename)) {
             return Ok(Outcome::default());
         }
-        if select::par2_source(files).is_none() {
+        // the PAR2 step reads no set of a release named as a picture: nothing would ever be kept to look by
+        if select::par2_source(files).is_none() || select::classify(&me.name) == select::Kind::Image {
             return Ok(Outcome::default());
         }
-        // a row another upload has taken is that upload's to look after
+        // a row of an upload linked by its set is that upload's to look after
         let lead: Option<i64> = query_one(ctx, "select lead_id from upload_link where release_id = ?", me.id)?;
-        if lead.is_some_and(|lead| lead != me.id) {
+        if lead.is_some() {
             return Ok(Outcome::default());
         }
         // only a set the PAR2 step read and kept: nothing is fetched to find out whether there's anything to look for.
@@ -383,10 +424,8 @@ impl LinkStep {
         }
         let mut have: HashSet<Vec<u8>> = HashSet::new();
         {
-            let mut stmt = ctx
-                .conn()
-                .prepare_cached("select par2_file from upload_link where lead_id = ?1 and release_id != ?1")
-                .map_err(retry)?;
+            let mut stmt =
+                ctx.conn().prepare_cached("select par2_file from beside_files where release_id = ?1").map_err(retry)?;
             let rows = stmt.query_map([me.id], |r| r.get::<_, Option<Vec<u8>>>(0)).map_err(retry)?;
             for row in rows {
                 have.extend(row.map_err(retry)?);
@@ -423,14 +462,12 @@ impl LinkStep {
         let mut writes: Vec<StepWrite> =
             tried.iter().map(|other| StepWrite::new(TRIED, vec![me.id.into(), (*other).into()])).collect();
         if found.is_empty() {
-            return Ok(Outcome { matched: lead.is_some(), writes, wait_until, ..Default::default() });
+            let matched = !have.is_empty();
+            return Ok(Outcome { matched, writes, wait_until, ..Default::default() });
         }
         for (row, file_id) in &found {
-            writes.push(StepWrite::new(LINK_DATA, vec![(*row).into(), me.id.into(), file_id.to_vec().into()]));
+            writes.push(StepWrite::new(SET_BESIDE, vec![(*row).into(), me.id.into(), file_id.to_vec().into()]));
         }
-        // the release leads as a row of data, not of recovery: its files stay its files, and the upload is whole when
-        // each of its rows is, soo a small file not found yet takes nothing from it
-        writes.push(StepWrite::new(LINK_LEAD, vec![me.id.into()]));
         // the pictures step reads what's linked in: run again, now there's more
         let rerun = mask(crate::images::step::IMAGES_STEP);
         Ok(Outcome { matched: true, writes, rerun, wait_until, ..Default::default() })
@@ -455,7 +492,8 @@ impl LinkStep {
                    and +r.posted_date between ?1 and ?2 and r.id != ?3 and f.filename = ?4 collate nocase
                    and coalesce(f.expected, 1) <= 2
                    and not exists (select 1 from files g where g.release_id = r.id and g.id != f.id)
-                   and not exists (select 1 from upload_link l where l.release_id = r.id and l.lead_id != ?3)
+                   and not exists (select 1 from upload_link l where l.release_id = r.id)
+                   and not exists (select 1 from beside_files b where b.row_id = r.id and b.release_id != ?3)
                    and not exists (select 1 from upload_link_tried t where t.release_id = ?3 and t.candidate_id = r.id)
                  order by abs(julianday(r.posted_date) - julianday(?6)), r.id limit ?5",
             )
@@ -1080,10 +1118,11 @@ mod tests {
                 .unwrap();
         let ids: Vec<i64> = found.iter().map(|c| c.id).collect();
         assert_eq!(ids, [2, 4], "nearest in time first, one file, not taken; the check against the set decides");
-        // linked into this release, it's no other's to take, and stays this one's on the next run
-        write(&conn, LINK_DATA, vec![2i64.into(), 1i64.into(), vec![7u8; 16].into()]);
-        write(&conn, LINK_LEAD, vec![1i64.into()]);
-        assert_eq!(links(&conn), [(1, 1), (2, 1), (6, 9)]);
+        // found beside this release, it's no other's to take, and stays this one's on the next run
+        write(&conn, SET_BESIDE, vec![2i64.into(), 1i64.into(), vec![7u8; 16].into()]);
+        let owner: i64 =
+            conn.query_row("select release_id from beside_files where row_id = 2", [], |r| r.get(0)).unwrap();
+        assert_eq!(owner, 1);
         let posted = "2026-10-10 00:01:39";
         let again = LinkStep::beside_candidates(&conn, 1, "00-thumbnail.jpg", (&window.0, &window.1, posted)).unwrap();
         assert_eq!(again.iter().map(|c| c.id).collect::<Vec<_>>(), [2, 4]);
