@@ -108,15 +108,18 @@ fn shift(segs: &mut [Seg], base: i64) {
     }
 }
 
-/// A stored blob of a shard being folded into another, its domains moved on by `base`: a blob kept here renumbered,
-/// a sealed-log place marked to be read on from `base` (`shifted`). One shifted already is shifted again.
-pub fn shift_blob(blob: &[u8], base: i64) -> Result<Vec<u8>> {
+/// A stored blob of a shard being folded into another: one kept here is written again with its domains taken from
+/// `map` (the id the target uses for the same suffix; one not in it moved on by `base`), a sealed-log place is marked
+/// to be read on from `base` (`shifted`), as what's in the log can't be rewritten. One shifted already is shifted again.
+pub fn remap_blob(blob: &[u8], base: i64, map: &std::collections::HashMap<i64, i64>) -> Result<Vec<u8>> {
     let (had, rest) = unshifted(blob);
     if sealed_log::Locator::from_ref(rest).is_some() {
         return Ok(shifted(rest, had + base));
     }
     let mut segs = decode(blob)?;
-    shift(&mut segs, base);
+    for s in segs.iter_mut().filter(|s| s.domain != 0) {
+        s.domain = map.get(&s.domain).copied().unwrap_or(s.domain + base);
+    }
     Ok(encode(&segs))
 }
 
@@ -319,22 +322,24 @@ mod tests {
     }
 
     #[test]
-    fn a_merged_shards_blobs_read_their_domains_on_from_its_base() {
+    fn a_merged_shards_blobs_take_the_targets_domains_or_read_theirs_on_from_a_base() {
         let segs = vec![
             Seg { part: Some(1), bytes: 10, domain: 3, local: b"a".to_vec() },
-            Seg { part: Some(2), bytes: 10, domain: 0, local: b"<whole@x>".to_vec() },
+            Seg { part: Some(2), bytes: 10, domain: 4, local: b"b".to_vec() },
+            Seg { part: Some(3), bytes: 10, domain: 0, local: b"<whole@x>".to_vec() },
         ];
         let base = 5i64 << 32;
-        // kept here: renumbered, a whole message-id left alone
-        let moved = decode(&shift_blob(&encode(&segs), base).unwrap()).unwrap();
-        assert_eq!(moved.iter().map(|s| s.domain).collect::<Vec<_>>(), [3 + base, 0]);
+        let map = std::collections::HashMap::from([(3, 17)]);
+        // kept here: the target's id where the map has one, moved on by the base where not, a whole id left alone
+        let moved = decode(&remap_blob(&encode(&segs), base, &map).unwrap()).unwrap();
+        assert_eq!(moved.iter().map(|s| s.domain).collect::<Vec<_>>(), [17, 4 + base, 0]);
         // a place in the sealed log: marked, still remote, its place unchanged
         let mut place = sealed_log::REF_TAG.to_vec();
         place.resize(sealed_log::REF_BYTES, 7);
-        let marked = shift_blob(&place, base).unwrap();
+        let marked = remap_blob(&place, base, &map).unwrap();
         assert!(is_remote(&marked));
         assert_eq!(inner(&marked), &place[..]);
         assert_eq!(unshifted(&marked).0, base);
-        assert_eq!(unshifted(&shift_blob(&marked, 1).unwrap()).0, base + 1, "shifted again adds up");
+        assert_eq!(unshifted(&remap_blob(&marked, 1, &map).unwrap()).0, base + 1, "shifted again adds up");
     }
 }

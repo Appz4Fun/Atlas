@@ -3015,8 +3015,9 @@ pub fn harvest_from_shards(main: &Path, log: &dyn Fn(&str)) -> anyhow::Result<()
         res.with_context(|| format!("harvesting {}", main.display()))?;
         detach_res.with_context(|| format!("detaching {}", main.display()))?;
     }
-    for shard_idx in 0..crate::store::SHARDS {
-        let shard_path = crate::store::shard_path(main, shard_idx);
+    // the shards from before one shard too, should a reset come before their merge
+    for shard_idx in 0..crate::merge_shards::LEGACY_SHARDS {
+        let shard_path = crate::merge_shards::legacy_shard_path(main, shard_idx);
         if shard_path.exists() {
             log(&format!("harvesting shard s{shard_idx} ({})...", shard_path.display()));
             conn.execute("ATTACH DATABASE ?1 AS sh", [shard_path.to_string_lossy().as_ref()])

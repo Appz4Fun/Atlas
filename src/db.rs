@@ -553,12 +553,12 @@ pub fn create_db_at(path: &Path) -> anyhow::Result<()> {
         anyhow::bail!("a shard merge is in progress: run `atlas --merge-shards --apply` to finish it before indexing");
     }
     // the shards from before one shard: their releases would be out of sight, their ids handed out again
-    let legacy = crate::merge_shards::sources(path);
+    let legacy = crate::merge_shards::legacy_leftovers(path);
     if !legacy.is_empty() {
         anyhow::bail!(
-            "{} shards from before the move to one shard are still here ({}): run `atlas --merge-shards --apply` first",
+            "{} files of the shards from before the move to one shard are still here ({}): run `atlas --merge-shards --apply` first",
             legacy.len(),
-            legacy.iter().map(|s| s.path.display().to_string()).collect::<Vec<_>>().join(", ")
+            legacy.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
         );
     }
 

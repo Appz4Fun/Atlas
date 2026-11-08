@@ -742,8 +742,15 @@ pub fn restore(conn: &Connection, schema: &str, p: &Payload, how: Domains) -> Re
         if how == Domains::Keep {
             conn.prepare_cached(&format!("insert or ignore into {schema}.domains (id, suffix) values (?1, ?2)"))?
                 .execute(params![old, suffix])?;
-            domain_of.insert(*old, *old);
-            continue;
+            let there: Option<String> = conn
+                .prepare_cached(&format!("select suffix from {schema}.domains where id = ?1"))?
+                .query_row([old], |r| r.get(0))
+                .optional()?;
+            if there.as_deref() == Some(suffix.as_str()) {
+                domain_of.insert(*old, *old);
+                continue;
+            }
+            // the id is another suffix's here (payloads of shards folded into one, `merge_shards`): by its text
         }
         let found: Option<i64> = conn
             .prepare_cached(&format!("select id from {schema}.domains where suffix = ?1 order by id limit 1"))?
