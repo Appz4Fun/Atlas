@@ -424,8 +424,12 @@ fn the_web_ui_end_to_end() {
     assert!(!lone.body.contains("Audio fingerprint"), "no match, no line: {}", lone.body);
 
     // until the word index has taken in every release queued for it: a search waits only so long (500 ms) for that,
-    // which a debug build's commit can outlast
+    // which a debug build's commit can outlast. A release build leaves it to the search's own catch-up, which is what
+    // makes a release saved a moment ago turn up (`WordIndex::catch_up`)
     let drained = || {
+        if !cfg!(debug_assertions) {
+            return;
+        }
         let waited = std::time::Instant::now();
         loop {
             let left: i64 = store::shard_paths(&main)
