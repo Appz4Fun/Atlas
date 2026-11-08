@@ -447,9 +447,14 @@ impl Store {
     /// chunks before it kept, and the slice is read again; should the linker settle those first (only after
     /// `SETTLE_SECS`), the rest come as late articles or files of their upload.
     pub fn record(&mut self, group: &str, articles: &[Article], added: i64) -> Result<usize> {
+        self.record_chunked(group, articles, added, WRITE_CHUNK)
+    }
+
+    /// `record`, `chunk` rows a transaction.
+    pub fn record_chunked(&mut self, group: &str, articles: &[Article], added: i64, chunk: usize) -> Result<usize> {
         let grp = self.group_id(group)?;
         let mut n = 0;
-        for chunk in articles.chunks(WRITE_CHUNK) {
+        for chunk in articles.chunks(chunk.max(1)) {
             let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             {
                 let mut insert = tx.prepare_cached(
@@ -1008,21 +1013,97 @@ pub fn keeps(article: &Article) -> bool {
 }
 
 /// A slice's articles of `group` without the ones obfuscated per article, whose headers go to the store. They're
-/// counted as unparsable still (`atlas_articles_unparsable_total`), as no subject rule reads them. An error when the
-/// headers couldnt be kept: the slice must not count as read.
+/// counted as unparsable still (`atlas_articles_unparsable_total`), as no subject rule reads them. They're handed to
+/// the recorder's thread, which writes many slices' at once (`record_queued`); an error only when it stopped. A
+/// write that fails there is said and counted (`recorder_failures`), the slice counted as read: the window of
+/// headers a backfill reread brings back is what such a loss costs.
 pub fn hold(group: &str, articles: Vec<Article>) -> Result<Vec<Article>> {
     let (held, kept): (Vec<Article>, Vec<Article>) = articles.into_iter().partition(keeps);
     if held.is_empty() {
         return Ok(kept);
     }
-    in_store(&RECORDER, |s| s.record(group, &held, now()))
-        .map_err(|e| e.context(format!("xref: keeping {} headers of {group}", held.len())))?;
     let mut unparsable = Unparsable::default();
     for a in &held {
         unparsable.note(a);
     }
     crate::collections::count_unparsable(group, &unparsable);
+    let n = held.len();
+    if cfg!(test) {
+        in_store(&RECORDER, |s| s.record(group, &held, now()))
+            .map_err(|e| e.context(format!("xref: keeping {n} headers of {group}")))?;
+    } else {
+        // to the recorder's thread, which writes many slices' headers at once (`record_queued`): the slice goes
+        // on. A full queue holds the slice until there's room, soo memory stays bounded
+        recorder()
+            .send((group.to_string(), held, now()))
+            .map_err(|_| anyhow::anyhow!("xref: the recorder stopped; {n} headers of {group} not kept"))?;
+    }
     Ok(kept)
+}
+
+/// Slices' headers waiting for the recorder's thread, at most (a slice is up to a request's 100k headers, soo this
+/// bounds the memory they hold to a few GB)
+const RECORD_QUEUE: usize = 32;
+/// Headers the recorder's thread writes at most in one go, sorted by message-id, and how long it gathers.
+const RECORD_BATCH: usize = 200_000;
+const RECORD_GATHER: Duration = Duration::from_secs(2);
+
+type Queued = (String, Vec<Article>, i64);
+
+static RECORDER_TX: std::sync::OnceLock<std::sync::mpsc::SyncSender<Queued>> = std::sync::OnceLock::new();
+static RECORDER_FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The queue to the recorder's thread, started on first use.
+fn recorder() -> &'static std::sync::mpsc::SyncSender<Queued> {
+    RECORDER_TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Queued>(RECORD_QUEUE);
+        let _ = std::thread::Builder::new().name("xref-recorder".into()).spawn(move || record_queued(rx));
+        tx
+    })
+}
+
+/// The recorder's thread: slices' headers gathered for up to `RECORD_GATHER` or `RECORD_BATCH` rows, then written a
+/// group at a time sorted by message-id, soo the key's B-tree is written in order and many slices share each
+/// transaction, rather than every parse thread taking the store's lock in turn for its own few thousand rows. A
+/// write that fails is said and counted; the slice was saved already.
+fn record_queued(rx: std::sync::mpsc::Receiver<Queued>) {
+    while let Ok(first) = rx.recv() {
+        let started = std::time::Instant::now();
+        let mut rows = first.1.len();
+        let mut batch = vec![first];
+        while rows < RECORD_BATCH {
+            let left = RECORD_GATHER.saturating_sub(started.elapsed());
+            match rx.recv_timeout(left) {
+                Ok(q) => {
+                    rows += q.1.len();
+                    batch.push(q);
+                }
+                Err(_) => break,
+            }
+        }
+        let mut by_group: HashMap<String, (Vec<Article>, i64)> = HashMap::new();
+        for (group, articles, at) in batch {
+            let e = by_group.entry(group).or_insert_with(|| (Vec::new(), at));
+            e.0.extend(articles);
+            e.1 = e.1.max(at);
+        }
+        for (group, (mut articles, at)) in by_group {
+            articles.sort_by(|a, b| a.message_id.cmp(&b.message_id));
+            if let Err(e) = in_store(&RECORDER, |s| s.record_chunked(&group, &articles, at, RECORD_CHUNK)) {
+                RECORDER_FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                eprintln!("xref: couldnt keep {} headers of {group}: {e:#}", articles.len());
+            }
+        }
+    }
+}
+
+/// rows one of the recorder's thread's transactions takes: larger than `WRITE_CHUNK`, as it writes for many slices;
+/// still short enough for the linker's writes to go between
+const RECORD_CHUNK: usize = 20_000;
+
+/// Batches of headers the recorder's thread couldn't write, since start.
+pub fn recorder_failures() -> u64 {
+    RECORDER_FAILED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Whether a group still has to read (back) any day from a day before `first` to a day after `last`, the poster's wall
