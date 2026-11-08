@@ -72,7 +72,10 @@ create table if not exists headers (
     added      INTEGER NOT NULL,
     done       INTEGER NOT NULL DEFAULT 0
 ) without rowid;
-create index if not exists headers_poster on headers(poster);
+-- a poster's articles in a file already: what the linker reads of them (`pass_with`). Partial, soo a header kept
+-- (done = 0) goes into one tree fewer: the parse path writes every one of them
+create index if not exists headers_done_by on headers(poster, grp, number, posted) where done = 1;
+drop index if exists headers_poster;
 -- covering, soo a pass's read of what waits reads the index alone (`waiting_placed`)
 create index if not exists headers_waiting_by on headers(poster, posted, added, grp) where done = 0;
 drop index if exists headers_waiting;
@@ -750,9 +753,13 @@ impl Store {
         for (poster, place, _) in &finished {
             let Some(place) = place else { continue };
             let Some(j) = saved.iter().position(|u| u.release == place.release) else { continue };
-            let mut stmt = self
-                .conn
-                .prepare_cached("select grp, min(posted), max(posted) from headers where poster = ?1 group by grp")?;
+            let mut stmt = self.conn.prepare_cached(
+                "select grp, min(posted), max(posted) from (
+                         select grp, posted from headers where poster = ?1 and done = 0
+                         union all
+                         select grp, posted from headers where poster = ?1 and done = 1)
+                     group by grp",
+            )?;
             for row in
                 stmt.query_map([poster], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))?
             {
@@ -992,8 +999,8 @@ fn in_store<T>(store: &Mutex<Option<Store>>, f: impl FnOnce(&mut Store) -> Resul
         }
         let opened = Store::open(&path_for(&crate::paths::database()))?;
         if std::ptr::eq(store_ref, &RECORDER) {
-            // the parse path's connection: each header goes into four B-trees by random keys (message-id, poster
-            // twice, arrival), and with the default 2 MB page cache nearly every insert read its pages from disk (it
+            // the parse path's connection: each header goes into three B-trees (message-id, the waiting rows' index by poster,
+            // arrival), and with the default 2 MB page cache nearly every insert read its pages from disk (it
             // kept about 4k headers a second). 512 MiB keeps the trees' upper levels and recent leaves in memory. The
             // linker's connection keeps the default: a commit on the other connection empties a WAL reader's cache
             // before its next read, and the linker reads after every one of the recorder's
