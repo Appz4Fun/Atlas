@@ -1323,6 +1323,19 @@ pub fn run() -> i32 {
             return 1;
         }
     };
+    {
+        // forward backfill's first day, fixed once, in the main database it indexes into (after any conversion); a
+        // change in the config needs a restart
+        let now = chrono::Utc::now().timestamp();
+        match db::open_at(&main)
+            .map_err(anyhow::Error::from)
+            .and_then(|c| Ok(crate::chunks::set_forward_start(&c, config.backfill_start_days_back, now)?))
+        {
+            Ok(day) if day > 0 => ui::print(&format!("backfill reads forward from day {day} to live")),
+            Ok(_) => {}
+            Err(e) => ui::warn(&format!("couldnt set the forward backfill's start: {e:#}")),
+        }
+    }
 
     let stop = Arc::new(AtomicBool::new(false));
 
