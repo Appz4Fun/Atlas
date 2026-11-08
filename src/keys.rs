@@ -723,7 +723,8 @@ const MIN_VOLUMES: usize = 3;
 pub(crate) fn volumes_text(files: &[(String, i64)]) -> Option<String> {
     use crate::archive::select::{Kind as File, classify, set_name};
     use std::collections::BTreeMap;
-    let mut sets: BTreeMap<(&str, String), Vec<(u32, i64)>> = BTreeMap::new();
+    // (format, set) -> volumes, and whether the set is named the old way (`.rar`, `.r00`, ...), which starts at 0
+    let mut sets: BTreeMap<(&str, String), (Vec<(u32, i64)>, bool)> = BTreeMap::new();
     for (name, size) in files {
         // RAR only: the probe can't tell an encrypted 7z, and a `.001` split could be anything
         let (format, volume) = match classify(name) {
@@ -731,9 +732,12 @@ pub(crate) fn volumes_text(files: &[(String, i64)]) -> Option<String> {
             _ => continue,
         };
         let set = set_name(name, false).to_lowercase();
-        sets.entry((format, set)).or_default().push((volume, *size));
+        let entry = sets.entry((format, set)).or_default();
+        entry.0.push((volume, *size));
+        entry.1 |= !name.to_ascii_lowercase().ends_with(".rar");
     }
-    let ((format, _), mut vols) = sets.into_iter().max_by_key(|(_, v)| v.iter().map(|(_, s)| *s).sum::<i64>())?;
+    let ((format, _), (mut vols, old)) =
+        sets.into_iter().max_by_key(|(_, (v, _))| v.iter().map(|(_, s)| *s).sum::<i64>())?;
     vols.sort_unstable();
     // one volume listed at two sizes is two sets under one name: no shape to go by
     if vols.windows(2).any(|w| w[0].0 == w[1].0 && w[0].1 != w[1].1) {
@@ -742,7 +746,11 @@ pub(crate) fn volumes_text(files: &[(String, i64)]) -> Option<String> {
     vols.dedup_by_key(|(n, _)| *n);
     // from the set's own first volume (`.rar` is 0, `.part1.rar` 1), none missing
     let first = vols.first()?.0;
-    if first > 1 || vols.len() < MIN_VOLUMES || vols.iter().enumerate().any(|(i, (n, _))| *n != first + i as u32) {
+    if first > 1
+        || (old && first != 0)
+        || vols.len() < MIN_VOLUMES
+        || vols.iter().enumerate().any(|(i, (n, _))| *n != first + i as u32)
+    {
         return None;
     }
     let (body, last) = vols.split_at(vols.len() - 1);
@@ -1550,6 +1558,8 @@ mod tests {
         assert_eq!(volumes_text(&set(&[100, 100, 100, 100], &part)), None, "a list cut short looks even");
         let later = |i: usize| format!("x.part{:02}.rar", i + 2);
         assert_eq!(volumes_text(&set(&[100, 100, 100, 40], &later)), None, "the first volume missing");
+        let no_rar = |i: usize| format!("Y.r{i:02}");
+        assert_eq!(volumes_text(&set(&[100, 100, 100, 40], &no_rar)), None, "an old set without its .rar");
         let mut twice = set(&[100, 100, 100, 40], &part);
         twice.push(("X.part02.rar".into(), 90));
         assert_eq!(volumes_text(&twice), None, "two sets under one name");
