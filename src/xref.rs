@@ -998,6 +998,9 @@ fn in_store<T>(store: &Mutex<Option<Store>>, f: impl FnOnce(&mut Store) -> Resul
             // linker's connection keeps the default: a commit on the other connection empties a WAL reader's cache
             // before its next read, and the linker reads after every one of the recorder's
             opened.conn.execute_batch("pragma cache_size = -524288;")?;
+            // its writes go on while the indexer stops (the queue is drained then, `flush_recorder`): waits out a
+            // busy store rather than give up at the stop
+            opened.conn.busy_timeout(BUSY)?;
         }
         *store = Some(opened);
     }
@@ -1035,7 +1038,7 @@ pub fn hold(group: &str, articles: Vec<Article>) -> Result<Vec<Article>> {
         // to the recorder's thread, which writes many slices' headers at once (`record_queued`): the slice goes
         // on. A full queue holds the slice until there's room, soo memory stays bounded
         recorder()
-            .send((group.to_string(), held, now()))
+            .send(Queued::Slice(group.to_string(), held, now()))
             .map_err(|_| anyhow::anyhow!("xref: the recorder stopped; {n} headers of {group} not kept"))?;
     }
     Ok(kept)
@@ -1048,7 +1051,12 @@ const RECORD_QUEUE: usize = 32;
 const RECORD_BATCH: usize = 200_000;
 const RECORD_GATHER: Duration = Duration::from_secs(2);
 
-type Queued = (String, Vec<Article>, i64);
+/// What goes to the recorder's thread: a slice's headers (group, headers, when), or a barrier answered once every
+/// slice queued before it is written (`flush_recorder`).
+enum Queued {
+    Slice(String, Vec<Article>, i64),
+    Flush(std::sync::mpsc::SyncSender<()>),
+}
 
 static RECORDER_TX: std::sync::OnceLock<std::sync::mpsc::SyncSender<Queued>> = std::sync::OnceLock::new();
 static RECORDER_FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1057,7 +1065,11 @@ static RECORDER_FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 fn recorder() -> &'static std::sync::mpsc::SyncSender<Queued> {
     RECORDER_TX.get_or_init(|| {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Queued>(RECORD_QUEUE);
-        let _ = std::thread::Builder::new().name("xref-recorder".into()).spawn(move || record_queued(rx));
+        let _ = std::thread::Builder::new().name("xref-recorder".into()).spawn(move || {
+            record_queued(rx, &mut |group, articles, at| {
+                in_store(&RECORDER, |s| s.record_chunked(group, articles, at, RECORD_CHUNK)).map(|_| ())
+            })
+        });
         tx
     })
 }
@@ -1066,57 +1078,84 @@ fn recorder() -> &'static std::sync::mpsc::SyncSender<Queued> {
 /// group at a time sorted by message-id, soo the key's B-tree is written in order and many slices share each
 /// transaction, rather than every parse thread taking the store's lock in turn for its own few thousand rows. A
 /// write that fails is said and counted; the slice was saved already.
-fn record_queued(rx: std::sync::mpsc::Receiver<Queued>) {
-    while let Ok(first) = rx.recv() {
+fn record_queued(rx: std::sync::mpsc::Receiver<Queued>, write: &mut dyn FnMut(&str, &[Article], i64) -> Result<()>) {
+    let mut first = match rx.recv() {
+        Ok(q) => q,
+        Err(_) => return,
+    };
+    loop {
         let started = std::time::Instant::now();
-        let mut rows = first.1.len();
-        let mut batch = vec![first];
-        while rows < RECORD_BATCH {
-            let left = RECORD_GATHER.saturating_sub(started.elapsed());
-            match rx.recv_timeout(left) {
-                Ok(q) => {
-                    rows += q.1.len();
-                    batch.push(q);
+        let mut slices: Vec<(String, Vec<Article>, i64)> = Vec::new();
+        let mut barriers = Vec::new();
+        let mut rows = 0;
+        let mut next = Some(first);
+        let mut closed = false;
+        // gathered until enough rows, the time's up, or a barrier: one is answered once what came before it is written
+        while let Some(q) = next.take() {
+            match q {
+                Queued::Slice(g, a, at) => {
+                    rows += a.len();
+                    slices.push((g, a, at));
                 }
-                Err(_) => break,
+                Queued::Flush(done) => {
+                    barriers.push(done);
+                    break;
+                }
+            }
+            if rows >= RECORD_BATCH {
+                break;
+            }
+            match rx.recv_timeout(RECORD_GATHER.saturating_sub(started.elapsed())) {
+                Ok(q) => next = Some(q),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => closed = true,
             }
         }
         let mut by_group: HashMap<String, (Vec<Article>, i64)> = HashMap::new();
-        for (group, articles, at) in batch {
+        for (group, articles, at) in slices {
             let e = by_group.entry(group).or_insert_with(|| (Vec::new(), at));
             e.0.extend(articles);
             e.1 = e.1.max(at);
         }
         for (group, (mut articles, at)) in by_group {
             articles.sort_by(|a, b| a.message_id.cmp(&b.message_id));
-            if let Err(e) = in_store(&RECORDER, |s| s.record_chunked(&group, &articles, at, RECORD_CHUNK)) {
-                RECORDER_FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Err(e) = write(&group, &articles, at) {
+                RECORDER_FAILED.fetch_add(articles.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 eprintln!("xref: couldnt keep {} headers of {group}: {e:#}", articles.len());
             }
         }
+        for done in barriers {
+            let _ = done.send(());
+        }
+        if closed {
+            return;
+        }
+        first = match rx.recv() {
+            Ok(q) => q,
+            Err(_) => return,
+        };
     }
+}
+
+/// Waits (up to `timeout`) until every slice handed to the recorder's thread before now is written. Before each
+/// linker pass, soo a chunk counted done has its headers in the store (the settle gate reads chunk state), and at
+/// shutdown, soo nothing queued is lost. False when it couldn't tell in time.
+pub fn flush_recorder(timeout: Duration) -> bool {
+    let Some(tx) = RECORDER_TX.get() else { return true };
+    let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+    if tx.send(Queued::Flush(done_tx)).is_err() {
+        return false;
+    }
+    done_rx.recv_timeout(timeout).is_ok()
 }
 
 /// rows one of the recorder's thread's transactions takes: larger than `WRITE_CHUNK`, as it writes for many slices;
 /// still short enough for the linker's writes to go between
 const RECORD_CHUNK: usize = 20_000;
 
-/// Batches of headers the recorder's thread couldn't write, since start.
+/// Headers the recorder's thread couldn't write, since start.
 pub fn recorder_failures() -> u64 {
     RECORDER_FAILED.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Whether a group still has to read (back) any day from a day before `first` to a day after `last`, the poster's wall
-/// clock, its backfill chunk pending or claimed (`chunks`). `days` keeps the answers of one pass. Unknown counts as
-/// read: a database that can't be asked shouldn't hold every upload for a day.
-fn unread_days(main: &Connection, days: &mut HashMap<i64, bool>, first: i64, last: i64) -> bool {
-    (first.div_euclid(86_400) - 1..=last.div_euclid(86_400) + 1).any(|day| {
-        *days.entry(day).or_insert_with(|| {
-            main.prepare_cached("select 1 from backfill_chunks where day = ?1 and state != 2 limit 1")
-                .and_then(|mut stmt| stmt.exists([day]))
-                .unwrap_or(false)
-        })
-    })
 }
 
 /// `atlas --xref-reread [--since YYYY-MM-DD] [--done-before UNIX_TIME] [--apply]`: the backfill days read before
@@ -1300,8 +1339,18 @@ pub async fn run(db: crate::indexer::Db, stopping: impl Fn() -> bool) {
                         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
                     )?;
                     main.busy_timeout(Duration::from_secs(30))?;
-                    let mut days: HashMap<i64, bool> = HashMap::new();
-                    let mut unread = |first: i64, last: i64| unread_days(&main, &mut days, first, last);
+                    // the days still to read as of now, then every header queued before now written: a chunk this
+                    // counts done has its headers in the store when the pass reads it
+                    let not_done: std::collections::HashSet<i64> = main
+                        .prepare("select distinct day from backfill_chunks where state != 2")?
+                        .query_map([], |r| r.get(0))?
+                        .collect::<rusqlite::Result<_>>()?;
+                    if !flush_recorder(Duration::from_secs(300)) {
+                        anyhow::bail!("the recorder didnt write what was queued in time; the pass waits");
+                    }
+                    let mut unread = |first: i64, last: i64| {
+                        (first.div_euclid(86_400) - 1..=last.div_euclid(86_400) + 1).any(|d| not_done.contains(&d))
+                    };
                     with_store(|s| {
                         let t = now();
                         if crate::frozen::STOPPING.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1707,6 +1756,32 @@ mod tests {
         let mut names: Vec<_> = all.iter().map(|f| f.poster.clone()).collect();
         names.dedup();
         assert_eq!(names.len(), all.len());
+    }
+
+    #[test]
+    fn the_recorder_writes_each_groups_slices_sorted_and_answers_a_barrier_after_them() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(8);
+        let art = |id: &str| Article { message_id: format!("<{id}@x>"), ..Default::default() };
+        tx.send(Queued::Slice("a.b.one".into(), vec![art("c"), art("a")], 10)).unwrap();
+        tx.send(Queued::Slice("a.b.two".into(), vec![art("z")], 11)).unwrap();
+        tx.send(Queued::Slice("a.b.one".into(), vec![art("b")], 12)).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        tx.send(Queued::Flush(done_tx)).unwrap();
+        drop(tx);
+        let mut written: Vec<(String, Vec<String>, i64)> = Vec::new();
+        record_queued(rx, &mut |g, a, at| {
+            written.push((g.to_string(), a.iter().map(|x| x.message_id.clone()).collect(), at));
+            Ok(())
+        });
+        written.sort();
+        assert_eq!(
+            written,
+            vec![
+                ("a.b.one".to_string(), vec!["<a@x>".into(), "<b@x>".into(), "<c@x>".into()], 12),
+                ("a.b.two".to_string(), vec!["<z@x>".into()], 11),
+            ]
+        );
+        assert!(done_rx.try_recv().is_ok(), "the barrier answered once what came before it was written");
     }
 
     #[test]
