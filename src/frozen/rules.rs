@@ -59,7 +59,8 @@ macro_rules! matching {
             and not exists (select 1 from freeze_exempt e where e.release_id = r.id)
             and not exists (select 1 from upload_link u where u.release_id = r.id)
             and not exists (select 1 from upload_link u where u.lead_id = r.id)
-            and not exists (select 1 from beside_files b where b.row_id = r.id or b.release_id = r.id)
+            and not exists (select 1 from beside_files b where b.release_id = r.id)
+            and not exists (select 1 from beside_files b join releases o on o.id = b.release_id where b.row_id = r.id)
             and not exists (select 1 from nzb_pointed p where p.release_id = r.id)
             and not exists (select 1 from files f where f.release_id = r.id and f.filename like '%.nzb')"
     };

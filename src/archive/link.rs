@@ -448,11 +448,22 @@ impl LinkStep {
                         break 'files;
                     }
                     checks += 1;
-                    let Some(seen) = self.check(ctx, &candidate)? else {
+                    let seen = match self.check(ctx, &candidate) {
+                        Ok(Some(seen)) => seen,
                         // a run that finished no check at all goes on later only when one may: a budget too small
                         // for a single check would look again for ever
-                        out_of_bodies = checks > 1;
-                        break 'files;
+                        Ok(None) => {
+                            out_of_bodies = checks > 1;
+                            break 'files;
+                        }
+                        // what this run found is kept; the rest waits for a later one
+                        Err(StepError::Transient(_) | StepError::OutOfBudget)
+                            if !found.is_empty() || !tried.is_empty() =>
+                        {
+                            out_of_bodies = true;
+                            break 'files;
+                        }
+                        Err(e) => return Err(e),
                     };
                     if seen.md5_16k.is_some() && seen.is(want) {
                         found.push((candidate.id, want.file_id));
@@ -503,7 +514,8 @@ impl LinkStep {
                    and coalesce(f.expected, 1) <= 2
                    and not exists (select 1 from files g where g.release_id = r.id and g.id != f.id)
                    and not exists (select 1 from upload_link l where l.release_id = r.id)
-                   and not exists (select 1 from beside_files b where b.row_id = r.id and b.release_id != ?3)
+                   and not exists (select 1 from beside_files b join releases o on o.id = b.release_id
+                                   where b.row_id = r.id and b.release_id != ?3)
                    and not exists (select 1 from upload_link_tried t where t.release_id = ?3 and t.candidate_id = r.id)
                  order by abs(julianday(r.posted_date) - julianday(?6)), r.id limit ?5",
             )
