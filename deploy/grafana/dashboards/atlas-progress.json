@@ -403,7 +403,7 @@
    "id": 8,
    "type": "stat",
    "title": "Day chunks ETA",
-   "description": "Days left at the last hour's pace.",
+   "description": "Days left at the last 6 hours' pace.",
    "datasource": {
     "type": "prometheus",
     "uid": "victoriametrics"
@@ -416,7 +416,7 @@
    },
    "targets": [
     {
-     "expr": "(atlas_backfill_chunks{host=\"$host\",state=\"total\"} - ignoring(state) atlas_backfill_chunks{host=\"$host\",state=\"done\"}) / ignoring(state) (atlas_backfill_chunks{host=\"$host\",state=\"done_last_hour\"} > 0) * 3600",
+     "expr": "(atlas_backfill_chunks{host=\"$host\",state=\"total\"} - ignoring(state) atlas_backfill_chunks{host=\"$host\",state=\"done\"}) / ignoring(state) (deriv(atlas_backfill_chunks{host=\"$host\",state=\"done\"}[6h:5m]) > 0)",
      "legendFormat": "__auto",
      "editorMode": "code",
      "instant": true,
@@ -445,7 +445,7 @@
        "options": {
         "match": "null",
         "result": {
-         "text": "none done this hour",
+         "text": "none done in 6 h",
          "index": 0
         }
        }

@@ -639,6 +639,9 @@ def one_host(board):
     return board
 
 
+ETA_WINDOW = "6h"  # the pace window behind every ETA on Backfill and realtime
+
+
 def progress():
     host = variable("host", "Atlas", 'label_values(atlas_build_info{role="indexer"}, host)', multi=False, include_all=False)
     group = variable("group", "Group", 'label_values(atlas_group_backfill_articles{host="$host"}, group)')
@@ -650,8 +653,10 @@ def progress():
     total = f'sum(atlas_group_backfill_articles{{state="total",{g}}})'
     covered = f'sum(atlas_group_backfill_articles{{state="covered",{g}}})'
     left = f"({total} - {covered})"
-    # how fast what is left shrinks, over the last 6 hours: new posts add to it, so it is net of them
-    shrink = f"(-deriv({left}[6h:5m]))"
+    # every ETA on this board is at the pace of the last ETA_WINDOW: long enough to ride out restarts and
+    # slow servers, short enough to follow a real change in speed
+    # how fast what is left shrinks: new posts add to it, so it is net of them
+    shrink = f"(-deriv({left}[{ETA_WINDOW}:5m]))"
     per_group_left = f'(atlas_group_backfill_articles{{state="total",{g}}} - ignoring(state) atlas_group_backfill_articles{{state="covered",{g}}})'
     behind = (f'clamp_min(atlas_group_article_number{{mark="last",{g}}} - ignoring(mark) '
               f'atlas_group_article_number{{mark="live_cursor",{g}}}, 0)')
@@ -668,9 +673,9 @@ def progress():
     b.stat("Day chunks done", 'atlas_backfill_chunks{state="done"} / ignoring(state) atlas_backfill_chunks{state="total"}', "percentunit", w=4,
            description="Split groups backfill a day at a time; this is the share of those days done.")
     b.stat("Day chunks ETA", '(atlas_backfill_chunks{state="total"} - ignoring(state) atlas_backfill_chunks{state="done"}) '
-                             '/ ignoring(state) (atlas_backfill_chunks{state="done_last_hour"} > 0) * 3600', "s", w=4,
-           description="Days left at the last hour's pace.",
-           mappings=[{"type": "special", "options": {"match": "null", "result": {"text": "none done this hour", "index": 0}}}])
+                             f'/ ignoring(state) (deriv(atlas_backfill_chunks{{state="done"}}[{ETA_WINDOW}:5m]) > 0)', "s", w=4,
+           description="Days left at the last 6 hours' pace.",
+           mappings=[{"type": "special", "options": {"match": "null", "result": {"text": "none done in 6 h", "index": 0}}}])
     b.graph("Done", [q(f"{covered} / {total}", "done")], "percentunit", w=8, colors={"done": SERIES[0]})
     b.graph("Articles left", [q(left, "left")], w=8, colors={"left": SERIES[0]})
     b.graph("How far back, middle group", [
@@ -688,7 +693,7 @@ def progress():
         q(f'atlas_group_posted_timestamp_seconds{{end="oldest",{g}}} * 1000', "G"),
         q(f'atlas_group_backfill_chunks{{state="done",{g}}} / ignoring(state) atlas_group_backfill_chunks{{state="total",{g}}}', "H"),
         q(f'atlas_group_backfill_day_timestamp_seconds{{day="oldest_done",{g}}} * 1000', "I"),
-        q(f"{per_group_left} / (-deriv({per_group_left}[6h:5m]) > 0)", "J"),
+        q(f"{per_group_left} / (-deriv({per_group_left}[{ETA_WINDOW}:5m]) > 0)", "J"),
     ], {"group": ("Group", None), "Value #A": ("Done", "percentunit"), "Value #B": ("Left", "short"),
         "Value #C": ("Server first", "none"), "Value #D": ("Backfill cursor", "none"), "Value #E": ("Live cursor", "none"),
         "Value #F": ("Server last", "none"), "Value #G": ("Oldest post", "dateTimeAsIso"),
