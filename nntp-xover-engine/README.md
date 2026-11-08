@@ -40,11 +40,11 @@ Each dictionary is stored raw, FSST-coded, or alphabet-packed (for random string
 
 ## Measurements
 
-`cargo run --release --bin nxv-bench` runs the 10,000-row synthetic corpus. `nxv-bench FILE...` runs files of raw overview lines. The real files below are two slices of 25,000 rows from each group, fetched from one server on 2026-11-07. Times are on an Apple M-series laptop that was also running Atlas, so they are approximate. A cold block's random read includes decompressing its whole block.
+`cargo run --release --bin nxv-bench` runs the 10,000-row synthetic corpus (`corpus.rs`: the shapes `plan.md` asks for, from a fixed Xorshift64* seed). `nxv-bench FILE...` runs files of raw overview lines. The real files below are two slices of 25,000 rows from each group, fetched from one server on 2026-11-07. Times are on an Apple M-series laptop that was also running Atlas, so they are approximate. A cold block's random read includes decompressing its whole block.
 
 | Data | Raw | zstd -3 per row + 64 KB dict | zstd -19 whole batch (no random access) | .nxv hot | .nxv cold |
 |---|---:|---:|---:|---:|---:|
-| synthetic, 10k rows | 2.7 MB | 3.73x | 11.40x | 5.68x | 10.75x |
+| synthetic, 10k rows | 3.5 MB | 3.93x | 12.87x | 6.91x | 12.98x |
 | alt.binaries.teevee, 50k rows | 15.5 MB | 3.28x | 7.81x | 5.25x | **8.09x** |
 | alt.binaries.multimedia, 50k rows | 12.1 MB | 2.95x | 5.98x | 3.91x | 5.87x |
 | alt.binaries.boneless, 50k rows | 12.2 MB | 2.47x | 3.87x | 2.65x | 3.40x |
@@ -58,9 +58,13 @@ Each dictionary is stored raw, FSST-coded, or alphabet-packed (for random string
 Against the targets in the brief:
 
 - Hot 8 to 10x and cold 20 to 28x don't hold on real data. Message-ids, and in obfuscated groups the subjects and posters too, are random strings. No codec gets below their entropy, and they are most of what is left: 28 to 37% of a hot block is packed message-id tails. Cold teevee beats whole-batch zstd -19 while keeping random access. Boneless, almost all random, ends about 12% behind it.
-- Streaming reaches 1.1 to 1.6 GB/s on real data and 1.95 GB/s on the synthetic corpus, on one core of a busy machine: close to the 2 GB/s target, not past it. Random access is bounded by the 127-row walk, not O(1) like a fixed-width table.
+- Streaming reaches 1.1 to 1.6 GB/s on real data and 1.6 GB/s on the synthetic corpus, on one core of a busy machine: close to the 2 GB/s target, not past it. Random access is bounded by the 127-row walk, not O(1) like a fixed-width table.
 - The u16 id columns and u32 offset arrays the format requires for zero-copy reads cost about 18 bytes a row. That is the main gap between hot and cold.
 - Zero literal rows on all three real groups. The codecs learned 2-digit years, empty `Lines`, per-article domains and subject-equals-message-id from these samples.
+
+## Tests
+
+`cargo test` runs the unit tests in each module, `tests/roundtrip.rs`, and the eight gate suites `plan.md` lays out, one file per phase (`tests/gate0_corpus.rs` to `tests/gate7_streamer.rs`): the corpus shape and determinism, varints and the date formatter against chrono on 50,000 timestamps, every corpus subject, message-id and Xref through its codec and back, the packed sizes, the filter and buckets over the corpus, a block written to a file and mapped back with rows found by article number at the sub-block edges, and the streamer. Two of the plan's numbers are not met and the tests say so where they measure them: the Xref column for 10,000 rows is about 39 KB, not under 25 KB, because a varint is a byte at least and the corpus has one to three cross-posted numbers a row; and the template cache hits on about 78% of rows, not 99%, because three posters are active at once.
 
 ## Format notes
 

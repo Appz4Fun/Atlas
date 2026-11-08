@@ -210,6 +210,24 @@ pub fn parse_date(s: &[u8]) -> Option<(i64, u32)> {
     (&buf[..n] == s).then_some((ts, style))
 }
 
+/// The length of `Dow, DD Mon YYYY HH:MM:SS +0000`.
+pub const RFC2822_UTC_LEN: usize = 31;
+
+/// Writes a UTC second as `Dow, DD Mon YYYY HH:MM:SS +0000`, the shape chrono's `to_rfc2822` gives for a
+/// UTC time. Years outside 0..=9999 are clamped.
+pub fn format_rfc2822_utc_fixed(epoch_secs: i64, out: &mut [u8; RFC2822_UTC_LEN]) {
+    let mut buf = [0u8; DATE_BUF];
+    let n = format_date(epoch_secs, 0, &mut buf);
+    debug_assert_eq!(n, RFC2822_UTC_LEN);
+    out.copy_from_slice(&buf[..RFC2822_UTC_LEN]);
+}
+
+/// The UTC second of a date in any shape [`parse_date`] reads (fixed zone offsets, GMT, UTC, 2- or 4-digit
+/// years, with or without the weekday).
+pub fn parse_rfc2822_to_epoch(bytes: &[u8]) -> Option<i64> {
+    parse_date(bytes).map(|(ts, _)| ts)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

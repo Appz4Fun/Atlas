@@ -1484,3 +1484,23 @@ pub fn literal_reason(line: &[u8]) -> Option<&'static str> {
         NxvBlockBuilder::structure(line, art, xp, &mut RowScratch::default(), &mut Vec::new(), &mut Vec::new(), &mut d);
     if s.is_none() { Some("does not write back the same") } else { None }
 }
+
+impl NxvBlockView<'_> {
+    /// The first row numbered exactly `art`, if the block has one. None for a cold block.
+    pub fn find_row_by_art_num(&self, art: u64) -> Option<usize> {
+        if !self.overlaps_art_range(art, art) {
+            return None;
+        }
+        let h = self.hot.as_ref()?;
+        let sb = self.checkpoints.partition_point(|c| (c.base_art_num as u64) < art).saturating_sub(1);
+        let mut cur = RowDecoder::at_sub_block(self, sb);
+        let end = self.row_count();
+        while cur.row < end {
+            let d = cur.advance(self, h);
+            if d.art >= art {
+                return (d.art == art).then_some(cur.row - 1);
+            }
+        }
+        None
+    }
+}

@@ -233,6 +233,28 @@ pub fn unpack_msgid_tail_into(packed: &[u8], out: &mut Vec<u8>) {
     }
 }
 
+/// `(prefix, tail, domain)` of `<prefix tail@domain>`. A string not shaped like a message-id comes back
+/// whole as the tail, with an empty prefix and domain; the block keeps such a row literal.
+pub fn split_msgid_parts(raw: &[u8]) -> (&[u8], &[u8], &[u8]) {
+    match split_msgid(raw) {
+        Some((local, domain)) => {
+            let (prefix, tail) = split_prefix(local);
+            (prefix, tail, domain)
+        }
+        None => (&raw[..0], raw, &raw[..0]),
+    }
+}
+
+/// The mode a tail packs in and, for a hex tail, where its dot is (0xFF for none).
+pub fn classify_tail(tail: &[u8]) -> (PackMode, u8) {
+    let mode = classify(tail);
+    let dot = match mode {
+        PackMode::Hex4Bit => tail.iter().position(|&b| b == b'.').map_or(NONE, |d| d as u8),
+        _ => NONE,
+    };
+    (mode, dot)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

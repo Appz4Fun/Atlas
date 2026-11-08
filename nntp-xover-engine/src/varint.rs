@@ -157,6 +157,27 @@ pub fn parse_canonical_i64(s: &[u8]) -> Option<i64> {
     }
 }
 
+/// Each value as a zigzag varint of its difference from the one before (the first from 0).
+pub fn encode_delta_stream(vals: &[i64], out: &mut Vec<u8>) {
+    let mut prev = 0i64;
+    for &v in vals {
+        write_varint(zigzag_encode(v.wrapping_sub(prev)), out);
+        prev = v;
+    }
+}
+
+/// Appends the `count` values an [`encode_delta_stream`] wrote at the start of `buf` to `out`,
+/// returning how many bytes they took.
+pub fn decode_delta_stream(buf: &[u8], count: usize, out: &mut Vec<i64>) -> usize {
+    let mut pos = 0usize;
+    let mut prev = 0i64;
+    for _ in 0..count {
+        prev = prev.wrapping_add(zigzag_decode(read_varint_unchecked(buf, &mut pos)));
+        out.push(prev);
+    }
+    pos
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

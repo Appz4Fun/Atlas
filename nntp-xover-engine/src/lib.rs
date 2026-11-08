@@ -21,5 +21,6 @@ pub use container::{
     AlignedBytes, NxvBlockBuilder, NxvBlockHeader, NxvBlockView, SectionEntry, SectionId, SkipCheckpoint,
     compress_block_to_cold, decompress_cold_block, peek_header,
 };
+pub use corpus::generate_realistic_xover_corpus;
 pub use msgid_index::{Xor8Builder, Xor8Header, msgid_hash};
 pub use streamer::{NxvRangeCursor, RowCache, XoverStreamScratch, stream_xover_blocks_tokio, stream_xover_range_tokio};

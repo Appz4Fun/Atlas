@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use nntp_xover_engine::container::msgid_field_pub;
-use nntp_xover_engine::corpus::{Rng, generate};
+use nntp_xover_engine::corpus::{Rng, generate_realistic_xover_corpus};
 use nntp_xover_engine::*;
 
 const BLOCK_ROWS: usize = 65_536;
@@ -281,7 +281,7 @@ fn run(label: &str, lines: &[Vec<u8>]) -> Result<()> {
 fn main() -> Result<()> {
     let files: Vec<String> = std::env::args().skip(1).collect();
     if files.is_empty() {
-        run("Synthetic corpus", &generate(10_000, 7))?;
+        run("Synthetic corpus", &generate_realistic_xover_corpus(10_000))?;
     }
     for f in files {
         let data = std::fs::read(&f).with_context(|| format!("reading {f}"))?;

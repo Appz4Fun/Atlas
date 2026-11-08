@@ -17,6 +17,8 @@ anyhow = "1.0"
 
 [dev-dependencies]
 tempfile = "3"
+# the gate tests check the date formatter against chrono; the engine itself never uses it
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [profile.release]
 codegen-units = 1
