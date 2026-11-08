@@ -155,7 +155,12 @@ pub fn hold_off_compaction(main: &Path) -> Result<WriteGuard> {
 pub fn try_hold_off_compaction(main: &Path) -> Result<Option<WriteGuard>> {
     let file = open_lock(main)?;
     match file.try_lock_shared() {
-        Ok(()) => Ok(Some(WriteGuard(file))),
+        Ok(()) => {
+            // every writer holds this: none may write to shards a merge left half done (checked once held, soo a
+            // merge that marked and let go just before is seen)
+            crate::merge_shards::refuse_if_merging(main)?;
+            Ok(Some(WriteGuard(file)))
+        }
         Err(std::fs::TryLockError::WouldBlock) => Ok(None),
         Err(std::fs::TryLockError::Error(e)) => Err(e).context("locking the database for a write"),
     }
@@ -172,7 +177,17 @@ impl Drop for WriteGuard {
 pub(crate) struct Lock(std::fs::File);
 
 impl Lock {
+    /// The lock, refused while a shard merge is half done (`merge_shards::MERGING`): what takes it writes to shards.
     pub(crate) fn take(main: &Path) -> Result<Lock> {
+        let lock = Lock::take_unchecked(main)?;
+        // after taking it: a merge that set its marker and let go just before is seen
+        crate::merge_shards::refuse_if_merging(main)?;
+        Ok(lock)
+    }
+
+    /// The lock whatever a merge left: for the merge itself, and for what removes the shards whole (wipe, reset) or
+    /// sets a database up (conversion), which goes through `db::create_db_at`'s own check after.
+    pub(crate) fn take_unchecked(main: &Path) -> Result<Lock> {
         let file = open_lock(main)?;
         match file.try_lock() {
             Ok(()) => Ok(Lock(file)),
@@ -339,6 +354,7 @@ pub fn run(main: &Path, progress: &(dyn Fn(&str) + Sync), stop: &Arc<AtomicBool>
 
 fn run_locked(main: &Path, progress: &(dyn Fn(&str) + Sync), stop: &Arc<AtomicBool>) -> Result<Shrunk> {
     let _lock = Lock::take(main)?;
+    crate::merge_shards::refuse_if_merging(main)?;
     // a conversion's swap cut short is finished (or undone) like at a start;
     // shards with no main database at all are refused: the main database
     // the next start made would hand out their ids again

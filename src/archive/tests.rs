@@ -1191,6 +1191,35 @@ fn rar5_keeps_each_files_crc_time_and_host_and_its_owner() {
 }
 
 #[test]
+fn a_split_files_whole_crc_comes_from_its_last_volume() {
+    // RAR4: the first volume's header says split after (0x02), the last's split before (0x01) with the file's CRC
+    let first = r4_block(0x74, 0x0002, &r4_fields_with(b"a.mkv", 2, 0x0bad_0bad, 0), Some(0));
+    let last = r4_block(0x74, 0x0001, &r4_fields_with(b"a.mkv", 2, 0x1122_3344, 0), Some(0));
+    let mut listing = rar::list(&rar4(&[r4_main(0x0001), first]));
+    assert_eq!(listing.files[0].crc32, None);
+    let closing = rar::list(&rar4(&[r4_main(0x0001), last]));
+    assert_eq!(closing.files[0].crc32, Some(0x1122_3344));
+    super::steps::close_split_files(&mut listing, &closing);
+    assert_eq!(listing.files[0].crc32, Some(0x1122_3344));
+    // another file of the same name and size in another set is no match: only `close_split_files`' caller pairs
+    // sets, and a different size never closes
+    let split = r4_block(0x74, 0x0002, &r4_fields_with(b"a.mkv", 2, 0, 0), Some(0));
+    let mut other = rar::list(&rar4(&[r4_main(0x0001), split]));
+    other.files[0].size = other.files[0].size.map(|s| s + 1);
+    super::steps::close_split_files(&mut other, &closing);
+    assert_eq!(other.files[0].crc32, None);
+    // RAR5: header flags 0x08 alone, the last part, keep the CRC; 0x10, a part with more after it, don't
+    let r5 = |flags: u64| {
+        let fields = r5_fields_with(b"a.mkv", 0xcafe_f00d, 0, 0);
+        let inner = [&vint(2)[..], &vint(flags | 2), &vint(1), &fields].concat();
+        let body = [vint(inner.len() as u64), inner].concat();
+        let block = [&crc32(&body).to_le_bytes()[..], &body, b"x"].concat();
+        rar::list(&rar5(&[r5_main(), block])).files[0].crc32
+    };
+    assert_eq!((r5(0x08), r5(0x18), r5(0x10)), (Some(0xcafe_f00d), None, None));
+}
+
+#[test]
 fn a_split_rar5_file_keeps_no_crc() {
     // header flags 0x10: the data goes on in the next volume
     let fields = r5_fields_with(b"a.mkv", 0xcafe_f00d, 0, 0);
