@@ -128,6 +128,11 @@ impl Slab {
         self.rows.len()
     }
 
+    /// Bytes of lines held.
+    pub fn bytes(&self) -> usize {
+        self.arena.len()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }

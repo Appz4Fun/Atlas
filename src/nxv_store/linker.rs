@@ -35,7 +35,7 @@ use nntp_xover_engine::container::NxvBlockView;
 use nntp_xover_engine::streamer::FieldCursor;
 
 use super::store::{DAY, Store};
-use super::sync::{fsync_only, full_flush, sync_all_durable};
+use super::sync::{full_flush, sync_all_durable};
 use crate::parser::Release;
 use crate::xref::{FileSum, KEEP_SECS, MIN_UPLOAD_ARTICLES, Place, Row, SETTLE_SECS, Seed};
 
@@ -152,7 +152,8 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     {
         let mut f = File::create(&tmp).with_context(|| format!("making {}", tmp.display()))?;
         f.write_all(bytes)?;
-        fsync_only(&f)?;
+        // durable on the drive before the rename can be: a power cut must never leave the new name over old data
+        full_flush(&f)?;
     }
     std::fs::rename(&tmp, path).with_context(|| format!("renaming over {}", path.display()))?;
     let d = File::open(path.parent().unwrap_or(Path::new(".")))?;
@@ -342,6 +343,81 @@ impl Links {
     }
 }
 
+// ---------------------------------------------------------------- linked-ids.rec
+
+const IDS_FILE: &str = "linked-ids.rec";
+const IDS_RECORD: usize = 16;
+
+/// Every article linked within `LINKS_LIFE`, by message-id hash, kept in `linked-ids.rec` (`[hash u64][added i64]`
+/// records): an article is linked at most once, soo a late block holding it again (from another server, or read again
+/// after a pass that wasn't fully noted) never adds it as more parts.
+pub struct LinkedIds {
+    path: PathBuf,
+    set: HashSet<u64>,
+}
+
+impl LinkedIds {
+    pub fn open(dir: &Path, now: i64) -> Result<LinkedIds> {
+        let path = dir.join(IDS_FILE);
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        let before = now - LINKS_LIFE;
+        let mut set = HashSet::new();
+        let mut kept = Vec::with_capacity(bytes.len());
+        // a torn last record was never acknowledged: dropped
+        for r in bytes.chunks_exact(IDS_RECORD) {
+            let added = i64::from_le_bytes(r[8..16].try_into().expect("8 bytes"));
+            if added >= before {
+                set.insert(u64::from_le_bytes(r[..8].try_into().expect("8 bytes")));
+                kept.extend_from_slice(r);
+            }
+        }
+        if kept.len() != bytes.len() && (kept.len() * 2 < bytes.len() || bytes.len() % IDS_RECORD != 0) {
+            write_atomic(&path, &kept)?;
+        }
+        Ok(LinkedIds { path, set })
+    }
+
+    pub fn contains(&self, h: u64) -> bool {
+        self.set.contains(&h)
+    }
+
+    pub fn len(&self) -> usize {
+        self.set.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.set.is_empty()
+    }
+
+    /// Hashes appended and made durable, then held.
+    pub fn append(&mut self, hashes: &[u64], now: i64) -> Result<()> {
+        if hashes.is_empty() {
+            return Ok(());
+        }
+        let existed = self.path.exists();
+        let f = OpenOptions::new().create(true).append(true).open(&self.path)?;
+        let mut buf = Vec::with_capacity(hashes.len() * IDS_RECORD);
+        for h in hashes {
+            buf.extend_from_slice(&h.to_le_bytes());
+            buf.extend_from_slice(&now.to_le_bytes());
+        }
+        let mut w = &f;
+        w.write_all(&buf)?;
+        if existed {
+            full_flush(&f)?;
+        } else {
+            let d = File::open(self.path.parent().unwrap_or(Path::new(".")))?;
+            sync_all_durable(&[&f, &d])?;
+        }
+        self.set.extend(hashes.iter().copied());
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------- readiness
 
 /// Whether wall-clock hour `h` is ready at `now`: two hours (and the settle time) past its end, and no backfill day
@@ -377,6 +453,8 @@ struct Art {
 /// What a pass found: releases to save, then `ack`.
 pub struct Found {
     pub releases: Vec<Release>,
+    /// message-id hashes of every article in `releases`, noted as linked by `ack`
+    ids: Vec<u64>,
     lines: Vec<String>,
     state: State,
     pub hours: Vec<i64>,
@@ -396,6 +474,10 @@ pub struct PassStats {
     pub late_unready: u64,
     /// posters posting again past `JOIN_GAP` under a name already placed: a new upload each
     pub posted_again: u64,
+    /// rows of articles linked before (in an earlier pass), passed over
+    pub already_linked: u64,
+    /// blocks that wouldn't read, passed over
+    pub bad_blocks: u64,
     pub read_secs: f64,
     pub secs: f64,
 }
@@ -404,6 +486,7 @@ pub struct Linker {
     dir: PathBuf,
     pub state: State,
     pub links: Arc<Mutex<Links>>,
+    pub ids: LinkedIds,
 }
 
 impl Linker {
@@ -411,7 +494,12 @@ impl Linker {
     pub fn open(store: &Store, now: i64) -> Result<Linker> {
         let dir = store.root().join("_state");
         std::fs::create_dir_all(&dir)?;
-        Ok(Linker { state: State::load(&dir)?, links: Arc::new(Mutex::new(Links::open(&dir, now)?)), dir })
+        Ok(Linker {
+            state: State::load(&dir)?,
+            links: Arc::new(Mutex::new(Links::open(&dir, now)?)),
+            ids: LinkedIds::open(&dir, now)?,
+            dir,
+        })
     }
 
     /// A linker with its state in `dir` (a scratch folder, for trying it on a copy).
@@ -420,6 +508,7 @@ impl Linker {
         Ok(Linker {
             state: State::load(dir)?,
             links: Arc::new(Mutex::new(Links::open(dir, now)?)),
+            ids: LinkedIds::open(dir, now)?,
             dir: dir.to_path_buf(),
         })
     }
@@ -449,6 +538,10 @@ impl Linker {
         let mut state = self.state.clone();
         let segs = store.segments();
         let open_days = store.open_days();
+        // a segment gone, or holding fewer blocks than were counted (expired and made again): its count starts over,
+        // soo its blocks are read (what was linked before is passed over by message-id)
+        let present: HashMap<(String, i64), u32> = segs.iter().map(|(g, d, n)| ((g.clone(), *d), *n as u32)).collect();
+        state.counts.retain(|k, c| present.get(k).is_some_and(|&n| n >= *c));
         for (_, day, n) in &segs {
             if *n > 0 {
                 state.seen.entry(*day).or_insert(now);
@@ -519,18 +612,25 @@ impl Linker {
         let mut group_names: HashMap<i64, String> = HashMap::new();
         let mut new_counts: Vec<((String, i64), u32)> = Vec::new();
         // blocks read before the last pass first, soo a repeat in a late block is the one dropped
+        // one snapshot of every (group, day) read, for both rounds and the counts: a block committed while the pass
+        // reads isn't half counted
+        let mut snaps = Vec::new();
+        for g in store.group_names() {
+            let gid = group_id(&g);
+            group_names.insert(gid, g.clone());
+            for &d in &read_days {
+                let (map, entries) = store.day_blocks(&g, d);
+                let Some(map) = map else { continue };
+                let old = state.counts.get(&(g.clone(), d)).copied().unwrap_or(0) as usize;
+                new_counts.push(((g.clone(), d), entries.len() as u32));
+                snaps.push((gid, map, entries, old));
+            }
+        }
         for late_round in [false, true] {
-            for g in store.group_names() {
-                let gid = group_id(&g);
-                group_names.insert(gid, g.clone());
-                for &d in &read_days {
-                    let (map, entries) = store.day_blocks(&g, d);
-                    let Some(map) = map else { continue };
-                    let old = state.counts.get(&(g.clone(), d)).copied().unwrap_or(0) as usize;
-                    if !late_round {
-                        new_counts.push(((g.clone(), d), entries.len() as u32));
-                    }
-                    for e in &entries {
+            for (gid, map, entries, old) in &snaps {
+                let (gid, old) = (*gid, *old);
+                {
+                    for e in entries {
                         let late = e.seq as usize >= old;
                         if late != late_round {
                             continue;
@@ -543,10 +643,21 @@ impl Linker {
                             return Ok(None);
                         }
                         stats.blocks += 1;
-                        let view = NxvBlockView::from_mmap_slice(&map[e.offset as usize..])?;
+                        // a block that won't read is passed over (counted), not the whole pass given up
+                        let Some(cur) = map
+                            .get(e.offset as usize..)
+                            .and_then(|b| NxvBlockView::from_mmap_slice(b).ok())
+                            .and_then(|v| FieldCursor::new(v).ok())
+                        else {
+                            stats.bad_blocks += 1;
+                            eprintln!(
+                                "header store linker: a block of {} won't read; passed over",
+                                group_names.get(&gid).map_or("?", |s| s.as_str())
+                            );
+                            continue;
+                        };
                         // rows outside the hours read are passed over before their strings are decoded (late blocks are
                         // read whole)
-                        let cur = FieldCursor::new(view)?;
                         let mut cur = if late { cur } else { cur.with_wall_window(lo, hi) };
                         stats.rows += e.rows as u64;
                         while let Some(r) = cur.next_row() {
@@ -579,7 +690,12 @@ impl Linker {
                                 stats.late_unready += 1;
                                 continue;
                             }
-                            if !seen_ids.insert(nntp_xover_engine::msgid_index::msgid_hash(msgid)) {
+                            let h = nntp_xover_engine::msgid_index::msgid_hash(msgid);
+                            if self.ids.contains(h) {
+                                stats.already_linked += 1;
+                                continue;
+                            }
+                            if !seen_ids.insert(h) {
                                 stats.repeats += 1;
                                 continue;
                             }
@@ -657,10 +773,6 @@ impl Linker {
                 if new.is_empty() {
                     continue;
                 }
-                if pr.place.oldest < now - KEEP_SECS {
-                    // its first articles left the window long ago: one read again couldnt be told from a new one
-                    continue;
-                }
                 // posted well after its upload ended: the poster uploading again under the same name, a new upload of
                 // its own made of the new articles only
                 let upload_last = links.uploads.get(&pr.place.release).map(|u| u.seed.last);
@@ -670,6 +782,10 @@ impl Linker {
                     new_rows = new;
                     rows = &new_rows;
                     again = true;
+                } else if pr.place.oldest < now - KEEP_SECS {
+                    // within its upload's time but its first articles left the window long ago: one read again
+                    // couldnt be told from a new one
+                    continue;
                 }
             }
             if let (Some(pr), false) = (links.places.get(poster), again) {
@@ -820,11 +936,19 @@ impl Linker {
         }
         lines.retain(|l| l.trim_end_matches('\n').split('\t').all(field_ok));
         stats.secs = started.elapsed().as_secs_f64();
-        Ok(Some(Found { releases: crate::xref::finish_releases(out), lines, state, hours: span, stats }))
+        let releases = crate::xref::finish_releases(out);
+        let ids = releases
+            .iter()
+            .flat_map(|r| r.articles.iter())
+            .map(|a| nntp_xover_engine::msgid_index::msgid_hash(a.message_id.as_bytes()))
+            .collect();
+        Ok(Some(Found { releases, ids, lines, state, hours: span, stats }))
     }
 
     /// Notes what `found`'s pass did, once its releases are saved: the links appended, then the state rewritten.
     pub fn ack(&mut self, found: Found) -> Result<()> {
+        // the articles linked first: a pass noted only in part is then retried without adding them again
+        self.ids.append(&found.ids, chrono::Utc::now().timestamp())?;
         self.links.lock().unwrap_or_else(|e| e.into_inner()).append(&found.lines)?;
         found.state.save(&self.dir)?;
         self.state = found.state;
@@ -968,6 +1092,8 @@ pub async fn run(db: crate::indexer::Db, store: Arc<Store>, stopping: impl Fn() 
         let found = match found {
             Ok(Ok(Some(f))) => f,
             Ok(Ok(None)) => {
+                // the linker has run and the keep set knows its unlinked days: expiry may go on
+                store.arm_expiry();
                 sleep_unless(PASS_EVERY, &stopping).await;
                 continue;
             }
@@ -1003,6 +1129,7 @@ pub async fn run(db: crate::indexer::Db, store: Arc<Store>, stopping: impl Fn() 
         let l = Arc::clone(&linker);
         match tokio::task::spawn_blocking(move || l.lock().unwrap_or_else(|e| e.into_inner()).ack(found)).await {
             Ok(Ok(())) => {
+                store.arm_expiry();
                 if count > 0 || st.late_files > 0 {
                     println!(
                         "header store linker: saved {count} releases ({} uploads, {} files late), {articles} articles; {} blocks, {} rows in {:.0}s",
@@ -1237,6 +1364,41 @@ mod tests {
         assert_eq!(more.len(), 1, "one new upload");
         assert_ne!(more[0].name, first[0].name, "named apart from the first upload");
         assert_eq!(more[0].articles.len(), 12, "only the new articles");
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn an_article_linked_before_is_not_added_again_from_a_late_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = Store::open(cfg(dir.path()), keep_all()).unwrap();
+        let rows = upload("cc", T0 + 600, 3, 4, 1);
+        record(&store, &rows, 1000);
+        let now = T0 + 6 * 3600;
+        let state = dir.path().join("s");
+        let mut lk = Linker::open_in(&state, now).unwrap();
+        let mut first = 0;
+        while let Some(f) = lk.pass(&store, now, &HashSet::new(), &|| false).unwrap() {
+            first += f.releases.iter().map(|r| r.articles.len()).sum::<usize>();
+            lk.ack(f).unwrap();
+        }
+        assert_eq!(first, 1 + 3 * 4);
+        // another server lists the same articles later: a late block of nothing new
+        let again: Vec<Vec<u8>> = rows.iter().map(|(_, l)| l.clone()).collect();
+        let t = store.record("srv2", "alt.binaries.g0", &again, Clamp::Unknown { now: 2_000_000_000 }).unwrap();
+        store.tick().unwrap();
+        t.wait(Duration::from_secs(5)).unwrap();
+        let mut more = 0;
+        let mut skipped = 0;
+        while let Some(f) = lk.pass(&store, now + 3600, &HashSet::new(), &|| false).unwrap() {
+            more += f.releases.iter().map(|r| r.articles.len()).sum::<usize>();
+            skipped += f.stats.already_linked;
+            lk.ack(f).unwrap();
+        }
+        assert_eq!(more, 0, "nothing added again");
+        assert!(skipped > 0);
+        // and after a restart, from the file
+        let lk2 = Linker::open_in(&state, now + 3600).unwrap();
+        assert_eq!(lk2.ids.len(), 1 + 3 * 4);
         store.close().unwrap();
     }
 

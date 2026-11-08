@@ -62,14 +62,25 @@ pub fn spawn(cfg: &crate::config::HeaderStoreConfig) {
     if STORE.set(Mutex::new(Some(Arc::clone(&store)))).is_err() {
         return;
     }
-    LINKS_ON.store(cfg.linker, Ordering::Relaxed);
+    // the old linker's recording goes off only once the store's linker can read its state
+    if cfg.linker {
+        match super::linker::Linker::open(&store, now()) {
+            Ok(_) => LINKS_ON.store(true, Ordering::Relaxed),
+            Err(e) => eprintln!("header store: its linker couldnt read its state ({e:#}); the SQLite linker stays on"),
+        }
+    }
     let weak = Arc::downgrade(&store);
     let _ = std::thread::Builder::new().name("nxv-keep".into()).spawn(move || {
         loop {
             std::thread::sleep(Duration::from_secs(60));
             let Some(s) = weak.upgrade() else { return };
-            if s.failure().is_some() {
-                return;
+            if let Some(e) = s.failure() {
+                // fail-stop: nothing more is written, and a restart runs recovery (launchd starts the indexer again
+                // after a non-zero exit)
+                eprintln!(
+                    "header store: stopped after a write error ({e}); exiting soo recovery runs at the next start"
+                );
+                std::process::exit(70);
             }
             s.set_keep(keep_now());
         }
@@ -95,8 +106,12 @@ pub fn record(server: &str, group: &str, lines: &[Vec<u8>]) {
 
 /// What a slice waits on before it counts as read: every row recorded for `group` so far durable. None when the
 /// store is off.
-pub fn sync_point(group: &str) -> Option<Ticket> {
-    store()?.sync_point(group)
+pub fn sync_point(group: &str) -> anyhow::Result<Option<Ticket>> {
+    let Some(s) = store() else { return Ok(None) };
+    if let Some(e) = s.failure() {
+        anyhow::bail!("the header store stopped: {e}");
+    }
+    Ok(s.sync_point(group))
 }
 
 /// Seals and commits what's open, then stops. For shutdown.

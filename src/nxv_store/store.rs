@@ -18,7 +18,7 @@ use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -31,6 +31,8 @@ use super::slab::{self, Sealed, Slab};
 use super::sync::{fsync_only, sync_all_durable};
 
 pub const DAY: i64 = 86_400;
+/// A slab's lines at most, in bytes: a block stays well under the format's 1 GiB limit whatever the line lengths.
+pub const SLAB_MAX_BYTES: usize = 256 << 20;
 
 #[derive(Clone, Debug)]
 pub struct StoreConfig {
@@ -240,7 +242,11 @@ pub struct Store {
     servers: Mutex<Vec<String>>,
     keep: RwLock<KeepSet>,
     shared: Arc<Shared>,
-    seal_tx: Mutex<Option<SyncSender<SealJob>>>,
+    seal_tx: Mutex<Option<Sender<SealJob>>>,
+    /// expiry waits until the linker has finished a pass, soo days it hasn't linked aren't let go after a start
+    expiry_armed: AtomicBool,
+    /// held while the store is open: a second process opening it would replay and append to the same files
+    _lock: File,
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
     /// one tick at a time: two would interleave their writes to a log
     tick_lock: Mutex<()>,
@@ -289,6 +295,18 @@ pub fn decode_name(dir: &str) -> Option<String> {
 }
 
 const STATE_DIR: &str = "_state";
+
+/// An exclusive lock on the store's `_state/lock`, refused when another process holds it.
+fn lock_store(root: &Path) -> Result<File> {
+    use std::os::fd::AsRawFd;
+    let path = root.join(STATE_DIR).join("lock");
+    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path)?;
+    // SAFETY: flock on a descriptor this File owns
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        bail!("{} is in use by another process (the indexer?)", root.display());
+    }
+    Ok(f)
+}
 const SERVERS_FILE: &str = "servers";
 
 impl Store {
@@ -298,6 +316,7 @@ impl Store {
     /// sealers and the committer.
     pub fn open(cfg: StoreConfig, keep: KeepSet) -> Result<(Arc<Store>, Opened)> {
         std::fs::create_dir_all(cfg.root.join(STATE_DIR)).with_context(|| format!("making {}", cfg.root.display()))?;
+        let lock = lock_store(&cfg.root)?;
         let _ = super::sync::raise_open_files(65_536);
         let servers = read_servers(&cfg.root)?;
         let mut opened = Opened::default();
@@ -309,7 +328,10 @@ impl Store {
                 continue;
             }
             let Some(name) = decode_name(&dname) else { continue };
-            let group = open_group(&dir, &name, &keep, &mut opened)?;
+            // nothing is deleted at open: what the keep set no longer holds goes once expiry is armed (after the
+            // linker's first pass), soo a day the linker hasn't linked survives a restart
+            let everything = KeepSet { live_from: i64::MIN / 2, ..KeepSet::default() };
+            let group = open_group(&dir, &name, &everything, &mut opened)?;
             groups.insert(name, group);
         }
         let shared = Arc::new(Shared {
@@ -333,13 +355,16 @@ impl Store {
             seal_tx: Mutex::new(None),
             threads: Mutex::new(Vec::new()),
             tick_lock: Mutex::new(()),
+            expiry_armed: AtomicBool::new(false),
+            _lock: lock,
         });
         store.start();
         Ok((store, opened))
     }
 
     fn start(self: &Arc<Self>) {
-        let (seal_tx, seal_rx) = sync_channel::<SealJob>(64);
+        // unbounded: a tick never waits on the sealers, soo durability doesn't wait on sealing
+        let (seal_tx, seal_rx) = channel::<SealJob>();
         let (commit_tx, commit_rx) = sync_channel::<Pending>(64);
         let seal_rx = Arc::new(Mutex::new(seal_rx));
         let mut threads = Vec::new();
@@ -408,6 +433,8 @@ impl Store {
         }
         let dir = self.cfg.root.join(encode_name(name));
         std::fs::create_dir_all(&dir).with_context(|| format!("making {}", dir.display()))?;
+        // the new folder's name durable before any row of it counts as kept
+        super::sync::sync_dir(&self.cfg.root)?;
         let g = Arc::new(new_group(dir, name, 1));
         gs.insert(name.to_string(), Arc::clone(&g));
         Ok(g)
@@ -419,6 +446,18 @@ impl Store {
         if let Some(e) = self.failure() {
             bail!("the header store stopped: {e}");
         }
+        match self.record_inner(server, group, lines, clamp) {
+            Ok(t) => Ok(t),
+            Err(e) => {
+                // rows that couldnt be kept must not let a cursor move: the store stops, and the slice's wait fails
+                let msg = format!("{e:#}");
+                self.shared.fail(e);
+                bail!("the header store stopped: {msg}")
+            }
+        }
+    }
+
+    fn record_inner(&self, server: &str, group: &str, lines: &[Vec<u8>], clamp: Clamp) -> Result<Ticket> {
         let sid = self.server_id(server)?;
         let g = self.group(group)?;
         let parsed: Vec<Option<(u64, Option<i64>)>> = lines
@@ -485,16 +524,26 @@ impl Store {
             if let Some(e) = self.failure() {
                 bail!("the header store stopped: {e}");
             }
+            // the slabs first, each group's lock on its own, then the slabs in flight: a slab moves from a group's
+            // slabs to `inflight` under the group's lock, soo looking in that order never misses one on its way, and no
+            // lock is held while another is taken (the batcher takes a group's slabs, then `inflight`)
             let left: usize = {
+                let groups: Vec<(String, Arc<Group>)> = {
+                    let gs = self.groups.read().unwrap_or_else(|e| e.into_inner());
+                    let names: HashSet<&String> = waiting.iter().map(|(n, _)| n).collect();
+                    names.into_iter().filter_map(|n| gs.get(n).map(|g| (n.clone(), Arc::clone(g)))).collect()
+                };
+                let mut still: HashSet<(String, u32)> = HashSet::new();
+                for (name, g) in &groups {
+                    let s = g.slabs.lock().unwrap_or_else(|e| e.into_inner());
+                    for sl in s.open.values().chain(s.full.iter()) {
+                        if waiting.contains(&(name.clone(), sl.slab_gen)) {
+                            still.insert((name.clone(), sl.slab_gen));
+                        }
+                    }
+                }
                 let inflight = self.shared.inflight.lock().unwrap_or_else(|e| e.into_inner());
-                let groups = self.groups.read().unwrap_or_else(|e| e.into_inner());
-                waiting.retain(|(name, slab_gen)| {
-                    inflight.contains(&(name.clone(), *slab_gen))
-                        || groups.get(name).is_some_and(|g| {
-                            let s = g.slabs.lock().unwrap_or_else(|e| e.into_inner());
-                            s.open.values().chain(s.full.iter()).any(|sl| sl.slab_gen == *slab_gen)
-                        })
-                });
+                waiting.retain(|k| still.contains(k) || inflight.contains(k));
                 waiting.len()
             };
             if left == 0 {
@@ -670,6 +719,7 @@ impl Store {
     /// expired.
     pub fn housekeeping(&self) {
         let keep = self.keep.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let armed = self.expiry_armed.load(Ordering::Acquire);
         for g in self.groups.read().unwrap_or_else(|e| e.into_inner()).values() {
             let open_days: BTreeSet<i64> = {
                 let s = g.slabs.lock().unwrap_or_else(|e| e.into_inner());
@@ -678,7 +728,7 @@ impl Store {
             let mut segs = g.segments.write().unwrap_or_else(|e| e.into_inner());
             let gone: Vec<i64> = segs
                 .iter()
-                .filter(|(day, seg)| !keep.keeps(**day) && !open_days.contains(day) && seg.expire())
+                .filter(|(day, seg)| armed && !keep.keeps(**day) && !open_days.contains(day) && seg.expire())
                 .map(|(d, _)| *d)
                 .collect();
             for d in gone {
@@ -688,6 +738,19 @@ impl Store {
                 seg.close_if_idle(self.cfg.writer_idle);
             }
         }
+    }
+
+    /// Lets a test reopen the store after "crashing" it (forgetting it with its lock held).
+    #[cfg(test)]
+    fn unlock_for_test(&self) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: flock on a descriptor this store owns
+        unsafe { libc::flock(self._lock.as_raw_fd(), libc::LOCK_UN) };
+    }
+
+    /// Lets expiry run (the linker calls it once it has finished a pass).
+    pub fn arm_expiry(&self) {
+        self.expiry_armed.store(true, Ordering::Release);
     }
 
     /// Seals and commits everything, then stops the threads. What `record` got after this isn't kept.
@@ -784,7 +847,7 @@ fn push_row(
     seal_rows: usize,
 ) -> Result<()> {
     let key = (sid, day);
-    if s.open.get(&key).is_some_and(|sl| sl.len() >= seal_rows)
+    if s.open.get(&key).is_some_and(|sl| sl.len() >= seal_rows || sl.bytes() >= SLAB_MAX_BYTES)
         && let Some(full) = s.open.remove(&key)
     {
         s.full.push(full);
@@ -1002,6 +1065,17 @@ mod tests {
     }
 
     #[test]
+    fn a_second_open_of_the_same_store_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = Store::open(cfg(dir.path()), keep_all()).unwrap();
+        assert!(Store::open(cfg(dir.path()), keep_all()).is_err());
+        store.close().unwrap();
+        drop(store);
+        let (again, _) = Store::open(cfg(dir.path()), keep_all()).unwrap();
+        again.close().unwrap();
+    }
+
+    #[test]
     fn names_encode_and_decode() {
         for n in ["alt.binaries.x", "a b/c", "", ".hidden", "_x", "ü"] {
             assert_eq!(decode_name(&encode_name(n)).as_deref(), Some(n), "{n}");
@@ -1090,6 +1164,7 @@ mod tests {
             store.tick().unwrap();
             t.wait(Duration::from_secs(1)).unwrap();
             // a crash: the store is dropped without close (its threads see stopping, but nothing is sealed)
+            store.unlock_for_test();
             std::mem::forget(store);
         }
         let (store, opened) = Store::open(cfg(dir.path()), keep_all()).unwrap();
@@ -1173,6 +1248,9 @@ mod tests {
         store.record("s", "g", &filling, Clamp::Live { now: NOW }).unwrap();
         store.tick().unwrap();
         store.set_keep(KeepSet { live_from: day_of("2026-11-09"), ..KeepSet::default() });
+        store.housekeeping();
+        assert!(dir.path().join("g/2026-11-01.nxv").exists(), "nothing expires before the linker has run");
+        store.arm_expiry();
         store.housekeeping();
         assert!(!dir.path().join("g/2026-11-01.nxv").exists(), "an old day goes");
         assert_eq!(
