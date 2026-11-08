@@ -142,6 +142,11 @@ struct Upload {
 /// fewest of them first; else a saved upload none of its groups had been read for, the closest: groups are read apart,
 /// and a file read in one only after its upload was saved from another shares none with it.
 pub fn chain(files: &[FileSum], seeds: &[Seed]) -> Vec<(Option<usize>, Vec<usize>)> {
+    chain_until(files, seeds, &|| false).expect("never stopped")
+}
+
+/// `chain`, None once `stop` says so (asked every few thousand files).
+fn chain_until(files: &[FileSum], seeds: &[Seed], stop: &dyn Fn() -> bool) -> Option<Vec<(Option<usize>, Vec<usize>)>> {
     let mut order: Vec<usize> = (0..files.len()).collect();
     order.sort_by(|&a, &b| {
         let (x, y) = (&files[a], &files[b]);
@@ -165,7 +170,10 @@ pub fn chain(files: &[FileSum], seeds: &[Seed]) -> Vec<(Option<usize>, Vec<usize
     let mut by_start: Vec<usize> = (0..uploads.len()).collect();
     by_start.sort_by_key(|&j| std::cmp::Reverse(uploads[j].first));
     let mut active: Vec<usize> = Vec::new();
-    for i in order {
+    for (k, i) in order.into_iter().enumerate() {
+        if k % 4096 == 0 && stop() {
+            return None;
+        }
         let f = &files[i];
         while by_start.last().is_some_and(|&j| uploads[j].first - GAP_SECS <= f.first) {
             active.extend(by_start.pop());
@@ -225,7 +233,7 @@ pub fn chain(files: &[FileSum], seeds: &[Seed]) -> Vec<(Option<usize>, Vec<usize
             }
         }
     }
-    uploads.into_iter().filter(|u| !u.files.is_empty()).map(|u| (u.seed.map(|(j, _)| j), u.files)).collect()
+    Some(uploads.into_iter().filter(|u| !u.files.is_empty()).map(|u| (u.seed.map(|(j, _)| j), u.files)).collect())
 }
 
 /// Stable, in decimal: a run of hex would read as a random name, and leave search (as `filters::per_article_name`).
@@ -347,7 +355,9 @@ pub struct Found {
 #[derive(Clone, Debug)]
 pub enum Taken {
     Ids(Vec<String>),
-    UpTo(i64),
+    /// every waiting article that came by this time, as long as they are still the count the pass saw: an article
+    /// that took long to commit is left to the next pass rather than let go unseen
+    UpTo(i64, i64),
 }
 
 /// What a pass took as done, noted by `Store::ack` once its releases are saved.
@@ -581,7 +591,11 @@ impl Store {
         let mut waits: HashMap<String, bool> = HashMap::new();
         let mut fresh = Vec::new();
         let mut late = Vec::new();
-        for (k, (f, place)) in self.waiting_placed()?.into_iter().enumerate() {
+        let waiting = self.waiting_placed()?;
+        if stop() {
+            return Ok(nothing());
+        }
+        for (k, (f, place)) in waiting.into_iter().enumerate() {
             if k % 4096 == 0 && stop() {
                 return Ok(nothing());
             }
@@ -606,8 +620,8 @@ impl Store {
             if settled(&f) && place.oldest < now - KEEP_SECS {
                 // the file's first articles have left the window: one read again couldnt be told from a new one, and
                 // would be numbered as another part. Let go
-                let upto = f.added;
-                finished.push((f.poster, None, Taken::UpTo(upto)));
+                let taken = Taken::UpTo(f.added, f.n);
+                finished.push((f.poster, None, taken));
             } else if settled(&f) {
                 let rows = self.rows_of(&f.poster)?;
                 let parts = place.parts + rows.len() as i64;
@@ -652,7 +666,8 @@ impl Store {
         }
         let seeds: Vec<Seed> = saved.iter().map(|u| u.seed.clone()).collect();
         let mut widened: Vec<(String, String, Seed, i64)> = Vec::new();
-        for (k, (seed, files)) in chain(&fresh, &seeds).into_iter().enumerate() {
+        let Some(chains) = chain_until(&fresh, &seeds, stop) else { return Ok(nothing()) };
+        for (k, (seed, files)) in chains.into_iter().enumerate() {
             if k % 4096 == 0 && stop() {
                 return Ok(nothing());
             }
@@ -663,7 +678,7 @@ impl Store {
             if seed.is_none() && articles < MIN_UPLOAD_ARTICLES {
                 // noise, let go whole: no need to read its articles
                 for &i in &files {
-                    finished.push((fresh[i].poster.clone(), None, Taken::UpTo(fresh[i].added)));
+                    finished.push((fresh[i].poster.clone(), None, Taken::UpTo(fresh[i].added, fresh[i].n)));
                 }
                 continue;
             }
@@ -744,8 +759,10 @@ impl Store {
                  values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  on conflict(poster) do update set parts = excluded.parts, leads = excluded.leads, added = excluded.added",
             )?;
-            let mut done_upto =
-                tx.prepare_cached("update headers set done = 1 where poster = ?1 and done = 0 and added <= ?2")?;
+            let mut done_upto = tx.prepare_cached(
+                "update headers set done = 1 where poster = ?1 and done = 0 and added <= ?2
+                 and (select count(*) from headers where poster = ?1 and done = 0 and added <= ?2) = ?3",
+            )?;
             for (poster, place, taken) in finished {
                 match taken {
                     Taken::Ids(ids) => {
@@ -753,8 +770,8 @@ impl Store {
                             done.execute([id])?;
                         }
                     }
-                    Taken::UpTo(upto) => {
-                        done_upto.execute(params![poster, upto])?;
+                    Taken::UpTo(upto, n) => {
+                        done_upto.execute(params![poster, upto, n])?;
                     }
                 }
                 if let Some(p) = place {
@@ -925,6 +942,12 @@ pub async fn run(db: crate::indexer::Db, stopping: impl Fn() -> bool) {
                     let mut unread = |first: i64, last: i64| unread_days(&main, &mut days, first, last);
                     with_store(|s| {
                         let t = now();
+                        if crate::frozen::STOPPING.load(std::sync::atomic::Ordering::Relaxed) {
+                            return Ok(Found {
+                                releases: Vec::new(),
+                                ack: Ack { finished: Vec::new(), widened: Vec::new(), now: t },
+                            });
+                        }
                         s.prune(t)?;
                         s.pass_with(t, &mut unread, &|| {
                             crate::frozen::STOPPING.load(std::sync::atomic::Ordering::Relaxed)
