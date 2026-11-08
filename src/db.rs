@@ -486,7 +486,7 @@ pub fn create_db_holding(path: &Path) -> anyhow::Result<Option<WriteGuard>> {
     // a conversion's swap cut short leaves no main database: finished or
     // undone first, alone (busy means someone is using the database, soo it's there)
     if (!path.try_exists()? || crate::convert::is_empty_interloper(path))
-        && let Ok(_alone) = crate::compact::Lock::take(path)
+        && let Ok(_alone) = crate::compact::Lock::take_unchecked(path)
         && let Some(said) = crate::convert::recover_cut_swap(path)?
     {
         crate::ui::warn(&said);
@@ -507,7 +507,7 @@ pub fn create_db_holding(path: &Path) -> anyhow::Result<Option<WriteGuard>> {
 /// shards would hand out their ids again. A shard that cant be removed is an
 /// error, with the main database left in place.
 pub fn wipe(main: &Path) -> anyhow::Result<()> {
-    let _exclusive = crate::compact::Lock::take(main)?;
+    let _exclusive = crate::compact::Lock::take_unchecked(main)?;
     let mut dbs = Vec::new();
     for shard in store::shard_paths(main) {
         let copy = crate::compact::with_suffix(&shard, "compact");
@@ -546,6 +546,10 @@ pub fn create_db_at(path: &Path) -> anyhow::Result<()> {
         refuse_orphaned_shards(path)?;
     }
     let conn = create_at(path)?;
+    // shards half merged: only `atlas --merge-shards --apply` may go on with them
+    if crate::merge_shards::in_progress(&conn) {
+        anyhow::bail!("a shard merge is in progress: run `atlas --merge-shards --apply` to finish it before indexing");
+    }
 
     // wal soo the indexer can write while search reads
     conn.query_row("pragma journal_mode = wal", [], |_| Ok(()))?;

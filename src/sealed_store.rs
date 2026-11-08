@@ -230,6 +230,14 @@ pub fn run_move() -> i32 {
         println!("stop the indexer first: it competes for the same locks, and it moves these anyway");
         return 1;
     }
+    // held for the whole sweep: a merge or a compaction can't start under it, and it refuses a merge half done
+    let _held = match crate::compact::hold_off_compaction(&crate::paths::database()) {
+        Ok(held) => held,
+        Err(e) => {
+            println!("{e:#}");
+            return 1;
+        }
+    };
     configure(&config.addr);
     let main = crate::paths::database();
     let started = Instant::now();
