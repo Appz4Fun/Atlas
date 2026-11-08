@@ -364,7 +364,7 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "description": "Days left at the last hour's pace.",
+      "description": "Days left at the last 6 hours' pace.",
       "fieldConfig": {
         "defaults": {
           "mappings": [
@@ -373,7 +373,7 @@
                 "match": "null",
                 "result": {
                   "index": 0,
-                  "text": "none done this hour"
+                  "text": "none done in 6 h"
                 }
               },
               "type": "special"
@@ -419,7 +419,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "(atlas_backfill_chunks{host=\"$host\",state=\"total\"} - ignoring(state) atlas_backfill_chunks{host=\"$host\",state=\"done\"}) / ignoring(state) (atlas_backfill_chunks{host=\"$host\",state=\"done_last_hour\"} > 0) * 3600",
+          "expr": "(atlas_backfill_chunks{host=\"$host\",state=\"total\"} - ignoring(state) atlas_backfill_chunks{host=\"$host\",state=\"done\"}) / ignoring(state) (deriv(atlas_backfill_chunks{host=\"$host\",state=\"done\"}[6h:5m]) > 0)",
           "instant": true,
           "legendFormat": "__auto",
           "range": false,
