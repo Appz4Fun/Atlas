@@ -473,13 +473,16 @@ impl Store {
         Ok(n)
     }
 
-    /// The WAL written back into the file and started over, between passes. Writers commit all the time, soo the
-    /// passive checkpoints at each commit never get to the end of it while a pass reads: on a busy run the WAL
-    /// grew past the file many times over (hundreds of GB in hours), and every write and read through it slowed
-    /// with it. Here no read is open on this connection; a write that comes meanwhile waits on the busy handler.
-    /// Returns the WAL's frames and those written back.
-    pub fn checkpoint(&mut self) -> Result<(i64, i64)> {
-        Ok(self.conn.query_row("pragma wal_checkpoint(truncate)", [], |r| Ok((r.get(1)?, r.get(2)?)))?)
+    /// The WAL written back into the file as far as no read holds it, without taking the write lock (soo the parse
+    /// path's writes never wait on it). Writers commit all the time, soo the passive checkpoint at each of their
+    /// commits rarely found this connection between reads during a pass: on a full run the WAL grew past the file
+    /// many times over (hundreds of GB in hours), slowing every write and read through it. Run between this
+    /// connection's statements (before each pass, and every few hundred posters in one), it lets the next write
+    /// start the WAL over, and `journal_size_limit` cut its file back. Returns (blocked, frames, written back).
+    pub fn checkpoint(&mut self) -> Result<(bool, i64, i64)> {
+        Ok(self.conn.query_row("pragma wal_checkpoint(passive)", [], |r| {
+            Ok((r.get::<_, i64>(0)? != 0, r.get(1)?, r.get(2)?))
+        })?)
     }
 
     /// Drop what arrived over `KEEP_SECS` ago.
@@ -682,6 +685,10 @@ impl Store {
         for (k, (f, place)) in late.into_iter().enumerate() {
             if k % 256 == 0 && stop() {
                 return Ok(nothing());
+            }
+            if k % 256 == 255 {
+                // between this connection's reads: what the parse path wrote meanwhile can go back (`checkpoint`)
+                self.checkpoint()?;
             }
             if settled(&f) && place.oldest < now - KEEP_SECS {
                 // the file's first articles have left the window: one read again couldnt be told from a new one, and
@@ -1162,10 +1169,17 @@ pub async fn run(db: crate::indexer::Db, stopping: impl Fn() -> bool) {
         }
         // the WAL written back before each pass, while no pass reads (`Store::checkpoint`)
         match tokio::task::spawn_blocking(|| with_store(|s| s.checkpoint())).await {
+            Ok(Ok(Some((blocked, frames, written)))) if blocked || frames > written => {
+                eprintln!(
+                    "xref: the WAL went back {written} of {frames} pages{}",
+                    if blocked { " (blocked)" } else { "" }
+                )
+            }
             Ok(Ok(_)) => {}
             Ok(Err(e)) => eprintln!("xref: couldnt write the WAL back: {e:#}"),
             Err(e) => eprintln!("xref: writing the WAL back failed: {e}"),
         }
+        let pass_started = std::time::Instant::now();
         let found = match pending.take() {
             Some(found) => found,
             None => {
@@ -1206,6 +1220,9 @@ pub async fn run(db: crate::indexer::Db, stopping: impl Fn() -> bool) {
                 }
             }
         };
+        if pass_started.elapsed() > PASS_EVERY {
+            eprintln!("xref: a pass took {:.0} s", pass_started.elapsed().as_secs_f64());
+        }
         let (count, articles) = (found.releases.len(), found.releases.iter().map(|r| r.articles.len()).sum::<usize>());
         // a save goes to one shard's writer, soo each shard's releases go apart; saving one again changes nothing
         let mut by_shard: HashMap<usize, Vec<Release>> = HashMap::new();
@@ -1546,7 +1563,7 @@ mod tests {
     }
 
     #[test]
-    fn a_checkpoint_writes_the_wal_back_and_starts_it_over() {
+    fn a_checkpoint_writes_the_wal_back_soo_the_next_write_starts_it_over() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("atlas.xref.db");
         let mut store = Store::open(&path).unwrap();
@@ -1561,9 +1578,12 @@ mod tests {
         assert!(std::fs::metadata(&wal).unwrap().len() > 0);
         reader.execute_batch("commit;").unwrap();
         drop(reader);
-        let (frames, written) = store.checkpoint().unwrap();
-        assert_eq!(frames, written, "all of it written back");
-        assert_eq!(std::fs::metadata(&wal).unwrap().len(), 0, "and the WAL started over");
+        let (blocked, frames, written) = store.checkpoint().unwrap();
+        assert!(!blocked);
+        assert_eq!(frames, written, "all of it written back once no read holds it");
+        // the next write starts the WAL over, and its file is cut back
+        store.record("a.b.one", &batch[..10], 1001).unwrap();
+        assert!(std::fs::metadata(&wal).unwrap().len() < 1 << 28);
         assert_eq!(store.waiting().unwrap().len(), 7, "nothing lost");
     }
 
