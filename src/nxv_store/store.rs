@@ -33,6 +33,8 @@ use super::sync::{fsync_only, sync_all_durable};
 pub const DAY: i64 = 86_400;
 /// A slab's lines at most, in bytes: a block stays well under the format's 1 GiB limit whatever the line lengths.
 pub const SLAB_MAX_BYTES: usize = 256 << 20;
+/// How long a day claimed here stays kept after its last claim, on top of the keep set's source.
+pub const RECENT_CLAIM: Duration = Duration::from_secs(6 * 3600);
 
 #[derive(Clone, Debug)]
 pub struct StoreConfig {
@@ -249,6 +251,9 @@ pub struct Store {
     /// where a fresh keep set comes from (`live::keep_now`): housekeeping and a refused row ask it, soo a keep set set
     /// earlier never wins over a newer one
     keep_source: Mutex<Option<KeepSource>>,
+    /// days claimed here (`add_claimed`, or a read found on a day not kept) and when: kept for `RECENT_CLAIM` past their
+    /// last claim, on top of what the source says
+    recent_claims: Mutex<BTreeMap<i64, Instant>>,
     /// held while the store is open: a second process opening it would replay and append to the same files
     _lock: File,
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
@@ -364,6 +369,7 @@ impl Store {
             tick_lock: Mutex::new(()),
             expiry_armed: AtomicBool::new(false),
             keep_source: Mutex::new(None),
+            recent_claims: Mutex::new(BTreeMap::new()),
             _lock: lock,
         });
         store.start();
@@ -422,14 +428,20 @@ impl Store {
         let source = self.keep_source.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let Some(f) = source else { return self.keep.read().unwrap_or_else(|e| e.into_inner()).clone() };
         let fresh = f();
+        // the fresh claims, and those made here lately that the source may not have caught up with (they age out,
+        // soo a day claimed once isn't kept for good)
+        let mut recent = self.recent_claims.lock().unwrap_or_else(|e| e.into_inner());
+        recent.retain(|_, at| at.elapsed() < RECENT_CLAIM);
+        let claimed: BTreeSet<i64> = fresh.claimed.iter().chain(recent.keys()).copied().collect();
+        drop(recent);
         let mut k = self.keep.write().unwrap_or_else(|e| e.into_inner());
-        let claimed: BTreeSet<i64> = k.claimed.iter().chain(fresh.claimed.iter()).copied().collect();
         *k = KeepSet { claimed, ..fresh };
         k.clone()
     }
 
     /// A backfill day just claimed, kept at once (not at the next refresh): its rows are about to come.
     pub fn add_claimed(&self, day: i64) {
+        self.recent_claims.lock().unwrap_or_else(|e| e.into_inner()).insert(day, Instant::now());
         self.keep.write().unwrap_or_else(|e| e.into_inner()).claimed.insert(day);
     }
 
@@ -503,6 +515,18 @@ impl Store {
             .collect();
         let dates: Vec<i64> = parsed.iter().filter_map(|p| p.and_then(|(_, d)| d)).collect();
         let (lo, hi) = clamp.bounds(&dates);
+        // a read is on the slice's own day (its median): that day is kept however far behind the read is (a live
+        // reader catching up after an outage, a slow group), soo its rows aren't refused; stray rows a day or more
+        // from it still are
+        let slice_day = ((lo + hi) / 2).div_euclid(DAY);
+        if !dates.is_empty() && !self.keep.read().unwrap_or_else(|e| e.into_inner()).keeps(slice_day) {
+            self.add_claimed(slice_day);
+        } else if !dates.is_empty() {
+            // refreshed while the read goes on
+            if let Some(at) = self.recent_claims.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&slice_day) {
+                *at = Instant::now();
+            }
+        }
         let mut keep = self.keep.read().unwrap_or_else(|e| e.into_inner()).clone();
         let mut refreshed = false;
         let mut s = g.slabs.lock().unwrap_or_else(|e| e.into_inner());
@@ -520,6 +544,7 @@ impl Store {
                 }
                 if !keep.keeps(day) {
                     self.shared.dropped_unkept.fetch_add(1, Ordering::Relaxed);
+                    crate::metrics::names::HEADER_STORE_DROPPED.inc(&[("reason", "unkept")], 1);
                     continue;
                 }
             }
@@ -762,14 +787,15 @@ impl Store {
         // armed first, then the keep set: arming comes after the keep set took the linker's unlinked days
         let armed = self.expiry_armed.load(Ordering::Acquire);
         let keep = self.current_keep();
-        // slabs on their way to the committer count as still filling their days
-        let inflight_days: BTreeSet<i64> =
-            self.shared.inflight.lock().unwrap_or_else(|e| e.into_inner()).values().copied().collect();
         for g in self.groups.read().unwrap_or_else(|e| e.into_inner()).values() {
+            // the slabs first, then those on their way to the committer (a slab moves from one to the other under the
+            // group's lock, soo this order never misses one in transit): both count as still filling their days
             let open_days: BTreeSet<i64> = {
                 let s = g.slabs.lock().unwrap_or_else(|e| e.into_inner());
                 s.open.values().chain(s.full.iter()).map(|sl| sl.day).collect()
             };
+            let inflight_days: BTreeSet<i64> =
+                self.shared.inflight.lock().unwrap_or_else(|e| e.into_inner()).values().copied().collect();
             let mut segs = g.segments.write().unwrap_or_else(|e| e.into_inner());
             let gone: Vec<i64> = segs
                 .iter()
@@ -997,6 +1023,9 @@ fn sealer(rx: Arc<Mutex<Receiver<SealJob>>>, tx: SyncSender<Pending>, shared: Ar
         }
         let Sealed { server, day, slab_gen, log_path, lines, dropped_repeats } = slab.seal();
         shared.dropped_repeats.fetch_add(dropped_repeats as u64, Ordering::Relaxed);
+        if dropped_repeats > 0 {
+            crate::metrics::names::HEADER_STORE_DROPPED.inc(&[("reason", "repeat")], dropped_repeats as u64);
+        }
         let refs: Vec<&[u8]> = lines.iter().map(|l| l.as_slice()).collect();
         match NxvBlockBuilder::build_hot_block_meta(&refs, BlockMeta { server_id: server, slab_gen }) {
             Ok(block) => {
@@ -1055,10 +1084,9 @@ fn commit(batch: &[Pending]) -> Result<usize> {
         }
         match seg.reserve(&p.block)? {
             Some(r) => reserved.push((r, p)),
-            // its day expired meanwhile: the rows go, as rows of a day not kept do
-            None => {
-                let _ = std::fs::remove_file(&p.log);
-            }
+            // its day expired while the slab was on its way, which housekeeping is meant to prevent: stop (the log stays,
+            // and the next start replays it) rather than drop rows whose cursor already moved
+            None => bail!("the segment of day {} expired with a slab of it on its way", p.day),
         }
     }
     for (r, p) in &reserved {
@@ -1207,9 +1235,30 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let keep = KeepSet { live_from: day_of("2026-11-08"), ..KeepSet::default() };
         let (store, _) = Store::open(cfg(dir.path()), keep).unwrap();
-        let lines: Vec<Vec<u8>> = (0..20).map(|k| line(k + 1, "p@x", "Sun, 01 Nov 2026 10:00:00 +0000")).collect();
+        // a slice of today with a few rows dated a week before it: clamped to a day before the median, a day nothing
+        // keeps, soo dropped and counted (the slice's own day is kept)
+        let mut lines: Vec<Vec<u8>> = (0..20).map(|k| line(k + 1, "p@x", NOV8)).collect();
+        lines.extend((0..3).map(|k| line(100 + k, "p@x", "Sun, 01 Nov 2026 10:00:00 +0000")));
         store.record("s", "g", &lines, Clamp::Live { now: NOW }).unwrap();
-        assert_eq!(store.counters().0, 20);
+        assert_eq!(store.counters().0, 3, "the strays dropped");
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn a_read_behind_the_live_window_keeps_its_own_day_and_claims_age_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let today = day_of("2026-11-08");
+        let (store, _) = Store::open(cfg(dir.path()), KeepSet { live_from: today, ..KeepSet::default() }).unwrap();
+        store.set_keep_source(Arc::new(move || KeepSet { live_from: today, ..KeepSet::default() }));
+        // a live reader five days behind (after an outage): its slice's day isn't in the live window, but it's read
+        let behind: Vec<Vec<u8>> = (0..20).map(|k| line(k + 1, "p@x", "Tue, 03 Nov 2026 10:00:00 +0000")).collect();
+        store.record("s", "g", &behind, Clamp::Live { now: NOW }).unwrap();
+        assert_eq!(store.counters().0, 0, "kept: a read is on that day");
+        assert!(store.current_keep().keeps(day_of("2026-11-03")));
+        // once the claim is older than RECENT_CLAIM and the source doesn't hold the day, it goes
+        let old = Instant::now().checked_sub(RECENT_CLAIM + Duration::from_secs(1)).unwrap();
+        store.recent_claims.lock().unwrap().insert(day_of("2026-11-03"), old);
+        assert!(!store.current_keep().keeps(day_of("2026-11-03")), "a claim ages out");
         store.close().unwrap();
     }
 

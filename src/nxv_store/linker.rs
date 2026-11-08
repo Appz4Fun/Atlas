@@ -79,6 +79,9 @@ pub struct State {
     pub seen: BTreeMap<i64, i64>,
     /// (group, UTC day) -> blocks of its segment the linker has read
     pub counts: BTreeMap<(String, i64), u32>,
+    /// the earliest posting time of an upload that waited on an hour not linked yet: the next pass reads back to it,
+    /// soo an upload longer than the margin keeps its first files though their hours were linked meanwhile
+    pub waiting_from: Option<i64>,
 }
 
 impl State {
@@ -98,6 +101,9 @@ impl State {
         for ((group, day), n) in &self.counts {
             out.push_str(&format!("C\t{day}\t{n}\t{group}\n"));
         }
+        if let Some(w) = self.waiting_from {
+            out.push_str(&format!("W\t{w}\n"));
+        }
         out.push_str("E\n");
         out
     }
@@ -116,6 +122,7 @@ impl State {
                 ["C", d, n, g] => {
                     s.counts.insert(((*g).to_string(), d.parse().ok()?), n.parse().ok()?);
                 }
+                ["W", w] => s.waiting_from = Some(w.parse().ok()?),
                 ["E"] => ended = true,
                 _ => {}
             }
@@ -187,6 +194,9 @@ pub struct Links {
     path: PathBuf,
     pub places: HashMap<String, PlaceRec>,
     pub uploads: HashMap<String, UploadRec>,
+    /// message-id hashes of the articles linked, from `I` lines (written in the same append as the places they go
+    /// with, soo a pass is noted whole or not at all), and those lines' times for the life check
+    pub ids: HashMap<u64, i64>,
 }
 
 fn csv<T: std::fmt::Display>(v: impl IntoIterator<Item = T>) -> String {
@@ -228,7 +238,25 @@ impl Links {
         )
     }
 
+    /// `I` lines for `hashes` linked at `at`, `IDS_PER_LINE` a line.
+    pub fn id_lines(hashes: &[u64], at: i64) -> Vec<String> {
+        hashes
+            .chunks(IDS_PER_LINE)
+            .map(|c| format!("I\t{at}\t{}\n", c.iter().map(|h| format!("{h:x}")).collect::<Vec<_>>().join(",")))
+            .collect()
+    }
+
     fn apply(&mut self, line: &str) {
+        if let Some(rest) = line.strip_prefix("I\t") {
+            if let Some((at, list)) = rest.split_once('\t')
+                && let Ok(at) = at.parse::<i64>()
+            {
+                for h in list.split(',').filter_map(|x| u64::from_str_radix(x, 16).ok()) {
+                    self.ids.insert(h, at);
+                }
+            }
+            return;
+        }
         let f: Vec<&str> = line.split('\t').collect();
         let num = |s: &str| s.parse::<i64>().ok();
         match f.as_slice() {
@@ -288,7 +316,7 @@ impl Links {
     /// The records in `dir`, those older than their life dropped; the file rewritten when most of it is dead.
     pub fn open(dir: &Path, now: i64) -> Result<Links> {
         let path = dir.join(LINKS_FILE);
-        let mut l = Links { path: path.clone(), places: HashMap::new(), uploads: HashMap::new() };
+        let mut l = Links { path: path.clone(), places: HashMap::new(), uploads: HashMap::new(), ids: HashMap::new() };
         let text = match std::fs::read(&path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
@@ -303,7 +331,8 @@ impl Links {
         let before = now - LINKS_LIFE;
         l.places.retain(|_, p| p.added >= before);
         l.uploads.retain(|_, u| u.added >= before);
-        let live = l.places.len() + l.uploads.len();
+        l.ids.retain(|_, at| *at >= before);
+        let live = l.places.len() + l.uploads.len() + l.ids.len() / IDS_PER_LINE;
         if lines > 2 * live + 1000 || !text.is_empty() && !text.ends_with(b"\n") {
             let mut out = String::new();
             for (poster, p) in &l.places {
@@ -311,6 +340,15 @@ impl Links {
             }
             for (release, u) in &l.uploads {
                 out.push_str(&Links::upload_line(release, u));
+            }
+            let mut by_time: BTreeMap<i64, Vec<u64>> = BTreeMap::new();
+            for (h, at) in &l.ids {
+                by_time.entry(*at).or_default().push(*h);
+            }
+            for (at, hashes) in by_time {
+                for line in Links::id_lines(&hashes, at) {
+                    out.push_str(&line);
+                }
             }
             write_atomic(&path, out.as_bytes())?;
         }
@@ -347,12 +385,13 @@ impl Links {
 
 const IDS_FILE: &str = "linked-ids.rec";
 const IDS_RECORD: usize = 16;
+/// message-id hashes per `I` line of `links.rec`
+const IDS_PER_LINE: usize = 4096;
 
-/// Every article linked within `LINKS_LIFE`, by message-id hash, kept in `linked-ids.rec` (`[hash u64][added i64]`
-/// records): an article is linked at most once, soo a late block holding it again (from another server, or read again
+/// Every article linked within `LINKS_LIFE`, by message-id hash: noted in `links.rec`'s `I` lines (and read from the
+/// older `linked-ids.rec`, `[hash u64][added i64]` records): an article is linked at most once, soo a late block holding it again (from another server, or read again
 /// after a pass that wasn't fully noted) never adds it as more parts.
 pub struct LinkedIds {
-    path: PathBuf,
     set: HashSet<u64>,
 }
 
@@ -378,11 +417,16 @@ impl LinkedIds {
         if kept.len() != bytes.len() && (kept.len() * 2 < bytes.len() || bytes.len() % IDS_RECORD != 0) {
             write_atomic(&path, &kept)?;
         }
-        Ok(LinkedIds { path, set })
+        Ok(LinkedIds { set })
     }
 
     pub fn contains(&self, h: u64) -> bool {
         self.set.contains(&h)
+    }
+
+    /// Hashes held (noted elsewhere: `links.rec`'s `I` lines).
+    pub fn extend(&mut self, hashes: impl IntoIterator<Item = u64>) {
+        self.set.extend(hashes);
     }
 
     pub fn len(&self) -> usize {
@@ -391,30 +435,6 @@ impl LinkedIds {
 
     pub fn is_empty(&self) -> bool {
         self.set.is_empty()
-    }
-
-    /// Hashes appended and made durable, then held.
-    pub fn append(&mut self, hashes: &[u64], now: i64) -> Result<()> {
-        if hashes.is_empty() {
-            return Ok(());
-        }
-        let existed = self.path.exists();
-        let f = OpenOptions::new().create(true).append(true).open(&self.path)?;
-        let mut buf = Vec::with_capacity(hashes.len() * IDS_RECORD);
-        for h in hashes {
-            buf.extend_from_slice(&h.to_le_bytes());
-            buf.extend_from_slice(&now.to_le_bytes());
-        }
-        let mut w = &f;
-        w.write_all(&buf)?;
-        if existed {
-            full_flush(&f)?;
-        } else {
-            let d = File::open(self.path.parent().unwrap_or(Path::new(".")))?;
-            sync_all_durable(&[&f, &d])?;
-        }
-        self.set.extend(hashes.iter().copied());
-        Ok(())
     }
 }
 
@@ -499,23 +519,17 @@ impl Linker {
     pub fn open(store: &Store, now: i64) -> Result<Linker> {
         let dir = store.root().join("_state");
         std::fs::create_dir_all(&dir)?;
-        Ok(Linker {
-            state: State::load(&dir)?,
-            links: Arc::new(Mutex::new(Links::open(&dir, now)?)),
-            ids: LinkedIds::open(&dir, now)?,
-            dir,
-        })
+        Linker::open_in(&dir, now)
     }
 
     /// A linker with its state in `dir` (a scratch folder, for trying it on a copy).
     pub fn open_in(dir: &Path, now: i64) -> Result<Linker> {
         std::fs::create_dir_all(dir)?;
-        Ok(Linker {
-            state: State::load(dir)?,
-            links: Arc::new(Mutex::new(Links::open(dir, now)?)),
-            ids: LinkedIds::open(dir, now)?,
-            dir: dir.to_path_buf(),
-        })
+        let links = Links::open(dir, now)?;
+        // articles linked: those of `links.rec`'s `I` lines, and of the older `linked-ids.rec`
+        let mut ids = LinkedIds::open(dir, now)?;
+        ids.extend(links.ids.keys().copied());
+        Ok(Linker { state: State::load(dir)?, links: Arc::new(Mutex::new(links)), ids, dir: dir.to_path_buf() })
     }
 
     /// UTC days the keep set must hold for the linker: those with a wall-clock hour it hasn't linked.
@@ -614,7 +628,12 @@ impl Linker {
             return Ok(None);
         }
         let (lo, hi) = match (span.first(), span.last()) {
-            (Some(&a), Some(&b)) => (a * HOUR - MARGIN, (b + 1) * HOUR + MARGIN - 1),
+            (Some(&a), Some(&b)) => {
+                let lo = a * HOUR - MARGIN;
+                // back to the first file of an upload that waited (never more than a day before the span)
+                let lo = state.waiting_from.map_or(lo, |w| lo.min(w.max(lo - KEEP_SECS)));
+                (lo, (b + 1) * HOUR + MARGIN - 1)
+            }
             _ => (i64::MAX, i64::MIN),
         };
         let mut read_days: BTreeSet<i64> = late_only.clone();
@@ -703,7 +722,10 @@ impl Linker {
                                     continue;
                                 }
                                 (subject, author, msgid) = (r.subject, r.author, r.msgid);
-                                (wall, bytes, lines, art) = (r.wall, r.bytes.unwrap_or(0), r.lines.unwrap_or(0), r.art);
+                                let (b, l) = (r.bytes.unwrap_or(0), r.lines.unwrap_or(0));
+                                // as `Overview::into_article`: no size listed, the lines say it
+                                let b = if b > 0 { b } else { crate::nntp::bytes_from_lines(l) };
+                                (wall, bytes, lines, art) = (r.wall, b, l, r.art);
                             }
                             let _ = subject;
                             if !late && (wall < lo || wall > hi) {
@@ -880,6 +902,7 @@ impl Linker {
         let seeds: Vec<Seed> = saved.iter().map(|(_, u)| u.seed.clone()).collect();
         let chains = crate::xref::chain(&fresh, &seeds);
         let linked_or_span = |h: i64| state.linked.contains(&h) || span_set.contains(&h);
+        let mut waiting_min: Option<i64> = None;
         let mut widened: HashSet<usize> = HashSet::new();
         for (k, (seed, files)) in chains.into_iter().enumerate() {
             if k % 4096 == 0 && stop() {
@@ -889,6 +912,7 @@ impl Linker {
             let last = files.iter().map(|&i| fresh[i].last).max().unwrap_or(0);
             // every hour it spans read, and something in it new: else it waits, or was seen before
             if !(hour_of(first)..=hour_of(last)).all(linked_or_span) {
+                waiting_min = Some(waiting_min.map_or(first, |w: i64| w.min(first)));
                 continue;
             }
             let new_material =
@@ -970,6 +994,10 @@ impl Linker {
             state.counts.insert(key, n);
         }
         state.linked.extend(span.iter().copied());
+        // a pass that linked hours sets where the next one reads back to; one of late rows only leaves it
+        if !span.is_empty() {
+            state.waiting_from = waiting_min;
+        }
         if let Some(&oldest) = days.first() {
             state.forget_before(oldest);
         }
@@ -986,9 +1014,13 @@ impl Linker {
 
     /// Notes what `found`'s pass did, once its releases are saved: the links appended, then the state rewritten.
     pub fn ack(&mut self, found: Found) -> Result<()> {
-        // the articles linked first: a pass noted only in part is then retried without adding them again
-        self.ids.append(&found.ids, chrono::Utc::now().timestamp())?;
-        self.links.lock().unwrap_or_else(|e| e.into_inner()).append(&found.lines)?;
+        // the articles linked and where their files went in one append, ids first: noted together or not at all (a
+        // torn last line is dropped on reading back), soo a retried pass neither adds articles again as parts nor
+        // leaves them linked with no place
+        let mut lines = Links::id_lines(&found.ids, chrono::Utc::now().timestamp());
+        lines.extend(found.lines.iter().cloned());
+        self.links.lock().unwrap_or_else(|e| e.into_inner()).append(&lines)?;
+        self.ids.extend(found.ids.iter().copied());
         found.state.save(&self.dir)?;
         self.state = found.state;
         Ok(())
@@ -1395,6 +1427,79 @@ mod tests {
         let lk2 = Linker::open_in(&state, now + 7200).unwrap();
         assert_eq!(lk2.state, lk.state);
         assert!(lk2.links.lock().unwrap().places.contains_key("aa001@x.y"));
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn an_upload_longer_than_the_margin_keeps_its_first_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = Store::open(cfg(dir.path()), keep_all()).unwrap();
+        // an index then six files of 3,000 parts, a second apart: over five hours of posting
+        let rows = upload("ll", T0 + 600, 6, 3000, 1);
+        record(&store, &rows, 1000);
+        let h0 = hour_of(T0);
+        let mut lk = Linker::open_in(&dir.path().join("s"), T0).unwrap();
+        // the first three hours ready: the upload runs on into hours not ready, soo it waits
+        let now1 = (h0 + 3) * HOUR + LIVE_WAIT;
+        let mut got = Vec::new();
+        while let Some(f) = lk.pass(&store, now1, &HashSet::new(), &|| false).unwrap() {
+            got.extend(f.releases.clone());
+            lk.ack(f).unwrap();
+        }
+        assert!(got.is_empty(), "it waits for its last hours");
+        assert_eq!(lk.state.waiting_from, Some(T0 + 600), "and where it starts is kept");
+        // the rest ready: its first hour (linked meanwhile, past the margin) is read back
+        let now2 = (h0 + 7) * HOUR + LIVE_WAIT;
+        while let Some(f) = lk.pass(&store, now2, &HashSet::new(), &|| false).unwrap() {
+            got.extend(f.releases.clone());
+            lk.ack(f).unwrap();
+        }
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].articles.len(), 1 + 6 * 3000, "every file, the first ones included");
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn articles_listed_with_no_size_take_it_from_their_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = Store::open(cfg(dir.path()), keep_all()).unwrap();
+        let rows: Vec<(usize, Vec<u8>)> = upload("zz", T0 + 600, 3, 4, 1)
+            .into_iter()
+            .map(|(g, l)| (g, String::from_utf8(l).unwrap().replace("\t740000\t", "\t\t").into_bytes()))
+            .collect();
+        record(&store, &rows, 1000);
+        let now = T0 + 6 * 3600;
+        let mut lk = Linker::open_in(&dir.path().join("s"), now).unwrap();
+        let mut got = Vec::new();
+        while let Some(f) = lk.pass(&store, now, &HashSet::new(), &|| false).unwrap() {
+            got.extend(f.releases.clone());
+            lk.ack(f).unwrap();
+        }
+        assert_eq!(got.len(), 1);
+        assert!(got[0].articles.iter().all(|a| a.bytes == crate::nntp::bytes_from_lines(5692)));
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn a_pass_is_noted_in_one_append_ids_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = Store::open(cfg(dir.path()), keep_all()).unwrap();
+        let rows = upload("nn", T0 + 600, 3, 4, 1);
+        record(&store, &rows, 1000);
+        let now = T0 + 6 * 3600;
+        let state = dir.path().join("s");
+        let mut lk = Linker::open_in(&state, now).unwrap();
+        while let Some(f) = lk.pass(&store, now, &HashSet::new(), &|| false).unwrap() {
+            lk.ack(f).unwrap();
+        }
+        let text = std::fs::read_to_string(state.join(LINKS_FILE)).unwrap();
+        let first_i = text.find("I\t").unwrap();
+        let first_f = text.find("F\t").unwrap();
+        assert!(first_i < first_f, "the ids go first in the append");
+        assert!(!state.join(IDS_FILE).exists(), "nothing written apart");
+        let lk2 = Linker::open_in(&state, now).unwrap();
+        assert_eq!(lk2.ids.len(), 1 + 3 * 4, "read back from the links");
+        assert!(lk2.links.lock().unwrap().places.contains_key("nn001@x.y"));
         store.close().unwrap();
     }
 
