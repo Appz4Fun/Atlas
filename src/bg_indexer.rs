@@ -1365,7 +1365,7 @@ pub fn run() -> i32 {
     }
     let lost = crate::xref::recorder_failures();
     if lost > 0 {
-        eprintln!("xref: {lost} headers couldnt be kept this run");
+        eprintln!("xref: {lost} headers' writes failed this run (their slices are read again)");
     }
     code
 }

@@ -1017,9 +1017,9 @@ pub fn keeps(article: &Article) -> bool {
 
 /// A slice's articles of `group` without the ones obfuscated per article, whose headers go to the store. They're
 /// counted as unparsable still (`atlas_articles_unparsable_total`), as no subject rule reads them. They're handed to
-/// the recorder's thread, which writes many slices' at once (`record_queued`); an error only when it stopped. A
-/// write that fails there is said and counted (`recorder_failures`), the slice counted as read: the window of
-/// headers a backfill reread brings back is what such a loss costs.
+/// the recorder's thread, which writes many slices' at once (`record_queued`), with a ticket the slice waits on
+/// before it counts as read (`Written`): one whose headers weren't written errors and is read again. An error here
+/// only when the recorder stopped.
 pub fn hold(group: &str, articles: Vec<Article>) -> Result<(Vec<Article>, Option<Written>)> {
     let (held, kept): (Vec<Article>, Vec<Article>) = articles.into_iter().partition(keeps);
     if held.is_empty() {
@@ -1063,9 +1063,8 @@ impl Written {
 /// Slices' headers waiting for the recorder's thread, at most (a slice is up to a request's 100k headers, soo this
 /// bounds the memory they hold to a few GB)
 const RECORD_QUEUE: usize = 32;
-/// Headers the recorder's thread writes at most in one go, sorted by message-id, and how long it gathers.
+/// Headers the recorder's thread writes at most in one go, sorted by message-id.
 const RECORD_BATCH: usize = 200_000;
-const RECORD_GATHER: Duration = Duration::from_secs(2);
 
 /// A slice the recorder's thread gathered: group, headers, when, and who waits to hear they're written.
 type SliceIn = (String, Vec<Article>, i64, Option<std::sync::mpsc::SyncSender<bool>>);
@@ -1098,17 +1097,16 @@ fn recorder() -> &'static std::sync::mpsc::SyncSender<Queued> {
     })
 }
 
-/// The recorder's thread: slices' headers gathered for up to `RECORD_GATHER` or `RECORD_BATCH` rows, then written a
+/// The recorder's thread: the slices' headers queued at the time (up to `RECORD_BATCH` rows), then written a
 /// group at a time sorted by message-id, soo the key's B-tree is written in order and many slices share each
 /// transaction, rather than every parse thread taking the store's lock in turn for its own few thousand rows. A
-/// write that fails is said and counted; the slice was saved already.
+/// write that fails is said and counted, and its slices told, soo they're read again.
 fn record_queued(rx: std::sync::mpsc::Receiver<Queued>, write: &mut WriteHeaders<'_>) {
     let mut first = match rx.recv() {
         Ok(q) => q,
         Err(_) => return,
     };
     loop {
-        let started = std::time::Instant::now();
         let mut slices: Vec<SliceIn> = Vec::new();
         let mut barriers = Vec::new();
         let mut rows = 0;
@@ -1129,10 +1127,12 @@ fn record_queued(rx: std::sync::mpsc::Receiver<Queued>, write: &mut WriteHeaders
             if rows >= RECORD_BATCH {
                 break;
             }
-            match rx.recv_timeout(RECORD_GATHER.saturating_sub(started.elapsed())) {
+            // what's queued now, no waiting for more: under load slices pile up while a batch is written, soo the
+            // next one is big anyway; when idle, no slice waits for others
+            match rx.try_recv() {
                 Ok(q) => next = Some(q),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => closed = true,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => closed = true,
             }
         }
         let mut by_group: HashMap<String, GroupOut> = HashMap::new();
@@ -1196,7 +1196,7 @@ pub fn flush_recorder(timeout: Duration) -> bool {
 /// still short enough for the linker's writes to go between
 const RECORD_CHUNK: usize = 20_000;
 
-/// Headers the recorder's thread couldn't write, since start.
+/// Headers whose write failed since start (their slices are read again).
 pub fn recorder_failures() -> u64 {
     RECORDER_FAILED.load(std::sync::atomic::Ordering::Relaxed)
 }
