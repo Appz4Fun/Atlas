@@ -375,7 +375,7 @@ impl Store {
             threads.push(
                 std::thread::Builder::new()
                     .name(format!("nxv-sealer-{i}"))
-                    .spawn(move || sealer(rx, tx, shared))
+                    .spawn(move || guarded("a sealer", &Arc::clone(&shared), move || sealer(rx, tx, shared)))
                     .expect("spawning a sealer"),
             );
         }
@@ -384,15 +384,16 @@ impl Store {
         threads.push(
             std::thread::Builder::new()
                 .name("nxv-committer".into())
-                .spawn(move || committer(commit_rx, shared))
+                .spawn(move || guarded("the committer", &Arc::clone(&shared), move || committer(commit_rx, shared)))
                 .expect("spawning the committer"),
         );
         *self.seal_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(seal_tx);
         let me = Arc::clone(self);
+        let shared = Arc::clone(&self.shared);
         threads.push(
             std::thread::Builder::new()
                 .name("nxv-batcher".into())
-                .spawn(move || me.batcher())
+                .spawn(move || guarded("the batcher", &shared, move || me.batcher()))
                 .expect("spawning the batcher"),
         );
         *self.threads.lock().unwrap_or_else(|e| e.into_inner()) = threads;
@@ -400,6 +401,11 @@ impl Store {
 
     pub fn failure(&self) -> Option<String> {
         self.shared.failure()
+    }
+
+    /// A backfill day just claimed, kept at once (not at the next refresh): its rows are about to come.
+    pub fn add_claimed(&self, day: i64) {
+        self.keep.write().unwrap_or_else(|e| e.into_inner()).claimed.insert(day);
     }
 
     pub fn set_keep(&self, keep: KeepSet) {
@@ -718,8 +724,9 @@ impl Store {
     /// Idle writer files closed, and segments of days the keep set no longer holds (and no slab still fills)
     /// expired.
     pub fn housekeeping(&self) {
-        let keep = self.keep.read().unwrap_or_else(|e| e.into_inner()).clone();
+        // armed first, then the keep set: arming comes after the keep set took the linker's unlinked days
         let armed = self.expiry_armed.load(Ordering::Acquire);
+        let keep = self.keep.read().unwrap_or_else(|e| e.into_inner()).clone();
         for g in self.groups.read().unwrap_or_else(|e| e.into_inner()).values() {
             let open_days: BTreeSet<i64> = {
                 let s = g.slabs.lock().unwrap_or_else(|e| e.into_inner());
@@ -955,6 +962,14 @@ fn sealer(rx: Arc<Mutex<Receiver<SealJob>>>, tx: SyncSender<Pending>, shared: Ar
             }
             Err(e) => shared.fail(e.context(format!("building a block of {}", group.name))),
         }
+    }
+}
+
+/// Runs a store thread; a panic in it stops the store (fail-stop) rather than leave slabs in flight or tickets
+/// waiting for good.
+fn guarded(what: &str, shared: &Arc<Shared>, f: impl FnOnce()) {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err() {
+        shared.fail(anyhow!("{what} panicked"));
     }
 }
 

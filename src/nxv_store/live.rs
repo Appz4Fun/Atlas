@@ -87,6 +87,14 @@ pub fn spawn(cfg: &crate::config::HeaderStoreConfig) {
     });
 }
 
+/// A backfill day claimed (`chunks::claim`): kept by the store at once, soo its rows aren't dropped as not kept
+/// before the next refresh.
+pub fn note_claimed_day(day: i64) {
+    if let Some(s) = store() {
+        s.add_claimed(day);
+    }
+}
+
 /// Whether the store is recording, soo the connection layer knows to hand it listings.
 pub fn enabled() -> bool {
     store().is_some()

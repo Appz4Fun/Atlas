@@ -71,7 +71,8 @@ pub fn art_of(line: &[u8]) -> Option<u64> {
     if n == 0 || n > 19 || line.get(n) != Some(&b'\t') {
         return None;
     }
-    std::str::from_utf8(&line[..n]).ok()?.parse().ok()
+    // what the block builder takes: a number that fits an i64
+    std::str::from_utf8(&line[..n]).ok()?.parse::<u64>().ok().filter(|&a| a <= i64::MAX as u64)
 }
 
 pub struct Slab {

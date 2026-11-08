@@ -431,8 +431,12 @@ pub fn ready(h: i64, now: i64, not_done: &HashSet<i64>, seen: &BTreeMap<i64, i64
     if !(first_day..=last_day).any(|d| not_done.contains(&d)) {
         return true;
     }
-    // let go at the latest a day after its rows came, as `xref` settles a file a day after it arrives
-    seen.get(&(h * HOUR).div_euclid(DAY)).is_some_and(|&t| now - t > KEEP_SECS)
+    // let go at the latest a day after its rows came, as `xref` settles a file a day after it arrives: the UTC days a
+    // row of wall-clock hour `h` can sit in (a poster's zone moves it up to 14h either way), those that have rows all
+    // first seen over a day ago
+    let days = (h * HOUR - ZONE).div_euclid(DAY)..=((h + 1) * HOUR + ZONE).div_euclid(DAY);
+    let stamps: Vec<i64> = days.filter_map(|d| seen.get(&d).copied()).collect();
+    !stamps.is_empty() && stamps.iter().all(|&t| now - t > KEEP_SECS)
 }
 
 // ---------------------------------------------------------------- a pass
@@ -445,7 +449,7 @@ struct Art {
     number: i64,
     bytes: i64,
     lines: i64,
-    msgid: (u32, u16),
+    msgid: (u64, u16),
     /// from a block committed after the last pass (or of a segment no pass has read)
     late: bool,
 }
@@ -528,28 +532,34 @@ impl Linker {
     /// One pass at `now`: None when no hour is ready and nothing came late. `not_done` is the backfill days still to
     /// read; `stop` is asked as it goes (a pass given up writes nothing).
     pub fn pass(
-        &self,
+        &mut self,
         store: &Store,
         now: i64,
         not_done: &HashSet<i64>,
         stop: &dyn Fn() -> bool,
     ) -> Result<Option<Found>> {
         let started = Instant::now();
-        let mut state = self.state.clone();
         let segs = store.segments();
         let open_days = store.open_days();
+        // when each day's rows first came, kept whether or not this pass finds anything (the day-later fallback in
+        // `ready` counts from it), and saved when a day is new
+        let before = self.state.seen.len();
+        for (_, day, n) in &segs {
+            if *n > 0 {
+                self.state.seen.entry(*day).or_insert(now);
+            }
+        }
+        for d in &open_days {
+            self.state.seen.entry(*d).or_insert(now);
+        }
+        if self.state.seen.len() != before {
+            self.state.save(&self.dir)?;
+        }
+        let mut state = self.state.clone();
         // a segment gone, or holding fewer blocks than were counted (expired and made again): its count starts over,
         // soo its blocks are read (what was linked before is passed over by message-id)
         let present: HashMap<(String, i64), u32> = segs.iter().map(|(g, d, n)| ((g.clone(), *d), *n as u32)).collect();
         state.counts.retain(|k, c| present.get(k).is_some_and(|&n| n >= *c));
-        for (_, day, n) in &segs {
-            if *n > 0 {
-                state.seen.entry(*day).or_insert(now);
-            }
-        }
-        for d in &open_days {
-            state.seen.entry(*d).or_insert(now);
-        }
         let late_days: BTreeSet<i64> = segs
             .iter()
             .filter(|(g, d, n)| *n as u32 > state.counts.get(&(g.clone(), *d)).copied().unwrap_or(0))
@@ -690,7 +700,9 @@ impl Linker {
                                 stats.late_unready += 1;
                                 continue;
                             }
-                            let h = nntp_xover_engine::msgid_index::msgid_hash(msgid);
+                            // hashed as the release's message-id string is (`Found::ids`), soo a non-UTF-8 id matches
+                            let h =
+                                nntp_xover_engine::msgid_index::msgid_hash(String::from_utf8_lossy(msgid).as_bytes());
                             if self.ids.contains(h) {
                                 stats.already_linked += 1;
                                 continue;
@@ -713,7 +725,7 @@ impl Linker {
                                     p
                                 }
                             };
-                            let at = ids.len() as u32;
+                            let at = ids.len() as u64;
                             ids.extend_from_slice(msgid);
                             arts.push(Art {
                                 poster: pid,
@@ -1049,14 +1061,21 @@ const PASS_EVERY: Duration = Duration::from_secs(60);
 
 /// The backfill days still to read, from the main database (read only).
 fn not_done_days() -> Result<HashSet<i64>> {
+    use rusqlite::OptionalExtension;
     let main = rusqlite::Connection::open_with_flags(
         crate::paths::database(),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     main.busy_timeout(Duration::from_secs(30))?;
+    // in forward mode the days before its start aren't read (their chunks stay undone for good): they don't hold an
+    // hour back
+    let start: i64 = main
+        .query_row("select value from meta where key = 'backfill_forward_start'", [], |r| r.get(0))
+        .optional()?
+        .unwrap_or(i64::MIN);
     let days = main
-        .prepare("select distinct day from backfill_chunks where state != 2")?
-        .query_map([], |r| r.get(0))?
+        .prepare("select distinct day from backfill_chunks where state != 2 and day >= ?1")?
+        .query_map([start], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     Ok(days)
 }
@@ -1078,7 +1097,7 @@ pub async fn run(db: crate::indexer::Db, store: Arc<Store>, stopping: impl Fn() 
         let (l, s) = (Arc::clone(&linker), Arc::clone(&store));
         let found = tokio::task::spawn_blocking(move || -> Result<Option<Found>> {
             let not_done = not_done_days()?;
-            let lk = l.lock().unwrap_or_else(|e| e.into_inner());
+            let mut lk = l.lock().unwrap_or_else(|e| e.into_inner());
             let stop = || crate::frozen::STOPPING.load(std::sync::atomic::Ordering::Relaxed);
             let found = lk.pass(&s, chrono::Utc::now().timestamp(), &not_done, &stop)?;
             let mut days: BTreeSet<i64> = s.segments().into_iter().map(|x| x.1).collect();
@@ -1092,7 +1111,8 @@ pub async fn run(db: crate::indexer::Db, store: Arc<Store>, stopping: impl Fn() 
         let found = match found {
             Ok(Ok(Some(f))) => f,
             Ok(Ok(None)) => {
-                // the linker has run and the keep set knows its unlinked days: expiry may go on
+                // the linker has run: the keep set takes its unlinked days first, then expiry may go on
+                store.set_keep(super::live::keep_now());
                 store.arm_expiry();
                 sleep_unless(PASS_EVERY, &stopping).await;
                 continue;
@@ -1129,6 +1149,7 @@ pub async fn run(db: crate::indexer::Db, store: Arc<Store>, stopping: impl Fn() 
         let l = Arc::clone(&linker);
         match tokio::task::spawn_blocking(move || l.lock().unwrap_or_else(|e| e.into_inner()).ack(found)).await {
             Ok(Ok(())) => {
+                store.set_keep(super::live::keep_now());
                 store.arm_expiry();
                 if count > 0 || st.late_files > 0 {
                     println!(
@@ -1399,6 +1420,32 @@ mod tests {
         // and after a restart, from the file
         let lk2 = Linker::open_in(&state, now + 3600).unwrap();
         assert_eq!(lk2.ids.len(), 1 + 3 * 4);
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn with_backfill_never_done_an_upload_links_a_day_after_its_rows_came() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = Store::open(cfg(dir.path()), keep_all()).unwrap();
+        let rows = upload("dd", T0 + 600, 3, 4, 1);
+        record(&store, &rows, 1000);
+        let state = dir.path().join("s");
+        let mut lk = Linker::open_in(&state, T0).unwrap();
+        // every day has backfill chunks still to read, as on a store reading weeks back
+        let d = T0.div_euclid(DAY);
+        let nd: HashSet<i64> = (d - 5..=d + 5).collect();
+        let now = T0 + 6 * 3600;
+        assert!(lk.pass(&store, now, &nd, &|| false).unwrap().is_none(), "nothing ready yet");
+        // the first-seen time is kept across passes (and on disk), soo a day later the hour is let go
+        let lk2 = Linker::open_in(&state, now).unwrap();
+        assert!(!lk2.state.seen.is_empty(), "first-seen times saved");
+        let later = now + DAY + 3600;
+        let mut n = 0;
+        while let Some(f) = lk.pass(&store, later, &nd, &|| false).unwrap() {
+            n += f.releases.len();
+            lk.ack(f).unwrap();
+        }
+        assert_eq!(n, 1);
         store.close().unwrap();
     }
 

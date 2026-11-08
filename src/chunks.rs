@@ -342,6 +342,7 @@ pub fn claim(conn: &Connection, groups: &[(String, i64)], host: &str, now: i64) 
     let claimed = claim_any(conn, groups, host, now)?;
     if let Some(c) = &claimed {
         crate::header_window::note_claimed_day(c.day);
+        crate::nxv_store::live::note_claimed_day(c.day);
     }
     Ok(claimed)
 }
@@ -392,6 +393,7 @@ pub fn claim_turn(
     let claimed = claim_turn_any(conn, group, all, host, now)?;
     if let Some(c) = &claimed {
         crate::header_window::note_claimed_day(c.day);
+        crate::nxv_store::live::note_claimed_day(c.day);
     }
     Ok(claimed)
 }
