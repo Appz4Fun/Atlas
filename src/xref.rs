@@ -405,9 +405,13 @@ impl Store {
     pub fn open(path: &Path) -> Result<Store> {
         let conn = Connection::open(path)?;
         conn.busy_handler(Some(wait_unless_stopping))?;
-        // a WAL reset leaves its file at most this big
+        // a WAL reset leaves its file at most this big. Each header goes into four B-trees by random keys (message-id,
+        // poster twice, arrival): with the default 2 MB page cache nearly every insert read its pages from disk, and
+        // the parse path's writes (one connection) kept about 4k headers a second. 512 MiB a connection keeps the
+        // trees' upper levels and recent leaves in memory
         conn.execute_batch(
-            "pragma journal_mode = wal; pragma synchronous = normal; pragma journal_size_limit = 268435456;",
+            "pragma journal_mode = wal; pragma synchronous = normal; pragma journal_size_limit = 268435456;
+             pragma cache_size = -524288; pragma temp_store = memory;",
         )?;
         conn.execute_batch(SCHEMA)?;
         // once: a store made by a build from before this kept no start, soo its file's birth or oldest header says
