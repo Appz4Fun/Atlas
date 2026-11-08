@@ -68,6 +68,12 @@ enabled = true
 max_bodies_per_release = 4
 probe_files = 2
 probes_per_minute = 60
+# a release's pictures are read as it's processed when it has at most this many, together at most this many MB;
+# past either only its thumbnail or cover is, and the release page offers a Fetch button for each of the rest
+pictures_auto_max = 12
+pictures_auto_max_mb = 16
+# the most articles one picture fetched from the page may take (about 0.7 MB each)
+picture_max_parts = 64
 
 [naming]
 enabled = true
