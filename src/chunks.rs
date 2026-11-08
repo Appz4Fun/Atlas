@@ -302,6 +302,13 @@ fn forward_from(_now: i64) -> Option<i64> {
 /// and kept in the main database, soo it stays "30 days before it began" rather than moving on every midnight; worked
 /// out again only when `back` changes. Sets `FORWARD_START_DAY`. Returns the day, 0 when off.
 pub fn set_forward_start(conn: &Connection, back: Option<i64>, now: i64) -> Result<i64> {
+    let day = forward_start_day(conn, back, now)?;
+    FORWARD_START_DAY.store(day, std::sync::atomic::Ordering::Relaxed);
+    Ok(day)
+}
+
+/// The day `set_forward_start` sets, worked out or read back (and kept), without setting it.
+fn forward_start_day(conn: &Connection, back: Option<i64>, now: i64) -> Result<i64> {
     let back = back.filter(|b| *b > 0).unwrap_or(0);
     let day = if back == 0 {
         0
@@ -318,7 +325,6 @@ pub fn set_forward_start(conn: &Connection, back: Option<i64>, now: i64) -> Resu
             }
         }
     };
-    FORWARD_START_DAY.store(day, std::sync::atomic::Ordering::Relaxed);
     Ok(day)
 }
 
@@ -1393,11 +1399,11 @@ mod tests {
         let c = conn();
         crate::store::create_main(&c).unwrap();
         let day = |d: i64| d * 86_400 + 5;
-        assert_eq!(set_forward_start(&c, Some(30), day(20_100)).unwrap(), 20_070);
-        assert_eq!(set_forward_start(&c, Some(30), day(20_105)).unwrap(), 20_070, "a later start keeps it");
-        assert_eq!(set_forward_start(&c, Some(10), day(20_105)).unwrap(), 20_095, "a new count, a new start");
-        assert_eq!(set_forward_start(&c, None, day(20_105)).unwrap(), 0);
-        FORWARD_START_DAY.store(0, std::sync::atomic::Ordering::Relaxed);
+        // the global isn't touched here: other tests claim in parallel
+        assert_eq!(forward_start_day(&c, Some(30), day(20_100)).unwrap(), 20_070);
+        assert_eq!(forward_start_day(&c, Some(30), day(20_105)).unwrap(), 20_070, "a later start keeps it");
+        assert_eq!(forward_start_day(&c, Some(10), day(20_105)).unwrap(), 20_095, "a new count, a new start");
+        assert_eq!(forward_start_day(&c, None, day(20_105)).unwrap(), 0);
     }
 
     #[test]
