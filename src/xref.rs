@@ -750,7 +750,10 @@ impl Store {
         // matched to it
         let mut saved = self.saved(now)?;
         let mut grown: BTreeSet<usize> = BTreeSet::new();
-        for (poster, place, _) in &finished {
+        for (k, (poster, place, _)) in finished.iter().enumerate() {
+            if k % 256 == 255 {
+                self.checkpoint()?;
+            }
             let Some(place) = place else { continue };
             let Some(j) = saved.iter().position(|u| u.release == place.release) else { continue };
             let mut stmt = self.conn.prepare_cached(
@@ -777,6 +780,10 @@ impl Store {
         for (k, (seed, files)) in chains.into_iter().enumerate() {
             if k % 4096 == 0 && stop() {
                 return Ok(nothing());
+            }
+            if k % 64 == 63 {
+                // a chain reads its files' rows: what the parse path wrote meanwhile goes back between (`checkpoint`)
+                self.checkpoint()?;
             }
             if !files.iter().all(|&i| settled(&fresh[i])) {
                 continue;
