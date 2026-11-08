@@ -958,6 +958,30 @@ pub fn one_shard_from(conn: &Connection) -> Result<i64> {
     Ok(dense.map_or(i64::MAX, |id| id - id % 8))
 }
 
+/// Note the first one-shard id in the merged shard beside `main` when `finish` didn't (an earlier build): the fallback
+/// `one_shard_from` reckons drifts once the first dense releases freeze, soo it's kept the first time it can be told,
+/// and with no dense release yet it's the counter (`main_conn`'s `next_seq`), which nothing has handed out from.
+pub fn note_one_shard_from(main: &Path, main_conn: &Connection) -> Result<()> {
+    let target = crate::store::shard_path(main, 0);
+    if !target.exists() {
+        return Ok(());
+    }
+    let conn = crate::db::open_at(&target)?;
+    let merged: bool =
+        conn.prepare("select 1 from main.sqlite_master where type = 'table' and name = 'merge_shards'")?.exists([])?;
+    if !merged || crate::store::get_meta(&conn, ONE_SHARD_FROM)?.is_some() {
+        return Ok(());
+    }
+    let from = match one_shard_from(&conn)? {
+        i64::MAX => crate::store::get_meta(main_conn, "next_seq")?.unwrap_or(i64::MAX),
+        found => found,
+    };
+    if from != i64::MAX {
+        conn.execute("insert or ignore into meta (key, value) values (?1, ?2)", params![ONE_SHARD_FROM, from])?;
+    }
+    Ok(())
+}
+
 /// The shards a merge into `target` has begun, and whether each is copied whole.
 fn started_shards(target: &Path) -> Result<Vec<(usize, bool)>> {
     let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
@@ -1542,5 +1566,23 @@ mod tests {
         assert_eq!(one_shard_from(&c).unwrap(), 1024);
         c.execute("insert into meta (key, value) values (?1, 1017)", [ONE_SHARD_FROM]).unwrap();
         assert_eq!(one_shard_from(&c).unwrap(), 1017, "noted");
+    }
+
+    #[test]
+    fn an_indexer_start_notes_the_first_one_shard_id_an_earlier_finish_didnt() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        fixture(&main);
+        let target = legacy_shard_path(&main, 0);
+        merge(&target, &sources(&main), true, None, &|_| {}).unwrap();
+        finish(&main, &target).unwrap();
+        let c = crate::db::open_at(&target).unwrap();
+        let noted = store::get_meta(&c, ONE_SHARD_FROM).unwrap().unwrap();
+        let next = store::get_meta(&crate::db::open_at(&main).unwrap(), "next_seq").unwrap().unwrap();
+        assert_eq!(noted, next, "the counter, which nothing has handed out from");
+        // as a finish of an earlier build leaves it
+        c.execute("delete from meta where key = ?1", [ONE_SHARD_FROM]).unwrap();
+        crate::db::create_db_at(&main).unwrap();
+        assert_eq!(store::get_meta(&c, ONE_SHARD_FROM).unwrap(), Some(next));
     }
 }

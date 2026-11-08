@@ -591,6 +591,8 @@ pub fn create_db_at(path: &Path) -> anyhow::Result<()> {
     let used = has_progress(&conn)?;
     store::create_main(&conn)?;
     create_shards(path, used)?;
+    // a merged shard finished by a build that didn't note its first one-shard id: noted now, while it can be told
+    crate::merge_shards::note_one_shard_from(path, &conn)?;
     if fresh && !used {
         crate::raw_store::restore_backfill_deepest(path, &conn);
     }
