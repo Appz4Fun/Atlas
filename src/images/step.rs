@@ -238,6 +238,19 @@ pub fn picked(files: &[FileInfo]) -> Vec<&FileInfo> {
     images
 }
 
+/// The files of the rows linked into the upload `lead` leads, its own left out, up to 50 a row.
+fn linked_files(conn: &rusqlite::Connection, lead: i64) -> rusqlite::Result<Vec<FileInfo>> {
+    let members: Vec<i64> = conn
+        .prepare_cached("select release_id from upload_link where lead_id = ?1 and release_id != ?1 limit 16")?
+        .query_map([lead], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut files = Vec::new();
+    for member in members {
+        files.extend(store::release_files(conn, member, 50)?);
+    }
+    Ok(files)
+}
+
 /// Books and comics small enough to read whole for the pictures inside them, at most two.
 pub fn containers(files: &[FileInfo]) -> Vec<&FileInfo> {
     files
@@ -318,12 +331,15 @@ impl Step for ImagesStep {
     fn applies(&self, r: &crate::postprocess::step::ReleaseInfo) -> bool {
         r.size > 0
     }
-    // a picture can come after the rest of the post
+    // a picture can come after the rest of the post; one linked into it later asks for a run itself (`archive::link`)
     fn reruns(&self) -> Reruns {
         Reruns { on_rename: false, on_growth: true }
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
-        let files = ctx.files().map_err(|e| StepError::Retry(e.to_string()))?;
+        let mut files = ctx.files().map_err(|e| StepError::Retry(e.to_string()))?;
+        // the small files linked into the upload this release leads: a thumbnail posted beside it under a subject of
+        // its own (`archive::link`)
+        files.extend(linked_files(ctx.conn(), ctx.release().id).map_err(|e| StepError::Retry(e.to_string()))?);
         let wanted = picked(&files);
         let books = containers(&files);
         if wanted.is_empty() && books.is_empty() {
