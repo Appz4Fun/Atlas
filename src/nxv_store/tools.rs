@@ -183,6 +183,7 @@ fn stats(args: &[String]) -> Result<()> {
 
 /// One article the linker considers.
 struct Art {
+    id: String,
     poster: String,
     posted: i64,
     group: i64,
@@ -232,7 +233,7 @@ fn link(args: &[String]) -> Result<()> {
                     dup += 1;
                     continue;
                 }
-                arts.push(Art { poster: a.author, posted, group: gid, bytes: a.bytes });
+                arts.push(Art { id: a.message_id, poster: a.author, posted, group: gid, bytes: a.bytes });
             }
         }
     }
@@ -255,10 +256,11 @@ fn link(args: &[String]) -> Result<()> {
         let t = Instant::now();
         let conn = rusqlite::Connection::open_with_flags(&xdb, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         conn.busy_timeout(Duration::from_secs(10))?;
-        let mut stmt = conn.prepare("select poster, posted, grp, bytes from headers where posted between ?1 and ?2")?;
+        let mut stmt =
+            conn.prepare("select message_id, poster, posted, grp, bytes from headers where posted between ?1 and ?2")?;
         let theirs: Vec<Art> = stmt
             .query_map([lo, hi], |r| {
-                Ok(Art { poster: r.get(0)?, posted: r.get(1)?, group: r.get(2)?, bytes: r.get(3)? })
+                Ok(Art { id: r.get(0)?, poster: r.get(1)?, posted: r.get(2)?, group: r.get(3)?, bytes: r.get(4)? })
             })?
             .collect::<rusqlite::Result<_>>()?;
         let sum = chain_summary(&theirs, from, to);
@@ -269,6 +271,29 @@ fn link(args: &[String]) -> Result<()> {
             t.elapsed().as_secs_f64()
         );
         println!("  {}", sum.line());
+        // the articles both hold, each side's rows of them chained apart: the same input should link the same way
+        let their_ids: HashSet<&str> = theirs.iter().map(|a| a.id.as_str()).collect();
+        let common_mine: Vec<&Art> = arts.iter().filter(|a| their_ids.contains(a.id.as_str())).collect();
+        let common_theirs: Vec<&Art> = theirs.iter().filter(|a| seen.contains(&a.id)).collect();
+        println!(
+            "articles in both: {} ({:.1}% of the SQLite store's, {:.1}% of this store's)",
+            common_mine.len(),
+            common_mine.len() as f64 * 100.0 / theirs.len().max(1) as f64,
+            common_mine.len() as f64 * 100.0 / arts.len().max(1) as f64
+        );
+        let owned = |v: &[&Art]| -> Vec<Art> {
+            v.iter()
+                .map(|a| Art {
+                    id: a.id.clone(),
+                    poster: a.poster.clone(),
+                    posted: a.posted,
+                    group: a.group,
+                    bytes: a.bytes,
+                })
+                .collect()
+        };
+        println!("  this store, those articles: {}", chain_summary(&owned(&common_mine), from, to).line());
+        println!("  SQLite store, those articles: {}", chain_summary(&owned(&common_theirs), from, to).line());
         let (n, f): (i64, Option<i64>) = conn.query_row(
             "select count(*), sum(files) from uploads where first between ?1 and ?2",
             [from, to],
