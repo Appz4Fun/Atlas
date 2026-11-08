@@ -139,6 +139,9 @@ fn id_window(id: i64, cutover: i64, saves: i64) -> (i64, i64) {
 const BESIDE_SECS: i64 = 30 * 60;
 /// Rows checked, at most, for the small files one release's set names.
 const BESIDE_CHECKS: usize = 8;
+/// How long after it was posted a release looks again for small files not found yet: a file of the same upload is
+/// saved within hours of the rest, or by a backfill of the same days.
+const BESIDE_WAIT_DAYS: f64 = 2.0;
 /// How far apart in days an upload's files can say they were posted. Real ones are an hour or two; a slow or resumed
 /// upload a day or two.
 const DAY_WINDOW: f64 = 3.0;
@@ -359,14 +362,22 @@ impl LinkStep {
         let Some(inventory) = super::store::par2_inventory(ctx.conn(), "main", me.id) else {
             let par2_done: i64 = ctx
                 .conn()
-                .prepare_cached("select coalesce((select done from pp_state where release_id = ?1), 0) & ?2")
+                .prepare_cached("select coalesce((select done | failed from pp_state where release_id = ?1), 0) & ?2")
                 .and_then(|mut stmt| stmt.query_row(params![me.id, mask(super::steps::PAR2_STEP)], |r| r.get(0)))
                 .map_err(retry)?;
-            let wait_until = (par2_done == 0).then(|| chrono::Utc::now().timestamp() + RESUME_SECS);
+            // a release the PAR2 step passes over, or one long settled, isn't waited on
+            let fresh = age_days(ctx, &me).is_some_and(|days| days < BESIDE_WAIT_DAYS);
+            let wait_until = (par2_done == 0 && fresh).then(|| chrono::Utc::now().timestamp() + RESUME_SECS);
             return Ok(Outcome { wait_until, ..Default::default() });
         };
         let own: HashSet<String> = files.iter().map(|f| f.filename.to_ascii_lowercase()).collect();
-        let outside = beside_wanted(&inventory.files, &own);
+        // posted names that aren't the set's (an obfuscated post) say nothing of which small files are missing
+        let named = inventory
+            .files
+            .iter()
+            .filter(|f| f.size >= MIN_LINKED && !is_par2_name(&f.name))
+            .all(|f| own.contains(&f.name.to_ascii_lowercase()));
+        let outside = if named { beside_wanted(&inventory.files, &own) } else { Vec::new() };
         if outside.is_empty() {
             return Ok(Outcome::default());
         }
@@ -404,10 +415,11 @@ impl LinkStep {
                 }
             }
         }
-        let young = age_days(ctx, &me).is_some_and(|days| days < LOOK_AGAIN_FOR_DAYS);
+        let fresh = age_days(ctx, &me).is_some_and(|days| days < BESIDE_WAIT_DAYS);
         let now = chrono::Utc::now().timestamp();
-        // one posted late may turn up yet
-        let wait_until = (!missing.is_empty() && young).then_some(now + LOOK_AGAIN_SECS);
+        // one not saved yet may turn up while the release is new; once one is found the run is done, soo the pictures
+        // step's rerun isn't lost to a wait
+        let wait_until = (!missing.is_empty() && fresh && found.is_empty()).then_some(now + LOOK_AGAIN_SECS);
         let mut writes: Vec<StepWrite> =
             tried.iter().map(|other| StepWrite::new(TRIED, vec![me.id.into(), (*other).into()])).collect();
         if found.is_empty() {
@@ -427,7 +439,8 @@ impl LinkStep {
     /// Rows posted within `window` (from, to, and the release's own time) holding one file named `name` and nothing
     /// else, in at most two articles, that no other upload has taken. Nearest in time first: an uploader that names
     /// every thumbnail the same posts dozens an hour. Such a row is named after its file (with ` [N]` after it when the
-    /// name is taken), soo the name's index finds them, not a scan of every file.
+    /// name is taken), soo the name's index finds them (the date is kept off its own index, which would read the whole
+    /// hour), not a scan of every file. The name is matched as the set spells it.
     fn beside_candidates(
         conn: &rusqlite::Connection,
         me: i64,
@@ -439,7 +452,7 @@ impl LinkStep {
                 "select r.id, coalesce(r.size, 0), coalesce(r.parts, 0), f.id, f.filename, f.expected
                  from releases r join files f on f.release_id = r.id
                  where r.name >= ?4 and r.name < ?4 || char(127)
-                   and r.posted_date between ?1 and ?2 and r.id != ?3 and f.filename = ?4 collate nocase
+                   and +r.posted_date between ?1 and ?2 and r.id != ?3 and f.filename = ?4 collate nocase
                    and coalesce(f.expected, 1) <= 2
                    and not exists (select 1 from files g where g.release_id = r.id and g.id != f.id)
                    and not exists (select 1 from upload_link l where l.release_id = r.id and l.lead_id != ?3)

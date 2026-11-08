@@ -689,6 +689,28 @@ fn whole_post_from(conn: &Connection, release: &crate::search::ReleaseRow, catal
             split.recovery = post.recovery;
             return Ok(Some(split));
         }
+        // a release cut across groups that leads small files posted beside it (`archive::link`): the cut post with
+        // those rows added, each of which has to be whole too
+        if let Ok(Some(mut split)) = split_post_from(conn, release, catalog)
+            && post.recovery.is_empty()
+            && post.lead.is_some_and(|lead| split.ids.binary_search(&lead).is_ok())
+            && split.ids.len() > 1
+        {
+            let extra: Vec<i64> = post.ids.iter().copied().filter(|id| split.ids.binary_search(id).is_err()).collect();
+            for id in extra {
+                let Some((group, bytes)) = group_and_size(conn, id)? else { continue };
+                split.complete &= union_files(conn, &[id])?.complete_by_files();
+                split.size += bytes;
+                if let Err(at) = split.groups.binary_search(&group) {
+                    split.groups.insert(at, group);
+                }
+                if let Err(at) = split.ids.binary_search(&id) {
+                    split.ids.insert(at, id);
+                }
+            }
+            split.lead = post.lead;
+            return Ok(Some(split));
+        }
         return Ok(Some(post));
     }
     split_post_from(conn, release, catalog)
@@ -2660,6 +2682,36 @@ mod tests {
             assert!(post.complete);
             assert_eq!(post.groups, [a, b, c, d]);
         }
+    }
+
+    #[test]
+    fn a_post_cut_across_groups_keeps_its_rows_when_one_leads_a_thumbnail() {
+        let (_dir, conn) = all_shards();
+        let name = "Some.Film.2007.2160p.UHD.BluRay.REMUX.DV.HDR.HEVC.Atmos-GRP";
+        let (mkv, vol) = ("Some.Film.mkv", "Some.Film.vol00+01.par2");
+        let (a, b, c) = ("alt.binaries.a", "alt.binaries.b", "alt.binaries.c");
+        put_row(&conn, 1, name, a, "x1@nyuu", &[(mkv, &[1, 4, 7], 8), (vol, &[1], 2)]);
+        put_row(&conn, 2, name, b, "x2@nyuu", &[(mkv, &[2, 5, 8], 8), (vol, &[2], 2)]);
+        put_row(&conn, 3, name, c, "x3@nyuu", &[(mkv, &[3, 6], 8)]);
+        put_row(&conn, 9, "00-thumbnail.jpg", a, "x9@nyuu", &[("00-thumbnail.jpg", &[1], 1)]);
+        let (lead, thumb) = (row_of(&conn, 1, a).id, row_of(&conn, 9, a).id);
+        let s = store::shard_of(a);
+        conn.execute(
+            &format!(
+                "insert into s{s}.upload_link (release_id, lead_id, recovery, par2_file)
+                 values (?1, ?1, 0, null), (?2, ?1, 0, x'07')"
+            ),
+            rusqlite::params![lead, thumb],
+        )
+        .unwrap();
+        let mut want: Vec<i64> =
+            [(1, a), (2, b), (3, c), (9, a)].iter().map(|(i, g)| row_of(&conn, *i, g).id).collect();
+        want.sort_unstable();
+        let post = whole_post_with(&conn, &row_of(&conn, 1, a)).unwrap().unwrap();
+        assert_eq!(post.ids, want, "the cut post and the thumbnail");
+        assert!(post.complete);
+        assert_eq!(post.lead, Some(lead));
+        assert_eq!(post.groups, [a, b, c]);
     }
 
     #[test]
