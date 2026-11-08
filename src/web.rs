@@ -3937,7 +3937,8 @@ fn images_html(id: i64, images: &[crate::images::step::Image]) -> String {
     let figures: String = images
         .iter()
         .map(|i| {
-            let src = format!("/ui/image?id={id}&amp;at={}", i.position);
+            // the picture's hash in the address: a rerun that puts another picture at this place isn't served from cache
+            let src = format!("/ui/image?id={id}&amp;at={}&amp;v={}", i.position, &i.sha256[..i.sha256.len().min(12)]);
             let facts = image_facts(i);
             format!(
                 "<figure class=\"picture\"><a href=\"{src}\"><img src=\"{src}\" width=\"{}\" height=\"{}\" loading=\"lazy\" alt=\"{}\"></a><figcaption><b>{}</b><dl class=\"facts\">{facts}</dl></figcaption></figure>",

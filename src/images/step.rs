@@ -4,6 +4,9 @@
 //! `images` folder under their SHA-256, soo the same picture posted in many groups is kept once, and its headers go to
 //! `release_images` beside the release. A JPEG's EXIF and XMP ids are kept as columns of their own: the same id on two
 //! releases says they carry one picture, whatever it was called and wherever it was posted.
+//!
+//! A post of nothing but pictures (a picture set, a lone cover) is outside the body lane's gate
+//! (`postprocess::rules::body_gate`), soo this step reads the pictures that come with a release, never a picture post.
 
 use sha2::Digest;
 

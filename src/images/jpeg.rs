@@ -104,6 +104,7 @@ pub fn read(bytes: &[u8]) -> Option<JpegInfo> {
     let mut framed = false;
     let mut scan_at = None;
     let mut xmp_read = false;
+    let mut exif_read = false;
     let mut at = 2;
     while at + 4 <= bytes.len() {
         if bytes[at] != 0xFF {
@@ -139,7 +140,11 @@ pub fn read(bytes: &[u8]) -> Option<JpegInfo> {
             0xE0 if info.jfif.is_none() => jfif(body, &mut info),
             0xE1 => {
                 if let Some(tiff) = body.strip_prefix(b"Exif\0\0") {
-                    exif(tiff, &mut info);
+                    // the first block only, as with XMP
+                    if !exif_read {
+                        exif_read = true;
+                        exif(tiff, &mut info);
+                    }
                 } else if let Some(xml) = body.strip_prefix(b"http://ns.adobe.com/xap/1.0/\0")
                     && !xmp_read
                 {
@@ -291,6 +296,8 @@ fn jfif(body: &[u8], info: &mut JpegInfo) {
 
 /// A text field: ASCII or UTF-8 up to its first NUL, trimmed, cut to `MAX_TEXT`. None when nothing's left.
 fn text(raw: &[u8]) -> Option<String> {
+    // a field can't say more than this many bytes' worth: a long one costs no more than a short one
+    let raw = &raw[..raw.len().min(MAX_TEXT * 4)];
     let raw = raw.split(|&b| b == 0).next().unwrap_or_default();
     let text = String::from_utf8_lossy(raw);
     let text: String = text.trim().chars().filter(|c| !c.is_control()).take(MAX_TEXT).collect();
