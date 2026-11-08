@@ -201,18 +201,31 @@ async fn finish(
     found: BTreeMap<String, Vec<(usize, Overview)>>,
     now: i64,
 ) -> anyhow::Result<()> {
-    // saved like a listing's headers: each part joins its file by its subject. A group that couldn't be saved has its
-    // ids asked again soon; the other groups are saved all the same
+    // what wasn't found is marked first, soo a stop during the saves keeps it
+    let missed: Vec<(String, Outcome)> =
+        outcomes.iter().filter(|(_, o)| *o != Outcome::Found).map(|(w, o)| (w.key(), *o)).collect();
+    on_db(db, move |conn| Ok(mark_ids(conn, &missed, now)?)).await?;
+    // saved like a listing's headers: each part joins its file by its subject, and is marked once its group is saved.
+    // A group that couldn't be saved has its ids asked again soon; the other groups are saved all the same
     for (group, headers) in found {
         let at: Vec<usize> = headers.iter().map(|(i, _)| *i).collect();
         let headers: Vec<Overview> = headers.into_iter().map(|(_, o)| o).collect();
         let unsaved = pool.reserve_unsaved_shard(store::shard_of(&group), headers.len() as u64).await;
-        if let Err(e) = crate::indexer::save_slice(pool, db, &group, headers, unsaved).await {
-            eprintln!("inferred: saving {group}: {e:#}");
-            for i in at {
-                outcomes[i].1 = Outcome::Failed;
+        let outcome = match crate::indexer::save_slice(pool, db, &group, headers, unsaved).await {
+            Ok(_) => Outcome::Found,
+            Err(e) => {
+                eprintln!("inferred: saving {group}: {e:#}");
+                Outcome::Failed
             }
-        }
+        };
+        let marks: Vec<(String, Outcome)> = at
+            .iter()
+            .map(|&i| {
+                outcomes[i].1 = outcome;
+                (outcomes[i].0.key(), outcome)
+            })
+            .collect();
+        on_db(db, move |conn| Ok(mark_ids(conn, &marks, now)?)).await?;
     }
     let mut counts: BTreeMap<&str, u64> = BTreeMap::new();
     let mut posts = HashSet::new();
@@ -233,8 +246,7 @@ async fn finish(
         counts.get("unusable").unwrap_or(&0),
         counts.get("failed").unwrap_or(&0)
     );
-    let marks: Vec<(String, Outcome)> = outcomes.iter().map(|(w, o)| (w.key(), *o)).collect();
-    on_db(db, move |conn| Ok(mark_ids(conn, &marks, now)?)).await
+    Ok(())
 }
 
 /// The parts worth asking for this round, most nearly whole posts first, `budget` ids at most: the ids of each post
@@ -377,17 +389,28 @@ fn mark_posts(conn: &mut Connection, nothing: &[i64], waiting: &[(Vec<i64>, i64)
 /// try; one that couldn't be asked or saved waits `FAILED_AGAIN`, its tries as they were.
 fn mark_ids(conn: &mut Connection, marks: &[(String, Outcome)], now: i64) -> rusqlite::Result<()> {
     let tx = conn.transaction()?;
-    for (id, outcome) in marks {
-        let tries: i64 = tx
-            .query_row("select tries from inferred_ids where message_id = ?1", [id], |r| r.get(0))
-            .optional()?
-            .unwrap_or(0);
-        let (next, tries) = match outcome {
-            Outcome::Found | Outcome::Absent | Outcome::Unusable => (backoff(now, tries + 1), tries + 1),
-            Outcome::Failed => (now + FAILED_AGAIN, tries),
-        };
-        tx.prepare_cached("insert or replace into inferred_ids (message_id, next_at, tries) values (?1, ?2, ?3)")?
-            .execute(params![id, next, tries])?;
+    {
+        // one statement each: an answer is one more try, its wait (`backoff`) from the tries it then has; a failure
+        // keeps them
+        let mut answered = tx.prepare_cached(
+            "insert into inferred_ids (message_id, next_at, tries) values (?1, ?2 + min(?3, ?4), 1)
+             on conflict(message_id) do update set
+                tries = tries + 1, next_at = ?2 + min(?3 << min(tries, 15), ?4)",
+        )?;
+        let mut failed = tx.prepare_cached(
+            "insert into inferred_ids (message_id, next_at, tries) values (?1, ?2, 0)
+             on conflict(message_id) do update set next_at = ?2",
+        )?;
+        for (id, outcome) in marks {
+            match outcome {
+                Outcome::Found | Outcome::Absent | Outcome::Unusable => {
+                    answered.execute(params![id, now, ABSENT_AGAIN, LONGEST])?;
+                }
+                Outcome::Failed => {
+                    failed.execute(params![id, now + FAILED_AGAIN])?;
+                }
+            }
+        }
     }
     tx.commit()
 }
@@ -400,7 +423,8 @@ fn interrupted(e: &rusqlite::Error) -> bool {
 /// The listing row a server's headers for `w` make, and the group to save it in: `w`'s, unless the headers' `Xref:`
 /// names other groups of its post and not it (a post cut across groups, its file in another of them). Subject and From
 /// are made as a listing makes them: a folded line's tab a space, and mojibake undone. None when they aren't the article
-/// asked for. Its size is what the headers say (`Bytes:`, or `Lines:`), else the size `w` was given.
+/// asked for, or have no subject. Its size is what `Bytes:` says, else the size `w` was given (its file's parts' own),
+/// else what `Lines:` makes of it.
 pub fn overview_of(head: &[u8], w: &Wanted) -> Option<(String, Overview)> {
     let value = |name: &str| crate::spotnet::header::header_value(head, name);
     let message_id = value("Message-ID")?;
@@ -408,7 +432,10 @@ pub fn overview_of(head: &[u8], w: &Wanted) -> Option<(String, Overview)> {
         return None;
     }
     let listed = |v: String| crate::nntp::undo_mojibake(v.replace('\t', " "));
-    let subject = listed(value("Subject")?);
+    let subject = listed(value("Subject")?).trim().to_string();
+    if subject.is_empty() {
+        return None;
+    }
     let number_of = |n: Option<String>| n.and_then(|n| n.trim().parse::<i64>().ok()).filter(|n| *n > 0);
     let bytes = number_of(value("Bytes")).unwrap_or(0);
     let lines = number_of(value("Lines")).unwrap_or(0);
@@ -430,7 +457,7 @@ pub fn overview_of(head: &[u8], w: &Wanted) -> Option<(String, Overview)> {
         date: value("Date").unwrap_or_default(),
         message_id: format!("<{}>", message_id.trim().trim_matches(['<', '>'])),
         references: value("References").unwrap_or_default(),
-        bytes: if bytes == 0 && lines == 0 { w.row.bytes.unwrap_or(0) } else { bytes },
+        bytes: if bytes > 0 { bytes } else { w.row.bytes.filter(|b| *b > 0).unwrap_or(0) },
         lines,
         xref_groups: (!xref.is_empty()).then(|| crate::nntp::xref_groups(&format!("Xref: {xref}"))).flatten(),
     };
@@ -473,10 +500,14 @@ Xref: news.example alt.binaries.movies:11666417361 alt.binaries.hdtv:42\r\n";
         assert_eq!(o.message_id, "<part3of6.tok@bzh29>");
         assert_eq!(o.number, 0);
         assert_eq!(o.lines, 5022);
-        // no Bytes: the line count gives the size (`Overview::into_article`)
-        assert_eq!(o.bytes, 0);
+        // no Bytes: the size its file's parts have, not the line count's guess
+        assert_eq!(o.bytes, 640);
         assert_eq!(o.xref_groups, Some(2));
-        assert_eq!(o.clone().into_article().bytes, 5022 * 130);
+        // and without that either, the line count gives it (`Overview::into_article`)
+        let mut sizeless = wanted("<part3of6.tok@bzh29>", "alt.binaries.movies");
+        sizeless.row.bytes = None;
+        let o = overview_of(HEAD, &sizeless).unwrap().1;
+        assert_eq!((o.bytes, o.into_article().bytes), (0, 5022 * 130));
         // a post cut across groups: saved in the group of the post the article is in
         let mut cut = wanted("<part3of6.tok@bzh29>", "alt.binaries.teevee");
         cut.groups = vec!["alt.binaries.teevee".to_string(), "alt.binaries.movies".to_string()].into();
@@ -504,6 +535,8 @@ Xref: news.example alt.binaries.movies:11666417361 alt.binaries.hdtv:42\r\n";
         assert!(overview_of(other, &wanted("<part3of6.tok@bzh29>", "g")).is_none());
         let bare = b"Message-ID: <part3of6.tok@bzh29>\n";
         assert!(overview_of(bare, &wanted("<part3of6.tok@bzh29>", "g")).is_none());
+        let empty = b"Subject:  \nMessage-ID: <part3of6.tok@bzh29>\n";
+        assert!(overview_of(empty, &wanted("<part3of6.tok@bzh29>", "g")).is_none());
     }
 
     #[test]

@@ -187,6 +187,8 @@ pub struct Config {
     pub parallel_groups: Option<usize>,
     /// compact the database every 24 hours from the indexer
     pub auto_run_compact: bool,
+    /// ask every server for the parts a file's own ids name when no listing showed them (`inferred`); on unless off
+    pub inferred_parts: bool,
     /// None = DEFAULT_MAX_UNSAVED_HEADERS
     pub max_unsaved_headers: Option<u64>,
     pub postprocess: PostprocessConfig,
@@ -1103,6 +1105,7 @@ impl Default for Config {
             backfill_start_days_back: None,
             parallel_groups: None,
             auto_run_compact: false,
+            inferred_parts: true,
             max_unsaved_headers: None,
             postprocess: PostprocessConfig::default(),
             archive: ArchiveConfig::default(),
@@ -1289,6 +1292,7 @@ impl Config {
                 .and_then(|n| usize::try_from(n).ok())
                 .filter(|n| *n > 0),
             auto_run_compact: v.get("auto_run_compact").and_then(Value::as_bool).unwrap_or(false),
+            inferred_parts: v.get("inferred_parts").and_then(Value::as_bool).unwrap_or(true),
             postprocess: PostprocessConfig::from_value(v.get("postprocess")),
             archive: ArchiveConfig::from_value(v.get("archive")),
             naming: NamingConfig::from_value(v.get("naming")),
@@ -1626,6 +1630,10 @@ fn config_value(
 
     if cfg.auto_run_compact {
         out.insert("auto_run_compact".into(), json!(true));
+    }
+
+    if !cfg.inferred_parts {
+        out.insert("inferred_parts".into(), json!(false));
     }
 
     // the settings pages edit these; None means "worked out", and the key goes

@@ -1074,7 +1074,7 @@ async fn run_servers(
         ));
     }
     // parts no listing showed, asked for on every server by the ids their files' other parts name (see `inferred`)
-    {
+    if config.inferred_parts {
         let s = sched.clone();
         tasks.spawn(named!(
             "inferred parts".into(),
