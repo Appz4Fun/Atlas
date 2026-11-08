@@ -950,6 +950,13 @@ fn across_posters(conn: &Connection, anchor: i64, named: &[Named]) -> Result<Acr
         }
     }
     rows.sort_by_key(|n| n.id);
+    // each poster's own rows, as `same_poster_post` reads them
+    let mut by_poster: HashMap<&str, Vec<&Named>> = HashMap::new();
+    for n in &rows {
+        if let Some(poster) = n.poster.as_deref() {
+            by_poster.entry(poster).or_default().push(*n);
+        }
+    }
     rows.truncate(ACROSS_POSTERS_ROWS);
     // each row alone, to tell a crosspost from a part
     let mut kept: Vec<(&Named, UnionFiles)> = Vec::new();
@@ -983,9 +990,24 @@ fn across_posters(conn: &Connection, anchor: i64, named: &[Named]) -> Result<Acr
     let whole = |chosen: &[i64], union: &UnionFiles| chosen.len() > 1 && union.one_upload() && union.complete();
     let in_whole: HashSet<i64> =
         posts.iter().filter(|(c, u)| whole(c, u)).flat_map(|(c, _)| c.iter().copied()).collect();
-    let rest: Vec<usize> = (0..kept.len()).filter(|i| !in_whole.contains(&kept[*i].0.id)).collect();
-    let sharing =
-        rest.iter().enumerate().any(|(n, a)| rest[n + 1..].iter().any(|b| kept[*a].1.shares_parts(&kept[*b].1)));
+    let mut rest: Vec<usize> = (0..kept.len()).filter(|i| !in_whole.contains(&kept[*i].0.id)).collect();
+    let shares = |rest: &[usize]| {
+        rest.iter().enumerate().any(|(n, a)| rest[n + 1..].iter().any(|b| kept[*a].1.shares_parts(&kept[*b].1)))
+    };
+    let mut sharing = shares(&rest);
+    let mut in_whole = in_whole;
+    if sharing {
+        // nor do the rows of a poster's own whole post: they keep it
+        for own in by_poster.values() {
+            if let Some(post) = same_poster_post(conn, own)?
+                && post.complete
+            {
+                in_whole.extend(post.ids);
+            }
+        }
+        rest.retain(|i| !in_whole.contains(&kept[*i].0.id));
+        sharing = shares(&rest);
+    }
     if sharing {
         // only a whole post sharing parts is kept: the rows of one that isn't keep the answers they had
         let mut taken = in_whole.clone();
