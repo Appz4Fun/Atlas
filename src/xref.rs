@@ -447,6 +447,28 @@ impl Store {
     }
 
     #[cfg(test)]
+    fn place_of(&self, poster: &str) -> Result<Option<Place>> {
+        Ok(self
+            .conn
+            .query_row(
+                "select release, grp, file, files, parts, leads, oldest from linked where poster = ?1",
+                [poster],
+                |r| {
+                    Ok(Place {
+                        release: r.get(0)?,
+                        group: r.get(1)?,
+                        file: r.get(2)?,
+                        files: r.get(3)?,
+                        parts: r.get(4)?,
+                        leads: r.get(5)?,
+                        oldest: r.get(6)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    #[cfg(test)]
     fn waiting(&self) -> Result<Vec<FileSum>> {
         Ok(self.waiting_placed()?.into_iter().map(|(f, _)| f).collect())
     }
