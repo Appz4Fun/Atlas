@@ -21,12 +21,14 @@ fn a_file_twin_in_another_shard_fills_the_gaps() {
     db::create_db().unwrap();
     let main = home.path().join("atlas.db");
     let groups: Vec<String> = (0..64).map(|n| format!("alt.binaries.g{n}")).collect();
-    let in_shard = |s: usize| groups.iter().find(|g| store::shard_of(g) == s).unwrap().as_str();
+    let in_shard = |s: usize| {
+        groups.iter().filter(|g| store::shard_of(g) == s % store::SHARDS).nth(s / store::SHARDS).unwrap().as_str()
+    };
     // this posting has 2 of 3 parts of a randomly named file; another poster's has all 3 under the real name
     store::save(&main, &[Release { group: in_shard(0).into(), ..release_of("Mine", "x9k2.bin", 2, 3) }]).unwrap();
     store::save(&main, &[Release { group: in_shard(5).into(), ..release_of("Theirs", "Movie.mkv", 3, 3) }]).unwrap();
     let shard_a = db::open_shard(&store::shard_path(&main, 0)).unwrap();
-    let shard_b = db::open_shard(&store::shard_path(&main, 5)).unwrap();
+    let shard_b = db::open_shard(&store::shard_path(&main, 5 % store::SHARDS)).unwrap();
     let mine: i64 = shard_a.query_row("select id from releases where name = 'Mine'", [], |r| r.get(0)).unwrap();
     let theirs: i64 = shard_b.query_row("select id from releases where name = 'Theirs'", [], |r| r.get(0)).unwrap();
     let insert = atlas::archive::store::INSERT_PAR2_FILE;
@@ -97,8 +99,8 @@ fn a_file_twin_in_another_shard_fills_the_gaps() {
     };
     store::save(&main, &[short]).unwrap();
     store::save(&main, &[stranger]).unwrap();
-    let shard_c = db::open_shard(&store::shard_path(&main, 2)).unwrap();
-    let shard_d = db::open_shard(&store::shard_path(&main, 4)).unwrap();
+    let shard_c = db::open_shard(&store::shard_path(&main, 2 % store::SHARDS)).unwrap();
+    let shard_d = db::open_shard(&store::shard_path(&main, 4 % store::SHARDS)).unwrap();
     let short: i64 = shard_c.query_row("select id from releases where name = 'Short'", [], |r| r.get(0)).unwrap();
     let stranger: i64 = shard_d.query_row("select id from releases where name = 'Stranger'", [], |r| r.get(0)).unwrap();
     let nfo = (vec![3u8; 16], vec![3u8; 16], 900i64);
@@ -176,7 +178,7 @@ fn a_file_twin_in_another_shard_fills_the_gaps() {
     for release in [base, donb, donc] {
         store::save(&main, &[release]).unwrap();
     }
-    let shard = |s: usize| db::open_shard(&store::shard_path(&main, s)).unwrap();
+    let shard = |s: usize| db::open_shard(&store::shard_path(&main, s % store::SHARDS)).unwrap();
     let id = |s: usize, name: &str| -> i64 {
         shard(s).query_row("select id from releases where name = ?", [name], |r| r.get(0)).unwrap()
     };

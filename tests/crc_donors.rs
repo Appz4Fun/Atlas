@@ -32,14 +32,16 @@ fn a_same_crc_file_under_another_name_fills_the_gaps() {
     db::create_db().unwrap();
     let main = home.path().join("atlas.db");
     let groups: Vec<String> = (0..64).map(|n| format!("alt.binaries.g{n}")).collect();
-    let in_shard = |s: usize| groups.iter().find(|g| store::shard_of(g) == s).unwrap().as_str();
+    let in_shard = |s: usize| {
+        groups.iter().filter(|g| store::shard_of(g) == s % store::SHARDS).nth(s / store::SHARDS).unwrap().as_str()
+    };
     // this posting lost part 3 of Movie.mkv; a repost under another name has all 3, cut the same way; a third posting
     // has the same file cut into 4 and can't lend
     store::save(&main, &[Release { group: in_shard(0).into(), ..release_of("Mine", "Movie.mkv", 2, 3) }]).unwrap();
     store::save(&main, &[Release { group: in_shard(5).into(), ..release_of("Repost", "a8f3k.mkv", 3, 3) }]).unwrap();
     store::save(&main, &[Release { group: in_shard(3).into(), ..release_of("Recut", "Recut.mkv", 4, 4) }]).unwrap();
     let shard = |s: usize| {
-        let c = db::open_shard(&store::shard_path(&main, s)).unwrap();
+        let c = db::open_shard(&store::shard_path(&main, s % store::SHARDS)).unwrap();
         atlas::postprocess::schema::migrate(&c).unwrap();
         c
     };

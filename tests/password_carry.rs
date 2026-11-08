@@ -21,11 +21,19 @@ fn a_password_carries_to_xposts_and_twins_but_not_alts() {
     db::create_db().unwrap();
     let main = home.path().join("atlas.db");
     let groups: Vec<String> = (0..64).map(|n| format!("alt.binaries.g{n}")).collect();
-    let in_shard = |s: usize| groups.iter().find(|g| store::shard_of(g) == s).unwrap().clone();
+    let in_shard = |s: usize| {
+        groups.iter().filter(|g| store::shard_of(g) == s % store::SHARDS).nth(s / store::SHARDS).unwrap().clone()
+    };
     let save = |name: &str, file: &str, s: usize| -> (i64, rusqlite::Connection) {
-        store::save(&main, &[Release { group: in_shard(s), ..release_of(name, file, 2, 2) }]).unwrap();
-        let shard = db::open_shard(&store::shard_path(&main, s)).unwrap();
-        let id = shard.query_row("select id from releases where name = ?", [name], |r| r.get(0)).unwrap();
+        let group = in_shard(s);
+        store::save(&main, &[Release { group: group.clone(), ..release_of(name, file, 2, 2) }]).unwrap();
+        let shard = db::open_shard(&store::shard_path(&main, s % store::SHARDS)).unwrap();
+        // by group too: the crosspost shares the name, and may share the shard
+        let id = shard
+            .query_row("select id from releases where name = ? and group_name = ?", [name, group.as_str()], |r| {
+                r.get(0)
+            })
+            .unwrap();
         (id, shard)
     };
     // the first upload, its crosspost to another group, a repost of the same volumes renamed, and the same film

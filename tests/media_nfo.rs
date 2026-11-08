@@ -301,9 +301,14 @@ fn an_nfo_id_survives_a_fan_out_and_a_late_article() {
     settle();
     assert_eq!(imdb(&h, FILM), Some(200002), "a re-parse keeps it");
     let conn = h.shard();
+    // another release of the title, by an id no save gives out: with one shard, the film's own id may be 1
+    const OTHER: i64 = 1_000_000;
     let key = title_key(Kind::Movie, &normalize("Some Movie"), Some(2019));
-    conn.execute("insert into media_release (release_id, kind, title_key, quality) values (1, 2, ?, 0)", [key])
-        .unwrap();
+    conn.execute(
+        "insert into media_release (release_id, kind, title_key, quality) values (?, 2, ?, 0)",
+        rusqlite::params![OTHER, key],
+    )
+    .unwrap();
     let null = None::<i64>;
     let changed = conn
         .execute(atlas::media::fanout::UPDATE, rusqlite::params![key, 0, i64::MAX, null, null, null, 501, 200009, null])
@@ -311,7 +316,7 @@ fn an_nfo_id_survives_a_fan_out_and_a_late_article() {
     assert_eq!(changed, 2, "both get the title's TMDB id");
     assert_eq!(imdb(&h, FILM), Some(200002), "the NFO's stays");
     let other: i64 =
-        conn.query_row("select imdb_id from media_release where release_id = 1", [], |r| r.get(0)).unwrap();
+        conn.query_row("select imdb_id from media_release where release_id = ?", [OTHER], |r| r.get(0)).unwrap();
     assert_eq!(other, 200009, "the other takes the title's");
 }
 
