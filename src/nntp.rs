@@ -3374,9 +3374,7 @@ impl Pool {
                     }
                     // a wide slice that times out is halved like an XOVER's (see `xover_on`): XOVER would likely time
                     // out too, soo it says nothing against XZVER, and a probe stays untried
-                    Err(e) if e.is_timeout() && end.saturating_sub(start) + 1 >= 2 * MIN_CHUNK => {
-                        ("xzver", Err(e))
-                    }
+                    Err(e) if e.is_timeout() && end.saturating_sub(start) + 1 >= 2 * MIN_CHUNK => ("xzver", Err(e)),
                     // hung, hung up on, or garbled: the slice again with plain XOVER on another connection (this one
                     // may still have the reply coming)
                     Err(e) => {
@@ -5391,10 +5389,7 @@ mod xzver_fallback_tests {
             let pool = pool(port, true);
             assert_eq!(numbers(&pool.xover_on(0, "g", 1, 2).await.unwrap()), [1, 2]);
             assert_eq!(count(&log, "XOVER"), 1);
-            assert!(
-                matches!(*pool.servers[0].xzver.lock().unwrap(), Xzver::Refused(_)),
-                "XOVER had rows XZVER didnt"
-            );
+            assert!(matches!(*pool.servers[0].xzver.lock().unwrap(), Xzver::Refused(_)), "XOVER had rows XZVER didnt");
         });
     }
 
