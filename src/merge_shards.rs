@@ -918,6 +918,8 @@ pub fn finish(main: &Path, target: &Path) -> Result<()> {
     crate::store::set_next_seq(&tx, highest + 1)?;
     tx.execute("insert or replace into meta (key, value) values (?1, 1)", [COUNTER_DONE])?;
     tx.commit()?;
+    // the first id in one-shard numbering, noted once (`one_shard_from`)
+    conn.execute("insert or ignore into meta (key, value) values (?1, ?2)", params![ONE_SHARD_FROM, highest + 1])?;
     // the copies' names, which no trigger indexed (`KEPT_TRIGGERS`): the index made again from `releases`
     if conn.prepare("select 1 from main.merge_triggers limit 1")?.exists([])? {
         conn.execute("insert into releases_fts(releases_fts) values ('rebuild')", [])?;
@@ -928,6 +930,24 @@ pub fn finish(main: &Path, target: &Path) -> Result<()> {
     main_conn.execute("insert or replace into meta (key, value) values (?1, 0)", [MERGING])?;
     main_conn.query_row("pragma wal_checkpoint(truncate)", [], |_| Ok(()))?;
     Ok(())
+}
+
+/// Set in the merged shard by `finish`: the first id handed out in one-shard numbering.
+const ONE_SHARD_FROM: &str = "one_shard_from";
+
+/// The first release id in one-shard numbering, for the merged shard on `conn`: ids below it were handed out eight to
+/// a save (`seq * 8 + shard`), ids from it on one to a save. What `finish` noted, or for a shard a build that didn't
+/// note it finished, the highest id a source brought; 0 for a shard never merged.
+pub fn one_shard_from(conn: &Connection) -> Result<i64> {
+    if let Some(v) = crate::store::get_meta(conn, ONE_SHARD_FROM)? {
+        return Ok(v);
+    }
+    let merged: bool =
+        conn.prepare("select 1 from main.sqlite_master where type = 'table' and name = 'merge_shards'")?.exists([])?;
+    if !merged {
+        return Ok(0);
+    }
+    Ok(conn.query_row("select coalesce(max(max_release), -1) + 1 from merge_shards", [], |r| r.get(0))?)
 }
 
 /// The shards a merge into `target` has begun, and whether each is copied whole.

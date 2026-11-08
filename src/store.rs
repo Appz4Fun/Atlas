@@ -2625,6 +2625,10 @@ impl ShardWriter {
             // a release split into one row per upload: its articles go to their upload's row
             let mut routed = tx.prepare_cached("select 1 from upload_routes limit 1")?.exists([])?;
             for release in batches.into_iter().flatten().filter(|r| !crate::filters::group_blocked(&r.group)) {
+                // a folded shard's collection under this shard's key before anything looks it up, routes included
+                if let Some(c) = release.collection.as_deref() {
+                    adopt_legacy_collection(&tx, &key, c)?;
+                }
                 // a frozen first upload's row comes back, with its routes, before they are read
                 if frozen {
                     if let Some(c) = release.collection.as_deref() {
