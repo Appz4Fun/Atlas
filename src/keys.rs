@@ -718,46 +718,54 @@ const MIN_VOLUMES: usize = 3;
 
 /// What the volume key is taken over: an archive set's format, its volume size, how many volumes and the last one's
 /// size, from `(name, size)` files as a PAR2 set lists them; the biggest set when there are several. None unless the
-/// set has `MIN_VOLUMES` or more numbered from its first with none missing, every volume but the last the same size
-/// and the last no bigger: the shape a packer's `-v` cut leaves, and the same whatever the password.
+/// RAR set has `MIN_VOLUMES` or more numbered from its first with none missing, every volume but the last the same
+/// size and the last smaller: the shape a packer's `-v` cut leaves, and the same whatever the password.
 pub(crate) fn volumes_text(files: &[(String, i64)]) -> Option<String> {
     use crate::archive::select::{Kind as File, classify, set_name};
     use std::collections::BTreeMap;
     let mut sets: BTreeMap<(&str, String), Vec<(u32, i64)>> = BTreeMap::new();
     for (name, size) in files {
+        // RAR only: the probe can't tell an encrypted 7z, and a `.001` split could be anything
         let (format, volume) = match classify(name) {
             File::Rar(n) => ("rar", n),
-            File::SevenZip(n) => ("7z", n),
-            File::Numbered(n) => ("split", n),
             _ => continue,
         };
-        let set = set_name(name, format == "split").to_lowercase();
+        let set = set_name(name, false).to_lowercase();
         sets.entry((format, set)).or_default().push((volume, *size));
     }
     let ((format, _), mut vols) = sets.into_iter().max_by_key(|(_, v)| v.iter().map(|(_, s)| *s).sum::<i64>())?;
     vols.sort_unstable();
+    // one volume listed at two sizes is two sets under one name: no shape to go by
+    if vols.windows(2).any(|w| w[0].0 == w[1].0 && w[0].1 != w[1].1) {
+        return None;
+    }
     vols.dedup_by_key(|(n, _)| *n);
+    // from the set's own first volume (`.rar` is 0, `.part1.rar` 1), none missing
     let first = vols.first()?.0;
-    if vols.len() < MIN_VOLUMES || vols.iter().enumerate().any(|(i, (n, _))| *n != first + i as u32) {
+    if first > 1 || vols.len() < MIN_VOLUMES || vols.iter().enumerate().any(|(i, (n, _))| *n != first + i as u32) {
         return None;
     }
     let (body, last) = vols.split_at(vols.len() - 1);
     let size = body.first()?.1;
     let last = last.first()?.1;
-    if size <= 0 || last <= 0 || last > size || body.iter().any(|(_, s)| *s != size) {
+    // a last volume as big as the cut is more often a list cut short than a set that came out even
+    if size <= 0 || last <= 0 || last >= size || body.iter().any(|(_, s)| *s != size) {
         return None;
     }
     Some(format!("volumes:{format}:{size}:{}:{last}", vols.len()))
 }
 
-/// The volume key of a release whose archive is encrypted (its probe says soo), from its PAR2 file list. An
-/// unencrypted archive has its files' own CRCs to go by.
+/// The volume key of a release whose archive is encrypted (its probe says soo), from its PAR2 file list, read whole
+/// (`complete`): a list cut short would key the part of the set it saw. An unencrypted archive has its files' own
+/// CRCs to go by.
 pub fn volume_key(shard: &Connection, release_id: i64, probe: Option<&ProbeInfo>) -> Option<i64> {
     let archive = probe?.archive.as_ref()?;
     if !archive.encrypted && !archive.headers_encrypted {
         return None;
     }
-    let mut q = shard.prepare_cached("select name, size from par2_files where release_id = ?1 and bound = 1").ok()?;
+    let mut q = shard
+        .prepare_cached("select name, size from par2_files where release_id = ?1 and bound = 1 and complete = 1")
+        .ok()?;
     let files: Vec<(String, i64)> =
         q.query_map([release_id], |r| Ok((r.get(0)?, r.get(1)?))).ok()?.filter_map(Result::ok).collect();
     volumes_text(&files).map(|t| as_key(digest8(t.as_bytes())))
@@ -1539,6 +1547,12 @@ mod tests {
         assert_eq!(volumes_text(&set(&[100, 40], &part)), None, "too few");
         assert_eq!(volumes_text(&set(&[100, 90, 100, 40], &part)), None, "not one cut");
         assert_eq!(volumes_text(&set(&[100, 100, 100, 140], &part)), None, "a last bigger than the cut");
+        assert_eq!(volumes_text(&set(&[100, 100, 100, 100], &part)), None, "a list cut short looks even");
+        let later = |i: usize| format!("x.part{:02}.rar", i + 2);
+        assert_eq!(volumes_text(&set(&[100, 100, 100, 40], &later)), None, "the first volume missing");
+        let mut twice = set(&[100, 100, 100, 40], &part);
+        twice.push(("X.part02.rar".into(), 90));
+        assert_eq!(volumes_text(&twice), None, "two sets under one name");
         let mut gap = set(&[100, 100, 100, 40], &part);
         gap.remove(1);
         assert_eq!(volumes_text(&gap), None, "a volume missing");
