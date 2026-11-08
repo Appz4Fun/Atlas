@@ -615,7 +615,7 @@ fn rss_listed(
             let attrs = media.get(&r.id).map_or(String::new(), |a| a.xml(on));
             let attrs = format!("{attrs}{}{incomplete}", release_attrs(r, copies.get(&r.id), spots.get(&r.id)));
             format!(
-                "    <item>      <title>{}</title>      <guid isPermaLink=\"false\">{}</guid>      <link>{}</link>      <size>{size}</size>      <pubDate>{}</pubDate>      <enclosure url=\"{}\" type=\"application/x-nzb\" length=\"{size}\"/>      <newznab:attr name=\"category\" value=\"{category}\"/>{attrs}{password}    </item>",
+                "    <item>      <title>{}</title>      <guid isPermaLink=\"false\">{}</guid>      <link>{}</link>      <size>{size}</size>      <pubDate>{}</pubDate>      <enclosure url=\"{}\" type=\"application/x-nzb\" length=\"{size}\"/>      <newznab:attr name=\"category\" value=\"{category}\"/><newznab:attr name=\"size\" value=\"{size}\"/>{attrs}{password}    </item>",
                 escape(&r.name),
                 r.id,
                 escape(&nzb_url),
