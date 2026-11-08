@@ -27,7 +27,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
-use nntp_xover_engine::container::{AlignedBytes, NxvBlockBuilder, NxvBlockView, decompress_cold_block};
+use nntp_xover_engine::container::{AlignedBytes, NxvBlockBuilder, NxvBlockView};
 use nntp_xover_engine::date::parse_rfc2822_to_epoch;
 use nntp_xover_engine::msgid_index::{Xor8Builder, Xor8View, msgid_hash};
 use nntp_xover_engine::streamer::{NxvRangeCursor, XoverStreamScratch};
@@ -109,8 +109,19 @@ pub struct Window {
 pub type Found = (String, String, Vec<u8>);
 
 impl Window {
-    /// The store at `root`: its blocks' indexes read, and its tails found (and cut back to their last whole line).
+    /// The store at `root` for the writer: its blocks' indexes read, its tails found and cut back to their last whole
+    /// line, and what a cut left half done cleared (a temp file, an index without its block or a block without its
+    /// index, an index that won't read).
     pub fn open(root: &Path) -> Result<Window> {
+        Window::open_with(root, true)
+    }
+
+    /// The store at `root` to read only, beside a writer: nothing repaired or cleared, what won't read passed over.
+    pub fn open_read_only(root: &Path) -> Result<Window> {
+        Window::open_with(root, false)
+    }
+
+    fn open_with(root: &Path, writable: bool) -> Result<Window> {
         fs::create_dir_all(root).with_context(|| format!("making {}", root.display()))?;
         if let Ok(day) = fs::read_to_string(root.join(FRONTIER_FILE))
             && let Ok(day) = day.trim().parse::<i64>()
@@ -122,21 +133,36 @@ impl Window {
             for group_dir in read_dirs(&server)? {
                 let (Some(s), Some(g)) = (decode(&server), decode(&group_dir)) else { continue };
                 let mut group = Group { dir: group_dir.clone(), ..Group::default() };
-                for entry in fs::read_dir(&group_dir)? {
-                    let path = entry?.path();
-                    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let names: Vec<String> = fs::read_dir(&group_dir)?
+                    .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+                    .collect();
+                for name in &names {
+                    let path = group_dir.join(name);
                     if let Some(stem) = name.strip_suffix(".idx") {
                         let Some(hour) = stem.split('-').next().and_then(|h| h.parse::<i64>().ok()) else { continue };
                         let block = group_dir.join(format!("{stem}.nxv"));
-                        if !block.exists() {
-                            let _ = fs::remove_file(&path);
-                            continue;
+                        match block.exists().then(|| read_idx(&path, block.clone())) {
+                            Some(Ok(sealed)) => group.sealed.entry(hour).or_default().push(sealed),
+                            other => {
+                                if let Some(Err(e)) = other {
+                                    eprintln!("header window: {} won't read ({e:#}); its hour is gone", path.display());
+                                }
+                                if writable {
+                                    let _ = fs::remove_file(&path);
+                                    let _ = fs::remove_file(&block);
+                                }
+                            }
                         }
-                        group.sealed.entry(hour).or_default().push(read_idx(&path, block)?);
                     } else if let Some(hour) = name.strip_suffix(".tail").and_then(|h| h.parse::<i64>().ok()) {
-                        let lines = repair_tail(&path)?;
+                        let lines = if writable { repair_tail(&path)? } else { read_tail(&path)?.len() };
                         group.open.insert(hour, Open { tail: path, lines, last: Instant::now() });
-                    } else if name.ends_with(".tmp") {
+                    } else if writable && name.ends_with(".tmp") {
+                        let _ = fs::remove_file(&path);
+                    } else if writable
+                        && let Some(stem) = name.strip_suffix(".nxv")
+                        && !names.iter().any(|n| n.strip_suffix(".idx") == Some(stem))
+                    {
+                        // a block whose index went first (an expiry or a seal cut short)
                         let _ = fs::remove_file(&path);
                     }
                 }
@@ -176,8 +202,14 @@ impl Window {
                 buf.extend_from_slice(&(l.len() as u32).to_le_bytes());
                 buf.extend_from_slice(l);
             }
-            // opened per batch: one file per group and hour stays open only as long as a write
-            fs::OpenOptions::new().create(true).append(true).open(&tail)?.write_all(&buf)?;
+            // opened per batch: one file per group and hour stays open only as long as a write. A write that fails
+            // part way is cut back off, soo what's appended later reads
+            let mut f = fs::OpenOptions::new().create(true).append(true).open(&tail)?;
+            let before = f.metadata()?.len();
+            if let Err(e) = f.write_all(&buf) {
+                let _ = f.set_len(before);
+                return Err(e.into());
+            }
             let open = g.open.entry(hour).or_insert_with(|| Open { tail, lines: 0, last: Instant::now() });
             open.lines += lines.len();
             open.last = Instant::now();
@@ -268,19 +300,23 @@ impl Window {
             }
             for (_, blocks) in g.sealed.range(first..=to) {
                 for s in blocks.iter().filter(|s| s.max >= from && s.min <= to && s.may_hold(hash)) {
-                    let bytes = AlignedBytes::from_slice(&fs::read(&s.path)?);
-                    let hot;
-                    let view = {
-                        let v = NxvBlockView::from_mmap_slice(&bytes)?;
-                        if v.is_cold() {
-                            hot = decompress_cold_block(v.data)?;
-                            NxvBlockView::from_mmap_slice(&hot)?
-                        } else {
-                            v
+                    let bytes = match fs::read(&s.path) {
+                        Ok(b) => AlignedBytes::from_slice(&b),
+                        Err(e) => {
+                            eprintln!("header window: {} won't read: {e}", s.path.display());
+                            continue;
                         }
                     };
-                    // one pass over the block in order: each row decoded once
-                    let mut cur = NxvRangeCursor::new_for_art_range(view, 0, u64::MAX)?;
+                    // a block cut short by a power cut is passed over (it goes with its hour)
+                    let Ok(view) = NxvBlockView::from_mmap_slice(&bytes) else {
+                        eprintln!("header window: {} won't read", s.path.display());
+                        continue;
+                    };
+                    // one pass over the block in order: each row decoded once (blocks here are never cold)
+                    let Ok(mut cur) = NxvRangeCursor::new_for_art_range(view, 0, u64::MAX) else {
+                        eprintln!("header window: {} won't read", s.path.display());
+                        continue;
+                    };
                     loop {
                         scratch.wire_buf.clear();
                         if !cur.format_next_row(&mut scratch) {
@@ -463,16 +499,20 @@ fn decode(dir: &Path) -> Option<String> {
 /// it, soo the window keeps those.
 pub static BACKFILL_FRONTIER_DAY: AtomicI64 = AtomicI64::new(0);
 
-/// The posting-time ranges the window keeps at `now`: the last `keep_hours` (live reading) and the days lockstep
-/// backfill reads around its frontier. With no frontier known, everything before the live hours is kept rather
-/// than dropped.
-pub fn kept_ranges(now: i64, keep_hours: i64) -> Vec<(i64, i64)> {
-    let day = BACKFILL_FRONTIER_DAY.load(Ordering::Relaxed);
-    if day <= 0 {
-        return vec![(i64::MIN, now + HOUR)];
+/// Posting-time ranges, seconds, both ends in.
+pub type Ranges = Vec<(i64, i64)>;
+
+/// The posting-time ranges the window takes lines in and keeps at `now`: the last `keep_hours` (live reading) and
+/// the days lockstep backfill reads around its frontier (`frontier_day`, 0 when not known). With no frontier known,
+/// only live lines are taken in, and nothing older is dropped: (record, keep).
+pub fn ranges(now: i64, keep_hours: i64, frontier_day: i64) -> (Ranges, Ranges) {
+    let live = (now - keep_hours * HOUR, now + HOUR);
+    if frontier_day <= 0 {
+        return (vec![live], vec![(i64::MIN, now + HOUR)]);
     }
     let lockstep = crate::chunks::LOCKSTEP_DAYS;
-    vec![(now - keep_hours * HOUR, now + HOUR), ((day - lockstep) * 86_400, (day + 1) * 86_400)]
+    let both = vec![live, ((frontier_day - lockstep) * 86_400, (frontier_day + 1) * 86_400)];
+    (both.clone(), both)
 }
 
 enum Msg {
@@ -550,12 +590,12 @@ fn now_secs() -> i64 {
 
 fn run(mut window: Window, rx: Receiver<Msg>, keep_hours: i64) {
     let mut last_sweep = Instant::now();
-    let mut keep = kept_ranges(now_secs(), keep_hours);
+    let (mut take, _) = ranges(now_secs(), keep_hours, BACKFILL_FRONTIER_DAY.load(Ordering::Relaxed));
     let (mut said_dropped, mut said_failed) = (0, 0);
     let mut frontier_saved = 0;
     loop {
         match rx.recv_timeout(Duration::from_secs(1)) {
-            Ok(Msg::Batch { server, group, lines }) => match window.record(&server, &group, &lines, &keep) {
+            Ok(Msg::Batch { server, group, lines }) => match window.record(&server, &group, &lines, &take) {
                 Ok(skipped) => {
                     RECORDED.fetch_add((lines.len() - skipped) as u64, Ordering::Relaxed);
                 }
@@ -575,9 +615,11 @@ fn run(mut window: Window, rx: Receiver<Msg>, keep_hours: i64) {
             continue;
         }
         last_sweep = Instant::now();
-        keep = kept_ranges(now_secs(), keep_hours);
         let day = BACKFILL_FRONTIER_DAY.load(Ordering::Relaxed);
-        if day != frontier_saved && fs::write(window.root.join(FRONTIER_FILE), day.to_string()).is_ok() {
+        let keep;
+        (take, keep) = ranges(now_secs(), keep_hours, day);
+        if day != frontier_saved && write_replace(&window.root.join(FRONTIER_FILE), day.to_string().as_bytes()).is_ok()
+        {
             frontier_saved = day;
         }
         // expired first: what's going needn't be sealed
@@ -600,7 +642,7 @@ fn run(mut window: Window, rx: Receiver<Msg>, keep_hours: i64) {
 /// `atlas --header-window [stats | POSTER FROM TO]`: reads the window, never a server. FROM and TO are unix seconds.
 pub fn run_cli(args: &[String]) -> i32 {
     let cfg = crate::config::header_window_config();
-    let window = match Window::open(&cfg.root()) {
+    let window = match Window::open_read_only(&cfg.root()) {
         Ok(w) => w,
         Err(e) => {
             println!("couldnt open {}: {e:#}", cfg.root().display());
@@ -724,15 +766,38 @@ mod tests {
     }
 
     #[test]
-    fn without_a_known_frontier_nothing_before_the_live_day_is_dropped() {
+    fn without_a_known_frontier_only_live_lines_come_in_and_nothing_older_goes() {
         let now = 20_400 * 86_400 + 5 * HOUR;
-        BACKFILL_FRONTIER_DAY.store(0, Ordering::Relaxed);
-        assert_eq!(kept_ranges(now, 24), vec![(i64::MIN, now + HOUR)]);
-        BACKFILL_FRONTIER_DAY.store(20_000, Ordering::Relaxed);
-        let ranges = kept_ranges(now, 24);
-        assert_eq!(ranges[0], (now - 24 * HOUR, now + HOUR));
-        assert_eq!(ranges[1], ((20_000 - crate::chunks::LOCKSTEP_DAYS) * 86_400, 20_001 * 86_400));
-        BACKFILL_FRONTIER_DAY.store(0, Ordering::Relaxed);
+        let live = (now - 24 * HOUR, now + HOUR);
+        assert_eq!(ranges(now, 24, 0), (vec![live], vec![(i64::MIN, now + HOUR)]));
+        let (take, keep) = ranges(now, 24, 20_000);
+        assert_eq!(take, keep);
+        assert_eq!(keep, vec![live, ((20_000 - crate::chunks::LOCKSTEP_DAYS) * 86_400, 20_001 * 86_400)]);
+    }
+
+    #[test]
+    fn a_torn_index_or_a_lone_block_is_cleared_and_the_window_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = Window::open(dir.path()).unwrap();
+        let date = "Sun, 08 Nov 2026 07:00:01 +0000";
+        let t = parse_rfc2822_to_epoch(date.as_bytes()).unwrap();
+        w.record("s", "g", &[line(1, "p@x", date, "a@x")], ALL).unwrap();
+        w.record("s", "h", &[line(1, "p@x", date, "b@x")], ALL).unwrap();
+        w.seal_idle(Duration::ZERO, Duration::from_secs(60)).unwrap();
+        drop(w);
+        let hour = t / HOUR * HOUR;
+        let g = crate::overview_archive::group_dir(dir.path(), "s", "g");
+        fs::write(g.join(format!("{hour}-0.idx")), b"HW").unwrap();
+        let h = crate::overview_archive::group_dir(dir.path(), "s", "h");
+        fs::remove_file(h.join(format!("{hour}-0.idx"))).unwrap();
+        // read only: nothing cleared
+        let r = Window::open_read_only(dir.path()).unwrap();
+        assert!(g.join(format!("{hour}-0.nxv")).exists());
+        assert!(r.by_poster(b"p@x", t - 5, t + 5).unwrap().is_empty());
+        let w = Window::open(dir.path()).unwrap();
+        assert!(!g.join(format!("{hour}-0.nxv")).exists(), "the torn pair cleared");
+        assert!(!h.join(format!("{hour}-0.nxv")).exists(), "the lone block cleared");
+        assert_eq!(w.stats(), (0, 0, 0));
     }
 
     #[test]
