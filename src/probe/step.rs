@@ -1608,11 +1608,8 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs more than one shard; store::SHARDS is 1"]
     fn lenders_in_every_shard_are_looked_at_newest_first() {
-        // only with more than one shard
-        if crate::store::SHARDS < 2 {
-            return;
-        }
         let conn = mux_shards();
         conn.execute("attach ':memory:' as s1", []).unwrap();
         conn.execute_batch("create table s1.releases (id integer primary key, group_name text not null)").unwrap();

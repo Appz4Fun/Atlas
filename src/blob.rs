@@ -103,7 +103,7 @@ pub fn inner(blob: &[u8]) -> &[u8] {
 fn shift(segs: &mut [Seg], base: i64) {
     if base != 0 {
         for s in segs.iter_mut().filter(|s| s.domain != 0) {
-            s.domain += base;
+            s.domain = s.domain.wrapping_add(base);
         }
     }
 }
@@ -118,7 +118,7 @@ pub fn remap_blob(blob: &[u8], base: i64, map: &std::collections::HashMap<i64, i
     }
     let mut segs = decode(blob)?;
     for s in segs.iter_mut().filter(|s| s.domain != 0) {
-        s.domain = map.get(&s.domain).copied().unwrap_or(s.domain + base);
+        s.domain = map.get(&s.domain).copied().unwrap_or(s.domain.wrapping_add(base));
     }
     Ok(encode(&segs))
 }

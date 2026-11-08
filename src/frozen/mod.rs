@@ -730,7 +730,9 @@ pub enum Domains {
     /// into a live shard: looked up by their text, and the ids in blobs changed to match (a blob in the sealed log is
     /// fetched and kept in the shard when they differ)
     Map,
-    /// into a scratch copy of its own shard: with the ids they had, blobs as they are
+    /// into a scratch copy: with the ids they had, blobs as they are. A payload's id that another payload gave another
+    /// suffix (shards folded into one, `merge_shards`) is looked up by text for the rows; the blobs still aren't
+    /// rewritten (no fetch from the sealed log), soo a scratch copy's blobs are only right where its ids were kept
     Keep,
 }
 
@@ -784,7 +786,7 @@ pub fn restore(conn: &Connection, schema: &str, p: &Payload, how: Domains) -> Re
             "insert",
             &["id"],
             &mut |c, v| match (c, v) {
-                ("blob", Value::Blob(b)) if !same_domains => {
+                ("blob", Value::Blob(b)) if how == Domains::Map && !same_domains => {
                     let mut segs =
                         crate::blob::decode(&b).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
                     for s in &mut segs {

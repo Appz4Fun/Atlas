@@ -2368,11 +2368,8 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs more than one shard; store::SHARDS is 1 (one shard is `a_corrupt_blob_stops_compacting_and_keeps_the_original`)"]
     fn a_failed_shard_doesnt_stop_the_others() {
-        // only with others: one shard is `a_corrupt_blob_stops_compacting_and_keeps_the_original`
-        if SHARDS < 2 {
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
         let main = dir.path().join("atlas.db");
         legacy_fixture(&main);

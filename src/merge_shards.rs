@@ -779,7 +779,7 @@ fn sync_dir(path: &Path) {
 /// A database file and everything beside it that belongs to it.
 fn remove_family(base: &Path) -> Result<()> {
     // the database last: a -wal left beside no file would be replayed into a new file of that name
-    for suffix in ["-wal", "-shm", "-journal", ".sealed-log-cursor", ".catalog-cursor", ""] {
+    for suffix in ["-wal", "-shm", "-journal", ".sealed-log-cursor", ".catalog-cursor", ".blob-bytes-cursor", ""] {
         let p = PathBuf::from(format!("{}{suffix}", base.display()));
         match std::fs::remove_file(&p) {
             Ok(()) => {}
@@ -819,16 +819,36 @@ pub fn refuse_if_merging(main: &Path) -> Result<()> {
 /// Set in `atlas.db` once `finish` has put the id counter in one-shard numbering.
 const COUNTER_DONE: &str = "merge_counter_done";
 
-/// Whether a merge started on `main` hasn't finished.
-pub fn in_progress(main: &Connection) -> bool {
-    crate::store::get_meta(main, MERGING).ok().flatten().is_some_and(|v| v != 0)
+/// Whether a merge started on `main` hasn't finished. An error when that can't be read: not taken as no.
+pub fn in_progress(main: &Connection) -> Result<bool> {
+    // a database with no `meta` yet (being set up) has had no merge
+    let has_meta: bool =
+        main.prepare("select 1 from main.sqlite_master where type = 'table' and name = 'meta'")?.exists([])?;
+    Ok(has_meta && crate::store::get_meta(main, MERGING)?.is_some_and(|v| v != 0))
 }
 
-/// After the last source: the triggers back, the id counter past every id handed out (live, frozen, a source's
-/// highest, and what the eight-shard numbering would hand out next), as one shard numbers them (`seq` is the id),
-/// and the merge marked finished. Safe to run again.
+/// Whether the target `target` is left as a merge leaves it before `finish`: its triggers parked. The target's own
+/// word on it, for when the marker in `atlas.db` was lost (a power cut between the two files' writes).
+pub fn needs_finish(target: &Path) -> Result<bool> {
+    if !target.exists() {
+        return Ok(false);
+    }
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(target, flags)?;
+    conn.busy_timeout(std::time::Duration::from_secs(30))?;
+    let has: bool =
+        conn.prepare("select 1 from sqlite_master where type = 'table' and name = 'merge_triggers'")?.exists([])?;
+    Ok(has && conn.prepare("select 1 from merge_triggers limit 1")?.exists([])?)
+}
+
+/// After the last source: the id counter past every id handed out (live, frozen, a source's highest, and once, what
+/// the eight-shard numbering would hand out next), as one shard numbers them (`seq` is the id); the full text index
+/// made again; the triggers back; the merge marked finished, once the target's changes are on disk. Safe to run
+/// again: each run raises the counter past what's there.
 pub fn finish(main: &Path, target: &Path) -> Result<()> {
     let conn = crate::db::open_at(target)?;
+    // on disk before the marker says the merge is finished
+    conn.execute_batch("pragma synchronous = full;")?;
     conn.execute_batch(SCHEMA)?;
     let mut highest: i64 = conn.query_row(
         "select max(coalesce((select max(id) from releases), 0), coalesce((select max(max_release) from merge_shards), 0))",
@@ -841,22 +861,27 @@ pub fn finish(main: &Path, target: &Path) -> Result<()> {
         highest = highest.max(f.query_row("select coalesce(max(id), 0) from frozen_releases", [], |r| r.get(0))?);
     }
     let main_conn = crate::db::open_at(main)?;
-    // the counter in one-shard numbering once, with a note that it is: a rerun doesn't take it for eight-shard again
-    if crate::store::get_meta(&main_conn, COUNTER_DONE)?.unwrap_or(0) == 0 {
+    main_conn.execute_batch("pragma synchronous = full;")?;
+    // the eight-shard counter counted sequences, each worth eight ids: taken into account once, with a note that it
+    // was, soo a rerun doesn't take the one-shard counter for eight-shard again
+    let converted = crate::store::get_meta(&main_conn, COUNTER_DONE)?.unwrap_or(0) != 0;
+    if !converted {
         let next = crate::store::get_meta(&main_conn, "next_seq")?.unwrap_or(0);
         highest = highest.max(next.saturating_mul(LEGACY_SHARDS as i64));
-        let tx = main_conn.unchecked_transaction()?;
-        crate::store::set_next_seq(&tx, highest + 1)?;
-        tx.execute("insert or replace into meta (key, value) values (?1, 1)", [COUNTER_DONE])?;
-        tx.commit()?;
     }
+    let tx = main_conn.unchecked_transaction()?;
+    crate::store::set_next_seq(&tx, highest + 1)?;
+    tx.execute("insert or replace into meta (key, value) values (?1, 1)", [COUNTER_DONE])?;
+    tx.commit()?;
     // the copies' names, which no trigger indexed (`KEPT_TRIGGERS`): the index made again from `releases`
     if conn.prepare("select 1 from main.merge_triggers limit 1")?.exists([])? {
         conn.execute("insert into releases_fts(releases_fts) values ('rebuild')", [])?;
     }
     restore_triggers(&conn)?;
     crate::sidecar::recount(&conn)?;
+    conn.query_row("pragma wal_checkpoint(truncate)", [], |_| Ok(()))?;
     main_conn.execute("insert or replace into meta (key, value) values (?1, 0)", [MERGING])?;
+    main_conn.query_row("pragma wal_checkpoint(truncate)", [], |_| Ok(()))?;
     Ok(())
 }
 
@@ -871,9 +896,34 @@ pub fn run(args: &[String]) -> i32 {
     let target = legacy_shard_path(&main, 0);
     let todo = sources(&main);
     if todo.is_empty() {
-        // the last source went but its run stopped before `finish`
-        let unfinished = crate::db::open_at(&main).map(|c| in_progress(&c)).unwrap_or(false);
-        if unfinished && apply {
+        // the last source went but its run stopped before `finish`: the marker says so, or the target does when the
+        // marker was lost with it
+        let marked = match crate::db::open_at(&main).map_err(anyhow::Error::from).and_then(|c| in_progress(&c)) {
+            Ok(m) => m,
+            Err(e) => {
+                println!("couldnt read {}: {e:#}", main.display());
+                return 1;
+            }
+        };
+        let left = match needs_finish(&target) {
+            Ok(n) => n,
+            Err(e) => {
+                println!("couldnt read {}: {e:#}", target.display());
+                return 1;
+            }
+        };
+        if marked || left {
+            if !apply {
+                println!("the merge's last step is still to do (its shards are gone): pass --apply to finish it");
+                return 0;
+            }
+            let _lock = match crate::compact::Lock::take_unchecked(&main) {
+                Ok(lock) => lock,
+                Err(e) => {
+                    println!("couldnt take the database lock: {e:#}");
+                    return 1;
+                }
+            };
             return match finish(&main, &target) {
                 Ok(()) => {
                     println!("finished the merge that stopped after its last shard");
@@ -1146,12 +1196,23 @@ mod tests {
         assert!(format!("{e:#}").contains("merge"), "{e:#}");
         assert!(crate::compact::try_hold_off_compaction(&main).is_err(), "nor any other writer");
         assert!(crate::compact::Lock::take(&main).is_err(), "nor purge, the walks or a compaction");
+        // the target itself says the last step is to do, marker or no marker
+        assert!(needs_finish(&target).unwrap());
+        m.execute("insert or replace into meta (key, value) values (?1, 0)", [MERGING]).unwrap();
+        assert!(!in_progress(&m).unwrap() && needs_finish(&target).unwrap(), "the marker lost, the target still knows");
         // the run stopped before finishing: finishing again is safe
         finish(&main, &target).unwrap();
+        assert!(!needs_finish(&target).unwrap(), "finished");
         let next = |m: &Connection| store::get_meta(m, "next_seq").unwrap().unwrap();
         let once = next(&m);
         finish(&main, &target).unwrap();
         assert_eq!(next(&m), once, "the counter converted once");
+        // an id handed out in between (eight-shard numbering, a split before the cutover): a rerun goes past it
+        let c = crate::db::open_at(&target).unwrap();
+        let high = once * 8 + 40;
+        c.execute("insert into releases (id, name, group_name) values (?1, 'Late', 'g')", [high]).unwrap();
+        finish(&main, &target).unwrap();
+        assert!(next(&m) > high, "{} past {high}", next(&m));
         assert!(crate::compact::try_hold_off_compaction(&main).unwrap().is_some());
         // past the merge guard (the eight-shard layout's own check of its files is the next PR's)
         if let Err(e) = crate::db::create_db_at(&main) {

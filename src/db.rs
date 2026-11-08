@@ -549,7 +549,7 @@ pub fn create_db_at(path: &Path) -> anyhow::Result<()> {
     }
     let conn = create_at(path)?;
     // shards half merged: only `atlas --merge-shards --apply` may go on with them
-    if crate::merge_shards::in_progress(&conn) {
+    if crate::merge_shards::in_progress(&conn)? {
         anyhow::bail!("a shard merge is in progress: run `atlas --merge-shards --apply` to finish it before indexing");
     }
     // the shards from before one shard: their releases would be out of sight, their ids handed out again

@@ -3154,7 +3154,7 @@ pub fn reset_shards_at(main: &Path, log: &dyn Fn(&str)) -> anyhow::Result<()> {
         }
     }
     let remove_db_family = |base: &Path| -> anyhow::Result<()> {
-        for suffix in ["", "-wal", "-shm", "-journal", ".sealed-log-cursor"] {
+        for suffix in ["-wal", "-shm", "-journal", ".sealed-log-cursor", ".catalog-cursor", ".blob-bytes-cursor", ""] {
             let p = PathBuf::from(format!("{}{suffix}", base.display()));
             match std::fs::remove_file(&p) {
                 Ok(()) => {}

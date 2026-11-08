@@ -2131,6 +2131,8 @@ pub(crate) struct SealedCache {
     max_decoded: usize,
     /// the last `contains` was past the budget: its false only means not known
     pub(crate) guessed: bool,
+    /// each domain's suffix, looked up once (a domain's suffix never changes)
+    suffixes: HashMap<i64, Option<String>>,
 }
 
 impl SealedCache {
@@ -2149,6 +2151,7 @@ impl SealedCache {
             decoded: 0,
             max_decoded,
             guessed: false,
+            suffixes: HashMap::new(),
         }
     }
 
@@ -2156,9 +2159,14 @@ impl SealedCache {
     pub(crate) fn contains(&mut self, conn: &Connection, file_id: i64, local: &[u8], domain: i64) -> Result<bool> {
         self.uses += 1;
         self.guessed = false;
-        let mut suffixes = HashMap::new();
-        let key =
-            seg_key(conn, &mut suffixes, &crate::blob::Seg { part: None, bytes: 0, domain, local: local.to_vec() })?;
+        if self.suffixes.len() > 100_000 {
+            self.suffixes.clear();
+        }
+        let key = seg_key(
+            conn,
+            &mut self.suffixes,
+            &crate::blob::Seg { part: None, bytes: 0, domain, local: local.to_vec() },
+        )?;
         if let Some((used, set)) = self.files.get_mut(&file_id) {
             self.by_use.remove(used);
             *used = self.uses;
@@ -2172,7 +2180,7 @@ impl SealedCache {
         let set: SegmentSet = sealed_segments(conn, file_id)?
             .unwrap_or_default()
             .iter()
-            .map(|s| seg_key(conn, &mut suffixes, s))
+            .map(|s| seg_key(conn, &mut self.suffixes, s))
             .collect::<Result<_>>()?;
         self.decoded += set.len();
         let found = set.contains(&key);
