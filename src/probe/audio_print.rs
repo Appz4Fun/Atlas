@@ -93,9 +93,9 @@ const SET_PRINT: &str =
     "insert or replace into release_audio_print (release_id, position, at_ms, items) values (?1, ?2, ?3, ?4)";
 const SET_ANCHOR: &str = "insert or ignore into release_audio_anchor (release_id, anchor) values (?1, ?2)";
 
-/// Kinds that say who posted or packed it, not what: one uploader's account, host, archive owner or clock zone ties
-/// together every film they post, soo sharing one doesn't make a print needless.
-const WHO_POSTED: [Kind; 4] = [Kind::Account, Kind::Host, Kind::Owner, Kind::Zone];
+/// Kinds that say who posted or packed it, not what: one uploader's account, host, posting session, archive owner or
+/// clock zone ties together every film they post, soo sharing one doesn't make a print needless.
+const WHO_POSTED: [Kind; 5] = [Kind::Account, Kind::Host, Kind::Owner, Kind::Zone, Kind::Session];
 
 // ---------------------------------------------------------------- finding the same sound
 

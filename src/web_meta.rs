@@ -72,6 +72,7 @@ fn lookup_of(i: &MetaInputs<'_>, l: &Looked) -> crate::keys::Lookup {
     crate::keys::Lookup {
         keys: crate::keys::Keys {
             volumes: shard.as_ref().and_then(|s| crate::keys::volume_key(s, i.release.id, i.probe)),
+            session: shard.as_ref().and_then(|s| crate::keys::session_key(s, i.release.id)),
             ..crate::keys::keys_of(i.probe, &timing, i.release.parts, l.salt)
         },
         par2_sets: shard
@@ -2254,6 +2255,11 @@ fn keys_panel(i: &MetaInputs<'_>, l: &Looked, compact: bool) -> Facts {
         "Chapter times key",
         media.and_then(crate::keys::chapters_text).map(|t| with_link(key16(t.as_bytes()), Kind::Chapters)),
     );
+    // the posting session: shown with its count only, the session itself is on the timing panel
+    let link = same_link(l, id, Kind::Session);
+    if !link.is_empty() {
+        f.add_html("Posting session", Some(format!("Same server session and day{link}")));
+    }
     // an encrypted set's volume sizes: how many releases share them, the sizes are on the PAR2 panel
     let link = same_link(l, id, Kind::Volumes);
     if !link.is_empty() {

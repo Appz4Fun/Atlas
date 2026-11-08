@@ -110,6 +110,10 @@ pub const RELEASE_KEYS: ShardTable = ShardTable {
             "release_keys_volumes",
             "create index if not exists release_keys_volumes on release_keys(volumes) where volumes is not null",
         ),
+        (
+            "release_keys_session",
+            "create index if not exists release_keys_session on release_keys(session) where session is not null",
+        ),
     ],
     release_key: Some("release_id"),
     // `video`: the first keyframe's key, from the probe's `keyframe_key`; `audio`: the first audio track's
@@ -117,6 +121,7 @@ pub const RELEASE_KEYS: ShardTable = ShardTable {
     // `mux`: SegmentUID and DateUTC; `encode`: the encoder's settings and the length; `thread`: the thread's root id
     // `subs`: the subtitle tracks' header keys; `fonts`: the attached fonts; `chapters`: the chapter start times
     // `volumes`: an encrypted set's volume size, count and last size (`volumes_text`)
+    // `session`: the Highwinds posting session (`session_text`)
     added: &[
         ("file_crc", "INTEGER"),
         ("body_crc", "INTEGER"),
@@ -129,13 +134,14 @@ pub const RELEASE_KEYS: ShardTable = ShardTable {
         ("fonts", "INTEGER"),
         ("chapters", "INTEGER"),
         ("volumes", "INTEGER"),
+        ("session", "INTEGER"),
     ],
 };
 
 const UPSERT: &str = "insert or replace into release_keys
     (release_id, account, host, layout, lines, file_crc, body_crc, video, audio, mux, encode, thread, subs, fonts,
-     chapters, volumes)
-    values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)";
+     chapters, volumes, session)
+    values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)";
 const DELETE: &str = "delete from release_keys where release_id = ?1";
 
 pub const KEYS_STEP: StepId = StepId(40);
@@ -183,10 +189,12 @@ pub enum Kind {
     Chapters,
     /// an encrypted archive set's volume size, count and last volume's size, from its PAR2 file list
     Volumes,
+    /// the same Highwinds posting session: server host, session key and day
+    Session,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 22] = [
+    pub const ALL: [Kind; 23] = [
         Kind::Account,
         Kind::Host,
         Kind::Layout,
@@ -209,6 +217,7 @@ impl Kind {
         Kind::Fonts,
         Kind::Chapters,
         Kind::Volumes,
+        Kind::Session,
     ];
 
     /// The word in `/ui/same?kind=`.
@@ -236,6 +245,7 @@ impl Kind {
             Kind::Fonts => "fonts",
             Kind::Chapters => "chapters",
             Kind::Volumes => "volumes",
+            Kind::Session => "session",
         }
     }
 
@@ -268,6 +278,7 @@ impl Kind {
             Kind::Fonts => "Same attached fonts",
             Kind::Chapters => "Same chapter times",
             Kind::Volumes => "Same encrypted volume sizes",
+            Kind::Session => "Same posting session",
         }
     }
 
@@ -338,6 +349,9 @@ impl Kind {
             Kind::Volumes => {
                 "An encrypted archive set of the same volume size, volume count and last volume size, to the byte, as its PAR2 set lists them: a password-protected repost of the same files packed the same way often has exactly these, whatever the password, names or posting. Only a hint: many sets of one disc size or one volume cap share a count, soo check the names."
             }
+            Kind::Session => {
+                "Every article posted through the same Highwinds-family server connection on the same day, going by the session key its Message-IDs carry: the same upload, its parts indexed as separate releases, or more posts its uploader sent in that sitting. Who posted, not what: one sitting can post many films."
+            }
         }
     }
 
@@ -358,6 +372,7 @@ impl Kind {
             Kind::Fonts => Some("fonts"),
             Kind::Chapters => Some("chapters"),
             Kind::Volumes => Some("volumes"),
+            Kind::Session => Some("session"),
             Kind::Par2 | Kind::MovieHash | Kind::FileCrc | Kind::InnerFile => None,
             Kind::ArchiveTwin | Kind::Owner | Kind::Zone | Kind::AudioPrint => None,
         }
@@ -392,6 +407,7 @@ pub struct Keys {
     pub fonts: Option<i64>,
     pub chapters: Option<i64>,
     pub volumes: Option<i64>,
+    pub session: Option<i64>,
 }
 
 impl Keys {
@@ -415,6 +431,7 @@ impl Keys {
             Kind::Fonts => self.fonts,
             Kind::Chapters => self.chapters,
             Kind::Volumes => self.volumes,
+            Kind::Session => self.session,
             _ => None,
         }
     }
@@ -779,6 +796,37 @@ pub fn volume_key(shard: &Connection, release_id: i64, probe: Option<&ProbeInfo>
     volumes_text(&files).map(|t| as_key(digest8(t.as_bytes())))
 }
 
+/// What the session key is taken over: the one Highwinds `(host, session key)` every timed file of a release came
+/// through, and the UTC day its first article was posted on by the server's clock, from `(host, key, first ms)` a
+/// file. None when no file has one, when the files came through more than one session, or with no clock: a short key
+/// is reused across days, soo the day keeps sessions apart.
+pub(crate) fn session_text(files: &[(Option<String>, Option<String>, Option<i64>)]) -> Option<String> {
+    let mut sessions: Vec<(&str, &str)> =
+        files.iter().filter_map(|(h, k, _)| Some((h.as_deref()?, k.as_deref()?))).collect();
+    sessions.sort_unstable();
+    sessions.dedup();
+    let [(host, key)] = sessions[..] else { return None };
+    let first = files.iter().filter(|(h, k, _)| h.is_some() && k.is_some()).filter_map(|(_, _, ms)| *ms).min()?;
+    let day = chrono::DateTime::from_timestamp_millis(first)?.format("%Y-%m-%d");
+    Some(format!("session:{}:{key}:{day}", host.to_ascii_lowercase()))
+}
+
+/// A release's session key, from its `file_timing` rows.
+pub fn session_key(shard: &Connection, release_id: i64) -> Option<i64> {
+    let mut q = shard
+        .prepare_cached(
+            "select t.hw_host, t.hw_key, t.clock_first from file_timing t join files f on f.id = t.file_id
+             where f.release_id = ?1 limit ?2",
+        )
+        .ok()?;
+    let files: Vec<(Option<String>, Option<String>, Option<i64>)> = q
+        .query_map(rusqlite::params![release_id, FILES_CAP], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .ok()?
+        .filter_map(Result::ok)
+        .collect();
+    session_text(&files).map(|t| as_key(digest8(t.as_bytes())))
+}
+
 /// The keys over what a release has: its probe and its `file_timing` rows.
 pub fn keys_of(
     probe: Option<&ProbeInfo>,
@@ -888,6 +936,7 @@ pub fn read_keys(shard: &Connection, release_id: i64, parts: Option<i64>, salt: 
         keys.file_crc = folded_files(shard, release_id).first().map(|f| f.key());
     }
     keys.volumes = volume_key(shard, release_id, probe.as_ref());
+    keys.session = session_key(shard, release_id);
     Ok(keys)
 }
 
@@ -1205,7 +1254,7 @@ fn stored(shard: &Connection, release_id: i64) -> rusqlite::Result<Option<Keys>>
     shard
         .prepare_cached(
             "select account, host, layout, lines, file_crc, body_crc, video, audio, mux, encode, thread, subs, fonts,
-             chapters, volumes from release_keys where release_id = ?1",
+             chapters, volumes, session from release_keys where release_id = ?1",
         )?
         .query_row([release_id], |r| {
             Ok(Keys {
@@ -1224,6 +1273,7 @@ fn stored(shard: &Connection, release_id: i64) -> rusqlite::Result<Option<Keys>>
                 fonts: r.get(12)?,
                 chapters: r.get(13)?,
                 volumes: r.get(14)?,
+                session: r.get(15)?,
             })
         })
         .optional()
@@ -1493,9 +1543,10 @@ impl Step for KeysStep {
     }
     /// Bit 1: the file and first-article keys, soo every release already keyed is keyed again: the file key comes
     /// from probes made long before it. Bit 2: the mux, encode and thread keys, and file CRCs folded from articles.
-    /// Bit 4: the subtitle header, font and chapter keys. Bit 8: the encrypted volume sizes key.
+    /// Bit 4: the subtitle header, font and chapter keys. Bit 8: the encrypted volume sizes key. Bit 16: the posting
+    /// session key.
     fn config_stamp(&self) -> u64 {
-        1 | 2 | 4 | 8
+        1 | 2 | 4 | 8 | 16
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let retry = |e: rusqlite::Error| StepError::Retry(e.to_string());
@@ -1527,6 +1578,7 @@ impl Step for KeysStep {
                     keys.fonts.into(),
                     keys.chapters.into(),
                     keys.volumes.into(),
+                    keys.session.into(),
                 ],
             )],
         };
@@ -1537,6 +1589,19 @@ impl Step for KeysStep {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_session_key_is_one_session_on_one_day() {
+        let f = |h: &str, k: &str, ms: i64| (Some(h.to_string()), Some(k.to_string()), Some(ms));
+        let day = 1_503_379_236_000;
+        assert_eq!(session_text(&[]), None);
+        assert_eq!(
+            session_text(&[f("fx09.am4", "JP7", day + 5), f("fx09.am4", "JP7", day), (None, None, Some(1))]).as_deref(),
+            Some("session:fx09.am4:JP7:2017-08-22")
+        );
+        assert_eq!(session_text(&[f("fx09.am4", "JP7", day), f("fx10.am4", "JP7", day)]), None, "two sessions");
+        assert_eq!(session_text(&[(Some("fx09.am4".into()), Some("JP7".into()), None)]), None, "no clock");
+    }
 
     #[test]
     fn the_volume_key_is_a_clean_v_cut() {
