@@ -294,6 +294,151 @@ impl<'a> NxvBlockView<'a> {
     }
 }
 
+/// One row's fields as a linker reads them, without writing the line out and parsing it again.
+#[derive(Debug, Clone, Copy)]
+pub struct RowFields<'c> {
+    pub art: u64,
+    /// the date as UTC seconds, and as the poster's wall clock (the zone it was written in added, then dropped)
+    pub utc: i64,
+    pub wall: i64,
+    pub bytes: Option<i64>,
+    pub lines: Option<i64>,
+    pub subject: &'c [u8],
+    pub author: &'c [u8],
+    /// with its angle brackets
+    pub msgid: &'c [u8],
+    /// the whole line of a row kept literal (the fields above are empty then: parse the line)
+    pub literal: Option<&'c [u8]>,
+}
+
+/// Every row of one hot block in order, as [`RowFields`]: each dictionary string decoded once per run of rows that
+/// share it, no date formatted, nothing allocated per row once warm.
+pub struct FieldCursor<'a> {
+    view: NxvBlockView<'a>,
+    h: HotSections<'a>,
+    dec: RowDecoder,
+    cache: RowCache,
+    subj: Vec<u8>,
+    msgid: Vec<u8>,
+    line: Vec<u8>,
+}
+
+impl<'a> FieldCursor<'a> {
+    pub fn new(view: NxvBlockView<'a>) -> Result<Self> {
+        let h = *view.hot()?;
+        let dec = RowDecoder::at_sub_block(&view, 0);
+        let mut cache = RowCache::default();
+        cache.bind(&view);
+        Ok(Self {
+            view,
+            h,
+            dec,
+            cache,
+            subj: Vec::with_capacity(256),
+            msgid: Vec::with_capacity(128),
+            line: Vec::with_capacity(512),
+        })
+    }
+
+    /// The next row's fields; None after the last.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next_row(&mut self) -> Option<RowFields<'_>> {
+        if self.dec.row >= self.view.row_count() {
+            return None;
+        }
+        let h = &self.h;
+        let d = self.dec.advance(&self.view, h);
+        let row = self.dec.row - 1;
+        let c = &mut self.cache;
+        if d.literal {
+            self.line.clear();
+            h.dict_entry_hinted(
+                DICT_LITERAL,
+                h.subj_tpl.at(row) as u32,
+                &mut c.pool_hints[DICT_LITERAL],
+                &mut self.line,
+            );
+            return Some(RowFields {
+                art: d.art,
+                utc: 0,
+                wall: 0,
+                bytes: None,
+                lines: None,
+                subject: &[],
+                author: &[],
+                msgid: &[],
+                literal: Some(&self.line),
+            });
+        }
+        let hints = &mut c.pool_hints;
+        refresh(
+            h,
+            DICT_AUTHOR,
+            h.author.at(row) as u32,
+            &mut c.cached_author_id,
+            &mut c.cached_author,
+            &mut hints[DICT_AUTHOR],
+        );
+        refresh(
+            h,
+            DICT_DOMAIN,
+            h.domain.at(row) as u32,
+            &mut c.cached_domain_id,
+            &mut c.cached_domain,
+            &mut hints[DICT_DOMAIN],
+        );
+        refresh(
+            h,
+            DICT_PFX,
+            h.pfx.at(row) as u32,
+            &mut c.cached_msgid_pfx_id,
+            &mut c.cached_msgid_pfx,
+            &mut hints[DICT_PFX],
+        );
+        let tail = h.tail.get(d.tail.0..d.tail.1).unwrap_or(&[]);
+        self.msgid.clear();
+        self.msgid.push(b'<');
+        self.msgid.extend_from_slice(&c.cached_msgid_pfx);
+        unpack_msgid_tail_into(tail, &mut self.msgid);
+        self.msgid.push(b'@');
+        self.msgid.extend_from_slice(&c.cached_domain);
+        self.msgid.push(b'>');
+        self.subj.clear();
+        if d.style & STYLE_SUBJ_IS_LOCAL != 0 {
+            self.subj.extend_from_slice(&c.cached_msgid_pfx);
+            unpack_msgid_tail_into(tail, &mut self.subj);
+        } else if let Some((s, e)) = d.subj {
+            unpack_msgid_tail_into(h.tail.get(s..e).unwrap_or(&[]), &mut self.subj);
+        } else {
+            refresh(
+                h,
+                DICT_SUBJ,
+                h.subj_tpl.at(row) as u32,
+                &mut c.cached_subj_tpl_id,
+                &mut c.cached_subj_tpl,
+                &mut hints[DICT_SUBJ],
+            );
+            crate::subject_codec::render_subject(
+                &c.cached_subj_tpl,
+                &SubjectNums { vals: d.nums, pad: PadMask(h.pad.at(row)) },
+                &mut self.subj,
+            );
+        }
+        let off = style_offset_secs(d.style & !STYLE_FREE_BITS);
+        Some(RowFields {
+            art: d.art,
+            utc: d.ts,
+            wall: d.ts.wrapping_add(off),
+            bytes: (d.style & STYLE_NO_BYTES == 0).then_some(d.bytes),
+            lines: (d.style & STYLE_NO_LINES == 0).then_some(d.lines),
+            subject: &self.subj,
+            author: &c.cached_author,
+            msgid: &self.msgid,
+            literal: None,
+        })
+    }
+}
+
 /// Rows numbered `min_art..=max_art` of one hot block, in order.
 pub struct NxvRangeCursor<'a> {
     view: NxvBlockView<'a>,
