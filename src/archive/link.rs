@@ -154,11 +154,11 @@ const MIN_LINKED: u64 = 1 << 20;
 const MIN_SIZE_ONLY: u64 = 64 << 20;
 /// How far apart, in ids of this shard, an upload's rows can be: they're read from one run of articles, but other
 /// groups' saves come in between, and an upload cut across groups lands in each group's own run.
-const ID_WINDOW: i64 = 2_000_000;
+pub(super) const ID_WINDOW: i64 = 2_000_000;
 
 /// The ids `saves` saves either way of `id`: ids below `cutover` were handed out eight to a save (eight shards), ids
 /// from it on one to a save (`merge_shards::one_shard_from`).
-fn id_window(id: i64, cutover: i64, saves: i64) -> (i64, i64) {
+pub(super) fn id_window(id: i64, cutover: i64, saves: i64) -> (i64, i64) {
     let per = crate::merge_shards::LEGACY_SHARDS as i64;
     let low = if id >= cutover {
         let dense = (id - cutover).min(saves);

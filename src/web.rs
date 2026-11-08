@@ -4146,6 +4146,9 @@ fn picture_state(
         return PictureState::Shown;
     }
     match requests.iter().filter(|q| q.file == name).max_by_key(|q| q.requested_at) {
+        Some(q) if q.done_at.is_none() && q.passed_over => {
+            PictureState::Failed("this release isn't read for pictures".to_string())
+        }
         Some(q) if q.done_at.is_none() => PictureState::Queued(
             crate::web_pending::step_eta(q.release_id, "images").unwrap_or_else(|| "soon".to_string()),
         ),
@@ -5821,6 +5824,7 @@ mod tests {
             requested_at: 1,
             done_at: done,
             outcome: outcome.map(str::to_string),
+            passed_over: false,
         };
         assert_eq!(picture_state("a.jpg", &[], &[]), PictureState::Offer);
         assert_eq!(
@@ -5833,6 +5837,8 @@ mod tests {
             "its file went from the folder"
         );
         assert!(matches!(picture_state("a.jpg", &[], &[req(None, None)]), PictureState::Queued(_)));
+        let passed = crate::images::step::Request { passed_over: true, ..req(None, None) };
+        assert!(matches!(picture_state("a.jpg", &[], &[passed]), PictureState::Failed(_)), "no run will answer it");
     }
 
     #[test]

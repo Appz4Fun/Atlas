@@ -24,7 +24,7 @@ use rusqlite::{OptionalExtension, params};
 use crate::postprocess::step::{BodyRequest, Got, Outcome, StepCtx, StepError, StepWrite, mask};
 use crate::store::{FileInfo, SegmentPick};
 
-use super::link::{BESIDE_SECS, RESUME_SECS, SET_BESIDE, beside_window, retry};
+use super::link::{BESIDE_SECS, ID_WINDOW, RESUME_SECS, SET_BESIDE, beside_window, id_window, retry};
 
 /// How far apart an NFO posted on its own and its release can say they were posted: it's often posted once the upload
 /// is up, which for a big one is hours after its first file.
@@ -327,7 +327,9 @@ fn post_posters(
 
 /// A row of one small picture, by a name posting tools give one, whose counter is the release's `/total` at a slot its
 /// files don't hold, posted within `BESIDE_SECS` of it by one of its posts' posters (or one sharing their prefix),
-/// that nothing else has taken. Nearest in time first.
+/// that nothing else has taken. Nearest in time first. Looked for by poster, not by name: every upload's thumbnail
+/// is named alike, but a poster's rows (or those of a prefix a tool makes up per upload) are few, and the poster
+/// index holds the id, which bounds them to the ids near this release's without reading a row.
 fn thumbnail_beside(
     conn: &rusqlite::Connection,
     me: i64,
@@ -337,10 +339,61 @@ fn thumbnail_beside(
     posted: &str,
 ) -> Result<Option<i64>, StepError> {
     let Some((from, to)) = beside_window(posted, BESIDE_SECS) else { return Ok(None) };
+    let cutover = crate::merge_shards::one_shard_from(conn).map_err(|e| StepError::Retry(format!("{e:#}")))?;
+    let (low, high) = id_window(me, cutover, ID_WINDOW);
+    let by_poster = conn
+        .query_row("select 1 from sqlite_master where type = 'index' and name = 'idx_release_poster'", [], |_| Ok(()))
+        .is_ok();
+    let mut found: Vec<(i64, String, Option<String>, Option<f64>)> = Vec::new();
+    let mut look = |sql: &str, key: &str| -> Result<(), StepError> {
+        let mut stmt = conn.prepare_cached(sql).map_err(retry)?;
+        let rows = stmt
+            .query_map(params![key, low, high, me, posted, from, to], |r| {
+                Ok((r.get(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default(), r.get(2)?, r.get(3)?))
+            })
+            .map_err(retry)?;
+        for row in rows {
+            found.push(row.map_err(retry)?);
+        }
+        Ok(())
+    };
+    const COLUMNS: &str =
+        "select r.id, r.name, r.poster, abs(julianday(r.posted_date) - julianday(?5)) from releases r";
+    const NEAR: &str = "r.id between ?2 and ?3 and r.id != ?4 and +r.posted_date between ?6 and ?7";
+    if by_poster {
+        for poster in posters {
+            look(&format!("{COLUMNS} indexed by idx_release_poster where r.poster = ?1 and {NEAR}"), poster)?;
+            // a bare address: the rows sharing its local part's prefix, as a tool makes one up per upload
+            if let Some(prefix) = poster
+                .split('@')
+                .next()
+                .filter(|local| local.len() >= POSTER_PREFIX + 2 && !local.contains(['<', ' ']) && poster.contains('@'))
+                .and_then(|local| local.get(..POSTER_PREFIX))
+            {
+                look(
+                    &format!(
+                        "{COLUMNS} indexed by idx_release_poster
+                         where r.poster >= ?1 and r.poster < ?1 || char(127) and {NEAR}"
+                    ),
+                    prefix,
+                )?;
+            }
+        }
+    } else {
+        // a shard without the poster index (`--search-indexes`): by name, its index's ids bounding the rows read
+        for name in PICTURE_NAMES {
+            let mut chars = name.chars();
+            let upper = chars.next().map(|c| c.to_ascii_uppercase().to_string() + chars.as_str()).unwrap_or_default();
+            for name in [*name, upper.as_str()] {
+                look(&format!("{COLUMNS} where r.name >= ?1 and r.name < ?1 || char(127) and {NEAR}"), name)?;
+            }
+        }
+    }
+    let mut seen: HashSet<i64> = HashSet::new();
     let mut best: Option<(f64, i64)> = None;
-    for name in picture_names() {
-        for (id, row_name, poster) in named_rows(conn, me, &name, (&from, &to, posted))? {
-            if row_name != name && !row_name.strip_prefix(name.as_str()).is_some_and(|rest| rest.starts_with(" [")) {
+    {
+        for (id, row_name, poster, apart) in found {
+            if !seen.insert(id) || !picture_named(&row_name) {
                 continue;
             }
             if !poster.as_deref().is_some_and(|p| posters.iter().any(|mine| posters_akin(mine, p))) {
@@ -356,14 +409,7 @@ fn thumbnail_beside(
             if lone_file(conn, id, fits)?.is_none() {
                 continue;
             }
-            let apart: f64 = conn
-                .query_row(
-                    "select abs(julianday(posted_date) - julianday(?2)) from releases where id = ?1",
-                    params![id, posted],
-                    |r| r.get::<_, Option<f64>>(0),
-                )
-                .map_err(retry)?
-                .unwrap_or(f64::MAX);
+            let apart = apart.unwrap_or(f64::MAX);
             if best.is_none_or(|(b, _)| apart < b) {
                 best = Some((apart, id));
             }
@@ -372,17 +418,15 @@ fn thumbnail_beside(
     Ok(best.map(|(_, id)| id))
 }
 
-/// `PICTURE_NAMES`, each as given and with its first letter upper case: the name's index is case sensitive.
-fn picture_names() -> Vec<String> {
-    let mut names = Vec::with_capacity(PICTURE_NAMES.len() * 2);
-    for name in PICTURE_NAMES {
-        names.push((*name).to_string());
-        let mut chars = name.chars();
-        if let Some(first) = chars.next().filter(char::is_ascii_lowercase) {
-            names.push(first.to_ascii_uppercase().to_string() + chars.as_str());
-        }
-    }
-    names
+/// Whether a row's name is one of `PICTURE_NAMES`, in any case, or one with the part of a hash a name another row
+/// has already gets (`thumbnail.jpg [01234567]`).
+fn picture_named(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let bare = match lower.split_once(" [") {
+        Some((head, rest)) if rest.ends_with(']') && rest[..rest.len() - 1].bytes().all(|b| b.is_ascii_digit()) => head,
+        _ => lower.as_str(),
+    };
+    PICTURE_NAMES.contains(&bare)
 }
 
 /// A subject's file counter `[k/N]`.
@@ -445,7 +489,8 @@ mod tests {
         assert_eq!(strip_nfo("Some.Film-GRP.nfo"), Some("Some.Film-GRP"));
         assert_eq!(strip_nfo(".nfo"), None);
         assert!(is_side_file("thumbnail.JPG") && is_side_file("a.vol01+02.par2") && !is_side_file("a.mkv"));
-        assert!(picture_names().contains(&"Thumbnail.jpg".to_string()));
+        assert!(picture_named("Thumbnail.jpg") && picture_named("thumbnail.jpg [01234567]"));
+        assert!(!picture_named("thumbnail.jpg [x]") && !picture_named("screen01.jpg"));
     }
 
     fn shard() -> (tempfile::TempDir, rusqlite::Connection) {
@@ -542,5 +587,22 @@ mod tests {
         let taken: HashSet<i64> = [7, 1, 8].into();
         assert_eq!(thumbnail_beside(&conn, 1, 8, &taken, &posters, posted).unwrap(), None, "its slot is held");
         assert_eq!(thumbnail_beside(&conn, 1, 9, &slots, &posters, posted).unwrap(), None, "another count");
+        // and the same by poster, on a shard with the poster index
+        conn.execute_batch("create index idx_release_poster on releases(poster)").unwrap();
+        assert_eq!(thumbnail_beside(&conn, 1, 8, &slots, &posters, posted).unwrap(), Some(2));
+        assert_eq!(thumbnail_beside(&conn, 1, 8, &taken, &posters, posted).unwrap(), None, "its slot is held");
+        assert_eq!(thumbnail_beside(&conn, 1, 9, &slots, &posters, posted).unwrap(), None, "another count");
+        let plan: String = conn
+            .prepare(
+                "explain query plan select r.id from releases r indexed by idx_release_poster
+                 where r.poster >= 'ZbivKJ38' and r.poster < 'ZbivKJ38' || char(127) and r.id between 0 and 9",
+            )
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(plan.contains("idx_release_poster (poster>? AND poster<?)"), "{plan}");
     }
 }

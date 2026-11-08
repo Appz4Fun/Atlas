@@ -338,6 +338,9 @@ pub struct Request {
     pub requested_at: i64,
     pub done_at: Option<i64>,
     pub outcome: Option<String>,
+    /// unanswered, but the pictures step is done with its release all the same: the release was passed over (a
+    /// release turned down for reading, or one of no size), and no run will answer it
+    pub passed_over: bool,
 }
 
 /// The pictures asked for of the releases `ids`, on a connection with their shards attached.
@@ -346,17 +349,22 @@ pub fn requests(conn: &rusqlite::Connection, ids: &[i64]) -> Vec<Request> {
     for &id in ids {
         let s = store::shard_of_id(id);
         let sql = format!(
-            "select file, requested_at, done_at, outcome from s{s}.picture_requests where release_id = ?1 order by file"
+            "select q.file, q.requested_at, q.done_at, q.outcome,
+                    coalesce((p.done | p.failed) & ?2 != 0 and coalesce(p.net_left, 0) & ?2 = 0, 0)
+             from s{s}.picture_requests q left join s{s}.pp_state p on p.release_id = q.release_id
+             where q.release_id = ?1 order by q.file"
         );
+        let bit = crate::postprocess::step::mask(IMAGES_STEP);
         // a shard without the table yet has been asked nothing
         let Ok(mut q) = conn.prepare(&sql) else { continue };
-        let rows = q.query_map([id], |r| {
+        let rows = q.query_map(rusqlite::params![id, bit], |r| {
             Ok(Request {
                 release_id: id,
                 file: r.get(0)?,
                 requested_at: r.get(1)?,
                 done_at: r.get(2)?,
                 outcome: r.get(3)?,
+                passed_over: r.get(4)?,
             })
         });
         out.extend(rows.into_iter().flatten().filter_map(Result::ok));
@@ -538,6 +546,13 @@ impl Step for ImagesStep {
     fn applies(&self, r: &crate::postprocess::step::ReleaseInfo) -> bool {
         r.size > 0
     }
+    // a picture asked for on the page is read whatever the release is: a post of pictures alone, the case the page's
+    // Fetch is most for, is outside the body gate
+    fn asked_for(&self, conn: &rusqlite::Connection, release_id: i64) -> bool {
+        conn.prepare_cached("select exists (select 1 from picture_requests where release_id = ?1 and done_at is null)")
+            .and_then(|mut q| q.query_row([release_id], |r| r.get(0)))
+            .unwrap_or(false)
+    }
     // a picture can come after the rest of the post; one linked into it later asks for a run itself (`archive::link`)
     fn reruns(&self) -> Reruns {
         Reruns { on_rename: false, on_growth: true }
@@ -551,9 +566,13 @@ impl Step for ImagesStep {
         // of an upload it leads (`archive::link`)
         files.extend(linked_files(ctx.conn(), ctx.release().id).map_err(|e| StepError::Retry(e.to_string()))?);
         let release_id = ctx.release().id;
+        // what's still owed an answer, and what was shown (kept again from the folder); one that came to nothing waits
+        // for "Try again" on the page, which clears its answer
         let asked: Vec<String> = ctx
             .conn()
-            .prepare_cached("select file from picture_requests where release_id = ?1")
+            .prepare_cached(
+                "select file from picture_requests where release_id = ?1 and (done_at is null or outcome = 'shown')",
+            )
             .and_then(|mut q| q.query_map([release_id], |r| r.get(0))?.collect())
             .map_err(|e| StepError::Retry(e.to_string()))?;
         let all = pictures(&files);
@@ -611,7 +630,8 @@ impl Step for ImagesStep {
             true
         };
         let mut unfinished = false;
-        let max_bytes = (limits.picture_max_parts.max(1) as usize).saturating_mul(1 << 20);
+        // a picture read without asking may be as big as `MAX_PARTS` articles, whatever `picture_max_parts` says
+        let max_bytes = (limits.picture_max_parts.max(MAX_PARTS as i64) as usize).saturating_mul(1 << 20);
         for (file, was_asked) in wanted {
             // read on an earlier run and still in the folder: not fetched again
             let cached =
@@ -696,6 +716,22 @@ mod tests {
         assert_eq!(names, ["00-thumbnail.jpg", "a-shot.jpg", "b-shot.png"], "each name once");
         let auto = auto_picked(&all, |_| 500_000, LIMITS);
         assert_eq!(auto.len(), 3);
+    }
+
+    #[test]
+    fn an_open_request_lets_the_step_past_the_body_gate_and_an_answered_one_doesnt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("atlas.s0.db");
+        crate::store::create_shard(&path).unwrap();
+        let conn = crate::db::open_shard(&path).unwrap();
+        crate::postprocess::schema::migrate(&conn).unwrap();
+        let step = ImagesStep::default();
+        assert!(!step.asked_for(&conn, 7));
+        conn.execute("insert into picture_requests (release_id, file, requested_at) values (7, 'a.jpg', 1)", [])
+            .unwrap();
+        assert!(step.asked_for(&conn, 7));
+        conn.execute("update picture_requests set done_at = 2, outcome = 'unreadable'", []).unwrap();
+        assert!(!step.asked_for(&conn, 7), "answered: nothing owed");
     }
 
     #[test]
