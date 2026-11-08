@@ -72,7 +72,10 @@ create table if not exists headers (
     added      INTEGER NOT NULL,
     done       INTEGER NOT NULL DEFAULT 0
 ) without rowid;
-create index if not exists headers_poster on headers(poster);
+-- a poster's articles in a file already: what the linker reads of them (`pass_with`). Partial, soo a header kept
+-- (done = 0) goes into one tree fewer: the parse path writes every one of them
+create index if not exists headers_done_by on headers(poster, grp, number, posted) where done = 1;
+drop index if exists headers_poster;
 -- covering, soo a pass's read of what waits reads the index alone (`waiting_placed`)
 create index if not exists headers_waiting_by on headers(poster, posted, added, grp) where done = 0;
 drop index if exists headers_waiting;
@@ -750,9 +753,13 @@ impl Store {
         for (poster, place, _) in &finished {
             let Some(place) = place else { continue };
             let Some(j) = saved.iter().position(|u| u.release == place.release) else { continue };
-            let mut stmt = self
-                .conn
-                .prepare_cached("select grp, min(posted), max(posted) from headers where poster = ?1 group by grp")?;
+            let mut stmt = self.conn.prepare_cached(
+                "select grp, min(posted), max(posted) from (
+                         select grp, posted from headers where poster = ?1 and done = 0
+                         union all
+                         select grp, posted from headers where poster = ?1 and done = 1)
+                     group by grp",
+            )?;
             for row in
                 stmt.query_map([poster], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))?
             {
