@@ -1073,6 +1073,14 @@ async fn run_servers(
             crate::repair::run(sched.ctx.clone(), settings, db.clone(), move || s.stopping(), scans_stop.clone()),
         ));
     }
+    // parts no listing showed, asked for on every server by the ids their files' other parts name (see `inferred`)
+    {
+        let s = sched.clone();
+        tasks.spawn(named!(
+            "inferred parts".into(),
+            crate::inferred::run(sched.ctx.clone(), db.clone(), move || s.stopping())
+        ));
+    }
     // once stopping, the writers do no freezing: their queues of saves drain as fast as they did before it
     let s = sched.clone();
     let since = stopping_since.clone();

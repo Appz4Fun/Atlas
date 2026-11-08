@@ -28,6 +28,7 @@ pub mod gemini;
 pub mod gf2;
 pub mod groups_menu;
 pub mod indexer;
+pub mod inferred;
 pub mod junk;
 pub mod keys;
 pub mod media;

@@ -2362,6 +2362,17 @@ async fn save_slice(
     saved
 }
 
+/// Headers found outside a listing (`inferred`), saved as a slice of them is: parsed, joined to their files, counted.
+pub(crate) async fn save_found(
+    pool: &Arc<Pool>,
+    db: &Db,
+    group: &str,
+    headers: Vec<Overview>,
+    unsaved: crate::nntp::Unsaved,
+) -> Result<Progress> {
+    save_slice(pool, db, group, headers, unsaved).await
+}
+
 async fn parse_and_save(
     pool: &Arc<Pool>,
     db: &Db,
