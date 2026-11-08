@@ -553,6 +553,8 @@ pub struct SpotsConfig {
     pub comment_days: u32,
     /// comments whose text is read in one pass at most; the rest wait for the next
     pub comments_per_pass: usize,
+    /// the Spotnet blacklist of spotters, read once a day (`spotnet::blacklist`); empty for none
+    pub blacklist_url: String,
 }
 
 impl Default for SpotsConfig {
@@ -566,6 +568,7 @@ impl Default for SpotsConfig {
             comments: true,
             comment_days: 60,
             comments_per_pass: 2_000,
+            blacklist_url: crate::spotnet::blacklist::DEFAULT_URL.to_string(),
         }
     }
 }
@@ -598,6 +601,9 @@ impl SpotsConfig {
         }
         if let Some(n) = int("comments_per_pass", 1, 100_000) {
             c.comments_per_pass = n as usize;
+        }
+        if let Some(url) = v.get("blacklist_url").and_then(|u| u.as_str()) {
+            c.blacklist_url = url.trim().to_string();
         }
         c
     }
@@ -1683,7 +1689,7 @@ mod tests {
         assert_eq!(Config::from_value(&json!({})).spots, SpotsConfig::default());
         let c = Config::from_value(
             &json!({"spots": {"enabled": false, "poll_minutes": 0, "first_articles": 500, "per_pass": 20, "concurrency": 99,
-                "comments": false, "comment_days": 0, "comments_per_pass": 50}}),
+                "comments": false, "comment_days": 0, "comments_per_pass": 50, "blacklist_url": " "}}),
         )
         .spots;
         assert_eq!(
@@ -1697,6 +1703,7 @@ mod tests {
                 comments: false,
                 comment_days: 1,
                 comments_per_pass: 50,
+                blacklist_url: String::new(),
             }
         );
         assert_eq!(Config::from_value(&json!({"spots": "no"})).spots, SpotsConfig::default());
