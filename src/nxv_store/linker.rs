@@ -48,6 +48,10 @@ const MARGIN: i64 = 2 * HOUR;
 const ZONE: i64 = 14 * HOUR;
 /// how long after an hour ends it's taken as read when live
 const LIVE_WAIT: i64 = 2 * HOUR + SETTLE_SECS;
+/// How long after an upload's last article a later file by the same poster still joins it. Uploads finish within about
+/// two hours; past this a poster posting again under the same name starts a new upload (its release named apart,
+/// `second_upload_key`). Stragglers posted much later join by file name and size, not by poster.
+pub const JOIN_GAP: i64 = 3 * HOUR;
 /// how long a file's place and an upload's seed are kept: an upload outlasts the window by a week, the archive step
 /// may still be taking its rounds (as `xref` keeps `linked` and `uploads`)
 const LINKS_LIFE: i64 = 7 * KEEP_SECS + KEEP_SECS;
@@ -388,6 +392,10 @@ pub struct PassStats {
     pub files: u64,
     pub uploads: u64,
     pub late_files: u64,
+    /// late rows of hours not linked yet, left to those hours' passes
+    pub late_unready: u64,
+    /// posters posting again past `JOIN_GAP` under a name already placed: a new upload each
+    pub posted_again: u64,
     pub read_secs: f64,
     pub secs: f64,
 }
@@ -565,6 +573,12 @@ impl Linker {
                             if !late && (wall < lo || wall > hi) {
                                 continue;
                             }
+                            // a late block's rows of an hour not linked yet are left to that hour's own pass, which
+                            // reads every block overlapping it, counted or not
+                            if late && !(state.linked.contains(&hour_of(wall)) || span_set.contains(&hour_of(wall))) {
+                                stats.late_unready += 1;
+                                continue;
+                            }
                             if !seen_ids.insert(nntp_xover_engine::msgid_index::msgid_hash(msgid)) {
                                 stats.repeats += 1;
                                 continue;
@@ -626,11 +640,16 @@ impl Linker {
         let mut grown: BTreeSet<usize> = BTreeSet::new();
         let mut fresh: Vec<FileSum> = Vec::new();
         let mut fresh_rows: Vec<Vec<usize>> = Vec::new();
+        // per fresh file: a poster's later upload, named apart from its first
+        let mut again_files: Vec<bool> = Vec::new();
         for (pid, rows) in by_poster.iter().enumerate() {
             if rows.is_empty() {
                 continue;
             }
             let poster = &posters[pid];
+            let mut rows: &Vec<usize> = rows;
+            let mut new_rows: Vec<usize> = Vec::new();
+            let mut again = false;
             if let Some(pr) = links.places.get(poster) {
                 // a file already placed: its new articles (late, or of the hours linked now) are more of its parts
                 let new: Vec<usize> =
@@ -642,6 +661,20 @@ impl Linker {
                     // its first articles left the window long ago: one read again couldnt be told from a new one
                     continue;
                 }
+                // posted well after its upload ended: the poster uploading again under the same name, a new upload of
+                // its own made of the new articles only
+                let upload_last = links.uploads.get(&pr.place.release).map(|u| u.seed.last);
+                let first_new = new.iter().map(|&i| arts[i].posted).min().unwrap_or(i64::MAX);
+                if upload_last.is_none_or(|last| first_new > last + JOIN_GAP) {
+                    stats.posted_again += 1;
+                    new_rows = new;
+                    rows = &new_rows;
+                    again = true;
+                }
+            }
+            if let (Some(pr), false) = (links.places.get(poster), again) {
+                let new: Vec<usize> =
+                    rows.iter().copied().filter(|&i| arts[i].late || new_hour(arts[i].posted)).collect();
                 stats.late_files += 1;
                 let mut file_rows = to_rows(&arts, &new, &msgid_of, now);
                 for r in &mut file_rows {
@@ -686,6 +719,7 @@ impl Linker {
             }
             fresh.push(f);
             fresh_rows.push(rows.clone());
+            again_files.push(again);
         }
         stats.files = fresh.len() as u64;
         let seeds: Vec<Seed> = saved.iter().map(|(_, u)| u.seed.clone()).collect();
@@ -735,7 +769,10 @@ impl Linker {
                 None => {
                     let home = crate::xref::home_group(&by_group);
                     let group = group_names.get(&home).cloned().unwrap_or_default();
-                    (crate::xref::upload_name(&fresh[files[0]].poster), group, 0, 0, 0)
+                    let f0 = &fresh[files[0]];
+                    let key =
+                        if again_files[files[0]] { second_upload_key(&f0.poster, f0.first) } else { f0.poster.clone() };
+                    (crate::xref::upload_name(&key), group, 0, 0, 0)
                 }
             };
             let count = before + files.len() as i64;
@@ -793,6 +830,12 @@ impl Linker {
         self.state = found.state;
         Ok(())
     }
+}
+
+/// The name key of a poster's later upload (posted again past `JOIN_GAP` under the same name): the poster and the hour
+/// its first article went up, soo the release doesn't fold into the first one's.
+fn second_upload_key(poster: &str, first: i64) -> String {
+    format!("{poster}\0{}", hour_of(first))
 }
 
 /// A file's articles as the rows `xref::add_file` takes: in group, number and message-id order, each group's first
@@ -1158,6 +1201,42 @@ mod tests {
         let lk2 = Linker::open_in(&state, now + 7200).unwrap();
         assert_eq!(lk2.state, lk.state);
         assert!(lk2.links.lock().unwrap().places.contains_key("aa001@x.y"));
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn a_poster_posting_again_hours_later_is_a_new_upload_not_more_parts() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = Store::open(cfg(dir.path()), keep_all()).unwrap();
+        let rows = upload("bb", T0 + 600, 3, 4, 1);
+        record(&store, &rows, 1000);
+        let now = T0 + 6 * 3600;
+        let mut lk = Linker::open_in(&dir.path().join("s"), now).unwrap();
+        let mut first = Vec::new();
+        while let Some(f) = lk.pass(&store, now, &HashSet::new(), &|| false).unwrap() {
+            first.extend(f.releases.clone());
+            lk.ack(f).unwrap();
+        }
+        assert_eq!(first.len(), 1);
+        // the same name posts twelve articles five hours after that upload ended: past JOIN_GAP
+        let again_t = T0 + 600 + 5 * 3600;
+        let again: Vec<Vec<u8>> =
+            (0..12u64).map(|k| ob(9000 + k, "bb001@x.y", again_t + k as i64, &format!("bb001again{k}"))).collect();
+        let t = store.record("srv", "alt.binaries.g0", &again, Clamp::Unknown { now: 2_000_000_000 }).unwrap();
+        store.tick().unwrap();
+        t.wait(Duration::from_secs(5)).unwrap();
+        let later = again_t + 6 * 3600;
+        let mut more = Vec::new();
+        let mut posted_again = 0;
+        while let Some(f) = lk.pass(&store, later, &HashSet::new(), &|| false).unwrap() {
+            posted_again += f.stats.posted_again;
+            more.extend(f.releases.clone());
+            lk.ack(f).unwrap();
+        }
+        assert_eq!(posted_again, 1);
+        assert_eq!(more.len(), 1, "one new upload");
+        assert_ne!(more[0].name, first[0].name, "named apart from the first upload");
+        assert_eq!(more[0].articles.len(), 12, "only the new articles");
         store.close().unwrap();
     }
 
