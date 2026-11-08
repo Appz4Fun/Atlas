@@ -33,7 +33,7 @@ pub fn run_cli(args: &[String]) -> i32 {
         Some("stats") => stats(&rest),
         _ => {
             println!(
-                "usage: atlas --header-store import --to DIR [--files N] | link --store DIR --from UNIX --to UNIX | link-day --store DIR --day YYYY-MM-DD | stats --store DIR"
+                "usage: atlas --header-store import --to DIR [--files N] | link --store DIR --from UNIX --to UNIX | link-day --store DIR --day YYYY-MM-DD [--from UNIX --to UNIX] | stats --store DIR"
             );
             return 1;
         }
@@ -384,6 +384,10 @@ fn link_day(args: &[String]) -> Result<()> {
     let dir = PathBuf::from(arg(args, "--store").context("--store DIR")?);
     let day_name = arg(args, "--day").context("--day YYYY-MM-DD")?;
     let day = super::segment::parse_day_name(day_name).context("--day YYYY-MM-DD")?;
+    // only these hours of it, when given (wall clock, unix seconds)
+    let from: i64 = arg(args, "--from").map_or(Ok(day * DAY), str::parse)?;
+    let to: i64 = arg(args, "--to").map_or(Ok(day * DAY + DAY - 1), str::parse)?;
+    let (first_hour, last_hour) = (from.div_euclid(3600), to.div_euclid(3600));
     let (store, _) = Store::open(StoreConfig::new(&dir), keep_all())?;
     let state_dir = dir.parent().unwrap_or(Path::new(".")).join(format!("linkstate-{day_name}"));
     let _ = std::fs::remove_dir_all(&state_dir);
@@ -395,7 +399,7 @@ fn link_day(args: &[String]) -> Result<()> {
     let (first_day, last_day) =
         (segs.iter().map(|s| s.1).min().unwrap_or(day), segs.iter().map(|s| s.1).max().unwrap_or(day));
     for h in (first_day - 2) * 24..(last_day + 3) * 24 {
-        if h < day * 24 || h >= (day + 1) * 24 {
+        if h < first_hour || h > last_hour {
             state.linked.insert(h);
         }
     }
@@ -411,6 +415,8 @@ fn link_day(args: &[String]) -> Result<()> {
     let mut bytes = 0i64;
     let mut cross = 0usize;
     let mut passes = 0;
+    // the uploads whose first article falls in the hours asked for, as `link` counts them
+    let (mut in_span, mut in_span_files, mut in_span_articles) = (0usize, 0usize, 0usize);
     while let Some(found) = linker.pass(&store, now, &HashSet::new(), &|| false)? {
         passes += 1;
         let st = found.stats.clone();
@@ -438,6 +444,12 @@ fn link_day(args: &[String]) -> Result<()> {
             bytes += r.size;
             let f: HashSet<&str> = r.articles.iter().filter_map(|a| a.filename.as_deref()).collect();
             files += f.len();
+            let first = r.articles.iter().filter_map(|a| crate::dates::naive_timestamp(&a.date)).min();
+            if first.is_some_and(|t| t >= from && t <= to) {
+                in_span += 1;
+                in_span_files += f.len();
+                in_span_articles += r.articles.len();
+            }
         }
         let groups: HashSet<String> = found.releases.iter().map(|r| r.group.clone()).collect();
         cross += groups.len();
@@ -452,6 +464,11 @@ fn link_day(args: &[String]) -> Result<()> {
     println!(
         "  releases {releases} ({uploads} uploads, {late} late files), {files} files, {articles} articles, {:.1} GB",
         bytes as f64 / 1e9
+    );
+    println!(
+        "  of them starting in {}..{}: {in_span} uploads, {in_span_files} files, {in_span_articles} articles",
+        crate::xref::iso_pub(from),
+        crate::xref::iso_pub(to)
     );
     store.close()
 }
