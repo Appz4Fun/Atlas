@@ -287,17 +287,21 @@ pub const LOCKSTEP_DAYS: i64 = 1;
 /// spare workers wait too. Within that the newest day goes first, a group big
 /// releases come from (`media_groups`) first among equals.
 pub fn claim(conn: &Connection, groups: &[(String, i64)], host: &str, now: i64) -> Result<Option<Claim>> {
+    let claimed = claim_any(conn, groups, host, now)?;
+    if let Some(c) = &claimed {
+        crate::header_window::note_claimed_day(c.day);
+    }
+    Ok(claimed)
+}
+
+fn claim_any(conn: &Connection, groups: &[(String, i64)], host: &str, now: i64) -> Result<Option<Claim>> {
     if groups.is_empty() {
         return Ok(None);
     }
     if let Some(claim) = claim_wanted(conn, groups, host, now)? {
         return Ok(Some(claim));
     }
-    let Some(frontier) = frontier(conn, groups, now)? else {
-        note_no_frontier(conn)?;
-        return Ok(None);
-    };
-    crate::header_window::BACKFILL_FRONTIER_DAY.store(frontier, std::sync::atomic::Ordering::Relaxed);
+    let Some(frontier) = frontier(conn, groups, now)? else { return Ok(None) };
     let floor = frontier - LOCKSTEP_DAYS;
     let groups: Vec<(String, i64)> = groups.iter().map(|(g, oldest)| (g.clone(), (*oldest).max(floor))).collect();
     let media = media_groups(conn)?;
@@ -315,40 +319,26 @@ pub fn claim_turn(
     host: &str,
     now: i64,
 ) -> Result<Option<Claim>> {
+    let claimed = claim_turn_any(conn, group, all, host, now)?;
+    if let Some(c) = &claimed {
+        crate::header_window::note_claimed_day(c.day);
+    }
+    Ok(claimed)
+}
+
+fn claim_turn_any(
+    conn: &Connection,
+    group: (String, i64),
+    all: &[(String, i64)],
+    host: &str,
+    now: i64,
+) -> Result<Option<Claim>> {
     if let Some(claim) = claim_wanted(conn, std::slice::from_ref(&group), host, now)? {
         return Ok(Some(claim));
     }
-    let Some(frontier) = frontier(conn, all, now)? else {
-        note_no_frontier(conn)?;
-        return Ok(None);
-    };
-    crate::header_window::BACKFILL_FRONTIER_DAY.store(frontier, std::sync::atomic::Ordering::Relaxed);
+    let Some(frontier) = frontier(conn, all, now)? else { return Ok(None) };
     let (g, oldest) = group;
     claim_newest(conn, &[(g, oldest.max(frontier - LOCKSTEP_DAYS))], &[], host, now)
-}
-
-/// A claim found no frontier for its host: the header window keeps only live hours once no chunk of any group is
-/// left at all, however far back or resting (`header_window::NO_BACKFILL`). Another host's deeper retention or days
-/// resting after a failure are backfill still to come, and change nothing.
-/// Asked once a minute at most: when every chunk is done the look is a full scan.
-fn note_no_frontier(conn: &Connection) -> Result<()> {
-    static LAST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
-    let last = LAST.load(std::sync::atomic::Ordering::Relaxed);
-    if now - last < 60
-        || LAST
-            .compare_exchange(last, now, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed)
-            .is_err()
-    {
-        return Ok(());
-    }
-    let left: bool =
-        conn.prepare_cached(&format!("select 1 from backfill_chunks where state != {DONE} limit 1"))?.exists([])?;
-    if !left {
-        crate::header_window::BACKFILL_FRONTIER_DAY
-            .store(crate::header_window::NO_BACKFILL, std::sync::atomic::Ordering::Relaxed);
-    }
-    Ok(())
 }
 
 /// The newest day any of `groups` still has to do or is doing: (group, oldest day the server keeps). A day pending

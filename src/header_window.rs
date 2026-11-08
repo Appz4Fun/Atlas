@@ -15,13 +15,14 @@
 //! lose the last minutes, which reading again brings back. A cut between a block landing and its tail going leaves
 //! those lines in both; a lookup dedups them.
 //!
-//! The window is in posting time, which lockstep backfill keeps aligned across groups.
+//! The window is in posting time, which lockstep backfill keeps aligned across groups: the last day of live reading,
+//! and the days around each backfill day claimed lately (by any host, wanted days included).
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
@@ -40,7 +41,7 @@ pub const SEAL_IDLE: Duration = Duration::from_secs(600);
 /// how long one sweep may spend sealing; the rest wait for the next
 pub const SEAL_BUDGET: Duration = Duration::from_secs(5);
 const IDX_MAGIC: [u8; 4] = *b"HWI1";
-const FRONTIER_FILE: &str = "backfill-frontier";
+const CLAIMED_FILE: &str = "claimed-days";
 
 /// The overview line's poster.
 fn poster_of(line: &[u8]) -> Option<&[u8]> {
@@ -127,12 +128,7 @@ impl Window {
         } else if !root.exists() {
             return Ok(Window { root: root.to_path_buf(), groups: HashMap::new() });
         }
-        if let Ok(day) = fs::read_to_string(root.join(FRONTIER_FILE))
-            && let Ok(day) = day.trim().parse::<i64>()
-        {
-            // a frontier found since start wins over the one kept
-            let _ = BACKFILL_FRONTIER_DAY.compare_exchange(0, day, Ordering::Relaxed, Ordering::Relaxed);
-        }
+        load_claimed(root);
         let mut w = Window { root: root.to_path_buf(), groups: HashMap::new() };
         for server in read_dirs(root)? {
             for group_dir in read_dirs(&server)? {
@@ -507,37 +503,61 @@ fn decode(dir: &Path) -> Option<String> {
     Some(if s == "\0" { String::new() } else { s })
 }
 
-/// The newest backfill day any group still has to do (`chunks::frontier`), set as claims are made and kept in the
-/// store, soo a restart knows it before the first claim; 0 while not known yet, `NO_BACKFILL` once a claim found
-/// no backfill day left. Lockstep reads the groups' days around
-/// it, soo the window keeps those.
-pub static BACKFILL_FRONTIER_DAY: AtomicI64 = AtomicI64::new(0);
+/// How long a backfill day stays kept after a claim of it was last made (wall time).
+pub const CLAIMED_KEEP: Duration = Duration::from_secs(6 * 3600);
+/// After a start, how long nothing older than the live hours is dropped: the claims of the days being read come
+/// again first.
+pub const START_GRACE: Duration = Duration::from_secs(600);
 
-/// `BACKFILL_FRONTIER_DAY` when there's no backfill to keep days around.
-pub const NO_BACKFILL: i64 = -1;
+/// The backfill days claimed lately (unix day, when last claimed, unix seconds), whichever host or group set claimed
+/// them, wanted days included: the window takes in and keeps the days around each.
+static CLAIMED: Mutex<BTreeMap<i64, i64>> = Mutex::new(BTreeMap::new());
 
-/// How far back hours stay while the backfill frontier isn't known.
-pub const UNKNOWN_KEEP_DAYS: i64 = 3;
+/// A backfill day claimed (`chunks::claim`, `chunks::claim_turn`), to be kept around.
+pub fn note_claimed_day(day: i64) {
+    if let Ok(mut m) = CLAIMED.lock() {
+        m.insert(day, now_secs());
+    }
+}
+
+/// The days claimed within `CLAIMED_KEEP` of `now`.
+fn claimed_days(now: i64) -> Vec<i64> {
+    let keep = CLAIMED_KEEP.as_secs() as i64;
+    CLAIMED.lock().map(|m| m.iter().filter(|(_, at)| now - **at <= keep).map(|(d, _)| *d).collect()).unwrap_or_default()
+}
 
 /// Posting-time ranges, seconds, both ends in.
 pub type Ranges = Vec<(i64, i64)>;
 
 /// The posting-time ranges the window takes lines in and keeps at `now`: the last `keep_hours` (live reading) and
-/// the days lockstep backfill reads around its frontier (`frontier_day`). While the frontier isn't known (0: no
-/// claim has said, as on an install with no backfill turn at all), only live lines are taken in, and older hours
-/// stay up to `UNKNOWN_KEEP_DAYS`, soo a store from before isn't dropped before a claim tells; with no backfill
-/// (`NO_BACKFILL`), only the live hours are kept: (record, keep).
-pub fn ranges(now: i64, keep_hours: i64, frontier_day: i64) -> (Ranges, Ranges) {
-    let live = (now - keep_hours * HOUR, now + HOUR);
-    if frontier_day == 0 {
-        return (vec![live], vec![(now - UNKNOWN_KEEP_DAYS * 86_400, now + HOUR)]);
+/// for each backfill day claimed lately (`days`) that day and one either side, where lockstep has the other groups
+/// reading and an upload over midnight lands. While `in_grace` (just started), nothing older than the live hours is
+/// dropped: (record, keep).
+pub fn ranges(now: i64, keep_hours: i64, days: &[i64], in_grace: bool) -> (Ranges, Ranges) {
+    let mut take = vec![(now - keep_hours * HOUR, now + HOUR)];
+    take.extend(days.iter().map(|d| ((d - 1) * 86_400, (d + 2) * 86_400 - 1)));
+    let keep = if in_grace { vec![(i64::MIN, now + HOUR)] } else { take.clone() };
+    (take, keep)
+}
+
+/// The claimed days kept in the store, back in `CLAIMED` (a restart's first claims come after the first sweep).
+fn load_claimed(root: &Path) {
+    let Ok(text) = fs::read_to_string(root.join(CLAIMED_FILE)) else { return };
+    let Ok(mut m) = CLAIMED.lock() else { return };
+    for line in text.lines() {
+        if let Some((d, at)) = line.split_once(' ')
+            && let (Ok(d), Ok(at)) = (d.parse::<i64>(), at.parse::<i64>())
+        {
+            let e = m.entry(d).or_insert(at);
+            *e = (*e).max(at);
+        }
     }
-    if frontier_day < 0 {
-        return (vec![live], vec![live]);
-    }
-    let lockstep = crate::chunks::LOCKSTEP_DAYS;
-    let both = vec![live, ((frontier_day - lockstep) * 86_400, (frontier_day + 1) * 86_400)];
-    (both.clone(), both)
+}
+
+fn save_claimed(root: &Path) -> Result<()> {
+    let text: String =
+        CLAIMED.lock().map(|m| m.iter().map(|(d, at)| format!("{d} {at}\n")).collect()).unwrap_or_default();
+    write_replace(&root.join(CLAIMED_FILE), text.as_bytes())
 }
 
 enum Msg {
@@ -614,22 +634,27 @@ fn now_secs() -> i64 {
 }
 
 fn run(mut window: Window, rx: Receiver<Msg>, keep_hours: i64) {
+    let started = Instant::now();
     let mut last_sweep = Instant::now();
-    let (mut take, _) = ranges(now_secs(), keep_hours, BACKFILL_FRONTIER_DAY.load(Ordering::Relaxed));
     let (mut said_dropped, mut said_failed) = (0, 0);
-    let mut frontier_saved = 0;
     loop {
         match rx.recv_timeout(Duration::from_secs(1)) {
-            Ok(Msg::Batch { server, group, lines }) => match window.record(&server, &group, &lines, &take) {
-                Ok(skipped) => {
-                    RECORDED.fetch_add((lines.len() - skipped) as u64, Ordering::Relaxed);
+            Ok(Msg::Batch { server, group, lines }) => {
+                // the ranges as of now: a day claimed a moment ago is taken in at once
+                let now = now_secs();
+                let (take, _) = ranges(now, keep_hours, &claimed_days(now), false);
+                match window.record(&server, &group, &lines, &take) {
+                    Ok(skipped) => {
+                        RECORDED.fetch_add((lines.len() - skipped) as u64, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        FAILED.fetch_add(1, Ordering::Relaxed);
+                        eprintln!("header window: couldnt record {group}: {e:#}");
+                    }
                 }
-                Err(e) => {
-                    FAILED.fetch_add(1, Ordering::Relaxed);
-                    eprintln!("header window: couldnt record {group}: {e:#}");
-                }
-            },
+            }
             Ok(Msg::Finish(done)) => {
+                let _ = save_claimed(&window.root);
                 let _ = done.send(());
                 return;
             }
@@ -640,13 +665,9 @@ fn run(mut window: Window, rx: Receiver<Msg>, keep_hours: i64) {
             continue;
         }
         last_sweep = Instant::now();
-        let day = BACKFILL_FRONTIER_DAY.load(Ordering::Relaxed);
-        let keep;
-        (take, keep) = ranges(now_secs(), keep_hours, day);
-        if day != frontier_saved && write_replace(&window.root.join(FRONTIER_FILE), day.to_string().as_bytes()).is_ok()
-        {
-            frontier_saved = day;
-        }
+        let now = now_secs();
+        let (_, keep) = ranges(now, keep_hours, &claimed_days(now), started.elapsed() < START_GRACE);
+        let _ = save_claimed(&window.root);
         // expired first: what's going needn't be sealed
         if let Err(e) = window.expire(&keep).and_then(|_| window.seal_idle(SEAL_IDLE, SEAL_BUDGET)) {
             FAILED.fetch_add(1, Ordering::Relaxed);
@@ -791,14 +812,30 @@ mod tests {
     }
 
     #[test]
-    fn without_a_known_frontier_only_live_lines_come_in_and_older_hours_stay_a_while() {
+    fn the_window_takes_in_the_live_hours_and_the_days_around_each_day_claimed() {
         let now = 20_400 * 86_400 + 5 * HOUR;
         let live = (now - 24 * HOUR, now + HOUR);
-        assert_eq!(ranges(now, 24, 0), (vec![live], vec![(now - UNKNOWN_KEEP_DAYS * 86_400, now + HOUR)]));
-        assert_eq!(ranges(now, 24, NO_BACKFILL), (vec![live], vec![live]), "no backfill: the live hours only");
-        let (take, keep) = ranges(now, 24, 20_000);
+        assert_eq!(ranges(now, 24, &[], false), (vec![live], vec![live]), "no backfill: the live hours only");
+        let (take, keep) = ranges(now, 24, &[20_000, 19_990], false);
         assert_eq!(take, keep);
-        assert_eq!(keep, vec![live, ((20_000 - crate::chunks::LOCKSTEP_DAYS) * 86_400, 20_001 * 86_400)]);
+        assert_eq!(take[1], (19_999 * 86_400, 20_002 * 86_400 - 1));
+        assert_eq!(take[2], (19_989 * 86_400, 19_992 * 86_400 - 1), "every host's day, not only the last");
+        let (_, keep) = ranges(now, 24, &[], true);
+        assert_eq!(keep, vec![(i64::MIN, now + HOUR)], "just started: nothing older dropped yet");
+    }
+
+    #[test]
+    fn days_claimed_stay_for_a_while_and_come_back_after_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = 1_000_003;
+        note_claimed_day(day);
+        assert!(claimed_days(now_secs()).contains(&day));
+        assert!(!claimed_days(now_secs() + CLAIMED_KEEP.as_secs() as i64 + 1).contains(&day), "gone after a while");
+        save_claimed(dir.path()).unwrap();
+        CLAIMED.lock().unwrap().remove(&day);
+        load_claimed(dir.path());
+        assert!(claimed_days(now_secs()).contains(&day));
+        CLAIMED.lock().unwrap().remove(&day);
     }
 
     #[test]
