@@ -962,8 +962,12 @@ pub fn one_shard_from(conn: &Connection) -> Result<i64> {
 /// `one_shard_from` reckons drifts once the first dense releases freeze, soo it's kept the first time it can be told,
 /// and with no dense release yet it's the counter (`main_conn`'s `next_seq`), which nothing has handed out from.
 pub fn note_one_shard_from(main: &Path, main_conn: &Connection) -> Result<()> {
+    // only once `finish` has put the counter in one-shard numbering: before, `next_seq` counts eight-shard sequences
+    if crate::store::get_meta(main_conn, COUNTER_DONE)?.unwrap_or(0) == 0 {
+        return Ok(());
+    }
     let target = crate::store::shard_path(main, 0);
-    if !target.exists() {
+    if !target.exists() || needs_finish(&target)? {
         return Ok(());
     }
     let conn = crate::db::open_at(&target)?;

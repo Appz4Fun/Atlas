@@ -592,7 +592,10 @@ pub fn create_db_at(path: &Path) -> anyhow::Result<()> {
     store::create_main(&conn)?;
     create_shards(path, used)?;
     // a merged shard finished by a build that didn't note its first one-shard id: noted now, while it can be told
-    crate::merge_shards::note_one_shard_from(path, &conn)?;
+    // best effort: without it the linker reckons the id from what the shard holds
+    if let Err(e) = crate::merge_shards::note_one_shard_from(path, &conn) {
+        crate::ui::warn(&format!("couldnt note the first one-shard release id: {e:#}"));
+    }
     if fresh && !used {
         crate::raw_store::restore_backfill_deepest(path, &conn);
     }
