@@ -451,6 +451,29 @@ fn claim_newest(
     Ok(found.map(|(group, day)| Claim { group, day, server: host.to_string(), claimed_at: now }))
 }
 
+/// Every day chunk done from `since` on (a unix day; `i64::MIN` for all of them) put back to pending, to be read
+/// again: for what the first read dropped and a later build keeps, as the headers of uploads obfuscated per article
+/// (`xref`). Articles saved already are passed over on the second read. The count put back.
+pub fn reopen_done(conn: &Connection, since: i64) -> Result<usize> {
+    conn.execute(
+        &format!(
+            "update backfill_chunks set state = {PENDING}, server = null, claimed_at = null, done_at = null,
+                    failures = null, failed_at = null
+             where state = {DONE} and day >= ?1"
+        ),
+        [since],
+    )
+}
+
+/// How many day chunks are done from `since` on, and over how many groups.
+pub fn done_since(conn: &Connection, since: i64) -> Result<(i64, i64)> {
+    conn.query_row(
+        &format!("select count(*), count(distinct grp) from backfill_chunks where state = {DONE} and day >= ?1"),
+        [since],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+}
+
 /// Mark a claimed chunk as done at `now`. False when the claim was taken over.
 pub fn finish(conn: &Connection, claim: &Claim, now: i64) -> Result<bool> {
     let n = conn.execute(
@@ -875,6 +898,25 @@ mod tests {
         // recent all read: `old`'s days are the newest left
         assert_eq!(turn("old", 0).map(|c| c.day), Some(19_095));
         assert_eq!(frontier(&c, &[], 0).unwrap(), None);
+    }
+
+    #[test]
+    fn days_done_are_put_back_to_be_read_again_from_a_day_on() {
+        let c = conn();
+        add(&c, "g", 20_010, 20_000).unwrap();
+        let groups = vec![("g".to_string(), i64::MIN)];
+        for _ in 0..5 {
+            let k = claim(&c, &groups, "a", 1000).unwrap().unwrap();
+            assert!(finish(&c, &k, 1000).unwrap());
+        }
+        assert_eq!(done_since(&c, i64::MIN).unwrap(), (5, 1));
+        assert_eq!(done_since(&c, 20_008).unwrap(), (3, 1));
+        assert_eq!(reopen_done(&c, 20_008).unwrap(), 3);
+        assert_eq!(progress(&c, "g").unwrap(), (2, 11), "20006 and 20007 stay done");
+        // read again newest first, before the days never read
+        assert_eq!(day(claim(&c, &groups, "a", 1000)), Some(20_010));
+        assert_eq!(reopen_done(&c, i64::MIN).unwrap(), 2);
+        assert_eq!(progress(&c, "g").unwrap(), (0, 11));
     }
 
     #[test]

@@ -980,6 +980,66 @@ fn unread_days(main: &Connection, days: &mut HashMap<i64, bool>, first: i64, las
     })
 }
 
+/// `atlas --xref-reread [--since YYYY-MM-DD] [--apply]`: the backfill days read before this linker kept the headers
+/// of uploads obfuscated per article, put back to be read again (`chunks::reopen_done`). Lockstep then reads them
+/// newest first, beside the days still to do. Runs beside the indexer.
+pub fn run_reread(args: &[String]) -> i32 {
+    let apply = args.iter().any(|a| a == "--apply");
+    let since = match args.iter().position(|a| a == "--since").and_then(|i| args.get(i + 1)) {
+        None => i64::MIN,
+        Some(day) => match chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d") {
+            Ok(d) => d.and_hms_opt(0, 0, 0).expect("midnight").and_utc().timestamp() / 86_400,
+            Err(_) => {
+                println!("--since takes a day as YYYY-MM-DD, not {day}");
+                return 1;
+            }
+        },
+    };
+    let main = crate::paths::database();
+    let conn = match crate::db::open_at(&main) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("couldnt open {}: {e:#}", main.display());
+            return 1;
+        }
+    };
+    let (chunks, groups) = match crate::chunks::done_since(&conn, since) {
+        Ok(n) => n,
+        Err(e) => {
+            println!("couldnt count the days read: {e:#}");
+            return 1;
+        }
+    };
+    let span = if since == i64::MIN {
+        "every day read".to_string()
+    } else {
+        format!("the days read from {} on", args[args.iter().position(|a| a == "--since").expect("checked") + 1])
+    };
+    println!("{span}: {chunks} day chunks over {groups} groups would be read again");
+    if !apply {
+        println!("dry run: pass --apply to put them back to be read (the indexer may keep running)");
+        return 0;
+    }
+    // a write to the main database, beside the indexer: held off a compaction, refused on a merge half done
+    let _held = match crate::compact::hold_off_compaction(&main) {
+        Ok(h) => h,
+        Err(e) => {
+            println!("{e:#}");
+            return 1;
+        }
+    };
+    match crate::chunks::reopen_done(&conn, since) {
+        Ok(n) => {
+            println!("{n} day chunks put back to be read again");
+            0
+        }
+        Err(e) => {
+            println!("couldnt put them back: {e:#}");
+            1
+        }
+    }
+}
+
 /// Every `PASS_EVERY`, drop the headers past the window, then save what has settled.
 pub async fn run(db: crate::indexer::Db, stopping: impl Fn() -> bool) {
     // a pass whose releases or note didnt all go through: tried again as it was, before any new pass, soo a retry
