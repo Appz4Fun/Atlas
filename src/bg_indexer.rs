@@ -1338,6 +1338,8 @@ pub fn run() -> i32 {
     crate::shared_catalog::start(&config.shared_catalog, stop.clone());
     crate::overview_archive::spawn(&config.overview_archive);
     crate::header_window::spawn(&config.header_window);
+    crate::chunks::FORWARD_FROM_DAYS
+        .store(config.backfill_start_days_back.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
     if config.metrics.enabled {
         crate::metrics::catalog::spawn(Duration::from_secs(config.metrics.catalog_every_secs), stop.clone());
     }

@@ -181,6 +181,8 @@ pub struct Config {
     pub request_size: Option<u64>,
     /// None = SPLIT_MIN_BACKLOG
     pub split_min_backlog: Option<i64>,
+    /// backfill forward from this many days back (`chunks::FORWARD_FROM_DAYS`); None = newest day first
+    pub backfill_start_days_back: Option<i64>,
     /// groups indexed at the same time, None = worked out from the connections
     pub parallel_groups: Option<usize>,
     /// compact the database every 24 hours from the indexer
@@ -1098,6 +1100,7 @@ impl Default for Config {
             batch_size: None,
             request_size: None,
             split_min_backlog: None,
+            backfill_start_days_back: None,
             parallel_groups: None,
             auto_run_compact: false,
             max_unsaved_headers: None,
@@ -1279,6 +1282,7 @@ impl Config {
             batch_size: v.get("batch_size").and_then(as_int).and_then(|n| u64::try_from(n).ok()).filter(|n| *n > 0),
             request_size: v.get("request_size").and_then(as_int).and_then(|n| u64::try_from(n).ok()).filter(|n| *n > 0),
             split_min_backlog: v.get("split_min_backlog").and_then(as_int).filter(|n| *n > 0),
+            backfill_start_days_back: v.get("backfill_start_days_back").and_then(as_int).filter(|n| *n > 0),
             parallel_groups: v
                 .get("parallel_groups")
                 .and_then(as_int)
@@ -1614,6 +1618,10 @@ fn config_value(
 
     if let Some(n) = cfg.split_min_backlog {
         out.insert("split_min_backlog".into(), json!(n));
+    }
+
+    if let Some(n) = cfg.backfill_start_days_back {
+        out.insert("backfill_start_days_back".into(), json!(n));
     }
 
     if cfg.auto_run_compact {
