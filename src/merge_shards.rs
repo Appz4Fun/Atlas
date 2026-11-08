@@ -179,10 +179,11 @@ pub fn merge(
     Ok(merged)
 }
 
-/// The full text index's insert trigger is all that runs while rows are copied. The rest would queue the copies again
-/// (word index, uncategorized list), count them again (sidecar bytes) or send every row to the shared catalog's
-/// outbox, where they already are. Each is kept (`merge_triggers`) and made again by `finish`.
-const KEPT_TRIGGERS: [&str; 1] = ["releases_ai"];
+/// No trigger runs while rows are copied. They would queue the copies again (word index, uncategorized list), count
+/// them again (sidecar bytes), send every row to the shared catalog's outbox, where they already are, or index each
+/// release's name one at a time: on a trial that took two hours for one shard's 12M releases, where `finish` rebuilds
+/// the full text index in one go. Each is kept (`merge_triggers`) and made again by `finish`.
+const KEPT_TRIGGERS: [&str; 0] = [];
 
 fn park_triggers(conn: &Connection) -> Result<()> {
     let triggers: Vec<(String, String)> = conn
@@ -789,6 +790,10 @@ pub fn finish(main: &Path, target: &Path) -> Result<()> {
         crate::store::set_next_seq(&tx, highest + 1)?;
         tx.execute("insert or replace into meta (key, value) values (?1, 1)", [COUNTER_DONE])?;
         tx.commit()?;
+    }
+    // the copies' names, which no trigger indexed (`KEPT_TRIGGERS`): the index made again from `releases`
+    if conn.prepare("select 1 from main.merge_triggers limit 1")?.exists([])? {
+        conn.execute("insert into releases_fts(releases_fts) values ('rebuild')", [])?;
     }
     restore_triggers(&conn)?;
     crate::sidecar::recount(&conn)?;
