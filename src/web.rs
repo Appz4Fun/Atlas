@@ -834,9 +834,12 @@ impl Search {
             })
             .filter(|r| !self.hides(r))
             .collect();
+        let mut spots_left_out = false;
         if self.hides_spots() {
             let spots = spot_ids(&found.iter().map(|r| r.id).collect::<Vec<_>>());
+            let before = found.len();
             found.retain(|r| !spots.contains(&r.id));
+            spots_left_out = found.len() < before;
         }
         if self.min_score.is_some() {
             let scores = post_scores(&found, &split);
@@ -844,7 +847,7 @@ impl Search {
         }
         if found.is_empty() && (self.hide_incomplete || self.min_score.is_some() || self.hides_spots()) {
             // every row of this page was left out: there may be others further on
-            let what = match (self.hide_incomplete, self.min_score.is_some(), self.hides_spots()) {
+            let what = match (self.hide_incomplete, self.min_score.is_some(), spots_left_out) {
                 (true, true, false) => "complete and rated that high",
                 (true, false, false) => "complete",
                 (false, true, false) => "rated that high",
@@ -2422,10 +2425,14 @@ fn frozen_section(search: &Search) -> String {
     };
     // tags are read from each name: a wider window, soo the newest ones that have them still come to the limit
     let tags = search.tag_filters();
-    let window = if tags.is_empty() { FROZEN_LISTED } else { FROZEN_LISTED * 20 };
+    // as do spots, left out once read
+    let window = if tags.is_empty() && !search.hides_spots() { FROZEN_LISTED } else { FROZEN_LISTED * 20 };
     let filter = parse_filter(&search.cat);
     let found = crate::frozen::search(&crate::paths::database(), &search.q, filter.as_ref(), &narrow, window);
+    // the read came back full: there may be older ones, whatever the filters left of it
+    let mut full = false;
     let hits = match found.map(|hits| {
+        full = hits.len() >= window;
         let mut hits: Vec<_> = hits
             .into_iter()
             .filter(|h| {
@@ -2464,8 +2471,9 @@ fn frozen_section(search: &Search) -> String {
         );
     }
     let note = match hits.len() {
+        0 if full => format!("None of the newest {window} match; a narrower search finds older ones."),
         0 => "None match.".to_string(),
-        n if n >= FROZEN_LISTED => format!("The newest {n}; a narrower search finds older ones."),
+        n if n >= FROZEN_LISTED || full => format!("The newest {n}; a narrower search finds older ones."),
         n => format!("{n} set aside, out of the default search."),
     };
     let table = if hits.is_empty() {
