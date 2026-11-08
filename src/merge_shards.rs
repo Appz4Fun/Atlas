@@ -154,6 +154,17 @@ pub fn merge(
         conn.execute_batch("pragma synchronous = full;")?;
         conn.execute_batch(SCHEMA)?;
         refuse_an_earlier_builds_merge(&conn)?;
+        // a merge begun by a build that left folded-only suffixes past `shard << 32` can't go on with small ids: its
+        // rows would end under two ids. Marked when the first source starts
+        let begun: i64 = conn.query_row("select count(*) from merge_shards", [], |r| r.get(0))?;
+        let dense = crate::store::get_meta(&conn, DENSE_DOMAINS)?.is_some_and(|v| v != 0);
+        if begun == 0 {
+            conn.execute("insert or replace into meta (key, value) values (?1, 1)", [DENSE_DOMAINS])?;
+        } else if !dense {
+            bail!(
+                "this shard was merged into by an earlier build (domains past shard << 32): start again from the shards as they were"
+            );
+        }
         domains_not_unique(&conn)?;
         // in shard order only (`sources`): a source after a higher one, merged or started, would take its domains'
         // lowest ids
@@ -847,6 +858,9 @@ pub fn refuse_if_merging(main: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Set in the target when a merge into it begins with small ids for folded-only suffixes (`map_domains`).
+const DENSE_DOMAINS: &str = "merge_dense_domains";
+
 /// Set in `atlas.db` once `finish` has put the id counter in one-shard numbering.
 const COUNTER_DONE: &str = "merge_counter_done";
 
@@ -916,8 +930,8 @@ pub fn finish(main: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The shards a merge into `target` has begun (or finished and not yet deleted).
-fn started_shards(target: &Path) -> Result<Vec<usize>> {
+/// The shards a merge into `target` has begun, and whether each is copied whole.
+fn started_shards(target: &Path) -> Result<Vec<(usize, bool)>> {
     let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = Connection::open_with_flags(target, flags)?;
     conn.busy_timeout(std::time::Duration::from_secs(30))?;
@@ -927,10 +941,10 @@ fn started_shards(target: &Path) -> Result<Vec<usize>> {
         return Ok(Vec::new());
     }
     let shards = conn
-        .prepare("select shard from merge_shards order by shard")?
-        .query_map([], |r| r.get::<_, i64>(0))?
+        .prepare("select shard, coalesce(done, 0) from merge_shards order by shard")?
+        .query_map([], |r| Ok((r.get::<_, i64>(0)? as usize, r.get::<_, i64>(1)? != 0)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(shards.into_iter().map(|s| s as usize).collect())
+    Ok(shards)
 }
 
 /// `atlas --merge-shards [--apply]`.
@@ -999,17 +1013,19 @@ pub fn run(args: &[String]) -> i32 {
     }
     let free = crate::frozen::free_bytes(&main).unwrap_or(0);
     let size = |p: &Path| std::fs::metadata(p).map_or(0, |m| m.len());
-    // a source a run stopped in (started, or copied and not yet deleted) needs room only for what's left of it, which
-    // the copy so far has taken from the free space already: counted as the rest, not whole
+    // a source a run copied whole and stopped before deleting needs no room; one it stopped inside is counted whole
+    // (what's left of it isn't known closer than that)
     let started = started_shards(&target).unwrap_or_default();
+    let copied: Vec<usize> = started.iter().filter(|(_, done)| *done).map(|(s, _)| *s).collect();
     let biggest = todo
         .iter()
-        .filter(|s| !started.contains(&s.shard))
+        .filter(|s| !copied.contains(&s.shard))
         .map(|s| size(&s.path) + size(&crate::frozen::path(&s.path)))
         .max()
         .unwrap_or(0);
     if !started.is_empty() {
-        println!("going on with the merge a run stopped in (shards {started:?} begun already)");
+        let begun: Vec<usize> = started.iter().map(|(s, _)| *s).collect();
+        println!("going on with the merge a run stopped in (shards {begun:?} begun already)");
     }
     println!("merging {} shards into {}:", todo.len(), target.display());
     for s in &todo {
