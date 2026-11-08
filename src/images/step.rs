@@ -255,9 +255,12 @@ pub fn row_values(file: &str, bytes: &[u8], sha256: &str) -> Option<Vec<rusqlite
     let info = (sniffed.format == "jpeg").then(|| jpeg::read(bytes)).flatten();
     let meta = info.as_ref().and_then(|i| serde_json::to_string(i).ok());
     let exif_id = info.as_ref().and_then(|i| i.exif.unique_id.clone()).filter(|id| !id.trim_matches('0').is_empty());
-    // the original's id names the picture through every save; an editor that writes only its own takes that
-    let document_id =
-        info.as_ref().and_then(|i| i.xmp.original_document_id.clone().or_else(|| i.xmp.document_id.clone()));
+    // the original's id names the picture through every save; an editor that writes only its own takes that. One
+    // stamped on every file a tool makes ties nothing
+    let document_id = info
+        .as_ref()
+        .and_then(|i| i.xmp.original_document_id.clone().or_else(|| i.xmp.document_id.clone()))
+        .filter(|id| is_telling_document_id(id));
     Some(vec![
         file.to_string().into(),
         sha256.to_string().into(),
