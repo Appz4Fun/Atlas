@@ -3467,7 +3467,11 @@ mod tests {
     /// a table of sealed files for a `SealedCache`: file i holds `per` segments
     fn sealed_files(files: i64, per: i64) -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("create table files (id INTEGER PRIMARY KEY, blob BLOB)").unwrap();
+        conn.execute_batch(
+            "create table files (id INTEGER PRIMARY KEY, blob BLOB);
+             create table domains (id INTEGER PRIMARY KEY, suffix TEXT NOT NULL);",
+        )
+        .unwrap();
         for id in 1..=files {
             let segs: Vec<crate::blob::Seg> = (0..per)
                 .map(|p| crate::blob::Seg {
