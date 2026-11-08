@@ -137,3 +137,12 @@ addr = ""
 # move sealed articles there while indexing
 offload = false
 offload_mb_per_second = 50
+
+[overview_archive]
+# keep every fetched XOVER row, byte for byte, in compressed .nxv files outside SQLite (nntp-xover-engine/)
+enabled = false
+# where: empty is `overview` next to the databases
+dir = ""
+# full segments per server and group kept hot (fast reads); older ones are zstd compressed
+keep_hot = 2
+zstd_level = 9

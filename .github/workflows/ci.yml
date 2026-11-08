@@ -24,3 +24,10 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+      # the overview engine is its own crate (like sealed-log), with its own lock file
+      - run: cargo fmt --check
+        working-directory: nntp-xover-engine
+      - run: cargo clippy --all-targets --locked -- -D warnings
+        working-directory: nntp-xover-engine
+      - run: cargo test --locked
+        working-directory: nntp-xover-engine

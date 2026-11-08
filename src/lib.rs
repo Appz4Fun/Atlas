@@ -38,6 +38,7 @@ pub mod nfo;
 pub mod nntp;
 pub mod nzb;
 pub mod nzblnk;
+pub mod overview_archive;
 pub mod par2;
 pub mod parity;
 pub mod parser;

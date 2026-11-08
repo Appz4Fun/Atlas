@@ -231,7 +231,9 @@ dependencies = [
  "keyring",
  "lzma-rs",
  "md-5 0.10.6",
+ "memmap2",
  "nntmux-yenc",
+ "nntp-xover-engine",
  "num-bigint",
  "par-rs",
  "postgres",
@@ -1212,6 +1214,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fsst-rs"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5913457b566e8b6b401c99cd6eb4f32bfe9ce19e34f9790d39b019ec00c65db"
+dependencies = [
+ "rustc-hash",
+]
+
+[[package]]
 name = "futures-channel"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2070,6 +2081,18 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "nntp-xover-engine"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fsst-rs",
+ "memmap2",
+ "tokio",
+ "xxhash-rust",
+ "zstd 0.14.3",
 ]
 
 [[package]]
@@ -3985,7 +4008,19 @@ dependencies = [
  "mio",
  "pin-project-lite",
  "socket2",
+ "tokio-macros",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "tokio-macros"
+version = "2.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78773a2a397f451582ce068015985c33193cf6dea8b74d2a639fe457b2f07b0e"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.6",
 ]
 
 [[package]]
@@ -4878,6 +4913,12 @@ dependencies = [
  "libc",
  "windows-sys 0.59.0",
 ]
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "550a2b930b62486a393c52d5c3b84bff264b28aa437ed64694d31e93b1757af7"
 
 [[package]]
 name = "yoke"
