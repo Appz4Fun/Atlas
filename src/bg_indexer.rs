@@ -1359,6 +1359,14 @@ pub fn run() -> i32 {
     // the batches still queued for the overview archive
     crate::overview_archive::finish(Duration::from_secs(30));
     crate::header_window::finish(Duration::from_secs(30));
+    // the obfuscated headers still queued for the cross-group store
+    if !crate::xref::flush_recorder(Duration::from_secs(60)) {
+        eprintln!("xref: headers still queued at exit weren't all written");
+    }
+    let lost = crate::xref::recorder_failures();
+    if lost > 0 {
+        eprintln!("xref: {lost} headers' writes failed this run (their slices are read again)");
+    }
     code
 }
 
