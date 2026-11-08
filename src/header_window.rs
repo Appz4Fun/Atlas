@@ -177,6 +177,17 @@ impl Window {
     /// range in `keep`, whose date won't read, or that isn't one overview line, is left out; the count of those comes
     /// back.
     pub fn record(&mut self, server: &str, group: &str, lines: &[Vec<u8>], keep: &[(i64, i64)]) -> Result<usize> {
+        self.record_days(server, group, lines, keep).map(|(skipped, _)| skipped)
+    }
+
+    /// `record`, and the posting days of the lines taken in.
+    pub fn record_days(
+        &mut self,
+        server: &str,
+        group: &str,
+        lines: &[Vec<u8>],
+        keep: &[(i64, i64)],
+    ) -> Result<(usize, Vec<i64>)> {
         let mut skipped = 0;
         let mut by_hour: BTreeMap<i64, Vec<&[u8]>> = BTreeMap::new();
         for line in lines {
@@ -188,8 +199,10 @@ impl Window {
             }
         }
         if by_hour.is_empty() {
-            return Ok(skipped);
+            return Ok((skipped, Vec::new()));
         }
+        let mut days: Vec<i64> = by_hour.keys().map(|h| h.div_euclid(86_400)).collect();
+        days.dedup();
         let g = self.groups.entry((server.to_string(), group.to_string())).or_insert_with(|| Group {
             dir: crate::overview_archive::group_dir(&self.root, server, group),
             ..Group::default()
@@ -221,7 +234,7 @@ impl Window {
         for hour in full {
             seal_hour(g, hour)?;
         }
-        Ok(skipped)
+        Ok((skipped, days))
     }
 
     /// Seal hours that have had no new line for `idle`, the longest quiet first, for up to `budget`. Returns the
@@ -520,10 +533,25 @@ pub fn note_claimed_day(day: i64) {
     }
 }
 
-/// The days claimed within `CLAIMED_KEEP` of `now`.
+/// Lines of `days` were just taken in: a claimed day they fall in (or beside) is still being read, however long
+/// its chunk takes, soo it stays kept.
+fn refresh_claimed(days: &[i64], now: i64) {
+    let Ok(mut m) = CLAIMED.lock() else { return };
+    for d in days {
+        for near in d - 1..=d + 1 {
+            if let Some(at) = m.get_mut(&near) {
+                *at = now;
+            }
+        }
+    }
+}
+
+/// The days claimed within `CLAIMED_KEEP` of `now`; older ones are forgotten.
 fn claimed_days(now: i64) -> Vec<i64> {
     let keep = CLAIMED_KEEP.as_secs() as i64;
-    CLAIMED.lock().map(|m| m.iter().filter(|(_, at)| now - **at <= keep).map(|(d, _)| *d).collect()).unwrap_or_default()
+    let Ok(mut m) = CLAIMED.lock() else { return Vec::new() };
+    m.retain(|_, at| now - *at <= keep);
+    m.keys().copied().collect()
 }
 
 /// Posting-time ranges, seconds, both ends in.
@@ -554,10 +582,14 @@ fn load_claimed(root: &Path) {
     }
 }
 
-fn save_claimed(root: &Path) -> Result<()> {
+/// The claimed days into the store, when they changed since `last` (what was written then). Returns what's there now.
+fn save_claimed(root: &Path, last: &str) -> Result<String> {
     let text: String =
         CLAIMED.lock().map(|m| m.iter().map(|(d, at)| format!("{d} {at}\n")).collect()).unwrap_or_default();
-    write_replace(&root.join(CLAIMED_FILE), text.as_bytes())
+    if text != last {
+        write_replace(&root.join(CLAIMED_FILE), text.as_bytes())?;
+    }
+    Ok(text)
 }
 
 enum Msg {
@@ -637,15 +669,19 @@ fn run(mut window: Window, rx: Receiver<Msg>, keep_hours: i64) {
     let started = Instant::now();
     let mut last_sweep = Instant::now();
     let (mut said_dropped, mut said_failed) = (0, 0);
+    // claimed-days as last written, soo an unchanged set isn't written again (each claim changes it, as a
+    // timestamp, which a write per sweep carries)
+    let mut saved = String::new();
     loop {
         match rx.recv_timeout(Duration::from_secs(1)) {
             Ok(Msg::Batch { server, group, lines }) => {
                 // the ranges as of now: a day claimed a moment ago is taken in at once
                 let now = now_secs();
                 let (take, _) = ranges(now, keep_hours, &claimed_days(now), false);
-                match window.record(&server, &group, &lines, &take) {
-                    Ok(skipped) => {
+                match window.record_days(&server, &group, &lines, &take) {
+                    Ok((skipped, days)) => {
                         RECORDED.fetch_add((lines.len() - skipped) as u64, Ordering::Relaxed);
+                        refresh_claimed(&days, now);
                     }
                     Err(e) => {
                         FAILED.fetch_add(1, Ordering::Relaxed);
@@ -654,7 +690,7 @@ fn run(mut window: Window, rx: Receiver<Msg>, keep_hours: i64) {
                 }
             }
             Ok(Msg::Finish(done)) => {
-                let _ = save_claimed(&window.root);
+                let _ = save_claimed(&window.root, &saved);
                 let _ = done.send(());
                 return;
             }
@@ -667,7 +703,9 @@ fn run(mut window: Window, rx: Receiver<Msg>, keep_hours: i64) {
         last_sweep = Instant::now();
         let now = now_secs();
         let (_, keep) = ranges(now, keep_hours, &claimed_days(now), started.elapsed() < START_GRACE);
-        let _ = save_claimed(&window.root);
+        if let Ok(now_saved) = save_claimed(&window.root, &saved) {
+            saved = now_saved;
+        }
         // expired first: what's going needn't be sealed
         if let Err(e) = window.expire(&keep).and_then(|_| window.seal_idle(SEAL_IDLE, SEAL_BUDGET)) {
             FAILED.fetch_add(1, Ordering::Relaxed);
@@ -830,11 +868,14 @@ mod tests {
         let day = 1_000_003;
         note_claimed_day(day);
         assert!(claimed_days(now_secs()).contains(&day));
-        assert!(!claimed_days(now_secs() + CLAIMED_KEEP.as_secs() as i64 + 1).contains(&day), "gone after a while");
-        save_claimed(dir.path()).unwrap();
+        // still being read: lines of the day keep it
+        refresh_claimed(&[day + 1], now_secs() + 100);
+        assert!(claimed_days(now_secs() + CLAIMED_KEEP.as_secs() as i64 + 50).contains(&day), "kept while read");
+        save_claimed(dir.path(), "").unwrap();
         CLAIMED.lock().unwrap().remove(&day);
         load_claimed(dir.path());
         assert!(claimed_days(now_secs()).contains(&day));
+        assert!(!claimed_days(now_secs() + 2 * CLAIMED_KEEP.as_secs() as i64).contains(&day), "then forgotten");
         CLAIMED.lock().unwrap().remove(&day);
     }
 
