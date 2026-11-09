@@ -109,7 +109,10 @@ fn feed_thread(shared: Arc<Shared>, fetch: Option<Arc<dyn Fetch>>) {
             }
             let Some(spec) = feeds::spec(key) else {
                 if unknown.insert(key.clone()) {
-                    println!("predb: no source named {key}, ignoring it");
+                    match feeds::RETIRED.iter().find(|(k, _)| k == key) {
+                        Some((_, why)) => println!("predb: {key} is retired ({why}), ignoring it"),
+                        None => println!("predb: no source named {key}, ignoring it"),
+                    }
                 }
                 continue;
             };
@@ -250,7 +253,11 @@ impl Service {
                         "updated": r.get::<_, i64>(6)?,
                     }))
                 })?
-                .collect::<rusqlite::Result<_>>()?;
+                .collect::<rusqlite::Result<Vec<Value>>>()?
+                .into_iter()
+                // a retired source keeps its row, but it isn't polled and its last error is old news
+                .filter(|s| s["key"].as_str().is_some_and(|k| feeds::spec(k).is_some()))
+                .collect();
             Ok((meta("titles")?, behind, sources))
         };
         if let Ok((titles, behind, sources)) = read() {

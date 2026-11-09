@@ -7,7 +7,7 @@ use serde_json::Value;
 use super::import::Entry;
 use super::more_feeds::{
     Rss, parse_apibay, parse_catalogue, parse_crowdnfo, parse_dat, parse_g4u, parse_gabber, parse_knaben, parse_nima4k,
-    parse_nzedb, parse_predatabase, parse_predb_ovh, parse_rss, parse_seriousaboutsound, parse_srrdb,
+    parse_nzedb, parse_predatabase, parse_rss, parse_seriousaboutsound, parse_srrdb,
 };
 
 #[derive(Debug, PartialEq)]
@@ -160,18 +160,6 @@ pub const SOURCES: &[FeedSpec] = &[
         refresh_secs: 0,
     },
     FeedSpec {
-        id: 6,
-        key: "predb_ovh",
-        endpoint: "https://predb.ovh/api/v1/",
-        page_size_param: "count",
-        max_page_size: 100,
-        max_page: None,
-        min_delay_ms: 1_000,
-        parse: Parser::Json(parse_predb_ovh),
-        paging: Paging::Query,
-        ..ONE_PAGE
-    },
-    FeedSpec {
         id: 7,
         key: "srrdb",
         endpoint: "https://api.srrdb.com/v1/search/order:date-desc",
@@ -295,6 +283,10 @@ pub const SOURCES: &[FeedSpec] = &[
         ..ONE_PAGE
     },
 ];
+
+/// Sources dropped from `SOURCES`, and why. Their ids are never reused.
+pub const RETIRED: &[(&str, &str)] =
+    &[("predb_ovh", "predb.ovh no longer resolves in DNS and never answered a request")];
 
 pub fn spec(key: &str) -> Option<&'static FeedSpec> {
     SOURCES.iter().find(|s| s.key == key)
@@ -516,13 +508,13 @@ mod tests {
             assert!(source.id > 0 && source.id < 100, "100 is a file's: {}", source.key);
             assert!(source.endpoint.starts_with("https://"), "{}", source.key);
         }
-        assert_eq!(SOURCES.len(), 33);
+        assert_eq!(SOURCES.len(), 32);
     }
 
     #[test]
     fn urls_by_paging() {
         let url = |key, page| page_url(spec(key).unwrap(), page, 100);
-        assert_eq!(url("predb_ovh", 2), "https://predb.ovh/api/v1/?count=100&page=2");
+        assert_eq!(url("predb_club", 2), "https://predb.club/api/v1/?count=100&page=2");
         assert_eq!(url("srrdb", 1), "https://api.srrdb.com/v1/search/order:date-desc");
         assert_eq!(url("srrdb", 3), "https://api.srrdb.com/v1/search/order:date-desc/skip:90");
         assert_eq!(url("predb_me", 1), "https://predb.me/?rss=1");
