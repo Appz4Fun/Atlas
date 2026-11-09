@@ -588,6 +588,11 @@ pub fn create_db_at(path: &Path) -> anyhow::Result<()> {
     {
         if !group_columns.contains(col) {
             conn.execute(&format!("alter table groups add column {col} INTEGER"), [])?;
+            // rows from before it may have started anywhere (a stand-in jumped to the newest article): they count as
+            // having begun now, soo no cursor moves up past a range they never read
+            if col == "start_posted" {
+                conn.execute("update groups set start_posted = strftime('%s','now')", [])?;
+            }
         }
     }
 

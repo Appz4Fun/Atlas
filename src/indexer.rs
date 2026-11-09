@@ -982,7 +982,7 @@ async fn time_cursor_start(
     let (others, here) = on_db(db, move |conn| {
         let (others, here) = read_through(conn, &g, &k)?;
         Ok(match (guarded, here) {
-            (true, Some(h)) => (read_through_since(conn, &g, &k, h + TIME_CURSOR_MARGIN)?, here),
+            (true, Some(h)) => (read_through_since(conn, &g, &k, h)?, here),
             (true, None) => (None, None),
             (false, _) => (others, here),
         })
@@ -995,7 +995,17 @@ async fn time_cursor_start(
     {
         return Ok(Some((own, None)));
     }
-    let at = ctx.pool.article_at(server, group, first as u64, last as u64, target).await? as i64;
+    // a server that can't answer the date search keeps its own cursor (or starts at the top), as without time cursors
+    let at = match ctx.pool.article_at(server, group, first as u64, last as u64, target).await {
+        Ok(at) => at as i64,
+        Err(e) => {
+            println!(
+                "[CURSOR] {group}: {} couldnt find where it's read through elsewhere ({e})",
+                ctx.pool.host(server)
+            );
+            return Ok(own.map(|own| (own, None)));
+        }
+    };
     ctx.states.set_aligned(key, through);
     let found = (at - 1).clamp(first - 1, last);
     let start = own.map_or(found, |own| own.max(found));
