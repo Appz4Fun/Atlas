@@ -1050,6 +1050,29 @@ mod tests {
         assert_eq!(found[&b].kind, "series");
     }
 
+    /// The queue's half of `removed_spots_are_not_fetched_tagged_or_shown_as_spots`, on SQLite and Postgres: removals
+    /// and the blacklist keep spots from being fetched.
+    #[test]
+    fn removed_and_blacklisted_spots_are_not_fetched_on_both_backends() {
+        both(|conn| {
+            let spots = vec![
+                ("mod@spot.net".to_string(), 1, Some("aaa".to_string())),
+                ("own@spot.net".to_string(), 2, Some("bbb".to_string())),
+                ("forged@spot.net".to_string(), 3, Some("ccc".to_string())),
+                ("kept@spot.net".to_string(), 4, Some("ddd".to_string())),
+                ("listed@spot.net".to_string(), 5, Some("fff".to_string())),
+            ];
+            note_read(conn, "s", 5, &spots, 0).unwrap();
+            let d = |id: &str, spotter: &str, at: i64| Disposal { message_id: id.into(), spotter: spotter.into(), at };
+            let removals = [d("mod@spot.net", "", 10), d("own@spot.net", "bbb", 10), d("forged@spot.net", "bbb", 10)];
+            assert_eq!(note_disposals(conn, &removals).unwrap(), 3);
+            assert_eq!(note_disposals(conn, &removals).unwrap(), 0, "noted once");
+            super::super::blacklist::replace(conn, &["fff".into()], 0).unwrap();
+            assert_eq!(todo(conn, 10).unwrap(), ["forged@spot.net", "kept@spot.net"]);
+            assert_eq!(waiting(conn).unwrap(), 2);
+        });
+    }
+
     #[test]
     fn removed_spots_are_not_fetched_tagged_or_shown_as_spots() {
         let conn = main_db();

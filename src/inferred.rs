@@ -399,7 +399,7 @@ fn mark_ids(db: &dyn Sql, marks: &[(String, Outcome)], now: i64) -> crate::pg::s
     let answered = format!(
         "insert into inferred_ids (message_id, next_at, tries) values ($1, $2, 1)
          on conflict (message_id) do update set
-            tries = inferred_ids.tries + 1, next_at = $3 + case inferred_ids.tries{waits} else {} end",
+            tries = inferred_ids.tries + 1, next_at = cast($3 as bigint) + case inferred_ids.tries{waits} else {} end",
         backoff(0, 16)
     );
     db.tx(|tx| {
