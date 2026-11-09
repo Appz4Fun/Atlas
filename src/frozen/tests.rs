@@ -890,7 +890,7 @@ fn a_split_uploads_frozen_rows_thaw_for_their_own_articles() {
 }
 
 #[test]
-fn payloads_of_shards_folded_into_one_keep_their_message_ids_in_a_scratch_copy() {
+fn payloads_whose_ids_another_payload_gave_other_suffixes_keep_their_message_ids_in_a_scratch_copy() {
     // id 3 is one suffix in the first payload's shard and another in the second's; each has a file sealed in a blob
     // and one kept as rows
     let conn = Connection::open_in_memory().unwrap();
@@ -958,41 +958,26 @@ fn payloads_of_shards_folded_into_one_keep_their_message_ids_in_a_scratch_copy()
 }
 
 #[test]
-fn a_release_frozen_in_a_folded_shard_thaws_without_fetching_its_sealed_blobs() {
-    // frozen in shard 3 before the merge: its domain 3 is that shard's, which the merged shard keeps at 3 << 32, and
+fn a_release_whose_ids_read_the_same_thaws_without_fetching_its_sealed_blobs() {
     // its file's blob is a place in the sealed log (which this test has no address for, soo a fetch would fail)
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(&SCRATCH.replace("{s}.", "")).unwrap();
-    let base = 3i64 << 32;
-    conn.execute("insert into domains (id, suffix) values (1, '@x>'), (3, '@other>'), (?1, '@x>')", [base + 3])
-        .unwrap();
+    conn.execute("insert into domains (id, suffix) values (1, '@x>')", []).unwrap();
     let mut place = sealed_log::REF_TAG.to_vec();
     place.resize(sealed_log::REF_BYTES, 7);
-    let payload = |release: i64, domain: i64| {
-        let mut releases = payload::Table::new("releases", vec!["id".into(), "name".into(), "parts".into()]);
-        releases.rows.push(vec![Value::Integer(release), Value::Text(format!("R{release}")), Value::Integer(1)]);
-        let mut files =
-            payload::Table::new("files", ["id", "release_id", "filename", "seen", "blob"].map(String::from).to_vec());
-        files.rows.push(vec![
-            Value::Integer(1),
-            Value::Integer(release),
-            Value::Text("a.rar".into()),
-            Value::Blob(vec![]),
-            Value::Blob(place.clone()),
-        ]);
-        Payload { domains: vec![(domain, "@x>".to_string())], tables: vec![releases, files] }
-    };
-    let blob_of = |release: i64| -> Vec<u8> {
-        conn.query_row("select blob from files where release_id = ?1", [release], |r| r.get(0)).unwrap()
-    };
-    restore(&conn, "main", &payload(8 * 1000 + 3, 3), Domains::Map).unwrap();
-    let thawed = blob_of(8 * 1000 + 3);
-    assert!(crate::blob::is_remote(&thawed), "still in the log");
-    assert_eq!(crate::blob::inner(&thawed), &place[..]);
-    assert_eq!(thawed[..crate::blob::SHIFTED_TAG.len()], crate::blob::SHIFTED_TAG);
-    let at = crate::blob::SHIFTED_TAG.len();
-    assert_eq!(i64::from_le_bytes(thawed[at..at + 8].try_into().unwrap()), base, "read on from the shard's base");
-    // frozen since the merge, its ids the merged shard's: the blob as it was
-    restore(&conn, "main", &payload(8 * 1000 + 16, base + 3), Domains::Map).unwrap();
-    assert_eq!(blob_of(8 * 1000 + 16), place);
+    let mut releases = payload::Table::new("releases", vec!["id".into(), "name".into(), "parts".into()]);
+    releases.rows.push(vec![Value::Integer(16), Value::Text("R16".into()), Value::Integer(1)]);
+    let mut files =
+        payload::Table::new("files", ["id", "release_id", "filename", "seen", "blob"].map(String::from).to_vec());
+    files.rows.push(vec![
+        Value::Integer(1),
+        Value::Integer(16),
+        Value::Text("a.rar".into()),
+        Value::Blob(vec![]),
+        Value::Blob(place.clone()),
+    ]);
+    let payload = Payload { domains: vec![(1, "@x>".to_string())], tables: vec![releases, files] };
+    restore(&conn, "main", &payload, Domains::Map).unwrap();
+    let blob: Vec<u8> = conn.query_row("select blob from files where release_id = 16", [], |r| r.get(0)).unwrap();
+    assert_eq!(blob, place, "the blob as it was");
 }

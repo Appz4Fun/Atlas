@@ -322,7 +322,7 @@ mod tests {
     }
 
     #[test]
-    fn a_merged_shards_blobs_take_the_targets_domains_or_read_theirs_on_from_a_base() {
+    fn remapped_blobs_take_the_targets_domains_or_read_theirs_on_from_a_base() {
         let segs = vec![
             Seg { part: Some(1), bytes: 10, domain: 3, local: b"a".to_vec() },
             Seg { part: Some(2), bytes: 10, domain: 4, local: b"b".to_vec() },

@@ -59,8 +59,7 @@ fn kept() -> Vec<Kept> {
 const FREEZE_EXEMPT: &str = "freeze_exempt";
 
 fn shard_files(main: &Path) -> Vec<PathBuf> {
-    crate::store::shard_paths(main).into_iter().filter(|p| p.exists())
-        .collect()
+    crate::store::shard_paths(main).into_iter().filter(|p| p.exists()).collect()
 }
 
 /// A column as SQLite declares it, and the Postgres type it's copied as.
