@@ -806,6 +806,7 @@ impl Inner {
             }
             if step.needs() == Needs::Bodies {
                 match rules::body_gate(rules, &facts(&row), &summary) {
+                    BodyGate::Outside if step.asked_for(conn, row.info.id) => {}
                     BodyGate::Outside => {
                         a.set_done |= bit;
                         done |= bit;
@@ -1025,6 +1026,7 @@ impl Inner {
             }
             if step.needs() == Needs::Bodies {
                 match gate {
+                    BodyGate::Outside if step.asked_for(conn, id) => {}
                     BodyGate::Outside => {
                         a.set_done |= bit;
                         self.stats.unmatched.fetch_add(1, Relaxed);
@@ -1096,6 +1098,10 @@ impl Inner {
                     }
                     if let Some(until) = o.wait_until {
                         a.writes.extend(std::mem::take(&mut o.writes).into_iter().map(|w| (bit, w)));
+                        // the reruns its kept writes ask for stand too: a step after it in this visit saw none of them
+                        let other = self.steps.iter().filter(|s| s.id() != step.id()).fold(0, |m, s| m | mask(s.id()));
+                        a.clear |= o.rerun & other;
+                        a.net_mask |= o.rerun & other & a.net_steps;
                         // what it waits for needn't hold up the steps after it
                         waiting = Some(waiting.map_or(until, |w: i64| w.min(until)));
                         a.net_attempts = Some(attempts_before);
@@ -1104,7 +1110,11 @@ impl Inner {
                     } else {
                         self.count_done(&o);
                         a.set_done |= bit;
-                        a.net_mask &= !bit;
+                        // one an earlier step of this visit asked for again ran on what that saw before its writes
+                        // were in: it stays owed
+                        if a.clear & bit == 0 {
+                            a.net_mask &= !bit;
+                        }
                         a.net_attempts = Some(0);
                         a.net_transient = Some(0);
                         a.net_next_at = Some(0);

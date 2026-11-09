@@ -81,7 +81,7 @@ pub const BESIDE_FILES: ShardTable = ShardTable {
 };
 
 /// ?1 the small file's row, ?2 the release it was found beside, ?3 its file id in the set
-const SET_BESIDE: &str = "insert into beside_files (row_id, release_id, par2_file) values (?1, ?2, ?3)
+pub(super) const SET_BESIDE: &str = "insert into beside_files (row_id, release_id, par2_file) values (?1, ?2, ?3)
     on conflict(row_id) do update set release_id = excluded.release_id, par2_file = excluded.par2_file";
 
 /// The release a small file's row was found beside, if any.
@@ -154,11 +154,11 @@ const MIN_LINKED: u64 = 1 << 20;
 const MIN_SIZE_ONLY: u64 = 64 << 20;
 /// How far apart, in ids of this shard, an upload's rows can be: they're read from one run of articles, but other
 /// groups' saves come in between, and an upload cut across groups lands in each group's own run.
-const ID_WINDOW: i64 = 2_000_000;
+pub(super) const ID_WINDOW: i64 = 2_000_000;
 
 /// The ids `saves` saves either way of `id`: ids below `cutover` were handed out eight to a save (eight shards), ids
 /// from it on one to a save (`merge_shards::one_shard_from`).
-fn id_window(id: i64, cutover: i64, saves: i64) -> (i64, i64) {
+pub(super) fn id_window(id: i64, cutover: i64, saves: i64) -> (i64, i64) {
     let per = crate::merge_shards::LEGACY_SHARDS as i64;
     let low = if id >= cutover {
         let dense = (id - cutover).min(saves);
@@ -176,7 +176,7 @@ fn id_window(id: i64, cutover: i64, saves: i64) -> (i64, i64) {
 }
 /// How far apart, in seconds, a small file posted beside a release can say it was posted: an upload's files go up
 /// within a minute or two of each other, and this allows a slow one.
-const BESIDE_SECS: i64 = 30 * 60;
+pub(super) const BESIDE_SECS: i64 = 30 * 60;
 /// Rows checked, at most, for the small files one release's set names.
 const BESIDE_CHECKS: usize = 8;
 /// Names looked up, at most, for one release's small files.
@@ -192,7 +192,7 @@ const LOOK_AGAIN_SECS: i64 = 3 * 3600;
 const LOOK_AGAIN_FOR_DAYS: f64 = 14.0;
 /// A volume that ran out of articles to fetch before it ran out of rows to check goes on this soon, until it has
 /// checked this many.
-const RESUME_SECS: i64 = 300;
+pub(super) const RESUME_SECS: i64 = 300;
 const MAX_TRIED: i64 = 2_000;
 /// How long after one file's last article the next file of the same upload may start, for the end-to-start join that
 /// puts a set's rows ahead of the rest. Tools post files in series, and on real uploads nearly every gap is under two
@@ -206,7 +206,7 @@ static ON_RENAME: LazyLock<(StepMask, StepMask)> = LazyLock::new(|| {
     })
 });
 
-fn retry(e: impl std::fmt::Display) -> StepError {
+pub(super) fn retry(e: impl std::fmt::Display) -> StepError {
     StepError::Retry(e.to_string())
 }
 
@@ -756,7 +756,20 @@ impl Step for LinkStep {
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let id = ctx.release().id;
         let files = ctx.files().map_err(retry)?;
-        let Some(par2_file) = self.par2_file(ctx, &files)? else { return self.small_beside(ctx, &files) };
+        let Some(par2_file) = self.par2_file(ctx, &files)? else {
+            // small files its set names, then the ones it doesn't: an NFO posted on its own, a counted thumbnail
+            let by_set = self.small_beside(ctx, &files)?;
+            let picture_found = by_set.rerun & mask(crate::images::step::IMAGES_STEP) != 0;
+            let by_name = match super::beside::by_name(ctx, &files, picture_found) {
+                Ok(found) => found,
+                // what the set found is kept; the rest waits for a later run
+                Err(StepError::OutOfBudget | StepError::Transient(_)) if !by_set.writes.is_empty() => {
+                    Outcome { wait_until: Some(chrono::Utc::now().timestamp() + RESUME_SECS), ..Default::default() }
+                }
+                Err(e) => return Err(e),
+            };
+            return Ok(merged(by_set, by_name));
+        };
         // the upload this row is in already, and which of its set's files that has
         let mine: Option<i64> = query_one(ctx, "select lead_id from upload_link where release_id = ?", id)?;
         let mut members = HashSet::new();
@@ -929,7 +942,7 @@ fn beside_wanted<'a>(files: &'a [Par2File], own: &HashSet<String>) -> Vec<&'a Pa
 }
 
 /// `posted` (as releases keep it, `YYYY-MM-DD HH:MM:SS`) less and plus `secs`, in the same form.
-fn beside_window(posted: &str, secs: i64) -> Option<(String, String)> {
+pub(super) fn beside_window(posted: &str, secs: i64) -> Option<(String, String)> {
     let at = chrono::NaiveDateTime::parse_from_str(posted.get(..19)?, "%Y-%m-%d %H:%M:%S").ok()?;
     let shift = chrono::Duration::seconds(secs);
     let form = |t: chrono::NaiveDateTime| t.format("%Y-%m-%d %H:%M:%S").to_string();
@@ -942,6 +955,18 @@ fn beside_window(posted: &str, secs: i64) -> Option<(String, String)> {
 fn sealed_set(inventory: &par2::Inventory, wanted: &[&Par2File]) -> Option<[u8; 16]> {
     let set = wanted.first()?.set_id;
     wanted.iter().all(|f| f.set_id == set && inventory.sealed.contains(&(set, f.file_id))).then_some(set)
+}
+
+/// Two outcomes of one run as one: both's writes, either's match and reruns, and the sooner of their waits.
+fn merged(mut a: Outcome, b: Outcome) -> Outcome {
+    a.matched |= b.matched;
+    a.writes.extend(b.writes);
+    a.rerun |= b.rerun;
+    a.wait_until = match (a.wait_until, b.wait_until) {
+        (Some(x), Some(y)) => Some(x.min(y)),
+        (x, y) => x.or(y),
+    };
+    a
 }
 
 /// The one value a query of one id gives, if it gives a row.
