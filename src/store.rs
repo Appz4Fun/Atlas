@@ -566,7 +566,7 @@ pub struct Domains {
     /// the table was read
     loaded: bool,
     /// `ids` has every row of the table (it had at most `DOMAIN_TABLE_MAX`): a domain not there has no row, and
-    /// isnt looked up. Only the shard's writer adds rows, and only through here
+    /// isnt looked up until it would get a row (a thaw adds rows outside here)
     complete: bool,
 }
 
@@ -615,6 +615,17 @@ impl Domains {
                     return Ok((whole(id), 0));
                 }
                 self.seen.remove(suffix);
+                // a row added outside this writer (a thaw, by hand or of late articles) isn't in `ids`: look before
+                // adding one, soo the suffix's UNIQUE never fails the save
+                if self.complete
+                    && let Some(d) = conn
+                        .prepare_cached("select id from domains where suffix = ? order by id limit 1")?
+                        .query_row([suffix], |r| r.get::<_, i64>(0))
+                        .optional()?
+                {
+                    self.remember(suffix.to_string(), d);
+                    return Ok((pack_local(local), d));
+                }
                 conn.prepare_cached(NEW_DOMAIN)?.execute([suffix])?;
                 let domain = conn.last_insert_rowid();
                 self.staged.insert(suffix.to_string(), domain);
@@ -665,6 +676,10 @@ impl Domains {
     /// The transaction `encode` was used in rolled back: its new rows are gone.
     pub(crate) fn rolled_back(&mut self) {
         self.staged.clear();
+        // what was read inside the transaction may hold rows it added (a thaw): read the table again
+        self.ids.clear();
+        self.loaded = false;
+        self.complete = false;
     }
 }
 

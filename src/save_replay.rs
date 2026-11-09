@@ -129,8 +129,11 @@ fn run(args: &[String]) -> Result<()> {
         arg(args, "--parsers", 6usize),
     );
     let live = crate::paths::app_dir();
-    anyhow::ensure!(!db_dir.starts_with(&live), "--db must not be in the live app folder {}", live.display());
     std::fs::create_dir_all(&db_dir)?;
+    // compared resolved (relative paths, `..`, symlinks)
+    let live_real = std::fs::canonicalize(&live).unwrap_or_else(|_| live.clone());
+    let db_real = std::fs::canonicalize(&db_dir)?;
+    anyhow::ensure!(!db_real.starts_with(&live_real), "--db must not be in the live app folder {}", live.display());
     // the run's app folder: the checkpointer and anything else looking for the database find the scratch one
     // SAFETY: set before any other thread starts
     unsafe { std::env::set_var("ATLAS_HOME", &db_dir) };
