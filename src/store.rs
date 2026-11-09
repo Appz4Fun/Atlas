@@ -359,40 +359,107 @@ fn alphabet(tag: u8) -> &'static [u8] {
     }
 }
 
-/// big-endian base-256 bytes of a base-`n` number given as digit values
+/// digits of base `n` that fit one u32 limb step: the most `c` with `n^c <= 2^32`, and `n^c`
+fn chunk(n: u32) -> (usize, u64) {
+    let (mut c, mut m) = (0usize, 1u64);
+    while m * u64::from(n) <= 1 << 32 {
+        m *= u64::from(n);
+        c += 1;
+    }
+    (c, m)
+}
+
+/// big-endian base-256 bytes of a base-`n` number given as digit values, no leading zero byte (none at all for 0)
 fn to_bytes(digits: &[u8], n: u32) -> Vec<u8> {
-    let mut out: Vec<u8> = Vec::new(); // little endian while building
-    for &d in digits {
-        let mut carry = u32::from(d);
-        for b in out.iter_mut() {
-            let v = u32::from(*b) * n + carry;
-            *b = (v & 0xff) as u8;
-            carry = v >> 8;
+    let (c, _) = chunk(n);
+    // little-endian u32 limbs, a chunk of digits folded in at a time
+    let mut limbs: Vec<u32> = Vec::with_capacity(digits.len() / 4 + 1);
+    for group in digits.chunks(c) {
+        let (mut m, mut v) = (1u64, 0u64);
+        for &d in group {
+            m *= u64::from(n);
+            v = v * u64::from(n) + u64::from(d);
         }
-        while carry > 0 {
-            out.push((carry & 0xff) as u8);
-            carry >>= 8;
+        let mut carry = v;
+        for limb in limbs.iter_mut() {
+            let t = u64::from(*limb) * m + carry;
+            *limb = t as u32;
+            carry = t >> 32;
+        }
+        if carry > 0 {
+            limbs.push(carry as u32);
         }
     }
-    out.reverse();
+    let mut out = Vec::with_capacity(limbs.len() * 4);
+    for limb in limbs.iter().rev() {
+        out.extend_from_slice(&limb.to_be_bytes());
+    }
+    let zeros = out.iter().take_while(|b| **b == 0).count();
+    out.drain(..zeros);
     out
 }
 
-/// `len` base-`n` digit values of a big-endian base-256 number
+/// `len` base-`n` digit values of a big-endian base-256 number (the lowest `len`, when it has more)
 fn from_bytes(bytes: &[u8], n: u32, len: usize) -> Vec<u8> {
-    let mut num: Vec<u8> = bytes.to_vec();
-    let mut digits = Vec::with_capacity(len);
-    for _ in 0..len {
-        let mut rem = 0u32;
-        for b in num.iter_mut() {
-            let v = (rem << 8) | u32::from(*b);
-            *b = (v / n) as u8;
-            rem = v % n;
-        }
-        digits.push(rem as u8);
+    let (c, m) = chunk(n);
+    // big-endian u32 limbs
+    let mut limbs: Vec<u32> = Vec::with_capacity(bytes.len() / 4 + 1);
+    let head = bytes.len() % 4;
+    if head > 0 {
+        limbs.push(bytes[..head].iter().fold(0u32, |v, b| (v << 8) | u32::from(*b)));
     }
-    digits.reverse();
+    limbs.extend(bytes[head..].chunks(4).map(|w| u32::from_be_bytes([w[0], w[1], w[2], w[3]])));
+    let mut digits = vec![0u8; len];
+    let mut at = len;
+    let mut start = 0;
+    while at > 0 {
+        while start < limbs.len() && limbs[start] == 0 {
+            start += 1;
+        }
+        if start == limbs.len() {
+            // the rest are leading zeros
+            break;
+        }
+        let mut rem = 0u64;
+        for limb in &mut limbs[start..] {
+            let v = (rem << 32) | u64::from(*limb);
+            *limb = (v / m) as u32;
+            rem = v % m;
+        }
+        for _ in 0..c {
+            if at == 0 {
+                break;
+            }
+            at -= 1;
+            digits[at] = (rem % u64::from(n)) as u8;
+            rem /= u64::from(n);
+        }
+    }
     digits
+}
+
+/// Which characters each packed alphabet takes: bit 0 digits, 1 lowercase, 2 uppercase, 3 `-` and `_`, 4 anything
+/// else
+fn char_class(b: u8) -> u8 {
+    match b {
+        b'0'..=b'9' => 1,
+        b'a'..=b'z' => 2,
+        b'A'..=b'Z' => 4,
+        b'-' | b'_' => 8,
+        _ => 16,
+    }
+}
+
+/// a character's digit value in a packed alphabet it is in
+fn digit_value(tag: u8, b: u8) -> u8 {
+    match (tag, b) {
+        (_, b'0'..=b'9') => b - b'0',
+        (BASE36_LOWER, b'a'..=b'z') => b - b'a' + 10,
+        (_, b'A'..=b'Z') => b - b'A' + 10,
+        (_, b'a'..=b'z') => b - b'a' + 36,
+        (_, b'-') => 62,
+        _ => 63,
+    }
 }
 
 /// Packs a message-id's local part by its shape: hex at half the size
@@ -401,44 +468,63 @@ fn from_bytes(bytes: &[u8], n: u32, len: usize) -> Vec<u8> {
 /// `unpack_local` gives back exactly the same string.
 pub(crate) fn pack_local(local: &str) -> Vec<u8> {
     let bytes = local.as_bytes();
+    let mut classes = 0u8;
+    let mut hex_lower = true;
+    let mut hex_upper = true;
+    for &b in bytes {
+        classes |= char_class(b);
+        hex_lower &= b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
+        hex_upper &= b.is_ascii_digit() || (b'A'..=b'F').contains(&b);
+    }
     let even = !bytes.is_empty() && bytes.len().is_multiple_of(2);
-    let lower = even && bytes.iter().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b));
-    let upper = even && !lower && bytes.iter().all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(b));
-    if lower || upper {
+    if even && (hex_lower || hex_upper) {
         let nibble = |c: u8| (c as char).to_digit(16).unwrap_or(0) as u8;
         let mut out = Vec::with_capacity(1 + bytes.len() / 2);
-        out.push(if lower { HEX_LOWER } else { HEX_UPPER });
+        out.push(if hex_lower { HEX_LOWER } else { HEX_UPPER });
         out.extend(bytes.chunks(2).map(|p| (nibble(p[0]) << 4) | nibble(p[1])));
         return out;
     }
-    if (1..=255).contains(&bytes.len()) {
-        for tag in [DIGITS, BASE36_LOWER, BASE36_UPPER, BASE62, BASE64_URL] {
-            let abc = alphabet(tag);
-            let values: Option<Vec<u8>> =
-                bytes.iter().map(|b| abc.iter().position(|a| a == b).map(|p| p as u8)).collect();
-            if let Some(values) = values {
-                let mut out = vec![tag, bytes.len() as u8];
-                out.extend(to_bytes(&values, abc.len() as u32));
-                return out;
-            }
-        }
+    // the first alphabet, in the order DIGITS, BASE36_LOWER, BASE36_UPPER, BASE62, BASE64_URL, with every character
+    let tag = match classes {
+        _ if !(1..=255).contains(&bytes.len()) || classes & 16 != 0 => TEXT,
+        1 => DIGITS,
+        c if c & 8 != 0 => BASE64_URL,
+        c if c & 6 == 6 => BASE62,
+        c if c & 2 != 0 => BASE36_LOWER,
+        _ => BASE36_UPPER,
+    };
+    if tag == TEXT {
+        let mut out = Vec::with_capacity(1 + bytes.len());
+        out.push(TEXT);
+        out.extend_from_slice(bytes);
+        return out;
     }
-    let mut out = Vec::with_capacity(1 + bytes.len());
-    out.push(TEXT);
-    out.extend_from_slice(bytes);
+    let values: Vec<u8> = bytes.iter().map(|&b| digit_value(tag, b)).collect();
+    let mut out = vec![tag, bytes.len() as u8];
+    out.extend(to_bytes(&values, alphabet(tag).len() as u32));
     out
 }
 
 /// A local part back from any of the packings (tags 0-7).
 pub(crate) fn unpack_local(blob: &[u8]) -> String {
+    const LOWER: &[u8; 16] = b"0123456789abcdef";
+    const UPPER: &[u8; 16] = b"0123456789ABCDEF";
+    let hex = |digits: &[u8; 16]| -> String {
+        let mut out = String::with_capacity(2 * blob.len());
+        for b in &blob[1..] {
+            out.push(digits[usize::from(b >> 4)] as char);
+            out.push(digits[usize::from(b & 15)] as char);
+        }
+        out
+    };
     match blob.first() {
-        Some(&HEX_LOWER) => blob[1..].iter().map(|b| format!("{b:02x}")).collect(),
-        Some(&HEX_UPPER) => blob[1..].iter().map(|b| format!("{b:02X}")).collect(),
+        Some(&HEX_LOWER) => hex(LOWER),
+        Some(&HEX_UPPER) => hex(UPPER),
         Some(&tag) if (DIGITS..=BASE64_URL).contains(&tag) && blob.len() >= 2 => {
             let abc = alphabet(tag);
             from_bytes(&blob[2..], abc.len() as u32, blob[1] as usize)
                 .iter()
-                .map(|&d| abc[d as usize] as char)
+                .map(|&d| abc.get(usize::from(d)).copied().unwrap_or(b'0') as char)
                 .collect()
         }
         _ => String::from_utf8_lossy(blob.get(1..).unwrap_or_default()).into_owned(),
@@ -498,7 +584,15 @@ pub struct Domains {
     /// rows this writer inserted in its open transaction: they move to `ids`
     /// once it commits, and are gone if it rolls back
     staged: HashMap<String, i64>,
+    /// the table was read
+    loaded: bool,
+    /// `ids` has every row of the table (it had at most `DOMAIN_TABLE_MAX`): a domain not there has no row, and
+    /// isnt looked up until it would get a row (a thaw adds rows outside here)
+    complete: bool,
 }
+
+/// domains a writer keeps all of in memory, when the table has no more (`Domains::complete`)
+const DOMAIN_TABLE_MAX: usize = 1_000_000;
 
 /// domains a writer keeps in memory at most, known and not yet known
 const DOMAIN_CACHE: usize = 100_000;
@@ -517,13 +611,19 @@ impl Domains {
     /// (local blob, domain id) for a message-id; domain 0 = stored whole
     pub(crate) fn encode(&mut self, conn: &Connection, id: &str) -> Result<(Vec<u8>, i64)> {
         let Some((local, suffix)) = split_message_id(id) else { return Ok((whole(id), 0)) };
+        if !self.loaded {
+            self.load(conn)?;
+        }
         if let Some(d) = self.ids.get(suffix).or_else(|| self.staged.get(suffix)) {
             return Ok((pack_local(local), *d));
         }
-        let found: Option<i64> = conn
-            .prepare_cached("select id from domains where suffix = ? order by id limit 1")?
-            .query_row([suffix], |r| r.get(0))
-            .optional()?;
+        let found: Option<i64> = if self.complete {
+            None
+        } else {
+            conn.prepare_cached("select id from domains where suffix = ? order by id limit 1")?
+                .query_row([suffix], |r| r.get(0))
+                .optional()?
+        };
         let domain = match found {
             Some(d) => d,
             None => {
@@ -536,6 +636,17 @@ impl Domains {
                     return Ok((whole(id), 0));
                 }
                 self.seen.remove(suffix);
+                // a row added outside this writer (a thaw, by hand or of late articles) isn't in `ids`: look before
+                // adding one, soo the suffix's UNIQUE never fails the save
+                if self.complete
+                    && let Some(d) = conn
+                        .prepare_cached("select id from domains where suffix = ? order by id limit 1")?
+                        .query_row([suffix], |r| r.get::<_, i64>(0))
+                        .optional()?
+                {
+                    self.remember(suffix.to_string(), d);
+                    return Ok((pack_local(local), d));
+                }
                 conn.prepare_cached(NEW_DOMAIN)?.execute([suffix])?;
                 let domain = conn.last_insert_rowid();
                 self.staged.insert(suffix.to_string(), domain);
@@ -546,8 +657,31 @@ impl Domains {
         Ok((pack_local(local), domain))
     }
 
+    /// Every row of the table into `ids`, when it has at most `DOMAIN_TABLE_MAX`; a suffix with two rows (folded
+    /// shards) by its lowest id, as the lookup takes it.
+    fn load(&mut self, conn: &Connection) -> Result<()> {
+        self.loaded = true;
+        let rows: i64 = conn.prepare_cached("select count(*) from domains")?.query_row([], |r| r.get(0))?;
+        if rows as usize > DOMAIN_TABLE_MAX {
+            return Ok(());
+        }
+        let mut stmt = conn.prepare("select suffix, min(id) from domains group by suffix")?;
+        let all = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        self.ids.clear();
+        for row in all {
+            let (suffix, id) = row?;
+            self.ids.insert(suffix, id);
+        }
+        self.complete = true;
+        Ok(())
+    }
+
     fn remember(&mut self, suffix: String, domain: i64) {
-        if self.ids.len() >= DOMAIN_CACHE {
+        if self.complete && self.ids.len() >= DOMAIN_TABLE_MAX {
+            // too many to keep all: back to looking up what isnt kept
+            self.complete = false;
+            self.ids.clear();
+        } else if !self.complete && self.ids.len() >= DOMAIN_CACHE {
             self.ids.clear();
         }
         self.ids.insert(suffix, domain);
@@ -563,6 +697,10 @@ impl Domains {
     /// The transaction `encode` was used in rolled back: its new rows are gone.
     pub(crate) fn rolled_back(&mut self) {
         self.staged.clear();
+        // what was read inside the transaction may hold rows it added (a thaw): read the table again
+        self.ids.clear();
+        self.loaded = false;
+        self.complete = false;
     }
 }
 
@@ -700,6 +838,52 @@ pub const UPLOAD_ROUTES: ShardTable = ShardTable {
 /// put it anyway. Less when two of the release's windows are nearer.
 pub(crate) const ROUTE_SLACK_SECS: i64 = 90;
 
+/// What a save reads off one article without the database (its Date, what its message-id says), worked out by
+/// `prepare` before the slice reaches the shard's writer: the writer is what limits how fast slices are saved, and
+/// this is a tenth of its time otherwise.
+#[derive(Debug, Default)]
+pub(crate) struct ArticleFacts {
+    date: Option<i64>,
+    id: crate::discovery::IdFacts,
+}
+
+impl ArticleFacts {
+    fn of(a: &Article) -> ArticleFacts {
+        ArticleFacts { date: crate::dates::naive_timestamp(&a.date), id: crate::discovery::id_facts(&a.message_id) }
+    }
+}
+
+/// One release's `ArticleFacts`, an article each in order, and whether a file name in it is a program
+/// (`junk::is_executable`).
+#[derive(Debug, Default)]
+pub(crate) struct PreparedRelease {
+    articles: Vec<ArticleFacts>,
+    executable: bool,
+}
+
+/// The prepared releases of slices, by where each release's articles are in memory: a release the save takes as it
+/// came finds its facts, and one it cut into pieces (`route_uploads`, `split_old_rows`) works them out itself.
+pub(crate) type Prepared = HashMap<usize, PreparedRelease>;
+
+/// `Prepared` for a slice's releases, for `ShardWriter::save_prepared`. Off the writer's thread.
+pub(crate) fn prepare(releases: &[Release]) -> Prepared {
+    releases
+        .iter()
+        .map(|r| {
+            let prepared = PreparedRelease {
+                articles: r.articles.iter().map(ArticleFacts::of).collect(),
+                executable: r.articles.iter().any(|a| a.filename.as_deref().is_some_and(crate::junk::is_executable)),
+            };
+            (r.articles.as_ptr() as usize, prepared)
+        })
+        .collect()
+}
+
+/// A release's prepared facts, when they are its own: the same articles, as many.
+fn prepared_for<'p>(prepared: &'p Prepared, release: &Release) -> Option<&'p PreparedRelease> {
+    prepared.get(&(release.articles.as_ptr() as usize)).filter(|p| p.articles.len() == release.articles.len())
+}
+
 /// One save's articles of one file, as `file_timing` keeps them. `from_variants`
 /// counts runs of one From in arrival order, soo a poster that rotates
 /// identities counts high and a steady one stays at 1; `from_hash` is the From
@@ -728,13 +912,22 @@ struct Timing {
 }
 
 impl Timing {
-    fn fold(&mut self, a: &Article, key: &IdKey) {
+    /// `facts`: what `prepare` read off the article already, or None to read it here
+    fn fold(&mut self, a: &Article, key: &IdKey, facts: Option<&ArticleFacts>) {
         self.articles += 1;
-        if let Some(ts) = crate::dates::naive_timestamp(&a.date) {
+        let here;
+        let facts = match facts {
+            Some(f) => f,
+            None => {
+                here = ArticleFacts::of(a);
+                &here
+            }
+        };
+        if let Some(ts) = facts.date {
             self.first_date = Some(self.first_date.map_or(ts, |f| f.min(ts)));
             self.last_date = Some(self.last_date.map_or(ts, |l| l.max(ts)));
         }
-        let facts = crate::discovery::id_facts(&a.message_id);
+        let facts = &facts.id;
         if let Some(tool) = facts.tool {
             self.tool.get_or_insert(tool.code());
         }
@@ -742,9 +935,9 @@ impl Timing {
             self.clock_first = Some(self.clock_first.map_or(ms, |f| f.min(ms)));
             self.clock_last = Some(self.clock_last.map_or(ms, |l| l.max(ms)));
         }
-        if let (Some(host), Some(hw_key), Some(n)) = (facts.hw_host, facts.hw_key, facts.hw_n) {
-            self.hw_host.get_or_insert(host);
-            self.hw_key.get_or_insert(hw_key);
+        if let (Some(host), Some(hw_key), Some(n)) = (&facts.hw_host, &facts.hw_key, facts.hw_n) {
+            self.hw_host.get_or_insert_with(|| host.clone());
+            self.hw_key.get_or_insert_with(|| hw_key.clone());
             self.hw_n_first = Some(self.hw_n_first.map_or(n, |f| f.min(n)));
             self.hw_n_last = Some(self.hw_n_last.map_or(n, |l| l.max(n)));
         }
@@ -862,6 +1055,9 @@ pub(crate) struct FileState {
     pub seen: Vec<u8>,
     /// its articles are in `files.blob` (plus any rows that came later)
     pub sealed: bool,
+    /// made by this save, and no article stored whole in it yet: nothing in it was stored another way that
+    /// `add_segment` has to look for (whole before its domain got a row, or text from before the packing)
+    pub fresh: std::cell::Cell<bool>,
 }
 
 impl FileState {
@@ -905,6 +1101,7 @@ pub(crate) fn file(conn: &Connection, release_id: i64, filename: &str) -> Result
                 file_total: r.get(5)?,
                 seen: r.get(6)?,
                 sealed: r.get(7)?,
+                fresh: std::cell::Cell::new(false),
             })
         })
         .optional()?;
@@ -913,7 +1110,7 @@ pub(crate) fn file(conn: &Connection, release_id: i64, filename: &str) -> Result
     }
     conn.prepare_cached("insert into files (release_id, filename, seen) values (?, ?, x'')")?
         .execute(params![release_id, filename])?;
-    Ok(FileState { id: conn.last_insert_rowid(), ..FileState::default() })
+    Ok(FileState { id: conn.last_insert_rowid(), fresh: std::cell::Cell::new(true), ..FileState::default() })
 }
 
 pub(crate) fn put_file(conn: &Connection, f: &FileState) -> Result<()> {
@@ -925,15 +1122,64 @@ pub(crate) fn put_file(conn: &Connection, f: &FileState) -> Result<()> {
     Ok(())
 }
 
-/// Add one article to a file; false when it was already there, as a row or
-/// in the file's sealed blob, or in another file of its release (`index`,
-/// the release and the hash key when it has more than one file: one
-/// message-id saved under two parsed file names is one article).
+/// `add_segment_with`, its statements prepared for the one article.
+#[cfg(test)]
 pub(crate) fn add_segment(
     conn: &Connection,
     domains: &mut Domains,
     f: &FileState,
     index: Option<(i64, &IdKey)>,
+    a: &Article,
+    sealed: &mut SealedCache,
+) -> Result<bool> {
+    add_segment_with(conn, &mut SegmentStatements::new(conn)?, domains, f, index, None, a, sealed)
+}
+
+/// A release's `release_ids` rows (id hash -> file), its own one left out: for `add_segment_with` to look in instead
+/// of the table, for a release made by the save, whose rows only that save adds.
+fn release_ids_of(conn: &Connection, release_id: i64) -> Result<HashMap<i64, i64>> {
+    conn.prepare_cached("select id_hash, file_id from release_ids where release_id = ? and id_hash != 0")?
+        .query_map([release_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect()
+}
+
+/// The statements `add_segment` runs for each article, prepared once for a whole save: taking each from the
+/// connection's cache again for every article (hashing its SQL to find it) was a few percent of the writer's time.
+pub(crate) struct SegmentStatements<'c> {
+    index_lookup: rusqlite::CachedStatement<'c>,
+    stored: rusqlite::CachedStatement<'c>,
+    insert: rusqlite::CachedStatement<'c>,
+    index_insert: rusqlite::CachedStatement<'c>,
+}
+
+impl<'c> SegmentStatements<'c> {
+    pub(crate) fn new(conn: &'c Connection) -> Result<SegmentStatements<'c>> {
+        Ok(SegmentStatements {
+            index_lookup: conn
+                .prepare_cached("select file_id from release_ids where release_id = ? and id_hash = ?")?,
+            stored: conn.prepare_cached("select 1 from segments where file_id = ? and local = ? and domain = ?")?,
+            insert: conn.prepare_cached(
+                "insert or ignore into segments (file_id, local, domain, part, bytes) values (?, ?, ?, ?, ?)",
+            )?,
+            index_insert: conn
+                .prepare_cached("insert or ignore into release_ids (release_id, id_hash, file_id) values (?, ?, ?)")?,
+        })
+    }
+}
+
+/// Add one article to a file; false when it was already there, as a row or
+/// in the file's sealed blob, or in another file of its release (`index`,
+/// the release and the hash key when it has more than one file: one
+/// message-id saved under two parsed file names is one article). `mirror`, with `index`: every row the release
+/// has in the index, looked in instead of the table and kept up with it (`release_ids_of`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn add_segment_with(
+    conn: &Connection,
+    stmts: &mut SegmentStatements<'_>,
+    domains: &mut Domains,
+    f: &FileState,
+    index: Option<(i64, &IdKey)>,
+    mut mirror: Option<&mut HashMap<i64, i64>>,
     a: &Article,
     sealed: &mut SealedCache,
 ) -> Result<bool> {
@@ -946,40 +1192,44 @@ pub(crate) fn add_segment(
     if hash.is_some() {
         LOOKUPS.set(LOOKUPS.get() + 1);
     }
+    let indexed = |stmts: &mut SegmentStatements<'_>, release_id: i64, hash: i64| -> Result<Option<i64>> {
+        match mirror.as_deref() {
+            Some(rows) => Ok(rows.get(&hash).copied()),
+            None => stmts.index_lookup.query_row(params![release_id, hash], |r| r.get::<_, i64>(0)).optional(),
+        }
+    };
     if let (Some((release_id, _)), Some(hash)) = (index, hash)
-        && let Some(file_id) = conn
-            .prepare_cached("select file_id from release_ids where release_id = ? and id_hash = ?")?
-            .query_row(params![release_id, hash], |r| r.get::<_, i64>(0))
-            .optional()?
+        && let Some(file_id) = indexed(stmts, release_id, hash)?
         && (file_id != f.id || f.sealed)
     {
         return Ok(false);
     }
     let (local, domain) = domains.encode(conn, &a.message_id)?;
-    let stored = |sealed: &mut SealedCache, local: &[u8], domain: i64| -> Result<bool> {
-        let row = conn
-            .prepare_cached("select 1 from segments where file_id = ? and local = ? and domain = ?")?
-            .exists(params![f.id, local, domain])?;
+    let mut stored = |sealed: &mut SealedCache, local: &[u8], domain: i64| -> Result<bool> {
+        let row = stmts.stored.exists(params![f.id, local, domain])?;
         Ok(row || (f.sealed && sealed.contains(conn, f.id, local, domain)?))
     };
     if f.sealed && sealed.contains(conn, f.id, &local, domain)? {
         return Ok(false);
     }
+    // a file this save made has only what this save put in it
+    let fresh = f.fresh.get();
+    if domain == 0 {
+        f.fresh.set(false);
+    }
     // an article saved before its domain got a row is stored whole: dont save it twice
-    if domain != 0 && stored(sealed, &whole(&a.message_id), 0)? {
+    if domain != 0 && !fresh && stored(sealed, &whole(&a.message_id), 0)? {
         return Ok(false);
     }
     // a row from before locals were packed by alphabet has the same local stored as text
-    if (DIGITS..=BASE64_URL).contains(&local[0]) {
+    if !fresh && (DIGITS..=BASE64_URL).contains(&local[0]) {
         let mut legacy = vec![TEXT];
         legacy.extend_from_slice(unpack_local(&local).as_bytes());
         if stored(sealed, &legacy, domain)? {
             return Ok(false);
         }
     }
-    let added = conn
-        .prepare_cached("insert or ignore into segments (file_id, local, domain, part, bytes) values (?, ?, ?, ?, ?)")?
-        .execute(params![f.id, local, domain, a.part, a.bytes])?;
+    let added = stmts.insert.execute(params![f.id, local, domain, a.part, a.bytes])?;
     if added > 0 && f.sealed && sealed.guessed {
         conn.prepare_cached(
             "insert or replace into held_back (file_id, message_id, subject, part, total_parts, file_total, again)
@@ -998,8 +1248,10 @@ pub(crate) fn add_segment(
     if added > 0
         && let (Some((release_id, _)), Some(hash)) = (index, hash)
     {
-        conn.prepare_cached("insert or ignore into release_ids (release_id, id_hash, file_id) values (?, ?, ?)")?
-            .execute(params![release_id, hash, f.id])?;
+        stmts.index_insert.execute(params![release_id, hash, f.id])?;
+        if let Some(rows) = mirror.as_deref_mut() {
+            rows.entry(hash).or_insert(f.id);
+        }
     }
     Ok(added > 0)
 }
@@ -2500,7 +2752,19 @@ impl ShardWriter {
         ids: &Ids,
         batches: impl IntoIterator<Item = &'a [Release]>,
     ) -> Result<()> {
-        let r = self.save_in_transaction(conn, ids, batches);
+        self.save_prepared(conn, ids, batches, &Prepared::new())
+    }
+
+    /// `save`, with what `prepare` worked out of the releases beforehand (none needed: what isnt there is worked out
+    /// here).
+    pub(crate) fn save_prepared<'a>(
+        &mut self,
+        conn: &mut Connection,
+        ids: &Ids,
+        batches: impl IntoIterator<Item = &'a [Release]>,
+        prepared: &Prepared,
+    ) -> Result<()> {
+        let r = self.save_in_transaction(conn, ids, batches, prepared);
         // domains inserted by a save that rolled back have no row: a later
         // save must not use their ids
         match r {
@@ -2515,6 +2779,7 @@ impl ShardWriter {
         conn: &mut Connection,
         ids: &Ids,
         batches: impl IntoIterator<Item = &'a [Release]>,
+        prepared: &Prepared,
     ) -> Result<()> {
         let shard = self.shard;
         // late articles of a frozen release thaw it first (`frozen::thaw_incoming`)
@@ -2553,6 +2818,7 @@ impl ShardWriter {
             )?;
             let mut update_stats = tx
                 .prepare_cached("update releases set size = ?, complete = ?, parts = ?, file_total = ? where id = ?")?;
+            let mut segment_stmts = SegmentStatements::new(&tx)?;
 
             // nothing is ever saved for a blocked group, whichever path it came by
             let mut releases: Vec<Cow<'_, Release>> = Vec::new();
@@ -2600,6 +2866,7 @@ impl ShardWriter {
 
             for release in releases.iter().map(Cow::as_ref) {
                 let t = Instant::now();
+                let ready = prepared_for(prepared, release);
                 let collection =
                     release.collection.as_deref().map(|c| collection_row(&tx, &key, c, release)).transpose()?;
                 let name = collection.as_ref().map_or(release.name.as_str(), |c| c.name.as_str());
@@ -2612,7 +2879,13 @@ impl ShardWriter {
                 {
                     continue;
                 }
-                if release.articles.iter().any(|a| a.filename.as_deref().is_some_and(crate::junk::is_executable)) {
+                let executable = match ready {
+                    Some(p) => p.executable,
+                    None => {
+                        release.articles.iter().any(|a| a.filename.as_deref().is_some_and(crate::junk::is_executable))
+                    }
+                };
+                if executable {
                     crate::junk::remember(&tx, name, &release.group, crate::junk::EXECUTABLE, now)?;
                     if let Some(c) = &collection {
                         crate::junk::remember_collection(&tx, c.key)?;
@@ -2660,15 +2933,18 @@ impl ShardWriter {
 
                 let t = Instant::now();
                 // articles by file, in arrival order
-                let mut by_file: IndexMap<&str, Vec<&Article>> = IndexMap::new();
-                for a in release.articles.iter().filter(|a| !a.message_id.is_empty()) {
-                    by_file.entry(a.filename.as_deref().unwrap_or("")).or_default().push(a);
+                let mut by_file: IndexMap<&str, Vec<(usize, &Article)>> = IndexMap::new();
+                for (i, a) in release.articles.iter().enumerate().filter(|(_, a)| !a.message_id.is_empty()) {
+                    by_file.entry(a.filename.as_deref().unwrap_or("")).or_default().push((i, a));
                 }
 
                 // and whether each might be a copy of a sealed article (see `SealedCache`). A part its file has
                 // already under another message-id is counted too: it isnt known to be a repost, as different files
                 // can share a file row (a name the subject doesnt give, or gives the same for each)
                 let mut added: Vec<(&Article, bool)> = Vec::new();
+                // a release this save made has in the index only what this save puts there: kept in memory
+                let made_now = release_id == id;
+                let mut mirror: Option<HashMap<i64, i64>> = None;
                 for (name, articles) in by_file {
                     let mut f = file(&tx, release_id, name)?;
                     // a release with other files is checked for the same message-id
@@ -2681,15 +2957,27 @@ impl ShardWriter {
                             .inc(&[("event", "indexed"), ("shard", &shard.to_string())], 1);
                     }
                     let index = others.then_some((release_id, &key));
+                    if made_now && others && mirror.is_none() {
+                        mirror = Some(release_ids_of(&tx, release_id)?);
+                    }
                     let before = added.len();
                     let mut timing = Timing::default();
-                    for a in articles {
-                        if add_segment(&tx, domains, &f, index, a, &mut sealed)? {
+                    for (i, a) in articles {
+                        if add_segment_with(
+                            &tx,
+                            &mut segment_stmts,
+                            domains,
+                            &f,
+                            index,
+                            mirror.as_mut(),
+                            a,
+                            &mut sealed,
+                        )? {
                             let unsure = f.sealed && sealed.guessed;
                             // an article that may be a copy of one in the blob isn't timed: sealing again can drop
                             // it, and nothing takes it back out of the timing row, so its counts would stay
                             if !unsure {
-                                timing.fold(a, &key);
+                                timing.fold(a, &key, ready.map(|p| &p.articles[i]));
                             }
                             if unsure {
                                 // maybe a copy of what the blob has: only its part
@@ -2726,6 +3014,7 @@ impl ShardWriter {
                             .exists([release_id])?;
                         if gone > 0 && !others {
                             unindex_release(&tx, release_id)?;
+                            mirror = None;
                         }
                     }
                 }
@@ -3599,6 +3888,135 @@ mod tests {
         assert_eq!(pack_local("ZjPsQyLgOjNtQvXbHeKaXyCm1730295651235").len(), 30, "base62 is smaller than text (38)");
     }
 
+    /// The packing as it was first written (one digit at a time, a byte at a time), kept to check the faster one
+    /// against: what is stored must not change.
+    mod first_packing {
+        use super::super::{BASE64_URL, DIGITS, HEX_LOWER, HEX_UPPER, TEXT, alphabet};
+
+        fn to_bytes(digits: &[u8], n: u32) -> Vec<u8> {
+            let mut out: Vec<u8> = Vec::new();
+            for &d in digits {
+                let mut carry = u32::from(d);
+                for b in out.iter_mut() {
+                    let v = u32::from(*b) * n + carry;
+                    *b = (v & 0xff) as u8;
+                    carry = v >> 8;
+                }
+                while carry > 0 {
+                    out.push((carry & 0xff) as u8);
+                    carry >>= 8;
+                }
+            }
+            out.reverse();
+            out
+        }
+
+        fn from_bytes(bytes: &[u8], n: u32, len: usize) -> Vec<u8> {
+            let mut num: Vec<u8> = bytes.to_vec();
+            let mut digits = Vec::with_capacity(len);
+            for _ in 0..len {
+                let mut rem = 0u32;
+                for b in num.iter_mut() {
+                    let v = (rem << 8) | u32::from(*b);
+                    *b = (v / n) as u8;
+                    rem = v % n;
+                }
+                digits.push(rem as u8);
+            }
+            digits.reverse();
+            digits
+        }
+
+        pub fn pack(local: &str) -> Vec<u8> {
+            let bytes = local.as_bytes();
+            let even = !bytes.is_empty() && bytes.len().is_multiple_of(2);
+            let lower = even && bytes.iter().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b));
+            let upper = even && !lower && bytes.iter().all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(b));
+            if lower || upper {
+                let nibble = |c: u8| (c as char).to_digit(16).unwrap_or(0) as u8;
+                let mut out = vec![if lower { HEX_LOWER } else { HEX_UPPER }];
+                out.extend(bytes.chunks(2).map(|p| (nibble(p[0]) << 4) | nibble(p[1])));
+                return out;
+            }
+            if (1..=255).contains(&bytes.len()) {
+                for tag in DIGITS..=BASE64_URL {
+                    let abc = alphabet(tag);
+                    let values: Option<Vec<u8>> =
+                        bytes.iter().map(|b| abc.iter().position(|a| a == b).map(|p| p as u8)).collect();
+                    if let Some(values) = values {
+                        let mut out = vec![tag, bytes.len() as u8];
+                        out.extend(to_bytes(&values, abc.len() as u32));
+                        return out;
+                    }
+                }
+            }
+            [&[TEXT][..], bytes].concat()
+        }
+
+        pub fn unpack(blob: &[u8]) -> String {
+            match blob.first() {
+                Some(&HEX_LOWER) => blob[1..].iter().map(|b| format!("{b:02x}")).collect(),
+                Some(&HEX_UPPER) => blob[1..].iter().map(|b| format!("{b:02X}")).collect(),
+                Some(&tag) if (DIGITS..=BASE64_URL).contains(&tag) && blob.len() >= 2 => {
+                    let abc = alphabet(tag);
+                    from_bytes(&blob[2..], abc.len() as u32, blob[1] as usize)
+                        .iter()
+                        .map(|&d| abc[d as usize] as char)
+                        .collect()
+                }
+                _ => String::from_utf8_lossy(blob.get(1..).unwrap_or_default()).into_owned(),
+            }
+        }
+    }
+
+    #[test]
+    fn packing_is_byte_for_byte_what_it_always_was() {
+        // a small deterministic generator: ids of every alphabet and length, and the odd character out
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let pools: [&[u8]; 8] = [
+            b"0123456789",
+            b"0123456789abcdef",
+            b"0123456789ABCDEF",
+            b"0123456789abcdefghijklmnopqrstuvwxyz",
+            b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+            b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+            b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_",
+            b"0123456789abcXYZ-_.$%+=",
+        ];
+        let mut cases: Vec<String> = vec![String::new(), "0".into(), "00".into(), "000".into(), "0000000a".into()];
+        for len in [1usize, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 40, 64, 100, 254, 255, 256, 300] {
+            for pool in pools {
+                for _ in 0..20 {
+                    cases.push((0..len).map(|_| pool[(next() % pool.len() as u64) as usize] as char).collect());
+                }
+                // leading zero digits
+                cases.push(format!(
+                    "00{}",
+                    (0..len).map(|_| pool[(next() % pool.len() as u64) as usize] as char).collect::<String>()
+                ));
+            }
+        }
+        for local in &cases {
+            let packed = pack_local(local);
+            assert_eq!(packed, first_packing::pack(local), "packs {local:?} as before");
+            assert_eq!(unpack_local(&packed), *local, "round trip of {local:?}");
+            assert_eq!(unpack_local(&packed), first_packing::unpack(&packed));
+        }
+        // blobs no packing makes (a stored length that doesnt match the number) still decode as before
+        for tag in DIGITS..=BASE64_URL {
+            for blob in [vec![tag, 0], vec![tag, 3, 0xff, 0xff, 0xff, 0xff], vec![tag, 40, 1, 2], vec![tag, 1, 0, 0, 7]]
+            {
+                assert_eq!(unpack_local(&blob), first_packing::unpack(&blob), "{blob:?}");
+            }
+        }
+    }
+
     #[test]
     fn old_packings_still_decode_and_repack_to_the_current_one() {
         // text and hex from before tags 3-7 keep their meaning
@@ -3685,6 +4103,62 @@ mod tests {
         );
         let segments: i64 = conn.query_row("select count(*) from segments", [], |r| r.get(0)).unwrap();
         assert_eq!(segments, 2);
+    }
+
+    #[test]
+    fn a_file_this_save_made_is_fresh_till_something_is_stored_whole_in_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("atlas.s0.db");
+        create_shard(&path).unwrap();
+        let conn = db::open_at(&path).unwrap();
+        let made = file(&conn, 9, "b.rar").unwrap();
+        assert!(made.fresh.get(), "just made: nothing in it but what this save adds");
+        assert!(!file(&conn, 9, "b.rar").unwrap().fresh.get(), "looked up: it may hold anything");
+        let mut domains = Domains::default();
+        // a shared domain's article is packed and leaves the file fresh
+        for n in 0..SHARED_AFTER {
+            domains.encode(&conn, &format!("<{n:032x}@ngPost>")).unwrap();
+        }
+        let packed = Article { message_id: format!("<{:032x}@ngPost>", 99), part: Some(1), ..Default::default() };
+        assert!(add_segment(&conn, &mut domains, &made, None, &packed, &mut SealedCache::new()).unwrap());
+        assert!(made.fresh.get());
+        assert!(!add_segment(&conn, &mut domains, &made, None, &packed, &mut SealedCache::new()).unwrap(), "twice");
+        // one stored whole makes it look again
+        let whole = Article { message_id: "<abc@Rand1>".into(), part: Some(2), ..Default::default() };
+        assert!(add_segment(&conn, &mut domains, &made, None, &whole, &mut SealedCache::new()).unwrap());
+        assert!(!made.fresh.get());
+        let segments: i64 = conn.query_row("select count(*) from segments", [], |r| r.get(0)).unwrap();
+        assert_eq!(segments, 2);
+    }
+
+    #[test]
+    fn a_writer_keeps_the_whole_domain_table_and_looks_nothing_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("atlas.s0.db");
+        create_shard(&path).unwrap();
+        let conn = db::open_at(&path).unwrap();
+        conn.execute_batch("insert into domains (id, suffix) values (7, '@x>'), (9, '@y>')").unwrap();
+        let mut domains = Domains::default();
+        assert_eq!(domains.encode(&conn, "<a1@x>").unwrap().1, 7);
+        assert!(domains.complete && domains.ids.len() == 2, "every row read at once");
+        assert_eq!(domains.encode(&conn, "<a1@y>").unwrap().1, 9);
+        // one not in the table gets its row from the third article on, as before
+        let got: Vec<i64> = (0..4).map(|n| domains.encode(&conn, &format!("<{n}@z>")).unwrap().1).collect();
+        assert_eq!(&got[..2], &[0, 0]);
+        assert!(got[2] > 9 && got[2] < 1 << 32 && got[3] == got[2]);
+        domains.committed();
+        assert_eq!(domains.ids.get("@z>"), Some(&got[2]));
+        // a rolled back row is forgotten, and made again
+        let mut again = Domains::default();
+        let tx = conn.unchecked_transaction().unwrap();
+        let rolled: Vec<i64> = (0..3).map(|n| again.encode(&tx, &format!("<{n}@w>")).unwrap().1).collect();
+        assert!(rolled[2] > 0);
+        tx.rollback().unwrap();
+        again.rolled_back();
+        let redone: Vec<i64> = (0..3).map(|n| again.encode(&conn, &format!("<{n}@w>")).unwrap().1).collect();
+        assert!(redone[2] > 0);
+        let rows: i64 = conn.query_row("select count(*) from domains where suffix = '@w>'", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 1);
     }
 
     #[test]
@@ -3937,6 +4411,84 @@ mod tests {
         let n: i64 = conn.query_row("select count(*) from releases", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 1, "a gone row isnt made again");
     }
+    #[test]
+    fn a_prepared_save_keeps_what_an_unprepared_one_does() {
+        let art = |id: &str, part: i64, file: &str, date: &str| Article {
+            message_id: id.into(),
+            subject: format!("\"{file}\" yEnc ({part}/3)"),
+            author: "p <p@x>".into(),
+            date: date.into(),
+            number: part as u64 + 100,
+            lines: 10,
+            filename: Some(file.into()),
+            part: Some(part),
+            total_parts: Some(3),
+            bytes: 100,
+            ..Default::default()
+        };
+        let releases = vec![
+            Release {
+                name: "Rel".into(),
+                group: "alt.binaries.t".into(),
+                articles: vec![
+                    art("<1730295651235.a1b2c3@nyuu>", 1, "a.rar", "Mon, 04 Nov 2024 10:00:00 +0000"),
+                    art("<1730295651299.a1b2c4@nyuu>", 2, "a.rar", "Mon, 04 Nov 2024 10:00:05 +0000"),
+                    art("<1730295652000.a1b2c5@nyuu>", 1, "a.par2", "2024-11-04 10:00:09"),
+                ],
+                ..Default::default()
+            },
+            Release {
+                name: "Prog".into(),
+                group: "alt.binaries.t".into(),
+                articles: vec![art("<x1@y>", 1, "setup.exe", "Mon, 04 Nov 2024 10:00:00 +0000")],
+                ..Default::default()
+            },
+        ];
+        let saved = |prepared: bool| {
+            let dir = tempfile::tempdir().unwrap();
+            let main = dir.path().join("atlas.db");
+            db::create_db_at(&main).unwrap();
+            let shard = shard_of("alt.binaries.t");
+            let mut conn = db::open_shard(&shard_path(&main, shard)).unwrap();
+            let ready = if prepared { prepare(&releases) } else { Prepared::new() };
+            assert_eq!(ready.len(), if prepared { 2 } else { 0 });
+            ShardWriter::new(shard).save_prepared(&mut conn, &Ids::new(&main), [releases.as_slice()], &ready).unwrap();
+            let rows: Vec<String> = conn
+                .prepare(
+                    "select r.name, f.filename, t.first_date, t.last_date, t.tool, t.clock_first, t.clock_last,
+                            t.articles from file_timing t join files f on f.id = t.file_id
+                     join releases r on r.id = t.release_id order by f.filename",
+                )
+                .unwrap()
+                .query_map([], |r| {
+                    Ok(format!(
+                        "{} {} {:?} {:?} {:?} {:?} {:?} {}",
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<i64>>(2)?,
+                        r.get::<_, Option<i64>>(3)?,
+                        r.get::<_, Option<i64>>(4)?,
+                        r.get::<_, Option<i64>>(5)?,
+                        r.get::<_, Option<i64>>(6)?,
+                        r.get::<_, i64>(7)?
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            rows
+        };
+        let plain = saved(false);
+        assert_eq!(plain.len(), 2, "both files of Rel, and nothing of the program: {plain:?}");
+        assert!(plain.iter().all(|r| r.starts_with("Rel ") && !r.contains(" None None None None ")), "{plain:?}");
+        assert_eq!(saved(true), plain);
+        // a release that isnt the one prepared (a piece the save cut) finds nothing, and works it out itself
+        let ready = prepare(&releases);
+        let piece = Release { articles: releases[0].articles[..1].to_vec(), ..releases[0].clone() };
+        assert!(prepared_for(&ready, &piece).is_none());
+        assert!(prepared_for(&ready, &releases[0]).is_some());
+    }
+
     #[test]
     fn file_timing_folds_each_save() {
         let dir = tempfile::tempdir().unwrap();
@@ -4961,6 +5513,73 @@ mod tests {
         let before = state();
         save(&main, &[again("<a3@x>"), again("<b1@x>")]).unwrap();
         assert_eq!(state(), before, "beside a blob");
+    }
+
+    /// A release the save makes is checked across its files from memory (`release_ids_of`): the same copies are
+    /// dropped, and the index ends up as a save of the files one at a time leaves it.
+    #[test]
+    fn a_release_made_by_the_save_drops_copies_across_its_files() {
+        let art = |id: &str, file: &str, part: i64| Article {
+            message_id: id.into(),
+            subject: format!("\"{file}\" yEnc ({part}/3)"),
+            filename: Some(file.into()),
+            part: Some(part),
+            total_parts: Some(3),
+            bytes: 10,
+            ..Default::default()
+        };
+        let all = vec![
+            art("<m1@x>", "a.rar", 1),
+            art("<m2@x>", "a.rar", 2),
+            art("<m2@x>", "b.rar", 1),
+            art("<m3@x>", "b.rar", 2),
+            art("<m1@x>", "c.rar", 1),
+            art("<m4@x>", "c.rar", 2),
+        ];
+        let rel = |articles: Vec<Article>| Release {
+            name: "Rel".into(),
+            group: "alt.binaries.t".into(),
+            articles,
+            ..Default::default()
+        };
+        let state = |main: &Path| {
+            let conn = db::open_at(&shard_path(main, shard_of("alt.binaries.t"))).unwrap();
+            let parts: i64 = conn.query_row("select parts from releases", [], |r| r.get(0)).unwrap();
+            let index: Vec<(String, i64)> = conn
+                .prepare(
+                    "select f.filename, count(*) from release_ids i join files f on f.id = i.file_id
+                     group by f.filename order by f.filename",
+                )
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            let segments: i64 = conn.query_row("select count(*) from segments", [], |r| r.get(0)).unwrap();
+            (parts, index, segments)
+        };
+        let fresh = || {
+            let dir = tempfile::tempdir().unwrap();
+            let main = dir.path().join("atlas.db");
+            db::create_db_at(&main).unwrap();
+            (dir, main)
+        };
+        // all in the save that makes the release
+        let (_one, at_once) = fresh();
+        save(&at_once, &[rel(all.clone())]).unwrap();
+        // a file a save, the release there already from the first
+        let (_two, one_by_one) = fresh();
+        for file in ["a.rar", "b.rar", "c.rar"] {
+            save(&one_by_one, &[rel(all.iter().filter(|a| a.filename.as_deref() == Some(file)).cloned().collect())])
+                .unwrap();
+        }
+        let made = state(&at_once);
+        assert_eq!(made.0, 4, "m1 to m4 once each");
+        assert_eq!(made.2, 4);
+        assert_eq!(made, state(&one_by_one));
+        // and a later save, of a release already there, still finds them
+        save(&at_once, &[rel(vec![art("<m3@x>", "d.rar", 1), art("<m5@x>", "d.rar", 2)])]).unwrap();
+        assert_eq!(state(&at_once).0, 5);
     }
 
     /// Past the decode budget a sealed file of the release is still known to
