@@ -51,7 +51,6 @@ A post with a weak name, such as numbered files, has its poster and day in its k
 - `scene_archive_sql`: needs a local dump file, and none is on hand. `--predb-import` covers plain title lists.
 - `predatabase` reads only the newest ten titles a poll. Its history needs a cursor and an API key.
 - The WebSocket streams and the IRC scraper. The streams carry predb.club and predb.net, which are polled. IRC needs its own login.
-- `predb.ovh`'s host no longer resolves. Its code stays in case it returns.
 
 ## Per-function CPU dispatch
 

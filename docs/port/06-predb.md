@@ -62,7 +62,7 @@ Atlas can keep a catalogue of scene and P2P release titles from public JSON feed
 | `predatabase` | JSON with an opaque cursor; 5 requests per run anonymously | Default | Later: its cursor differs, and the depth limit makes it weak without a key |
 | `predb_me` | RSS | Default | Later: needs an XML reader |
 | `srrdb` | JSON, first page only | Opt-in | No: terms say "Use but don't scrape" |
-| `predb_ovh` | JSON, unverified against live responses | Opt-in | No: upstream never reached it |
+| `predb_ovh` | Retired: the domain no longer resolves | Gone | No: it never answered |
 | `apibay`, `knaben` | JSON, P2P or catalogue names | Opt-in | No: not PREs, more false names |
 | `scnsrc_me`, `eztv` | RSS, spaced titles | Opt-in | No: titles are lossy |
 | `nfodb`, `one_techno`, `one_gabba`, `ddlvalley`, `hdencode`, `hdencode_tv`, `mp3scene`, `gload`, `hdworld`, `scnlog`, `movieblog` | RSS catalogues | Opt-in | No: listing sites, not PREs |
