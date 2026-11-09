@@ -64,6 +64,8 @@ par-rs = { git = "https://github.com/xbmc4lyfe/par-rs", branch = "main", default
 tantivy = "0.27"
 quick-xml = "0.42"
 postgres = "0.19"
+# the buffer `pg::sql::Value` writes its Postgres parameters into
+bytes = "1"
 
 [target.'cfg(unix)'.dependencies]
 signal-hook = "0.4"

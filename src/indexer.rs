@@ -1690,7 +1690,7 @@ impl Drop for GiveBackOnDrop<'_> {
         }
         // best effort and quick: one update, only while this claim still owns it
         let r = match self.db.conn.lock() {
-            Ok(conn) => crate::chunks::release(&conn, self.chunk).map(|_| ()).map_err(anyhow::Error::from),
+            Ok(conn) => crate::chunks::release(&*conn, self.chunk).map(|_| ()).map_err(anyhow::Error::from),
             Err(_) => Err(anyhow!("the database connection is poisoned")),
         };
         if let Err(e) = r {
