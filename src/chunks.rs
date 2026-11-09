@@ -35,6 +35,11 @@ fn not_resting_of(prefix: &str, now: i64) -> String {
     )
 }
 
+/// SQL: claimed chunk `c`'s claim isnt stale at unix time `now` (see `CLAIM_TIMEOUT`)
+fn claim_live(now: i64) -> String {
+    format!("(c.claimed_at >= {})", now - CLAIM_TIMEOUT)
+}
+
 const PENDING: i64 = 0;
 const CLAIMED: i64 = 1;
 const DONE: i64 = 2;
@@ -429,54 +434,48 @@ fn claim_turn_with(
 }
 
 /// The newest day any of `groups` still has to do or is doing: (group, oldest day the server keeps). A day pending
-/// (not resting after a failure, see `FAIL_REST`) or claimed, however fresh the claim: a day being read holds the
-/// groups behind it (`claim`). None when none is left.
+/// (not resting after a failure, see `FAIL_REST`) or claimed within `CLAIM_TIMEOUT`: a day being read holds the
+/// groups behind it (`claim`), one whose claim went stale (its worker was killed) doesnt, it is anyone's to take over
+/// (`claim` takes it first). Only when stale claims are all that's left are they the frontier. None when none is left.
 pub fn frontier(db: &dyn Sql, groups: &[(String, i64)], now: i64) -> Result<Option<i64>> {
-    if groups.is_empty() {
-        return Ok(None);
-    }
-    let rows = values_rows(groups.len(), &["text", "bigint"], 0);
-    let sql = format!(
-        "with wanted (g, oldest) as (values {rows}),
-              newest (day) as (
-                  select (select c.day from backfill_chunks c
-                          where c.grp = w.g and c.state = {PENDING} and c.day >= w.oldest and {resting}
-                          order by c.day desc limit 1)
-                  from wanted w
-                  union all
-                  select (select c.day from backfill_chunks c
-                          where c.grp = w.g and c.state = {CLAIMED} and c.day >= w.oldest
-                          order by c.day desc limit 1)
-                  from wanted w
-              )
-         select max(day) from newest",
-        resting = not_resting(now)
-    );
-    first(db.query_uncached(&sql, &group_values(groups))?)?.map_or(Ok(None), |r| r.get(0))
+    frontier_by(db, groups, now, true)
 }
 
 /// The oldest day any of `groups` still has to do or is doing, from each one's `oldest` on: (group, first day). The
-/// forward backfill's frontier (`FORWARD_START_DAY`), as `frontier` is the usual one's.
+/// forward backfill's frontier (`FORWARD_START_DAY`), as `frontier` is the usual one's, and like it not held by a
+/// stale claim: on prod claims left by killed restarts held every group's forward backfill for half an hour.
 pub fn frontier_oldest(db: &dyn Sql, groups: &[(String, i64)], now: i64) -> Result<Option<i64>> {
+    frontier_by(db, groups, now, false)
+}
+
+/// `frontier` when `newest`, else `frontier_oldest`.
+fn frontier_by(db: &dyn Sql, groups: &[(String, i64)], now: i64, newest: bool) -> Result<Option<i64>> {
     if groups.is_empty() {
         return Ok(None);
     }
+    let (order, most) = if newest { ("desc", "max") } else { ("asc", "min") };
     let rows = values_rows(groups.len(), &["text", "bigint"], 0);
     let sql = format!(
         "with wanted (g, oldest) as (values {rows}),
-              oldest (day) as (
+              days (day, stale) as (
                   select (select c.day from backfill_chunks c
                           where c.grp = w.g and c.state = {PENDING} and c.day >= w.oldest and {resting}
-                          order by c.day limit 1)
+                          order by c.day {order} limit 1), 0
                   from wanted w
                   union all
                   select (select c.day from backfill_chunks c
-                          where c.grp = w.g and c.state = {CLAIMED} and c.day >= w.oldest
-                          order by c.day limit 1)
+                          where c.grp = w.g and c.state = {CLAIMED} and c.day >= w.oldest and {live}
+                          order by c.day {order} limit 1), 0
+                  from wanted w
+                  union all
+                  select (select c.day from backfill_chunks c
+                          where c.grp = w.g and c.state = {CLAIMED} and c.day >= w.oldest and not {live}
+                          order by c.day {order} limit 1), 1
                   from wanted w
               )
-         select min(day) from oldest",
-        resting = not_resting(now)
+         select coalesce({most}(case when stale = 0 then day end), {most}(day)) from days",
+        resting = not_resting(now),
+        live = claim_live(now)
     );
     first(db.query_uncached(&sql, &group_values(groups))?)?.map_or(Ok(None), |r| r.get(0))
 }
@@ -751,6 +750,26 @@ pub fn fail(db: &dyn Sql, claim: &Claim, now: i64) -> Result<bool> {
         vals![PENDING, now, &claim.group, claim.day, &claim.server, claim.claimed_at],
     )?;
     Ok(n > 0)
+}
+
+/// At an indexer's start, every chunk still claimed by one of `hosts` (this indexer's servers, `nntp::server_keys`)
+/// put back to pending: only one indexer runs on a database, soo they are claims of a run that was killed before it
+/// could give them back, which otherwise hold their days for `CLAIM_TIMEOUT`. The count.
+pub fn release_left_over(db: &dyn Sql, hosts: &[String]) -> Result<usize> {
+    if hosts.is_empty() {
+        return Ok(0);
+    }
+    // one pass over the table: the hosts in one list
+    let list: Vec<String> = (1..=hosts.len()).map(|i| format!("cast(${i} as text)")).collect();
+    let values: Vec<crate::pg::sql::Value> = hosts.iter().map(Into::into).collect();
+    db.execute_uncached(
+        &format!(
+            "update backfill_chunks set state = {PENDING}, server = null, claimed_at = null
+             where state = {CLAIMED} and server in ({list})",
+            list = list.join(", ")
+        ),
+        &values,
+    )
 }
 
 pub fn release(db: &dyn Sql, claim: &Claim) -> Result<bool> {
@@ -1497,6 +1516,69 @@ mod tests {
             }
             assert_eq!(day(claim(c, &from_11, "short", 0)), None, "day 10 is older than it keeps");
             assert_eq!(day(claim(c, &[("g".to_string(), i64::MIN)], "long", 0)), Some(10));
+        });
+    }
+
+    /// A claim left by a killed run doesnt hold the frontier past `CLAIM_TIMEOUT`: the days ahead of it go on, and
+    /// the stale day itself is still anyone's to take over (forward, it's the oldest soo it goes first).
+    #[test]
+    fn a_stale_claim_doesnt_hold_the_frontier() {
+        both(|c| {
+            add(c, "big", 20_005, 20_000).unwrap();
+            add(c, "small", 20_005, 20_000).unwrap();
+            let all: Vec<(String, i64)> = ["big", "small"].iter().map(|g| (g.to_string(), i64::MIN)).collect();
+            // forward from 20_000: big's 20_000 claimed by a run that then died, small reads its first two days
+            let big = claim_turn_with(c, ("big".into(), i64::MIN), &all, "h", 1000, Some(20_000)).unwrap().unwrap();
+            assert_eq!(big.day, 20_000);
+            for d in [20_000, 20_001] {
+                let k = claim_turn_with(c, ("small".into(), i64::MIN), &all, "h", 1000, Some(20_000)).unwrap().unwrap();
+                assert_eq!(k.day, d);
+                assert!(finish(c, &k, 1000).unwrap());
+            }
+            let small = || claim_turn_with(c, ("small".into(), i64::MIN), &all, "h", 2000, Some(20_000)).unwrap();
+            assert_eq!(frontier_oldest(c, &all, 2000).unwrap(), Some(20_000), "a fresh claim holds it");
+            assert_eq!(small(), None);
+            // past the timeout big's claim no longer counts: the frontier is big's next pending day
+            let late = 1000 + CLAIM_TIMEOUT + 1;
+            assert_eq!(frontier_oldest(c, &all, late).unwrap(), Some(20_001));
+            assert_eq!(frontier(c, &all, late).unwrap(), Some(20_005));
+            // and the stale day is taken over first
+            let k = claim_with(c, &all, "h2", late, Some(20_000)).unwrap().unwrap();
+            assert_eq!((k.group.as_str(), k.day), ("big", 20_000));
+            assert!(!finish(c, &big, late).unwrap(), "the dead run's claim is no longer its own");
+        });
+    }
+
+    /// At start, every chunk still claimed by one of the indexer's servers goes back to pending; another server's
+    /// claims, pending and done days are left alone.
+    #[test]
+    fn a_start_releases_its_servers_left_over_claims() {
+        both(|c| {
+            let one = |g: &str| vec![(g.to_string(), i64::MIN)];
+            for g in ["a1", "a2", "other", "done"] {
+                add(c, g, 20_005, 20_005).unwrap();
+            }
+            let a1 = claim(c, &one("a1"), "a", 1000).unwrap().unwrap();
+            let a2 = claim(c, &one("a2"), "a:119", 1000).unwrap().unwrap();
+            let other = claim(c, &one("other"), "other", 1000).unwrap().unwrap();
+            let done = claim(c, &one("done"), "a", 1000).unwrap().unwrap();
+            assert!(finish(c, &done, 1000).unwrap());
+            assert_eq!(release_left_over(c, &[]).unwrap(), 0);
+            assert_eq!(release_left_over(c, &["a".into(), "a:119".into()]).unwrap(), 2);
+            let state = |k: &Claim| -> (i64, Option<String>) {
+                let r = c.row(
+                    "select state, server from backfill_chunks where grp = $1 and day = $2",
+                    vals![&k.group, k.day],
+                );
+                let r = r.unwrap().unwrap();
+                (r.get(0).unwrap(), r.get(1).unwrap())
+            };
+            assert_eq!(state(&a1), (PENDING, None));
+            assert_eq!(state(&a2), (PENDING, None));
+            assert_eq!(state(&other), (CLAIMED, Some("other".into())));
+            assert_eq!(state(&done).0, DONE);
+            // the released days are claimed again at once, not after CLAIM_TIMEOUT
+            assert_eq!(day(claim(c, &one("a1"), "a", 1001)), Some(20_005));
         });
     }
 

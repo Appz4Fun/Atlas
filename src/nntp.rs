@@ -691,6 +691,10 @@ const SLICES_BUFFERED: usize = 4;
 /// unsaved budget in one burst and every other pass waits while it saves
 /// them one by one
 pub const STREAM_SLICES: usize = 2 * SLICES_BUFFERED;
+/// `STREAM_SLICES` of a day chunk's pass: forward backfill holds every group to the slowest one's day
+/// (`chunks::LOCKSTEP_DAYS`), and one day of the biggest groups is tens of millions of article numbers, soo a chunk
+/// takes many connections at once while the rest wait on it. The unsaved budget still bounds them all
+pub const CHUNK_STREAM_SLICES: usize = 32;
 
 /// `fut`'s output, or None as soon as `stop` is set: stopping doesnt wait on
 /// a provider that went quiet mid reply. Dropping a request part way is safe,
@@ -2057,7 +2061,14 @@ struct UnsavedBudget {
     peak: AtomicUsize,
     /// per-shard partitioned budgets (crate::store::SHARDS = 8)
     shards: Vec<Arc<ShardBudget>>,
+    /// what backfill, day chunks and sweeps may hold at most (`BULK_SHARE` of the cap): the rest is live's, soo new
+    /// posts are never stuck behind old days
+    bulk: Arc<Semaphore>,
+    bulk_cap: usize,
 }
+
+/// The share of the unsaved budget passes other than live may hold.
+pub const BULK_SHARE: f64 = 0.6;
 
 /// The unsaved headers cap a pool takes for `headers`: at least one, at
 /// most what its semaphore holds. Config reads through this too, soo what it
@@ -2080,12 +2091,15 @@ impl UnsavedBudget {
                 })
             })
             .collect();
+        let bulk_cap = ((cap as f64 * BULK_SHARE) as usize).max(1);
         Arc::new(UnsavedBudget {
             permits: Arc::new(Semaphore::new(cap)),
             cap,
             now: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
             shards,
+            bulk: Arc::new(Semaphore::new(bulk_cap)),
+            bulk_cap,
         })
     }
 }
@@ -2100,11 +2114,19 @@ pub struct Unsaved {
     over: usize,
     /// the slice's place among its pass's `STREAM_SLICES`
     _slot: Option<OwnedSemaphorePermit>,
+    /// its room in the bulk share, for a pass other than live
+    bulk: Option<OwnedSemaphorePermit>,
 }
 
 impl Unsaved {
     /// give back all but `headers`
     fn keep(&mut self, headers: usize) {
+        if let Some(ref mut bp) = self.bulk {
+            let b_extra = bp.num_permits().saturating_sub(headers);
+            if b_extra > 0 {
+                drop(bp.split(b_extra));
+            }
+        }
         let extra = self.permit.num_permits().saturating_sub(headers);
         if extra > 0
             && let Some(back) = self.permit.split(extra)
@@ -2554,6 +2576,7 @@ impl Pool {
                 shard_info: Some((sb, shard_permit)),
                 over: 0,
                 _slot: None,
+                bulk: None,
             }
         } else {
             self.reserve_unsaved(numbers).await
@@ -2564,12 +2587,26 @@ impl Pool {
     /// waiting until there is. A slice bigger than the whole budget waits for
     /// all of it.
     async fn reserve_unsaved(&self, numbers: u64) -> Unsaved {
+        self.reserve_unsaved_for(numbers, false).await
+    }
+
+    /// `reserve_unsaved`; `bulk` (a pass other than live) also takes its room in the bulk share first, soo old days
+    /// never hold all of the budget
+    async fn reserve_unsaved_for(&self, numbers: u64, bulk: bool) -> Unsaved {
         let budget = self.unsaved.clone();
-        let n = usize::try_from(numbers).unwrap_or(usize::MAX).clamp(1, budget.cap);
+        // a bulk slice never holds more than the bulk share, even one bigger than it (it then holds past its room, as
+        // a slice bigger than the whole budget does)
+        let most = if bulk { budget.bulk_cap } else { budget.cap };
+        let n = usize::try_from(numbers).unwrap_or(usize::MAX).clamp(1, most);
+        let bulk = if bulk {
+            Some(budget.bulk.clone().acquire_many_owned(n as u32).await.expect("semaphore closed"))
+        } else {
+            None
+        };
         let permit = budget.permits.clone().acquire_many_owned(n as u32).await.expect("semaphore closed");
         let now = budget.now.fetch_add(n, Ordering::Relaxed) + n;
         budget.peak.fetch_max(now, Ordering::Relaxed);
-        Unsaved { permit, budget, shard_info: None, over: 0, _slot: None }
+        Unsaved { permit, budget, shard_info: None, over: 0, _slot: None, bulk }
     }
 
     pub fn len(&self) -> usize {
@@ -3965,8 +4002,8 @@ impl Pool {
     ///
     /// Every slice holds its room in the pool's unsaved budget (`Unsaved`)
     /// until the receiver drops it, soo a receiver keeps it until the slice is
-    /// parsed. At most `STREAM_SLICES` of a stream hold room at once, soo one
-    /// stream cant take the whole budget while its receiver saves slice after
+    /// parsed. At most `width` (`STREAM_SLICES`, `CHUNK_STREAM_SLICES` for a day chunk) of a
+    /// stream hold room at once, soo one stream cant take the whole budget while its receiver saves slice after
     /// slice. A slice takes its slot, then its room, then a connection, and the
     /// slices of one stream take room in order, one waiting at a time. Nothing
     /// that holds room waits for more: a slice holding some is fetching (and
@@ -3977,14 +4014,17 @@ impl Pool {
         group: &str,
         server: usize,
         slices: Vec<(u64, u64)>,
+        width: usize,
+        bulk: bool,
         stop: Arc<AtomicBool>,
     ) -> tokio::sync::mpsc::Receiver<HeaderSlice> {
         let i = server;
+        let width = width.max(1);
         // several groups can stream from one server at once, the server's
         // semaphore keeps the total at its `connections`
-        let workers = self.connections(i).max(1).min(slices.len().max(1)).min(STREAM_SLICES);
+        let workers = self.connections(i).max(1).min(slices.len().max(1)).min(width);
         let (tx, rx) = tokio::sync::mpsc::channel(SLICES_BUFFERED);
-        let slots = Arc::new(Semaphore::new(STREAM_SLICES));
+        let slots = Arc::new(Semaphore::new(width));
         let queue = Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::from(slices)));
         let halt = Arc::new(AtomicBool::new(false));
 
@@ -4006,7 +4046,7 @@ impl Pool {
                     let ((start, end), mut unsaved) = {
                         let mut queue = queue.lock().await;
                         let Some((start, end)) = queue.pop_front() else { return };
-                        let room = pool.reserve_unsaved(end.saturating_sub(start).saturating_add(1));
+                        let room = pool.reserve_unsaved_for(end.saturating_sub(start).saturating_add(1), bulk);
                         let Some(mut unsaved) = unless_stopped(&stop, room).await else { return };
                         unsaved._slot = Some(slot);
                         ((start, end), unsaved)
