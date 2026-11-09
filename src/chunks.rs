@@ -74,7 +74,7 @@ pub fn create(conn: &Connection) -> Result<()> {
         ) without rowid;
         create index if not exists idx_backfill_chunks_grp_state_day
             on backfill_chunks (grp, state, day desc, claimed_at);
-        -- whether any group still has a day to read (`xref::unread_days`)
+        -- whether any group still has a day to read (the header store linker's readiness)
         create index if not exists idx_backfill_chunks_day_state on backfill_chunks (day, state);",
     )?;
     add_column(conn, "backfill_chunks", "done_at")?;
@@ -341,7 +341,6 @@ fn forward_start_day(conn: &Connection, back: Option<i64>, now: i64) -> Result<i
 pub fn claim(conn: &Connection, groups: &[(String, i64)], host: &str, now: i64) -> Result<Option<Claim>> {
     let claimed = claim_any(conn, groups, host, now)?;
     if let Some(c) = &claimed {
-        crate::header_window::note_claimed_day(c.day);
         crate::nxv_store::live::note_claimed_day(c.day);
     }
     Ok(claimed)
@@ -392,7 +391,6 @@ pub fn claim_turn(
 ) -> Result<Option<Claim>> {
     let claimed = claim_turn_any(conn, group, all, host, now)?;
     if let Some(c) = &claimed {
-        crate::header_window::note_claimed_day(c.day);
         crate::nxv_store::live::note_claimed_day(c.day);
     }
     Ok(claimed)

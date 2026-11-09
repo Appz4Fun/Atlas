@@ -1184,7 +1184,6 @@ impl Conn {
     fn archive(&self, lines: &[Vec<u8>]) {
         if let Some(group) = &self.group {
             crate::overview_archive::record(&self.server, group, lines);
-            crate::header_window::record(&self.server, group, lines);
             crate::nxv_store::live::record(&self.server, group, lines);
         }
     }
@@ -1253,11 +1252,7 @@ impl Conn {
             true
         })
         .await?;
-        if self.group.is_some()
-            && (crate::overview_archive::enabled()
-                || crate::header_window::enabled()
-                || crate::nxv_store::live::enabled())
-        {
+        if self.group.is_some() && (crate::overview_archive::enabled() || crate::nxv_store::live::enabled()) {
             let lines = decode_xzver_raw(&raw_lines)?;
             self.archive(&lines);
             return Ok(lines.iter().filter_map(|l| parse_overview(l)).collect());
@@ -4086,7 +4081,7 @@ pub(crate) fn undo_mojibake(text: String) -> String {
 
 /// The groups an overview's `Xref:` field names: `Xref: host group:number group:number`, the full-header form
 /// a server with `Xref:full` in its OVERVIEW.FMT sends. None when the field is something else, or missing.
-fn xref_groups(field: &str) -> Option<u16> {
+pub(crate) fn xref_groups(field: &str) -> Option<u16> {
     let field = field.trim_start();
     if field.len() < 5 || !field.as_bytes()[..5].eq_ignore_ascii_case(b"xref:") {
         return None;

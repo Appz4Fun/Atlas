@@ -1073,6 +1073,14 @@ async fn run_servers(
             crate::repair::run(sched.ctx.clone(), settings, db.clone(), move || s.stopping(), scans_stop.clone()),
         ));
     }
+    // parts no listing showed, asked for on every server by the ids their files' other parts name (see `inferred`)
+    if config.inferred_parts {
+        let s = sched.clone();
+        tasks.spawn(named!(
+            "inferred parts".into(),
+            crate::inferred::run(sched.ctx.clone(), db.clone(), move || s.stopping(), scans_stop.clone())
+        ));
+    }
     // once stopping, the writers do no freezing: their queues of saves drain as fast as they did before it
     let s = sched.clone();
     let since = stopping_since.clone();
@@ -1084,21 +1092,14 @@ async fn run_servers(
         scans_stop.store(true, Ordering::Relaxed);
         crate::frozen::STOPPING.store(true, Ordering::Relaxed);
     });
-    // uploads whose every article has a random subject, linked across groups from the headers kept (`xref`), or from
-    // the day-segment store's blocks when its linker is on (`nxv_store::linker`)
-    {
+    // uploads whose every article has a random subject, linked across groups from the header store's blocks
+    // (`nxv_store::linker`), when the store is on
+    if let Some(store) = crate::nxv_store::live::handle() {
         let s = sched.clone();
-        match crate::nxv_store::live::handle().filter(|_| crate::nxv_store::live::links_on()) {
-            Some(store) => {
-                tasks.spawn(named!(
-                    "the header store linker".into(),
-                    crate::nxv_store::linker::run(db.clone(), store, move || s.stopping())
-                ));
-            }
-            None => {
-                tasks.spawn(named!("the xref linker".into(), crate::xref::run(db.clone(), move || s.stopping())));
-            }
-        }
+        tasks.spawn(named!(
+            "the header store linker".into(),
+            crate::nxv_store::linker::run(db.clone(), store, move || s.stopping())
+        ));
     }
     tasks.spawn(named!("the config watcher".into(), watch_config(sched.clone(), servers)));
     tasks.spawn(named!("the status report".into(), report(sched.clone())));
@@ -1361,7 +1362,6 @@ pub fn run() -> i32 {
     crate::blob_bytes::spawn(&config.sealed_log, stop.clone());
     crate::shared_catalog::start(&config.shared_catalog, stop.clone());
     crate::overview_archive::spawn(&config.overview_archive);
-    crate::header_window::spawn(&config.header_window);
     crate::nxv_store::live::spawn(&crate::config::header_store_config());
     if config.metrics.enabled {
         crate::metrics::catalog::spawn(Duration::from_secs(config.metrics.catalog_every_secs), stop.clone());
@@ -1370,16 +1370,8 @@ pub fn run() -> i32 {
     let code = index(config, stop, Some(writing));
     // the batches still queued for the overview archive
     crate::overview_archive::finish(Duration::from_secs(30));
-    crate::header_window::finish(Duration::from_secs(30));
+    // the header store's open slabs sealed and committed
     crate::nxv_store::live::finish();
-    // the obfuscated headers still queued for the cross-group store
-    if !crate::xref::flush_recorder(Duration::from_secs(60)) {
-        eprintln!("xref: headers still queued at exit weren't all written");
-    }
-    let lost = crate::xref::recorder_failures();
-    if lost > 0 {
-        eprintln!("xref: {lost} headers' writes failed this run (their slices are read again)");
-    }
     code
 }
 

@@ -123,6 +123,16 @@ pub(crate) fn whole_file(
     file: &FileInfo,
     left: &mut usize,
 ) -> Result<Option<Vec<u8>>, StepError> {
+    whole_file_within(ctx, file, left, nzb::MAX_NZB_BYTES)
+}
+
+/// `whole_file`, for a file of at most `max_bytes`.
+pub(crate) fn whole_file_within(
+    ctx: &mut StepCtx<'_>,
+    file: &FileInfo,
+    left: &mut usize,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>, StepError> {
     let parts = file.expected.unwrap_or(0).max(file.parts_seen);
     if parts < 1 || parts as usize > *left {
         return Ok(None);
@@ -151,7 +161,7 @@ pub(crate) fn whole_file(
         }
         let Some(body) = body else { return Ok(None) };
         whole.extend(body);
-        if whole.len() > nzb::MAX_NZB_BYTES {
+        if whole.len() > max_bytes {
             return Ok(None);
         }
     }

@@ -6,7 +6,7 @@ use indexmap::IndexMap;
 
 use crate::atomic::write_atomic;
 use crate::dates::article_timestamp;
-use crate::search::{ArticleRow, ReleaseRow, get_articles, get_release};
+use crate::search::{ArticleRow, ReleaseRow, get_release};
 use crate::ui;
 
 pub fn nzb_filename(name: &str, release_id: Option<i64>) -> String {
@@ -437,11 +437,18 @@ pub fn build_nzb_checked(release_id: i64) -> Result<Option<NzbBuild>> {
 /// all of them: it only makes its files with all of them.
 /// Also returns the rows the articles came from: the release's own, or every row of its post.
 pub(crate) fn inventory(release: &ReleaseRow) -> crate::db::Result<(Vec<ArticleRow>, Vec<String>, Vec<i64>)> {
-    let conn = crate::db::open()?;
-    if let Some(post) = crate::release_info::whole_post_with(&conn, release)? {
+    inventory_with(&crate::db::open()?, release)
+}
+
+/// `inventory` on `conn`, which has the shards attached.
+pub(crate) fn inventory_with(
+    conn: &rusqlite::Connection,
+    release: &ReleaseRow,
+) -> crate::db::Result<(Vec<ArticleRow>, Vec<String>, Vec<i64>)> {
+    if let Some(post) = crate::release_info::whole_post_with(conn, release)? {
         let mut rows = Vec::new();
         for id in &post.ids {
-            rows.push((*id, crate::store::articles(&conn, *id)?));
+            rows.push((*id, crate::store::articles(conn, *id)?));
         }
         // the rows of a linked upload are separate files, where a post cut across groups is one file under one name
         if post.lead.is_some() {
@@ -451,7 +458,7 @@ pub(crate) fn inventory(release: &ReleaseRow) -> crate::db::Result<(Vec<ArticleR
         all.sort_by(|a, b| (&a.filename, a.part, &a.message_id).cmp(&(&b.filename, b.part, &b.message_id)));
         return Ok((all, post.groups, post.ids));
     }
-    Ok((get_articles(release.id)?, vec![release.group_name.clone()], vec![release.id]))
+    Ok((crate::store::articles(conn, release.id)?, vec![release.group_name.clone()], vec![release.id]))
 }
 
 /// A file whose name another row already has keeps its own <file>: the name the NZB groups it by gets its row's id.

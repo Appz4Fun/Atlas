@@ -61,6 +61,12 @@ pub trait Step: Send + Sync + 'static {
     fn reruns(&self) -> Reruns {
         Reruns::default()
     }
+    /// Asked for by hand on release `release_id`, as a picture on its page: a body step runs past the body gate's
+    /// size and type bounds then, which would otherwise mark it done unrun. Only called for a release outside them.
+    fn asked_for(&self, conn: &rusqlite::Connection, release_id: i64) -> bool {
+        let _ = (conn, release_id);
+        false
+    }
     /// Inputs that can change while `enabled` stays true, one bit each. A bit
     /// that wasnt there before redoes this step on existing releases. Cheap, no I/O.
     fn config_stamp(&self) -> u64 {

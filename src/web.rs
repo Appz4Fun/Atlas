@@ -81,7 +81,7 @@ pub fn get(path: &str, query: &str, cookies: Option<&str>, base: &str, api_key: 
         "/ui/results" if signed_in => remembered(results(&args)),
         "/ui/total" if signed_in => html(200, exact_total(&args)),
         "/ui/results" => ApiResponse { headers: vec![("HX-Redirect".into(), "/".into())], ..html(401, String::new()) },
-        "/ui/release" if signed_in => release_page(&args),
+        "/ui/release" if signed_in => release_page(&args, api_key),
         "/ui/duplicates" if signed_in => duplicates_page(&args),
         "/ui/stats" if signed_in => crate::web_stats::page(),
         "/ui/stats/live" if signed_in => crate::web_stats::live(),
@@ -93,6 +93,7 @@ pub fn get(path: &str, query: &str, cookies: Option<&str>, base: &str, api_key: 
         "/ui/still" if signed_in => still(&args),
         "/ui/image" if signed_in => image(&args),
         "/ui/samepicture" if signed_in => same_picture_panel(&args),
+        "/ui/picture" if signed_in => picture_state_fragment(&args, api_key),
         "/ui/samefilm" if signed_in => same_film_panel(&args),
         "/ui/same" if signed_in => same_key_page(&args),
         "/ui/meta" if signed_in => crate::web_meta::fragment(&args),
@@ -102,7 +103,8 @@ pub fn get(path: &str, query: &str, cookies: Option<&str>, base: &str, api_key: 
         "/ui/nzb" if signed_in && args.get("fill").is_some_and(|v| v == "1") => filled_nzb(&args),
         "/ui/nzb" if signed_in => get_nzb(&args),
         "/ui/total" | "/ui/details" | "/ui/pending" | "/ui/poster" | "/ui/cover" | "/ui/still" | "/ui/samefilm"
-        | "/ui/image" | "/ui/samepicture" | "/ui/meta" | "/ui/row" | "/ui/stats/live" | "/ui/stats/stored" => {
+        | "/ui/image" | "/ui/samepicture" | "/ui/picture" | "/ui/meta" | "/ui/row" | "/ui/stats/live"
+        | "/ui/stats/stored" => {
             ApiResponse { headers: vec![("HX-Redirect".into(), "/".into())], ..html(401, String::new()) }
         }
         "/ui/nzb"
@@ -142,6 +144,10 @@ pub fn post(
         "/logout" => Some(redirect(vec![cookie_header("", 0)])),
         "/ui/ask" if signed_in => Some(ask(body, htmx, cookie_value(cookies, INCOMPLETE_COOKIE) == Some(HIDE))),
         "/ui/thaw" if signed_in => Some(thaw_release(body)),
+        "/ui/picture" if signed_in => Some(ask_picture(body, csrf, api_key)),
+        "/ui/picture" => {
+            Some(ApiResponse { headers: vec![("HX-Redirect".into(), "/".into())], ..html(401, String::new()) })
+        }
         "/ui/ask" if htmx => {
             Some(ApiResponse { headers: vec![("HX-Redirect".into(), "/".into())], ..html(401, String::new()) })
         }
@@ -154,7 +160,8 @@ pub fn post(
 
 /// The ui reads a request body only on these paths.
 pub fn takes_post(path: &str) -> bool {
-    matches!(path, "/login" | "/logout" | "/ui/ask" | "/ui/thaw") || crate::web_settings::takes_post(path)
+    matches!(path, "/login" | "/logout" | "/ui/ask" | "/ui/thaw" | "/ui/picture")
+        || crate::web_settings::takes_post(path)
 }
 
 /// Whether to hide incomplete releases, put in `args` as `incomplete=hide` when the url doesn't say but the cookie does,
@@ -2705,7 +2712,7 @@ fn search_page(args: &HashMap<String, String>, base: &str) -> String {
 }
 
 /// One release: what's known about it, and its files where Atlas has looked inside.
-fn release_page(args: &HashMap<String, String>) -> ApiResponse {
+fn release_page(args: &HashMap<String, String>, api_key: &str) -> ApiResponse {
     let id = args.get("id").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
     let release = match get_release(id) {
         Ok(Some(release)) => release,
@@ -2726,6 +2733,7 @@ fn release_page(args: &HashMap<String, String>) -> ApiResponse {
     let mut release = release;
     let mut whole_post = false;
     let mut split_groups = None;
+    let mut post_ids = vec![id];
     // a post spread over several groups, or linked by its PAR2 set, is shown whole
     if let Ok(conn) = crate::db::open()
         && let Ok(Some(post)) = release_info::whole_post_from_catalog(&conn, &release)
@@ -2734,6 +2742,7 @@ fn release_page(args: &HashMap<String, String>) -> ApiResponse {
         let post_contents = release_info::contents_of_split(&conn, &post)
             .unwrap_or_else(|_| release_info::contents(id).unwrap_or_default());
         split_groups = release_info::groups_of_ids(&conn, &post.ids).ok();
+        post_ids.extend(post.ids.iter().copied().filter(|other| *other != id));
         if post.lead.is_none() || !crate::parser::is_obfuscated(&release.name) {
             release.name = release_info::post_stem(&release.name);
             if let Some(names) = &mut names {
@@ -2787,6 +2796,8 @@ fn release_page(args: &HashMap<String, String>) -> ApiResponse {
             &contents,
             recovery.as_ref(),
             split_groups.as_deref(),
+            &post_ids,
+            api_key,
         ),
     )
 }
@@ -2891,6 +2902,8 @@ fn release_html(
     contents: &release_info::Contents,
     recovery: Option<&release_info::RecoveryOnly>,
     split_groups: Option<&[release_info::GroupPosting]>,
+    post_ids: &[i64],
+    api_key: &str,
 ) -> String {
     let category = category.unwrap_or(UNCATEGORIZED);
     // only what's kept: the title panel below fetches what isn't
@@ -3051,7 +3064,8 @@ fn release_html(
         fact("Links", links);
     }
 
-    let nzb_files = nzb_files_html(r.id, contents);
+    // the post's rows, this one first: its pictures and NFO can be in any of them
+    let rows: Vec<i64> = if post_ids.is_empty() { vec![r.id] } else { post_ids.to_vec() };
     let (heading, listed) = inner_files_listed(inner, recovery.is_some());
     let files = if listed.is_empty() {
         String::new()
@@ -3081,8 +3095,16 @@ fn release_html(
             Some(stills_html(shown, &crate::probe::stills::stills(conn, shown), from))
         })
         .unwrap_or_default();
-    let images = conn.as_ref().map(|c| images_html(r.id, &crate::images::step::images(c, r.id))).unwrap_or_default();
+    let shown_pictures = conn.as_ref().map(|c| post_images(c, &rows)).unwrap_or_default();
+    let images = images_html(r.id, &shown_pictures);
     let found = conn.as_ref().and_then(|c| crate::probe::read(c, r.id)).map(|p| seven_z_first_file(p, inner, contents));
+    let nfo = conn
+        .as_ref()
+        .and_then(|c| post_nfo(c, &rows, found.as_ref()))
+        .map_or(String::new(), |(text, imdb)| nfo_html(&text, &imdb));
+    let picture_states = conn.as_ref().map(|c| picture_states(c, &rows, &shown_pictures, contents)).unwrap_or_default();
+    let csrf = crate::web_settings::csrf_token(api_key);
+    let nzb_files = nzb_files_html(r.id, contents, &picture_states, &csrf);
     let probe = match (conn.as_ref(), found.as_ref()) {
         (Some(c), Some(found)) => probe_html(
             found,
@@ -3135,8 +3157,9 @@ fn release_html(
 <div class="panel"><dl class="facts">{facts}</dl></div>
 <div id="pending" hx-get="/ui/pending?id={id}" hx-trigger="load" hx-swap="outerHTML"></div>
 {spot}
-{stills}
+{nfo}
 {images}
+{stills}
 {copies}
 {meta}
 {probe}
@@ -3186,11 +3209,17 @@ fn inner_files_listed(
 /// The files the NZB lists, with how many of each one's articles were seen. With more than one, each name links an
 /// NZB of that file alone, picked by its name (`t=get&name=`), since the list is sorted by name and not in the NZB's
 /// order that `file=N` counts in.
-fn nzb_files_html(id: i64, contents: &release_info::Contents) -> String {
+fn nzb_files_html(
+    id: i64,
+    contents: &release_info::Contents,
+    pictures: &HashMap<String, PictureState>,
+    csrf: &str,
+) -> String {
     if contents.list.is_empty() {
         return String::new();
     }
     let one_by_one = contents.files > 1;
+    let picture_column = !pictures.is_empty();
     let rows: String = contents
         .list
         .iter()
@@ -3210,8 +3239,14 @@ fn nzb_files_html(id: i64, contents: &release_info::Contents) -> String {
             } else {
                 escape(&f.name)
             };
+            let picture = if picture_column {
+                let cell = pictures.get(&f.name).map(|p| picture_state_html(id, &f.name, p, csrf)).unwrap_or_default();
+                format!("<td class=\"col-picture\">{cell}</td>")
+            } else {
+                String::new()
+            };
             format!(
-                "<tr><td class=\"name\">{name}</td><td class=\"num col-size\" title=\"{} bytes\">{}</td><td class=\"num\">{} / {}</td><td class=\"col-state\">{state}</td></tr>",
+                "<tr><td class=\"name\">{name}</td><td class=\"num col-size\" title=\"{} bytes\">{}</td><td class=\"num\">{} / {}</td><td class=\"col-state\">{state}</td>{picture}</tr>",
                 f.bytes,
                 escape(&fmt_size(Some(f.bytes))),
                 thousands(f.seen),
@@ -3219,6 +3254,7 @@ fn nzb_files_html(id: i64, contents: &release_info::Contents) -> String {
             )
         })
         .collect();
+    let picture_head = if picture_column { "<th class=\"col-picture\">Picture</th>" } else { "" };
     let hint = if one_by_one { "<p class=\"note dim\">Click a name for an NZB of that file alone.</p>" } else { "" };
     let more = if (contents.files as usize) > contents.list.len() {
         format!("<p class=\"note\">The first {} of {} files.</p>", contents.list.len(), thousands(contents.files))
@@ -3226,7 +3262,7 @@ fn nzb_files_html(id: i64, contents: &release_info::Contents) -> String {
         String::new()
     };
     format!(
-        "<h2>Files in the NZB</h2>{hint}<div class=\"table-wrap\"><table><thead><tr><th>Name</th><th class=\"num col-size\">Posted size</th><th class=\"num\">Articles</th><th class=\"col-state\">State</th></tr></thead><tbody>{rows}</tbody></table></div>{more}"
+        "<h2>Files in the NZB</h2>{hint}<div class=\"table-wrap\"><table><thead><tr><th>Name</th><th class=\"num col-size\">Posted size</th><th class=\"num\">Articles</th><th class=\"col-state\">State</th>{picture_head}</tr></thead><tbody>{rows}</tbody></table></div>{more}"
     )
 }
 
@@ -3555,14 +3591,6 @@ fn probe_html(
             "<h2>Cover art</h2><div class=\"panel cover-panel\"><a href=\"/ui/cover?id={id}\"><img class=\"cover\" src=\"/ui/cover?id={id}\" alt=\"Cover art attached to the video\" loading=\"lazy\"></a></div>"
         )
     });
-    let imdb: Vec<String> = p
-        .imdb_ids
-        .iter()
-        .map(|id| format!("<a href=\"https://www.imdb.com/title/{id}/\" rel=\"noreferrer\">{id}</a>", id = attr(id)))
-        .collect();
-    let nfo = p.nfo.as_deref().map_or(String::new(), |text| {
-        format!("<h2>NFO</h2><p>{}</p><pre class=\"nfo\">{}</pre>", imdb.join(" · "), escape(text))
-    });
     let sfv = if p.sfv.is_empty() {
         String::new()
     } else {
@@ -3576,7 +3604,7 @@ fn probe_html(
         format!("<h2>SFV</h2><div class=\"table-wrap\"><table><tbody>{rows}</tbody></table></div>")
     };
     format!(
-        "{cover}{}{}{}{attachments}{}{}{}{nfo}{sfv}",
+        "{cover}{}{}{}{attachments}{}{}{}{sfv}",
         panel("Tracks", &tracks),
         panel("Chapters", &chapters),
         panel("Tags", &tags),
@@ -3995,16 +4023,63 @@ fn stills_html(id: i64, stills: &[(u8, Option<i64>, u32, u32)], from: Option<(i6
     )
 }
 
-/// The pictures posted with a release, each with what its headers say.
-fn images_html(id: i64, images: &[crate::images::step::Image]) -> String {
-    if images.is_empty() {
+/// The pictures of a post's rows, each picture once (by its bytes): (the row it's kept for, the picture).
+fn post_images(conn: &rusqlite::Connection, rows: &[i64]) -> Vec<(i64, crate::images::step::Image)> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for &row in rows.iter().take(LINKED_PICTURE_ROWS) {
+        for image in crate::images::step::images(conn, row) {
+            if seen.insert(image.sha256.clone()) {
+                out.push((row, image));
+            }
+        }
+    }
+    out
+}
+
+/// The NFO of a post: the probe's (with the IMDb ids it read) of this release, else of another of its rows, else one a
+/// step kept for any of them (an NFO posted on its own and found beside the release is kept that way).
+fn post_nfo(
+    conn: &rusqlite::Connection,
+    rows: &[i64],
+    probe: Option<&crate::probe::ProbeInfo>,
+) -> Option<(String, Vec<String>)> {
+    if let Some(p) = probe
+        && let Some(text) = &p.nfo
+    {
+        return Some((text.clone(), p.imdb_ids.clone()));
+    }
+    for &row in rows.iter().skip(1).take(32) {
+        if let Some(p) = crate::probe::read(conn, row)
+            && let Some(text) = p.nfo
+        {
+            return Some((text, p.imdb_ids));
+        }
+    }
+    rows.iter().take(32).find_map(|&row| crate::probe::nfo_store::any_text(conn, row)).map(|text| (text, Vec::new()))
+}
+
+/// The NFO panel: its text as posted, and the IMDb titles it names.
+fn nfo_html(text: &str, imdb_ids: &[String]) -> String {
+    let imdb: Vec<String> = imdb_ids
+        .iter()
+        .map(|id| format!("<a href=\"https://www.imdb.com/title/{id}/\" rel=\"noreferrer\">{id}</a>", id = attr(id)))
+        .collect();
+    let links = if imdb.is_empty() { String::new() } else { format!("<p>{}</p>", imdb.join(" · ")) };
+    format!("<section id=\"nfo\"><h2>NFO</h2>{links}<pre class=\"nfo\">{}</pre></section>", escape(text))
+}
+
+/// The pictures posted with a release, each with what its headers say: `pictures` are (the row each is kept for, the
+/// picture), and `id` is the release shown.
+fn images_html(id: i64, pictures: &[(i64, crate::images::step::Image)]) -> String {
+    if pictures.is_empty() {
         return String::new();
     }
-    let figures: String = images
+    let figures: String = pictures
         .iter()
-        .map(|i| {
+        .map(|(row, i)| {
             // the picture's hash in the address: a rerun that puts another picture at this place isn't served from cache
-            let src = format!("/ui/image?id={id}&amp;at={}&amp;v={}", i.position, &i.sha256[..i.sha256.len().min(12)]);
+            let src = format!("/ui/image?id={row}&amp;at={}&amp;v={}", i.position, &i.sha256[..i.sha256.len().min(12)]);
             let facts = image_facts(i);
             format!(
                 "<figure class=\"picture\"><a href=\"{src}\"><img src=\"{src}\" width=\"{}\" height=\"{}\" loading=\"lazy\" alt=\"{}\"></a><figcaption><b>{}</b><dl class=\"facts\">{facts}</dl></figcaption></figure>",
@@ -4016,8 +4091,199 @@ fn images_html(id: i64, images: &[crate::images::step::Image]) -> String {
         })
         .collect();
     format!(
-        "<h2>Pictures</h2><div class=\"pictures\">{figures}</div><div id=\"same-picture\" hx-get=\"/ui/samepicture?id={id}\" hx-trigger=\"load\" hx-swap=\"outerHTML\"></div>"
+        "<section id=\"pictures\"><h2>Pictures</h2><div class=\"pictures\">{figures}</div><div id=\"same-picture\" hx-get=\"/ui/samepicture?id={id}\" hx-trigger=\"load\" hx-swap=\"outerHTML\"></div></section>"
     )
+}
+
+/// Where one of a release's pictures stands, for its line in the files list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PictureState {
+    /// in the Pictures panel
+    Shown,
+    /// asked for and not read yet: when it's read, in words
+    Queued(String),
+    /// asked for and read, but it isn't a picture that could be shown (`images::step::Answer`)
+    Failed(String),
+    /// not read: a Fetch button
+    Offer,
+}
+
+/// The state of each picture the post's files list holds.
+fn picture_states(
+    conn: &rusqlite::Connection,
+    rows: &[i64],
+    shown: &[(i64, crate::images::step::Image)],
+    contents: &release_info::Contents,
+) -> HashMap<String, PictureState> {
+    let names: Vec<&str> =
+        contents.list.iter().map(|f| f.name.as_str()).filter(|n| crate::images::is_image_name(n)).collect();
+    if names.is_empty() {
+        return HashMap::new();
+    }
+    let requests = picture_requests_of(conn, rows);
+    names.into_iter().map(|name| (name.to_string(), picture_state(name, shown, &requests))).collect()
+}
+
+/// Requests of a post's rows and of the releases they were found beside or linked into, which read them.
+fn picture_requests_of(conn: &rusqlite::Connection, rows: &[i64]) -> Vec<crate::images::step::Request> {
+    let mut ids: Vec<i64> = rows.iter().take(LINKED_PICTURE_ROWS).copied().collect();
+    for &row in rows.iter().take(LINKED_PICTURE_ROWS) {
+        if let Some(reader) = picture_reader(conn, row)
+            && !ids.contains(&reader)
+        {
+            ids.push(reader);
+        }
+    }
+    crate::images::step::requests(conn, &ids)
+}
+
+fn picture_state(
+    name: &str,
+    shown: &[(i64, crate::images::step::Image)],
+    requests: &[crate::images::step::Request],
+) -> PictureState {
+    if shown.iter().any(|(_, i)| i.file == name) {
+        return PictureState::Shown;
+    }
+    match requests.iter().filter(|q| q.file == name).max_by_key(|q| q.requested_at) {
+        Some(q) if q.done_at.is_none() && q.passed_over => {
+            PictureState::Failed("the pictures step isn't reading this release".to_string())
+        }
+        Some(q) if q.done_at.is_none() => PictureState::Queued(
+            crate::web_pending::step_eta(q.release_id, "images").unwrap_or_else(|| "soon".to_string()),
+        ),
+        Some(q) if q.outcome.as_deref().is_some_and(|o| o != crate::images::step::Answer::Shown.word()) => {
+            PictureState::Failed(q.outcome.clone().unwrap_or_default())
+        }
+        _ => PictureState::Offer,
+    }
+}
+
+/// The release whose pictures step reads row `row`'s files: the release it was found beside, the upload it's linked
+/// into, or the row itself.
+fn picture_reader(conn: &rusqlite::Connection, row: i64) -> Option<i64> {
+    if let Ok(Some(owner)) = crate::archive::link::beside_owner(conn, row) {
+        return Some(owner);
+    }
+    let s = crate::store::shard_of_id(row);
+    let lead: Option<i64> = conn
+        .prepare_cached(&format!("select lead_id from s{s}.upload_link where release_id = ?1"))
+        .and_then(|mut q| rusqlite::OptionalExtension::optional(q.query_row([row], |r| r.get(0))))
+        .ok()
+        .flatten();
+    Some(lead.unwrap_or(row))
+}
+
+/// The release that reads picture `name` of the post release `id` is shown with: the reader of the row holding it.
+fn picture_target(conn: &rusqlite::Connection, id: i64, name: &str) -> Option<i64> {
+    let release = crate::search::get_release_with(conn, id).ok()??;
+    let rows = release_info::whole_post_with(conn, &release).ok().flatten().map_or_else(|| vec![id], |p| p.ids);
+    let holder = rows.into_iter().take(LINKED_PICTURE_ROWS).find(|row| {
+        let s = crate::store::shard_of_id(*row);
+        conn.query_row(
+            &format!("select exists (select 1 from s{s}.files where release_id = ?1 and filename = ?2)"),
+            rusqlite::params![row, name],
+            |r| r.get::<_, bool>(0),
+        )
+        .unwrap_or(false)
+    })?;
+    picture_reader(conn, holder)
+}
+
+/// Rows of a post looked through for its pictures: the one holding a picture asked for, the pictures shown, and
+/// the requests their cells show. One limit for all three, soo a picture that can be asked for shows how it went.
+const LINKED_PICTURE_ROWS: usize = 256;
+
+/// One picture's cell in the files list: shown, queued with when it's read, failed, or a Fetch button. A queued one
+/// asks again every 30 seconds.
+fn picture_state_html(id: i64, name: &str, state: &PictureState, csrf: &str) -> String {
+    let query = format!("id={id}&amp;name={}", attr(&url_encode(name)));
+    let button = |label: &str| {
+        let vals = serde_json::json!({"id": id.to_string(), "name": name}).to_string();
+        let headers = serde_json::json!({"X-CSRF-Token": csrf}).to_string();
+        format!(
+            "<button class=\"button small\" hx-post=\"/ui/picture\" hx-vals=\"{}\" hx-headers=\"{}\" hx-target=\"closest .picture-state\" hx-swap=\"outerHTML\" title=\"Read this picture at the release's next turn and show it with what its headers say\">{label}</button>",
+            attr(&vals),
+            attr(&headers)
+        )
+    };
+    match state {
+        PictureState::Shown => {
+            "<div class=\"picture-state\"><a href=\"#pictures\">".to_string() + &tag("tag-ok", "SHOWN") + "</a></div>"
+        }
+        PictureState::Queued(when) => format!(
+            "<div class=\"picture-state\" hx-get=\"/ui/picture?{query}\" hx-trigger=\"every 30s\" hx-swap=\"outerHTML\">{} <span class=\"dim\">ready {}</span></div>",
+            tag("tag-warn", "QUEUED"),
+            escape(when)
+        ),
+        PictureState::Failed(why) => format!(
+            "<div class=\"picture-state\">{} <span class=\"dim\">{}</span> {}</div>",
+            tag("tag-bad", "NOT SHOWN"),
+            escape(why),
+            button("Try again")
+        ),
+        PictureState::Offer => format!("<div class=\"picture-state\">{}</div>", button("Fetch")),
+    }
+}
+
+/// `/ui/picture?id=&name=`: a picture's cell, as it stands now. Once it's shown, a link that reloads the page to show it.
+fn picture_state_fragment(args: &HashMap<String, String>, api_key: &str) -> ApiResponse {
+    let id = args.get("id").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
+    let name = args.get("name").map(String::as_str).unwrap_or_default();
+    let Ok(conn) = crate::db::open() else { return html(200, String::new()) };
+    let state = current_picture_state(&conn, id, name);
+    if state == PictureState::Shown {
+        return html(
+            200,
+            format!(
+                "<div class=\"picture-state\">{} <a href=\"/ui/release?id={id}#pictures\">reload to see it</a></div>",
+                tag("tag-ok", "SHOWN")
+            ),
+        );
+    }
+    html(200, picture_state_html(id, name, &state, &crate::web_settings::csrf_token(api_key)))
+}
+
+fn current_picture_state(conn: &rusqlite::Connection, id: i64, name: &str) -> PictureState {
+    let rows = crate::search::get_release_with(conn, id)
+        .ok()
+        .flatten()
+        .and_then(|r| release_info::whole_post_with(conn, &r).ok().flatten())
+        .map_or_else(|| vec![id], |p| p.ids);
+    let shown = post_images(conn, &rows);
+    picture_state(name, &shown, &picture_requests_of(conn, &rows))
+}
+
+/// POST /ui/picture: a picture of release `id` asked for, read at its reader's next turn. Its cell, now queued. A
+/// refusal comes back as a 200 too, soo htmx swaps it in and the cell says why.
+fn ask_picture(body: &str, csrf: Option<&str>, api_key: &str) -> ApiResponse {
+    let args = parse_query(body);
+    if !crate::web_settings::csrf_ok(&args, csrf, api_key) {
+        return html(200, "<div class=\"picture-state\">The page is out of date: reload it.</div>".into());
+    }
+    let id = args.get("id").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
+    let name = args.get("name").map(String::as_str).unwrap_or_default();
+    if !crate::images::is_image_name(name) {
+        return html(200, "<div class=\"picture-state\">Not a picture.</div>".into());
+    }
+    let main = crate::paths::database();
+    let asked = crate::compact::hold_off_compaction(&main).and_then(|_writing| {
+        let conn = crate::db::open()?;
+        let Some(target) = picture_target(&conn, id, name) else { return Ok(None) };
+        crate::images::step::ask(&conn, target, name, chrono::Utc::now().timestamp())?;
+        Ok(Some(conn))
+    });
+    match asked {
+        Ok(Some(conn)) => {
+            let state = current_picture_state(&conn, id, name);
+            html(200, picture_state_html(id, name, &state, &crate::web_settings::csrf_token(api_key)))
+        }
+        Ok(None) => html(200, "<div class=\"picture-state\">No such picture in this release.</div>".into()),
+        Err(e) => {
+            eprintln!("web picture {id} {name:?} failed: {e:#}");
+            html(200, "<div class=\"picture-state\">Couldn't be queued: the error is in Atlas's log.</div>".into())
+        }
+    }
 }
 
 /// A picture's facts, as `<dt>`/`<dd>` pairs: its size and kind, then what a JPEG's headers add.
@@ -4712,13 +4978,16 @@ mod tests {
             list: vec![file("a b&c.mkv"), file("a.par2"), file("")],
             ..Default::default()
         };
-        let html = super::nzb_files_html(9, &contents);
+        let html = super::nzb_files_html(9, &contents, &HashMap::new(), "");
         assert!(html.contains("<a href=\"/ui/nzb?id=9&amp;name=a%20b%26c.mkv\""), "{html}");
         assert!(html.contains(">a b&amp;c.mkv</a>"), "{html}");
         assert_eq!(html.matches("<a href").count(), 2, "no link for a file with no name: {html}");
         contents.files = 1;
         contents.list.truncate(1);
-        assert!(!super::nzb_files_html(9, &contents).contains("<a href"), "one file: the whole NZB is that file");
+        assert!(
+            !super::nzb_files_html(9, &contents, &HashMap::new(), "").contains("<a href"),
+            "one file: the whole NZB is that file"
+        );
     }
 
     #[test]
@@ -5537,6 +5806,49 @@ mod tests {
         let media = MediaInfo { audio: vec![audio(None), audio(Some("DTS:X 7.1"))], ..Default::default() };
         let html = probe_html(&crate::probe::ProbeInfo { media: Some(media), ..Default::default() }, None, None, None);
         assert_eq!(html.matches("DTS:X").count(), 2, "{html}");
+    }
+
+    #[test]
+    fn a_pictures_cell_says_where_it_stands_and_offers_a_fetch() {
+        let offer = picture_state_html(9, "00 thumb.jpg", &PictureState::Offer, "tok");
+        assert!(offer.contains("hx-post=\"/ui/picture\""), "{offer}");
+        assert!(offer.contains("&quot;name&quot;:&quot;00 thumb.jpg&quot;"), "{offer}");
+        assert!(offer.contains("&quot;X-CSRF-Token&quot;:&quot;tok&quot;"), "{offer}");
+        let queued = picture_state_html(9, "a.jpg", &PictureState::Queued("in about 4 min".into()), "tok");
+        assert!(queued.contains("QUEUED") && queued.contains("ready in about 4 min") && queued.contains("every 30s"));
+        assert!(picture_state_html(9, "a.jpg", &PictureState::Shown, "tok").contains("SHOWN"));
+        let failed = picture_state_html(9, "a.jpg", &PictureState::Failed("not a picture".into()), "tok");
+        assert!(failed.contains("not a picture") && failed.contains("Try again"));
+        let req = |done: Option<i64>, outcome: Option<&str>| crate::images::step::Request {
+            release_id: 9,
+            file: "a.jpg".into(),
+            requested_at: 1,
+            done_at: done,
+            outcome: outcome.map(str::to_string),
+            passed_over: false,
+        };
+        assert_eq!(picture_state("a.jpg", &[], &[]), PictureState::Offer);
+        assert_eq!(
+            picture_state("a.jpg", &[], &[req(Some(2), Some("unreadable"))]),
+            PictureState::Failed("unreadable".into())
+        );
+        assert_eq!(
+            picture_state("a.jpg", &[], &[req(Some(2), Some("shown"))]),
+            PictureState::Offer,
+            "its file went from the folder"
+        );
+        assert!(matches!(picture_state("a.jpg", &[], &[req(None, None)]), PictureState::Queued(_)));
+        let passed = crate::images::step::Request { passed_over: true, ..req(None, None) };
+        assert!(matches!(picture_state("a.jpg", &[], &[passed]), PictureState::Failed(_)), "no run will answer it");
+    }
+
+    #[test]
+    fn the_nfo_has_a_panel_of_its_own() {
+        let html = nfo_html("<Some NFO>", &["tt1409024".to_string()]);
+        assert!(html.contains("<section id=\"nfo\"><h2>NFO</h2>"));
+        assert!(html.contains("&lt;Some NFO&gt;"));
+        assert!(html.contains("imdb.com/title/tt1409024/"));
+        assert!(!nfo_html("x", &[]).contains("<p>"));
     }
 
     #[test]
