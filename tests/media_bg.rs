@@ -87,11 +87,7 @@ fn every_shard_is_rewritten_with_the_fan_out_running() {
     }
     let after = shard_inodes(&main);
     assert!(after.iter().zip(&before).all(|(now, was)| now != was), "every shard was rewritten");
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while provider.requests().is_empty() {
-        assert!(Instant::now() < deadline, "the net lane never asked");
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    provider.wait_for_request();
     stop.store(true, Ordering::Relaxed);
     runner.join().unwrap();
 
