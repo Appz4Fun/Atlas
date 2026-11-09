@@ -106,7 +106,7 @@ impl Outcome {
 }
 
 pub async fn run(ctx: PassContext, db: Db, stopping: impl Fn() -> bool, stop: Arc<AtomicBool>) {
-    if let Err(e) = on_db(&db, |conn| Ok(conn.execute_batch(CREATE)?)).await {
+    if let Err(e) = crate::indexer::on_sqlite_db(&db, |conn| Ok(conn.execute_batch(CREATE)?)).await {
         eprintln!("inferred: {e:#}");
         return;
     }

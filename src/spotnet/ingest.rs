@@ -53,7 +53,7 @@ pub struct Pass {
 
 /// Runs spot passes until `stopping`.
 pub async fn run(pool: Arc<Pool>, db: Db, config: SpotsConfig, stopping: impl Fn() -> bool + Send + 'static) {
-    if let Err(e) = on_db(&db, |conn| Ok(store::create_main(conn)?)).await {
+    if let Err(e) = crate::indexer::on_sqlite_db(&db, |conn| Ok(store::create_main(conn)?)).await {
         eprintln!("spots: {e:#}");
         return;
     }
