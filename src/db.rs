@@ -200,11 +200,17 @@ pub fn with_full_flush<T>(conn: &mut Connection, save: impl FnOnce(&mut Connecti
     Ok(saved)
 }
 
+/// statements a writer's connection keeps prepared (`tune_for_writing`)
+pub(crate) const WRITER_STATEMENTS: usize = 256;
+
 /// Tune a connection for heavy indexing writes: a big page cache, no
 /// checkpointing on commit (`checkpointer` copies the WAL into the main file on
 /// its own thread, `finish_checkpoint` lets the WAL start over), and a WAL file
 /// cut back to 1GB whenever it starts over.
 pub fn tune_for_writing(conn: &Connection) -> Result<()> {
+    // a save runs some forty statements, a writer's stage work more: with rusqlite's 16 they pushed each other out
+    // and were prepared again over and over
+    conn.set_prepared_statement_cache_capacity(WRITER_STATEMENTS);
     conn.execute_batch(
         "pragma cache_size = -1048576;
          pragma temp_store = memory;
