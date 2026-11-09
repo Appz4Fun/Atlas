@@ -7,7 +7,8 @@
 //! same code in a schema of its own (`testing`).
 //!
 //! While Postgres is down (a server reboot), `Pool::with_retry` waits and tries again instead of failing, so a
-//! caller that writes a cursor after its save never sees the save fail and the cursor move on regardless.
+//! caller pauses rather than moving a cursor on past a save that didn't happen. The work it repeats must be safe to
+//! run again even when the first try's commit landed and only its answer was lost (see `with_retry`).
 
 pub mod migrate;
 #[cfg(test)]
@@ -256,7 +257,10 @@ impl Pool {
     /// connection (bad SQL, a constraint, a row that isn't there) comes back at once. A reused connection that
     /// turns out dead (Postgres restarted since) is tried again at once on a new one before any wait.
     ///
-    /// `work` may run more than once, so it must be one transaction or otherwise safe to repeat. A transaction is
+    /// `work` may run more than once, and a try whose commit landed but whose answer was lost (the connection
+    /// dropped in between) runs again too: it must give the same result applied twice. One transaction isn't
+    /// enough on its own: write with upserts (`on conflict ... do update` / `do nothing`), compare-and-set (a cursor
+    /// moved only from the value read), or keys made by the caller, never a plain insert or `value = value + n`. A transaction is
     /// opened with `Client::transaction` only (it rolls back if dropped), never with a raw `begin`, and nothing
     /// may `set` a session setting: the connection goes back to the pool as `work` leaves it.
     pub fn with_retry<T>(
