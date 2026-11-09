@@ -937,9 +937,20 @@ fn cursors_or_adopted(
     }
 
     for old in legacy.iter().map(|k| format!("{group}@{k}")) {
-        if db::get_group_state(conn, &old)?.is_some() {
-            conn.execute("delete from groups where name = $1", vals![key])?;
-            conn.execute("update groups set name = $1 where name = $2", vals![key, old.as_str()])?;
+        // the move as one, soo a load of the same key at the same moment can't delete what this one just renamed
+        let moved = conn.tx(|tx| {
+            tx.lock("atlas.adopt_cursors")?;
+            if db::get_group_state(tx, key)?.is_some() {
+                return Ok(true);
+            }
+            if db::get_group_state(tx, &old)?.is_none() {
+                return Ok(false);
+            }
+            tx.execute("delete from groups where name = $1", vals![key])?;
+            tx.execute("update groups set name = $1 where name = $2", vals![key, old.as_str()])?;
+            Ok(true)
+        })?;
+        if moved {
             return Ok(db::get_group_state(conn, key)?);
         }
     }
@@ -1751,32 +1762,37 @@ async fn drop_older_days(db: &Db, group: &str, day: i64) {
 async fn reach_further(db: &Db, group: &str, (_day, floor, oldest): (i64, i64, Option<i64>), dated: i64) {
     let first = oldest.map_or(floor, crate::chunks::unix_day);
     let g = group.to_string();
-    let added = on_db(db, move |conn| {
-        let Some(mut s) = crate::chunks::speculative(conn, &g)? else { return Ok(0) };
-        // a day of a window the reach has moved past is not the current one's
-        if floor != s.runner_up_day - s.reach {
-            return Ok(0);
-        }
-        s.days += 1;
-        s.articles += dated;
-        // the window is judged when its last day is done, not when its oldest is
-        let running = conn.exists(
-            "select 1 from backfill_chunks where grp = $1 and day >= $2 and day < $3 and state != 2",
-            vals![g.as_str(), floor, floor + SPECULATIVE_WINDOW],
-        )?;
-        let further = !running && s.articles >= SPECULATIVE_YIELD * s.days && first < floor;
-        if further {
-            // each extension has to hold enough a day on its own: a dense
-            // first window doesnt pay for the sparse ones after it
-            s.reach += SPECULATIVE_WINDOW;
-            s.days = 0;
-            s.articles = 0;
-        }
-        crate::chunks::set_speculative(conn, &g, &s)?;
-        if !further {
-            return Ok(0);
-        }
-        Ok(crate::chunks::add(conn, &g, floor - 1, (floor - SPECULATIVE_WINDOW).max(first))?)
+    let added = on_db(db, move |db| {
+        // read, counted and written back as one: two days of the window finishing at once would else both count
+        // from the same row, on Postgres
+        Ok(db.tx(|conn| -> crate::pg::sql::Result<usize> {
+            conn.lock(&format!("atlas.speculative.{g}"))?;
+            let Some(mut s) = crate::chunks::speculative(conn, &g)? else { return Ok(0) };
+            // a day of a window the reach has moved past is not the current one's
+            if floor != s.runner_up_day - s.reach {
+                return Ok(0);
+            }
+            s.days += 1;
+            s.articles += dated;
+            // the window is judged when its last day is done, not when its oldest is
+            let running = conn.exists(
+                "select 1 from backfill_chunks where grp = $1 and day >= $2 and day < $3 and state != 2",
+                vals![g.as_str(), floor, floor + SPECULATIVE_WINDOW],
+            )?;
+            let further = !running && s.articles >= SPECULATIVE_YIELD * s.days && first < floor;
+            if further {
+                // each extension has to hold enough a day on its own: a dense
+                // first window doesnt pay for the sparse ones after it
+                s.reach += SPECULATIVE_WINDOW;
+                s.days = 0;
+                s.articles = 0;
+            }
+            crate::chunks::set_speculative(conn, &g, &s)?;
+            if !further {
+                return Ok(0);
+            }
+            Ok(crate::chunks::add(conn, &g, floor - 1, (floor - SPECULATIVE_WINDOW).max(first))?)
+        })?)
     })
     .await;
     match added {
