@@ -173,3 +173,14 @@ dir = ""
 # full segments per server and group kept hot (fast reads); older ones are zstd compressed
 keep_hot = 2
 zstd_level = 9
+
+[storage]
+# where the data lives: "sqlite" (the files next to config.toml) or "postgres" (src/pg/). Postgres is being brought
+# in one area at a time; until then "sqlite" is the only working choice
+backend = "sqlite"
+# a Postgres connection string: "host=... port=... user=... password=... dbname=..." or "postgresql://..."
+url = ""
+schema = "atlas"
+max_connections = 16
+# the connection isn't encrypted: without this, only a loopback or private network address is used
+allow_plaintext = false

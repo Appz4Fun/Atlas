@@ -887,6 +887,12 @@ impl SharedCatalogConfig {
     }
 }
 
+/// The file's `storage` object: which backend holds the data, and the Postgres to use for it (`crate::pg`).
+pub fn storage_config() -> crate::pg::StorageConfig {
+    read_file()
+        .map_or_else(crate::pg::StorageConfig::default, |v| crate::pg::StorageConfig::from_value(v.get("storage")))
+}
+
 /// The file's `shared_catalog` object, for the fill and check commands: no keyring.
 pub fn shared_catalog_config() -> SharedCatalogConfig {
     read_file().map_or_else(SharedCatalogConfig::default, |v| SharedCatalogConfig::from_value(v.get("shared_catalog")))

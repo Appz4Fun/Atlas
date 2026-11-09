@@ -27,6 +27,14 @@ jobs:
 
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
+      # a Postgres for the tests that need one (src/pg/testing.rs); they return early without it, as on macOS and
+      # Windows here
+      - name: Start Postgres
+        if: runner.os == 'Linux'
+        run: |
+          sudo systemctl start postgresql.service
+          sudo -u postgres psql -c "create user atlas superuser password 'atlas'" -c "create database atlas_test owner atlas"
+          echo "ATLAS_PG_TEST_URL=host=127.0.0.1 port=5432 user=atlas password=atlas dbname=atlas_test" >> "$GITHUB_ENV"
       - run: cargo test --locked
       # the overview engine is its own crate (like sealed-log), with its own lock file
       - run: cargo fmt --check
