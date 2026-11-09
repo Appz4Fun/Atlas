@@ -343,6 +343,30 @@ pub fn put_meta(db: &dyn crate::pg::sql::Sql, key: &str, value: i64) -> crate::p
     Ok(())
 }
 
+/// A text kept in the main database's `meta` table, on either backend: SQLite keeps it in `value` (any type goes),
+/// Postgres in `text_value`.
+pub fn meta_text(db: &dyn crate::pg::sql::Sql, key: &str) -> crate::pg::sql::Result<Option<String>> {
+    let sql = match db.dialect() {
+        crate::pg::sql::Dialect::Sqlite => "select cast(value as text) from meta where key = $1",
+        crate::pg::sql::Dialect::Postgres => "select text_value from meta where key = $1",
+    };
+    Ok(db.opt::<Option<String>>(sql, crate::pg::sql::vals![key])?.flatten())
+}
+
+/// Keep a text in the main database's `meta` table, on either backend (see `meta_text`).
+pub fn put_meta_text(db: &dyn crate::pg::sql::Sql, key: &str, value: &str) -> crate::pg::sql::Result<()> {
+    let sql = match db.dialect() {
+        crate::pg::sql::Dialect::Sqlite => {
+            "insert into meta (key, value) values ($1, $2) on conflict (key) do update set value = excluded.value"
+        }
+        crate::pg::sql::Dialect::Postgres => {
+            "insert into meta (key, text_value) values ($1, $2) on conflict (key) do update set text_value = excluded.text_value"
+        }
+    };
+    db.execute(sql, crate::pg::sql::vals![key, value])?;
+    Ok(())
+}
+
 /// Keep a number in the main database's `meta` table.
 pub fn set_meta(conn: &Connection, key: &str, value: i64) -> Result<()> {
     conn.execute("insert or replace into main.meta (key, value) values (?, ?)", params![key, value])?;
@@ -3709,6 +3733,22 @@ pub fn purge_incomplete(main: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn meta_keeps_numbers_and_texts_on_both_backends() {
+        crate::pg::testing::each(
+            |c| create_main(c).unwrap(),
+            |db| {
+                assert_eq!(meta_text(db, "owner").unwrap(), None);
+                put_meta_text(db, "owner", "a.example").unwrap();
+                put_meta_text(db, "owner", "b.example").unwrap();
+                assert_eq!(meta_text(db, "owner").unwrap().as_deref(), Some("b.example"));
+                put_meta(db, "count", 7).unwrap();
+                assert_eq!(meta(db, "count").unwrap(), Some(7));
+                assert_eq!(meta(db, "next_seq").unwrap(), Some(1));
+            },
+        );
+    }
 
     /// a table of sealed files for a `SealedCache`: file i holds `per` segments
     fn sealed_files(files: i64, per: i64) -> Connection {

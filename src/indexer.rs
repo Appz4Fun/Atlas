@@ -826,16 +826,23 @@ impl Db {
     }
 }
 
+/// Schema upkeep of a main database on SQLite (tables added since it was made); on Postgres the migrations made
+/// them, soo there's nothing to do.
+pub(crate) async fn on_sqlite_db(db: &Db, f: impl FnOnce(&Connection) -> Result<()> + Send + 'static) -> Result<()> {
+    let conn = db.conn.clone();
+    tokio::task::spawn_blocking(move || f(&conn.lock().unwrap())).await.map_err(|e| anyhow!("db task failed: {e}"))?
+}
+
 pub(crate) async fn on_db<T: Send + 'static>(
     db: &Db,
-    f: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+    f: impl FnOnce(&dyn Sql) -> Result<T> + Send + 'static,
 ) -> Result<T> {
     let conn = db.conn.clone();
     tokio::task::spawn_blocking(move || {
         let t = std::time::Instant::now();
-        let mut conn = conn.lock().unwrap();
+        let conn = conn.lock().unwrap();
         crate::profile::DB_WAIT.add_since(t);
-        f(&mut conn)
+        f(&*conn)
     })
     .await
     .map_err(|e| anyhow!("db task failed: {e}"))?
@@ -877,28 +884,22 @@ const PLAIN_CURSORS_OF: &str = "plain_cursors_of";
 /// plain name is the one writing them, soo it takes them over from whoever
 /// had them before. With several servers and nothing recorded (cursors kept
 /// by a build from before) they are no one's: each server starts fresh.
-pub fn claim_plain_cursors(conn: &Connection, pool: &Pool) -> Result<()> {
+pub fn claim_plain_cursors(conn: &dyn Sql, pool: &Pool) -> Result<()> {
     let indexing = pool.indexing_servers();
     let [only] = indexing.as_slice() else { return Ok(()) };
     let writes_plain = cursor_key(pool, *only, "g") == "g";
     if writes_plain || plain_cursors_owner(conn)?.is_none() {
-        conn.execute(
-            "insert or replace into main.meta (key, value) values (?, ?)",
-            rusqlite::params![PLAIN_CURSORS_OF, pool.host(*only)],
-        )?;
+        crate::store::put_meta_text(conn, PLAIN_CURSORS_OF, &pool.host(*only))?;
     }
     Ok(())
 }
 
-fn plain_cursors_owner(conn: &Connection) -> Result<Option<String>> {
-    use rusqlite::OptionalExtension;
-    Ok(conn
-        .query_row("select cast(value as text) from main.meta where key = ?", [PLAIN_CURSORS_OF], |r| r.get(0))
-        .optional()?)
+fn plain_cursors_owner(conn: &dyn Sql) -> Result<Option<String>> {
+    Ok(crate::store::meta_text(conn, PLAIN_CURSORS_OF)?)
 }
 
 /// whether the server named `host` (`Pool::host`) kept the plain cursors
-fn owns_plain_cursors(conn: &Connection, host: &str) -> Result<bool> {
+fn owns_plain_cursors(conn: &dyn Sql, host: &str) -> Result<bool> {
     Ok(plain_cursors_owner(conn)?.as_deref() == Some(host))
 }
 
@@ -925,7 +926,7 @@ async fn load_cursors(
 /// plain group name (before a second server was added) only by the server
 /// that kept them (`owns_plain`, see `claim_plain_cursors`)
 fn cursors_or_adopted(
-    conn: &Connection,
+    conn: &dyn Sql,
     key: &str,
     group: &str,
     owns_plain: bool,
@@ -936,9 +937,20 @@ fn cursors_or_adopted(
     }
 
     for old in legacy.iter().map(|k| format!("{group}@{k}")) {
-        if db::get_group_state(conn, &old)?.is_some() {
-            Sql::execute(conn, "delete from groups where name = $1", vals![key])?;
-            Sql::execute(conn, "update groups set name = $1 where name = $2", vals![key, old.as_str()])?;
+        // the move as one, soo a load of the same key at the same moment can't delete what this one just renamed
+        let moved = conn.tx(|tx| {
+            tx.lock("atlas.adopt_cursors")?;
+            if db::get_group_state(tx, key)?.is_some() {
+                return Ok(true);
+            }
+            if db::get_group_state(tx, &old)?.is_none() {
+                return Ok(false);
+            }
+            tx.execute("delete from groups where name = $1", vals![key])?;
+            tx.execute("update groups set name = $1 where name = $2", vals![key, old.as_str()])?;
+            Ok(true)
+        })?;
+        if moved {
             return Ok(db::get_group_state(conn, key)?);
         }
     }
@@ -1750,31 +1762,37 @@ async fn drop_older_days(db: &Db, group: &str, day: i64) {
 async fn reach_further(db: &Db, group: &str, (_day, floor, oldest): (i64, i64, Option<i64>), dated: i64) {
     let first = oldest.map_or(floor, crate::chunks::unix_day);
     let g = group.to_string();
-    let added = on_db(db, move |conn| {
-        let Some(mut s) = crate::chunks::speculative(conn, &g)? else { return Ok(0) };
-        // a day of a window the reach has moved past is not the current one's
-        if floor != s.runner_up_day - s.reach {
-            return Ok(0);
-        }
-        s.days += 1;
-        s.articles += dated;
-        // the window is judged when its last day is done, not when its oldest is
-        let running = conn
-            .prepare_cached("select 1 from backfill_chunks where grp = ? and day >= ? and day < ? and state != 2")?
-            .exists(rusqlite::params![g, floor, floor + SPECULATIVE_WINDOW])?;
-        let further = !running && s.articles >= SPECULATIVE_YIELD * s.days && first < floor;
-        if further {
-            // each extension has to hold enough a day on its own: a dense
-            // first window doesnt pay for the sparse ones after it
-            s.reach += SPECULATIVE_WINDOW;
-            s.days = 0;
-            s.articles = 0;
-        }
-        crate::chunks::set_speculative(conn, &g, &s)?;
-        if !further {
-            return Ok(0);
-        }
-        Ok(crate::chunks::add(conn, &g, floor - 1, (floor - SPECULATIVE_WINDOW).max(first))?)
+    let added = on_db(db, move |db| {
+        // read, counted and written back as one: two days of the window finishing at once would else both count
+        // from the same row, on Postgres
+        Ok(db.tx(|conn| -> crate::pg::sql::Result<usize> {
+            conn.lock(&crate::chunks::speculative_lock(&g))?;
+            let Some(mut s) = crate::chunks::speculative(conn, &g)? else { return Ok(0) };
+            // a day of a window the reach has moved past is not the current one's
+            if floor != s.runner_up_day - s.reach {
+                return Ok(0);
+            }
+            s.days += 1;
+            s.articles += dated;
+            // the window is judged when its last day is done, not when its oldest is
+            let running = conn.exists(
+                "select 1 from backfill_chunks where grp = $1 and day >= $2 and day < $3 and state != 2",
+                vals![g.as_str(), floor, floor + SPECULATIVE_WINDOW],
+            )?;
+            let further = !running && s.articles >= SPECULATIVE_YIELD * s.days && first < floor;
+            if further {
+                // each extension has to hold enough a day on its own: a dense
+                // first window doesnt pay for the sparse ones after it
+                s.reach += SPECULATIVE_WINDOW;
+                s.days = 0;
+                s.articles = 0;
+            }
+            crate::chunks::set_speculative(conn, &g, &s)?;
+            if !further {
+                return Ok(0);
+            }
+            crate::chunks::add(conn, &g, floor - 1, (floor - SPECULATIVE_WINDOW).max(first))
+        })?)
     })
     .await;
     match added {
@@ -1965,16 +1983,24 @@ where
     let floor = match runner_up_day {
         Some(r) => {
             let g = group.to_string();
-            let dropped = on_db(db, move |conn| {
-                let s = match crate::chunks::speculative(conn, &g)? {
-                    Some(s) => crate::chunks::Speculative { runner_up_day: r, ..s },
-                    None => {
-                        crate::chunks::Speculative { runner_up_day: r, reach: SPECULATIVE_WINDOW, days: 0, articles: 0 }
-                    }
-                };
-                crate::chunks::set_speculative(conn, &g, &s)?;
-                let floor = r - s.reach;
-                Ok((floor, crate::chunks::drop_before(conn, &g, floor)?))
+            let dropped = on_db(db, move |db| {
+                // under the window's lock, as `reach_further` changes it: else its count or extension could be
+                // written over, and the days it just added dropped
+                Ok(db.tx(|conn| {
+                    conn.lock(&crate::chunks::speculative_lock(&g))?;
+                    let s = match crate::chunks::speculative(conn, &g)? {
+                        Some(s) => crate::chunks::Speculative { runner_up_day: r, ..s },
+                        None => crate::chunks::Speculative {
+                            runner_up_day: r,
+                            reach: SPECULATIVE_WINDOW,
+                            days: 0,
+                            articles: 0,
+                        },
+                    };
+                    crate::chunks::set_speculative(conn, &g, &s)?;
+                    let floor = r - s.reach;
+                    Ok((floor, crate::chunks::drop_before(conn, &g, floor)?))
+                })?)
             })
             .await;
             let floor = match dropped {
@@ -2965,8 +2991,9 @@ mod tests {
         .await
         .unwrap();
         let window = || on_db(&db, move |c| Ok(crate::chunks::speculative(c, g)?.unwrap()));
-        let done =
-            |day: i64| on_db(&db, move |c| Ok(c.execute("update backfill_chunks set state = 2 where day = ?", [day])?));
+        let done = |day: i64| {
+            on_db(&db, move |c| Ok(c.execute("update backfill_chunks set state = 2 where day = $1", vals![day])?))
+        };
 
         // the floor day is done and dense, the rest of the window is still running
         done(floor).await.unwrap();
@@ -3010,13 +3037,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(claim.day, floor);
-        let days = || {
-            on_db(&db, move |c| Ok(c.query_row("select count(*) from backfill_chunks", [], |r| r.get::<_, i64>(0))?))
-        };
+        let days = || on_db(&db, move |c| Ok(c.one::<i64>("select count(*) from backfill_chunks", &[])?));
         let window = || on_db(&db, move |c| Ok(crate::chunks::speculative(c, g)?.unwrap()));
 
         // its claim went stale and another worker has it now
-        on_db(&db, move |c| Ok(c.execute("update backfill_chunks set claimed_at = 99 where day = ?", [floor])?))
+        on_db(&db, move |c| Ok(c.execute("update backfill_chunks set claimed_at = 99 where day = $1", vals![floor])?))
             .await
             .unwrap();
         // no dated article in the day: the older days stay
