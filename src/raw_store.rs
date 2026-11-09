@@ -2998,7 +2998,7 @@ fn harvest_attached_shard(conn: &Connection) -> rusqlite::Result<()> {
     tx.commit()
 }
 
-/// Harvests natural-keyed enrichments from `main` (`atlas.db` + `atlas.s0..s7.db`) into `atlas.raw.db`,
+/// Harvests natural-keyed enrichments from `main` (`atlas.db` + `atlas.s0.db`) into `atlas.raw.db`,
 /// including legacy pre-sharding release tables when `atlas.db` itself holds `releases`.
 /// Any SQL or transaction failure rolls back the failed harvest and returns `Err` so callers never delete
 /// source databases after a partial or failed harvest.
@@ -3015,9 +3015,7 @@ pub fn harvest_from_shards(main: &Path, log: &dyn Fn(&str)) -> anyhow::Result<()
         res.with_context(|| format!("harvesting {}", main.display()))?;
         detach_res.with_context(|| format!("detaching {}", main.display()))?;
     }
-    // the shards from before one shard too, should a reset come before their merge
-    for shard_idx in 0..crate::merge_shards::LEGACY_SHARDS {
-        let shard_path = crate::merge_shards::legacy_shard_path(main, shard_idx);
+    for (shard_idx, shard_path) in crate::store::shard_paths(main).into_iter().enumerate() {
         if shard_path.exists() {
             log(&format!("harvesting shard s{shard_idx} ({})...", shard_path.display()));
             conn.execute("ATTACH DATABASE ?1 AS sh", [shard_path.to_string_lossy().as_ref()])
@@ -3127,11 +3125,11 @@ pub fn run_replay_predb(args: &[String]) -> i32 {
 }
 
 /// Safely holds the exclusive database lock, resolves any interrupted conversion/compaction swaps,
-/// harvests natural-keyed shard data into `atlas.raw.db`, and removes `atlas.db`, `atlas.s0..s7.db`,
+/// harvests natural-keyed shard data into `atlas.raw.db`, and removes `atlas.db`, `atlas.s0.db`,
 /// and compaction/conversion scratch files while keeping `atlas.raw.db`, `atlas.predb.db`,
 /// `atlas.media.db`, `atlas.details.db`, `posters/`, `covers/`, and `stills/`.
 pub fn reset_shards_at(main: &Path, log: &dyn Fn(&str)) -> anyhow::Result<()> {
-    let _exclusive = crate::compact::Lock::take_unchecked(main)?;
+    let _exclusive = crate::compact::Lock::take(main)?;
     if (!main.try_exists()? || crate::convert::is_empty_interloper(main))
         && let Some(msg) = crate::convert::recover_cut_swap(main)?
     {
@@ -3169,8 +3167,7 @@ pub fn reset_shards_at(main: &Path, log: &dyn Fn(&str)) -> anyhow::Result<()> {
         }
         Ok(())
     };
-    // the shards from before one shard too, should a reset come before their merge
-    for shard in (0..crate::merge_shards::LEGACY_SHARDS).map(|s| crate::merge_shards::legacy_shard_path(main, s)) {
+    for shard in crate::store::shard_paths(main) {
         let copy = crate::compact::with_suffix(&shard, "compact");
         remove_db_family(&crate::compact::with_suffix(&copy, "check"))?;
         remove_db_family(&copy)?;
@@ -3209,7 +3206,7 @@ pub fn run_reset_shards(args: &[String]) -> i32 {
     let main = crate::paths::database();
     if !apply {
         println!(
-            "dry run (pass --apply to reset):\n  1. harvest natural-keyed data from {} and shards into {}\n  2. preserve atlas.raw.db, atlas.predb.db, atlas.media.db, atlas.details.db, posters/, covers/, stills/\n  3. delete atlas.db*, atlas.s0..s7.db*, *.sealed-log-cursor, and segment-*.log\n  4. reset media fanout_done=0 and predb late_after_id=0",
+            "dry run (pass --apply to reset):\n  1. harvest natural-keyed data from {} and shards into {}\n  2. preserve atlas.raw.db, atlas.predb.db, atlas.media.db, atlas.details.db, posters/, covers/, stills/\n  3. delete atlas.db*, atlas.s0.db*, *.sealed-log-cursor, and segment-*.log\n  4. reset media fanout_done=0 and predb late_after_id=0",
             main.display(),
             path_for(&main).display()
         );

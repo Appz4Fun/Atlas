@@ -78,7 +78,7 @@ pub fn run(args: &[String]) -> i32 {
         .and_then(|v| v.parse().ok())
         .unwrap_or(20);
     let main = crate::paths::database();
-    // writing counts: held off a compaction, and refused on shards a merge left half done
+    // writing counts: held off a compaction
     let _held = if apply {
         match crate::compact::hold_off_compaction(&main) {
             Ok(held) => Some(held),

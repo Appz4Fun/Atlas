@@ -55,14 +55,11 @@ fn kept() -> Vec<Kept> {
     ]
 }
 
-/// Releases thawed by hand, from every shard file there is (one shard, or the eight there were).
+/// Releases thawed by hand, from every shard file there is.
 const FREEZE_EXEMPT: &str = "freeze_exempt";
 
 fn shard_files(main: &Path) -> Vec<PathBuf> {
-    (0..crate::merge_shards::LEGACY_SHARDS)
-        .map(|s| crate::merge_shards::legacy_shard_path(main, s))
-        .filter(|p| p.exists())
-        .collect()
+    crate::store::shard_paths(main).into_iter().filter(|p| p.exists()).collect()
 }
 
 /// A column as SQLite declares it, and the Postgres type it's copied as.
