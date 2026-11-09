@@ -200,11 +200,17 @@ pub fn with_full_flush<T>(conn: &mut Connection, save: impl FnOnce(&mut Connecti
     Ok(saved)
 }
 
+/// statements a writer's connection keeps prepared (`tune_for_writing`)
+pub(crate) const WRITER_STATEMENTS: usize = 256;
+
 /// Tune a connection for heavy indexing writes: a big page cache, no
 /// checkpointing on commit (`checkpointer` copies the WAL into the main file on
 /// its own thread, `finish_checkpoint` lets the WAL start over), and a WAL file
 /// cut back to 1GB whenever it starts over.
 pub fn tune_for_writing(conn: &Connection) -> Result<()> {
+    // a save runs some forty statements, a writer's stage work more: with rusqlite's 16 they pushed each other out
+    // and were prepared again over and over
+    conn.set_prepared_statement_cache_capacity(WRITER_STATEMENTS);
     conn.execute_batch(
         "pragma cache_size = -1048576;
          pragma temp_store = memory;
@@ -574,11 +580,19 @@ pub fn create_db_at(path: &Path) -> anyhow::Result<()> {
     )?;
 
     // the server's first/last article numbers per group, for progress and ETA, and
-    // the post date at both ends of what has been indexed (article number + unix time)
+    // the post date at both ends of what has been indexed (article number + unix time), and
+    // the posting time the live cursor began reading from (`set_start_posted`)
     let group_columns = columns(&conn, "groups")?;
-    for col in ["first_article", "last_article", "low_article", "low_posted", "high_article", "high_posted"] {
+    for col in
+        ["first_article", "last_article", "low_article", "low_posted", "high_article", "high_posted", "start_posted"]
+    {
         if !group_columns.contains(col) {
             conn.execute(&format!("alter table groups add column {col} INTEGER"), [])?;
+            // rows from before it may have started anywhere (a stand-in jumped to the newest article): they count as
+            // having begun now, soo no cursor moves up past a range they never read
+            if col == "start_posted" {
+                conn.execute("update groups set start_posted = strftime('%s','now')", [])?;
+            }
         }
     }
 
@@ -960,6 +974,14 @@ pub fn update_live_cursor(conn: &Connection, group: &str, article: i64) -> Resul
          on conflict(name) do update set live_cursor = excluded.live_cursor",
         params![group, article, article],
     )?;
+    Ok(())
+}
+
+/// Remember the posting time a row's live cursor began reading from (cursor key), when it is started or jumped:
+/// the time it was found by, or now when it starts at the newest article. Nothing posted before that is read through
+/// on this row; NULL (a row from before this was kept) counts as long ago.
+pub fn set_start_posted(conn: &Connection, group: &str, posted: i64) -> Result<()> {
+    conn.execute("update groups set start_posted = ? where name = ?", params![posted, group])?;
     Ok(())
 }
 

@@ -309,8 +309,8 @@ struct Scheduler {
     next: Mutex<HashMap<usize, usize>>,
     /// the groups big releases come from (`chunks::media_groups`), taken before the round robin's next
     media: RwLock<Vec<String>>,
-    /// groups a worker is on right now
-    busy: Mutex<HashSet<String>>,
+    /// groups a worker is on right now, and whose worker (the server it was taken for)
+    busy: Mutex<HashMap<String, usize>>,
     /// (group, server) pairs whose day chunks the server leaves alone: for
     /// good (None) when it doesnt carry the group, until then after chunk errors
     skip: Mutex<HashMap<(String, usize), Option<Instant>>>,
@@ -361,8 +361,7 @@ impl Scheduler {
     /// server's connections stay busy.
     /// How many of `server`'s workers may be on the groups big releases come from at once: half, and one at least.
     fn media_share(&self, server: usize) -> usize {
-        let workers = self.plan.iter().find(|(s, _)| *s == server).map_or(self.workers, |(_, n)| *n);
-        (workers / 2).max(1)
+        (self.workers_of(server) / 2).max(1)
     }
 
     fn take_group(&self, server: usize) -> Option<String> {
@@ -387,22 +386,22 @@ impl Scheduler {
 
         failed.retain(|_, parked| parked.since.elapsed() < FAILED_RETRY);
         wait.retain(|_, until| *until > now);
-        // the server a group's passes go to: a parked one's stand-in
+        // the server a group's passes go to: a parked one's stand-in. none when config bans it from every server left
         let on = |g: &String| match failed.get(g) {
-            None => Some(pool.pick_server_in(&tier, g)),
+            None => pool.server_for_in(&tier, g),
             Some(parked) => pool.fallback_in(&tier, g, &parked.servers),
         };
-        let free = |g: &String| !busy.contains(g) && !wait.contains_key(g) && on(g) == Some(server);
+        let free = |g: &String| !busy.contains_key(g) && !wait.contains_key(g) && on(g) == Some(server);
 
         // a group big releases come from goes as soon as it's due, so it keeps up with what's posted while the round
         // robin goes through all the others; one worker at a time on each, like any group, and at most half of the
         // server's workers on them, so the round robin always moves
         let media = self.media.read().unwrap();
-        let on_media = media.iter().filter(|g| busy.contains(*g) && on(g) == Some(server)).count();
+        let on_media = media.iter().filter(|g| busy.contains_key(*g) && on(g) == Some(server)).count();
         if on_media < self.media_share(server)
             && let Some(g) = media.iter().find(|g| groups.contains(g) && free(g))
         {
-            busy.insert(g.clone());
+            busy.insert(g.clone(), server);
             return Some(g.clone());
         }
 
@@ -415,11 +414,43 @@ impl Scheduler {
             }
 
             *next = idx + 1;
-            busy.insert(g.clone());
+            busy.insert(g.clone(), server);
             return Some(g.clone());
         }
 
+        // by rank: a group whose server has every worker busy goes to this one when it's next down the group's list
+        // and every server above it is just as full, and stays a while (`Pool::assign`)
+        if pool.ranks() {
+            let mut taken: HashMap<usize, usize> = HashMap::new();
+            for &s in busy.values() {
+                *taken.entry(s).or_insert(0) += 1;
+            }
+            let full = |s: usize| taken.get(&s).copied().unwrap_or(0) >= self.workers_of(s);
+            for step in 0..groups.len() {
+                let idx = (*next + step) % groups.len();
+                let g = &groups[idx];
+                if busy.contains_key(g) || wait.contains_key(g) || failed.contains_key(g) {
+                    continue;
+                }
+                let Some(now_on) = on(g).filter(|&s| s != server && full(s)) else { continue };
+                let order = pool.rank_order(&tier, g);
+                let Some(at) = order.iter().position(|&s| s == server) else { continue };
+                if !order[..at].iter().all(|&s| s == now_on || full(s)) {
+                    continue;
+                }
+                *next = idx + 1;
+                pool.assign(g, server);
+                busy.insert(g.clone(), server);
+                return Some(g.clone());
+            }
+        }
+
         None
+    }
+
+    /// groups `server`'s workers take at once
+    fn workers_of(&self, server: usize) -> usize {
+        self.plan.iter().find(|(s, _)| *s == server).map_or(self.workers, |(_, n)| *n)
     }
 
     #[cfg(test)]
@@ -488,6 +519,8 @@ impl Scheduler {
                     if !parked.servers.contains(&server) {
                         parked.servers.push(server);
                     }
+                    // by rank, a server that keeps failing a group is left out of it for a day (`Pool::strike`)
+                    pool.strike(group, server, "failed three passes in a row");
                     let instead = match pool.fallback_in(&pool.indexing_tier(), group, &parked.servers) {
                         Some(i) => format!(", reading its new posts from {} meanwhile", pool.host(i)),
                         None => String::new(),
@@ -619,7 +652,10 @@ async fn take_chunk(sched: &Scheduler, server: usize, db: &Db) -> Option<crate::
         skip.keys().filter(|(_, s)| *s == server).map(|(g, _)| g.clone()).collect()
     };
     let mode = sched.settings.read().unwrap().mode.clone();
-    let groups = chunk_groups(&mode, &sched.groups.read().unwrap(), &skip);
+    let mut groups = chunk_groups(&mode, &sched.groups.read().unwrap(), &skip);
+    // a server a group is banned from takes none of its day chunks either (`Pool::banned`): by config, ranked or not,
+    // and by rank for a while
+    groups.retain(|g| !sched.ctx.pool.banned(g, server));
     if groups.is_empty() {
         return None;
     }
@@ -652,7 +688,7 @@ async fn take_sweep(sched: &Scheduler, server: usize, db: &Db) -> Option<String>
     let mode = sched.settings.read().unwrap().mode.clone();
     let groups: Vec<String> = chunk_groups(&mode, &sched.groups.read().unwrap(), &skip)
         .into_iter()
-        .filter(|g| sched.ctx.pool.pick_server_in(&tier, g) != server)
+        .filter(|g| sched.ctx.pool.pick_server_in(&tier, g) != server && !sched.ctx.pool.banned_for_good(g, server))
         .collect();
     let found = match crate::indexer::sweep_to_take(db, sched.ctx.pool.host(server), groups).await {
         Ok(found) => found,
@@ -940,7 +976,7 @@ async fn run_servers(
         workers,
         next: Mutex::new(HashMap::new()),
         media: RwLock::new(Vec::new()),
-        busy: Mutex::new(HashSet::new()),
+        busy: Mutex::new(HashMap::new()),
         skip: Mutex::new(HashMap::new()),
         chunk_errors: Mutex::new(HashMap::new()),
         sweeping: Mutex::new(HashSet::new()),
@@ -1235,10 +1271,16 @@ async fn supervise(stop: Arc<AtomicBool>, stats: Arc<Mutex<Stats>>, writing: Opt
         started = true;
 
         let pp = &config.postprocess;
-        let pool = Arc::new(Pool::new(&servers).with_max_unsaved(config.max_unsaved_headers()).with_body_tries(
-            Duration::from_secs(pp.body_timeout_secs.max(1) as u64),
-            usize::try_from(pp.body_retries).unwrap_or(0),
-        ));
+        let pool = Arc::new(
+            Pool::new(&servers)
+                .with_max_unsaved(config.max_unsaved_headers())
+                .with_body_tries(
+                    Duration::from_secs(pp.body_timeout_secs.max(1) as u64),
+                    usize::try_from(pp.body_retries).unwrap_or(0),
+                )
+                // by rank, best server first, when `[indexing]` says soo; bans learned are kept beside the databases
+                .with_ranking(&crate::config::indexing_config(), Some(crate::paths::app_dir().join("server-bans"))),
+        );
 
         // at least one server has to answer before spinning everything up
         if let Err(e) = pool.connect().await {
@@ -1503,6 +1545,36 @@ mod tests {
         }
     }
 
+    /// by rank every group is the best server's; one due while all of that server's workers are busy goes to the next
+    /// server down its list, and stays there a while
+    #[test]
+    fn by_rank_a_group_overflows_when_the_best_servers_workers_are_busy() {
+        let pool = Pool::new(&[UsenetServer::new("a.test", "u", "p", 119), UsenetServer::new("b.test", "u", "p", 119)])
+            .with_ranking(&crate::config::IndexingConfig { prefer: vec!["a.test".into()], ..Default::default() }, None);
+        let groups: Vec<String> = ["g1", "g2", "g3"].iter().map(|g| g.to_string()).collect();
+        let mut sched = scheduler(pool, groups);
+        sched.plan = vec![(0, 1), (1, 1)];
+        assert_eq!(sched.take_group(0).as_deref(), Some("g1"));
+        assert_eq!(sched.take_group(1).as_deref(), Some("g2"), "a's one worker is busy: b takes the next");
+        assert_eq!(sched.ctx.pool.pick_server("g2"), 1, "and keeps it a while");
+        sched.busy.lock().unwrap().remove("g1");
+        assert_eq!(sched.take_group(1), None, "a has a worker free again: nothing more for b");
+        assert_eq!(sched.take_group(0).as_deref(), Some("g3"));
+    }
+
+    /// by rank, a server parked on a group three times in a day is banned from it for a day
+    #[test]
+    fn by_rank_a_server_that_keeps_failing_a_group_is_banned_from_it() {
+        let pool = Pool::new(&[UsenetServer::new("a.test", "u", "p", 119), UsenetServer::new("b.test", "u", "p", 119)])
+            .with_ranking(&crate::config::IndexingConfig { prefer: vec!["a.test".into()], ..Default::default() }, None);
+        let sched = scheduler(pool, vec!["g".into()]);
+        for _ in 0..9 {
+            sched.finish("g", 0, false, Err(anyhow::anyhow!("broken listing")));
+        }
+        assert!(sched.ctx.pool.banned("g", 0));
+        assert_eq!(sched.ctx.pool.homes_of("g"), vec![1]);
+    }
+
     /// a group big releases come from is taken whenever it's free, the others in turn
     #[test]
     fn groups_big_releases_come_from_go_first() {
@@ -1587,7 +1659,7 @@ mod tests {
         let taken: Vec<String> = (0..5).filter_map(|_| sched.take_group(0)).collect();
         assert_eq!(taken, ["m1", "m2", "m3", "a", "b"]);
         // with the round robin past them, a media group done goes straight back to the front
-        sched.busy.lock().unwrap().retain(|g| g != "m1" && g != "m3");
+        sched.busy.lock().unwrap().retain(|g, _| g != "m1" && g != "m3");
         assert_eq!(sched.take_group(0).as_deref(), Some("m1"));
     }
 
@@ -1614,6 +1686,40 @@ mod tests {
             assert!(take_sweep(&sched, server, &db).await.is_none());
             assert!(matches!(take_chunk(&sched, server, &db).await, Some(c) if c.group == "busy"));
         });
+    }
+
+    /// a config `ban` alone, without ranking: the banned server takes none of the group's live passes or day chunks,
+    /// and banned from every server the group isn't read at all
+    #[test]
+    fn a_config_ban_alone_keeps_a_group_off_a_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+        let ban = |hosts: &[&str]| crate::config::IndexingConfig {
+            ban: vec![("g".into(), hosts.iter().map(|h| h.to_string()).collect())],
+            ..Default::default()
+        };
+        let servers = [UsenetServer::new("a.test", "u", "p", 119), UsenetServer::new("b.test", "u", "p", 119)];
+        let home = Pool::new(&servers).pick_server("g");
+        let pool = Pool::new(&servers).with_ranking(&ban(&[servers[home].host.as_str()]), None);
+        assert!(!pool.ranks());
+        let conn = db::open_at(&main).unwrap();
+        crate::chunks::add(&conn, "g", 20_000, 10_000).unwrap();
+        let mut sched = scheduler(pool, vec!["g".into()]);
+        sched.plan = vec![(0, 1), (1, 1)];
+        assert_eq!(sched.take_group(home), None, "not on the server it's banned from");
+        assert_eq!(sched.take_group(1 - home).as_deref(), Some("g"));
+        let db = shared_db(conn);
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            assert!(take_chunk(&sched, home, &db).await.is_none(), "none of its day chunks either");
+            assert!(matches!(take_chunk(&sched, 1 - home, &db).await, Some(c) if c.group == "g"));
+        });
+
+        let pool = Pool::new(&servers).with_ranking(&ban(&["a.test", "b.test"]), None);
+        let mut sched = scheduler(pool, vec!["g".into()]);
+        sched.plan = vec![(0, 1), (1, 1)];
+        assert_eq!((sched.take_group(0), sched.take_group(1)), (None, None), "banned from both: not read");
     }
 
     /// home groups that keep every worker busy dont hold a due sweep off

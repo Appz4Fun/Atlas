@@ -35,6 +35,7 @@ pub mod media;
 pub mod merging;
 pub mod images;
 pub mod nxv_store;
+pub mod save_replay;
 pub mod keep_export;
 pub mod merge_shards;
 pub mod metrics;

@@ -368,7 +368,7 @@ fn indexing_section(cfg: &Config, managed: &Managed, token: &str) -> String {
 <form class="settings-form" method="post" action="/ui/settings/indexing">{csrf}
 <label for="index-mode">Mode</label><select id="index-mode" name="index_mode"{mode_off}>{modes}</select>
 <label for="parallel-groups">Groups indexed at once</label><input id="parallel-groups" name="parallel_groups" type="number" min="1" max="{max_parallel}" value="{parallel}" placeholder="worked out from the connections"{parallel_off}>
-<p class="hint">Empty: one group per 5 connections on each server. At most {max_parallel}.</p>
+<p class="hint">Empty: one group per connection on each server. At most {max_parallel}.</p>
 <label for="max-unsaved">Headers fetched ahead of saving</label><input id="max-unsaved" name="max_unsaved_headers" type="number" min="1" value="{unsaved}" placeholder="{default_unsaved}"{unsaved_off}>
 <p class="hint">Empty: {default_unsaved}. Lower it when memory is tight, raise it when the writer keeps up and connections wait.</p>
 <div class="actions"><button class="button primary">Save</button></div></form></section>"#,
