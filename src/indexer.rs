@@ -1791,7 +1791,7 @@ async fn reach_further(db: &Db, group: &str, (_day, floor, oldest): (i64, i64, O
             if !further {
                 return Ok(0);
             }
-            Ok(crate::chunks::add(conn, &g, floor - 1, (floor - SPECULATIVE_WINDOW).max(first))?)
+            crate::chunks::add(conn, &g, floor - 1, (floor - SPECULATIVE_WINDOW).max(first))
         })?)
     })
     .await;
