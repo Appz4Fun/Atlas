@@ -454,11 +454,36 @@ pub(crate) fn inventory_with(
         if post.lead.is_some() {
             keep_files_apart(&mut rows);
         }
-        let mut all: Vec<ArticleRow> = rows.into_iter().flat_map(|(_, articles)| articles).collect();
-        all.sort_by(|a, b| (&a.filename, a.part, &a.message_id).cmp(&(&b.filename, b.part, &b.message_id)));
-        return Ok((all, post.groups, post.ids));
+        return Ok((merge_rows(rows), post.groups, post.ids));
     }
     Ok((crate::store::articles(conn, release.id)?, vec![release.group_name.clone()], vec![release.id]))
+}
+
+/// A post's rows' articles as one list, by file and part. An article in more than one row is listed once. Where rows
+/// hold the same part of a file (a file uploaded again, each upload spread over the groups), the part is listed once,
+/// under the first message-id: a reader keeps one segment of a number anyway, and the rest only inflate the size.
+fn merge_rows(rows: Vec<(i64, Vec<ArticleRow>)>) -> Vec<ArticleRow> {
+    let mut first_row: std::collections::HashMap<(Option<String>, i64), i64> = std::collections::HashMap::new();
+    let mut in_rows: std::collections::HashSet<(Option<String>, i64)> = std::collections::HashSet::new();
+    for (id, articles) in &rows {
+        for a in articles {
+            if let Some(part) = a.part {
+                let key = (a.filename.clone(), part);
+                if *first_row.entry(key.clone()).or_insert(*id) != *id {
+                    in_rows.insert(key);
+                }
+            }
+        }
+    }
+    let mut all: Vec<ArticleRow> = rows.into_iter().flat_map(|(_, articles)| articles).collect();
+    all.sort_by(|a, b| (&a.filename, a.part, &a.message_id).cmp(&(&b.filename, b.part, &b.message_id)));
+    // a part more than one row holds is listed once; a row's own second article of a part stays, as before
+    all.dedup_by(|a, b| {
+        a.filename == b.filename
+            && a.part == b.part
+            && (a.message_id == b.message_id || a.part.is_some_and(|p| in_rows.contains(&(a.filename.clone(), p))))
+    });
+    all
 }
 
 /// A file whose name another row already has keeps its own <file>: the name the NZB groups it by gets its row's id.
@@ -620,6 +645,35 @@ pub fn generate_nzb(release_id: i64, output_dir: Option<&Path>) -> Result<PathBu
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_post_lists_each_part_once_when_its_rows_share_parts() {
+        let art = |file: &str, part: i64, mid: &str| crate::search::ArticleRow {
+            message_id: mid.into(),
+            filename: Some(file.into()),
+            part: Some(part),
+            total_parts: None,
+            bytes: None,
+            subject: None,
+            poster: None,
+            posted_date: None,
+        };
+        // one article in two rows: listed once; parts that differ by row stay as they are
+        let crossposted = vec![(1, vec![art("f", 1, "<a1>"), art("f", 2, "<a2>")]), (2, vec![art("f", 2, "<a2>")])];
+        let merged = merge_rows(crossposted);
+        assert_eq!(merged.iter().map(|a| a.message_id.as_str()).collect::<Vec<_>>(), ["<a1>", "<a2>"]);
+        // a row's own repost of a part, with no part shared across rows: both kept, as before
+        let own = vec![(1, vec![art("f", 1, "<a1>"), art("f", 1, "<b1>")]), (2, vec![art("f", 2, "<a2>")])];
+        assert_eq!(merge_rows(own).len(), 3);
+        // two uploads spread over the rows: one segment per part, the first message-id
+        let uploads = vec![
+            (1, vec![art("f", 1, "<a1>"), art("f", 2, "<b2>")]),
+            (2, vec![art("f", 1, "<b1>"), art("f", 2, "<a2>"), art("f", 3, "<b3>")]),
+        ];
+        let merged = merge_rows(uploads);
+        let listed: Vec<(i64, &str)> = merged.iter().map(|a| (a.part.unwrap(), a.message_id.as_str())).collect();
+        assert_eq!(listed, [(1, "<a1>"), (2, "<a2>"), (3, "<b3>")]);
+    }
     use super::*;
 
     #[test]
