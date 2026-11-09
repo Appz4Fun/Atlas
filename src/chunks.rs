@@ -520,29 +520,42 @@ fn claim_wanted(db: &dyn Sql, groups: &[(String, i64)], host: &str, now: i64) ->
     if !db.exists("select 1 from backfill_wanted limit 1", vals![])? {
         return Ok(None);
     }
-    let n = groups.len() * 2;
-    let rows = values_rows(db.dialect(), groups.len(), &["text", "bigint"], 0);
-    let sql = format!(
-        "with wanted (g, oldest) as (values {rows})
-         update backfill_chunks set state = ${a}, server = ${b}, claimed_at = ${c}
-         where (grp, day) = (
-             select c.grp, c.day from backfill_wanted r
-             join wanted w on w.g = r.grp
-             join backfill_chunks c on c.grp = r.grp and c.day = r.day
-             where c.day >= w.oldest and (c.state = {PENDING} or (c.state = {CLAIMED} and c.claimed_at < ${d}))
-             order by c.day desc, c.grp limit 1)
-           -- picked from the rows as they were when this began: on Postgres another connection's finish or reach
-           -- back may have changed it since, and only this is checked again then
-           and (state = {PENDING} or (state = {CLAIMED} and claimed_at < ${d}))
-         returning grp, day, coalesce(reread, 0)",
-        a = n + 1,
-        b = n + 2,
-        c = n + 3,
-        d = n + 4,
-    );
-    let mut values = group_values(groups);
-    values.extend([CLAIMED.into(), host.into(), now.into(), (now - CLAIM_TIMEOUT).into()]);
-    claim_one(db, &sql, &values, host, now)
+    // the few days asked for are read and checked against `groups` here: joined in SQL with a values list of every
+    // group, SQLite's plan for it walked the whole chunk table on prod, under the main connection's lock
+    let oldest: std::collections::HashMap<&str, i64> = groups.iter().map(|(g, o)| (g.as_str(), *o)).collect();
+    let stale = now - CLAIM_TIMEOUT;
+    let row = db.tx(|tx| {
+        tx.lock("atlas.backfill_claim")?;
+        let asked = tx.query(
+            &format!(
+                "select c.grp, c.day from backfill_wanted r
+                 join backfill_chunks c on c.grp = r.grp and c.day = r.day
+                 where c.state = {PENDING} or (c.state = {CLAIMED} and c.claimed_at < $1)
+                 order by c.day desc, c.grp"
+            ),
+            vals![stale],
+        )?;
+        for r in asked {
+            let (grp, day): (String, i64) = (r.get(0)?, r.get(1)?);
+            if oldest.get(grp.as_str()).is_none_or(|o| day < *o) {
+                continue;
+            }
+            return Ok(tx
+                .query(
+                    &format!(
+                        "update backfill_chunks set state = $1, server = $2, claimed_at = $3
+                         where grp = $4 and day = $5 and (state = {PENDING} or (state = {CLAIMED} and claimed_at < $6))
+                         returning grp, day, coalesce(reread, 0)"
+                    ),
+                    vals![CLAIMED, host, now, grp.as_str(), day, stale],
+                )?
+                .into_iter()
+                .next());
+        }
+        Ok(None)
+    })?;
+    let Some(r) = row else { return Ok(None) };
+    Ok(Some(Claim { group: r.get(0)?, day: r.get(1)?, server: host.to_string(), claimed_at: now, reread: r.get(2)? }))
 }
 
 /// The chunk `claim` takes after the days asked for: of each group its newest day pending or with a stale claim, then
