@@ -3,6 +3,7 @@
 //! store.rs. A database from before the shards still holds everything in
 //! `atlas.db` until convert.rs moves it over.
 
+use crate::pg::sql::{Sql, vals};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -10,7 +11,7 @@ use std::sync::{Mutex, Once};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::compact::WriteGuard;
 use crate::parser::Release;
@@ -856,12 +857,11 @@ pub struct GroupState {
     pub backfill_cursor: i64,
 }
 
-pub fn get_group_state(conn: &Connection, group: &str) -> Result<Option<GroupState>> {
-    let row: Option<(Option<i64>, Option<i64>)> = conn
-        .query_row("select live_cursor, backfill_cursor from groups where name = ?", [group], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
-        .optional()?;
+pub fn get_group_state(db: &dyn Sql, group: &str) -> crate::pg::sql::Result<Option<GroupState>> {
+    let row: Option<(Option<i64>, Option<i64>)> = db
+        .row("select live_cursor, backfill_cursor from groups where name = $1", vals![group])?
+        .map(|r| Ok::<_, crate::pg::sql::Error>((r.get(0)?, r.get(1)?)))
+        .transpose()?;
 
     Ok(match row {
         Some((Some(live), Some(back))) => Some(GroupState { live_cursor: live, backfill_cursor: back }),
@@ -869,20 +869,20 @@ pub fn get_group_state(conn: &Connection, group: &str) -> Result<Option<GroupSta
     })
 }
 
-pub fn init_group_state(conn: &Connection, group: &str, cursor: i64) -> Result<()> {
-    conn.execute(
-        "insert into groups(name, live_cursor, backfill_cursor) values(?, ?, ?)
-         on conflict(name) do update set
+pub fn init_group_state(db: &dyn Sql, group: &str, cursor: i64) -> crate::pg::sql::Result<()> {
+    db.execute(
+        "insert into groups(name, live_cursor, backfill_cursor) values ($1, $2, $3)
+         on conflict (name) do update set
          live_cursor = excluded.live_cursor,
          backfill_cursor = excluded.backfill_cursor",
-        params![group, cursor, cursor],
+        vals![group, cursor, cursor],
     )?;
     Ok(())
 }
 
 /// Remember the article numbers the server reported for a group (cursor key).
-pub fn save_group_bounds(conn: &Connection, group: &str, first: i64, last: i64) -> Result<()> {
-    conn.execute("update groups set first_article = ?, last_article = ? where name = ?", params![first, last, group])?;
+pub fn save_group_bounds(db: &dyn Sql, group: &str, first: i64, last: i64) -> crate::pg::sql::Result<()> {
+    db.execute("update groups set first_article = $1, last_article = $2 where name = $3", vals![first, last, group])?;
     Ok(())
 }
 
@@ -892,16 +892,16 @@ pub type Dated = (i64, i64);
 /// Widen the dated ends of what has been indexed on a group (cursor key): `low`
 /// replaces the stored low end when it is further back, `high` the high end
 /// when it is further ahead.
-pub fn save_group_dates(conn: &Connection, group: &str, low: Dated, high: Dated) -> Result<()> {
+pub fn save_group_dates(db: &dyn Sql, group: &str, low: Dated, high: Dated) -> crate::pg::sql::Result<()> {
     // every right hand side sees the row as it was, soo each pair moves together
-    conn.execute(
+    db.execute(
         "update groups set
-         low_article = case when low_article is null or ?1 < low_article then ?1 else low_article end,
-         low_posted = case when low_article is null or ?1 < low_article then ?2 else low_posted end,
-         high_article = case when high_article is null or ?3 > high_article then ?3 else high_article end,
-         high_posted = case when high_article is null or ?3 > high_article then ?4 else high_posted end
-         where name = ?5",
-        params![low.0, low.1, high.0, high.1, group],
+         low_article = case when low_article is null or $1 < low_article then $1 else low_article end,
+         low_posted = case when low_article is null or $1 < low_article then $2 else low_posted end,
+         high_article = case when high_article is null or $3 > high_article then $3 else high_article end,
+         high_posted = case when high_article is null or $3 > high_article then $4 else high_posted end
+         where name = $5",
+        vals![low.0, low.1, high.0, high.1, group],
     )?;
     Ok(())
 }
@@ -919,14 +919,16 @@ pub struct GroupProgress {
     pub high: Option<Dated>,
 }
 
-pub fn group_progress(conn: &Connection) -> Result<Vec<GroupProgress>> {
-    let mut stmt = conn.prepare(
+pub fn group_progress(db: &dyn Sql) -> crate::pg::sql::Result<Vec<GroupProgress>> {
+    let pair = |a: Option<i64>, b: Option<i64>| a.zip(b);
+    db.query(
         "select name, live_cursor, backfill_cursor, first_article, last_article,
                 low_article, low_posted, high_article, high_posted from groups
          where live_cursor is not null and backfill_cursor is not null",
-    )?;
-    let pair = |a: Option<i64>, b: Option<i64>| a.zip(b);
-    stmt.query_map([], |r| {
+        vals![],
+    )?
+    .into_iter()
+    .map(|r| {
         Ok(GroupProgress {
             key: r.get(0)?,
             live_cursor: r.get(1)?,
@@ -936,7 +938,7 @@ pub fn group_progress(conn: &Connection) -> Result<Vec<GroupProgress>> {
             low: pair(r.get(5)?, r.get(6)?),
             high: pair(r.get(7)?, r.get(8)?),
         })
-    })?
+    })
     .collect()
 }
 
@@ -972,22 +974,22 @@ pub fn best_progress<'a>(
     best
 }
 
-pub fn save_group_state(conn: &Connection, group: &str, state: GroupState) -> Result<()> {
-    conn.execute(
-        "insert into groups(name, live_cursor, backfill_cursor) values(?, ?, ?)
-         on conflict(name) do update set
+pub fn save_group_state(db: &dyn Sql, group: &str, state: GroupState) -> crate::pg::sql::Result<()> {
+    db.execute(
+        "insert into groups(name, live_cursor, backfill_cursor) values ($1, $2, $3)
+         on conflict (name) do update set
          live_cursor = excluded.live_cursor,
          backfill_cursor = excluded.backfill_cursor",
-        params![group, state.live_cursor, state.backfill_cursor],
+        vals![group, state.live_cursor, state.backfill_cursor],
     )?;
     Ok(())
 }
 
-pub fn update_live_cursor(conn: &Connection, group: &str, article: i64) -> Result<()> {
-    conn.execute(
-        "insert into groups(name, live_cursor, backfill_cursor) values(?, ?, ?)
-         on conflict(name) do update set live_cursor = excluded.live_cursor",
-        params![group, article, article],
+pub fn update_live_cursor(db: &dyn Sql, group: &str, article: i64) -> crate::pg::sql::Result<()> {
+    db.execute(
+        "insert into groups(name, live_cursor, backfill_cursor) values ($1, $2, $3)
+         on conflict (name) do update set live_cursor = excluded.live_cursor",
+        vals![group, article, article],
     )?;
     Ok(())
 }
@@ -995,16 +997,16 @@ pub fn update_live_cursor(conn: &Connection, group: &str, article: i64) -> Resul
 /// Remember the posting time a row's live cursor began reading from (cursor key), when it is started or jumped:
 /// the time it was found by, or now when it starts at the newest article. Nothing posted before that is read through
 /// on this row; NULL (a row from before this was kept) counts as long ago.
-pub fn set_start_posted(conn: &Connection, group: &str, posted: i64) -> Result<()> {
-    conn.execute("update groups set start_posted = ? where name = ?", params![posted, group])?;
+pub fn set_start_posted(db: &dyn Sql, group: &str, posted: i64) -> crate::pg::sql::Result<()> {
+    db.execute("update groups set start_posted = $1 where name = $2", vals![posted, group])?;
     Ok(())
 }
 
-pub fn update_backfill_cursor(conn: &Connection, group: &str, article: i64) -> Result<()> {
-    conn.execute(
-        "insert into groups(name, live_cursor, backfill_cursor) values(?, ?, ?)
-         on conflict(name) do update set backfill_cursor = excluded.backfill_cursor",
-        params![group, article, article],
+pub fn update_backfill_cursor(db: &dyn Sql, group: &str, article: i64) -> crate::pg::sql::Result<()> {
+    db.execute(
+        "insert into groups(name, live_cursor, backfill_cursor) values ($1, $2, $3)
+         on conflict (name) do update set backfill_cursor = excluded.backfill_cursor",
+        vals![group, article, article],
     )?;
     Ok(())
 }

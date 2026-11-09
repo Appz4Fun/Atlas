@@ -247,26 +247,38 @@ async fn mark(
     tried: Vec<(i64, i64)>,
     older: Vec<(usize, Option<i64>)>,
 ) -> anyhow::Result<()> {
-    on_db(db, move |conn| {
-        let tx = conn.transaction()?;
-        for (group, day) in &days {
-            crate::chunks::want(&tx, group, *day, now)?;
+    on_db(db, move |conn| Ok(mark_in(conn, now, &days, &tried, &older)?)).await
+}
+
+/// `mark`'s writes, in one transaction.
+fn mark_in(
+    db: &dyn crate::pg::sql::Sql,
+    now: i64,
+    days: &[(String, i64)],
+    tried: &[(i64, i64)],
+    older: &[(usize, Option<i64>)],
+) -> crate::pg::sql::Result<()> {
+    use crate::pg::sql::vals;
+    db.tx(|tx| {
+        for (group, day) in days {
+            crate::chunks::want(tx, group, *day, now)?;
         }
-        {
-            let mut mark = tx
-                .prepare_cached("insert or replace into repair_tried (release_id, at, permille) values (?1, ?2, ?3)")?;
-            for (id, permille) in &tried {
-                mark.execute(params![id, now, permille])?;
-            }
-            let mut sweep = tx.prepare_cached("insert or replace into repair_older (shard, before) values (?1, ?2)")?;
-            for (shard, before) in &older {
-                sweep.execute(params![*shard as i64, before])?;
-            }
+        for (id, permille) in tried {
+            tx.execute(
+                "insert into repair_tried (release_id, at, permille) values ($1, $2, $3)
+                 on conflict (release_id) do update set at = excluded.at, permille = excluded.permille",
+                vals![*id, now, *permille],
+            )?;
         }
-        tx.commit()?;
+        for (shard, before) in older {
+            tx.execute(
+                "insert into repair_older (shard, before) values ($1, $2)
+                 on conflict (shard) do update set before = excluded.before",
+                vals![*shard as i64, *before],
+            )?;
+        }
         Ok(())
     })
-    .await
 }
 
 /// `f` on a reader that gives up (SQLITE_INTERRUPT) once `stop` is set: a scan of every shard's releases runs for
@@ -375,12 +387,12 @@ fn ids_agree(a: &[(u64, String)], b: &[(u64, String)]) -> bool {
 }
 
 /// The servers that index `group` already, by its cursors (`group@server`): reading it there again finds the same.
-fn indexed_from(conn: &Connection, group: &str) -> rusqlite::Result<HashSet<String>> {
+fn indexed_from(db: &dyn crate::pg::sql::Sql, group: &str) -> crate::pg::sql::Result<HashSet<String>> {
     let prefix = format!("{group}@");
-    let names: Vec<String> = conn
-        .prepare("select name from groups where name >= ?1 and name < ?2")?
-        .query_map(params![prefix, format!("{group}A")], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
+    let names: Vec<String> = db.column(
+        "select name from groups where name >= $1 and name < $2",
+        crate::pg::sql::vals![&prefix, format!("{group}A")],
+    )?;
     Ok(names.into_iter().filter_map(|n| n.strip_prefix(&prefix).map(str::to_string)).collect())
 }
 
@@ -574,6 +586,74 @@ fn windows_of(conn: &Connection, ids: &[i64]) -> rusqlite::Result<Vec<Window>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The main database's writes of a round and the group cursors it reads, alike on SQLite and Postgres.
+    #[test]
+    fn marks_and_group_cursors_on_both_backends() {
+        use crate::db;
+        use crate::pg::sql::vals;
+        crate::pg::testing::each(
+            |c| {
+                c.execute_batch(
+                    "create table groups (name TEXT PRIMARY KEY, live_cursor INTEGER, backfill_cursor INTEGER,
+                        first_article INTEGER, last_article INTEGER, low_article INTEGER, low_posted INTEGER,
+                        high_article INTEGER, high_posted INTEGER, start_posted INTEGER)",
+                )
+                .unwrap();
+                c.execute_batch(CREATE).unwrap();
+                crate::store::create_main(c).unwrap();
+            },
+            |c| {
+                // cursors: made, moved one at a time, and read back
+                assert_eq!(db::get_group_state(c, "g@a").unwrap(), None);
+                db::init_group_state(c, "g@a", 100).unwrap();
+                db::update_live_cursor(c, "g@a", 150).unwrap();
+                db::update_backfill_cursor(c, "g@a", 50).unwrap();
+                db::update_live_cursor(c, "g@b", 7).unwrap();
+                db::save_group_state(c, "g2@a", db::GroupState { live_cursor: 3, backfill_cursor: 1 }).unwrap();
+                assert_eq!(
+                    db::get_group_state(c, "g@a").unwrap(),
+                    Some(db::GroupState { live_cursor: 150, backfill_cursor: 50 })
+                );
+                db::save_group_bounds(c, "g@a", 10, 200).unwrap();
+                // each end widens alone
+                db::save_group_dates(c, "g@a", (60, 6000), (140, 14_000)).unwrap();
+                db::save_group_dates(c, "g@a", (70, 7000), (145, 14_500)).unwrap();
+                db::save_group_dates(c, "g@b", (1, 100), (7, 700)).unwrap();
+                db::set_start_posted(c, "g@b", 500).unwrap();
+                let rows = db::group_progress(c).unwrap();
+                let a = rows.iter().find(|r| r.key == "g@a").unwrap();
+                assert_eq!(
+                    (a.first, a.last, a.low, a.high),
+                    (Some(10), Some(200), Some((60, 6000)), Some((145, 14_500)))
+                );
+                // read through: g@a's newest saved slice is behind its live cursor, g@b's too; g2 isn't g's
+                assert_eq!(crate::indexer::read_through(c, "g", "g@a").unwrap(), (Some(700), Some(14_500)));
+                assert_eq!(crate::indexer::read_through_since(c, "g", "g@a", 400).unwrap(), None, "b began after");
+                assert_eq!(crate::indexer::read_through_since(c, "g", "g@a", 500).unwrap(), Some(700));
+                let mut from: Vec<String> = indexed_from(c, "g").unwrap().into_iter().collect();
+                from.sort();
+                assert_eq!(from, ["a", "b"]);
+
+                // a round's marks: tried releases, the older sweeps, and the days asked for
+                crate::chunks::add(c, "g", 20_000, 19_990).unwrap();
+                mark_in(c, 1000, &[("g".into(), 19_995)], &[(5, 900), (6, 100)], &[(0, Some(42)), (1, None)]).unwrap();
+                mark_in(c, 2000, &[], &[(5, 950)], &[(0, Some(41))]).unwrap();
+                let tried: Vec<(i64, i64, i64)> = c
+                    .query("select release_id, at, permille from repair_tried order by release_id", vals![])
+                    .unwrap()
+                    .iter()
+                    .map(|r| (r.get(0).unwrap(), r.get(1).unwrap(), r.get(2).unwrap()))
+                    .collect();
+                assert_eq!(tried, [(5, 2000, 950), (6, 1000, 100)]);
+                let older: Vec<Option<i64>> =
+                    c.column("select before from repair_older order by shard", vals![]).unwrap();
+                assert_eq!(older, [Some(41), None]);
+                let k = crate::chunks::claim(c, &[("g".into(), i64::MIN)], "s", 3000).unwrap().unwrap();
+                assert_eq!(k.day, 19_995, "the day asked for first");
+            },
+        );
+    }
 
     #[test]
     fn a_scan_gives_up_once_stopping_and_the_reader_reads_on_after() {

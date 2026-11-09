@@ -6,7 +6,9 @@
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
+
+use crate::pg::sql::{Sql, vals};
 
 /// Where Spotweb reads the blacklist.
 pub const DEFAULT_URL: &str = "https://spotlist.store/spotnet/blacklist.xml";
@@ -57,41 +59,38 @@ pub fn fetch(url: &str) -> Result<String> {
 }
 
 /// Whether the list is due to be read again at `now`.
-pub fn due(conn: &Connection, now: i64) -> rusqlite::Result<bool> {
-    let at = super::store::read_cursor(conn, READ_AT)?.and_then(|at| i64::try_from(at).ok());
+pub fn due(db: &dyn Sql, now: i64) -> crate::pg::sql::Result<bool> {
+    let at = super::store::read_cursor(db, READ_AT)?.and_then(|at| i64::try_from(at).ok());
     Ok(at.is_none_or(|at| now - at >= REFRESH_SECS))
 }
 
 /// Puts `spotters` in place of the list kept, and notes when. An empty list is no list (a page that changed or an
 /// error page): the one kept stays, and it's read again at the next refresh. Returns how many are listed.
-pub fn replace(conn: &mut Connection, spotters: &[String], now: i64) -> Result<usize> {
+pub fn replace(db: &dyn Sql, spotters: &[String], now: i64) -> Result<usize> {
     if spotters.is_empty() {
         bail!("the blacklist names no spotters");
     }
-    let tx = conn.transaction()?;
-    tx.execute("delete from spot_blacklist", [])?;
-    {
-        let mut insert = tx.prepare_cached("insert or ignore into spot_blacklist (spotter) values (?)")?;
+    db.tx(|tx| {
+        tx.execute("delete from spot_blacklist", vals![])?;
         for s in spotters {
-            insert.execute(params![s])?;
+            tx.execute("insert into spot_blacklist (spotter) values ($1) on conflict (spotter) do nothing", vals![s])?;
         }
-    }
-    super::store::write_cursor(&tx, READ_AT, now.max(0) as u64)?;
-    tx.commit()?;
+        super::store::write_cursor(tx, READ_AT, now.max(0) as u64)
+    })?;
     Ok(spotters.len())
 }
 
 /// Empties the list kept, for a blacklist turned off; the next one turned on is read at once. Returns how many
 /// spotters it named.
-pub fn clear(conn: &Connection) -> rusqlite::Result<usize> {
-    let n = conn.execute("delete from spot_blacklist", [])?;
-    conn.execute("delete from meta where key = ?", [READ_AT])?;
+pub fn clear(db: &dyn Sql) -> crate::pg::sql::Result<usize> {
+    let n = db.execute("delete from spot_blacklist", vals![])?;
+    db.execute("delete from meta where key = $1", vals![READ_AT])?;
     Ok(n)
 }
 
 /// Notes a failed read, so it's tried again at the next refresh, not every pass.
-pub fn tried(conn: &Connection, now: i64) -> rusqlite::Result<()> {
-    super::store::write_cursor(conn, READ_AT, now.max(0) as u64)
+pub fn tried(db: &dyn Sql, now: i64) -> crate::pg::sql::Result<()> {
+    super::store::write_cursor(db, READ_AT, now.max(0) as u64)
 }
 
 #[cfg(test)]
@@ -121,28 +120,27 @@ mod tests {
 
     #[test]
     fn replaces_the_list_and_keeps_it_on_an_empty_one() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("create table meta (key TEXT PRIMARY KEY, value INTEGER)").unwrap();
-        create(&conn).unwrap();
-        assert!(due(&conn, 100).unwrap());
-        assert_eq!(replace(&mut conn, &["abc".into(), "def".into()], 100).unwrap(), 2);
-        assert!(!due(&conn, 100 + REFRESH_SECS - 1).unwrap());
-        assert!(due(&conn, 100 + REFRESH_SECS).unwrap());
-        assert!(replace(&mut conn, &[], 200).is_err());
-        assert_eq!(replace(&mut conn, &["xyz".into()], 300).unwrap(), 1);
-        let left: Vec<String> = conn
-            .prepare("select spotter from spot_blacklist")
-            .unwrap()
-            .query_map([], |r| r.get(0))
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect();
-        assert_eq!(left, ["xyz"]);
-        tried(&conn, 400).unwrap();
-        assert!(!due(&conn, 401).unwrap());
-        // turned off: nothing left, and turned on again it's read at once
-        assert_eq!(clear(&conn).unwrap(), 1);
-        assert_eq!(clear(&conn).unwrap(), 0);
-        assert!(due(&conn, 402).unwrap());
+        crate::pg::testing::each(
+            |c| {
+                c.execute_batch("create table meta (key TEXT PRIMARY KEY, value INTEGER)").unwrap();
+                create(c).unwrap();
+            },
+            |db| {
+                assert!(due(db, 100).unwrap());
+                assert_eq!(replace(db, &["abc".into(), "def".into(), "abc".into()], 100).unwrap(), 3);
+                assert!(!due(db, 100 + REFRESH_SECS - 1).unwrap());
+                assert!(due(db, 100 + REFRESH_SECS).unwrap());
+                assert!(replace(db, &[], 200).is_err());
+                assert_eq!(replace(db, &["xyz".into()], 300).unwrap(), 1);
+                let left: Vec<String> = db.column("select spotter from spot_blacklist", vals![]).unwrap();
+                assert_eq!(left, ["xyz"]);
+                tried(db, 400).unwrap();
+                assert!(!due(db, 401).unwrap());
+                // turned off: nothing left, and turned on again it's read at once
+                assert_eq!(clear(db).unwrap(), 1);
+                assert_eq!(clear(db).unwrap(), 0);
+                assert!(due(db, 402).unwrap());
+            },
+        );
     }
 }

@@ -14,6 +14,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::indexer::{Db, PassContext, on_db};
 use crate::nntp::{BackgroundBody, BackgroundRead, Overview, Pool};
+use crate::pg::sql::{Sql, vals};
 use crate::search::{ArticleRow, ReleaseRow};
 use crate::store;
 
@@ -365,54 +366,59 @@ pub fn backoff(now: i64, tries: i64) -> i64 {
 
 /// Posts with nothing to ask, looked at again after `NOTHING_AGAIN`; posts whose ids all wait, when the first is due.
 /// What was due longer ago than a post is looked at for goes: its post is past `DAYS`.
-fn mark_posts(conn: &mut Connection, nothing: &[i64], waiting: &[(Vec<i64>, i64)], now: i64) -> rusqlite::Result<()> {
-    let tx = conn.transaction()?;
-    let stale = now - DAYS * 86_400;
-    tx.execute("delete from inferred_asked where next_at < ?1", [stale])?;
-    tx.execute("delete from inferred_ids where next_at < ?1", [stale])?;
-    {
-        let mut stmt =
-            tx.prepare_cached("insert or replace into inferred_asked (release_id, next_at) values (?1, ?2)")?;
+fn mark_posts(db: &dyn Sql, nothing: &[i64], waiting: &[(Vec<i64>, i64)], now: i64) -> crate::pg::sql::Result<()> {
+    db.tx(|tx| {
+        let stale = now - DAYS * 86_400;
+        tx.execute("delete from inferred_asked where next_at < $1", vals![stale])?;
+        tx.execute("delete from inferred_ids where next_at < $1", vals![stale])?;
+        let put = |id: i64, at: i64| {
+            tx.execute(
+                "insert into inferred_asked (release_id, next_at) values ($1, $2)
+                 on conflict (release_id) do update set next_at = excluded.next_at",
+                vals![id, at],
+            )
+        };
         for id in nothing {
-            stmt.execute(params![id, now + NOTHING_AGAIN])?;
+            put(*id, now + NOTHING_AGAIN)?;
         }
         for (ids, at) in waiting {
             for id in ids {
-                stmt.execute(params![id, at])?;
+                put(*id, *at)?;
             }
         }
-    }
-    tx.commit()
+        Ok(())
+    })
 }
 
 /// What each id asked came to: one found, or that no server has (or whose headers were no use), waits longer with each
 /// try; one that couldn't be asked or saved waits `FAILED_AGAIN`, its tries as they were.
-fn mark_ids(conn: &mut Connection, marks: &[(String, Outcome)], now: i64) -> rusqlite::Result<()> {
-    let tx = conn.transaction()?;
-    {
-        // one statement each: an answer is one more try, its wait (`backoff`) from the tries it then has; a failure
-        // keeps them
-        let mut answered = tx.prepare_cached(
-            "insert into inferred_ids (message_id, next_at, tries) values (?1, ?2 + min(?3, ?4), 1)
-             on conflict(message_id) do update set
-                tries = tries + 1, next_at = ?2 + min(?3 << min(tries, 15), ?4)",
-        )?;
-        let mut failed = tx.prepare_cached(
-            "insert into inferred_ids (message_id, next_at, tries) values (?1, ?2, 0)
-             on conflict(message_id) do update set next_at = ?2",
-        )?;
+fn mark_ids(db: &dyn Sql, marks: &[(String, Outcome)], now: i64) -> crate::pg::sql::Result<()> {
+    // one statement each: an answer is one more try, its wait (`backoff`) from the tries it then has; a failure
+    // keeps them
+    let waits: String = (0..16).map(|t| format!(" when {t} then {}", backoff(0, t + 1))).collect();
+    let answered = format!(
+        "insert into inferred_ids (message_id, next_at, tries) values ($1, $2, 1)
+         on conflict (message_id) do update set
+            tries = inferred_ids.tries + 1, next_at = cast($3 as bigint) + case inferred_ids.tries{waits} else {} end",
+        backoff(0, 16)
+    );
+    db.tx(|tx| {
         for (id, outcome) in marks {
             match outcome {
                 Outcome::Found | Outcome::Absent | Outcome::Unusable => {
-                    answered.execute(params![id, now, ABSENT_AGAIN, LONGEST])?;
+                    tx.execute(&answered, vals![id, backoff(now, 1), now])?;
                 }
                 Outcome::Failed => {
-                    failed.execute(params![id, now + FAILED_AGAIN])?;
+                    tx.execute(
+                        "insert into inferred_ids (message_id, next_at, tries) values ($1, $2, 0)
+                         on conflict (message_id) do update set next_at = excluded.next_at",
+                        vals![id, now + FAILED_AGAIN],
+                    )?;
                 }
             }
         }
-    }
-    tx.commit()
+        Ok(())
+    })
 }
 
 /// Whether a read failed because a stop interrupted it.
@@ -549,42 +555,49 @@ Xref: news.example alt.binaries.movies:11666417361 alt.binaries.hdtv:42\r\n";
 
     #[test]
     fn each_id_keeps_its_own_tries() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(CREATE).unwrap();
-        let row = |conn: &Connection, id: &str| -> Option<(i64, i64)> {
-            conn.query_row("select next_at, tries from inferred_ids where message_id = ?1", [id], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
-            .optional()
-            .unwrap()
-        };
-        let mark = |conn: &mut Connection, id: &str, o: Outcome, now: i64| {
-            mark_ids(conn, &[(id.to_string(), o)], now).unwrap();
-        };
-        mark(&mut conn, "a", Outcome::Absent, 100);
-        assert_eq!(row(&conn, "a"), Some((100 + ABSENT_AGAIN, 1)));
-        // headers that can't be used are an answer too
-        mark(&mut conn, "a", Outcome::Unusable, 200);
-        assert_eq!(row(&conn, "a"), Some((200 + 2 * ABSENT_AGAIN, 2)));
-        // a server that couldn't be asked isn't a try
-        mark(&mut conn, "a", Outcome::Failed, 300);
-        assert_eq!(row(&conn, "a"), Some((300 + FAILED_AGAIN, 2)));
-        // found waits too: should it not have joined its file, it isn't asked every round
-        mark(&mut conn, "a", Outcome::Found, 400);
-        assert_eq!(row(&conn, "a"), Some((400 + 4 * ABSENT_AGAIN, 3)));
-        mark(&mut conn, "b", Outcome::Failed, 500);
-        assert_eq!(row(&conn, "b"), Some((500 + FAILED_AGAIN, 0)));
+        crate::pg::testing::each(
+            |c| c.execute_batch(CREATE).unwrap(),
+            |db| {
+                let row = |id: &str| -> Option<(i64, i64)> {
+                    let r = db.row("select next_at, tries from inferred_ids where message_id = $1", vals![id]);
+                    r.unwrap().map(|r| (r.get(0).unwrap(), r.get(1).unwrap()))
+                };
+                let mark = |id: &str, o: Outcome, now: i64| mark_ids(db, &[(id.to_string(), o)], now).unwrap();
+                mark("a", Outcome::Absent, 100);
+                assert_eq!(row("a"), Some((100 + ABSENT_AGAIN, 1)));
+                // headers that can't be used are an answer too
+                mark("a", Outcome::Unusable, 200);
+                assert_eq!(row("a"), Some((200 + 2 * ABSENT_AGAIN, 2)));
+                // a server that couldn't be asked isn't a try
+                mark("a", Outcome::Failed, 300);
+                assert_eq!(row("a"), Some((300 + FAILED_AGAIN, 2)));
+                // found waits too: should it not have joined its file, it isn't asked every round
+                mark("a", Outcome::Found, 400);
+                assert_eq!(row("a"), Some((400 + 4 * ABSENT_AGAIN, 3)));
+                // and the wait stops growing at `LONGEST`
+                for t in 0..20 {
+                    mark("a", Outcome::Absent, 1000 + t);
+                }
+                assert_eq!(row("a"), Some((1019 + LONGEST, 23)));
+                mark("b", Outcome::Failed, 500);
+                assert_eq!(row("b"), Some((500 + FAILED_AGAIN, 0)));
 
-        mark_posts(&mut conn, &[1], &[(vec![2, 3], 900)], 600).unwrap();
-        let next = |id: i64| -> i64 {
-            conn.query_row("select next_at from inferred_asked where release_id = ?1", [id], |r| r.get(0)).unwrap()
-        };
-        assert_eq!((next(1), next(2), next(3)), (600 + NOTHING_AGAIN, 900, 900));
-        // a week on, what was due long ago is gone
-        let later = 600 + NOTHING_AGAIN + DAYS * 86_400 + 1;
-        mark_posts(&mut conn, &[], &[], later).unwrap();
-        assert_eq!(row(&conn, "b"), None);
-        assert_eq!(conn.query_row("select count(*) from inferred_asked", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+                mark_posts(db, &[1], &[(vec![2, 3], 900)], 600).unwrap();
+                let next = |id: i64| -> i64 {
+                    db.one("select next_at from inferred_asked where release_id = $1", vals![id]).unwrap()
+                };
+                assert_eq!((next(1), next(2), next(3)), (600 + NOTHING_AGAIN, 900, 900));
+                mark_posts(db, &[1], &[], 700).unwrap();
+                assert_eq!(next(1), 700 + NOTHING_AGAIN, "looked at again: its time moves");
+                // a week on, what was due long ago is gone
+                let later = 700 + NOTHING_AGAIN + DAYS * 86_400 + 1;
+                mark("a", Outcome::Failed, later - DAYS * 86_400 - FAILED_AGAIN - 1);
+                mark_posts(db, &[], &[], later).unwrap();
+                assert_eq!(row("b"), None);
+                assert_eq!(row("a"), None);
+                assert_eq!(db.one::<i64>("select count(*) from inferred_asked", vals![]).unwrap(), 0);
+            },
+        );
     }
 
     /// Every shard attached, `inferred_asked` in main, and releases (id, size, posted, complete) in shard 0.
@@ -678,12 +691,12 @@ Xref: news.example alt.binaries.movies:11666417361 alt.binaries.hdtv:42\r\n";
         assert_eq!(p.asked, [2]);
 
         // ids asked lately wait: 1's part 3 is skipped, and once part 5 waits too, the post waits for the first of them
-        let mut conn = conn;
-        mark_ids(&mut conn, &[("part3of6.tok@bzh29".into(), Outcome::Absent)], now).unwrap();
+        let conn = conn;
+        mark_ids(&conn, &[("part3of6.tok@bzh29".into(), Outcome::Absent)], now).unwrap();
         let p = plan(&conn, now, 100, post, articles).unwrap();
         let asked: Vec<&str> = p.wanted.iter().map(|w| w.row.message_id.as_str()).collect();
         assert_eq!(asked, ["<part4of4.tok@bzh29>", "<part5of6.tok@bzh29>"]);
-        mark_ids(&mut conn, &[("part5of6.tok@bzh29".into(), Outcome::Failed)], now).unwrap();
+        mark_ids(&conn, &[("part5of6.tok@bzh29".into(), Outcome::Failed)], now).unwrap();
         let p = plan(&conn, now, 100, post, articles).unwrap();
         assert_eq!(p.waiting, [(vec![1, 11], now + FAILED_AGAIN)]);
 

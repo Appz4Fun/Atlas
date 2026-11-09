@@ -8,6 +8,8 @@
 
 use rusqlite::{Connection, Result, params};
 
+use crate::pg::sql::{Sql, vals};
+
 use super::store::{SAVED, TODO, read_cursor, write_cursor};
 
 /// Where comments are posted.
@@ -134,52 +136,52 @@ fn cursor_key(group: &str, server: &str) -> String {
 }
 
 /// The last article of `group` read on `server`, by its numbers there.
-pub fn cursor(conn: &Connection, group: &str, server: &str) -> Result<Option<u64>> {
-    read_cursor(conn, &cursor_key(group, server))
+pub fn cursor(db: &dyn Sql, group: &str, server: &str) -> crate::pg::sql::Result<Option<u64>> {
+    read_cursor(db, &cursor_key(group, server))
 }
 
 /// Notes the comments (or, with `reports`, the reports) of one stretch of `group`, seen `now`, and that it was read
 /// up to `last`, together. Returns how many were new.
 pub fn note_read(
-    conn: &mut Connection,
+    db: &dyn Sql,
     group: &str,
     server: &str,
     last: u64,
     found: &[Noted],
     reports: bool,
     now: i64,
-) -> Result<usize> {
-    let tx = conn.transaction()?;
-    let mut added = 0;
-    {
-        let mut report = tx.prepare_cached(
-            "insert or ignore into spot_reports (message_id, spot, at, poster, seen) values (?, ?, ?, ?, ?)",
-        )?;
-        let mut comment = tx.prepare_cached(
-            "insert or ignore into spot_comments (message_id, spot, at, rating, poster, spotter_id, seen)
-             values (?, ?, ?, ?, ?, ?, ?)",
-        )?;
+) -> crate::pg::sql::Result<usize> {
+    db.tx(|tx| {
+        let mut added = 0;
         for n in found {
             added += if reports {
-                report.execute(params![n.message_id, n.spot, n.at, n.poster, now])?
+                tx.execute(
+                    "insert into spot_reports (message_id, spot, at, poster, seen) values ($1, $2, $3, $4, $5)
+                     on conflict (message_id) do nothing",
+                    vals![&n.message_id, &n.spot, n.at, &n.poster, now],
+                )?
             } else {
-                comment.execute(params![n.message_id, n.spot, n.at, n.rating, n.poster, n.spotter_id, now])?
+                tx.execute(
+                    "insert into spot_comments (message_id, spot, at, rating, poster, spotter_id, seen)
+                     values ($1, $2, $3, $4, $5, $6, $7)
+                     on conflict (message_id) do nothing",
+                    vals![&n.message_id, &n.spot, n.at, i64::from(n.rating), &n.poster, n.spotter_id.as_deref(), now],
+                )?
             };
         }
-        write_cursor(&tx, &cursor_key(group, server), last)?;
-    }
-    tx.commit()?;
-    Ok(added)
+        write_cursor(tx, &cursor_key(group, server), last)?;
+        Ok(added)
+    })
 }
 
 /// Comments on kept spots waiting for their body, those on saved spots first, newest first.
-pub fn todo(conn: &Connection, limit: usize) -> Result<Vec<String>> {
-    conn.prepare_cached(
+pub fn todo(db: &dyn Sql, limit: usize) -> crate::pg::sql::Result<Vec<String>> {
+    db.column(
         "select c.message_id from spot_comments c join spots_seen s on s.message_id = c.spot
-         where c.state = 0 and s.state in (?1, ?2) order by s.state = ?2 desc, c.at desc limit ?3",
-    )?
-    .query_map(params![TODO, SAVED, limit as i64], |r| r.get(0))?
-    .collect()
+         where c.state = 0 and s.state in ($1, $2)
+         order by case when s.state = $2 then 0 else 1 end, c.at desc, c.message_id limit $3",
+        vals![TODO, SAVED, limit as i64],
+    )
 }
 
 /// What came of reading a comment's body.
@@ -192,38 +194,40 @@ pub enum Outcome {
 }
 
 /// What came of reading these comments' bodies, in one transaction.
-pub fn settle(conn: &mut Connection, outcomes: &[(String, Outcome)]) -> Result<()> {
-    let tx = conn.transaction()?;
-    {
-        let mut read = tx.prepare_cached("update spot_comments set state = ?, body = ? where message_id = ?")?;
-        let mut gone = tx.prepare_cached("update spot_comments set state = ? where message_id = ?")?;
-        let mut failed = tx.prepare_cached(
-            "update spot_comments set tries = tries + 1,
-                state = case when tries + 1 >= ? then ? else state end
-             where message_id = ?",
-        )?;
+pub fn settle(db: &dyn Sql, outcomes: &[(String, Outcome)]) -> crate::pg::sql::Result<()> {
+    db.tx(|tx| {
         for (message_id, outcome) in outcomes {
             match outcome {
-                Outcome::Read(body) => read.execute(params![READ, body, message_id])?,
-                Outcome::Gone => gone.execute(params![GONE, message_id])?,
-                Outcome::Failed => failed.execute(params![MAX_TRIES, GONE, message_id])?,
+                Outcome::Read(body) => tx.execute(
+                    "update spot_comments set state = $1, body = $2 where message_id = $3",
+                    vals![READ, body, message_id],
+                )?,
+                Outcome::Gone => {
+                    tx.execute("update spot_comments set state = $1 where message_id = $2", vals![GONE, message_id])?
+                }
+                Outcome::Failed => tx.execute(
+                    "update spot_comments set tries = tries + 1,
+                        state = case when tries + 1 >= $1 then $2 else state end
+                     where message_id = $3",
+                    vals![MAX_TRIES, GONE, message_id],
+                )?,
             };
         }
-    }
-    tx.commit()
+        Ok(())
+    })
 }
 
 /// Forgets the comments and reports of spots not kept (never noted, came to nothing, forgotten since) once they
 /// were noted `UNKEPT_DAYS` ago. A saved spot is kept for good (`store::prune`).
-pub fn prune(conn: &Connection, now: i64) -> Result<usize> {
+pub fn prune(db: &dyn Sql, now: i64) -> crate::pg::sql::Result<usize> {
     let mut n = 0;
     for table in ["spot_comments", "spot_reports"] {
-        n += conn.execute(
+        n += db.execute(
             &format!(
-                "delete from {table} where seen < ?3
-                 and spot not in (select message_id from spots_seen where state in (?1, ?2))"
+                "delete from {table} where seen < $3
+                 and spot not in (select message_id from spots_seen where state in ($1, $2))"
             ),
-            params![TODO, SAVED, now - UNKEPT_DAYS * 86_400],
+            vals![TODO, SAVED, now - UNKEPT_DAYS * 86_400],
         )?;
     }
     Ok(n)
@@ -379,9 +383,9 @@ mod tests {
 
     #[test]
     fn comments_on_kept_spots_are_noted_read_and_shown() {
-        let mut conn = main_db();
+        let conn = main_db();
         let spots = vec![("s1@spot.net".to_string(), 1, None), ("s2@spot.net".to_string(), 2, None)];
-        super::super::store::note_read(&mut conn, "srv", 2, &spots, 0).unwrap();
+        super::super::store::note_read(&conn, "srv", 2, &spots, 0).unwrap();
         let saved = super::super::store::Settled { state: SAVED, release_id: Some(9), ..Default::default() };
         super::super::store::settle(&conn, "s1@spot.net", Some(&saved), 0).unwrap();
         let noted = |id: &str, spot: &str, at| Noted {
@@ -393,29 +397,29 @@ mod tests {
             spotter_id: None,
         };
         let found = vec![noted("s1.8.a.b@spot.net", "s1@spot.net", 20), noted("s2.0.a.b@spot.net", "s2@spot.net", 30)];
-        assert_eq!(note_read(&mut conn, COMMENT_GROUP, "srv", 100, &found, false, 0).unwrap(), 2);
-        assert_eq!(note_read(&mut conn, COMMENT_GROUP, "srv", 120, &found, false, 0).unwrap(), 0);
+        assert_eq!(note_read(&conn, COMMENT_GROUP, "srv", 100, &found, false, 0).unwrap(), 2);
+        assert_eq!(note_read(&conn, COMMENT_GROUP, "srv", 120, &found, false, 0).unwrap(), 0);
         assert_eq!(cursor(&conn, COMMENT_GROUP, "srv").unwrap(), Some(120));
         assert_eq!(cursor(&conn, REPORT_GROUP, "srv").unwrap(), None);
         // nothing new: the cursor still moves
-        assert_eq!(note_read(&mut conn, COMMENT_GROUP, "srv", 130, &[], false, 0).unwrap(), 0);
+        assert_eq!(note_read(&conn, COMMENT_GROUP, "srv", 130, &[], false, 0).unwrap(), 0);
         assert_eq!(cursor(&conn, COMMENT_GROUP, "srv").unwrap(), Some(130));
         let report = vec![noted("r1@spot.net", "s1@spot.net", 25)];
-        assert_eq!(note_read(&mut conn, REPORT_GROUP, "srv", 7, &report, true, 0).unwrap(), 1);
+        assert_eq!(note_read(&conn, REPORT_GROUP, "srv", 7, &report, true, 0).unwrap(), 1);
         // a comment on a spot not noted yet (it reached the server first): kept, its text not read for now
         let day = 86_400;
         let early = vec![noted("s3.0.a.b@spot.net", "s3@spot.net", 40)];
-        note_read(&mut conn, COMMENT_GROUP, "srv", 140, &early, false, 10 * day).unwrap();
+        note_read(&conn, COMMENT_GROUP, "srv", 140, &early, false, 10 * day).unwrap();
         // the saved spot's comment first, though the other is newer
         assert_eq!(todo(&conn, 10).unwrap(), ["s1.8.a.b@spot.net", "s2.0.a.b@spot.net"]);
         let read = ("s1.8.a.b@spot.net".to_string(), Outcome::Read("Password in comment: hunter2".into()));
         let failed = ("s2.0.a.b@spot.net".to_string(), Outcome::Failed);
-        settle(&mut conn, &[read, failed.clone()]).unwrap();
+        settle(&conn, &[read, failed.clone()]).unwrap();
         for _ in 1..MAX_TRIES - 1 {
-            settle(&mut conn, std::slice::from_ref(&failed)).unwrap();
+            settle(&conn, std::slice::from_ref(&failed)).unwrap();
         }
         assert_eq!(todo(&conn, 10).unwrap(), ["s2.0.a.b@spot.net"], "tried, not given up on yet");
-        settle(&mut conn, &[failed]).unwrap();
+        settle(&conn, &[failed]).unwrap();
         assert!(todo(&conn, 10).unwrap().is_empty());
 
         // the release page: its spot's comments and reports, and those of an earlier spot of the same NZB
@@ -428,7 +432,7 @@ mod tests {
         assert!(none.is_empty() && no_reports == 0);
 
         // its spot comes: its text is next
-        super::super::store::note_read(&mut conn, "srv", 3, &[("s3@spot.net".to_string(), 3, None)], 0).unwrap();
+        super::super::store::note_read(&conn, "srv", 3, &[("s3@spot.net".to_string(), 3, None)], 0).unwrap();
         assert_eq!(todo(&conn, 10).unwrap(), ["s3.0.a.b@spot.net"]);
 
         // `UNKEPT_DAYS` after they were noted, the comments of spots not kept go: one that came to nothing, one
@@ -446,5 +450,77 @@ mod tests {
         assert_eq!(prune(&conn, now + 1).unwrap(), 1);
         let left: i64 = conn.query_row("select count(*) from spot_comments", [], |r| r.get(0)).unwrap();
         assert_eq!(left, 0);
+    }
+
+    /// `comments_on_kept_spots_are_noted_read_and_shown` but the release page, on SQLite and Postgres
+    #[test]
+    fn the_queue_works_alike_on_both_backends() {
+        crate::pg::testing::each(
+            |c| {
+                c.execute_batch("create table meta (key TEXT PRIMARY KEY, value INTEGER)").unwrap();
+                super::super::store::create_main(c).unwrap();
+            },
+            |conn| {
+                let spots = vec![("s1@spot.net".to_string(), 1, None), ("s2@spot.net".to_string(), 2, None)];
+                super::super::store::note_read(conn, "srv", 2, &spots, 0).unwrap();
+                let saved = super::super::store::Settled { state: SAVED, release_id: Some(9), ..Default::default() };
+                super::super::store::settle(conn, "s1@spot.net", Some(&saved), 0).unwrap();
+                let noted = |id: &str, spot: &str, at| Noted {
+                    message_id: id.into(),
+                    spot: spot.into(),
+                    at,
+                    rating: 0,
+                    poster: "p".into(),
+                    spotter_id: None,
+                };
+                let found =
+                    vec![noted("s1.8.a.b@spot.net", "s1@spot.net", 20), noted("s2.0.a.b@spot.net", "s2@spot.net", 30)];
+                assert_eq!(note_read(conn, COMMENT_GROUP, "srv", 100, &found, false, 0).unwrap(), 2);
+                assert_eq!(note_read(conn, COMMENT_GROUP, "srv", 120, &found, false, 0).unwrap(), 0);
+                assert_eq!(cursor(conn, COMMENT_GROUP, "srv").unwrap(), Some(120));
+                assert_eq!(cursor(conn, REPORT_GROUP, "srv").unwrap(), None);
+                // nothing new: the cursor still moves
+                assert_eq!(note_read(conn, COMMENT_GROUP, "srv", 130, &[], false, 0).unwrap(), 0);
+                assert_eq!(cursor(conn, COMMENT_GROUP, "srv").unwrap(), Some(130));
+                let report = vec![noted("r1@spot.net", "s1@spot.net", 25)];
+                assert_eq!(note_read(conn, REPORT_GROUP, "srv", 7, &report, true, 0).unwrap(), 1);
+                // a comment on a spot not noted yet (it reached the server first): kept, its text not read for now
+                let day = 86_400;
+                let early = vec![noted("s3.0.a.b@spot.net", "s3@spot.net", 40)];
+                note_read(conn, COMMENT_GROUP, "srv", 140, &early, false, 10 * day).unwrap();
+                // the saved spot's comment first, though the other is newer
+                assert_eq!(todo(conn, 10).unwrap(), ["s1.8.a.b@spot.net", "s2.0.a.b@spot.net"]);
+                let read = ("s1.8.a.b@spot.net".to_string(), Outcome::Read("Password in comment: hunter2".into()));
+                let failed = ("s2.0.a.b@spot.net".to_string(), Outcome::Failed);
+                settle(conn, &[read, failed.clone()]).unwrap();
+                for _ in 1..MAX_TRIES - 1 {
+                    settle(conn, std::slice::from_ref(&failed)).unwrap();
+                }
+                assert_eq!(todo(conn, 10).unwrap(), ["s2.0.a.b@spot.net"], "tried, not given up on yet");
+                settle(conn, &[failed]).unwrap();
+                assert!(todo(conn, 10).unwrap().is_empty());
+
+                // its spot comes: its text is next
+                super::super::store::note_read(conn, "srv", 3, &[("s3@spot.net".to_string(), 3, None)], 0).unwrap();
+                assert_eq!(todo(conn, 10).unwrap(), ["s3.0.a.b@spot.net"]);
+
+                // `UNKEPT_DAYS` after they were noted, the comments of spots not kept go: one that came to nothing, one
+                // forgotten since. A kept spot's stay
+                let now = 10 * day + UNKEPT_DAYS * day;
+                assert_eq!(prune(conn, now).unwrap(), 0);
+                let skipped =
+                    super::super::store::Settled { state: super::super::store::SKIPPED, ..Default::default() };
+                super::super::store::settle(conn, "s2@spot.net", Some(&skipped), 0).unwrap();
+                assert_eq!(prune(conn, now).unwrap(), 1);
+                conn.execute("delete from spots_seen where message_id = 's1@spot.net'", vals![]).unwrap();
+                assert_eq!(prune(conn, now).unwrap(), 2, "its comment and its report");
+                // the one noted on day 10 is past `UNKEPT_DAYS` a second later, whatever its spot did
+                conn.execute("delete from spots_seen where message_id = 's3@spot.net'", vals![]).unwrap();
+                assert_eq!(prune(conn, now).unwrap(), 0);
+                assert_eq!(prune(conn, now + 1).unwrap(), 1);
+                let left: i64 = conn.one("select count(*) from spot_comments", vals![]).unwrap();
+                assert_eq!(left, 0);
+            },
+        );
     }
 }
