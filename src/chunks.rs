@@ -522,7 +522,12 @@ fn claim_wanted(db: &dyn Sql, groups: &[(String, i64)], host: &str, now: i64) ->
     }
     // the few days asked for are read and checked against `groups` here: joined in SQL with a values list of every
     // group, SQLite's plan for it walked the whole chunk table on prod, under the main connection's lock
-    let oldest: std::collections::HashMap<&str, i64> = groups.iter().map(|(g, o)| (g.as_str(), *o)).collect();
+    // a group listed twice is open from the older of its days, as the join with every entry was
+    let mut oldest: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
+    for (g, o) in groups {
+        let e = oldest.entry(g.as_str()).or_insert(*o);
+        *e = (*e).min(*o);
+    }
     let stale = now - CLAIM_TIMEOUT;
     let row = db.tx(|tx| {
         tx.lock("atlas.backfill_claim")?;

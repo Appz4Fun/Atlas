@@ -454,7 +454,9 @@ impl Sql for rusqlite::Connection {
 
     fn transaction(&self, f: &mut dyn FnMut(&dyn Sql) -> Result<()>) -> Result<()> {
         if self.is_autocommit() {
-            let tx = self.unchecked_transaction()?;
+            // immediate: the write lock first, as a lone update took it. A deferred one that reads before it writes
+            // fails at once (no busy wait) when another connection wrote in between, in WAL
+            let tx = rusqlite::Transaction::new_unchecked(self, rusqlite::TransactionBehavior::Immediate)?;
             f(&*tx)?;
             return Ok(tx.commit()?);
         }
