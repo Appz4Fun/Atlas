@@ -157,6 +157,8 @@ fn add_days(tx: &dyn Sql, group: &str, from: i64, before: i64) -> Result<usize> 
 /// that server started in it. Returns the chunks added or to do again.
 pub fn reach_back(db: &dyn Sql, group: &str, oldest_day: i64, oldest_at: i64) -> Result<usize> {
     db.tx(|tx| {
+        // what's added depends on the window's floor: read as it is, not as it was before a change to it commits
+        tx.lock(&speculative_lock(group))?;
         let Some(old) = self::oldest_day(tx, group)? else { return Ok(0) };
         // never past the window of days only the deepest server has
         let spec = speculative(tx, group)?;
@@ -215,6 +217,11 @@ pub struct Speculative {
     pub reach: i64,
     pub days: i64,
     pub articles: i64,
+}
+
+/// The lock a group's speculative window is read and changed under (`Sql::lock`), on Postgres.
+pub fn speculative_lock(group: &str) -> String {
+    format!("atlas.speculative.{group}")
 }
 
 pub fn speculative(db: &dyn Sql, group: &str) -> Result<Option<Speculative>> {
