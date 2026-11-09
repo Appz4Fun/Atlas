@@ -70,8 +70,8 @@ pub fn encode(segs: &[Seg]) -> Vec<u8> {
     zstd::bulk::compress(&raw, LEVEL).expect("zstd compress of an in memory buffer")
 }
 
-/// A sealed-log place of a blob from a shard folded into another (`merge_shards`): the segments in the log carry
-/// that shard's domain numbers, which this one keeps on from `base`. `SHIFTED_TAG`, `base` (8 bytes, little endian),
+/// A sealed-log place of a blob restored under other domain numbers (`remap_blob`): the segments in the log carry
+/// the numbers they were sealed with, which this copy keeps on from `base`. `SHIFTED_TAG`, `base` (8 bytes, little endian),
 /// then the place. A blob kept here is renumbered as it's copied instead (`shift_blob`).
 pub const SHIFTED_TAG: [u8; 5] = *b"\xFFSHF1";
 
@@ -95,7 +95,7 @@ fn unshifted(blob: &[u8]) -> (i64, &[u8]) {
     }
 }
 
-/// What is stored without the base a merge put on it: the blob, or its sealed-log place.
+/// What is stored without the base a remap put on it: the blob, or its sealed-log place.
 pub fn inner(blob: &[u8]) -> &[u8] {
     unshifted(blob).1
 }
@@ -108,7 +108,7 @@ fn shift(segs: &mut [Seg], base: i64) {
     }
 }
 
-/// A stored blob of a shard being folded into another: one kept here is written again with its domains taken from
+/// A stored blob moved under other domain numbers: one kept here is written again with its domains taken from
 /// `map` (the id the target uses for the same suffix; one not in it moved on by `base`), a sealed-log place is marked
 /// to be read on from `base` (`shifted`), as what's in the log can't be rewritten. One shifted already is shifted again.
 pub fn remap_blob(blob: &[u8], base: i64, map: &std::collections::HashMap<i64, i64>) -> Result<Vec<u8>> {

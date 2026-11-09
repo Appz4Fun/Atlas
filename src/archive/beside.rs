@@ -349,8 +349,7 @@ fn thumbnail_beside(
     posted: &str,
 ) -> Result<Option<i64>, StepError> {
     let Some((from, to)) = beside_window(posted, BESIDE_SECS) else { return Ok(None) };
-    let cutover = crate::merge_shards::one_shard_from(conn).map_err(|e| StepError::Retry(format!("{e:#}")))?;
-    let (low, high) = id_window(me, cutover, ID_WINDOW);
+    let (low, high) = id_window(me, ID_WINDOW);
     let by_poster = conn
         .query_row("select 1 from sqlite_master where type = 'index' and name = 'idx_release_poster'", [], |_| Ok(()))
         .is_ok();

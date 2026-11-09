@@ -446,8 +446,8 @@ fn sort_groups(out: &mut [GroupPosting]) {
     out.sort_by(|a, b| b.articles.cmp(&a.articles).then_with(|| a.group.cmp(&b.group)));
 }
 
-/// The most rows of one name a lookup reads: what eight shards' lookups of 64 each read together, before one shard.
-const NAME_ROWS: usize = 64 * crate::merge_shards::LEGACY_SHARDS;
+/// The most rows of one name a lookup reads.
+const NAME_ROWS: usize = 512;
 
 pub fn groups_of_with(conn: &Connection, name: &str) -> Result<Vec<GroupPosting>> {
     let mut out = Vec::new();

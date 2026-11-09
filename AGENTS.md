@@ -21,7 +21,7 @@ When resetting/wiping the database to test fresh shard schemas **without** havin
    ```bash
    launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.atlas.indexer.plist ~/Library/LaunchAgents/com.atlas.web.plist
    ```
-2. Run the built-in shard reset command (which automatically harvests all natural-keyed `release_opensubtitles`, `release_probe`, `release_cover`, `archive_release`, `archive_inner_files`, `par2_files`, `rev_volumes`, `release_fingerprint`, `release_nfo_password`, `release_stills`, `release_audio_print`, and `backfill_deepest` rows from `atlas.s0..s7.db` / `atlas.db` into `atlas.raw.db` before removing the shards):
+2. Run the built-in shard reset command (which automatically harvests all natural-keyed `release_opensubtitles`, `release_probe`, `release_cover`, `archive_release`, `archive_inner_files`, `par2_files`, `rev_volumes`, `release_fingerprint`, `release_nfo_password`, `release_stills`, `release_audio_print`, and `backfill_deepest` rows from `atlas.s0.db` / `atlas.db` into `atlas.raw.db` before removing the shards):
    ```bash
    atlas --reset-shards --apply
    ```

@@ -156,23 +156,9 @@ const MIN_SIZE_ONLY: u64 = 64 << 20;
 /// groups' saves come in between, and an upload cut across groups lands in each group's own run.
 pub(super) const ID_WINDOW: i64 = 2_000_000;
 
-/// The ids `saves` saves either way of `id`: ids below `cutover` were handed out eight to a save (eight shards), ids
-/// from it on one to a save (`merge_shards::one_shard_from`).
-pub(super) fn id_window(id: i64, cutover: i64, saves: i64) -> (i64, i64) {
-    let per = crate::merge_shards::LEGACY_SHARDS as i64;
-    let low = if id >= cutover {
-        let dense = (id - cutover).min(saves);
-        id - dense - (saves - dense) * per
-    } else {
-        id - saves * per
-    };
-    let high = if id < cutover {
-        let eight = ((cutover - id) / per).min(saves);
-        if eight < saves { cutover + (saves - eight) } else { id + saves * per }
-    } else {
-        id + saves
-    };
-    (low, high)
+/// The ids `saves` saves either way of `id`, one id to a save.
+pub(super) fn id_window(id: i64, saves: i64) -> (i64, i64) {
+    (id - saves, id + saves)
 }
 /// How far apart, in seconds, a small file posted beside a release can say it was posted: an upload's files go up
 /// within a minute or two of each other, and this allows a slow one.
@@ -592,11 +578,8 @@ impl LinkStep {
     ) -> Result<Vec<Candidate>, StepError> {
         let me = ctx.release();
         let Some(posted) = me.posted_date.clone() else { return Ok(Vec::new()) };
-        // `ID_WINDOW` saves either way of this one, whether their ids are from the eight shards there were (eight to
-        // a save) or dense since
-        let cutover =
-            crate::merge_shards::one_shard_from(ctx.conn()).map_err(|e| StepError::Retry(format!("{e:#}")))?;
-        let (low, high) = id_window(me.id, cutover, ID_WINDOW);
+        // `ID_WINDOW` saves either way of this one
+        let (low, high) = id_window(me.id, ID_WINDOW);
         let mut stmt = ctx
             .conn()
             .prepare_cached(
@@ -977,21 +960,6 @@ fn query_one<T: rusqlite::types::FromSql>(ctx: &StepCtx<'_>, sql: &str, id: i64)
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_window_is_the_same_saves_whether_ids_were_eight_to_a_save_or_one() {
-        let w = 100;
-        // all from before one shard: eight ids a save
-        assert_eq!(id_window(10_000, 1_000_000, w), (10_000 - 800, 10_000 + 800));
-        // all since: one id a save
-        assert_eq!(id_window(2_000_000, 1_000_000, w), (2_000_000 - 100, 2_000_100));
-        // across: 40 dense saves down to the cutover, the other 60 at eight
-        assert_eq!(id_window(1_000_040, 1_000_000, w).0, 1_000_000 - 60 * 8);
-        // and up: 30 saves at eight to the cutover, the other 70 dense
-        assert_eq!(id_window(1_000_000 - 240, 1_000_000, w).1, 1_000_000 + 70);
-        // never merged: every id dense
-        assert_eq!(id_window(500, 0, w), (400, 600));
-    }
 
     fn file(size: u64, md5: u8) -> Par2File {
         Par2File {

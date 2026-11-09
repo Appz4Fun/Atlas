@@ -486,7 +486,7 @@ pub fn create_db_holding(path: &Path) -> anyhow::Result<Option<WriteGuard>> {
     // a conversion's swap cut short leaves no main database: finished or
     // undone first, alone (busy means someone is using the database, soo it's there)
     if (!path.try_exists()? || crate::convert::is_empty_interloper(path))
-        && let Ok(_alone) = crate::compact::Lock::take_unchecked(path)
+        && let Ok(_alone) = crate::compact::Lock::take(path)
         && let Some(said) = crate::convert::recover_cut_swap(path)?
     {
         crate::ui::warn(&said);
@@ -507,10 +507,9 @@ pub fn create_db_holding(path: &Path) -> anyhow::Result<Option<WriteGuard>> {
 /// shards would hand out their ids again. A shard that cant be removed is an
 /// error, with the main database left in place.
 pub fn wipe(main: &Path) -> anyhow::Result<()> {
-    let _exclusive = crate::compact::Lock::take_unchecked(main)?;
+    let _exclusive = crate::compact::Lock::take(main)?;
     let mut dbs = Vec::new();
-    // the shards from before one shard too, should a wipe come before their merge
-    for shard in (0..crate::merge_shards::LEGACY_SHARDS).map(|s| crate::merge_shards::legacy_shard_path(main, s)) {
+    for shard in store::shard_paths(main) {
         dbs.push(crate::frozen::path(&shard));
         let copy = crate::compact::with_suffix(&shard, "compact");
         dbs.push(crate::compact::with_suffix(&copy, "check"));
@@ -548,19 +547,6 @@ pub fn create_db_at(path: &Path) -> anyhow::Result<()> {
         refuse_orphaned_shards(path)?;
     }
     let conn = create_at(path)?;
-    // shards half merged: only `atlas --merge-shards --apply` may go on with them
-    if crate::merge_shards::in_progress(&conn)? {
-        anyhow::bail!("a shard merge is in progress: run `atlas --merge-shards --apply` to finish it before indexing");
-    }
-    // the shards from before one shard: their releases would be out of sight, their ids handed out again
-    let legacy = crate::merge_shards::legacy_leftovers(path);
-    if !legacy.is_empty() {
-        anyhow::bail!(
-            "{} files of the shards from before the move to one shard are still here ({}): run `atlas --merge-shards --apply` first",
-            legacy.len(),
-            legacy.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
-        );
-    }
 
     // wal soo the indexer can write while search reads
     conn.query_row("pragma journal_mode = wal", [], |_| Ok(()))?;
@@ -591,11 +577,6 @@ pub fn create_db_at(path: &Path) -> anyhow::Result<()> {
     let used = has_progress(&conn)?;
     store::create_main(&conn)?;
     create_shards(path, used)?;
-    // a merged shard finished by a build that didn't note its first one-shard id: noted now, while it can be told
-    // best effort: without it the linker reckons the id from what the shard holds
-    if let Err(e) = crate::merge_shards::note_one_shard_from(path, &conn) {
-        crate::ui::warn(&format!("couldnt note the first one-shard release id: {e:#}"));
-    }
     if fresh && !used {
         crate::raw_store::restore_backfill_deepest(path, &conn);
     }

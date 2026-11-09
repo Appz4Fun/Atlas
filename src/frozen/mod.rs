@@ -731,9 +731,9 @@ pub enum Domains {
     /// fetched and kept in the shard when they differ)
     Map,
     /// into a scratch copy: with the ids they had, blobs as they are (nothing fetched from the sealed log). A payload
-    /// some of whose ids another payload gave other suffixes (shards folded into one, `merge_shards`) goes in whole on
-    /// from a base past them, its blobs marked to be read on from it (`blob::remap_blob`). The copy's `domains` takes
-    /// one suffix under several ids for that (`merge_shards::domains_not_unique`)
+    /// some of whose ids another payload gave other suffixes goes in whole on from a base past them, its blobs marked
+    /// to be read on from it (`blob::remap_blob`). The copy's `domains` takes one suffix under several ids for that
+    /// (`store::domains_not_unique`)
     Keep,
 }
 
@@ -748,9 +748,8 @@ pub fn restore(conn: &Connection, schema: &str, p: &Payload, how: Domains) -> Re
             .query_row([id], |r| r.get(0))
             .optional()
     };
-    // Map: the base the payload's ids already read right on from here, when they do, soo its blobs needn't be
-    // decoded (a sealed-log place fetched) to be renumbered: 0 for a payload frozen since the shards were folded
-    // into one, `shard << 32` for one frozen in a folded shard before (`merge_shards` keeps its domains there)
+    // Map: whether the payload's ids already read right here, soo its blobs needn't be decoded (a sealed-log place
+    // fetched) to be renumbered
     let reads_same = |base: i64| -> Result<bool> {
         for (old, suffix) in &p.domains {
             if suffix_at(old + base)?.as_deref() != Some(suffix.as_str()) {
@@ -760,17 +759,8 @@ pub fn restore(conn: &Connection, schema: &str, p: &Payload, how: Domains) -> Re
         Ok(true)
     };
     let mut kept_base: Option<i64> = None;
-    if how == Domains::Map {
-        let release_id = p
-            .table("releases")
-            .and_then(|r| r.rows.first().and_then(|row| int(r.column("id").map(|c| &row[c]))))
-            .unwrap_or(0);
-        let shard = release_id.rem_euclid(crate::merge_shards::LEGACY_SHARDS as i64);
-        if reads_same(0)? {
-            kept_base = Some(0);
-        } else if shard != 0 && reads_same(shard << 32)? {
-            kept_base = Some(shard << 32);
-        }
+    if how == Domains::Map && reads_same(0)? {
+        kept_base = Some(0);
     }
     if how == Domains::Keep {
         let fits = |base: i64| -> Result<bool> {
@@ -1170,8 +1160,8 @@ pub fn unfrozen_copy(main: &Path, shard: usize) -> anyhow::Result<Option<PathBuf
     crate::store::create_shard(&copy)?;
     let conn = crate::db::open_shard(&copy)?;
     crate::postprocess::schema::migrate(&conn)?;
-    // payloads of shards folded into one: one suffix under each shard's id (`Domains::Keep`)
-    crate::merge_shards::domains_not_unique(&conn)?;
+    // payloads whose ids another payload gave other suffixes: one suffix under several ids (`Domains::Keep`)
+    crate::store::domains_not_unique(&conn)?;
     let tx = conn.unchecked_transaction()?;
     let mut stmt = frozen.prepare("select id, payload from frozen_releases order by id")?;
     let mut rows = stmt.query([])?;

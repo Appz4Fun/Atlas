@@ -36,7 +36,6 @@ pub mod merging;
 pub mod images;
 pub mod nxv_store;
 pub mod keep_export;
-pub mod merge_shards;
 pub mod metrics;
 pub mod naming;
 pub mod nfo;
