@@ -1184,7 +1184,6 @@ impl Conn {
     fn archive(&self, lines: &[Vec<u8>]) {
         if let Some(group) = &self.group {
             crate::overview_archive::record(&self.server, group, lines);
-            crate::header_window::record(&self.server, group, lines);
             crate::nxv_store::live::record(&self.server, group, lines);
         }
     }
@@ -1253,11 +1252,7 @@ impl Conn {
             true
         })
         .await?;
-        if self.group.is_some()
-            && (crate::overview_archive::enabled()
-                || crate::header_window::enabled()
-                || crate::nxv_store::live::enabled())
-        {
+        if self.group.is_some() && (crate::overview_archive::enabled() || crate::nxv_store::live::enabled()) {
             let lines = decode_xzver_raw(&raw_lines)?;
             self.archive(&lines);
             return Ok(lines.iter().filter_map(|l| parse_overview(l)).collect());

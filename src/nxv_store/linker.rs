@@ -1,7 +1,7 @@
-//! The cross-group linker over the day-segment store: what `xref` does over `atlas.xref.db`, reading the store's
-//! blocks instead of a table of headers, behind `[header_store] linker`.
+//! The cross-group linker over the day-segment store: uploads obfuscated per article tied back together from the
+//! store's blocks, by the rules in `xref`. It runs whenever the store is on (`[header_store] enabled`).
 //!
-//! The unit of work is an hour of the posters' wall clock (the scale `xref` keeps posting times on). An hour is
+//! The unit of work is an hour of the posters' wall clock (the scale posting times are kept on). An hour is
 //! ready once every backfill day chunk covering it and two hours either side is done and two hours (and the settle
 //! time) have gone by since it ended, or a day after its rows first came. A pass takes the earliest ready hours, a
 //! few at a time (`SPAN_HOURS`), seals and commits whatever the store still holds of their days (a barrier), reads
@@ -479,7 +479,7 @@ impl LinkedIds {
         let mut set = HashSet::new();
         let mut kept = Vec::with_capacity(bytes.len());
         // a torn last record was never acknowledged: dropped
-        for r in bytes.chunks_exact(IDS_RECORD) {
+        for r in bytes.as_chunks::<IDS_RECORD>().0 {
             let added = i64::from_le_bytes(r[8..16].try_into().expect("8 bytes"));
             if added >= before {
                 set.insert(u64::from_le_bytes(r[..8].try_into().expect("8 bytes")));

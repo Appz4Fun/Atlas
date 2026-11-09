@@ -2379,17 +2379,16 @@ async fn parse_and_save(
         let group = group.to_string();
         move || {
             let _span = crate::metrics::span("indexer.parse_slice");
-            // articles whose every subject is random go to the store that links them across groups (`xref`)
-            // the slice fails, and is read again, when their headers couldnt be kept
-            let (articles, written) = crate::xref::hold(&group, headers_to_articles(headers))?;
+            // articles whose every subject is random are left to the header store's linker (`xref::hold`)
+            let articles = crate::xref::hold(&group, headers_to_articles(headers));
             let (articles, uploads, skipped) = crate::filters::gather_per_article(&group, articles);
             let mut releases: Vec<Release> =
                 crate::collections::group_articles(&group, articles).into_values().collect();
             releases.extend(uploads);
-            anyhow::Ok((releases, skipped, written))
+            anyhow::Ok((releases, skipped))
         }
     };
-    let (mut releases, skipped, written) =
+    let (mut releases, skipped) =
         tokio::task::spawn_blocking(parsing).await.map_err(|e| anyhow!("parse task failed: {e}"))??;
     crate::profile::PARSE.add_since(t);
     crate::profile::Load::add_since(&crate::profile::LOAD.parse_ns, t);
@@ -2425,13 +2424,6 @@ async fn parse_and_save(
             span.failed();
         }
         saved?;
-    }
-    // the slice's obfuscated headers written too before it counts as read (`xref::hold`): one that failed is read
-    // again
-    if let Some(written) = written {
-        tokio::task::spawn_blocking(move || written.wait(Duration::from_secs(600)))
-            .await
-            .map_err(|e| anyhow!("waiting for the headers failed: {e}"))??;
     }
     // with the header store on, the slice's rows durable in its logs too before the slice counts as read
     if let Some(ticket) = crate::nxv_store::live::sync_point(group)? {
