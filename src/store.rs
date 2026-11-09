@@ -1096,7 +1096,15 @@ pub(crate) fn add_segment(
     a: &Article,
     sealed: &mut SealedCache,
 ) -> Result<bool> {
-    add_segment_with(conn, &mut SegmentStatements::new(conn)?, domains, f, index, a, sealed)
+    add_segment_with(conn, &mut SegmentStatements::new(conn)?, domains, f, index, None, a, sealed)
+}
+
+/// A release's `release_ids` rows (id hash -> file), its own one left out: for `add_segment_with` to look in instead
+/// of the table, for a release made by the save, whose rows only that save adds.
+fn release_ids_of(conn: &Connection, release_id: i64) -> Result<HashMap<i64, i64>> {
+    conn.prepare_cached("select id_hash, file_id from release_ids where release_id = ? and id_hash != 0")?
+        .query_map([release_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect()
 }
 
 /// The statements `add_segment` runs for each article, prepared once for a whole save: taking each from the
@@ -1126,13 +1134,16 @@ impl<'c> SegmentStatements<'c> {
 /// Add one article to a file; false when it was already there, as a row or
 /// in the file's sealed blob, or in another file of its release (`index`,
 /// the release and the hash key when it has more than one file: one
-/// message-id saved under two parsed file names is one article).
+/// message-id saved under two parsed file names is one article). `mirror`, with `index`: every row the release
+/// has in the index, looked in instead of the table and kept up with it (`release_ids_of`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn add_segment_with(
     conn: &Connection,
     stmts: &mut SegmentStatements<'_>,
     domains: &mut Domains,
     f: &FileState,
     index: Option<(i64, &IdKey)>,
+    mut mirror: Option<&mut HashMap<i64, i64>>,
     a: &Article,
     sealed: &mut SealedCache,
 ) -> Result<bool> {
@@ -1145,9 +1156,14 @@ pub(crate) fn add_segment_with(
     if hash.is_some() {
         LOOKUPS.set(LOOKUPS.get() + 1);
     }
+    let indexed = |stmts: &mut SegmentStatements<'_>, release_id: i64, hash: i64| -> Result<Option<i64>> {
+        match mirror.as_deref() {
+            Some(rows) => Ok(rows.get(&hash).copied()),
+            None => stmts.index_lookup.query_row(params![release_id, hash], |r| r.get::<_, i64>(0)).optional(),
+        }
+    };
     if let (Some((release_id, _)), Some(hash)) = (index, hash)
-        && let Some(file_id) =
-            stmts.index_lookup.query_row(params![release_id, hash], |r| r.get::<_, i64>(0)).optional()?
+        && let Some(file_id) = indexed(stmts, release_id, hash)?
         && (file_id != f.id || f.sealed)
     {
         return Ok(false);
@@ -1197,6 +1213,9 @@ pub(crate) fn add_segment_with(
         && let (Some((release_id, _)), Some(hash)) = (index, hash)
     {
         stmts.index_insert.execute(params![release_id, hash, f.id])?;
+        if let Some(rows) = mirror.as_deref_mut() {
+            rows.entry(hash).or_insert(f.id);
+        }
     }
     Ok(added > 0)
 }
@@ -2980,6 +2999,9 @@ impl ShardWriter {
                 // already under another message-id is counted too: it isnt known to be a repost, as different files
                 // can share a file row (a name the subject doesnt give, or gives the same for each)
                 let mut added: Vec<(&Article, bool)> = Vec::new();
+                // a release this save made has in the index only what this save puts there: kept in memory
+                let made_now = release_id == id;
+                let mut mirror: Option<HashMap<i64, i64>> = None;
                 for (name, articles) in by_file {
                     let mut f = file(&tx, release_id, name)?;
                     // a release with other files is checked for the same message-id
@@ -2992,10 +3014,22 @@ impl ShardWriter {
                             .inc(&[("event", "indexed"), ("shard", &shard.to_string())], 1);
                     }
                     let index = others.then_some((release_id, &key));
+                    if made_now && others && mirror.is_none() {
+                        mirror = Some(release_ids_of(&tx, release_id)?);
+                    }
                     let before = added.len();
                     let mut timing = Timing::default();
                     for (i, a) in articles {
-                        if add_segment_with(&tx, &mut segment_stmts, domains, &f, index, a, &mut sealed)? {
+                        if add_segment_with(
+                            &tx,
+                            &mut segment_stmts,
+                            domains,
+                            &f,
+                            index,
+                            mirror.as_mut(),
+                            a,
+                            &mut sealed,
+                        )? {
                             let unsure = f.sealed && sealed.guessed;
                             // an article that may be a copy of one in the blob isn't timed: sealing again can drop
                             // it, and nothing takes it back out of the timing row, so its counts would stay
@@ -3037,6 +3071,7 @@ impl ShardWriter {
                             .exists([release_id])?;
                         if gone > 0 && !others {
                             unindex_release(&tx, release_id)?;
+                            mirror = None;
                         }
                     }
                 }
@@ -5536,6 +5571,73 @@ mod tests {
         let before = state();
         save(&main, &[again("<a3@x>"), again("<b1@x>")]).unwrap();
         assert_eq!(state(), before, "beside a blob");
+    }
+
+    /// A release the save makes is checked across its files from memory (`release_ids_of`): the same copies are
+    /// dropped, and the index ends up as a save of the files one at a time leaves it.
+    #[test]
+    fn a_release_made_by_the_save_drops_copies_across_its_files() {
+        let art = |id: &str, file: &str, part: i64| Article {
+            message_id: id.into(),
+            subject: format!("\"{file}\" yEnc ({part}/3)"),
+            filename: Some(file.into()),
+            part: Some(part),
+            total_parts: Some(3),
+            bytes: 10,
+            ..Default::default()
+        };
+        let all = vec![
+            art("<m1@x>", "a.rar", 1),
+            art("<m2@x>", "a.rar", 2),
+            art("<m2@x>", "b.rar", 1),
+            art("<m3@x>", "b.rar", 2),
+            art("<m1@x>", "c.rar", 1),
+            art("<m4@x>", "c.rar", 2),
+        ];
+        let rel = |articles: Vec<Article>| Release {
+            name: "Rel".into(),
+            group: "alt.binaries.t".into(),
+            articles,
+            ..Default::default()
+        };
+        let state = |main: &Path| {
+            let conn = db::open_at(&shard_path(main, shard_of("alt.binaries.t"))).unwrap();
+            let parts: i64 = conn.query_row("select parts from releases", [], |r| r.get(0)).unwrap();
+            let index: Vec<(String, i64)> = conn
+                .prepare(
+                    "select f.filename, count(*) from release_ids i join files f on f.id = i.file_id
+                     group by f.filename order by f.filename",
+                )
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            let segments: i64 = conn.query_row("select count(*) from segments", [], |r| r.get(0)).unwrap();
+            (parts, index, segments)
+        };
+        let fresh = || {
+            let dir = tempfile::tempdir().unwrap();
+            let main = dir.path().join("atlas.db");
+            db::create_db_at(&main).unwrap();
+            (dir, main)
+        };
+        // all in the save that makes the release
+        let (_one, at_once) = fresh();
+        save(&at_once, &[rel(all.clone())]).unwrap();
+        // a file a save, the release there already from the first
+        let (_two, one_by_one) = fresh();
+        for file in ["a.rar", "b.rar", "c.rar"] {
+            save(&one_by_one, &[rel(all.iter().filter(|a| a.filename.as_deref() == Some(file)).cloned().collect())])
+                .unwrap();
+        }
+        let made = state(&at_once);
+        assert_eq!(made.0, 4, "m1 to m4 once each");
+        assert_eq!(made.2, 4);
+        assert_eq!(made, state(&one_by_one));
+        // and a later save, of a release already there, still finds them
+        save(&at_once, &[rel(vec![art("<m3@x>", "d.rar", 1), art("<m5@x>", "d.rar", 2)])]).unwrap();
+        assert_eq!(state(&at_once).0, 5);
     }
 
     /// Past the decode budget a sealed file of the release is still known to
