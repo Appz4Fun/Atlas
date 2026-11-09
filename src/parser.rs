@@ -240,8 +240,13 @@ pub enum Shape {
 
 /// The shape of `article`'s subject, which `parse_subject` doesn't read.
 pub fn unparsable_shape(article: &Article) -> Shape {
-    let subject = article.subject.trim();
-    let local = article.message_id.trim_matches(|c| c == '<' || c == '>').split('@').next().unwrap_or("");
+    shape_of(&article.subject, &article.message_id)
+}
+
+/// `unparsable_shape` of a subject and message-id as an article holds them.
+pub fn shape_of(subject: &str, message_id: &str) -> Shape {
+    let subject = subject.trim();
+    let local = message_id.trim_matches(|c| c == '<' || c == '>').split('@').next().unwrap_or("");
     if !subject.is_empty() && subject == local {
         Shape::IdSubject
     } else if subject.len() >= 16 && subject.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {

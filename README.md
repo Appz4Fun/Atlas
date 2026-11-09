@@ -320,7 +320,7 @@ The background indexer reads `config.toml` again every 5 seconds:
 
 - New groups, `index_mode`, `batch_size`, `request_size`, and `auto_run_compact` apply immediately.
 - Changes to servers, logins, `connections`, `parallel_groups`, or `max_unsaved_headers` rebuild the connection pool. A login you fix in the file, or in **Settings > Usenet servers**, takes effect within a few seconds.
-- `api_host` and `api_port` apply when the API restarts. Restart Atlas, or use **Settings > Change API port**.
+- `api_host` and `api_port` apply when the API restarts. Restart Atlas, use **Settings > Change API port**, or save a new address on the Web UI's Settings page, which moves the API there within a second.
 - `metrics` applies when Atlas restarts.
 
 ### Measure connection limits
@@ -406,6 +406,14 @@ Atlas seals each file that is complete, or untouched for three days, into one zs
 A release ID tells Atlas which file holds the release, and IDs keep counting up across all 8 files in the order releases are added, so the newest releases still come first.
 
 Sealed articles can live on another machine, on a big disk. Run the service in `sealed-log/` with `docker compose up -d --build` there, and set `sealed_log.addr` and `sealed_log.offload = true` in `config.toml`. The indexer then moves blobs of 1 KB or more from files untouched for a day: it appends them, reads each back and compares, and only then swaps the blob in `files.blob` for its place in the log. With the indexer stopped, `atlas --sealed-log-move` does the same at full speed. An NZB needs the service up to read those articles, and indexing goes on without it. A shard with articles there can't be compacted, because that would pull them all back, so turn `auto_run_compact` off and reclaim the freed pages with `VACUUM` while the indexer is stopped.
+
+### The overview archive
+
+With `overview_archive.enabled = true`, every XOVER (and XZVER) listing the indexer fetches is also kept exactly as the server sent it, outside SQLite, in `overview/<server>/<group>/` next to the databases. A shard reset or a new parser can then read a group's headers back from disk instead of asking the provider again. The rows are stored by `nntp-xover-engine` (its README has the format and the measurements): columnar blocks of up to 65,536 rows that a reader maps and uses in place, each with a message-id filter and index, so `atlas --overview SERVER GROUP START-END` answers a range and `atlas --overview SERVER GROUP '<message-id>'` finds one article without the provider; `atlas --overview SERVER GROUP stats` prints the sizes and `atlas --overview SERVER GROUP verify` reads every row back, checking each block against its hash. SERVER is the server's key as the indexer names it in its metrics: its host, or `host:port`, plus `#key` for a second account. The writer gathers a group's rows for up to 30 seconds or 4,096 rows and appends them to the group's `tail.nxv` as one block; once that holds 65,536 rows they are sorted into a segment file, and all but the newest `keep_hot` segments are zstd compressed with their routing data left readable. On real alt.binaries listings the cold segments take from about a third to an eighth of the raw size, depending on how obfuscated the group is. Writing happens on its own thread and never holds up a fetch: if it falls behind, batches are dropped and counted rather than waited for.
+
+### The header store
+
+With `header_store.enabled = true`, every listing the indexer fetches is also kept, for as long as linking needs it, in `header-store/<group>/<day>.nxv` next to the databases: `.nxv` blocks of one server, one group and one UTC day, appended to a day file by one writer, with a 64-byte entry per block in `<day>.nxvi`. Rows wait in per-slab logs, made durable every 100 ms, before a slice counts as read; a slab is sealed into a block once full or idle. A day file goes once nothing keeps it: the live window, the days around a backfill day being read, and days with hours not linked yet. The store's linker reads those blocks a day at a time and ties uploads whose every article has a random subject (and a random poster per file) back together across groups, by poster, posting time and groups, saving each as one release. `atlas --header-store link-day --store DIR --day YYYY-MM-DD` runs that linker over a copy of the store without saving anything. Without the store such articles are counted as unparsable and dropped.
 
 ### Measuring the sealed log
 
@@ -567,13 +575,14 @@ When you turn it on, Atlas contacts the third parties you list, and walks your e
 | `xrel` | `api.xrel.to` | Scene titles | The same, and never over 900 requests an hour |
 | `xrel_p2p` | `api.xrel.to` | P2P titles | The same |
 | `predb_org` | `predb.org` | History, through `history_pages` | The same |
-| `predb_ovh` | `predb.ovh` | Scene titles | The same |
 | `srrdb` | `api.srrdb.com` | Scene titles, with no pre time | The same |
 | `predatabase` | `predataba.se` | The newest ten titles | One request a poll |
 | `predb_me`, `scnsrc_me`, `eztv`, `nfodb`, `one_techno`, `one_gabba`, `ddlvalley`, `hdencode`, `hdencode_tv`, `mp3scene`, `gload`, `hdworld`, `movieblog`, `scnlog` | Each one's RSS feed | Recent titles | One request a poll |
 | `apibay`, `knaben` | `apibay.org`, `api.knaben.org` | Recent movie and TV names | One request a poll |
 | `crowdnfo`, `nima4k`, `g4u`, `gabber`, `seriousaboutsound` | Each site's listing page | Recent titles | One request a poll. A site that changes its page reads as no rows, and backs off |
 | `nswdb`, `3dsdb`, `dats_pciso_1998`, `nzedb_archive` | Each one's whole catalogue | Older titles | One request a week |
+
+`predb_ovh` is retired: its domain stopped resolving. A config that still lists it logs that once and skips it. When a history page past the first answers HTTP 400 or 404, the source has run out of pages: history ends there, the log says at which page, and the poll still counts as a success. On newer pages it is still a failure.
 
 All of these go in the `predb` object:
 
@@ -762,6 +771,12 @@ Below a release's facts, six panels show everything else Atlas knows about it, f
 The search box's More fields searches on Usenet group, poster, email, size (`1234567890`, or `1.5 GB` as the pages write it, which finds every size written that way), release group, CRC32 and posting tool. Clicking any of those on a release's page does the same, and the results show a total. Each column heading sorts, both ways, instantly from an in-memory window of the first 2,000 results kept warm in the background.
 
 With a Google Gemini API key configured in **Settings** (or via `GEMINI_API_KEY`), the **Ask AI** search bar translates natural-language queries (for example, `4K Dolby Vision remuxes of Dune, biggest first`) into search terms, categories, quality filters, and sort order. Nothing from your index is sent to Google—only your question and the list of available categories and filter names. If the configured Gemini model is busy (`503`/`429`), Atlas retries and automatically falls back across Gemini Flash models.
+
+### Settings in the browser
+
+**Settings**, in the masthead, edits what the terminal's Settings menu edits, behind the same sign in: the Usenet servers (add, change, remove; host, login, port, SSL, connections, priority, and whether a server indexes or only serves downloads), the indexer mode, groups indexed at once and the header cap, the groups to index (including provider search and add/remove), the API address, and the metadata provider keys. It writes `config.toml` the way the terminal does (the file is replaced whole, never half written) and the indexer picks the change up within a few seconds, as above. A password or key is write-only: the page says whether one is saved, never what it is, and an empty field keeps it. Every form carries a token tied to your sign in, so a page on another site can't change your settings with your browser's cookie; a form kept open across a restart of Atlas says so and has to be sent again.
+
+Where something outside Atlas owns a setting, the page shows it read-only instead of taking a change the next start would undo: the servers and the API address when `ATLAS_NNTP_*` is set, the mode when `ATLAS_INDEX_MODE` is, and any `config.toml` key named in `ATLAS_MANAGED_KEYS` (for example `ATLAS_MANAGED_KEYS=api_key,groups,parallel_groups` for a container whose start script writes those).
 
 Every page in the Web UI includes a persistent footer displaying the compile-time build metadata (`Atlas - Rust Edition`, authors, latest tag/version, git commit link, copyright year, GPL v3.0 license link, compiled Rust version, UTC compilation timestamp, and Patreon support link).
 
@@ -1027,6 +1042,7 @@ The screenshots come from a real instance, with its address, host name and news 
 | `ATLAS_AI_MODEL` | Ollama model for AI search. Default: `qwen3:4b`. |
 | `GEMINI_API_KEY` | Google Gemini API key for **Ask AI** in the Web UI (can also be saved in **Settings** in the Web UI). |
 | `ATLAS_NO_KEYRING` | Skips the OS keyring and keeps passwords in `config.toml`. |
+| `ATLAS_MANAGED_KEYS` | Comma-separated `config.toml` keys something outside Atlas writes (a container's start script, say), such as `api_key,groups,parallel_groups`. The Web UI's Settings page shows them read-only. |
 | `ATLAS_PROFILE` | Set to `1` to log a timing breakdown of the indexer every 30 seconds. |
 | `ATLAS_SAB_HOST`, `ATLAS_SAB_PORT`, `ATLAS_SAB_DIR`, `ATLAS_PYTHON` | Optional SABnzbd handoff. See [Direct downloads](#direct-downloads-with-sabnzbd). |
 

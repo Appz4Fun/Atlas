@@ -9,6 +9,7 @@
 //! spot's signatures.
 
 pub mod binary;
+pub mod blacklist;
 pub mod category;
 pub mod comments;
 pub mod full;
@@ -36,6 +37,15 @@ pub enum Kind {
 }
 
 impl Kind {
+    /// The kind a `spots` row's `kind` names, if any.
+    pub fn parse(kind: Option<&str>) -> Option<Kind> {
+        match kind? {
+            "movie" => Some(Kind::Movie),
+            "series" => Some(Kind::Series),
+            _ => None,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Kind::Movie => "movie",

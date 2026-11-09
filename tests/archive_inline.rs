@@ -36,8 +36,11 @@ fn the_save_path_stops_fetching_when_told() {
 
     let named = |group: &str| -> (i64, i64) {
         let shard = db::open_shard(&store::shard_path(&home.path().join("atlas.db"), store::shard_of(group))).unwrap();
+        // by group: with one shard, the other group's releases are in the same one
         shard
-            .query_row("select count(*), count(display_name) from releases", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .query_row("select count(*), count(display_name) from releases where group_name = ?", [group], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .unwrap()
     };
 
@@ -49,9 +52,11 @@ fn the_save_path_stops_fetching_when_told() {
     assert!(sent > 0);
     assert_eq!(named(GROUP), (2, 2));
 
-    // the same posts in a group on another shard, with lookups off
-    let other =
-        (0..).map(|i| format!("alt.binaries.other{i}")).find(|g| store::shard_of(g) != store::shard_of(GROUP)).unwrap();
+    // the same posts in another group, on another shard when there is more than one, with lookups off
+    let other = (0..1_000)
+        .map(|i| format!("alt.binaries.other{i}"))
+        .find(|g| store::SHARDS == 1 || store::shard_of(g) != store::shard_of(GROUP))
+        .unwrap();
     archive::set_inline_lookups(false);
     for _ in 0..20 {
         indexer.index_group(&other).unwrap();

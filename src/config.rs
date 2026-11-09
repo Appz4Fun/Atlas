@@ -18,10 +18,34 @@ pub const DEFAULT_CONNECTIONS: u32 = 10;
 pub const DEFAULT_PRIORITY: i64 = 99;
 /// article numbers the indexer takes on per pass over a group (50 requests)
 pub const DEFAULT_BATCH_SIZE: u64 = 500_000;
-/// with `parallel_groups` unset, one group runs per this many connections
-pub const CONNECTIONS_PER_GROUP: usize = 5;
-/// sanity cap on groups indexed at once
-pub const MAX_PARALLEL_GROUPS: usize = 256;
+/// with `parallel_groups` unset, one group runs per this many connections: one each, soo no connection waits for a
+/// group to give it work
+pub const CONNECTIONS_PER_GROUP: usize = 1;
+/// sanity cap on groups indexed at once (above any real connection count)
+pub const MAX_PARALLEL_GROUPS: usize = 4096;
+/// What `index_mode` can be: new headers only, old ones only, or both.
+pub const INDEX_MODES: [&str; 3] = ["dynamic", "live", "backfill"];
+/// Names of config.toml keys something outside atlas writes (a container's init script, say), comma separated in
+/// `ATLAS_MANAGED_KEYS`. The settings pages show them read-only: a change there would be undone on the next start.
+pub const MANAGED_KEYS_ENV: &str = "ATLAS_MANAGED_KEYS";
+
+pub fn valid_index_mode(mode: &str) -> bool {
+    INDEX_MODES.contains(&mode)
+}
+
+/// The keys `ATLAS_MANAGED_KEYS` names, trimmed and lowercased.
+pub fn managed_keys() -> Vec<String> {
+    managed_keys_of(env::var(MANAGED_KEYS_ENV).ok().as_deref())
+}
+
+fn managed_keys_of(value: Option<&str>) -> Vec<String> {
+    value.unwrap_or_default().split(',').map(|k| k.trim().to_ascii_lowercase()).filter(|k| !k.is_empty()).collect()
+}
+
+/// Whether something outside atlas owns this config.toml key, see `MANAGED_KEYS_ENV`.
+pub fn is_managed(key: &str) -> bool {
+    managed_keys().iter().any(|k| k == key)
+}
 /// article numbers per XOVER request (one connection's slice of a batch).
 /// providers spend most of a request's time on their side, not the network:
 /// measured on old articles, 10k per request got 3-6x the headers/s of 1k on
@@ -158,10 +182,14 @@ pub struct Config {
     pub request_size: Option<u64>,
     /// None = SPLIT_MIN_BACKLOG
     pub split_min_backlog: Option<i64>,
+    /// backfill forward from this many days back (`chunks::FORWARD_START_DAY`); None = newest day first
+    pub backfill_start_days_back: Option<i64>,
     /// groups indexed at the same time, None = worked out from the connections
     pub parallel_groups: Option<usize>,
     /// compact the database every 24 hours from the indexer
     pub auto_run_compact: bool,
+    /// ask every server for the parts a file's own ids name when no listing showed them (`inferred`); on unless off
+    pub inferred_parts: bool,
     /// None = DEFAULT_MAX_UNSAVED_HEADERS
     pub max_unsaved_headers: Option<u64>,
     pub postprocess: PostprocessConfig,
@@ -173,6 +201,7 @@ pub struct Config {
     pub media: MediaConfig,
     pub metrics: MetricsConfig,
     pub sealed_log: SealedLogConfig,
+    pub overview_archive: OverviewArchiveConfig,
     pub freeze: FreezeConfig,
     pub shared_catalog: SharedCatalogConfig,
 }
@@ -553,6 +582,8 @@ pub struct SpotsConfig {
     pub comment_days: u32,
     /// comments whose text is read in one pass at most; the rest wait for the next
     pub comments_per_pass: usize,
+    /// the Spotnet blacklist of spotters, read once a day (`spotnet::blacklist`); empty for none
+    pub blacklist_url: String,
 }
 
 impl Default for SpotsConfig {
@@ -566,6 +597,7 @@ impl Default for SpotsConfig {
             comments: true,
             comment_days: 60,
             comments_per_pass: 2_000,
+            blacklist_url: crate::spotnet::blacklist::DEFAULT_URL.to_string(),
         }
     }
 }
@@ -598,6 +630,9 @@ impl SpotsConfig {
         }
         if let Some(n) = int("comments_per_pass", 1, 100_000) {
             c.comments_per_pass = n as usize;
+        }
+        if let Some(url) = v.get("blacklist_url").and_then(|u| u.as_str()) {
+            c.blacklist_url = url.trim().to_string();
         }
         c
     }
@@ -635,6 +670,160 @@ impl SealedLogConfig {
         }
         c
     }
+}
+
+/// The `overview_archive` object of config.toml (`crate::overview_archive`): every fetched XOVER row kept outside
+/// SQLite, compressed. Off unless enabled.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OverviewArchiveConfig {
+    pub enabled: bool,
+    /// where it lives, `overview` next to the databases unless set (a relative path is taken from there too)
+    pub dir: String,
+    /// segments per group kept hot (fast to read); older ones are zstd compressed
+    pub keep_hot: usize,
+    pub zstd_level: i32,
+}
+
+impl Default for OverviewArchiveConfig {
+    fn default() -> Self {
+        OverviewArchiveConfig { enabled: false, dir: String::new(), keep_hot: 2, zstd_level: 9 }
+    }
+}
+
+impl OverviewArchiveConfig {
+    fn from_value(v: Option<&Value>) -> OverviewArchiveConfig {
+        let mut c = OverviewArchiveConfig::default();
+        let Some(v) = v else { return c };
+        if let Some(b) = v.get("enabled").and_then(as_bool) {
+            c.enabled = b;
+        }
+        if let Some(d) = v.get("dir").and_then(Value::as_str) {
+            c.dir = d.trim().to_string();
+        }
+        if let Some(n) = v.get("keep_hot").and_then(as_int).and_then(|n| usize::try_from(n).ok()) {
+            c.keep_hot = n.min(1_000_000);
+        }
+        if let Some(n) = v.get("zstd_level").and_then(as_int) {
+            c.zstd_level = n.clamp(1, 22) as i32;
+        }
+        c
+    }
+
+    pub fn root(&self) -> std::path::PathBuf {
+        // a relative dir is next to the databases, soo the indexer and the CLI agree whatever their cwd
+        let dir = std::path::PathBuf::from(&self.dir);
+        if self.dir.is_empty() {
+            crate::paths::app_dir().join("overview")
+        } else if dir.is_absolute() {
+            dir
+        } else {
+            crate::paths::app_dir().join(dir)
+        }
+    }
+}
+
+/// The `header_store` object of config.toml (`crate::nxv_store`): the day-segment header store every fetched overview
+/// line is kept in for a while, and the linker that ties uploads obfuscated per article back together across groups
+/// reads. Off unless enabled. (A `linker` key from when the old SQLite linker was the other choice is ignored.)
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HeaderStoreConfig {
+    pub enabled: bool,
+    /// where it lives, `header-store` next to the databases unless set (a relative path is taken from there too)
+    pub dir: String,
+}
+
+impl HeaderStoreConfig {
+    fn from_value(v: Option<&Value>) -> HeaderStoreConfig {
+        let mut c = HeaderStoreConfig::default();
+        let Some(v) = v else { return c };
+        if let Some(b) = v.get("enabled").and_then(as_bool) {
+            c.enabled = b;
+        }
+        if let Some(d) = v.get("dir").and_then(Value::as_str) {
+            c.dir = d.trim().to_string();
+        }
+        c
+    }
+
+    pub fn root(&self) -> std::path::PathBuf {
+        let dir = std::path::PathBuf::from(&self.dir);
+        if self.dir.is_empty() {
+            crate::paths::app_dir().join("header-store")
+        } else if dir.is_absolute() {
+            dir
+        } else {
+            crate::paths::app_dir().join(dir)
+        }
+    }
+}
+
+/// The file's `header_store` object: no keyring.
+pub fn header_store_config() -> HeaderStoreConfig {
+    read_file().map_or_else(HeaderStoreConfig::default, |v| HeaderStoreConfig::from_value(v.get("header_store")))
+}
+
+/// The `indexing` object of config.toml: which servers a group is read from. With `ranked` (or a `prefer` list) a group
+/// goes to the best server that carries it and fails over down the list, instead of being spread over every server
+/// by a hash; `time_cursors` starts a group on a server it hasn't been reading at the time already read, not at the
+/// newest article. All off by default.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IndexingConfig {
+    pub ranked: bool,
+    /// hosts best first; servers not named follow, the most connections first
+    pub prefer: Vec<String>,
+    /// group -> hosts never asked for it
+    pub ban: Vec<(String, Vec<String>)>,
+    pub time_cursors: bool,
+}
+
+impl IndexingConfig {
+    fn from_value(v: Option<&Value>) -> IndexingConfig {
+        let mut c = IndexingConfig::default();
+        let Some(v) = v else { return c };
+        if let Some(b) = v.get("ranked").and_then(as_bool) {
+            c.ranked = b;
+        }
+        if let Some(list) = v.get("prefer").and_then(Value::as_array) {
+            c.prefer = list
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|h| h.trim().to_lowercase())
+                .filter(|h| !h.is_empty())
+                .collect();
+        }
+        if let Some(map) = v.get("ban").and_then(Value::as_object) {
+            for (group, hosts) in map {
+                let hosts: Vec<String> = match hosts {
+                    Value::Array(a) => a.iter().filter_map(Value::as_str).map(|h| h.trim().to_lowercase()).collect(),
+                    Value::String(h) => vec![h.trim().to_lowercase()],
+                    _ => Vec::new(),
+                };
+                if !hosts.is_empty() {
+                    c.ban.push((group.trim().to_string(), hosts));
+                }
+            }
+        }
+        if let Some(b) = v.get("time_cursors").and_then(as_bool) {
+            c.time_cursors = b;
+        }
+        c
+    }
+
+    /// whether groups go to servers by rank (`ranked`, or a `prefer` list given)
+    pub fn ranks(&self) -> bool {
+        self.ranked || !self.prefer.is_empty()
+    }
+}
+
+/// The file's `indexing` object: no keyring.
+pub fn indexing_config() -> IndexingConfig {
+    read_file().map_or_else(IndexingConfig::default, |v| IndexingConfig::from_value(v.get("indexing")))
+}
+
+/// The file's `overview_archive` object: no keyring.
+pub fn overview_archive_config() -> OverviewArchiveConfig {
+    read_file()
+        .map_or_else(OverviewArchiveConfig::default, |v| OverviewArchiveConfig::from_value(v.get("overview_archive")))
 }
 
 /// The `shared_catalog` object of config.toml: a Postgres copy of every shard's release-level tables
@@ -795,6 +984,13 @@ pub struct ArchiveConfig {
     pub probe_files: i64,
     pub probes_per_minute: i64,
     pub max_names_mb: i64,
+    /// a release's pictures are all read as it's processed when it has at most this many, all together at most
+    /// `pictures_auto_max_mb`; past either, only its thumbnail or cover is, and the page offers each of the rest
+    pub pictures_auto_max: i64,
+    pub pictures_auto_max_mb: i64,
+    /// the most articles one picture asked for on the page may take: at most 64, what one release's run may fetch
+    /// (`postprocess.bodies_per_release`) by default
+    pub picture_max_parts: i64,
 }
 
 impl Default for ArchiveConfig {
@@ -805,6 +1001,9 @@ impl Default for ArchiveConfig {
             probe_files: 8,
             probes_per_minute: 600,
             max_names_mb: 16_384,
+            pictures_auto_max: 12,
+            pictures_auto_max_mb: 16,
+            picture_max_parts: 64,
         }
     }
 }
@@ -825,6 +1024,9 @@ impl ArchiveConfig {
         int("probe_files", 0, 8, &mut c.probe_files);
         int("probes_per_minute", 12, 600, &mut c.probes_per_minute);
         int("max_names_mb", 64, i64::MAX, &mut c.max_names_mb);
+        int("pictures_auto_max", 0, 1_000, &mut c.pictures_auto_max);
+        int("pictures_auto_max_mb", 0, 1_024, &mut c.pictures_auto_max_mb);
+        int("picture_max_parts", 1, 64, &mut c.picture_max_parts);
         c
     }
 }
@@ -961,14 +1163,17 @@ impl Default for Config {
             batch_size: None,
             request_size: None,
             split_min_backlog: None,
+            backfill_start_days_back: None,
             parallel_groups: None,
             auto_run_compact: false,
+            inferred_parts: true,
             max_unsaved_headers: None,
             postprocess: PostprocessConfig::default(),
             archive: ArchiveConfig::default(),
             naming: NamingConfig::default(),
             metrics: MetricsConfig::default(),
             sealed_log: SealedLogConfig::default(),
+            overview_archive: OverviewArchiveConfig::default(),
             shared_catalog: SharedCatalogConfig::default(),
             predb: PredbConfig::default(),
             spots: SpotsConfig::default(),
@@ -1064,12 +1269,7 @@ impl Config {
         let mut seen = std::collections::HashSet::new();
         let mut duplicates = Vec::new();
         for s in &self.servers {
-            let id = (
-                s.host.trim().to_ascii_lowercase(),
-                s.port,
-                s.username.trim().to_string(),
-                s.key.clone(),
-            );
+            let id = (s.host.trim().to_ascii_lowercase(), s.port, s.username.trim().to_string(), s.key.clone());
             if !seen.insert(id) {
                 let label = format!("{}:{}", s.host.trim(), s.port);
                 if !duplicates.contains(&label) {
@@ -1086,12 +1286,7 @@ impl Config {
         let before = self.servers.len();
         let mut seen = std::collections::HashSet::new();
         self.servers.retain(|s| {
-            seen.insert((
-                s.host.trim().to_ascii_lowercase(),
-                s.port,
-                s.username.trim().to_string(),
-                s.key.clone(),
-            ))
+            seen.insert((s.host.trim().to_ascii_lowercase(), s.port, s.username.trim().to_string(), s.key.clone()))
         });
         before - self.servers.len()
     }
@@ -1150,17 +1345,20 @@ impl Config {
             batch_size: v.get("batch_size").and_then(as_int).and_then(|n| u64::try_from(n).ok()).filter(|n| *n > 0),
             request_size: v.get("request_size").and_then(as_int).and_then(|n| u64::try_from(n).ok()).filter(|n| *n > 0),
             split_min_backlog: v.get("split_min_backlog").and_then(as_int).filter(|n| *n > 0),
+            backfill_start_days_back: v.get("backfill_start_days_back").and_then(as_int).filter(|n| *n > 0),
             parallel_groups: v
                 .get("parallel_groups")
                 .and_then(as_int)
                 .and_then(|n| usize::try_from(n).ok())
                 .filter(|n| *n > 0),
             auto_run_compact: v.get("auto_run_compact").and_then(Value::as_bool).unwrap_or(false),
+            inferred_parts: v.get("inferred_parts").and_then(Value::as_bool).unwrap_or(true),
             postprocess: PostprocessConfig::from_value(v.get("postprocess")),
             archive: ArchiveConfig::from_value(v.get("archive")),
             naming: NamingConfig::from_value(v.get("naming")),
             metrics: MetricsConfig::from_value(v.get("metrics")),
             sealed_log: SealedLogConfig::from_value(v.get("sealed_log")),
+            overview_archive: OverviewArchiveConfig::from_value(v.get("overview_archive")),
             shared_catalog: SharedCatalogConfig::from_value(v.get("shared_catalog")),
             predb: PredbConfig::from_value(v.get("predb")),
             spots: SpotsConfig::from_value(v.get("spots")),
@@ -1214,7 +1412,7 @@ fn env_nonempty(key: &str) -> Option<String> {
 }
 
 /// server creds come from ATLAS_NNTP_* (docker) instead of config.toml
-fn env_creds_active() -> bool {
+pub fn env_creds_active() -> bool {
     ["ATLAS_NNTP_HOST", "ATLAS_NNTP_USER", "ATLAS_NNTP_PASS"].iter().all(|k| env_nonempty(k).is_some())
 }
 
@@ -1398,7 +1596,19 @@ pub fn load_settings() -> Config {
 /// a password that was already written in the file stays there, new ones go
 /// to the keyring when it works. Server creds from env vars never get saved.
 pub fn save_config(cfg: &Config) -> io::Result<()> {
-    let existing = read_file();
+    let (value, private) = config_value(cfg, read_file(), env_creds_active(), &keyring::set);
+    write_config(&value, private)
+}
+
+/// What `save_config` writes: the file's map with `cfg` put over it, and whether the file holds a password.
+/// `env_servers`: the servers come from `ATLAS_NNTP_*`, soo none are saved. `store` puts a password in the keyring,
+/// and says whether it took it.
+fn config_value(
+    cfg: &Config,
+    existing: Option<Value>,
+    env_servers: bool,
+    store: &dyn Fn(&str, &str) -> bool,
+) -> (Value, bool) {
     let mut out = match &existing {
         Some(Value::Object(map)) => map.clone(),
         _ => Map::new(),
@@ -1406,7 +1616,7 @@ pub fn save_config(cfg: &Config) -> io::Result<()> {
 
     let mut private = out.get("password").and_then(Value::as_str).is_some_and(|p| !p.is_empty());
 
-    if !env_creds_active() {
+    if !env_servers {
         let list_form = out.contains_key("usenet_servers") || cfg.servers.len() > 1;
 
         if list_form {
@@ -1420,7 +1630,7 @@ pub fn save_config(cfg: &Config) -> io::Result<()> {
                 .servers
                 .iter()
                 .map(|s| {
-                    let plain = in_file(&s.host) || !keyring::set(&s.username, &s.password);
+                    let plain = in_file(&s.host) || !store(&s.username, &s.password);
                     private |= plain && !s.password.is_empty();
                     s.to_value(plain)
                 })
@@ -1437,7 +1647,7 @@ pub fn save_config(cfg: &Config) -> io::Result<()> {
             out.insert("username".into(), json!(server.username));
             out.insert("port".into(), json!(server.port));
 
-            if keyring::set(&server.username, &server.password) {
+            if store(&server.username, &server.password) {
                 out.remove("password");
                 private = false;
             } else {
@@ -1473,11 +1683,70 @@ pub fn save_config(cfg: &Config) -> io::Result<()> {
         out.insert("split_min_backlog".into(), json!(n));
     }
 
+    if let Some(n) = cfg.backfill_start_days_back {
+        out.insert("backfill_start_days_back".into(), json!(n));
+    }
+
     if cfg.auto_run_compact {
         out.insert("auto_run_compact".into(), json!(true));
     }
 
-    write_config(&Value::Object(out), private)
+    if !cfg.inferred_parts {
+        out.insert("inferred_parts".into(), json!(false));
+    }
+
+    // the settings pages edit these; None means "worked out", and the key goes
+    for (key, value) in [
+        ("parallel_groups", cfg.parallel_groups.map(|n| json!(n))),
+        ("max_unsaved_headers", cfg.max_unsaved_headers.map(|n| json!(n))),
+    ] {
+        match value {
+            Some(v) => {
+                out.insert(key.into(), v);
+            }
+            None => {
+                out.remove(key);
+            }
+        }
+    }
+    if cfg.api_host != DEFAULT_API_HOST || out.contains_key("api_host") {
+        out.insert("api_host".into(), json!(cfg.api_host));
+    }
+    merge_media_keys(&mut out, &cfg.media);
+
+    (Value::Object(out), private)
+}
+
+/// The metadata providers' keys from `media`, put into the file's `media` tables: a key that is set or was in the
+/// file is written (empty clears it), the rest of each table is kept as it is.
+fn merge_media_keys(out: &mut Map<String, Value>, media: &MediaConfig) {
+    let keys: [(&str, &str, &str); 6] = [
+        ("tmdb", "api_key", &media.tmdb.api_key),
+        ("omdb", "api_key", &media.omdb.api_key),
+        ("tvdb", "api_key", &media.tvdb.api_key),
+        ("tvdb", "pin", &media.tvdb.pin),
+        ("trakt", "client_id", &media.trakt.client_id),
+        ("opensubtitles", "api_key", &media.opensubtitles.api_key),
+    ];
+    let table = out.entry("media").or_insert_with(|| Value::Object(Map::new()));
+    if !table.is_object() {
+        *table = Value::Object(Map::new());
+    }
+    let table = table.as_object_mut().expect("made an object above");
+    for (provider, field, value) in keys {
+        let had = table.get(provider).and_then(|p| p.get(field)).is_some();
+        if value.is_empty() && !had {
+            continue;
+        }
+        let entry = table.entry(provider).or_insert_with(|| Value::Object(Map::new()));
+        if !entry.is_object() {
+            *entry = Value::Object(Map::new());
+        }
+        entry.as_object_mut().expect("made an object above").insert(field.into(), json!(value));
+    }
+    if table.is_empty() {
+        out.remove("media");
+    }
 }
 
 /// Returns the api key, generating and persisting one the first time.
@@ -1683,7 +1952,7 @@ mod tests {
         assert_eq!(Config::from_value(&json!({})).spots, SpotsConfig::default());
         let c = Config::from_value(
             &json!({"spots": {"enabled": false, "poll_minutes": 0, "first_articles": 500, "per_pass": 20, "concurrency": 99,
-                "comments": false, "comment_days": 0, "comments_per_pass": 50}}),
+                "comments": false, "comment_days": 0, "comments_per_pass": 50, "blacklist_url": " "}}),
         )
         .spots;
         assert_eq!(
@@ -1697,6 +1966,7 @@ mod tests {
                 comments: false,
                 comment_days: 1,
                 comments_per_pass: 50,
+                blacklist_url: String::new(),
             }
         );
         assert_eq!(Config::from_value(&json!({"spots": "no"})).spots, SpotsConfig::default());
@@ -1800,7 +2070,16 @@ mod tests {
     fn archive_defaults_when_absent() {
         let c = ArchiveConfig::from_value(None);
         assert!(c.enabled);
-        assert_eq!((c.max_bodies_per_release, c.probe_files, c.probes_per_minute, c.max_names_mb), (16, 8, 600, 16_384));
+        assert_eq!(
+            (c.max_bodies_per_release, c.probe_files, c.probes_per_minute, c.max_names_mb),
+            (16, 8, 600, 16_384)
+        );
+        assert_eq!((c.pictures_auto_max, c.pictures_auto_max_mb, c.picture_max_parts), (12, 16, 64));
+        let v = serde_json::json!({"pictures_auto_max": 40, "pictures_auto_max_mb": 5000, "picture_max_parts": 0});
+        let c = ArchiveConfig::from_value(Some(&v));
+        assert_eq!((c.pictures_auto_max, c.pictures_auto_max_mb, c.picture_max_parts), (40, 1_024, 1));
+        let c = ArchiveConfig::from_value(Some(&serde_json::json!({"picture_max_parts": 500})));
+        assert_eq!(c.picture_max_parts, 64);
     }
 
     #[test]
@@ -1992,8 +2271,8 @@ mod tests {
     #[test]
     fn workers_follow_connections() {
         let auto = Config::default();
-        assert_eq!(auto.workers_per_server(&[25, 25, 25, 25]), vec![5, 5, 5, 5]);
-        assert_eq!(auto.workers_per_server(&[10, 3]), vec![2, 1], "at least one each");
+        assert_eq!(auto.workers_per_server(&[25, 25, 25, 25]), vec![25, 25, 25, 25]);
+        assert_eq!(auto.workers_per_server(&[10, 0]), vec![10, 1], "at least one each");
 
         let fixed = Config { parallel_groups: Some(20), ..Config::default() };
         assert_eq!(fixed.workers_per_server(&[25, 25, 25, 25]), vec![5, 5, 5, 5]);
@@ -2089,5 +2368,135 @@ mod tests {
         assert_eq!(c.dedup_servers(), 1);
         assert_eq!(c.servers.len(), 2);
         assert!(c.duplicate_servers().is_empty());
+    }
+
+    fn no_store(_: &str, _: &str) -> bool {
+        false
+    }
+
+    #[test]
+    fn index_modes_are_the_three_the_indexer_knows() {
+        for mode in INDEX_MODES {
+            assert!(valid_index_mode(mode));
+        }
+        assert!(!valid_index_mode("Live") && !valid_index_mode("") && !valid_index_mode("fast"));
+    }
+
+    #[test]
+    fn managed_keys_come_from_a_comma_list() {
+        assert!(managed_keys_of(None).is_empty());
+        assert!(managed_keys_of(Some(" , ")).is_empty());
+        assert_eq!(managed_keys_of(Some("api_key, Groups ,parallel_groups")), ["api_key", "groups", "parallel_groups"]);
+    }
+
+    /// The settings pages edit these; the file has to take them and give them back.
+    #[test]
+    fn a_save_round_trips_the_indexing_and_api_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg = Config {
+            servers: vec![UsenetServer::new("news.x", "me", "pw", 563)],
+            groups: vec!["alt.binaries.a".into()],
+            group: "alt.binaries.a".into(),
+            index_mode: "live".into(),
+            api_host: "0.0.0.0".into(),
+            api_port: Some(9191),
+            parallel_groups: Some(3),
+            max_unsaved_headers: Some(40_000),
+            ..Config::default()
+        };
+        let (value, _) = config_value(&cfg, None, false, &no_store);
+        write_toml_at(&path, &value).unwrap();
+        let back = Config::from_value(&parse_config(&path, &std::fs::read_to_string(&path).unwrap()).unwrap());
+        assert_eq!(back.index_mode, "live");
+        assert_eq!(back.api_host, "0.0.0.0");
+        assert_eq!(back.api_port, Some(9191));
+        assert_eq!(back.parallel_groups, Some(3));
+        assert_eq!(back.max_unsaved_headers, Some(40_000));
+        assert_eq!(back.servers.len(), 1);
+        assert_eq!(back.servers[0].password, "pw", "no keyring took it, soo it stays in the file");
+
+        // back to "worked out": the keys go, rather than staying at the old numbers
+        let cleared = Config { parallel_groups: None, max_unsaved_headers: None, ..back };
+        let (value, _) = config_value(
+            &cleared,
+            Some(parse_config(&path, &std::fs::read_to_string(&path).unwrap()).unwrap()),
+            false,
+            &no_store,
+        );
+        assert!(value.get("parallel_groups").is_none() && value.get("max_unsaved_headers").is_none(), "{value}");
+        assert_eq!(value.get("api_host"), Some(&json!("0.0.0.0")));
+    }
+
+    #[test]
+    fn the_default_api_host_is_not_written_unless_it_was_there() {
+        let cfg = Config::default();
+        let (value, _) = config_value(&cfg, None, false, &no_store);
+        assert!(value.get("api_host").is_none(), "{value}");
+        let (value, _) = config_value(&cfg, Some(json!({"api_host": "0.0.0.0"})), false, &no_store);
+        assert_eq!(value.get("api_host"), Some(&json!("127.0.0.1")), "a host in the file is kept up to date");
+    }
+
+    #[test]
+    fn env_servers_are_never_saved() {
+        let cfg = Config { servers: vec![UsenetServer::new("news.env", "me", "pw", 563)], ..Config::default() };
+        let (value, _) = config_value(&cfg, Some(json!({"groups": ["a"]})), true, &no_store);
+        assert!(value.get("usenet_servers").is_none() && value.get("host").is_none(), "{value}");
+    }
+
+    #[test]
+    fn provider_keys_are_merged_into_their_tables() {
+        let existing = json!({
+            "media": {"tmdb": {"api_key": "old", "requests_per_minute": 9}, "tvmaze": {"enabled": false}},
+            "groups": ["a"],
+        });
+        let mut cfg = Config::from_value(&existing);
+        cfg.media.tmdb.api_key = "new".into();
+        cfg.media.omdb.api_key = "om".into();
+        let (value, _) = config_value(&cfg, Some(existing), false, &no_store);
+        let media = value.get("media").unwrap();
+        assert_eq!(media["tmdb"]["api_key"], json!("new"));
+        assert_eq!(media["tmdb"]["requests_per_minute"], json!(9), "the rest of the table is kept");
+        assert_eq!(media["tvmaze"]["enabled"], json!(false));
+        assert_eq!(media["omdb"]["api_key"], json!("om"));
+        assert!(media.get("trakt").is_none(), "an empty key that wasnt there isnt added: {media}");
+
+        // clearing: the key stays, empty, as in config.example.toml
+        cfg.media.tmdb.api_key.clear();
+        let (value, _) = config_value(&cfg, Some(value), false, &no_store);
+        assert_eq!(value["media"]["tmdb"]["api_key"], json!(""));
+        let back = Config::from_value(&value);
+        assert!(back.media.tmdb.api_key.is_empty() && back.media.omdb.api_key == "om");
+    }
+
+    #[test]
+    fn a_config_without_provider_keys_gets_no_media_table() {
+        let (value, _) = config_value(&Config::default(), None, false, &no_store);
+        assert!(value.get("media").is_none(), "{value}");
+    }
+
+    #[test]
+    fn indexing_reads_its_ranking_bans_and_time_cursors() {
+        let v: Value = serde_json::json!({
+            "ranked": false,
+            "prefer": ["News.Newshosting.com", " news.eweka.nl "],
+            "ban": { "alt.binaries.x": ["farm.example"], "alt.binaries.y": "viper.example" },
+            "time_cursors": true
+        });
+        let c = IndexingConfig::from_value(Some(&v));
+        assert_eq!(c.prefer, vec!["news.newshosting.com".to_string(), "news.eweka.nl".to_string()]);
+        assert!(c.ranks(), "a prefer list ranks");
+        assert!(c.time_cursors);
+        let mut ban = c.ban.clone();
+        ban.sort();
+        assert_eq!(
+            ban,
+            vec![
+                ("alt.binaries.x".to_string(), vec!["farm.example".to_string()]),
+                ("alt.binaries.y".to_string(), vec!["viper.example".to_string()])
+            ]
+        );
+        assert_eq!(IndexingConfig::from_value(None), IndexingConfig::default());
+        assert!(!IndexingConfig::default().ranks());
     }
 }

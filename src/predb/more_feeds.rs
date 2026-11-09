@@ -10,7 +10,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 use serde_json::Value;
 
-use super::feeds::{ParseError, int, megabytes, number, rows, text};
+use super::feeds::{ParseError, int, megabytes, rows, text};
 use super::import::Entry;
 
 const MAX_TITLE_CHARS: usize = 255;
@@ -153,38 +153,6 @@ pub fn parse_rss(body: &str, o: Rss) -> Result<Vec<Entry>, ParseError> {
                 .map(|at| at.timestamp())
         };
         out.push(Entry { title, category, pre_at, ..Entry::default() });
-    }
-    Ok(out)
-}
-
-pub fn parse_predb_ovh(v: &Value, _page: u32) -> Result<Vec<Entry>, ParseError> {
-    super::feeds::envelope(v)?;
-    let mut out = Vec::new();
-    for r in rows(v, "/data/rows")? {
-        let Some(title) = text(r.get("name")).map(|t| t.trim().to_string()) else { continue };
-        let nuke = r.get("nuke").filter(|n| n.is_object()).filter(|n| {
-            // a nuke of some other pre isn't this one's
-            match (int(r.get("id")), int(n.get("preId"))) {
-                (Some(id), Some(pre)) => id == pre,
-                _ => true,
-            }
-        });
-        let type_id = nuke.and_then(|n| int(n.get("typeId"))).unwrap_or(0);
-        let nuked = match type_id {
-            0 => 0,
-            2 | 5 => 2,
-            3 => 3,
-            _ => 1,
-        };
-        out.push(Entry {
-            title,
-            category: text(r.get("cat")),
-            size_bytes: number(r.get("size")).filter(|n| *n >= 0.0).map(|kb| (kb * 1024.0) as i64),
-            files: int(r.get("files")),
-            pre_at: int(r.get("preAt")),
-            nuked,
-            nuke_reason: if type_id == 0 { None } else { nuke.and_then(|n| text(n.get("reason"))) },
-        });
     }
     Ok(out)
 }
@@ -501,25 +469,6 @@ mod tests {
     #[test]
     fn entities_decode() {
         assert_eq!(unescape(" A&amp;B&#46;C&#x2e;D "), "A&B.C.D");
-    }
-
-    #[test]
-    fn predb_ovh_rows() {
-        let page = json!({"status": "success", "data": {"rows": [
-            {"id": 1, "name": "A.Release-GRP", "cat": "TV", "size": 2048, "files": 5, "preAt": 100, "nuke": null},
-            {"id": 2, "name": "B.Release-GRP", "nuke": {"preId": 2, "typeId": 1, "reason": "dupe"}},
-            {"id": 3, "name": "C.Release-GRP", "nuke": {"preId": 3, "typeId": 2, "reason": "fine"}},
-            {"id": 4, "name": "D.Release-GRP", "nuke": {"preId": 9, "typeId": 1, "reason": "other"}},
-            {"id": 5, "name": ""},
-        ]}});
-        let got = parse_predb_ovh(&page, 1).unwrap();
-        assert_eq!(got.len(), 4);
-        assert_eq!((got[0].size_bytes, got[0].files, got[0].pre_at), (Some(2_097_152), Some(5), Some(100)));
-        assert_eq!((got[1].nuked, got[1].nuke_reason.as_deref()), (1, Some("dupe")));
-        assert_eq!(got[2].nuked, 2);
-        assert_eq!((got[3].nuked, got[3].nuke_reason.as_deref()), (0, None), "another pre's nuke");
-        let limited = json!({"status": "error", "message": "rate limit exceeded"});
-        assert!(matches!(parse_predb_ovh(&limited, 1), Err(ParseError::RateLimited(_))));
     }
 
     #[test]

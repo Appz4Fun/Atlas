@@ -95,8 +95,14 @@ pub fn fetch(at: Locator) -> Result<Vec<u8>> {
 /// all back to rewrite them, so it stops there instead.
 pub fn has_places(conn: &rusqlite::Connection) -> rusqlite::Result<bool> {
     conn.query_row(
-        "select exists(select 1 from files where length(blob) = ? and substr(blob, 1, 5) = ?)",
-        params![sealed_log::REF_BYTES as i64, &sealed_log::REF_TAG[..]],
+        "select exists(select 1 from files where length(blob) = ? and substr(blob, 1, 5) = ?)
+             or exists(select 1 from files where length(blob) = ? and substr(blob, 1, 5) = ?)",
+        params![
+            sealed_log::REF_BYTES as i64,
+            &sealed_log::REF_TAG[..],
+            (crate::blob::SHIFTED_TAG.len() + 8 + sealed_log::REF_BYTES) as i64,
+            &crate::blob::SHIFTED_TAG[..]
+        ],
         |r| r.get(0),
     )
 }
@@ -230,6 +236,14 @@ pub fn run_move() -> i32 {
         println!("stop the indexer first: it competes for the same locks, and it moves these anyway");
         return 1;
     }
+    // held for the whole sweep: a merge or a compaction can't start under it, and it refuses a merge half done
+    let _held = match crate::compact::hold_off_compaction(&crate::paths::database()) {
+        Ok(held) => held,
+        Err(e) => {
+            println!("{e:#}");
+            return 1;
+        }
+    };
     configure(&config.addr);
     let main = crate::paths::database();
     let started = Instant::now();

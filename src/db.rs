@@ -200,11 +200,17 @@ pub fn with_full_flush<T>(conn: &mut Connection, save: impl FnOnce(&mut Connecti
     Ok(saved)
 }
 
+/// statements a writer's connection keeps prepared (`tune_for_writing`)
+pub(crate) const WRITER_STATEMENTS: usize = 256;
+
 /// Tune a connection for heavy indexing writes: a big page cache, no
 /// checkpointing on commit (`checkpointer` copies the WAL into the main file on
 /// its own thread, `finish_checkpoint` lets the WAL start over), and a WAL file
 /// cut back to 1GB whenever it starts over.
 pub fn tune_for_writing(conn: &Connection) -> Result<()> {
+    // a save runs some forty statements, a writer's stage work more: with rusqlite's 16 they pushed each other out
+    // and were prepared again over and over
+    conn.set_prepared_statement_cache_capacity(WRITER_STATEMENTS);
     conn.execute_batch(
         "pragma cache_size = -1048576;
          pragma temp_store = memory;
@@ -486,7 +492,7 @@ pub fn create_db_holding(path: &Path) -> anyhow::Result<Option<WriteGuard>> {
     // a conversion's swap cut short leaves no main database: finished or
     // undone first, alone (busy means someone is using the database, soo it's there)
     if (!path.try_exists()? || crate::convert::is_empty_interloper(path))
-        && let Ok(_alone) = crate::compact::Lock::take(path)
+        && let Ok(_alone) = crate::compact::Lock::take_unchecked(path)
         && let Some(said) = crate::convert::recover_cut_swap(path)?
     {
         crate::ui::warn(&said);
@@ -507,9 +513,11 @@ pub fn create_db_holding(path: &Path) -> anyhow::Result<Option<WriteGuard>> {
 /// shards would hand out their ids again. A shard that cant be removed is an
 /// error, with the main database left in place.
 pub fn wipe(main: &Path) -> anyhow::Result<()> {
-    let _exclusive = crate::compact::Lock::take(main)?;
+    let _exclusive = crate::compact::Lock::take_unchecked(main)?;
     let mut dbs = Vec::new();
-    for shard in store::shard_paths(main) {
+    // the shards from before one shard too, should a wipe come before their merge
+    for shard in (0..crate::merge_shards::LEGACY_SHARDS).map(|s| crate::merge_shards::legacy_shard_path(main, s)) {
+        dbs.push(crate::frozen::path(&shard));
         let copy = crate::compact::with_suffix(&shard, "compact");
         dbs.push(crate::compact::with_suffix(&copy, "check"));
         dbs.push(copy);
@@ -546,6 +554,19 @@ pub fn create_db_at(path: &Path) -> anyhow::Result<()> {
         refuse_orphaned_shards(path)?;
     }
     let conn = create_at(path)?;
+    // shards half merged: only `atlas --merge-shards --apply` may go on with them
+    if crate::merge_shards::in_progress(&conn)? {
+        anyhow::bail!("a shard merge is in progress: run `atlas --merge-shards --apply` to finish it before indexing");
+    }
+    // the shards from before one shard: their releases would be out of sight, their ids handed out again
+    let legacy = crate::merge_shards::legacy_leftovers(path);
+    if !legacy.is_empty() {
+        anyhow::bail!(
+            "{} files of the shards from before the move to one shard are still here ({}): run `atlas --merge-shards --apply` first",
+            legacy.len(),
+            legacy.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+        );
+    }
 
     // wal soo the indexer can write while search reads
     conn.query_row("pragma journal_mode = wal", [], |_| Ok(()))?;
@@ -559,11 +580,19 @@ pub fn create_db_at(path: &Path) -> anyhow::Result<()> {
     )?;
 
     // the server's first/last article numbers per group, for progress and ETA, and
-    // the post date at both ends of what has been indexed (article number + unix time)
+    // the post date at both ends of what has been indexed (article number + unix time), and
+    // the posting time the live cursor began reading from (`set_start_posted`)
     let group_columns = columns(&conn, "groups")?;
-    for col in ["first_article", "last_article", "low_article", "low_posted", "high_article", "high_posted"] {
+    for col in
+        ["first_article", "last_article", "low_article", "low_posted", "high_article", "high_posted", "start_posted"]
+    {
         if !group_columns.contains(col) {
             conn.execute(&format!("alter table groups add column {col} INTEGER"), [])?;
+            // rows from before it may have started anywhere (a stand-in jumped to the newest article): they count as
+            // having begun now, soo no cursor moves up past a range they never read
+            if col == "start_posted" {
+                conn.execute("update groups set start_posted = strftime('%s','now')", [])?;
+            }
         }
     }
 
@@ -576,6 +605,11 @@ pub fn create_db_at(path: &Path) -> anyhow::Result<()> {
     let used = has_progress(&conn)?;
     store::create_main(&conn)?;
     create_shards(path, used)?;
+    // a merged shard finished by a build that didn't note its first one-shard id: noted now, while it can be told
+    // best effort: without it the linker reckons the id from what the shard holds
+    if let Err(e) = crate::merge_shards::note_one_shard_from(path, &conn) {
+        crate::ui::warn(&format!("couldnt note the first one-shard release id: {e:#}"));
+    }
     if fresh && !used {
         crate::raw_store::restore_backfill_deepest(path, &conn);
     }
@@ -943,6 +977,14 @@ pub fn update_live_cursor(conn: &Connection, group: &str, article: i64) -> Resul
     Ok(())
 }
 
+/// Remember the posting time a row's live cursor began reading from (cursor key), when it is started or jumped:
+/// the time it was found by, or now when it starts at the newest article. Nothing posted before that is read through
+/// on this row; NULL (a row from before this was kept) counts as long ago.
+pub fn set_start_posted(conn: &Connection, group: &str, posted: i64) -> Result<()> {
+    conn.execute("update groups set start_posted = ? where name = ?", params![posted, group])?;
+    Ok(())
+}
+
 pub fn update_backfill_cursor(conn: &Connection, group: &str, article: i64) -> Result<()> {
     conn.execute(
         "insert into groups(name, live_cursor, backfill_cursor) values(?, ?, ?)
@@ -1183,7 +1225,7 @@ mod tests {
         assert!(!was_kept(&main));
         assert!(was_kept(&main));
 
-        let shard = &store::shard_paths(&main)[3];
+        let shard = &store::shard_paths(&main)[store::SHARDS - 1];
         let swapped = dir.path().join("swapped.db");
         fs::copy(shard, &swapped).unwrap();
         fs::rename(&swapped, shard).unwrap();
@@ -1383,7 +1425,7 @@ mod tests {
         assert!(next.unwrap() > 1);
 
         // what a compaction leaves behind, and the sidecars of a shard
-        let shard = store::shard_path(&main, 2);
+        let shard = store::shard_path(&main, store::SHARDS - 1);
         let leftovers = [
             crate::compact::with_suffix(&shard, "compact"),
             crate::compact::with_suffix(&shard, "precompact"),

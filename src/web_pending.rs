@@ -74,6 +74,7 @@ pub(crate) fn label(name: &str) -> &str {
         "nfo" => "Name from the NFO",
         "sidecar" => "Sidecar text",
         "sidecar_image" => "Sidecar cover",
+        "images" => "Pictures",
         "predb_match" => "PreDB match",
         "category" => "Category",
         "media_parse" => "Title parse",
@@ -160,8 +161,9 @@ fn read_state(conn: &Connection, s: usize, id: i64) -> rusqlite::Result<State> {
         .query_row(
             &format!(
                 "select name, display_name, group_name, poster, posted_date, coalesce(size, 0), coalesce(complete, 0),
-                        coalesce(parts, 0), file_total, coalesce(is_obfuscated, 0), name_source
-                 from s{s}.releases where id = ?"
+                        coalesce(parts, 0), file_total, coalesce(is_obfuscated, 0), name_source,
+                        (select kind from s{s}.spots where release_id = ?1)
+                 from s{s}.releases where id = ?1"
             ),
             [id],
             |r| {
@@ -179,6 +181,7 @@ fn read_state(conn: &Connection, s: usize, id: i64) -> rusqlite::Result<State> {
                     file_total: r.get(8)?,
                     is_obfuscated: r.get::<_, i64>(9)? != 0,
                     name_source: r.get(10)?,
+                    spot_kind: crate::spotnet::Kind::parse(r.get::<_, Option<String>>(11)?.as_deref()),
                 })
             },
         )
@@ -668,9 +671,8 @@ fn render(id: i64, state: &State, pace: &Pace, rows: &[(&'static StepMeta, Stand
     )
 }
 
-/// `/ui/pending?id=`: the Processing panel of a release.
-pub(crate) fn fragment(args: &HashMap<String, String>) -> ApiResponse {
-    let id = args.get("id").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
+/// A release's standing in the processing stage: its rows, its shard's pace, and the lanes' waits.
+fn read_all(id: i64) -> rusqlite::Result<(State, Pace, Waits, i64)> {
     let s = store::shard_of_id(id);
     let now = chrono::Utc::now();
     let stats: Value = std::fs::read(crate::paths::stats_file())
@@ -679,7 +681,7 @@ pub(crate) fn fragment(args: &HashMap<String, String>) -> ApiResponse {
         .unwrap_or(Value::Null);
     let pace = pace_of(&stats, s, now.timestamp_millis() as f64 / 1000.0);
     let now = now.timestamp();
-    let read = crate::db::with_reader(|conn| {
+    let (state, waits) = crate::db::with_reader(|conn| {
         let state = read_state(conn, s, id)?;
         let measured = pace.measured();
         let rate = |r: f64| measured.then_some(r);
@@ -694,9 +696,15 @@ pub(crate) fn fragment(args: &HashMap<String, String>) -> ApiResponse {
             waits.walk = Some(walk_wait(conn, s, id, walk, rate(pace.walk_rows))?);
         }
         Ok((state, waits))
-    });
-    match read {
-        Ok((state, waits)) => {
+    })?;
+    Ok((state, pace, waits, now))
+}
+
+/// `/ui/pending?id=`: the Processing panel of a release.
+pub(crate) fn fragment(args: &HashMap<String, String>) -> ApiResponse {
+    let id = args.get("id").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
+    match read_all(id) {
+        Ok((state, pace, waits, now)) => {
             let rows = standings(&state, &pace, &waits, now);
             html(200, render(id, &state, &pace, &rows, now))
         }
@@ -705,6 +713,38 @@ pub(crate) fn fragment(args: &HashMap<String, String>) -> ApiResponse {
             html(200, String::new())
         }
     }
+}
+
+/// When step `name` runs next on release `id`, in a few words for a line of the release page: "in about 4 min
+/// (around 21:40 UTC)". None when it isn't lined up (done, or it doesn't apply).
+pub(crate) fn step_eta(id: i64, name: &str) -> Option<String> {
+    let (state, pace, waits, now) = read_all(id).map_err(|e| eprintln!("web pending {id} failed: {e}")).ok()?;
+    let rows = standings(&state, &pace, &waits, now);
+    let (_, standing) = rows.into_iter().find(|(step, _)| step.name == name)?;
+    eta_words(&standing, &pace, now)
+}
+
+fn eta_words(standing: &Standing, pace: &Pace, now: i64) -> Option<String> {
+    let around = |minutes: f64| {
+        let at = now + (minutes * 60.0).round() as i64;
+        chrono::DateTime::from_timestamp(at, 0).map_or(String::new(), |t| t.format(" (around %H:%M UTC)").to_string())
+    };
+    Some(match standing {
+        Standing::Done | Standing::Failed | Standing::Skipped(_) => return None,
+        Standing::Off => "the Pictures step is turned off in the settings".into(),
+        _ if !pace.running => "on hold: the indexer isn't running".into(),
+        Standing::Running(_) => "being read now".into(),
+        Standing::AfterRunning => "next, after the step running now".into(),
+        Standing::Until(at, _) => format!("not before {}", clock(*at)),
+        Standing::Queued { wait, after, .. } => match wait {
+            Wait::About(minutes, _) if minutes + after < 1.0 => "in under a minute".into(),
+            Wait::About(minutes, _) => format!("in about {}{}", span(minutes + after), around(minutes + after)),
+            Wait::Between(soonest, latest, _) => format!("in {} to {}", span(soonest + after), span(latest + after)),
+            Wait::AtLeast(minutes) => format!("in more than {}", span(minutes + after)),
+            Wait::Unknown(_) => "soon: too little has gone through lately to say when".into(),
+            Wait::Later => "after the walk in progress".into(),
+        },
+    })
 }
 
 #[cfg(test)]
@@ -717,6 +757,22 @@ mod tests {
 
     fn counted(n: i64) -> impl Fn(i64) -> rusqlite::Result<(i64, bool)> {
         move |cap| Ok((n.min(cap), n > cap))
+    }
+
+    #[test]
+    fn a_steps_wait_in_a_few_words() {
+        let pace = Pace { running: true, ..Pace::default() };
+        let queued = Standing::Queued { wait: Wait::About(3.6, 12), after: 0.4, next: true, lane: "net" };
+        assert_eq!(eta_words(&queued, &pace, 0).as_deref(), Some("in about 4 min (around 00:04 UTC)"));
+        assert_eq!(eta_words(&Standing::Done, &pace, 0), None);
+        let now = Standing::Queued { wait: Wait::About(0.0, 0), after: 0.0, next: true, lane: "net" };
+        assert_eq!(eta_words(&now, &pace, 0).as_deref(), Some("in under a minute"));
+        let stopped = Pace::default();
+        assert_eq!(eta_words(&queued, &stopped, 0).as_deref(), Some("on hold: the indexer isn't running"));
+        assert_eq!(
+            eta_words(&Standing::Off, &stopped, 0).as_deref(),
+            Some("the Pictures step is turned off in the settings")
+        );
     }
 
     #[test]
@@ -804,7 +860,7 @@ mod tests {
         assert_eq!(*standing_of(&rows, "predb_match"), Standing::Skipped(None), "no queue row, no walk");
 
         let html = render(8, &state, &pace(), &rows, 1_000);
-        assert!(html.contains("2 of 18 steps still to run: Probe (tracks, codecs), Media lookup."), "{html}");
+        assert!(html.contains("2 of 19 steps still to run: Probe (tracks, codecs), Media lookup."), "{html}");
         assert!(html.contains("in about 2 h · 7,200 ahead in shard 0's net line"), "{html}");
     }
 
@@ -920,7 +976,7 @@ mod tests {
         let main = dir.path().join("atlas.db");
         crate::db::create_db_at(&main).unwrap();
         let conn = crate::db::open_with_shards(&main).unwrap();
-        let s = 3;
+        let s = store::SHARDS - 1;
         for (i, rank) in [(1, 2), (2, 1), (3, 1), (4, 0), (5, 1)] {
             let id = i * store::SHARDS as i64 + s as i64;
             conn.execute(

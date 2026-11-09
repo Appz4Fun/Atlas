@@ -70,7 +70,10 @@ fn lookup_of(i: &MetaInputs<'_>, l: &Looked) -> crate::keys::Lookup {
     let timing: Vec<(Option<i64>, i64)> = l.timing.iter().map(|t| (t.lines, t.articles)).collect();
     let shard = shard_conn(i.release.id);
     crate::keys::Lookup {
-        keys: crate::keys::keys_of(i.probe, &timing, i.release.parts, l.salt),
+        keys: crate::keys::Keys {
+            volumes: shard.as_ref().and_then(|s| crate::keys::volume_key(s, i.release.id, i.probe)),
+            ..crate::keys::keys_of(i.probe, &timing, i.release.parts, l.salt)
+        },
         par2_sets: shard
             .as_ref()
             .map(|s| crate::keys::par2_sets(s, i.release.id).unwrap_or_default())
@@ -914,7 +917,7 @@ fn where_panel(i: &MetaInputs<'_>, l: &Looked, compact: bool) -> Facts {
         f.add("Posting rate", posting_rate(&l.timing, if partial.is_none() { i.release.size } else { None }));
         f.add("File order", file_order(&l.timing));
         f.add("Sessions", sessions(&l.timing));
-        f.add("Article numbers", article_numbers(&l.timing));
+        f.add("Group article numbers", article_numbers(&l.timing));
         f.add("Threaded replies", Some(threaded_replies(&l.timing)));
         f.add("Crossposts per article", crossposts(&l.timing));
         f.add("From variants", from_variants(&l.timing));
@@ -1073,11 +1076,12 @@ fn sessions(timing: &[FileTiming]) -> Option<String> {
     Some(if count == 1 { "one session".into() } else { format!("{count} sessions, gaps over 30 min between files") })
 }
 
-/// "1,200–1,251 where it was read, adjacent" or ", 12 other articles between them".
+/// "1,200 through 1,251, adjacent" or ", 12 other articles between them".
 fn article_numbers(timing: &[FileTiming]) -> Option<String> {
     let first = timing.iter().filter_map(|t| t.number_first).min()?;
     let last = timing.iter().filter_map(|t| t.number_last).max()?;
-    let mut text = format!("{}–{} where it was read", thousands(first), thousands(last));
+    // the group's own counter on the server it was read from: the same article has another number in each group
+    let mut text = format!("{} through {}", thousands(first), thousands(last));
     let others = last - first + 1 - timed(timing);
     if others <= 0 {
         text.push_str(", adjacent");
@@ -2250,6 +2254,11 @@ fn keys_panel(i: &MetaInputs<'_>, l: &Looked, compact: bool) -> Facts {
         "Chapter times key",
         media.and_then(crate::keys::chapters_text).map(|t| with_link(key16(t.as_bytes()), Kind::Chapters)),
     );
+    // an encrypted set's volume sizes: how many releases share them, the sizes are on the PAR2 panel
+    let link = same_link(l, id, Kind::Volumes);
+    if !link.is_empty() {
+        f.add_html("Encrypted volume sizes", Some(format!("Volume size, count and last size{link}")));
+    }
     f.add_html(
         "Thread key",
         i.probe
@@ -3797,7 +3806,7 @@ mod tests {
         assert_eq!(posting_rate(&rows, None).as_deref(), Some("0.5 articles a minute"));
         assert_eq!(file_order(&rows).as_deref(), Some("3 files one after another"));
         assert_eq!(sessions(&rows).as_deref(), Some("2 sessions, gaps over 30 min between files"));
-        assert_eq!(article_numbers(&rows).as_deref(), Some("100–129 where it was read, adjacent"));
+        assert_eq!(article_numbers(&rows).as_deref(), Some("100 through 129, adjacent"));
         assert_eq!(threaded_replies(&rows), "none");
         assert_eq!(crossposts(&rows), None, "no Xref from this server");
         assert_eq!(from_variants(&rows).as_deref(), Some("one From throughout"));
@@ -3841,7 +3850,7 @@ mod tests {
         busy[1].lines = None;
         assert_eq!(file_order(&busy).as_deref(), Some("interleaved: 1 of 2 files started before an earlier one ended"));
         assert_eq!(sessions(&busy).as_deref(), Some("one session"));
-        assert_eq!(article_numbers(&busy).as_deref(), Some("100–120 where it was read, 1 other article between them"));
+        assert_eq!(article_numbers(&busy).as_deref(), Some("100 through 120, 1 other article between them"));
         assert_eq!(threaded_replies(&busy), "3 articles carried References");
         assert_eq!(crossposts(&busy).as_deref(), Some("3 groups at most, by Xref"));
         assert_eq!(crossposts(&busy[..1]).as_deref(), Some("one group, by Xref"));
@@ -3872,7 +3881,7 @@ mod tests {
             "<dt>Posting rate</dt><dd>16.7 articles a minute</dd>",
             "<dt>File order</dt><dd>2 files one after another</dd>",
             "<dt>Sessions</dt><dd>one session</dd>",
-            "<dt>Article numbers</dt><dd>500–2,499 where it was read, adjacent</dd>",
+            "<dt>Group article numbers</dt><dd>500 through 2,499, adjacent</dd>",
             "<dt>Threaded replies</dt><dd>none</dd>",
             "<dt>From variants</dt><dd>one From throughout</dd>",
             "<dt>Lines per article</dt><dd>100 lines an article</dd>",

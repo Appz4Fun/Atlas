@@ -21,7 +21,9 @@ fn every_field_finds_its_releases_and_counts_them() {
     db::create_db().unwrap();
     let main = home.path().join("atlas.db");
     let groups: Vec<String> = (0..64).map(|n| format!("alt.binaries.g{n}")).collect();
-    let in_shard = |s: usize| groups.iter().find(|g| store::shard_of(g) == s).unwrap().clone();
+    let in_shard = |s: usize| {
+        groups.iter().filter(|g| store::shard_of(g) == s % store::SHARDS).nth(s / store::SHARDS).unwrap().clone()
+    };
     let save = |name: &str, group: &str, poster: &str| {
         store::save(
             &main,

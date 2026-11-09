@@ -155,7 +155,12 @@ pub fn hold_off_compaction(main: &Path) -> Result<WriteGuard> {
 pub fn try_hold_off_compaction(main: &Path) -> Result<Option<WriteGuard>> {
     let file = open_lock(main)?;
     match file.try_lock_shared() {
-        Ok(()) => Ok(Some(WriteGuard(file))),
+        Ok(()) => {
+            // every writer holds this: none may write to shards a merge left half done (checked once held, soo a
+            // merge that marked and let go just before is seen)
+            crate::merge_shards::refuse_if_merging(main)?;
+            Ok(Some(WriteGuard(file)))
+        }
         Err(std::fs::TryLockError::WouldBlock) => Ok(None),
         Err(std::fs::TryLockError::Error(e)) => Err(e).context("locking the database for a write"),
     }
@@ -172,7 +177,17 @@ impl Drop for WriteGuard {
 pub(crate) struct Lock(std::fs::File);
 
 impl Lock {
+    /// The lock, refused while a shard merge is half done (`merge_shards::MERGING`): what takes it writes to shards.
     pub(crate) fn take(main: &Path) -> Result<Lock> {
+        let lock = Lock::take_unchecked(main)?;
+        // after taking it: a merge that set its marker and let go just before is seen
+        crate::merge_shards::refuse_if_merging(main)?;
+        Ok(lock)
+    }
+
+    /// The lock whatever a merge left: for the merge itself, and for what removes the shards whole (wipe, reset) or
+    /// sets a database up (conversion), which goes through `db::create_db_at`'s own check after.
+    pub(crate) fn take_unchecked(main: &Path) -> Result<Lock> {
         let file = open_lock(main)?;
         match file.try_lock() {
             Ok(()) => Ok(Lock(file)),
@@ -339,6 +354,7 @@ pub fn run(main: &Path, progress: &(dyn Fn(&str) + Sync), stop: &Arc<AtomicBool>
 
 fn run_locked(main: &Path, progress: &(dyn Fn(&str) + Sync), stop: &Arc<AtomicBool>) -> Result<Shrunk> {
     let _lock = Lock::take(main)?;
+    crate::merge_shards::refuse_if_merging(main)?;
     // a conversion's swap cut short is finished (or undone) like at a start;
     // shards with no main database at all are refused: the main database
     // the next start made would hand out their ids again
@@ -1489,7 +1505,12 @@ mod tests {
                 .unwrap();
             }
         }
-        assert_eq!(domains(main), 120 + 5, "every made up domain has a row, ngPost one per shard used");
+        let shards_used = (0..5).map(|g| store::shard_of(&format!("alt.binaries.g{g}"))).collect::<HashSet<_>>().len();
+        assert_eq!(
+            domains(main),
+            120 + shards_used as i64,
+            "every made up domain has a row, ngPost one per shard used"
+        );
     }
 
     /// The sample is compared by digest, order aside; a copy that lost a
@@ -2347,6 +2368,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs more than one shard; store::SHARDS is 1 (one shard is `a_corrupt_blob_stops_compacting_and_keeps_the_original`)"]
     fn a_failed_shard_doesnt_stop_the_others() {
         let dir = tempfile::tempdir().unwrap();
         let main = dir.path().join("atlas.db");
@@ -2466,6 +2488,8 @@ mod tests {
         legacy_fixture(&main);
         let group = "alt.binaries.g3";
         let path = store::shard_path(&main, store::shard_of(group));
+        let kept = dir.path().join("kept.db");
+        std::fs::copy(&path, &kept).unwrap();
 
         // no backup at all
         remove_db(&path);
@@ -2475,7 +2499,7 @@ mod tests {
 
         // only a compacted copy, which may not have been checked: kept, still refused
         let copy = with_suffix(&path, "compact");
-        std::fs::copy(store::shard_path(&main, (store::shard_of(group) + 1) % SHARDS), &copy).unwrap();
+        std::fs::copy(&kept, &copy).unwrap();
         let err = format!("{:#}", db::create_db_at(&main).unwrap_err());
         assert!(err.contains(&copy.display().to_string()), "{err}");
         assert!(!path.exists() && copy.exists(), "the copy is left for whoever puts it back");

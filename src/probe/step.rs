@@ -1608,6 +1608,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs more than one shard; store::SHARDS is 1"]
     fn lenders_in_every_shard_are_looked_at_newest_first() {
         let conn = mux_shards();
         conn.execute("attach ':memory:' as s1", []).unwrap();

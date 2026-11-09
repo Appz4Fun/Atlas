@@ -61,6 +61,12 @@ pub trait Step: Send + Sync + 'static {
     fn reruns(&self) -> Reruns {
         Reruns::default()
     }
+    /// Asked for by hand on release `release_id`, as a picture on its page: a body step runs past the body gate's
+    /// size and type bounds then, which would otherwise mark it done unrun. Only called for a release outside them.
+    fn asked_for(&self, conn: &rusqlite::Connection, release_id: i64) -> bool {
+        let _ = (conn, release_id);
+        false
+    }
     /// Inputs that can change while `enabled` stays true, one bit each. A bit
     /// that wasnt there before redoes this step on existing releases. Cheap, no I/O.
     fn config_stamp(&self) -> u64 {
@@ -85,6 +91,8 @@ pub struct ReleaseInfo {
     pub file_total: Option<i64>,
     pub is_obfuscated: bool,
     pub name_source: Option<i64>,
+    /// a movie or series, when the release was saved from a Spotnet spot that says so (`spotnet::store::SPOTS`)
+    pub spot_kind: Option<crate::spotnet::Kind>,
 }
 
 /// What a step gets for one release.
@@ -98,6 +106,8 @@ pub struct StepCtx<'a> {
     pub(crate) lane_can_fetch: bool,
     /// the CRC of each article body read whole this run, written with the step's outcome (`archive::store::SEGMENT_CRC`)
     pub(crate) crcs: Vec<StepWrite>,
+    /// pictures may be fetched: off unless the step asks (`allow_pictures`)
+    pub(crate) pictures: bool,
 }
 
 impl StepCtx<'_> {
@@ -126,6 +136,11 @@ impl StepCtx<'_> {
         self.facts.iter().rev().find(|(k, _)| *k == key).map(|(_, v)| v.as_str())
     }
 
+    /// Lets this run fetch pictures, which are refused otherwise: for a step that reads them on purpose.
+    pub fn allow_pictures(&mut self) {
+        self.pictures = true;
+    }
+
     /// Only from `Needs::Bodies` steps. One at a time, within every budget.
     pub fn fetch_bodies(&mut self, wanted: &[BodyRequest]) -> Result<Vec<BodyResult>, StepError> {
         if !self.lane_can_fetch {
@@ -133,12 +148,13 @@ impl StepCtx<'_> {
         }
         let mut results = Vec::with_capacity(wanted.len());
         for request in wanted {
-            let got = self.bodies.fetch(
+            let got = self.bodies.fetch_with(
                 &self.release,
                 request,
                 &mut self.used_bodies,
                 self.deadline,
                 BackgroundRead::Capped,
+                self.pictures,
             )?;
             if let Got::Body(body) = &got
                 && request.max_bytes.is_none_or(|cap| body.len() < cap)
@@ -156,8 +172,14 @@ impl StepCtx<'_> {
         if !self.lane_can_fetch {
             return Err(StepError::Permanent("a database step cant fetch bodies".into()));
         }
-        let got =
-            self.bodies.fetch(&self.release, wanted, &mut self.used_bodies, self.deadline, BackgroundRead::Prefix)?;
+        let got = self.bodies.fetch_with(
+            &self.release,
+            wanted,
+            &mut self.used_bodies,
+            self.deadline,
+            BackgroundRead::Prefix,
+            self.pictures,
+        )?;
         Ok(BodyResult { message_id: wanted.message_id.clone(), got })
     }
 
@@ -166,8 +188,14 @@ impl StepCtx<'_> {
         if !self.lane_can_fetch {
             return Err(StepError::Permanent("a database step cant fetch bodies".into()));
         }
-        let got =
-            self.bodies.fetch(&self.release, wanted, &mut self.used_bodies, self.deadline, BackgroundRead::Head)?;
+        let got = self.bodies.fetch_with(
+            &self.release,
+            wanted,
+            &mut self.used_bodies,
+            self.deadline,
+            BackgroundRead::Head,
+            self.pictures,
+        )?;
         Ok(BodyResult { message_id: wanted.message_id.clone(), got })
     }
 
@@ -177,8 +205,14 @@ impl StepCtx<'_> {
         if !self.lane_can_fetch {
             return Err(StepError::Permanent("a database step cant fetch bodies".into()));
         }
-        let got =
-            self.bodies.fetch(&self.release, wanted, &mut self.used_bodies, self.deadline, BackgroundRead::Capped)?;
+        let got = self.bodies.fetch_with(
+            &self.release,
+            wanted,
+            &mut self.used_bodies,
+            self.deadline,
+            BackgroundRead::Capped,
+            self.pictures,
+        )?;
         Ok(BodyResult { message_id: wanted.message_id.clone(), got })
     }
 
@@ -197,7 +231,8 @@ impl StepCtx<'_> {
         if !self.lane_can_fetch {
             return Err(StepError::Permanent("a database step cant fetch bodies".into()));
         }
-        let got = self.bodies.fetch(&self.release, wanted, &mut self.used_bodies, self.deadline, read)?;
+        let got =
+            self.bodies.fetch_with(&self.release, wanted, &mut self.used_bodies, self.deadline, read, self.pictures)?;
         // a cut one has no trailer, soo nothing's kept of it
         if let Got::Body(raw) = &got {
             // what the trailer says of the part: its CRC, and how many bytes it decodes to
@@ -231,8 +266,14 @@ impl StepCtx<'_> {
             return Err(StepError::Permanent("a database step cant fetch bodies".into()));
         }
         let wanted = BodyRequest { message_id: message_id.to_string(), file: file.to_string(), max_bytes: Some(1) };
-        let got =
-            self.bodies.fetch(&self.release, &wanted, &mut self.used_bodies, self.deadline, BackgroundRead::Stat)?;
+        let got = self.bodies.fetch_with(
+            &self.release,
+            &wanted,
+            &mut self.used_bodies,
+            self.deadline,
+            BackgroundRead::Stat,
+            self.pictures,
+        )?;
         Ok(match got {
             Got::Body(_) | Got::TooBig => Some(true),
             Got::Missing => Some(false),

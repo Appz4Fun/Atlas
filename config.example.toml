@@ -42,6 +42,20 @@ ssl = true
 connections = 20
 priority = 4
 
+# Which server a group is read from (all off by default). With `ranked` or a `prefer` list a group goes to the
+# best server that carries it, the hosts in `prefer` first and the rest by connections, and falls to the next when
+# that one is down, failing it, banned from it or has no worker free. `ban` keeps groups off servers for good,
+# ranked or not: a group banned from every server left isn't read until one it may be read from frees up. Ranked,
+# a server that says it lacks a group, or fails it three times in a day, is left out of it for a day (unless no
+# other is left).
+# `time_cursors` starts a group on a server it hasn't been reading about an hour before the time it's read through
+# on any server, found by date, instead of at the newest article.
+[indexing]
+ranked = false
+# prefer = ["news.example.com", "fill.example.net"]
+# ban = { "alt.binaries.example" = ["fill.example.net"] }
+time_cursors = false
+
 [postprocess]
 enabled = true
 workers = 2
@@ -68,6 +82,12 @@ enabled = true
 max_bodies_per_release = 4
 probe_files = 2
 probes_per_minute = 60
+# a release's pictures are read as it's processed when it has at most this many, together at most this many MB;
+# past either only its thumbnail or cover is, and the release page offers a Fetch button for each of the rest
+pictures_auto_max = 12
+pictures_auto_max_mb = 16
+# the most articles one picture fetched from the page may take (about 0.7 MB each, 64 at most)
+picture_max_parts = 64
 
 [naming]
 enabled = true
@@ -90,6 +110,8 @@ concurrency = 16
 comments = true
 comment_days = 60
 comments_per_pass = 2000
+# spotters known for spam and fakes, read once a day; "" for none
+blacklist_url = "https://spotlist.store/spotnet/blacklist.xml"
 
 [category]
 enabled = true
@@ -135,3 +157,19 @@ addr = ""
 # move sealed articles there while indexing
 offload = false
 offload_mb_per_second = 50
+
+[header_store]
+# keep every fetched overview row for a while in per-day .nxv files, and link uploads whose every article has a random
+# subject back together across groups from them (src/nxv_store/). Off: such articles are counted and dropped
+enabled = false
+# where: empty is `header-store` next to the databases
+dir = ""
+
+[overview_archive]
+# keep every fetched XOVER row, byte for byte, in compressed .nxv files outside SQLite (nntp-xover-engine/)
+enabled = false
+# where: empty is `overview` next to the databases
+dir = ""
+# full segments per server and group kept hot (fast reads); older ones are zstd compressed
+keep_hot = 2
+zstd_level = 9
