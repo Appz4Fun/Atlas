@@ -526,21 +526,15 @@ fn claim_wanted(db: &dyn Sql, groups: &[(String, i64)], host: &str, now: i64) ->
     let stale = now - CLAIM_TIMEOUT;
     let row = db.tx(|tx| {
         tx.lock("atlas.backfill_claim")?;
-        let asked = tx.query(
-            &format!(
-                "select c.grp, c.day from backfill_wanted r
-                 join backfill_chunks c on c.grp = r.grp and c.day = r.day
-                 where c.state = {PENDING} or (c.state = {CLAIMED} and c.claimed_at < $1)
-                 order by c.day desc, c.grp"
-            ),
-            vals![stale],
-        )?;
+        // the days asked for alone, each claimed by its key below: joined to the chunks, SQLite's plan (no stats for
+        // the small table) scanned all of backfill_chunks by its day index first
+        let asked = tx.query("select grp, day from backfill_wanted order by day desc, grp", vals![])?;
         for r in asked {
             let (grp, day): (String, i64) = (r.get(0)?, r.get(1)?);
             if oldest.get(grp.as_str()).is_none_or(|o| day < *o) {
                 continue;
             }
-            return Ok(tx
+            let claimed = tx
                 .query(
                     &format!(
                         "update backfill_chunks set state = $1, server = $2, claimed_at = $3
@@ -550,7 +544,11 @@ fn claim_wanted(db: &dyn Sql, groups: &[(String, i64)], host: &str, now: i64) ->
                     vals![CLAIMED, host, now, grp.as_str(), day, stale],
                 )?
                 .into_iter()
-                .next());
+                .next();
+            // a day done or claimed fresh since it was asked for: the next one
+            if claimed.is_some() {
+                return Ok(claimed);
+            }
         }
         Ok(None)
     })?;
