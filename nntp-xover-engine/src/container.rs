@@ -20,6 +20,30 @@
 //! row before; a checkpoint every 128 rows holds the state to start from, so
 //! a row is at most 127 steps from a known state and a range walks one step
 //! per row.
+//!
+//! Version 2 (what the builder writes; readers take both) changes how some
+//! sections are kept, nothing else:
+//! - A row's message-id tail data is a *segment*: the packed tail, then, when
+//!   the subject is a random token kept per row, the packed subject. Packed
+//!   strings delimit themselves, soo `MsgIdTailOffsets` holds one u32 per 32
+//!   rows (where the first one's segment starts) instead of one per row, and a
+//!   row's segment is at most 31 segments from one.
+//! - A per-row token subject has the subject template id one past the subject
+//!   dictionary's last entry, and no dictionary entry.
+//! - String pool entries delimit themselves too (a packed entry by its header,
+//!   a raw or FSST one by a varint length before it), soo `StringPoolOffsets`
+//!   holds one u32 per 32 entries of each dictionary.
+//! - Each u16 id column is one value when the block has one, a palette and a u8
+//!   per row when it has at most 256, nothing when each row's id is its row
+//!   number, a u16 per row otherwise (see [`IdCol`]).
+//! - A subject template with three or more counters writes a mask of the ones
+//!   that changed, then only those deltas.
+//! - A sub-block whose rows have no references stores nothing for them.
+//! - A dictionary may be *shaped* ([`DICT_SHAPED`]): each entry a shape id and
+//!   its alphabet runs packed, for posters made of random tokens.
+//! - A sub-block whose article numbers run one by one stores none, and one
+//!   whose Xref slot 0 is always the article number stores no slot 0 (flags in
+//!   its checkpoint, see [`CP_CONSECUTIVE`]).
 
 use anyhow::{Context, Result, bail, ensure};
 use std::collections::HashMap;
@@ -32,7 +56,10 @@ pub(crate) const STYLE_NO_BYTES: u32 = 1 << 6;
 /// The subject is the message-id's local part (obfuscating posters do this): no template is stored.
 pub(crate) const STYLE_SUBJ_IS_LOCAL: u32 = 1 << 7;
 const _: () = assert!(STYLE_FREE_BITS == STYLE_NO_LINES | STYLE_NO_BYTES | STYLE_SUBJ_IS_LOCAL);
-use crate::msgid_codec::{pack_msgid_tail, split_msgid, split_prefix};
+use crate::msgid_codec::{
+    in_pack_alphabet, pack_msgid_tail, packed_tail_len, packs_by_alphabet, split_msgid, split_prefix,
+    unpack_msgid_tail_into,
+};
 use crate::msgid_index::{BucketIndexView, Xor8Builder, Xor8View, build_bucket_index, msgid_hash};
 use crate::subject_codec::{SubjectNums, extract_subject_template, render_subject};
 use crate::varint::{
@@ -45,10 +72,26 @@ use crate::xref_codec::{MAX_XREF_GROUPS, XREF_PREFIX, extract_xref_skeleton, ren
 compile_error!("the .nxv format is read in place and assumes a little-endian host");
 
 pub const MAGIC: [u8; 4] = *b"NXVB";
-pub const VERSION: u16 = 1;
+/// The first format: a u32 offset per row and per dictionary entry, every id column a u16 per row.
+pub const VERSION_1: u16 = 1;
+/// Per-row token subjects, self-delimiting tails and pool entries with a checkpoint every 32, narrow id columns,
+/// masked subject counters, sub-blocks without references stored empty. See the module notes.
+pub const VERSION_2: u16 = 2;
+/// The version the builder writes.
+pub const VERSION: u16 = VERSION_2;
+/// A subject at least this long, made only of the packing alphabet, that no other row of the block has, is kept per
+/// row instead of in the subject dictionary.
+pub const TOKEN_SUBJECT_MIN: usize = 12;
+/// A subject template with at least this many counters writes a mask of the ones that changed (version 2).
+const MASKED_COUNTERS: u32 = 3;
 pub const FLAG_COLD: u16 = 1;
 pub const FLAG_XREF_PREFIX: u16 = 2;
 pub const SUB_BLOCK_ROWS: usize = 128;
+/// Version 2: rows per message-id tail checkpoint (a sub-block holds a whole number of them), and dictionary entries
+/// per string pool checkpoint. A row's segment or an entry is then at most this many less one steps from one.
+pub const TAIL_CP_ROWS: usize = 32;
+pub const POOL_CP_ENTRIES: usize = 32;
+const _: () = assert!(SUB_BLOCK_ROWS.is_multiple_of(TAIL_CP_ROWS));
 pub const MAX_BLOCK_ROWS: usize = 65_536;
 /// PadMask bit 15: the row is kept whole in the literal dictionary.
 pub const PADMASK_LITERAL: u16 = 0x8000;
@@ -63,6 +106,20 @@ pub const MAX_HOT_BLOCK_BYTES: usize = 1 << 30;
 /// covers this hash too.
 const BODY_HASH_LO: SectionId = SectionId::FsstTables;
 const BODY_HASH_HI: SectionId = SectionId::ReferencesData;
+
+/// The section entries whose `encoding_flags` hold the store's fields (`BlockMeta`): the server a block's rows came
+/// from and the slab it was sealed from. The header CRC covers the section table, soo it covers these too, and a
+/// block built without them reads as server 0, slab 0.
+const META_SLAB_GEN: SectionId = SectionId::SkipCheckpoints;
+const META_SERVER: SectionId = SectionId::MsgIdXor8;
+
+/// What a store keeps about a block besides its rows: which server sent them, and which slab they were sealed from
+/// (recovery tells a slab's leftover log was committed by it).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct BlockMeta {
+    pub server_id: u16,
+    pub slab_gen: u32,
+}
 
 /// The body hash a block's section table holds.
 fn stored_body_hash(sections: &[SectionEntry]) -> u64 {
@@ -135,10 +192,19 @@ pub struct SkipCheckpoint {
     pub base_lines: i32,
     pub base_subj_nums: [i32; 5],
     pub base_xref_slot0_delta: i32,
+    /// where the sub-block's numbers start; in version 2 the top two bits are [`CP_CONSECUTIVE`] and
+    /// [`CP_SLOT0_IS_ART`] (a block is at most 1 GiB, soo an offset never reaches them)
     pub varint_byte_offset: u32,
     pub refs_byte_offset: u32,
 }
 const _: () = assert!(std::mem::size_of::<SkipCheckpoint>() == 64);
+
+/// Version 2 checkpoint flag: each row's article number is one more than the row before's, and none is stored.
+pub const CP_CONSECUTIVE: u32 = 1 << 31;
+/// Version 2 checkpoint flag: every structured row's Xref slot 0 is its own article number, and none is stored.
+pub const CP_SLOT0_IS_ART: u32 = 1 << 30;
+const CP_OFFSET_MASK: u32 = CP_SLOT0_IS_ART - 1;
+const _: () = assert!(MAX_HOT_BLOCK_BYTES as u64 <= CP_OFFSET_MASK as u64 + 1);
 
 pub const DICT_SUBJ: usize = 0;
 pub const DICT_XREF: usize = 1;
@@ -152,6 +218,107 @@ const DICT_RAW: u16 = 0;
 const DICT_FSST: u16 = 1;
 /// each entry packed by alphabet like a message-id tail (random strings that FSST can't shrink)
 const DICT_PACKED: u16 = 2;
+/// Version 2: each entry a shape id (varint), then each run of the packing alphabet in it packed like a message-id
+/// tail. A shape is the entry with each run as one [`SHAPE_SLOT`] byte (`\0 <\0@\0>` for most obfuscated posters);
+/// the shapes are a table in the FsstTables section: `n_symbols + 1` u32 offsets, then the shapes' bytes.
+const DICT_SHAPED: u16 = 3;
+const SHAPE_SLOT: u8 = 0;
+
+/// A dictionary's entries in shaped mode: (the shape table, how many shapes it has, each entry coded), or None when an
+/// entry holds a [`SHAPE_SLOT`] byte or there are more shapes than a `u16` counts.
+fn shape_dict(entries: &[&[u8]]) -> Option<(Vec<u8>, usize, Vec<Vec<u8>>)> {
+    let mut ids: HashMap<Vec<u8>, u32> = HashMap::new();
+    let mut shapes: Vec<Vec<u8>> = Vec::new();
+    let mut coded = Vec::with_capacity(entries.len());
+    let mut shape = Vec::new();
+    for e in entries {
+        if e.contains(&SHAPE_SLOT) {
+            return None;
+        }
+        shape.clear();
+        let mut runs = Vec::with_capacity(e.len());
+        let mut i = 0;
+        while i < e.len() {
+            if in_pack_alphabet(e[i]) {
+                let start = i;
+                while i < e.len() && in_pack_alphabet(e[i]) {
+                    i += 1;
+                }
+                pack_msgid_tail(&e[start..i], &mut runs);
+                shape.push(SHAPE_SLOT);
+            } else {
+                shape.push(e[i]);
+                i += 1;
+            }
+        }
+        let id = match ids.get(shape.as_slice()) {
+            Some(&id) => id,
+            None => {
+                let id = shapes.len() as u32;
+                ids.insert(shape.clone(), id);
+                shapes.push(shape.clone());
+                id
+            }
+        };
+        let mut c = Vec::with_capacity(runs.len() + 2);
+        write_varint(id as u64, &mut c);
+        c.extend_from_slice(&runs);
+        coded.push(c);
+    }
+    if shapes.len() > u16::MAX as usize {
+        return None;
+    }
+    let mut table = Vec::new();
+    let mut at = 0u32;
+    for s in &shapes {
+        table.extend_from_slice(&at.to_le_bytes());
+        at += s.len() as u32;
+    }
+    table.extend_from_slice(&at.to_le_bytes());
+    for s in &shapes {
+        table.extend_from_slice(s);
+    }
+    Some((table, shapes.len(), coded))
+}
+
+/// Shape `id` of a shape table (see [`DICT_SHAPED`]) with `n` shapes; empty when there is none.
+#[inline]
+fn shape_of(table: &[u8], n: usize, id: usize) -> &[u8] {
+    let Some(offs) = table.get(..4 * (n + 1)).and_then(cast_slice::<u32>) else { return &[] };
+    let body = &table[4 * (n + 1)..];
+    match (offs.get(id), offs.get(id + 1)) {
+        (Some(&a), Some(&b)) => body.get(a as usize..b as usize).unwrap_or(&[]),
+        _ => &[],
+    }
+}
+
+/// Appends the entry a shaped entry `coded` stands for. Returns how many bytes of `coded` it took.
+#[inline]
+fn unshape_into(coded: &[u8], table: &[u8], n: usize, out: Option<&mut Vec<u8>>) -> usize {
+    let mut pos = 0usize;
+    let id = read_varint_unchecked(coded, &mut pos) as usize;
+    let shape = shape_of(table, n, id);
+    match out {
+        Some(out) => {
+            for &b in shape {
+                if b == SHAPE_SLOT {
+                    let run = coded.get(pos..).unwrap_or(&[]);
+                    let len = packed_tail_len(run).min(run.len());
+                    unpack_msgid_tail_into(&run[..len], out);
+                    pos += len;
+                } else {
+                    out.push(b);
+                }
+            }
+        }
+        None => {
+            for _ in shape.iter().filter(|&&b| b == SHAPE_SLOT) {
+                pos = pos.saturating_add(packed_tail_len(coded.get(pos..).unwrap_or(&[])));
+            }
+        }
+    }
+    pos.min(coded.len())
+}
 
 #[derive(Copy, Clone, Debug, Default)]
 #[repr(C)]
@@ -305,6 +472,8 @@ pub(crate) struct RowParts<'x> {
     pub art: u64,
     /// the subject is `pfx` and the unpacked tail
     pub subj_is_local: bool,
+    /// the subject is this packed token (kept per row)
+    pub subj_packed: Option<&'x [u8]>,
     pub tpl: &'x [u8],
     pub nums: SubjectNums,
     pub author: &'x [u8],
@@ -328,6 +497,8 @@ pub(crate) fn render_row(p: &RowParts, out: &mut Vec<u8>) {
     if p.subj_is_local {
         out.extend_from_slice(p.pfx);
         crate::msgid_codec::unpack_msgid_tail_into(p.tail_packed, out);
+    } else if let Some(t) = p.subj_packed {
+        crate::msgid_codec::unpack_msgid_tail_into(t, out);
     } else {
         render_subject(p.tpl, &p.nums, out);
     }
@@ -441,6 +612,8 @@ struct Structured {
     nx: u8,
     smask: u8,
     refs: (u32, u32),
+    /// the subject is a token kept per row, after the message-id tail (version 2)
+    tok: bool,
 }
 
 enum Kind {
@@ -587,7 +760,47 @@ struct RowScratch {
     tpl: Vec<u8>,
     skel: Vec<u8>,
     tail: Vec<u8>,
+    tok: Vec<u8>,
     check: Vec<u8>,
+}
+
+/// How many counters a template with this mask has.
+#[inline(always)]
+fn counter_count(smask: u8) -> u32 {
+    2 * (smask & 1) as u32 + 2 * ((smask >> 1) & 1) as u32 + ((smask >> 2) & 1) as u32
+}
+
+#[inline(always)]
+fn varint_len(v: u64) -> usize {
+    (64 - (v | 1).leading_zeros() as usize).div_ceil(7)
+}
+
+/// A u16 id column as version 2 keeps it: (bytes, the section's `encoding_flags`). One value: the palette alone
+/// (width 0). At most 256 values: the palette, padded to 8 bytes, then a u8 index per row (width 1). Each row's id
+/// its row number (a block where every row brings a new poster or domain): nothing (width 3). Otherwise a u16 per row
+/// (width 2). The flags are the width, with the palette's length from bit 8.
+fn encode_id_col(vals: &[u16]) -> (Vec<u8>, u32) {
+    let wide = || -> Vec<u8> { vals.iter().flat_map(|v| v.to_le_bytes()).collect() };
+    if vals.len() > 1 && vals.iter().enumerate().all(|(i, &v)| v as usize == i) {
+        return (Vec::new(), ID_COL_ROW);
+    }
+    let mut pal = vals.to_vec();
+    pal.sort_unstable();
+    pal.dedup();
+    if pal.len() > 256 {
+        return (wide(), 2);
+    }
+    let mut out: Vec<u8> = pal.iter().flat_map(|v| v.to_le_bytes()).collect();
+    out.resize(align_up(out.len(), 8), 0);
+    let width = if pal.len() == 1 { 0 } else { 1 };
+    if width == 1 {
+        // narrower than u16s unless the block is tiny
+        if out.len() + vals.len() >= 2 * vals.len() {
+            return (wide(), 2);
+        }
+        out.extend(vals.iter().map(|v| pal.binary_search(v).unwrap_or(0) as u8));
+    }
+    (out, width | ((pal.len() as u32) << 8))
 }
 
 pub struct NxvBlockBuilder;
@@ -596,6 +809,18 @@ impl NxvBlockBuilder {
     /// Builds a hot block from raw overview lines (no CR/LF). Rows are kept in
     /// article-number order (a stable sort, so equal numbers keep their order).
     pub fn build_hot_block(lines: &[&[u8]]) -> Result<Vec<u8>> {
+        Self::build_hot_block_meta(lines, BlockMeta::default())
+    }
+
+    /// `build_hot_block`, with the store's fields kept in the section table.
+    pub fn build_hot_block_meta(lines: &[&[u8]], meta: BlockMeta) -> Result<Vec<u8>> {
+        Self::build_hot_block_version(lines, meta, VERSION)
+    }
+
+    /// `build_hot_block_meta` in format `version` ([`VERSION_1`] or [`VERSION_2`]). Version 1 is kept for tests and
+    /// for comparing sizes; a store writes [`VERSION`].
+    pub fn build_hot_block_version(lines: &[&[u8]], meta: BlockMeta, version: u16) -> Result<Vec<u8>> {
+        ensure!(version == VERSION_1 || version == VERSION_2, "can't write .nxv version {version}");
         ensure!(!lines.is_empty(), "a block needs at least one row");
         ensure!(lines.len() <= MAX_BLOCK_ROWS, "{} rows is more than a block holds", lines.len());
         let mut order: Vec<(u64, usize)> = Vec::with_capacity(lines.len());
@@ -617,6 +842,21 @@ impl NxvBlockBuilder {
         }
         let xref_prefix = any_tail && all_prefixed;
 
+        // version 2: a subject that is one random token, on no other row, is kept per row
+        let mut subjects: HashMap<&[u8], u32> = HashMap::new();
+        if version >= VERSION_2 {
+            for l in lines {
+                if let Some(s) = l.split(|&b| b == b'\t').nth(1)
+                    && s.len() >= TOKEN_SUBJECT_MIN
+                {
+                    *subjects.entry(s).or_default() += 1;
+                }
+            }
+        }
+        let token_ok = |line: &[u8]| {
+            line.split(|&b| b == b'\t').nth(1).is_some_and(|s| subjects.get(s) == Some(&1) && packs_by_alphabet(s))
+        };
+
         let mut dicts: [Dict; NUM_DICTS] = Default::default();
         let mut tail_data = Vec::new();
         let mut tail_offsets: Vec<u32> = Vec::with_capacity(lines.len() + 1);
@@ -630,8 +870,10 @@ impl NxvBlockBuilder {
             if let Some(m) = msgid_field(line) {
                 index_entries.push((msgid_hash(m), r as u16));
             }
+            let tok = token_ok(line);
             let kind =
-                match Self::structure(line, art, xref_prefix, &mut sc, &mut tail_data, &mut refs_pool, &mut dicts) {
+                match Self::structure(line, art, xref_prefix, tok, &mut sc, &mut tail_data, &mut refs_pool, &mut dicts)
+                {
                     Some(s) => Kind::Structured(s),
                     None => {
                         tail_data.truncate(*tail_offsets.last().unwrap() as usize);
@@ -642,14 +884,17 @@ impl NxvBlockBuilder {
         }
         tail_offsets.push(tail_data.len() as u32);
 
-        Self::assemble(rows, dicts, tail_offsets, tail_data, refs_pool, index_entries, xref_prefix)
+        Self::assemble(rows, dicts, tail_offsets, tail_data, refs_pool, index_entries, xref_prefix, meta, version)
     }
 
-    /// Takes a line apart; None when some field won't write back as it was.
+    /// Takes a line apart; None when some field won't write back as it was. `token`: keep the subject per row when it
+    /// has no counters (the caller checked it is a token no other row has).
+    #[allow(clippy::too_many_arguments)]
     fn structure(
         line: &[u8],
         art: u64,
         xref_prefix: bool,
+        token: bool,
         sc: &mut RowScratch,
         tail_data: &mut Vec<u8>,
         refs_pool: &mut Vec<u8>,
@@ -661,9 +906,16 @@ impl NxvBlockBuilder {
         let (ts, style) = parse_date(f[3])?;
         let (local, domain) = split_msgid(f[4])?;
         let subj_is_local = local == f[1];
+        // a template that is the whole subject has no counters
+        let tok = token && !subj_is_local && sc.tpl.as_slice() == f[1];
+        sc.tok.clear();
         let (nums, style) = if subj_is_local {
             sc.tpl.clear();
             (SubjectNums::default(), style | STYLE_SUBJ_IS_LOCAL)
+        } else if tok {
+            sc.tpl.clear();
+            pack_msgid_tail(f[1], &mut sc.tok);
+            (SubjectNums::default(), style)
         } else {
             (nums, style)
         };
@@ -702,6 +954,7 @@ impl NxvBlockBuilder {
             &RowParts {
                 art,
                 subj_is_local,
+                subj_packed: tok.then_some(sc.tok.as_slice()),
                 tpl: &sc.tpl,
                 nums,
                 author: f[2],
@@ -722,10 +975,12 @@ impl NxvBlockBuilder {
             return None;
         }
         tail_data.extend_from_slice(&sc.tail);
+        tail_data.extend_from_slice(&sc.tok);
         let refs_start = refs_pool.len() as u32;
         refs_pool.extend_from_slice(f[5]);
         Some(Structured {
-            tpl: dicts[DICT_SUBJ].intern(&sc.tpl),
+            // a token's id is one past the subject dictionary's last entry, known once every row is in
+            tpl: if tok { u32::MAX } else { dicts[DICT_SUBJ].intern(&sc.tpl) },
             skel: dicts[DICT_XREF].intern(&sc.skel),
             author: dicts[DICT_AUTHOR].intern(f[2]),
             domain: dicts[DICT_DOMAIN].intern(domain),
@@ -740,9 +995,11 @@ impl NxvBlockBuilder {
             nx: nx as u8,
             smask: subj_mask(&sc.tpl),
             refs: (refs_start, refs_pool.len() as u32),
+            tok,
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn assemble(
         rows: Vec<Row>,
         dicts: [Dict; NUM_DICTS],
@@ -751,7 +1008,10 @@ impl NxvBlockBuilder {
         refs_pool: Vec<u8>,
         index_entries: Vec<(u64, u16)>,
         xref_prefix: bool,
+        meta: BlockMeta,
+        version: u16,
     ) -> Result<Vec<u8>> {
+        let v2 = version >= VERSION_2;
         let n = rows.len();
         // ---- numeric stream, references and checkpoints
         let mut num = Vec::with_capacity(n * 12);
@@ -784,10 +1044,31 @@ impl NxvBlockBuilder {
                     cp.base_xref_slot1 = s.xref[1] as i64;
                 }
             }
+            ensure!(num.len() < CP_OFFSET_MASK as usize, "block too large");
+            // version 2: flags for sub-blocks whose article numbers run one by one, or whose Xref slot 0 is always
+            // the article number (neither is then stored)
+            let consecutive = v2 && sb.iter().enumerate().all(|(i, r)| r.art == sb[0].art + i as u64);
+            let slot0_is_art = v2
+                && sb.iter().all(|r| match &r.kind {
+                    Kind::Structured(s) => s.nx == 0 || s.xref[0] == r.art,
+                    Kind::Literal(_) => true,
+                });
+            if consecutive {
+                cp.varint_byte_offset |= CP_CONSECUTIVE;
+            }
+            if slot0_is_art {
+                cp.varint_byte_offset |= CP_SLOT0_IS_ART;
+            }
             let mut st = DeltaState::from_checkpoint(&cp);
+            // version 2 stores nothing for a sub-block without references: its refs offset equals the next one's
+            let refs_here = !v2 || sb.iter().any(|r| matches!(&r.kind, Kind::Structured(s) if s.refs.1 > s.refs.0));
             for r in sb {
                 let art = r.art as i64;
-                put_delta(art, &mut st.art, &mut num);
+                if consecutive {
+                    st.art = art;
+                } else {
+                    put_delta(art, &mut st.art, &mut num);
+                }
                 let Kind::Structured(s) = &r.kind else { continue };
                 min_ts = min_ts.min(s.ts);
                 max_ts = max_ts.max(s.ts);
@@ -805,9 +1086,25 @@ impl NxvBlockBuilder {
                 if s.style & STYLE_NO_LINES == 0 {
                     put_delta(s.lines, &mut st.lines, &mut num);
                 }
-                for k in 0..5 {
-                    if has_slot(s.smask, k) {
-                        put_delta(s.nums[k] as i64, &mut st.subj[k], &mut num);
+                if v2 && counter_count(s.smask) >= MASKED_COUNTERS {
+                    // which counters moved, then only those
+                    let mut moved = 0u64;
+                    for k in 0..5 {
+                        if has_slot(s.smask, k) && s.nums[k] as i64 != st.subj[k] {
+                            moved |= 1 << k;
+                        }
+                    }
+                    write_varint(moved, &mut num);
+                    for k in 0..5 {
+                        if moved & (1 << k) != 0 {
+                            put_delta(s.nums[k] as i64, &mut st.subj[k], &mut num);
+                        }
+                    }
+                } else {
+                    for k in 0..5 {
+                        if has_slot(s.smask, k) {
+                            put_delta(s.nums[k] as i64, &mut st.subj[k], &mut num);
+                        }
                     }
                 }
                 let nx = s.nx as usize;
@@ -818,14 +1115,17 @@ impl NxvBlockBuilder {
                     for (v, &x) in vals.iter_mut().zip(&s.xref).take(nx).skip(1) {
                         *v = x as i64;
                     }
-                    for k in 0..nx {
+                    // slot 0 less the article number is 0 throughout such a sub-block
+                    for k in slot0_is_art as usize..nx {
                         write_varint(zigzag_encode(vals[k].wrapping_sub(bases[k])), &mut num);
                     }
                     st.xref_done(s.skel, &vals, nx);
                 }
-                let body = &refs_pool[s.refs.0 as usize..s.refs.1 as usize];
-                write_varint(body.len() as u64, &mut refs);
-                refs.extend_from_slice(body);
+                if refs_here {
+                    let body = &refs_pool[s.refs.0 as usize..s.refs.1 as usize];
+                    write_varint(body.len() as u64, &mut refs);
+                    refs.extend_from_slice(body);
+                }
             }
             cps.push(cp);
         }
@@ -833,15 +1133,21 @@ impl NxvBlockBuilder {
             (min_ts, max_ts) = (0, 0);
         }
 
-        // ---- id columns
-        let col = |f: &dyn Fn(&Row) -> u16| -> Vec<u8> { rows.iter().flat_map(|r| f(r).to_le_bytes()).collect() };
+        // ---- id columns: (bytes, encoding flags)
+        let col = |f: &dyn Fn(&Row) -> u16| -> (Vec<u8>, u32) {
+            let vals: Vec<u16> = rows.iter().map(f).collect();
+            if v2 { encode_id_col(&vals) } else { (vals.iter().flat_map(|v| v.to_le_bytes()).collect(), 0) }
+        };
         let sid = |pick: fn(&Structured) -> u32| {
             move |r: &Row| match &r.kind {
                 Kind::Structured(s) => pick(s) as u16,
                 Kind::Literal(_) => 0,
             }
         };
+        // a per-row token subject: one past the last template (there are at most 65,535 when any row has a token)
+        let token_tpl = dicts[DICT_SUBJ].entries.len() as u16;
         let tpl_col = col(&|r| match &r.kind {
+            Kind::Structured(s) if s.tok => token_tpl,
             Kind::Structured(s) => s.tpl as u16,
             Kind::Literal(id) => *id as u16,
         });
@@ -866,7 +1172,13 @@ impl NxvBlockBuilder {
             let comp = fsst::Compressor::train(&refs);
             let coded: Vec<Vec<u8>> = refs.iter().map(|e| comp.compress(e)).collect();
             let ns = comp.n_symbols();
-            let fsst_len: usize = coded.iter().map(|c| c.len()).sum::<usize>() + ns * 9 + 8;
+            let mut fsst_len: usize = coded.iter().map(|c| c.len()).sum::<usize>() + ns * 9 + 8;
+            // version 2: a raw or FSST entry carries its length (a packed one delimits itself)
+            let mut raw_len = raw_len;
+            if v2 {
+                raw_len += refs.iter().map(|e| varint_len(e.len() as u64)).sum::<usize>();
+                fsst_len += coded.iter().map(|c| varint_len(c.len() as u64)).sum::<usize>();
+            }
             let packed: Vec<Vec<u8>> = refs
                 .iter()
                 .map(|e| {
@@ -880,7 +1192,23 @@ impl NxvBlockBuilder {
             desc.first_entry = entry_index;
             desc.entry_count = d.entries.len() as u32;
             let use_fsst = ns > 0 && fsst_len < raw_len && fsst_len <= packed_len;
-            let chosen: Vec<&[u8]> = if !use_fsst && packed_len < raw_len {
+            let best_len = if use_fsst { fsst_len } else { packed_len.min(raw_len) };
+            // version 2: shaped, when smaller than the best of the others and every entry comes back from it
+            let shaped = if v2 { shape_dict(&refs) } else { None }.filter(|(table, n, coded)| {
+                align_up(table.len(), 8) + 8 + coded.iter().map(|c| c.len()).sum::<usize>() < best_len
+                    && coded.iter().zip(&refs).all(|(c, e)| {
+                        let mut back = Vec::with_capacity(e.len());
+                        unshape_into(c, table, *n, Some(&mut back)) == c.len() && back == *e
+                    })
+            });
+            let chosen: Vec<&[u8]> = if let Some((table, n, coded)) = &shaped {
+                desc.mode = DICT_SHAPED;
+                desc.n_symbols = *n as u16;
+                fsst_sec.resize(align_up(fsst_sec.len(), 8), 0);
+                desc.table_offset = fsst_sec.len() as u32;
+                fsst_sec.extend_from_slice(table);
+                coded.iter().map(|c| c.as_slice()).collect()
+            } else if !use_fsst && packed_len < raw_len {
                 desc.mode = DICT_PACKED;
                 packed.iter().map(|c| c.as_slice()).collect()
             } else if use_fsst {
@@ -897,13 +1225,23 @@ impl NxvBlockBuilder {
                 desc.mode = DICT_RAW;
                 refs.clone()
             };
-            for e in chosen {
-                pool_offsets.push(u32::try_from(pool.len()).context("string pool too large")?);
+            let self_delimiting = desc.mode == DICT_PACKED || desc.mode == DICT_SHAPED;
+            for (i, e) in chosen.into_iter().enumerate() {
+                // version 1: every entry's offset; version 2: every 32nd entry's, each dictionary from its first
+                if !v2 || i % POOL_CP_ENTRIES == 0 {
+                    pool_offsets.push(u32::try_from(pool.len()).context("string pool too large")?);
+                }
+                if v2 && !self_delimiting {
+                    write_varint(e.len() as u64, &mut pool);
+                }
                 pool.extend_from_slice(e);
             }
             entry_index += d.entries.len() as u32;
         }
-        pool_offsets.push(u32::try_from(pool.len()).context("string pool too large")?);
+        if !v2 {
+            pool_offsets.push(u32::try_from(pool.len()).context("string pool too large")?);
+        }
+        ensure!(pool.len() <= u32::MAX as usize, "string pool too large");
         fsst_sec.resize(align_up(fsst_sec.len(), 8), 0);
         dir.slot_counts_offset = fsst_sec.len() as u32;
         dir.slot_counts_len = dicts[DICT_XREF].entries.len() as u32;
@@ -946,17 +1284,27 @@ impl NxvBlockBuilder {
         let cold_prefix = out.len();
         place(&mut out, SectionId::FsstTables, &fsst_sec, NUM_DICTS, 64);
         place(&mut out, SectionId::MsgIdBucketIndex, &buckets, index_entries.len(), 8);
-        place(&mut out, SectionId::SubjTplIds, &tpl_col, n, 8);
-        place(&mut out, SectionId::SubjPadMasks, &pad_col, n, 8);
-        place(&mut out, SectionId::XrefSkelIds, &skel_col, n, 8);
-        place(&mut out, SectionId::AuthorIds, &author_col, n, 8);
-        place(&mut out, SectionId::DomainIds, &domain_col, n, 8);
-        place(&mut out, SectionId::MsgIdPfxIds, &pfx_col, n, 8);
-        let to: Vec<u8> = tail_offsets.iter().flat_map(|o| o.to_le_bytes()).collect();
-        place(&mut out, SectionId::MsgIdTailOffsets, &to, n + 1, 8);
+        let cols = [
+            (SectionId::SubjTplIds, tpl_col),
+            (SectionId::SubjPadMasks, pad_col),
+            (SectionId::XrefSkelIds, skel_col),
+            (SectionId::AuthorIds, author_col),
+            (SectionId::DomainIds, domain_col),
+            (SectionId::MsgIdPfxIds, pfx_col),
+        ];
+        for (id, (bytes, _)) in &cols {
+            place(&mut out, *id, bytes, n, 8);
+        }
+        // version 1: an offset per row (and one past the last); version 2: one per sub-block
+        let to: Vec<u8> = if v2 {
+            tail_offsets[..n].iter().step_by(TAIL_CP_ROWS).flat_map(|o| o.to_le_bytes()).collect()
+        } else {
+            tail_offsets.iter().flat_map(|o| o.to_le_bytes()).collect()
+        };
+        place(&mut out, SectionId::MsgIdTailOffsets, &to, to.len() / 4, 8);
         let po: Vec<u8> = pool_offsets.iter().flat_map(|o| o.to_le_bytes()).collect();
         place(&mut out, SectionId::StringPoolOffsets, &po, pool_offsets.len(), 8);
-        place(&mut out, SectionId::StringPoolData, &pool, pool_offsets.len() - 1, 8);
+        place(&mut out, SectionId::StringPoolData, &pool, entry_index as usize, 8);
         place(&mut out, SectionId::MsgIdTailData, &tail_data, n, 8);
         place(&mut out, SectionId::NumericVarints, &num, n, 8);
         place(&mut out, SectionId::ReferencesData, &refs, n, 8);
@@ -967,6 +1315,11 @@ impl NxvBlockBuilder {
         let body_hash = xxhash_rust::xxh3::xxh3_64(&out[DATA_START..]);
         table[BODY_HASH_LO as usize].encoding_flags = body_hash as u32;
         table[BODY_HASH_HI as usize].encoding_flags = (body_hash >> 32) as u32;
+        table[META_SLAB_GEN as usize].encoding_flags = meta.slab_gen;
+        table[META_SERVER as usize].encoding_flags = meta.server_id as u32;
+        for (id, (_, flags)) in &cols {
+            table[*id as usize].encoding_flags = *flags;
+        }
         let total = u32::try_from(out.len()).context("block over 4 GiB")?;
         for (i, e) in table.iter().enumerate() {
             let at = HEADER_LEN + i * 16;
@@ -977,7 +1330,7 @@ impl NxvBlockBuilder {
         }
         let header = NxvBlockHeader {
             magic: MAGIC,
-            version: VERSION,
+            version,
             flags: if xref_prefix { FLAG_XREF_PREFIX } else { 0 },
             min_art_num: rows[0].art as i64,
             max_art_num: rows[n - 1].art as i64,
@@ -1089,22 +1442,101 @@ pub fn decompress_cold_block(cold: &[u8]) -> Result<AlignedBytes> {
 
 // ---------------------------------------------------------------- reading
 
+/// Version 2 id column width: each row's id is its row number, and nothing is stored.
+const ID_COL_ROW: u32 = 3;
+
+/// A u16 id column read in place: a u16 per row (width 2, and every version-1 column), a palette and a u8 index per
+/// row (width 1), one value for every row (width 0), or the row number (width 3). See [`encode_id_col`].
+#[derive(Copy, Clone)]
+pub(crate) struct IdCol<'a> {
+    width: u8,
+    rows: usize,
+    palette: &'a [u16],
+    narrow: &'a [u8],
+    wide: &'a [u16],
+}
+
+impl<'a> IdCol<'a> {
+    fn from_section(sec: &'a [u8], flags: u32, rows: usize, version: u16) -> Option<Self> {
+        let width = if version >= VERSION_2 { (flags & 0xFF) as u8 } else { 2 };
+        let pal = (flags >> 8) as usize;
+        let mut c = Self { width, rows, palette: &[], narrow: &[], wide: &[] };
+        match width {
+            2 => {
+                c.wide = cast_slice::<u16>(sec)?;
+                (c.wide.len() == rows).then_some(c)
+            }
+            0 | 1 => {
+                if !(1..=256).contains(&pal) || (width == 0 && pal != 1) {
+                    return None;
+                }
+                c.palette = cast_slice::<u16>(sec.get(..2 * pal)?)?;
+                if width == 1 {
+                    let at = align_up(2 * pal, 8);
+                    c.narrow = sec.get(at..at + rows)?;
+                }
+                Some(c)
+            }
+            3 => (pal == 0 && rows <= MAX_BLOCK_ROWS).then_some(c),
+            _ => None,
+        }
+    }
+
+    /// Row `row`'s value; None past the last row (or for an index past the palette, in a damaged block).
+    #[inline(always)]
+    pub fn get(&self, row: usize) -> Option<u16> {
+        match self.width {
+            2 => self.wide.get(row).copied(),
+            1 => self.palette.get(*self.narrow.get(row)? as usize).copied(),
+            3 => (row < self.rows).then_some(row as u16),
+            _ => (row < self.rows).then(|| self.palette[0]),
+        }
+    }
+
+    /// Row `row`'s value, 0 if there is none.
+    #[inline(always)]
+    pub fn at(&self, row: usize) -> u16 {
+        self.get(row).unwrap_or(0)
+    }
+}
+
+/// Where the next entry of a dictionary starts, after the last one a reader decoded (version 2): a run of rows with
+/// new entries in a row then reads each from where the one before ended, without walking from a checkpoint.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct PoolHint {
+    next_id: u32,
+    next_at: u32,
+}
+
+impl Default for PoolHint {
+    fn default() -> Self {
+        Self { next_id: u32::MAX, next_at: 0 }
+    }
+}
+
 /// The parts of a hot block a row read needs.
 #[derive(Copy, Clone)]
 pub(crate) struct HotSections<'a> {
+    pub version: u16,
     pub fsst_sec: &'a [u8],
     pub dicts: &'a [DictDesc],
     pub slot_counts: &'a [u8],
     pub subj_masks: &'a [u8],
     pub bucket: BucketIndexView<'a>,
-    pub subj_tpl: &'a [u16],
-    pub pad: &'a [u16],
-    pub skel: &'a [u16],
-    pub author: &'a [u16],
-    pub domain: &'a [u16],
-    pub pfx: &'a [u16],
+    pub subj_tpl: IdCol<'a>,
+    pub pad: IdCol<'a>,
+    pub skel: IdCol<'a>,
+    pub author: IdCol<'a>,
+    pub domain: IdCol<'a>,
+    pub pfx: IdCol<'a>,
+    /// version 1: each row's tail offset, and one past the last; version 2: every 32nd row's segment
     pub tail_off: &'a [u32],
+    /// version 1: each entry's offset, and one past the last; version 2: every 32nd entry's, dictionary by
+    /// dictionary, dictionary `k`'s from `pool_cp_base[k]`
     pub pool_off: &'a [u32],
+    pub pool_cp_base: [u32; NUM_DICTS],
+    /// the subject template id of a per-row token subject (u32::MAX in version 1, which has none)
+    pub token_tpl: u32,
     pub pool: &'a [u8],
     pub tail: &'a [u8],
     pub num: &'a [u8],
@@ -1130,7 +1562,8 @@ impl<'a> NxvBlockView<'a> {
         ensure!(slice.len() >= DATA_START, "block slice shorter than a header");
         let header: &NxvBlockHeader = &cast_slice::<NxvBlockHeader>(&slice[..HEADER_LEN]).context("header cast")?[0];
         ensure!(header.magic == MAGIC, "not an .nxv block");
-        ensure!(header.version == VERSION, "unsupported .nxv version {}", header.version);
+        let version = header.version;
+        ensure!(version == VERSION_1 || version == VERSION_2, "unsupported .nxv version {version}");
         ensure!(header_crc(slice) == header.header_crc32, "block header checksum mismatch");
         let total = header.total_block_bytes as usize;
         ensure!(total <= slice.len() && total.is_multiple_of(64), "block cut short");
@@ -1161,10 +1594,9 @@ impl<'a> NxvBlockView<'a> {
         let hot = if cold {
             None
         } else {
-            let u16col = |id: SectionId| -> Result<&'a [u16]> {
-                let c = cast_slice::<u16>(sec(id)?).with_context(|| format!("{id:?} cast"))?;
-                ensure!(c.len() == rows, "{id:?} has {} rows, not {rows}", c.len());
-                Ok(c)
+            let u16col = |id: SectionId| -> Result<IdCol<'a>> {
+                IdCol::from_section(sec(id)?, sections[id as usize].encoding_flags, rows, version)
+                    .with_context(|| format!("{id:?} is not a column of {rows} rows"))
             };
             let fsst_sec = sec(SectionId::FsstTables)?;
             let dir: &FsstDirectory =
@@ -1176,16 +1608,31 @@ impl<'a> NxvBlockView<'a> {
             let subj_masks = fsst_sec
                 .get(dir.subj_masks_offset as usize..dir.subj_masks_offset as usize + dir.subj_masks_len as usize)
                 .context("subject masks out of bounds")?;
+            let dicts = &dir.dicts[..NUM_DICTS];
             let tail_off = cast_slice::<u32>(sec(SectionId::MsgIdTailOffsets)?).context("tail offsets cast")?;
-            ensure!(tail_off.len() == rows + 1, "tail offsets count mismatch");
+            let want = if version >= VERSION_2 { rows.div_ceil(TAIL_CP_ROWS) } else { rows + 1 };
+            ensure!(tail_off.len() == want, "tail offsets count mismatch");
             let pool_off = cast_slice::<u32>(sec(SectionId::StringPoolOffsets)?).context("pool offsets cast")?;
-            ensure!(!pool_off.is_empty(), "empty pool offsets");
+            let mut pool_cp_base = [0u32; NUM_DICTS];
+            if version >= VERSION_2 {
+                let mut cps = 0u64;
+                for (b, d) in pool_cp_base.iter_mut().zip(dicts) {
+                    *b = cps as u32;
+                    cps += d.entry_count.div_ceil(POOL_CP_ENTRIES as u32) as u64;
+                }
+                ensure!(pool_off.len() as u64 == cps, "pool checkpoint count mismatch");
+            } else {
+                ensure!(!pool_off.is_empty(), "empty pool offsets");
+            }
             let bucket_e = sections[SectionId::MsgIdBucketIndex as usize];
             let bucket = BucketIndexView::from_section(sec(SectionId::MsgIdBucketIndex)?, bucket_e.item_count as usize)
                 .context("bad message-id buckets")?;
             Some(HotSections {
+                version,
+                pool_cp_base,
+                token_tpl: if version >= VERSION_2 { dicts[DICT_SUBJ].entry_count } else { u32::MAX },
                 fsst_sec,
-                dicts: &dir.dicts[..NUM_DICTS],
+                dicts,
                 slot_counts,
                 subj_masks,
                 bucket,
@@ -1204,6 +1651,21 @@ impl<'a> NxvBlockView<'a> {
             })
         };
         Ok(Self { data, header, sections, checkpoints, xor8, hot })
+    }
+
+    /// The store's fields (server, slab), from the section table.
+    #[inline]
+    pub fn store_meta(&self) -> BlockMeta {
+        BlockMeta {
+            server_id: self.sections[META_SERVER as usize].encoding_flags as u16,
+            slab_gen: self.sections[META_SLAB_GEN as usize].encoding_flags,
+        }
+    }
+
+    /// How many posters the block has (its author dictionary's size); 0 for a cold block.
+    #[inline]
+    pub fn poster_count(&self) -> u32 {
+        self.hot.map_or(0, |h| h.dicts[DICT_AUTHOR].entry_count)
     }
 
     /// The xxh3 hash of the hot body, from the section table.
@@ -1271,19 +1733,75 @@ impl<'a> NxvBlockView<'a> {
 }
 
 impl HotSections<'_> {
+    /// Version 2: the entry starting at `at` of a dictionary in `mode`: (its stored bytes' start, their end, where the
+    /// next entry starts). A packed entry is stored with its header; a raw or FSST one after its varint length.
+    #[inline(always)]
+    fn pool_entry_at(&self, at: usize, d: &DictDesc) -> (usize, usize) {
+        let pool = self.pool;
+        let rest = pool.get(at..).unwrap_or(&[]);
+        match d.mode {
+            DICT_PACKED => (at, at.saturating_add(packed_tail_len(rest)).min(pool.len())),
+            DICT_SHAPED => (at, at + unshape_into(rest, self.shape_table(d), d.n_symbols as usize, None)),
+            _ => {
+                let mut pos = at;
+                let len = read_varint_unchecked(pool, &mut pos) as usize;
+                (pos, pos.saturating_add(len).min(pool.len()))
+            }
+        }
+    }
+
+    /// A shaped dictionary's shape table (see [`DICT_SHAPED`]), to the end of the FsstTables section.
+    #[inline(always)]
+    fn shape_table(&self, d: &DictDesc) -> &[u8] {
+        self.fsst_sec.get(d.table_offset as usize..).unwrap_or(&[])
+    }
+
+    /// Where entry `id` of dictionary `dict` is kept in the pool, as stored. Version 2 walks from the entry's
+    /// checkpoint (at most 31 entries), or from `hint` when that is nearer, and moves `hint` past the entry.
+    #[inline]
+    fn dict_entry_range(&self, dict: usize, id: u32, hint: &mut PoolHint) -> Option<(usize, usize)> {
+        let d = &self.dicts[dict];
+        if id >= d.entry_count {
+            return None;
+        }
+        if self.version < VERSION_2 {
+            let e = d.first_entry as usize + id as usize;
+            return Some((*self.pool_off.get(e)? as usize, *self.pool_off.get(e + 1)? as usize));
+        }
+        let step = POOL_CP_ENTRIES as u32;
+        let (mut at, mut from) = if (id - id % step..=id).contains(&hint.next_id) {
+            (hint.next_at as usize, hint.next_id)
+        } else {
+            (*self.pool_off.get((self.pool_cp_base[dict] + id / step) as usize)? as usize, id - id % step)
+        };
+        while from < id {
+            at = self.pool_entry_at(at, d).1;
+            from += 1;
+        }
+        let (s, e) = self.pool_entry_at(at, d);
+        *hint = PoolHint { next_id: id + 1, next_at: e as u32 };
+        Some((s, e))
+    }
+
     /// Appends dictionary entry `id` of dictionary `dict` to `out`.
     #[inline]
     pub fn dict_entry_into(&self, dict: usize, id: u32, out: &mut Vec<u8>) {
+        self.dict_entry_hinted(dict, id, &mut PoolHint::default(), out)
+    }
+
+    /// [`Self::dict_entry_into`], starting from `hint` when it is nearer than the checkpoint (version 2).
+    #[inline]
+    pub fn dict_entry_hinted(&self, dict: usize, id: u32, hint: &mut PoolHint, out: &mut Vec<u8>) {
         let d = &self.dicts[dict];
-        if id >= d.entry_count {
-            return;
-        }
-        let e = d.first_entry as usize + id as usize;
-        let (Some(&s), Some(&t)) = (self.pool_off.get(e), self.pool_off.get(e + 1)) else { return };
-        let Some(coded) = self.pool.get(s as usize..t as usize) else { return };
+        let Some((s, t)) = self.dict_entry_range(dict, id, hint) else { return };
+        let Some(coded) = self.pool.get(s..t) else { return };
         match d.mode {
             DICT_FSST => {}
             DICT_PACKED => return crate::msgid_codec::unpack_msgid_tail_into(coded, out),
+            DICT_SHAPED => {
+                unshape_into(coded, self.shape_table(d), d.n_symbols as usize, Some(out));
+                return;
+            }
             _ => {
                 out.extend_from_slice(coded);
                 return;
@@ -1298,6 +1816,53 @@ impl HotSections<'_> {
             return;
         };
         fsst_decode(coded, syms, lens, out);
+    }
+
+    /// Whether structured row `row` keeps its subject per row (a token after its message-id tail).
+    #[inline(always)]
+    pub fn token_subject(&self, row: usize) -> bool {
+        self.subj_tpl.get(row).is_some_and(|t| t as u32 == self.token_tpl)
+    }
+
+    /// Version 2: where the segment after row `row`'s starts, given that row's starts at `at`.
+    #[inline(always)]
+    fn next_segment(&self, row: usize, at: usize) -> usize {
+        if self.pad.get(row).is_none_or(|p| p & PADMASK_LITERAL != 0) {
+            return at;
+        }
+        let item = |at: usize| at.saturating_add(packed_tail_len(self.tail.get(at..).unwrap_or(&[])));
+        let at = item(at);
+        if self.token_subject(row) { item(at) } else { at }
+    }
+
+    /// Row `row`'s packed message-id tail: (start, end) in the tail data. Version 2 walks from the nearest tail
+    /// checkpoint before it, at most 31 rows.
+    pub fn msgid_tail_range(&self, row: usize) -> (usize, usize) {
+        if self.version < VERSION_2 {
+            let at = |r: usize| self.tail_off.get(r).copied().unwrap_or(0) as usize;
+            return (at(row), at(row + 1));
+        }
+        let cp = row / TAIL_CP_ROWS;
+        let mut at = self.tail_off.get(cp).copied().unwrap_or(0) as usize;
+        for r in cp * TAIL_CP_ROWS..row {
+            at = self.next_segment(r, at);
+        }
+        (at, at.saturating_add(packed_tail_len(self.tail.get(at..).unwrap_or(&[]))))
+    }
+
+    /// (start, end) of dictionary `dict` in the string pool, for size breakdowns.
+    fn dict_pool_span(&self, dict: usize) -> (usize, usize) {
+        let d = &self.dicts[dict];
+        if self.version < VERSION_2 {
+            let at = |e: u32| self.pool_off.get(e as usize).copied().unwrap_or(0) as usize;
+            return (at(d.first_entry), at(d.first_entry + d.entry_count));
+        }
+        let first = |k: usize| {
+            (self.dicts[k].entry_count > 0)
+                .then(|| self.pool_off.get(self.pool_cp_base[k] as usize).copied().unwrap_or(0) as usize)
+        };
+        let end = (dict + 1..NUM_DICTS).find_map(first).unwrap_or(self.pool.len());
+        (first(dict).unwrap_or(end), end)
     }
 }
 
@@ -1334,24 +1899,46 @@ pub(crate) struct DecodedRow {
     pub xref: [u64; MAX_XREF_GROUPS],
     pub nx: usize,
     pub refs: (usize, usize),
+    /// the packed message-id tail, in the tail data
+    pub tail: (usize, usize),
+    /// the packed subject, in the tail data, when the subject is kept per row
+    pub subj: Option<(usize, usize)>,
 }
 
-/// Walks the numeric and references streams one row at a time.
+/// Walks the numeric, references and (version 2) tail streams one row at a time.
 pub(crate) struct RowDecoder {
     pub row: usize,
     st: DeltaState,
     vpos: usize,
     rpos: usize,
+    /// version 2: where the next row's segment starts in the tail data
+    tpos: usize,
+    /// whether this sub-block's structured rows have references stored (a length each)
+    has_refs: bool,
+    /// version 2 checkpoint flags: no article number deltas, no Xref slot 0 deltas
+    consecutive: bool,
+    slot0_is_art: bool,
 }
 
 impl RowDecoder {
     pub fn at_sub_block(view: &NxvBlockView, sb: usize) -> Self {
         let cp = &view.checkpoints[sb];
+        let hot = view.hot.as_ref();
+        let flags = if hot.is_some_and(|h| h.version >= VERSION_2) { cp.varint_byte_offset } else { 0 };
+        // a sub-block holds references when its stream offset moves before the next one's (or the stream's end)
+        let next =
+            view.checkpoints.get(sb + 1).map_or(hot.map_or(0, |h| h.refs.len()), |c| c.refs_byte_offset as usize);
         Self {
             row: sb * SUB_BLOCK_ROWS,
             st: DeltaState::from_checkpoint(cp),
-            vpos: cp.varint_byte_offset as usize,
+            vpos: (cp.varint_byte_offset & CP_OFFSET_MASK) as usize,
             rpos: cp.refs_byte_offset as usize,
+            tpos: hot
+                .filter(|h| h.version >= VERSION_2)
+                .map_or(0, |h| h.tail_off.get(sb * (SUB_BLOCK_ROWS / TAIL_CP_ROWS)).copied().unwrap_or(0) as usize),
+            has_refs: next != cp.refs_byte_offset as usize,
+            consecutive: flags & CP_CONSECUTIVE != 0,
+            slot0_is_art: flags & CP_SLOT0_IS_ART != 0,
         }
     }
 
@@ -1363,10 +1950,14 @@ impl RowDecoder {
         let r = self.row;
         let st = &mut self.st;
         let mut d = DecodedRow::default();
-        st.art = st.art.wrapping_add(zigzag_decode(read_varint_unchecked(num, &mut self.vpos)));
+        if !self.consecutive {
+            st.art = st.art.wrapping_add(zigzag_decode(read_varint_unchecked(num, &mut self.vpos)));
+        } else if !r.is_multiple_of(SUB_BLOCK_ROWS) {
+            st.art = st.art.wrapping_add(1);
+        }
         d.art = st.art as u64;
         self.row += 1;
-        let pad = h.pad.get(r).copied().unwrap_or(PADMASK_LITERAL);
+        let pad = h.pad.get(r).unwrap_or(PADMASK_LITERAL);
         if pad & PADMASK_LITERAL != 0 {
             d.literal = true;
             return d;
@@ -1386,20 +1977,26 @@ impl RowDecoder {
         }
         d.bytes = st.bytes;
         d.lines = st.lines;
-        let tpl = h.subj_tpl.get(r).copied().unwrap_or(0) as usize;
-        let smask = h.subj_masks.get(tpl).copied().unwrap_or(0);
+        let tpl = h.subj_tpl.at(r) as u32;
+        let token = tpl == h.token_tpl;
+        let smask = if token { 0 } else { h.subj_masks.get(tpl as usize).copied().unwrap_or(0) };
+        let moved = if h.version >= VERSION_2 && counter_count(smask) >= MASKED_COUNTERS {
+            read_varint_unchecked(num, &mut self.vpos)
+        } else {
+            u64::MAX
+        };
         for k in 0..5 {
-            if has_slot(smask, k) {
+            if has_slot(smask, k) && moved & (1 << k) != 0 {
                 st.subj[k] = st.subj[k].wrapping_add(zigzag_decode(read_varint_unchecked(num, &mut self.vpos)));
             }
             d.nums[k] = st.subj[k] as u32;
         }
-        let skel = h.skel.get(r).copied().unwrap_or(0) as usize;
+        let skel = h.skel.at(r) as usize;
         let nx = (h.slot_counts.get(skel).copied().unwrap_or(0) as usize).min(MAX_XREF_GROUPS);
         if nx > 0 {
             let bases = st.xref_bases(skel as u32);
             let mut vals = [0i64; MAX_XREF_GROUPS];
-            for k in 0..nx {
+            for k in self.slot0_is_art as usize..nx {
                 vals[k] = bases[k].wrapping_add(zigzag_decode(read_varint_unchecked(num, &mut self.vpos)));
             }
             d.xref[0] = st.art.wrapping_add(vals[0]) as u64;
@@ -1409,10 +2006,27 @@ impl RowDecoder {
             st.xref_done(skel as u32, &vals, nx);
         }
         d.nx = nx;
-        let len = read_varint_unchecked(h.refs, &mut self.rpos) as usize;
-        let start = self.rpos.min(h.refs.len());
-        self.rpos = self.rpos.saturating_add(len).min(h.refs.len());
-        d.refs = (start, self.rpos);
+        if self.has_refs {
+            let len = read_varint_unchecked(h.refs, &mut self.rpos) as usize;
+            let start = self.rpos.min(h.refs.len());
+            self.rpos = self.rpos.saturating_add(len).min(h.refs.len());
+            d.refs = (start, self.rpos);
+        } else {
+            d.refs = (self.rpos, self.rpos);
+        }
+        if h.version >= VERSION_2 {
+            let item = |at: usize| (at, at.saturating_add(packed_tail_len(h.tail.get(at..).unwrap_or(&[]))));
+            d.tail = item(self.tpos);
+            self.tpos = d.tail.1;
+            if token {
+                let s = item(self.tpos);
+                self.tpos = s.1;
+                d.subj = Some(s);
+            }
+        } else {
+            let at = |r: usize| h.tail_off.get(r).copied().unwrap_or(0) as usize;
+            d.tail = (at(r), at(r + 1));
+        }
         d
     }
 
@@ -1462,7 +2076,17 @@ pub fn msgid_field_pub(line: &[u8]) -> Option<&[u8]> {
 impl NxvBlockView<'_> {
     /// How many rows are kept whole in the literal dictionary.
     pub fn literal_rows(&self) -> usize {
-        self.hot.map_or(0, |h| h.pad.iter().filter(|&&p| p & PADMASK_LITERAL != 0).count())
+        self.hot.map_or(0, |h| {
+            (0..self.row_count()).filter(|&r| h.pad.get(r).is_some_and(|p| p & PADMASK_LITERAL != 0)).count()
+        })
+    }
+    /// How many rows keep their subject per row (version 2 token subjects).
+    pub fn token_subject_rows(&self) -> usize {
+        self.hot.map_or(0, |h| {
+            (0..self.row_count())
+                .filter(|&r| h.token_subject(r) && h.pad.get(r).is_some_and(|p| p & PADMASK_LITERAL == 0))
+                .count()
+        })
     }
     /// (section, bytes) for each section, for size breakdowns.
     pub fn section_sizes(&self) -> [(SectionId, u32); 16] {
@@ -1486,6 +2110,17 @@ impl NxvBlockView<'_> {
             ReferencesData,
         ];
         ids.map(|id| (id, self.sections[id as usize].byte_len))
+    }
+    /// (entries, string pool bytes, mode) of each dictionary, for size breakdowns.
+    pub fn dict_stats(&self) -> [(u32, u32, u16); NUM_DICTS] {
+        let mut out = [(0, 0, 0); NUM_DICTS];
+        if let Some(h) = self.hot {
+            for (k, (o, d)) in out.iter_mut().zip(h.dicts).enumerate() {
+                let (a, b) = h.dict_pool_span(k);
+                *o = (d.entry_count, b.saturating_sub(a) as u32, d.mode);
+            }
+        }
+        out
     }
     /// Entries in each dictionary (subject, xref, author, domain, prefix, literal).
     pub fn dict_sizes(&self) -> [u32; NUM_DICTS] {
@@ -1531,8 +2166,16 @@ pub fn literal_reason(line: &[u8]) -> Option<&'static str> {
     let mut d = [Dict::default(), Dict::default(), Dict::default(), Dict::default(), Dict::default(), Dict::default()];
     let xp = tail.is_some_and(|t| t.starts_with(XREF_PREFIX));
     let art = parse_canonical_u64(f[0], 19).unwrap_or(0);
-    let s =
-        NxvBlockBuilder::structure(line, art, xp, &mut RowScratch::default(), &mut Vec::new(), &mut Vec::new(), &mut d);
+    let s = NxvBlockBuilder::structure(
+        line,
+        art,
+        xp,
+        false,
+        &mut RowScratch::default(),
+        &mut Vec::new(),
+        &mut Vec::new(),
+        &mut d,
+    );
     if s.is_none() { Some("does not write back the same") } else { None }
 }
 
@@ -1553,5 +2196,94 @@ impl NxvBlockView<'_> {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn col_round_trip(vals: &[u16]) -> u32 {
+        let (bytes, flags) = encode_id_col(vals);
+        let al = AlignedBytes::from_slice(&bytes);
+        let c = IdCol::from_section(&al, flags, vals.len(), VERSION_2).expect("column reads back");
+        for (i, &v) in vals.iter().enumerate() {
+            assert_eq!(c.get(i), Some(v), "row {i}");
+        }
+        assert_eq!(c.get(vals.len()), None);
+        assert_eq!(c.at(vals.len()), 0);
+        flags & 0xFF
+    }
+
+    #[test]
+    fn id_columns_come_back_at_every_width() {
+        assert_eq!(col_round_trip(&[7]), 0);
+        assert_eq!(col_round_trip(&[PADMASK_LITERAL; 300]), 0);
+        let few: Vec<u16> = (0..1000).map(|i| [3u16, 65_535, 0, 900][i % 4]).collect();
+        assert_eq!(col_round_trip(&few), 1);
+        let palette_full: Vec<u16> = (0..1000u32).map(|i| (i % 256 * 255) as u16).collect();
+        assert_eq!(col_round_trip(&palette_full), 1);
+        let many: Vec<u16> = (0..1000u32).map(|i| (i % 257) as u16).collect();
+        assert_eq!(col_round_trip(&many), 2);
+        let rows: Vec<u16> = (0..65_536u32).map(|i| i as u16).collect();
+        assert_eq!(col_round_trip(&rows), 3);
+        assert_eq!(col_round_trip(&rows[..2]), 3);
+        // a palette that doesn't pay for itself in a tiny block
+        assert_eq!(col_round_trip(&[1, 2, 3, 4, 5, 6, 7, 9]), 2);
+        // version 1 columns are always u16s
+        let v1: Vec<u8> = few.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let al = AlignedBytes::from_slice(&v1);
+        let c = IdCol::from_section(&al, 0, few.len(), VERSION_1).unwrap();
+        assert_eq!(c.get(5), Some(few[5]));
+        // damaged flags are refused, not trusted
+        let (bytes, _) = encode_id_col(&few);
+        let al = AlignedBytes::from_slice(&bytes);
+        for flags in [4, 1 | (300 << 8), 1, 2 << 8, 3 | (1 << 8)] {
+            assert!(IdCol::from_section(&al, flags, few.len(), VERSION_2).is_none(), "{flags:#x}");
+        }
+        assert!(IdCol::from_section(&al, 1 | (4 << 8), few.len() + 1000, VERSION_2).is_none());
+    }
+
+    #[test]
+    fn shaped_entries_come_back() {
+        let long = "x".repeat(300);
+        let entries: Vec<&[u8]> = vec![
+            b"Abc123 <def.GH-9@ij.kl>",
+            b"",
+            b"plain",
+            b" <>@ ",
+            b"a_b_c",
+            long.as_bytes(),
+            b"\xff\xfe9\x01",
+            b"Abc123 <def.GH-9@ij.kl>",
+        ];
+        let (table, n, coded) = shape_dict(&entries).unwrap();
+        // the first and last entries share a shape, and so do the two that are one run; the empty one's is empty
+        assert_eq!(n, 6);
+        for (c, e) in coded.iter().zip(&entries) {
+            let mut back = Vec::new();
+            let mut pool = c.clone();
+            pool.extend_from_slice(b"next entry");
+            assert_eq!(unshape_into(&pool, &table, n, Some(&mut back)), c.len());
+            assert_eq!(unshape_into(&pool, &table, n, None), c.len());
+            assert_eq!(back, *e);
+        }
+        assert!(shape_dict(&[b"a\0b"]).is_none());
+        // a shape id past the table, or a cut entry, gives what there is and never reads past the end
+        let mut out = Vec::new();
+        assert_eq!(unshape_into(&[200, 1], &table, n, Some(&mut out)), 2);
+        assert_eq!(unshape_into(&coded[0][..3], &table, n, Some(&mut out)), 3);
+        assert_eq!(unshape_into(&[], &table, n, None), 0);
+        assert_eq!(shape_of(&table[..3], n, 0), b"");
+    }
+
+    #[test]
+    fn helpers() {
+        for v in [0u64, 1, 127, 128, 16_383, 16_384, u32::MAX as u64, u64::MAX] {
+            let mut b = Vec::new();
+            write_varint(v, &mut b);
+            assert_eq!(varint_len(v), b.len(), "{v}");
+        }
+        assert_eq!([0u8, 1, 2, 3, 4, 5, 6, 7].map(counter_count), [0, 2, 2, 4, 1, 3, 3, 5]);
     }
 }

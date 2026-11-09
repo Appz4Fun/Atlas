@@ -9,8 +9,8 @@ use anyhow::Result;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::container::{
-    DICT_AUTHOR, DICT_DOMAIN, DICT_LITERAL, DICT_PFX, DICT_SUBJ, DICT_XREF, DecodedRow, HotSections, NxvBlockView,
-    PADMASK_LITERAL, RowDecoder, RowParts, SUB_BLOCK_ROWS, msgid_field, render_row,
+    DICT_AUTHOR, DICT_DOMAIN, DICT_LITERAL, DICT_PFX, DICT_SUBJ, DICT_XREF, DecodedRow, HotSections, NUM_DICTS,
+    NxvBlockView, PADMASK_LITERAL, PoolHint, RowDecoder, RowParts, SUB_BLOCK_ROWS, msgid_field, render_row,
 };
 use crate::container::{STYLE_NO_BYTES, STYLE_NO_LINES, STYLE_SUBJ_IS_LOCAL};
 use crate::date::{COMMENT_UTC, DATE_BUF, STYLE_FREE_BITS, format_date, style_offset_secs};
@@ -45,6 +45,8 @@ pub struct RowCache {
     pub tpl_misses: u64,
     /// a buffer for message-id compares
     msgid_buf: Vec<u8>,
+    /// where each dictionary's next entry starts, after the last one read (version 2)
+    pool_hints: [PoolHint; NUM_DICTS],
 }
 
 impl Default for RowCache {
@@ -69,6 +71,7 @@ impl Default for RowCache {
             tpl_hits: 0,
             tpl_misses: 0,
             msgid_buf: Vec::with_capacity(1024),
+            pool_hints: [PoolHint::default(); NUM_DICTS],
         }
     }
 }
@@ -92,16 +95,17 @@ impl RowCache {
         self.cached_author_id = NONE;
         self.cached_domain_id = NONE;
         self.cached_msgid_pfx_id = NONE;
+        self.pool_hints = [PoolHint::default(); NUM_DICTS];
     }
 }
 
 #[inline(always)]
-fn refresh(h: &HotSections, dict: usize, id: u32, cached_id: &mut u32, buf: &mut Vec<u8>) -> bool {
+fn refresh(h: &HotSections, dict: usize, id: u32, cached_id: &mut u32, buf: &mut Vec<u8>, hint: &mut PoolHint) -> bool {
     if *cached_id == id {
         return true;
     }
     buf.clear();
-    h.dict_entry_into(dict, id, buf);
+    h.dict_entry_hinted(dict, id, hint, buf);
     *cached_id = id;
     false
 }
@@ -135,19 +139,51 @@ pub(crate) fn write_row(
     out: &mut Vec<u8>,
 ) {
     if d.literal {
-        h.dict_entry_into(DICT_LITERAL, h.subj_tpl.get(row).copied().unwrap_or(0) as u32, out);
+        h.dict_entry_hinted(DICT_LITERAL, h.subj_tpl.at(row) as u32, &mut c.pool_hints[DICT_LITERAL], out);
         return;
     }
-    let tpl_id = h.subj_tpl[row] as u32;
-    if refresh(h, DICT_SUBJ, tpl_id, &mut c.cached_subj_tpl_id, &mut c.cached_subj_tpl) {
-        c.tpl_hits += 1;
-    } else {
-        c.tpl_misses += 1;
+    let hints = &mut c.pool_hints;
+    // a subject kept per row needs no template
+    if d.subj.is_none() {
+        let tpl_id = h.subj_tpl.at(row) as u32;
+        if refresh(h, DICT_SUBJ, tpl_id, &mut c.cached_subj_tpl_id, &mut c.cached_subj_tpl, &mut hints[DICT_SUBJ]) {
+            c.tpl_hits += 1;
+        } else {
+            c.tpl_misses += 1;
+        }
     }
-    refresh(h, DICT_XREF, h.skel[row] as u32, &mut c.cached_xref_skel_id, &mut c.cached_xref_skel);
-    refresh(h, DICT_AUTHOR, h.author[row] as u32, &mut c.cached_author_id, &mut c.cached_author);
-    refresh(h, DICT_DOMAIN, h.domain[row] as u32, &mut c.cached_domain_id, &mut c.cached_domain);
-    refresh(h, DICT_PFX, h.pfx[row] as u32, &mut c.cached_msgid_pfx_id, &mut c.cached_msgid_pfx);
+    refresh(
+        h,
+        DICT_XREF,
+        h.skel.at(row) as u32,
+        &mut c.cached_xref_skel_id,
+        &mut c.cached_xref_skel,
+        &mut hints[DICT_XREF],
+    );
+    refresh(
+        h,
+        DICT_AUTHOR,
+        h.author.at(row) as u32,
+        &mut c.cached_author_id,
+        &mut c.cached_author,
+        &mut hints[DICT_AUTHOR],
+    );
+    refresh(
+        h,
+        DICT_DOMAIN,
+        h.domain.at(row) as u32,
+        &mut c.cached_domain_id,
+        &mut c.cached_domain,
+        &mut hints[DICT_DOMAIN],
+    );
+    refresh(
+        h,
+        DICT_PFX,
+        h.pfx.at(row) as u32,
+        &mut c.cached_msgid_pfx_id,
+        &mut c.cached_msgid_pfx,
+        &mut hints[DICT_PFX],
+    );
     let date_style = d.style & !STYLE_FREE_BITS;
     if d.ts != c.cached_timestamp || date_style != c.cached_style {
         // the hour as written is the local one: compare and patch in local time (offsets can be +0530)
@@ -171,17 +207,17 @@ pub(crate) fn write_row(
         c.cached_timestamp = d.ts;
         c.cached_style = date_style;
     }
-    let (ts, te) = (h.tail_off[row] as usize, h.tail_off[row + 1] as usize);
     render_row(
         &RowParts {
             art: d.art,
             subj_is_local: d.style & STYLE_SUBJ_IS_LOCAL != 0,
+            subj_packed: d.subj.map(|(s, e)| h.tail.get(s..e).unwrap_or(&[])),
             tpl: &c.cached_subj_tpl,
-            nums: SubjectNums { vals: d.nums, pad: PadMask(h.pad[row]) },
+            nums: SubjectNums { vals: d.nums, pad: PadMask(h.pad.at(row)) },
             author: &c.cached_author,
             date: &c.cached_date_bytes[..c.cached_date_len],
             pfx: &c.cached_msgid_pfx,
-            tail_packed: h.tail.get(ts..te).unwrap_or(&[]),
+            tail_packed: h.tail.get(d.tail.0..d.tail.1).unwrap_or(&[]),
             domain: &c.cached_domain,
             refs: h.refs.get(d.refs.0..d.refs.1).unwrap_or(&[]),
             bytes: (d.style & STYLE_NO_BYTES == 0).then_some(d.bytes),
@@ -219,15 +255,15 @@ impl<'a> NxvBlockView<'a> {
     fn msgid_matches(&self, h: &HotSections, row: usize, raw: &[u8], buf: &mut Vec<u8>) -> bool {
         buf.clear();
         if h.pad.get(row).is_none_or(|p| p & PADMASK_LITERAL != 0) {
-            h.dict_entry_into(DICT_LITERAL, h.subj_tpl.get(row).copied().unwrap_or(0) as u32, buf);
+            h.dict_entry_into(DICT_LITERAL, h.subj_tpl.at(row) as u32, buf);
             return msgid_field(buf) == Some(raw);
         }
         buf.push(b'<');
-        h.dict_entry_into(DICT_PFX, h.pfx[row] as u32, buf);
-        let (ts, te) = (h.tail_off[row] as usize, h.tail_off[row + 1] as usize);
+        h.dict_entry_into(DICT_PFX, h.pfx.at(row) as u32, buf);
+        let (ts, te) = h.msgid_tail_range(row);
         unpack_msgid_tail_into(h.tail.get(ts..te).unwrap_or(&[]), buf);
         buf.push(b'@');
-        h.dict_entry_into(DICT_DOMAIN, h.domain[row] as u32, buf);
+        h.dict_entry_into(DICT_DOMAIN, h.domain.at(row) as u32, buf);
         buf.push(b'>');
         buf.as_slice() == raw
     }
@@ -255,6 +291,169 @@ impl<'a> NxvBlockView<'a> {
         let h = self.hot.as_ref()?;
         let mut buf = Vec::new();
         h.bucket.find(hash, |row| self.msgid_matches(h, row, raw_msgid, &mut buf))
+    }
+}
+
+/// One row's fields as a linker reads them, without writing the line out and parsing it again.
+#[derive(Debug, Clone, Copy)]
+pub struct RowFields<'c> {
+    pub art: u64,
+    /// the date as UTC seconds, and as the poster's wall clock (the zone it was written in added, then dropped)
+    pub utc: i64,
+    pub wall: i64,
+    pub bytes: Option<i64>,
+    pub lines: Option<i64>,
+    pub subject: &'c [u8],
+    pub author: &'c [u8],
+    /// with its angle brackets
+    pub msgid: &'c [u8],
+    /// the whole line of a row kept literal (the fields above are empty then: parse the line)
+    pub literal: Option<&'c [u8]>,
+}
+
+/// Every row of one hot block in order, as [`RowFields`]: each dictionary string decoded once per run of rows that
+/// share it, no date formatted, nothing allocated per row once warm.
+pub struct FieldCursor<'a> {
+    view: NxvBlockView<'a>,
+    h: HotSections<'a>,
+    dec: RowDecoder,
+    cache: RowCache,
+    subj: Vec<u8>,
+    msgid: Vec<u8>,
+    line: Vec<u8>,
+    /// rows whose wall clock falls outside this are passed over before any string is decoded
+    window: (i64, i64),
+    /// rows passed over for the window
+    pub skipped: u64,
+}
+
+impl<'a> FieldCursor<'a> {
+    pub fn new(view: NxvBlockView<'a>) -> Result<Self> {
+        let h = *view.hot()?;
+        let dec = RowDecoder::at_sub_block(&view, 0);
+        let mut cache = RowCache::default();
+        cache.bind(&view);
+        Ok(Self {
+            view,
+            h,
+            dec,
+            cache,
+            subj: Vec::with_capacity(256),
+            msgid: Vec::with_capacity(128),
+            line: Vec::with_capacity(512),
+            window: (i64::MIN, i64::MAX),
+            skipped: 0,
+        })
+    }
+
+    /// Only rows whose wall clock is in `from..=to` (rows kept literal always come, their date unread).
+    pub fn with_wall_window(mut self, from: i64, to: i64) -> Self {
+        self.window = (from, to);
+        self
+    }
+
+    /// The next row's fields; None after the last.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next_row(&mut self) -> Option<RowFields<'_>> {
+        let h = &self.h;
+        let (d, row, off) = loop {
+            if self.dec.row >= self.view.row_count() {
+                return None;
+            }
+            let d = self.dec.advance(&self.view, h);
+            let off = style_offset_secs(d.style & !STYLE_FREE_BITS);
+            let wall = d.ts.wrapping_add(off);
+            if d.literal || (self.window.0..=self.window.1).contains(&wall) {
+                break (d, self.dec.row - 1, off);
+            }
+            self.skipped += 1;
+        };
+        let c = &mut self.cache;
+        if d.literal {
+            self.line.clear();
+            h.dict_entry_hinted(
+                DICT_LITERAL,
+                h.subj_tpl.at(row) as u32,
+                &mut c.pool_hints[DICT_LITERAL],
+                &mut self.line,
+            );
+            return Some(RowFields {
+                art: d.art,
+                utc: 0,
+                wall: 0,
+                bytes: None,
+                lines: None,
+                subject: &[],
+                author: &[],
+                msgid: &[],
+                literal: Some(&self.line),
+            });
+        }
+        let hints = &mut c.pool_hints;
+        refresh(
+            h,
+            DICT_AUTHOR,
+            h.author.at(row) as u32,
+            &mut c.cached_author_id,
+            &mut c.cached_author,
+            &mut hints[DICT_AUTHOR],
+        );
+        refresh(
+            h,
+            DICT_DOMAIN,
+            h.domain.at(row) as u32,
+            &mut c.cached_domain_id,
+            &mut c.cached_domain,
+            &mut hints[DICT_DOMAIN],
+        );
+        refresh(
+            h,
+            DICT_PFX,
+            h.pfx.at(row) as u32,
+            &mut c.cached_msgid_pfx_id,
+            &mut c.cached_msgid_pfx,
+            &mut hints[DICT_PFX],
+        );
+        let tail = h.tail.get(d.tail.0..d.tail.1).unwrap_or(&[]);
+        self.msgid.clear();
+        self.msgid.push(b'<');
+        self.msgid.extend_from_slice(&c.cached_msgid_pfx);
+        unpack_msgid_tail_into(tail, &mut self.msgid);
+        self.msgid.push(b'@');
+        self.msgid.extend_from_slice(&c.cached_domain);
+        self.msgid.push(b'>');
+        self.subj.clear();
+        if d.style & STYLE_SUBJ_IS_LOCAL != 0 {
+            self.subj.extend_from_slice(&c.cached_msgid_pfx);
+            unpack_msgid_tail_into(tail, &mut self.subj);
+        } else if let Some((s, e)) = d.subj {
+            unpack_msgid_tail_into(h.tail.get(s..e).unwrap_or(&[]), &mut self.subj);
+        } else {
+            refresh(
+                h,
+                DICT_SUBJ,
+                h.subj_tpl.at(row) as u32,
+                &mut c.cached_subj_tpl_id,
+                &mut c.cached_subj_tpl,
+                &mut hints[DICT_SUBJ],
+            );
+            crate::subject_codec::render_subject(
+                &c.cached_subj_tpl,
+                &SubjectNums { vals: d.nums, pad: PadMask(h.pad.at(row)) },
+                &mut self.subj,
+            );
+        }
+        Some(RowFields {
+            art: d.art,
+            utc: d.ts,
+            wall: d.ts.wrapping_add(off),
+            bytes: (d.style & STYLE_NO_BYTES == 0).then_some(d.bytes),
+            lines: (d.style & STYLE_NO_LINES == 0).then_some(d.lines),
+            subject: &self.subj,
+            author: &c.cached_author,
+            msgid: &self.msgid,
+            literal: None,
+        })
     }
 }
 

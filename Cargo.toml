@@ -52,6 +52,9 @@ zstd = "0.13"
 sealed-log = { path = "sealed-log" }
 nntp-xover-engine = { path = "nntp-xover-engine" }
 memmap2 = "0.9"
+# the header store: per-file fsync and F_FULLFSYNC, open-file limit (`nxv_store::sync`), slab log records
+libc = "0.2"
+crc32fast = "1"
 nntmux-yenc = { git = "https://github.com/xbmc4lyfe/newznab-tmux", rev = "8dade08ca0372e046af2bd9d3040e23a47379bd4" }
 zipfast = { git = "https://github.com/xbmc4lyfe/zipfast", rev = "f0274b2e7fb4b024b25afdfa31878fd135e12849" }
 zipview = { git = "https://github.com/xbmc4lyfe/zipview", rev = "2c3d73a06b29987cea1510e903e437a482076745" }

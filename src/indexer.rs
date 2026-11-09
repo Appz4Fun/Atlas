@@ -2433,6 +2433,12 @@ async fn parse_and_save(
             .await
             .map_err(|e| anyhow!("waiting for the headers failed: {e}"))??;
     }
+    // with the header store on, the slice's rows durable in its logs too before the slice counts as read
+    if let Some(ticket) = crate::nxv_store::live::sync_point(group)? {
+        tokio::task::spawn_blocking(move || ticket.wait(Duration::from_secs(600)))
+            .await
+            .map_err(|e| anyhow!("waiting for the header store failed: {e}"))??;
+    }
     // the parsed releases stood for these headers until they were committed: the room goes back only now, soo
     // slices waiting on a slow writer stay inside `max_unsaved_headers`
     drop(unsaved);

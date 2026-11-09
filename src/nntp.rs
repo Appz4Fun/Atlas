@@ -1185,6 +1185,7 @@ impl Conn {
         if let Some(group) = &self.group {
             crate::overview_archive::record(&self.server, group, lines);
             crate::header_window::record(&self.server, group, lines);
+            crate::nxv_store::live::record(&self.server, group, lines);
         }
     }
 
@@ -1252,7 +1253,11 @@ impl Conn {
             true
         })
         .await?;
-        if self.group.is_some() && (crate::overview_archive::enabled() || crate::header_window::enabled()) {
+        if self.group.is_some()
+            && (crate::overview_archive::enabled()
+                || crate::header_window::enabled()
+                || crate::nxv_store::live::enabled())
+        {
             let lines = decode_xzver_raw(&raw_lines)?;
             self.archive(&lines);
             return Ok(lines.iter().filter_map(|l| parse_overview(l)).collect());
@@ -3402,7 +3407,9 @@ impl Pool {
                     }
                     Ok(rows) => {
                         self.xzver_works(&lease.server);
-                        ("xzver", Ok(rows))
+                        let (r, asked) = self.xzver_rest(&mut lease, rows, end, deadline).await;
+                        requests += asked;
+                        ("xzver", r)
                     }
                     Err(e) if e.is_empty_range() => {
                         self.xzver_works(&lease.server);
@@ -3453,6 +3460,37 @@ impl Pool {
             }
             return lease.check(r);
         }
+    }
+
+    /// The rest of an `XZVER` listing past its last row, asked for again on the same connection until a reply brings
+    /// nothing new or `end` is reached: Usenet.Farm stops every `XZVER` reply at 10,000 rows without saying so (on
+    /// prod each 100,000-number slice read there kept its first 10,000 articles and the cursor moved past the rest). A
+    /// reply that wasn't cut short costs one more request, answered empty. Returns the rows and the requests added.
+    async fn xzver_rest(
+        &self,
+        lease: &mut Lease,
+        mut rows: Vec<Overview>,
+        end: u64,
+        deadline: Duration,
+    ) -> (Result<Vec<Overview>>, u64) {
+        let mut asked = 0;
+        while let Some(last) = rows.iter().map(|o| o.number).max().filter(|&n| n < end) {
+            lease.busy = false;
+            asked += 1;
+            match within(deadline, "XZVER", lease.begin().xzver(last + 1, end)).await {
+                Ok(more) => {
+                    let before = rows.len();
+                    rows.extend(more.into_iter().filter(|o| o.number > last));
+                    if rows.len() == before {
+                        break;
+                    }
+                }
+                Err(e) if e.is_empty_range() => break,
+                // the slice fails and is read again: rows short of the range must not move a cursor past the rest
+                Err(e) => return (Err(e), asked),
+            }
+        }
+        (Ok(rows), asked)
     }
 
     /// Whether a listing on `conn` asks for `XZVER`: the server refused `XFEATURE COMPRESS GZIP` on it, compression
@@ -3965,6 +4003,11 @@ fn tls_config() -> Arc<rustls::ClientConfig> {
     });
 
     CONFIG.clone()
+}
+
+/// An overview line as the indexer reads it (`parse_overview`), for tools that read stored lines back.
+pub fn overview_of(line: &[u8]) -> Option<Overview> {
+    parse_overview(line)
 }
 
 fn parse_overview(line: &[u8]) -> Option<Overview> {
@@ -5197,6 +5240,8 @@ mod xzver_fallback_tests {
         AfterThreeXovers(Vec<u8>),
         /// the first time, then hangs up
         OnceThenClose(Vec<u8>),
+        /// the rows of `1..=total` in the range asked for, at most `cap` of them (a server that cuts replies short)
+        Capped { total: u64, cap: u64 },
         /// never
         Hang,
         /// hangs up
@@ -5249,6 +5294,23 @@ mod xzver_fallback_tests {
                                     }
                                     let _ = write.write_all(r).await;
                                 }
+                                Answer::Capped { total, cap } => {
+                                    let range = line.split_whitespace().nth(1).unwrap_or("1-1");
+                                    let (a, b) = range.split_once('-').unwrap_or((range, range));
+                                    let (a, b): (u64, u64) = (a.parse().unwrap_or(1), b.parse().unwrap_or(1));
+                                    let rows: Vec<u64> = (a..=b.min(*total)).take(*cap as usize).collect();
+                                    if rows.is_empty() {
+                                        let _ = write.write_all(b"423 no articles in that range\r\n").await;
+                                    } else {
+                                        let mut listing = Vec::new();
+                                        for n in rows {
+                                            listing.extend_from_slice(
+                                                format!("{n}\ts{n}\tp\tdate\t<{n}@x>\t\t10\t1\r\n").as_bytes(),
+                                            );
+                                        }
+                                        let _ = write.write_all(&xzver_of(&listing)).await;
+                                    }
+                                }
                                 Answer::Hang => tokio::time::sleep(Duration::from_secs(60)).await,
                                 Answer::Close => return,
                             }
@@ -5299,6 +5361,26 @@ mod xzver_fallback_tests {
             assert_eq!(count(&log, "XZVER"), 2);
             assert_eq!(count(&log, "XOVER"), 0);
             assert_eq!(*pool.servers[0].xzver.lock().unwrap(), Xzver::Works);
+        });
+    }
+
+    #[test]
+    fn an_xzver_reply_cut_short_is_read_on_from_its_last_row() {
+        run(async {
+            // a server that stops each XZVER reply at 4 rows, of articles 1..=10
+            let (port, log) = serve_with(Answer::Capped { total: 10, cap: 4 }).await;
+            let pool = pool(port, true);
+            assert_eq!(numbers(&pool.xover_on(0, "g", 1, 20).await.unwrap()), (1..=10).collect::<Vec<u64>>());
+            // 1-4, 5-8, 9-10, then 11-20 answered empty
+            assert_eq!(count(&log, "XZVER"), 4);
+            // a range read whole in one reply costs one more request, answered empty
+            log.lock().unwrap().clear();
+            assert_eq!(numbers(&pool.xover_on(0, "g", 9, 12).await.unwrap()), [9, 10]);
+            assert_eq!(count(&log, "XZVER"), 2);
+            // a range ending at its last row costs nothing more
+            log.lock().unwrap().clear();
+            assert_eq!(numbers(&pool.xover_on(0, "g", 2, 3).await.unwrap()), [2, 3]);
+            assert_eq!(count(&log, "XZVER"), 1);
         });
     }
 

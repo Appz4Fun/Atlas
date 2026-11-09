@@ -1,0 +1,137 @@
+//! The store in the indexer, behind `[header_store] enabled` (off by default): listings recorded as they're fetched,
+//! the slice's cursor held until its rows are durable, the keep set refreshed every minute, and everything sealed and
+//! committed at shutdown.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+
+use super::store::{Clamp, DAY, KeepSet, Store, StoreConfig, Ticket};
+
+static STORE: OnceLock<Mutex<Option<Arc<Store>>>> = OnceLock::new();
+/// The store is open and its linker takes the place of the SQLite one (`[header_store] linker`).
+static LINKS_ON: AtomicBool = AtomicBool::new(false);
+
+/// Whether obfuscated headers go to the store's linker only (`xref::hold` keeps none in `atlas.xref.db`).
+pub fn links_on() -> bool {
+    LINKS_ON.load(Ordering::Relaxed)
+}
+
+/// The store the indexer records to, when it's on.
+pub fn handle() -> Option<Arc<Store>> {
+    store()
+}
+
+fn store() -> Option<Arc<Store>> {
+    STORE.get().and_then(|m| m.lock().ok().and_then(|g| g.clone()))
+}
+
+fn now() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+/// The days kept now: the live window (two days back, until cursors say where live reading stands), the days around
+/// each backfill day claimed lately (the header window's claims), and the days with an hour the store's linker hasn't
+/// linked (when it runs).
+pub fn keep_now() -> KeepSet {
+    let now = now();
+    KeepSet {
+        live_from: (now - 2 * DAY).div_euclid(DAY),
+        claimed: crate::header_window::claimed_days(now).into_iter().collect(),
+        unlinked: super::linker::unlinked_days(),
+    }
+}
+
+/// Opens the store when it's on. Call once, from the indexer.
+pub fn spawn(cfg: &crate::config::HeaderStoreConfig) {
+    if !cfg.enabled {
+        return;
+    }
+    let root = cfg.root();
+    let (store, opened) = match Store::open(StoreConfig::new(&root), keep_now()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("header store: couldnt open {}: {e:#}; not recording", root.display());
+            return;
+        }
+    };
+    eprintln!(
+        "header store: {} segments, {} blocks; {} logs replayed ({} rows), {} already committed",
+        opened.segments, opened.blocks, opened.logs_replayed, opened.rows_replayed, opened.logs_already_committed
+    );
+    if STORE.set(Mutex::new(Some(Arc::clone(&store)))).is_err() {
+        return;
+    }
+    // housekeeping and refused rows ask for the keep set as of then
+    store.set_keep_source(Arc::new(keep_now));
+    // the old linker's recording goes off only once the store's linker can read its state
+    if cfg.linker {
+        match super::linker::Linker::open(&store, now()) {
+            Ok(_) => LINKS_ON.store(true, Ordering::Relaxed),
+            Err(e) => eprintln!("header store: its linker couldnt read its state ({e:#}); the SQLite linker stays on"),
+        }
+    }
+    // with no store linker to wait for, expiry follows the keep set from the start
+    if !LINKS_ON.load(Ordering::Relaxed) {
+        store.arm_expiry();
+    }
+    let weak = Arc::downgrade(&store);
+    let _ = std::thread::Builder::new().name("nxv-keep".into()).spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_secs(60));
+            let Some(s) = weak.upgrade() else { return };
+            if let Some(e) = s.failure() {
+                // fail-stop: nothing more is written, and a restart runs recovery (launchd starts the indexer again
+                // after a non-zero exit)
+                eprintln!(
+                    "header store: stopped after a write error ({e}); exiting soo recovery runs at the next start"
+                );
+                std::process::exit(70);
+            }
+        }
+    });
+}
+
+/// A backfill day claimed (`chunks::claim`): kept by the store at once, soo its rows aren't dropped as not kept
+/// before the next refresh.
+pub fn note_claimed_day(day: i64) {
+    if let Some(s) = store() {
+        s.add_claimed(day);
+    }
+}
+
+/// Whether the store is recording, soo the connection layer knows to hand it listings.
+pub fn enabled() -> bool {
+    store().is_some()
+}
+
+/// A fetched listing of `group` from `server`. A failure is said once the store stops; the slice then fails at its
+/// `sync_point`, and is read again after a restart.
+pub fn record(server: &str, group: &str, lines: &[Vec<u8>]) {
+    let Some(s) = store() else { return };
+    if lines.is_empty() {
+        return;
+    }
+    if let Err(e) = s.record(server, group, lines, Clamp::Unknown { now: now() }) {
+        eprintln!("header store: couldnt record {group}: {e:#}");
+    }
+}
+
+/// What a slice waits on before it counts as read: every row recorded for `group` so far durable. None when the
+/// store is off.
+pub fn sync_point(group: &str) -> anyhow::Result<Option<Ticket>> {
+    let Some(s) = store() else { return Ok(None) };
+    if let Some(e) = s.failure() {
+        anyhow::bail!("the header store stopped: {e}");
+    }
+    Ok(s.sync_point(group))
+}
+
+/// Seals and commits what's open, then stops. For shutdown.
+pub fn finish() {
+    let Some(m) = STORE.get() else { return };
+    let Some(s) = m.lock().ok().and_then(|mut g| g.take()) else { return };
+    if let Err(e) = s.close() {
+        eprintln!("header store: {e:#}");
+    }
+}
