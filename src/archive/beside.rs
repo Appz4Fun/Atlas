@@ -376,7 +376,7 @@ fn thumbnail_beside(
     };
     let bare = |poster: &str| -> Option<String> {
         let (local, _) = poster.split_once('@')?;
-        (local.len() >= POSTER_PREFIX + 2 && !local.contains(['<', ' ', '"']))
+        (local.is_ascii() && local.len() >= POSTER_PREFIX + 2 && !local.contains(['<', ' ', '"']))
             .then(|| local[..POSTER_PREFIX].to_string())
     };
     if by_poster {

@@ -657,6 +657,9 @@ impl Step for ImagesStep {
             true
         };
         let mut unfinished = false;
+        // out of time or budget, or a server's trouble, after some pictures came: those are kept and the rest wait
+        // for the next run, which finds these in the folder, instead of all of them being fetched again for ever
+        let mut stopped = false;
         // a picture read without asking may be as big as `MAX_PARTS` articles, whatever `picture_max_parts` says
         let max_bytes = (limits.picture_max_parts.max(MAX_PARTS as i64) as usize).saturating_mul(1 << 20);
         for (file, was_asked) in wanted {
@@ -665,6 +668,10 @@ impl Step for ImagesStep {
                 before.get(&file.filename).and_then(|sha| image_file(sha)).and_then(|path| std::fs::read(path).ok());
             let body = match cached {
                 Some(body) => Some(body),
+                None if stopped => {
+                    unfinished = true;
+                    continue;
+                }
                 None if parts_of(file) as usize > left => {
                     unfinished |= was_asked;
                     continue;
@@ -677,9 +684,21 @@ impl Step for ImagesStep {
                     ctx.used_bodies = i64::MIN / 2;
                     let body = crate::archive::steps::whole_file_within(ctx, file, &mut left, max_bytes);
                     ctx.used_bodies = used;
-                    body?
+                    match body {
+                        Err(StepError::OutOfBudget | StepError::Transient(_)) if writes.len() > 1 || !answers.is_empty() => {
+                            (stopped, unfinished) = (true, true);
+                            continue;
+                        }
+                        other => other?,
+                    }
                 }
-                None => crate::archive::steps::whole_file_within(ctx, file, &mut left, max_bytes)?,
+                None => match crate::archive::steps::whole_file_within(ctx, file, &mut left, max_bytes) {
+                    Err(StepError::OutOfBudget | StepError::Transient(_)) if writes.len() > 1 || !answers.is_empty() => {
+                        (stopped, unfinished) = (true, true);
+                        continue;
+                    }
+                    other => other?,
+                },
             };
             let shown = body.as_deref().is_some_and(|b| row(&file.filename, b, &mut writes));
             if was_asked {
@@ -693,7 +712,7 @@ impl Step for ImagesStep {
         }
         // a book's own pictures, while there's room for them
         let mut book_images = 0;
-        for file in books {
+        for file in books.into_iter().filter(|_| !stopped) {
             let room = MAX_BOOK_IMAGES.saturating_sub(book_images);
             let mut book_left = MAX_CONTAINER_PARTS;
             if room == 0 {

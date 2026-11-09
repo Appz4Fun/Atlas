@@ -4027,7 +4027,7 @@ fn stills_html(id: i64, stills: &[(u8, Option<i64>, u32, u32)], from: Option<(i6
 fn post_images(conn: &rusqlite::Connection, rows: &[i64]) -> Vec<(i64, crate::images::step::Image)> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
-    for &row in rows.iter().take(32) {
+    for &row in rows.iter().take(LINKED_PICTURE_ROWS) {
         for image in crate::images::step::images(conn, row) {
             if seen.insert(image.sha256.clone()) {
                 out.push((row, image));
@@ -4126,8 +4126,8 @@ fn picture_states(
 
 /// Requests of a post's rows and of the releases they were found beside or linked into, which read them.
 fn picture_requests_of(conn: &rusqlite::Connection, rows: &[i64]) -> Vec<crate::images::step::Request> {
-    let mut ids: Vec<i64> = rows.iter().take(32).copied().collect();
-    for &row in rows.iter().take(32) {
+    let mut ids: Vec<i64> = rows.iter().take(LINKED_PICTURE_ROWS).copied().collect();
+    for &row in rows.iter().take(LINKED_PICTURE_ROWS) {
         if let Some(reader) = picture_reader(conn, row)
             && !ids.contains(&reader)
         {
@@ -4190,8 +4190,9 @@ fn picture_target(conn: &rusqlite::Connection, id: i64, name: &str) -> Option<i6
     picture_reader(conn, holder)
 }
 
-/// Rows of a post looked through for the one holding a picture asked for.
-const LINKED_PICTURE_ROWS: usize = 1_024;
+/// Rows of a post looked through for its pictures: the one holding a picture asked for, the pictures shown, and
+/// the requests their cells show. One limit for all three, soo a picture that can be asked for shows how it went.
+const LINKED_PICTURE_ROWS: usize = 256;
 
 /// One picture's cell in the files list: shown, queued with when it's read, failed, or a Fetch button. A queued one
 /// asks again every 30 seconds.
