@@ -4086,7 +4086,7 @@ pub(crate) fn undo_mojibake(text: String) -> String {
 
 /// The groups an overview's `Xref:` field names: `Xref: host group:number group:number`, the full-header form
 /// a server with `Xref:full` in its OVERVIEW.FMT sends. None when the field is something else, or missing.
-fn xref_groups(field: &str) -> Option<u16> {
+pub(crate) fn xref_groups(field: &str) -> Option<u16> {
     let field = field.trim_start();
     if field.len() < 5 || !field.as_bytes()[..5].eq_ignore_ascii_case(b"xref:") {
         return None;

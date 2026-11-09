@@ -2343,7 +2343,7 @@ fn slice_date(headers: &[Overview]) -> Option<db::Dated> {
 /// Parse one slice into releases, look up real names, save.
 /// `unsaved` is the slice's room in the unsaved budget: the parsed releases
 /// stand for its headers until they are committed, soo it goes back only then.
-async fn save_slice(
+pub(crate) async fn save_slice(
     pool: &Arc<Pool>,
     db: &Db,
     group: &str,
