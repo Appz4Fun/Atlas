@@ -27,6 +27,7 @@ type Seen = (String, Vec<(String, String)>);
 struct Shared {
     routes: Mutex<Vec<Route>>,
     requests: Mutex<Vec<Seen>>,
+    requests_ready: std::sync::Condvar,
     bodies: Mutex<Vec<String>>,
     stop: AtomicBool,
     /// answers wait while set
@@ -56,6 +57,7 @@ impl FixtureServer {
                 let url = request.url().to_string();
                 let headers = request.headers().iter().map(|h| (h.field.to_string(), h.value.to_string())).collect();
                 on_thread.requests.lock().unwrap().push((url.clone(), headers));
+                on_thread.requests_ready.notify_all();
                 on_thread.waiting.fetch_add(1, Relaxed);
                 while on_thread.held.load(Relaxed) && !on_thread.stop.load(Relaxed) {
                     std::thread::sleep(Duration::from_millis(5));
@@ -72,6 +74,14 @@ impl FixtureServer {
             }
         });
         FixtureServer { base: format!("http://127.0.0.1:{port}"), shared, thread: Some(thread) }
+    }
+
+    /// Wait until at least one request has reached the fixture server.
+    pub fn wait_for_request(&self) {
+        let mut requests = self.shared.requests.lock().unwrap();
+        while requests.is_empty() {
+            requests = self.shared.requests_ready.wait(requests).unwrap();
+        }
     }
 
     /// "path?query", in order.
