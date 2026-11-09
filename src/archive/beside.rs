@@ -53,6 +53,8 @@ const MAX_SHORT: usize = 2;
 const POSTER_PREFIX: usize = 8;
 /// Index entries read, at most, for one range the thumbnail lookup scans.
 const SCANNED: usize = 4_096;
+/// Rows read either way of a release's id when its thumbnail can't be looked for by poster.
+const NEIGHBOURS: i64 = 20_000;
 
 static FILE_COUNTER: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"\[(\d+)\s*/\s*(\d+)\]").unwrap());
 
@@ -179,16 +181,20 @@ fn read_nfo(ctx: &mut StepCtx<'_>, file: &FileInfo) -> Result<NfoRead, StepError
         file: file.filename.clone(),
         max_bytes: Some(super::ARTICLE_CAP),
     }];
+    let used_before = ctx.used_bodies;
     let got = match ctx.fetch_bodies(&wanted) {
         Ok(got) => got.into_iter().next().map(|b| b.got),
-        Err(StepError::OutOfBudget | StepError::Transient(_)) => return Ok(NfoRead::Later),
+        // out of this minute's budget: later. A server down or an article it won't give is the lane's to back off
+        // from (`StepError::Transient`), not a wait of this step's that would come back every few minutes for ever
+        Err(StepError::OutOfBudget) => return Ok(NfoRead::Later),
         Err(e) => return Err(e),
     };
     Ok(match got {
         Some(Got::Body(body)) if body.len() < crate::media::steps::NFO_READ => {
             NfoRead::Text(crate::probe::nfo_text(&body))
         }
-        Some(Got::Refused(why)) if why == crate::postprocess::bodies::PAST_BUDGET => NfoRead::Later,
+        // past the release's budget after fetches of this run's own; with none, a budget of nothing would wait for ever
+        Some(Got::Refused(why)) if why == crate::postprocess::bodies::PAST_BUDGET && used_before > 0 => NfoRead::Later,
         _ => NfoRead::Never,
     })
 }
@@ -351,13 +357,14 @@ fn thumbnail_beside(
     // ids from an index alone (its entries hold the id), near this release's, reading at most `SCANNED` entries: a
     // range of a busy poster, or of a name every upload's thumbnail has, can't cost more than that
     let mut ids: Vec<i64> = Vec::new();
+    let mut have: HashSet<i64> = HashSet::new();
     let mut scan = |sql: &str, values: &[&dyn rusqlite::ToSql]| -> Result<(), StepError> {
         let mut stmt = conn.prepare_cached(sql).map_err(retry)?;
         let mut rows = stmt.query(values).map_err(retry)?;
         let mut read = 0;
         while let Some(row) = rows.next().map_err(retry)? {
             let id: i64 = row.get(0).map_err(retry)?;
-            if (low..=high).contains(&id) && id != me && !ids.contains(&id) {
+            if (low..=high).contains(&id) && id != me && have.insert(id) {
                 ids.push(id);
             }
             read += 1;
@@ -389,13 +396,25 @@ fn thumbnail_beside(
         }
     }
     // a shard without the poster index (`--search-indexes`), or a poster written `Name <address>`, whose made-up
-    // address no range of the poster column reaches: by name
+    // address no range of the poster column reaches: the rows saved nearest this one, either way, by their names.
+    // Not by the name index: every upload's thumbnail is named alike, and its rows sort by a hash, not by when
     if !by_poster || posters.iter().any(|p| p.contains('<')) {
-        for name in PICTURE_NAMES {
-            let mut chars = name.chars();
-            let upper = chars.next().map(|c| c.to_ascii_uppercase().to_string() + chars.as_str()).unwrap_or_default();
-            for name in [*name, upper.as_str()] {
-                scan("select id from releases where name >= ?1 and name < ?1 || char(127)", &[&name])?;
+        for sql in [
+            "select id, name from releases where id < ?1 and id >= ?2 order by id desc limit ?3",
+            "select id, name from releases where id > ?1 and id <= ?2 order by id limit ?3",
+        ] {
+            let bound = if sql.contains("desc") { low } else { high };
+            let mut stmt = conn.prepare_cached(sql).map_err(retry)?;
+            let rows = stmt
+                .query_map(params![me, bound, NEIGHBOURS], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default()))
+                })
+                .map_err(retry)?;
+            for row in rows {
+                let (id, name) = row.map_err(retry)?;
+                if picture_named(&name) && have.insert(id) {
+                    ids.push(id);
+                }
             }
         }
     }

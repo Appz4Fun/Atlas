@@ -463,6 +463,24 @@ fn linked_files(conn: &rusqlite::Connection, lead: i64) -> rusqlite::Result<Vec<
     Ok(files)
 }
 
+/// File `name` of a row linked into the upload `lead` leads, or found beside it.
+fn asked_linked_file(conn: &rusqlite::Connection, lead: i64, name: &str) -> rusqlite::Result<Option<FileInfo>> {
+    let row: Option<i64> = rusqlite::OptionalExtension::optional(
+        conn.prepare_cached(
+            "select f.release_id from files f
+         where f.release_id in (select release_id from upload_link where lead_id = ?1
+                                union select row_id from beside_files where release_id = ?1)
+           and f.filename = ?2 limit 1",
+        )?
+        .query_row(rusqlite::params![lead, name], |r| r.get(0)),
+    )?;
+    let Some(row) = row else { return Ok(None) };
+    Ok(store::release_files(conn, row, LINKED_ROW_FILES)?.into_iter().find(|f| f.filename == name))
+}
+
+/// Files of one linked row looked through for one asked for by name.
+const LINKED_ROW_FILES: usize = 4_096;
+
 /// Books and comics small enough to read whole for the pictures inside them, at most two.
 pub fn containers(files: &[FileInfo]) -> Vec<&FileInfo> {
     files
@@ -575,6 +593,15 @@ impl Step for ImagesStep {
             )
             .and_then(|mut q| q.query_map([release_id], |r| r.get(0))?.collect())
             .map_err(|e| StepError::Retry(e.to_string()))?;
+        // one asked for that the rows read above don't reach (a member past the first few, a file past a row's first
+        // fifty): looked for in the upload's rows by its name
+        for name in &asked {
+            if !files.iter().any(|f| f.filename == *name) {
+                files.extend(
+                    asked_linked_file(ctx.conn(), release_id, name).map_err(|e| StepError::Retry(e.to_string()))?,
+                );
+            }
+        }
         let all = pictures(&files);
         let auto_limits = AutoLimits::of(&limits);
         // the sizes are read only when they could keep the pictures within the limits
@@ -646,7 +673,8 @@ impl Step for ImagesStep {
                 // that could never be read, as a run's fetches start from none
                 None if was_asked => {
                     let used = ctx.used_bodies;
-                    ctx.used_bodies = 0;
+                    // as good as none used, whatever the read takes: `left` is what bounds it
+                    ctx.used_bodies = i64::MIN / 2;
                     let body = crate::archive::steps::whole_file_within(ctx, file, &mut left, max_bytes);
                     ctx.used_bodies = used;
                     body?
