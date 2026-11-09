@@ -2594,10 +2594,12 @@ impl Pool {
     /// never hold all of the budget
     async fn reserve_unsaved_for(&self, numbers: u64, bulk: bool) -> Unsaved {
         let budget = self.unsaved.clone();
-        let n = usize::try_from(numbers).unwrap_or(usize::MAX).clamp(1, budget.cap);
+        // a bulk slice never holds more than the bulk share, even one bigger than it (it then holds past its room, as
+        // a slice bigger than the whole budget does)
+        let most = if bulk { budget.bulk_cap } else { budget.cap };
+        let n = usize::try_from(numbers).unwrap_or(usize::MAX).clamp(1, most);
         let bulk = if bulk {
-            let b = n.clamp(1, budget.bulk_cap);
-            Some(budget.bulk.clone().acquire_many_owned(b as u32).await.expect("semaphore closed"))
+            Some(budget.bulk.clone().acquire_many_owned(n as u32).await.expect("semaphore closed"))
         } else {
             None
         };

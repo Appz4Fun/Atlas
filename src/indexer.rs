@@ -1290,7 +1290,8 @@ fn stream_width(kind: &str) -> usize {
 /// prod alias and rail claimed a day chunk each and their live cursors stood still for hours.
 /// Live always wins: putting it off every other turn (`deferred`, no longer used) let a big group's frontier day hold
 /// its worker for hours on prod, and its live side fell a day behind. Its frontier days go to the chunk workers
-/// (`bg_indexer::chunk_share`) instead.
+/// (`bg_indexer::chunk_share`) instead. While it stays more than a slice behind, its home's sweep and cursor backfill
+/// wait (the day chunks still cover its days).
 fn live_first(mode: &str, phase: Phase, split: bool, behind: i64, slice: u64, _deferred: bool) -> bool {
     mode != "live" && mode != "backfill" && phase == Phase::Backfill && split && behind > slice as i64
 }
