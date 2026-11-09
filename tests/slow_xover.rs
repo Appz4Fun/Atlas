@@ -22,7 +22,8 @@ fn a_range_too_wide_to_answer_in_time_is_asked_for_in_halves() {
 
     let stop = Arc::new(AtomicBool::new(false));
     let (rows, errors) = pool.block_on(async {
-        let mut rx = pool.pool.stream_headers(GROUP, 0, vec![(1, 2000)], atlas::nntp::STREAM_SLICES, stop.clone());
+        let mut rx =
+            pool.pool.stream_headers(GROUP, 0, vec![(1, 2000)], atlas::nntp::STREAM_SLICES, false, stop.clone());
         let (mut rows, mut errors) = (0, Vec::new());
         while let Some(slice) = rx.recv().await {
             match slice.result {
@@ -50,7 +51,8 @@ fn a_server_that_never_answers_still_fails() {
 
     let stop = Arc::new(AtomicBool::new(false));
     let failed = pool.block_on(async {
-        let mut rx = pool.pool.stream_headers(GROUP, 0, vec![(1, 2000)], atlas::nntp::STREAM_SLICES, stop.clone());
+        let mut rx =
+            pool.pool.stream_headers(GROUP, 0, vec![(1, 2000)], atlas::nntp::STREAM_SLICES, false, stop.clone());
         let mut failed = 0;
         while let Some(slice) = rx.recv().await {
             failed += slice.result.is_err() as usize;

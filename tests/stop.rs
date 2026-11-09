@@ -63,7 +63,8 @@ fn stop_does_not_wait_for_a_stuck_request() {
     let stop = Arc::new(AtomicBool::new(false));
     let stopper = stop_when_stalled(state.clone(), stop.clone());
     let got = pool.block_on(async {
-        let mut rx = pool.pool.stream_headers(GROUP, 0, slices.clone(), atlas::nntp::STREAM_SLICES, stop.clone());
+        let mut rx =
+            pool.pool.stream_headers(GROUP, 0, slices.clone(), atlas::nntp::STREAM_SLICES, false, stop.clone());
         let mut got = 0;
         while let Some(slice) = rx.recv().await {
             got += slice.result.is_ok() as usize;

@@ -2295,7 +2295,8 @@ impl Pass<'_> {
         let total = slices.len();
 
         let width = stream_width(kind);
-        let mut rx = pool.stream_headers(group, self.server, slices, width, self.ctx.stop.clone());
+        // everything but live takes from the bulk share of the unsaved budget: new posts never wait behind old days
+        let mut rx = pool.stream_headers(group, self.server, slices, width, kind != "LIVE", self.ctx.stop.clone());
         let mut saved = Progress::default();
         let mut done = 0;
         let mut finished = Finished::default();
