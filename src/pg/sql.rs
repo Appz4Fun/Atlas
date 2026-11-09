@@ -248,7 +248,9 @@ pub trait Sql {
     /// Whether the table exists (in the schema queries name tables in).
     fn has_table(&self, table: &str) -> Result<bool>;
     /// Runs `f` in a transaction, committed when it returns Ok, else rolled back; nested in one already, a
-    /// savepoint. See `tx`.
+    /// savepoint. See `tx`. A statement that fails inside `f` must fail `f`, or be caught only around a nested
+    /// `tx`: on Postgres the failure aborts the transaction, and its commit is then a rollback that reports
+    /// success.
     fn transaction(&self, f: &mut dyn FnMut(&dyn Sql) -> Result<()>) -> Result<()>;
 }
 
@@ -318,13 +320,14 @@ pub fn sqlite_sql(sql: &str) -> std::borrow::Cow<'_, str> {
     while i < b.len() {
         let c = b[i];
         match c {
-            b'\'' | b'"' => {
+            b'\'' | b'"' | b'`' | b'[' => {
                 // to the closing quote; a doubled one is part of the text
+                let c = if c == b'[' { b']' } else { c };
                 let start = i;
                 i += 1;
                 while i < b.len() {
                     if b[i] == c {
-                        if b.get(i + 1) == Some(&c) {
+                        if c != b']' && b.get(i + 1) == Some(&c) {
                             i += 2;
                             continue;
                         }
@@ -671,6 +674,7 @@ mod tests {
         assert_eq!(sqlite_sql("select 'é', $1"), "select 'é', ?1");
         assert_eq!(sqlite_sql("select $x"), "select $x");
         assert_eq!(sqlite_sql("select /* $1 */ a$1, $2"), "select /* $1 */ a$1, ?2");
+        assert_eq!(sqlite_sql("select [$1], `$2`, $3"), "select [$1], `$2`, ?3");
     }
 
     fn check(db: &dyn Sql) {

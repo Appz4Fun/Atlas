@@ -23,9 +23,15 @@ fn rest(failures: i64) -> i64 {
 
 /// SQL: chunk `c` isnt resting after a failure at unix time `now`
 fn not_resting(now: i64) -> String {
+    not_resting_of("c.", now)
+}
+
+/// SQL: the chunk whose columns are named with `prefix` isnt resting after a failure at unix time `now`
+fn not_resting_of(prefix: &str, now: i64) -> String {
     let steps: String = (1..=8).map(|n| format!(" when {n} then {}", rest(n))).collect();
     format!(
-        "(c.failed_at is null or c.failed_at + case coalesce(c.failures, 1){steps} else {FAIL_REST_MOST} end <= {now})"
+        "({prefix}failed_at is null or {prefix}failed_at + case coalesce({prefix}failures, 1){steps} \
+         else {FAIL_REST_MOST} end <= {now})"
     )
 }
 
@@ -586,10 +592,11 @@ fn claim_ordered(
          where (grp, day) = (
              select grp, day from best where day is not null
              order by day {best}, media desc, grp limit 1)
-           -- as in `claim_wanted`: still claimable when the update gets to it
-           and (state = {PENDING} or (state = {CLAIMED} and claimed_at < ${stale}))
+           -- as in `claim_wanted`: still claimable when the update gets to it, and not failed and resting since
+           and ((state = {PENDING} and {rested}) or (state = {CLAIMED} and claimed_at < ${stale}))
          returning grp, day, coalesce(reread, 0)",
         resting = not_resting(now),
+        rested = not_resting_of("", now),
         stale = n + 1,
         a = n + 2,
         b = n + 3,
