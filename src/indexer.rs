@@ -1288,11 +1288,11 @@ fn stream_width(kind: &str) -> usize {
 /// a slice behind. Its day chunks are taken by any server's free workers too (`take_chunk`), and one can hold its home's
 /// worker for over an hour, while its new posts waited: after a restart every group's first turn is backfill, and on
 /// prod alias and rail claimed a day chunk each and their live cursors stood still for hours.
-/// Never twice in a row (`deferred`: its last backfill turn went live already): a big group is always more than a
-/// slice behind by its next turn, and on prod its own frontier day was never claimed, holding every group's
-/// backfill behind it (`chunks::LOCKSTEP_DAYS`).
-fn live_first(mode: &str, phase: Phase, split: bool, behind: i64, slice: u64, deferred: bool) -> bool {
-    mode != "live" && mode != "backfill" && phase == Phase::Backfill && split && !deferred && behind > slice as i64
+/// Live always wins: putting it off every other turn (`deferred`, no longer used) let a big group's frontier day hold
+/// its worker for hours on prod, and its live side fell a day behind. Its frontier days go to the chunk workers
+/// (`bg_indexer::chunk_share`) instead.
+fn live_first(mode: &str, phase: Phase, split: bool, behind: i64, slice: u64, _deferred: bool) -> bool {
+    mode != "live" && mode != "backfill" && phase == Phase::Backfill && split && behind > slice as i64
 }
 
 /// Whether split `group`'s cursor backfill on `host` may sweep: no day
@@ -3066,19 +3066,14 @@ mod tests {
         }
     }
 
-    /// A big split group is always far behind on its live side, yet every other backfill turn is its own: its frontier
-    /// day gets claimed, not starved by live passes forever.
+    /// A big split group far behind on its live side reads live on every turn: its frontier days are the chunk
+    /// workers', and a day chunk holding its worker for hours left its new posts a day behind on prod.
     #[test]
-    fn a_split_groups_own_backfill_turn_is_never_put_off_twice_in_a_row() {
-        let (mut deferred, mut own) = (false, 0);
-        for _ in 0..10 {
-            let first = live_first("dynamic", Phase::Backfill, true, 68_000_000, 100_000, deferred);
-            deferred = first;
-            own += usize::from(!first);
+    fn a_split_group_behind_on_live_always_reads_live_first() {
+        for deferred in [false, true] {
+            assert!(live_first("dynamic", Phase::Backfill, true, 68_000_000, 100_000, deferred));
         }
-        assert_eq!(own, 5, "every other backfill turn");
-        // put off once, the next turn is its own however far behind
-        assert!(!live_first("dynamic", Phase::Backfill, true, 68_000_000, 100_000, true));
+        assert!(!live_first("dynamic", Phase::Backfill, true, 50_000, 100_000, false), "caught up: its own turn");
     }
 
     #[test]
