@@ -897,7 +897,10 @@ pub fn forget_deepest(db: &dyn Sql, group: &str, server: &str) -> Result<()> {
 /// still to do (pending or claimed) on a day the server keeps.
 pub fn waiting(db: &dyn Sql, groups: &[(String, i64)]) -> Result<bool> {
     for (g, oldest) in groups {
-        if db.exists("select 1 from backfill_chunks where grp = $1 and day >= $2 and state != 2", vals![g, *oldest])? {
+        if db.exists(
+            "select 1 from backfill_chunks where grp = $1 and day >= $2 and state != 2 limit 1",
+            vals![g, *oldest],
+        )? {
             return Ok(true);
         }
     }
@@ -907,7 +910,7 @@ pub fn waiting(db: &dyn Sql, groups: &[(String, i64)]) -> Result<bool> {
 /// Whether every day chunk of split `group` is done.
 pub fn chunks_done(db: &dyn Sql, group: &str) -> Result<bool> {
     Ok(is_split(db, group)?
-        && !db.exists("select 1 from backfill_chunks where grp = $1 and state != 2", vals![group])?)
+        && !db.exists("select 1 from backfill_chunks where grp = $1 and state != 2 limit 1", vals![group])?)
 }
 
 /// The split generation of `group`: counts the times its split reached back

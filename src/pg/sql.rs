@@ -278,9 +278,11 @@ impl dyn Sql + '_ {
         self.query(sql, params)?.iter().map(|r| r.get(0)).collect()
     }
 
-    /// Whether the query returns any row.
+    /// Whether the query returns any row. Asked as `select exists (...)`, soo the database stops at the first row:
+    /// `row` reads every row of its query, and a chunk check without a limit read every pending day of every group
+    /// under the main connection's lock, which stalled every pass on prod.
     pub fn exists(&self, sql: &str, params: &[Value]) -> Result<bool> {
-        Ok(self.row(sql, params)?.is_some())
+        self.one::<bool>(&format!("select exists ({sql})"), params)
     }
 
     /// Waits for, and holds to the end of the transaction this runs in, the lock named `name`: what's done under

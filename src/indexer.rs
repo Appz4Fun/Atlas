@@ -1776,7 +1776,7 @@ async fn reach_further(db: &Db, group: &str, (_day, floor, oldest): (i64, i64, O
             s.articles += dated;
             // the window is judged when its last day is done, not when its oldest is
             let running = conn.exists(
-                "select 1 from backfill_chunks where grp = $1 and day >= $2 and day < $3 and state != 2",
+                "select 1 from backfill_chunks where grp = $1 and day >= $2 and day < $3 and state != 2 limit 1",
                 vals![g.as_str(), floor, floor + SPECULATIVE_WINDOW],
             )?;
             let further = !running && s.articles >= SPECULATIVE_YIELD * s.days && first < floor;
