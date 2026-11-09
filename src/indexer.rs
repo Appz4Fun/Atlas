@@ -3,6 +3,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::pg::sql::{Sql, vals};
 use anyhow::{Result, anyhow};
 use rusqlite::Connection;
 
@@ -936,8 +937,8 @@ fn cursors_or_adopted(
 
     for old in legacy.iter().map(|k| format!("{group}@{k}")) {
         if db::get_group_state(conn, &old)?.is_some() {
-            conn.execute("delete from groups where name = ?", [key])?;
-            conn.execute("update groups set name = ? where name = ?", [key, old.as_str()])?;
+            Sql::execute(conn, "delete from groups where name = $1", vals![key])?;
+            Sql::execute(conn, "update groups set name = $1 where name = $2", vals![key, old.as_str()])?;
             return Ok(db::get_group_state(conn, key)?);
         }
     }
@@ -1035,31 +1036,32 @@ pub const TIME_CURSOR_MARGIN: i64 = 3600;
 /// time of the newest slice its passes saved (`db::save_group_dates`), and it counts only when its live cursor is past
 /// that slice: a pass cut short saves the newest slices first, and those aren't read through until the ones before
 /// them are.
-pub fn read_through(conn: &Connection, group: &str, key: &str) -> Result<(Option<i64>, Option<i64>)> {
+pub fn read_through(db: &dyn Sql, group: &str, key: &str) -> Result<(Option<i64>, Option<i64>)> {
     let prefix = format!("{group}@");
-    Ok(conn.query_row(
-        "select max(case when name != ?3 then high_posted end), max(case when name = ?3 then high_posted end)
-         from groups
-         where (name = ?2 or substr(name, 1, length(?1)) = ?1)
-           and high_posted is not null and live_cursor is not null and high_article <= live_cursor",
-        rusqlite::params![prefix, group, key],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?)
+    let r = db
+        .row(
+            "select max(case when name != $3 then high_posted end), max(case when name = $3 then high_posted end)
+             from groups
+             where (name = $2 or substr(name, 1, length(cast($1 as text))) = $1)
+               and high_posted is not null and live_cursor is not null and high_article <= live_cursor",
+            vals![prefix, group, key],
+        )?
+        .unwrap_or_default();
+    Ok((r.get(0)?, r.get(1)?))
 }
 
 /// `read_through`'s time on the other servers, from only the rows that began reading (`db::set_start_posted`) at or
 /// before `began_by`: what an own cursor read through up to then may move up to. A row from before that was kept
 /// counts as begun long ago.
-pub fn read_through_since(conn: &Connection, group: &str, key: &str, began_by: i64) -> Result<Option<i64>> {
+pub fn read_through_since(db: &dyn Sql, group: &str, key: &str, began_by: i64) -> Result<Option<i64>> {
     let prefix = format!("{group}@");
-    Ok(conn.query_row(
+    Ok(db.one(
         "select max(high_posted)
          from groups
-         where (name = ?2 or substr(name, 1, length(?1)) = ?1) and name != ?3
+         where (name = $2 or substr(name, 1, length(cast($1 as text))) = $1) and name != $3
            and high_posted is not null and live_cursor is not null and high_article <= live_cursor
-           and (start_posted is null or start_posted <= ?4)",
-        rusqlite::params![prefix, group, key, began_by],
-        |r| r.get(0),
+           and (start_posted is null or start_posted <= $4)",
+        vals![prefix, group, key, began_by],
     )?)
 }
 

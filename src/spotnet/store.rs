@@ -7,6 +7,8 @@ use std::collections::{BTreeMap, HashMap};
 
 use rusqlite::{Connection, OptionalExtension, Result, params};
 
+use crate::pg::sql::{Sql, vals};
+
 use crate::postprocess::schema::ShardTable;
 
 use super::Kind;
@@ -98,42 +100,36 @@ fn cursor_key(server: &str) -> String {
 }
 
 /// The last `free.pt` article read on `server`, by its numbers there.
-pub fn cursor(conn: &Connection, server: &str) -> Result<Option<u64>> {
-    read_cursor(conn, &cursor_key(server))
+pub fn cursor(db: &dyn Sql, server: &str) -> crate::pg::sql::Result<Option<u64>> {
+    read_cursor(db, &cursor_key(server))
 }
 
 /// A group's cursor in `meta`: the last article read, by its numbers on the server the key names.
-pub(super) fn read_cursor(conn: &Connection, key: &str) -> Result<Option<u64>> {
-    let v: Option<i64> = conn.query_row("select value from meta where key = ?", [key], |r| r.get(0)).optional()?;
-    Ok(v.and_then(|v| u64::try_from(v).ok()))
+pub(super) fn read_cursor(db: &dyn Sql, key: &str) -> crate::pg::sql::Result<Option<u64>> {
+    Ok(crate::store::meta(db, key)?.and_then(|v| u64::try_from(v).ok()))
 }
 
-pub(super) fn write_cursor(conn: &Connection, key: &str, last: u64) -> Result<()> {
-    conn.execute(
-        "insert into meta (key, value) values (?, ?) on conflict(key) do update set value = excluded.value",
-        params![key, last as i64],
-    )?;
-    Ok(())
+pub(super) fn write_cursor(db: &dyn Sql, key: &str, last: u64) -> crate::pg::sql::Result<()> {
+    crate::store::put_meta(db, key, last as i64)
 }
 
 /// A spot the overview lists: its message-id, article number and spotter id.
 pub type Noted = (String, u64, Option<String>);
 
 /// Notes the spots of one stretch of the overview, and that it was read up to `last`, together.
-pub fn note_read(conn: &mut Connection, server: &str, last: u64, spots: &[Noted], now: i64) -> Result<usize> {
-    let tx = conn.transaction()?;
-    let mut added = 0;
-    {
-        let mut insert = tx.prepare_cached(
-            "insert or ignore into spots_seen (message_id, number, state, tries, at, spotter) values (?, ?, 0, 0, ?, ?)",
-        )?;
+pub fn note_read(db: &dyn Sql, server: &str, last: u64, spots: &[Noted], now: i64) -> crate::pg::sql::Result<usize> {
+    db.tx(|tx| {
+        let mut added = 0;
         for (id, number, spotter) in spots {
-            added += insert.execute(params![id, *number as i64, now, spotter])?;
+            added += tx.execute(
+                "insert into spots_seen (message_id, number, state, tries, at, spotter) values ($1, $2, 0, 0, $3, $4)
+                 on conflict (message_id) do nothing",
+                vals![id, *number as i64, now, spotter.as_deref()],
+            )?;
         }
-        write_cursor(&tx, &cursor_key(server), last)?;
-    }
-    tx.commit()?;
-    Ok(added)
+        write_cursor(tx, &cursor_key(server), last)?;
+        Ok(added)
+    })
 }
 
 /// A spot (or comment) removed with a `DISPOSE`, `DELETE` or `REMOVE` in `free.pt`: by a Spotnet moderator
@@ -154,53 +150,59 @@ pub const OWN_DISPOSAL_SECS: i64 = 5 * 86_400;
 /// with when the spot was made, when the row has one: a spotter's own removal holds only `OWN_DISPOSAL_SECS` after
 /// it.
 pub(crate) fn disposed_sql(d: &str, s: &str, spotter: &str, created: Option<&str>) -> String {
+    disposed_sql_in("main.", d, s, spotter, created)
+}
+
+/// `disposed_sql` with the main database's tables named with `main` (`main.`, or empty on a query of the main
+/// database alone, which runs on Postgres too).
+fn disposed_sql_in(main: &str, d: &str, s: &str, spotter: &str, created: Option<&str>) -> String {
     // 0: the spot's XML had no date, so not known, as NULL
     let made = created.map_or(format!("{d}.at"), |c| format!("coalesce(nullif({s}.{c}, 0), {d}.at)"));
     format!(
-        "(exists (select 1 from main.spot_disposals {d} where {d}.message_id = {s}.message_id
+        "(exists (select 1 from {main}spot_disposals {d} where {d}.message_id = {s}.message_id
             and ({d}.spotter = '' or ({d}.spotter = {s}.{spotter} and {d}.at - {made} <= {OWN_DISPOSAL_SECS})))
-          or exists (select 1 from main.spot_blacklist {d}_b where {d}_b.spotter = {s}.{spotter}))"
+          or exists (select 1 from {main}spot_blacklist {d}_b where {d}_b.spotter = {s}.{spotter}))"
     )
 }
 
 /// Notes removals read in the overview. Kept whatever they name, now or later: a spot noted, saved or commented on
 /// after its removal is still removed (`todo`, `spots_of`, `comments::about`). Returns how many were new.
-pub fn note_disposals(conn: &mut Connection, disposals: &[Disposal]) -> Result<usize> {
-    let tx = conn.transaction()?;
-    let mut added = 0;
-    {
-        let mut insert =
-            tx.prepare_cached("insert or ignore into spot_disposals (message_id, spotter, at) values (?, ?, ?)")?;
+pub fn note_disposals(db: &dyn Sql, disposals: &[Disposal]) -> crate::pg::sql::Result<usize> {
+    db.tx(|tx| {
+        let mut added = 0;
         for d in disposals {
-            added += insert.execute(params![d.message_id, d.spotter, d.at])?;
+            added += tx.execute(
+                "insert into spot_disposals (message_id, spotter, at) values ($1, $2, $3)
+                 on conflict (message_id, spotter) do nothing",
+                vals![&d.message_id, &d.spotter, d.at],
+            )?;
         }
-    }
-    tx.commit()?;
-    Ok(added)
+        Ok(added)
+    })
 }
 
 /// Spots to fetch. Half of `limit` goes to the oldest waiting, whoever posted them, so every spot gets its turn
 /// however many new ones come in. The rest goes to each spotter's newest, a spotter at a time in turn
 /// (`PER_SPOTTER` deep at most).
-pub fn todo(conn: &Connection, limit: usize) -> Result<Vec<String>> {
-    let oldest: Vec<String> = conn
-        .prepare_cached(&format!(
-            "select message_id from spots_seen where state = ?1 and not {} order by number limit ?2",
+pub fn todo(db: &dyn Sql, limit: usize) -> crate::pg::sql::Result<Vec<String>> {
+    let oldest: Vec<String> = db.column(
+        &format!(
+            "select message_id from spots_seen where state = $1 and not {} order by number, message_id limit $2",
             seen_disposed()
-        ))?
-        .query_map(params![TODO, (limit / 2) as i64], |r| r.get(0))?
-        .collect::<Result<_>>()?;
-    let newest: Vec<String> = conn
-        .prepare_cached(&format!(
+        ),
+        vals![TODO, (limit / 2) as i64],
+    )?;
+    let newest: Vec<String> = db.column(
+        &format!(
             "select message_id from (
                 select message_id, number,
                     row_number() over (partition by coalesce(spotter, '') order by number desc) as turn
-                from spots_seen where state = ?1 and not {}
-             ) where turn <= ?2 order by turn, number desc limit ?3",
+                from spots_seen where state = $1 and not {}
+             ) t where turn <= $2 order by turn, number desc, message_id limit $3",
             seen_disposed()
-        ))?
-        .query_map(params![TODO, PER_SPOTTER, limit as i64], |r| r.get(0))?
-        .collect::<Result<_>>()?;
+        ),
+        vals![TODO, PER_SPOTTER, limit as i64],
+    )?;
     let mut out = oldest;
     for id in newest {
         if out.len() >= limit {
@@ -214,44 +216,40 @@ pub fn todo(conn: &Connection, limit: usize) -> Result<Vec<String>> {
 }
 
 /// Spots waiting to be fetched.
-pub fn waiting(conn: &Connection) -> Result<i64> {
-    conn.query_row(
-        &format!("select count(*) from spots_seen where state = ? and not {}", seen_disposed()),
-        [TODO],
-        |r| r.get(0),
-    )
+pub fn waiting(db: &dyn Sql) -> crate::pg::sql::Result<i64> {
+    db.one(&format!("select count(*) from spots_seen where state = $1 and not {}", seen_disposed()), vals![TODO])
 }
 
 /// Whether the `spots_seen` row was removed: a spot waiting has no `created`, so a spotter's own removal holds
 /// whenever it came.
 fn seen_disposed() -> String {
-    disposed_sql("d", "spots_seen", "spotter", None)
+    disposed_sql_in("", "d", "spots_seen", "spotter", None)
 }
 
 /// Gives up on spots waiting past `TODO_DAYS` and on the oldest past `MAX_TODO`, and forgets the ones that came to
 /// nothing past `KEEP_DAYS`, and removals of nothing kept. Saved ones stay. Returns the rows it changed.
-pub fn prune(conn: &Connection, now: i64) -> Result<usize> {
+pub fn prune(db: &dyn Sql, now: i64) -> crate::pg::sql::Result<usize> {
     let day = 86_400;
-    let mut n = conn.execute(
-        "update spots_seen set state = ?1 where state = ?2 and at < ?3",
-        params![GAVE_UP, TODO, now - TODO_DAYS * day],
+    let mut n = db.execute(
+        "update spots_seen set state = $1 where state = $2 and at < $3",
+        vals![GAVE_UP, TODO, now - TODO_DAYS * day],
     )?;
-    n += conn.execute(
-        "update spots_seen set state = ?1 where state = ?2 and message_id not in
-            (select message_id from spots_seen where state = ?2 order by number desc limit ?3)",
-        params![GAVE_UP, TODO, MAX_TODO],
+    n += db.execute(
+        "update spots_seen set state = $1 where state = $2 and message_id not in
+            (select message_id from spots_seen where state = $2 order by number desc, message_id limit $3)",
+        vals![GAVE_UP, TODO, MAX_TODO],
     )?;
-    n += conn.execute(
-        "delete from spots_seen where state not in (?1, ?2) and at < ?3",
-        params![TODO, SAVED, now - KEEP_DAYS * day],
+    n += db.execute(
+        "delete from spots_seen where state not in ($1, $2) and at < $3",
+        vals![TODO, SAVED, now - KEEP_DAYS * day],
     )?;
     // a removal is kept as long as what it removes may be: a spot waiting, or a saved spot or a comment (kept for
     // good)
-    n += conn.execute(
-        "delete from spot_disposals where at < ?1
-            and message_id not in (select message_id from spots_seen where state in (?2, ?3))
+    n += db.execute(
+        "delete from spot_disposals where at < $1
+            and message_id not in (select message_id from spots_seen where state in ($2, $3))
             and message_id not in (select message_id from spot_comments)",
-        params![now - KEEP_DAYS * day, SAVED, TODO],
+        vals![now - KEEP_DAYS * day, SAVED, TODO],
     )?;
     Ok(n)
 }
@@ -268,17 +266,18 @@ pub struct Settled {
 }
 
 /// What came of fetching a spot, or one more try (given up after `MAX_TRIES`).
-pub fn settle(conn: &Connection, message_id: &str, outcome: Option<&Settled>, now: i64) -> Result<()> {
+pub fn settle(db: &dyn Sql, message_id: &str, outcome: Option<&Settled>, now: i64) -> crate::pg::sql::Result<()> {
     match outcome {
-        Some(s) => conn.execute(
-            "update spots_seen set state = ?, release_id = ?, nzb_ref = ?, nzb_key = ?, at = ? where message_id = ?",
-            params![s.state, s.release_id, s.nzb_ref, s.nzb_key, now, message_id],
+        Some(s) => db.execute(
+            "update spots_seen set state = $1, release_id = $2, nzb_ref = $3, nzb_key = $4, at = $5
+             where message_id = $6",
+            vals![s.state, s.release_id, s.nzb_ref.as_deref(), s.nzb_key.as_deref(), now, message_id],
         )?,
-        None => conn.execute(
-            "update spots_seen set tries = tries + 1, at = ?,
-                state = case when tries + 1 >= ? then ? else state end
-             where message_id = ?",
-            params![now, MAX_TRIES, GAVE_UP, message_id],
+        None => db.execute(
+            "update spots_seen set tries = tries + 1, at = $1,
+                state = case when tries + 1 >= $2 then $3 else state end
+             where message_id = $4",
+            vals![now, MAX_TRIES, GAVE_UP, message_id],
         )?,
     };
     Ok(())
@@ -286,24 +285,24 @@ pub fn settle(conn: &Connection, message_id: &str, outcome: Option<&Settled>, no
 
 /// What an earlier spot pointing at the same NZB articles came to, `SAVED` (with its release) or `SKIPPED`: then
 /// they needn't be read again.
-pub fn known_ref(conn: &Connection, nzb_ref: &str) -> Result<Option<(i64, Option<i64>)>> {
-    conn.query_row(
-        "select state, release_id from spots_seen where nzb_ref = ? and state in (?, ?) order by state limit 1",
-        params![nzb_ref, SAVED, SKIPPED],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )
-    .optional()
+pub fn known_ref(db: &dyn Sql, nzb_ref: &str) -> crate::pg::sql::Result<Option<(i64, Option<i64>)>> {
+    db.row(
+        "select state, release_id from spots_seen where nzb_ref = $1 and state in ($2, $3)
+         order by state, message_id limit 1",
+        vals![nzb_ref, SAVED, SKIPPED],
+    )?
+    .map(|r| Ok((r.get(0)?, r.get(1)?)))
+    .transpose()
 }
 
 /// The release an earlier spot with the same NZB made. Kept here, in the main database, so a release that has
 /// been frozen since (its shard row gone) is still found.
-pub fn known_key(conn: &Connection, nzb_key: &str) -> Result<Option<i64>> {
-    conn.query_row(
-        "select release_id from spots_seen where nzb_key = ? and state = ? and release_id is not null limit 1",
-        params![nzb_key, SAVED],
-        |r| r.get(0),
+pub fn known_key(db: &dyn Sql, nzb_key: &str) -> crate::pg::sql::Result<Option<i64>> {
+    db.opt(
+        "select release_id from spots_seen where nzb_key = $1 and state = $2 and release_id is not null
+         order by message_id limit 1",
+        vals![nzb_key, SAVED],
     )
-    .optional()
 }
 
 /// A spot as its release's row in `spots` keeps it.
@@ -712,6 +711,17 @@ pub fn set_xml(conn: &Connection, release_id: i64, message_id: &str, xml: &str) 
 mod tests {
     use super::*;
 
+    /// `body` on the main database's tables, in SQLite and (with a test server) Postgres
+    fn both(body: impl Fn(&dyn Sql)) {
+        crate::pg::testing::each(
+            |c| {
+                c.execute_batch("create table meta (key TEXT PRIMARY KEY, value INTEGER)").unwrap();
+                create_main(c).unwrap();
+            },
+            body,
+        );
+    }
+
     fn main_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("create table meta (key TEXT PRIMARY KEY, value INTEGER)").unwrap();
@@ -722,33 +732,34 @@ mod tests {
 
     #[test]
     fn reading_the_overview_moves_the_cursor_with_the_spots() {
-        let mut conn = main_db();
-        assert_eq!(cursor(&conn, "news.example").unwrap(), None);
-        let spots = vec![("a@spot.net".to_string(), 10, None), ("b@spot.net".to_string(), 12, None)];
-        assert_eq!(note_read(&mut conn, "news.example", 20, &spots, 1).unwrap(), 2);
-        // read again: nothing new, the cursor still moves
-        assert_eq!(note_read(&mut conn, "news.example", 25, &spots, 2).unwrap(), 0);
-        assert_eq!(cursor(&conn, "news.example").unwrap(), Some(25));
-        assert_eq!(cursor(&conn, "other").unwrap(), None);
-        assert_eq!(todo(&conn, 10).unwrap(), ["a@spot.net", "b@spot.net"]);
+        both(|conn| {
+            assert_eq!(cursor(conn, "news.example").unwrap(), None);
+            let spots = vec![("a@spot.net".to_string(), 10, None), ("b@spot.net".to_string(), 12, None)];
+            assert_eq!(note_read(conn, "news.example", 20, &spots, 1).unwrap(), 2);
+            // read again: nothing new, the cursor still moves
+            assert_eq!(note_read(conn, "news.example", 25, &spots, 2).unwrap(), 0);
+            assert_eq!(cursor(conn, "news.example").unwrap(), Some(25));
+            assert_eq!(cursor(conn, "other").unwrap(), None);
+            assert_eq!(todo(conn, 10).unwrap(), ["a@spot.net", "b@spot.net"]);
+        });
     }
 
     #[test]
     fn settled_spots_leave_the_list_and_tries_run_out() {
-        let mut conn = main_db();
-        let spots = vec![("a@spot.net".to_string(), 1, None), ("b@spot.net".to_string(), 2, None)];
-        note_read(&mut conn, "s", 2, &spots, 0).unwrap();
-        settle(&conn, "b@spot.net", Some(&Settled { state: SAVED, release_id: Some(7), ..Settled::default() }), 1)
-            .unwrap();
-        assert_eq!(todo(&conn, 10).unwrap(), ["a@spot.net"]);
-        for _ in 0..MAX_TRIES {
-            assert_eq!(todo(&conn, 10).unwrap(), ["a@spot.net"]);
-            settle(&conn, "a@spot.net", None, 1).unwrap();
-        }
-        assert!(todo(&conn, 10).unwrap().is_empty());
-        let state: i64 =
-            conn.query_row("select state from spots_seen where message_id = 'a@spot.net'", [], |r| r.get(0)).unwrap();
-        assert_eq!(state, GAVE_UP);
+        both(|conn| {
+            let spots = vec![("a@spot.net".to_string(), 1, None), ("b@spot.net".to_string(), 2, None)];
+            note_read(conn, "s", 2, &spots, 0).unwrap();
+            settle(conn, "b@spot.net", Some(&Settled { state: SAVED, release_id: Some(7), ..Settled::default() }), 1)
+                .unwrap();
+            assert_eq!(todo(conn, 10).unwrap(), ["a@spot.net"]);
+            for _ in 0..MAX_TRIES {
+                assert_eq!(todo(conn, 10).unwrap(), ["a@spot.net"]);
+                settle(conn, "a@spot.net", None, 1).unwrap();
+            }
+            assert!(todo(conn, 10).unwrap().is_empty());
+            let state: i64 = conn.one("select state from spots_seen where message_id = 'a@spot.net'", vals![]).unwrap();
+            assert_eq!(state, GAVE_UP);
+        });
     }
 
     /// A shard's tables: tagging a release touches its row and the stage's queue (`recategorize`).
@@ -855,62 +866,60 @@ mod tests {
 
     #[test]
     fn todo_takes_spotters_in_turn() {
-        let mut conn = main_db();
-        // one spotter with 30 spots, newer than another's 2
-        let mut spots: Vec<Noted> =
-            (0..30).map(|n| (format!("flood{n}@spot.net"), 100 + n, Some("A".into()))).collect();
-        spots.push(("b1@spot.net".into(), 1, Some("B".into())));
-        spots.push(("b2@spot.net".into(), 2, Some("B".into())));
-        note_read(&mut conn, "s", 200, &spots, 0).unwrap();
-        // half to the oldest, whoever posted them; the rest to spotters in turn, newest first
-        let first = todo(&conn, 4).unwrap();
-        assert_eq!(first, ["b1@spot.net", "b2@spot.net", "flood29@spot.net", "flood28@spot.net"]);
-        // flooded with new keys, the oldest still get half of every round
-        let fresh: Vec<Noted> =
-            (0..50).map(|n| (format!("key{n}@spot.net"), 1000 + n, Some(format!("K{n}")))).collect();
-        note_read(&mut conn, "s", 2000, &fresh, 0).unwrap();
-        let round = todo(&conn, 10).unwrap();
-        assert_eq!(&round[..2], ["b1@spot.net", "b2@spot.net"]);
-        assert!(round[2..5].iter().all(|id| id.starts_with("flood")), "{round:?}");
+        both(|conn| {
+            // one spotter with 30 spots, newer than another's 2
+            let mut spots: Vec<Noted> =
+                (0..30).map(|n| (format!("flood{n}@spot.net"), 100 + n, Some("A".into()))).collect();
+            spots.push(("b1@spot.net".into(), 1, Some("B".into())));
+            spots.push(("b2@spot.net".into(), 2, Some("B".into())));
+            note_read(conn, "s", 200, &spots, 0).unwrap();
+            // half to the oldest, whoever posted them; the rest to spotters in turn, newest first
+            let first = todo(conn, 4).unwrap();
+            assert_eq!(first, ["b1@spot.net", "b2@spot.net", "flood29@spot.net", "flood28@spot.net"]);
+            // flooded with new keys, the oldest still get half of every round
+            let fresh: Vec<Noted> =
+                (0..50).map(|n| (format!("key{n}@spot.net"), 1000 + n, Some(format!("K{n}")))).collect();
+            note_read(conn, "s", 2000, &fresh, 0).unwrap();
+            let round = todo(conn, 10).unwrap();
+            assert_eq!(&round[..2], ["b1@spot.net", "b2@spot.net"]);
+            assert!(round[2..5].iter().all(|id| id.starts_with("flood")), "{round:?}");
+        });
     }
 
     #[test]
     fn prune_gives_up_on_stale_and_excess_spots_and_forgets_old_ones() {
-        let mut conn = main_db();
-        let day = 86_400;
-        let spots: Vec<Noted> = vec![("old@spot.net".into(), 1, None), ("new@spot.net".into(), 2, None)];
-        note_read(&mut conn, "s", 2, &spots, 0).unwrap();
-        conn.execute("update spots_seen set at = ? where message_id = 'new@spot.net'", [TODO_DAYS * day]).unwrap();
-        assert_eq!(prune(&conn, TODO_DAYS * day + 1).unwrap(), 1);
-        assert_eq!(todo(&conn, 10).unwrap(), ["new@spot.net"]);
-        // past KEEP_DAYS, a spot that came to nothing goes and a saved one stays
-        settle(&conn, "new@spot.net", Some(&Settled { state: SAVED, ..Settled::default() }), 0).unwrap();
-        prune(&conn, KEEP_DAYS * day + 1).unwrap();
-        let left: Vec<String> = conn
-            .prepare("select message_id from spots_seen")
-            .unwrap()
-            .query_map([], |r| r.get(0))
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect();
-        assert_eq!(left, ["new@spot.net"]);
+        both(|conn| {
+            let day = 86_400;
+            let spots: Vec<Noted> = vec![("old@spot.net".into(), 1, None), ("new@spot.net".into(), 2, None)];
+            note_read(conn, "s", 2, &spots, 0).unwrap();
+            conn.execute("update spots_seen set at = $1 where message_id = 'new@spot.net'", vals![TODO_DAYS * day])
+                .unwrap();
+            assert_eq!(prune(conn, TODO_DAYS * day + 1).unwrap(), 1);
+            assert_eq!(todo(conn, 10).unwrap(), ["new@spot.net"]);
+            // past KEEP_DAYS, a spot that came to nothing goes and a saved one stays
+            settle(conn, "new@spot.net", Some(&Settled { state: SAVED, ..Settled::default() }), 0).unwrap();
+            prune(conn, KEEP_DAYS * day + 1).unwrap();
+            let left: Vec<String> = conn.column("select message_id from spots_seen", vals![]).unwrap();
+            assert_eq!(left, ["new@spot.net"]);
+        });
     }
 
     #[test]
     fn nzbs_are_known_by_their_articles_and_their_contents() {
-        let mut conn = main_db();
-        let spots: Vec<Noted> = vec![("a@spot.net".into(), 1, None), ("b@spot.net".into(), 2, None)];
-        note_read(&mut conn, "s", 2, &spots, 0).unwrap();
-        assert_eq!(known_ref(&conn, "r1").unwrap(), None);
-        let saved =
-            Settled { state: SAVED, release_id: Some(9), nzb_ref: Some("r1".into()), nzb_key: Some("k1".into()) };
-        settle(&conn, "a@spot.net", Some(&saved), 0).unwrap();
-        let skipped = Settled { state: SKIPPED, nzb_ref: Some("r2".into()), ..Settled::default() };
-        settle(&conn, "b@spot.net", Some(&skipped), 0).unwrap();
-        assert_eq!(known_ref(&conn, "r1").unwrap(), Some((SAVED, Some(9))));
-        assert_eq!(known_ref(&conn, "r2").unwrap(), Some((SKIPPED, None)));
-        assert_eq!(known_key(&conn, "k1").unwrap(), Some(9));
-        assert_eq!(known_key(&conn, "k2").unwrap(), None);
+        both(|conn| {
+            let spots: Vec<Noted> = vec![("a@spot.net".into(), 1, None), ("b@spot.net".into(), 2, None)];
+            note_read(conn, "s", 2, &spots, 0).unwrap();
+            assert_eq!(known_ref(conn, "r1").unwrap(), None);
+            let saved =
+                Settled { state: SAVED, release_id: Some(9), nzb_ref: Some("r1".into()), nzb_key: Some("k1".into()) };
+            settle(conn, "a@spot.net", Some(&saved), 0).unwrap();
+            let skipped = Settled { state: SKIPPED, nzb_ref: Some("r2".into()), ..Settled::default() };
+            settle(conn, "b@spot.net", Some(&skipped), 0).unwrap();
+            assert_eq!(known_ref(conn, "r1").unwrap(), Some((SAVED, Some(9))));
+            assert_eq!(known_ref(conn, "r2").unwrap(), Some((SKIPPED, None)));
+            assert_eq!(known_key(conn, "k1").unwrap(), Some(9));
+            assert_eq!(known_key(conn, "k2").unwrap(), None);
+        });
     }
 
     #[test]
@@ -1043,7 +1052,7 @@ mod tests {
 
     #[test]
     fn removed_spots_are_not_fetched_tagged_or_shown_as_spots() {
-        let mut conn = main_db();
+        let conn = main_db();
         let day = 86_400;
         let spots = vec![
             ("mod@spot.net".to_string(), 1, Some("aaa".to_string())),
@@ -1051,7 +1060,7 @@ mod tests {
             ("forged@spot.net".to_string(), 3, Some("ccc".to_string())),
             ("kept@spot.net".to_string(), 4, Some("ddd".to_string())),
         ];
-        note_read(&mut conn, "s", 4, &spots, 0).unwrap();
+        note_read(&conn, "s", 4, &spots, 0).unwrap();
         let d = |id: &str, spotter: &str, at: i64| Disposal { message_id: id.into(), spotter: spotter.into(), at };
         let removals = [
             d("mod@spot.net", "", 10),
@@ -1061,12 +1070,12 @@ mod tests {
             // and its spotter removing it late holds only while it waits (no `created` yet)
             d("late@spot.net", "eee", 10 * day),
         ];
-        assert_eq!(note_disposals(&mut conn, &removals).unwrap(), 4);
-        assert_eq!(note_disposals(&mut conn, &removals).unwrap(), 0, "noted once");
+        assert_eq!(note_disposals(&conn, &removals).unwrap(), 4);
+        assert_eq!(note_disposals(&conn, &removals).unwrap(), 0, "noted once");
         assert_eq!(todo(&conn, 10).unwrap(), ["forged@spot.net", "kept@spot.net"]);
         assert_eq!(waiting(&conn).unwrap(), 2);
         // noted after its removal: still not fetched
-        note_read(&mut conn, "s", 5, &[("late@spot.net".to_string(), 5, Some("eee".to_string()))], 0).unwrap();
+        note_read(&conn, "s", 5, &[("late@spot.net".to_string(), 5, Some("eee".to_string()))], 0).unwrap();
         assert_eq!(todo(&conn, 10).unwrap(), ["forged@spot.net", "kept@spot.net"]);
 
         // saved ones lose their tag, and their page says why
@@ -1110,8 +1119,8 @@ mod tests {
         settle(&conn, "forged@spot.net", Some(&skipped), 0).unwrap();
         // an old removal of a spot just noted (an overview read far back) stays while the spot waits
         let now = KEEP_DAYS * day + 11;
-        note_disposals(&mut conn, &[d("fresh@spot.net", "", 5)]).unwrap();
-        note_read(&mut conn, "s", 6, &[("fresh@spot.net".to_string(), 6, None)], now).unwrap();
+        note_disposals(&conn, &[d("fresh@spot.net", "", 5)]).unwrap();
+        note_read(&conn, "s", 6, &[("fresh@spot.net".to_string(), 6, None)], now).unwrap();
         prune(&conn, now).unwrap();
         let kept: Vec<String> = conn
             .prepare("select message_id from spot_disposals order by message_id")
