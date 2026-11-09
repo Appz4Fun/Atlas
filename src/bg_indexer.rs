@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -15,7 +15,7 @@ use crate::compact::WriteGuard;
 use crate::config::{Config, UsenetServer, load_config};
 use crate::db;
 use crate::indexer::{Db, NotCarried, PassContext, PassSettings, Progress, RunStates, TooOld, run_pass_on, shared_db};
-use crate::nntp::{Pool, unless_stopped};
+use crate::nntp::{Pool, RankView, unless_stopped};
 use crate::paths;
 use crate::postprocess::{Stage, StageParams};
 use crate::sab;
@@ -322,6 +322,12 @@ struct Scheduler {
     chunking: Mutex<HashSet<usize>>,
     /// groups resting after going idle or after an error
     wait_until: Mutex<HashMap<String, Instant>>,
+    /// when `wait_until` was last rid of groups done resting
+    wait_pruned: Mutex<Option<Instant>>,
+    /// goes up when `groups` changes (with its write lock held)
+    groups_changed: AtomicU64,
+    /// by rank: every group's servers in order, see `RankCache`
+    rank_cache: Mutex<Option<Arc<RankCache>>>,
     /// consecutive errors per group, on each server
     errors: Mutex<HashMap<(String, usize), u32>>,
     /// groups parked after 3 errors in a row, retried after FAILED_RETRY
@@ -351,6 +357,135 @@ struct Parked {
     stood_in: Vec<usize>,
 }
 
+/// With groups going by rank: every group's servers in order (`Pool::rank_order` over the tier), worked out once for
+/// each change of the groups, the tier or the bans instead of for each group on every `take_group`. Prod's 3087 groups
+/// on 9 servers took 9 bans each per look, and the workers of the servers below the best, which by rank have no
+/// group of their own, looked at every group on every call with the scheduler's locks held: ~50 headers/s.
+struct RankCache {
+    /// (`Scheduler::groups_changed`, `Pool::bans_version`) it was worked out for
+    version: (u64, u64),
+    tier: Vec<usize>,
+    /// a learned ban ends then (unix seconds), and with it some group's order
+    until: i64,
+    /// a group's place in the groups
+    idx: HashMap<String, u32>,
+    /// each group's order, in `orders`
+    of: Vec<u32>,
+    /// the orders groups have, each once: groups with no bans all share the first
+    orders: Vec<Ranked>,
+    /// the groups whose order puts them on each server while none is short of connections, in the groups' order
+    home: HashMap<usize, Vec<u32>>,
+}
+
+/// One order of servers (`Pool::rank_order`) and the groups that have it.
+struct Ranked {
+    servers: Vec<usize>,
+    /// with `servers` empty (config bans the groups from every server left): where they go, if anywhere
+    none_left: Option<usize>,
+    /// it's the order of groups banned from every server, `servers` banned too
+    all_banned: bool,
+    /// in the groups' order
+    groups: Vec<u32>,
+}
+
+impl Ranked {
+    /// the server its groups go to unless one was given another (`RankView::pick`)
+    fn target(&self, view: &RankView) -> Option<usize> {
+        if self.servers.is_empty() {
+            return self.none_left;
+        }
+        self.servers.iter().copied().find(|&i| !view.saturated(i)).or(self.servers.first().copied())
+    }
+}
+
+impl RankCache {
+    fn new(pool: &Pool, groups: &[String], tier: &[usize], version: (u64, u64)) -> Self {
+        let until = pool.next_ban_end();
+        let mut index: HashMap<(Vec<usize>, Option<usize>), u32> = HashMap::new();
+        let mut orders: Vec<Ranked> = Vec::new();
+        let mut of = Vec::with_capacity(groups.len());
+        let mut idx = HashMap::with_capacity(groups.len());
+        for (i, g) in groups.iter().enumerate() {
+            let (servers, all_banned) = pool.rank_order_why(tier, g);
+            let none_left =
+                if servers.is_empty() { tier.first().copied().filter(|&s| !pool.banned_for_good(g, s)) } else { None };
+            let n = *index.entry((servers.clone(), none_left)).or_insert_with(|| {
+                orders.push(Ranked { servers, none_left, all_banned, groups: Vec::new() });
+                orders.len() as u32 - 1
+            });
+            orders[n as usize].groups.push(i as u32);
+            of.push(n);
+            idx.insert(g.clone(), i as u32);
+        }
+        let mut home: HashMap<usize, Vec<u32>> = HashMap::new();
+        for o in &orders {
+            if let Some(s) = o.servers.first().copied().or(o.none_left) {
+                home.entry(s).or_default().extend(&o.groups);
+            }
+        }
+        for list in home.values_mut() {
+            list.sort_unstable();
+        }
+        RankCache { version, tier: tier.to_vec(), until, idx, of, orders, home }
+    }
+
+    fn order_at(&self, i: usize) -> &[usize] {
+        &self.orders[self.of[i] as usize].servers
+    }
+
+    /// `group`'s order, none for one not among the groups
+    fn order(&self, group: &str) -> &[usize] {
+        self.idx.get(group).map_or(&[], |&i| self.order_at(i as usize))
+    }
+
+    /// the server the passes of the group at `i` go to (not parked), as `Pool::server_for_in` gives it
+    fn on(&self, i: usize, group: &str, view: &RankView) -> Option<usize> {
+        let o = &self.orders[self.of[i] as usize];
+        if o.servers.is_empty() { o.none_left } else { view.pick(&o.servers, group) }
+    }
+
+    /// whether `group` isn't read from `server`, one in the tier (`Pool::banned`)
+    fn banned(&self, group: &str, server: usize) -> bool {
+        self.idx.get(group).is_some_and(|&i| {
+            let o = &self.orders[self.of[i as usize] as usize];
+            o.all_banned || !o.servers.contains(&server)
+        })
+    }
+
+    /// `home` of `server` and `extra`, in the groups' order
+    fn home_of(&self, server: usize, len: usize, extra: &[u32]) -> std::borrow::Cow<'_, [u32]> {
+        let home = self.home.get(&server).map_or(&[][..], Vec::as_slice);
+        if extra.is_empty() {
+            return std::borrow::Cow::Borrowed(home);
+        }
+        let mut mark = vec![false; len];
+        for &i in home.iter().chain(extra) {
+            mark[i as usize] = true;
+        }
+        std::borrow::Cow::Owned((0..len as u32).filter(|&i| mark[i as usize]).collect())
+    }
+
+    /// the groups of the orders `pick` takes and `extra`, in the groups' order
+    fn groups_of(&self, len: usize, pick: impl Fn(&Ranked) -> bool, extra: &[u32]) -> std::borrow::Cow<'_, [u32]> {
+        let picked: Vec<bool> = self.orders.iter().map(pick).collect();
+        if extra.is_empty() {
+            let mut which = picked.iter().enumerate().filter(|(_, p)| **p).map(|(n, _)| n);
+            match (which.next(), which.next()) {
+                (None, _) => return std::borrow::Cow::Borrowed(&[]),
+                (Some(n), None) => return std::borrow::Cow::Borrowed(&self.orders[n].groups),
+                _ => {}
+            }
+        }
+        let mut mark = vec![false; len];
+        for &i in extra {
+            mark[i as usize] = true;
+        }
+        std::borrow::Cow::Owned(
+            (0..len as u32).filter(|&i| mark[i as usize] || picked[self.of[i as usize] as usize]).collect(),
+        )
+    }
+}
+
 impl Scheduler {
     fn stopping(&self) -> bool {
         self.wind_down.load(Ordering::Relaxed) || self.ctx.stop.load(Ordering::Relaxed)
@@ -377,6 +512,9 @@ impl Scheduler {
             // this server is resting after a failure, its groups went elsewhere
             return None;
         }
+        // by rank: every group's servers in order, worked out again only when something they depend on changed, and
+        // before the locks below are taken
+        let ranked = pool.ranks().then(|| self.rank_cache(&groups, &tier));
 
         let mut busy = self.busy.lock().unwrap();
         let mut wait = self.wait_until.lock().unwrap();
@@ -385,13 +523,25 @@ impl Scheduler {
         let next = next.entry(server).or_insert(0);
 
         failed.retain(|_, parked| parked.since.elapsed() < FAILED_RETRY);
-        wait.retain(|_, until| *until > now);
+        // thousands of groups can be resting: the ones done resting are let go of once a second, not on every call
+        {
+            let mut pruned = self.wait_pruned.lock().unwrap();
+            if pruned.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1)) {
+                wait.retain(|_, until| *until > now);
+                *pruned = Some(now);
+            }
+        }
+        let resting = |g: &str| wait.get(g).is_some_and(|until| *until > now);
+        if let Some(cache) = ranked {
+            return self.take_ranked(server, &groups, &tier, &cache, &mut busy, &resting, &failed, next);
+        }
+
         // the server a group's passes go to: a parked one's stand-in. none when config bans it from every server left
         let on = |g: &String| match failed.get(g) {
             None => pool.server_for_in(&tier, g),
             Some(parked) => pool.fallback_in(&tier, g, &parked.servers),
         };
-        let free = |g: &String| !busy.contains_key(g) && !wait.contains_key(g) && on(g) == Some(server);
+        let free = |g: &String| !busy.contains_key(g) && !resting(g) && on(g) == Some(server);
 
         // a group big releases come from goes as soon as it's due, so it keeps up with what's posted while the round
         // robin goes through all the others; one worker at a time on each, like any group, and at most half of the
@@ -418,31 +568,142 @@ impl Scheduler {
             return Some(g.clone());
         }
 
-        // by rank: a group whose server has every worker busy goes to this one when it's next down the group's list
-        // and every server above it is just as full, and stays a while (`Pool::assign`)
-        if pool.ranks() {
-            let mut taken: HashMap<usize, usize> = HashMap::new();
-            for &s in busy.values() {
-                *taken.entry(s).or_insert(0) += 1;
-            }
-            let full = |s: usize| taken.get(&s).copied().unwrap_or(0) >= self.workers_of(s);
-            for step in 0..groups.len() {
-                let idx = (*next + step) % groups.len();
-                let g = &groups[idx];
-                if busy.contains_key(g) || wait.contains_key(g) || failed.contains_key(g) {
-                    continue;
+        None
+    }
+
+    /// The groups' `RankCache` for `groups` over `tier`, worked out again when the groups, the tier or the bans
+    /// changed, or a learned ban ended.
+    fn rank_cache(&self, groups: &[String], tier: &[usize]) -> Arc<RankCache> {
+        let pool = &self.ctx.pool;
+        let version = (self.groups_changed.load(Ordering::Relaxed), pool.bans_version());
+        let mut cache = self.rank_cache.lock().unwrap();
+        if let Some(c) = cache.as_ref()
+            && c.version == version
+            && c.tier == tier
+            && c.of.len() == groups.len()
+            && (now() as i64) < c.until
+        {
+            return c.clone();
+        }
+        let built = Arc::new(RankCache::new(pool, groups, tier, version));
+        *cache = Some(built.clone());
+        built
+    }
+
+    /// `take_group` when groups go by rank, with the scheduler's locks held: the same picks as looking at every group
+    /// in turn would give, from only the groups that can be on `server` (see `RankCache`), soo a server no group is
+    /// on finds that out without a look at each.
+    #[allow(clippy::too_many_arguments)]
+    fn take_ranked(
+        &self,
+        server: usize,
+        groups: &[String],
+        tier: &[usize],
+        cache: &RankCache,
+        busy: &mut HashMap<String, usize>,
+        resting: &dyn Fn(&str) -> bool,
+        failed: &HashMap<String, Parked>,
+        next: &mut usize,
+    ) -> Option<String> {
+        let pool = &self.ctx.pool;
+        let mut view = pool.rank_view();
+        // the server a group's passes go to: a parked one's stand-in. none when config bans it from every server left
+        let on = |g: &str, view: &RankView| match failed.get(g) {
+            Some(parked) => pool.fallback_in(tier, g, &parked.servers),
+            None => match cache.idx.get(g) {
+                Some(&i) => cache.on(i as usize, g, view),
+                // not one of the groups (a group big releases come from that config.toml left out)
+                None => {
+                    let order = pool.rank_order(tier, g);
+                    view.pick(&order, g).or_else(|| tier.first().copied().filter(|&i| !pool.banned_for_good(g, i)))
                 }
-                let Some(now_on) = on(g).filter(|&s| s != server && full(s)) else { continue };
-                let order = pool.rank_order(&tier, g);
-                let Some(at) = order.iter().position(|&s| s == server) else { continue };
-                if !order[..at].iter().all(|&s| s == now_on || full(s)) {
-                    continue;
-                }
-                *next = idx + 1;
-                pool.assign(g, server);
-                busy.insert(g.clone(), server);
-                return Some(g.clone());
+            },
+        };
+        let free = |g: &str, view: &RankView| !busy.contains_key(g) && !resting(g) && on(g, view) == Some(server);
+
+        // a group big releases come from goes as soon as it's due, like `take_group` says
+        let media = self.media.read().unwrap();
+        let on_media = media.iter().filter(|g| busy.contains_key(*g) && on(g, &view) == Some(server)).count();
+        if on_media < self.media_share(server)
+            && let Some(g) = media.iter().find(|g| cache.idx.contains_key(*g) && free(g, &view))
+        {
+            if !failed.contains_key(g) {
+                view.keep(cache.order(g), g, server);
             }
+            busy.insert(g.clone(), server);
+            return Some(g.clone());
+        }
+
+        // the round robin, over the groups that can be on this server: those whose order has it first among the
+        // servers with connections to spare, those given to it, and parked ones standing in on it
+        let mut extra: Vec<u32> = view.given_to(server).filter_map(|g| cache.idx.get(g).copied()).collect();
+        for (g, parked) in failed {
+            if pool.fallback_in(tier, g, &parked.servers) == Some(server)
+                && let Some(&i) = cache.idx.get(g.as_str())
+            {
+                extra.push(i);
+            }
+        }
+        let candidates = if view.any_saturated() {
+            cache.groups_of(groups.len(), |o| o.target(&view) == Some(server), &extra)
+        } else {
+            cache.home_of(server, groups.len(), &extra)
+        };
+        let start = candidates.partition_point(|&i| (i as usize) < *next % groups.len());
+        for &i in candidates[start..].iter().chain(&candidates[..start]) {
+            let g = &groups[i as usize];
+            if !free(g, &view) {
+                continue;
+            }
+            *next = i as usize + 1;
+            if !failed.contains_key(g) {
+                view.keep(cache.order_at(i as usize), g, server);
+            }
+            busy.insert(g.clone(), server);
+            return Some(g.clone());
+        }
+
+        // a group whose server has every worker busy goes to this one when it's next down the group's list and every
+        // server above it is just as full, and stays a while (`Pool::assign`). Only while another server is full, and
+        // only among the groups that can be on a full one
+        let mut taken: HashMap<usize, usize> = HashMap::new();
+        for &s in busy.values() {
+            *taken.entry(s).or_insert(0) += 1;
+        }
+        let full = |s: usize| taken.get(&s).copied().unwrap_or(0) >= self.workers_of(s);
+        if !tier.iter().chain(taken.keys()).any(|&s| s != server && full(s)) {
+            return None;
+        }
+        let mut extra: Vec<u32> = Vec::new();
+        for &s in tier.iter().chain(taken.keys()) {
+            if s != server && full(s) {
+                extra.extend(view.given_to(s).filter_map(|g| cache.idx.get(g).copied()));
+            }
+        }
+        let candidates = cache.groups_of(
+            groups.len(),
+            |o| {
+                o.servers.iter().position(|&s| s == server).is_some_and(|at| o.servers[..at].iter().all(|&s| full(s)))
+                    && o.target(&view).is_some_and(|t| t != server && full(t))
+            },
+            &extra,
+        );
+        let start = candidates.partition_point(|&i| (i as usize) < *next % groups.len());
+        for &i in candidates[start..].iter().chain(&candidates[..start]) {
+            let g = &groups[i as usize];
+            if busy.contains_key(g) || resting(g) || failed.contains_key(g) {
+                continue;
+            }
+            let Some(now_on) = on(g, &view).filter(|&s| s != server && full(s)) else { continue };
+            let order = cache.order_at(i as usize);
+            let Some(at) = order.iter().position(|&s| s == server) else { continue };
+            if !order[..at].iter().all(|&s| s == now_on || full(s)) {
+                continue;
+            }
+            *next = i as usize + 1;
+            view.assign(g, server);
+            busy.insert(g.clone(), server);
+            return Some(g.clone());
         }
 
         None
@@ -652,10 +913,20 @@ async fn take_chunk(sched: &Scheduler, server: usize, db: &Db) -> Option<crate::
         skip.keys().filter(|(_, s)| *s == server).map(|(g, _)| g.clone()).collect()
     };
     let mode = sched.settings.read().unwrap().mode.clone();
-    let mut groups = chunk_groups(&mode, &sched.groups.read().unwrap(), &skip);
-    // a server a group is banned from takes none of its day chunks either (`Pool::banned`): by config, ranked or not,
-    // and by rank for a while
-    groups.retain(|g| !sched.ctx.pool.banned(g, server));
+    let groups = {
+        let all = sched.groups.read().unwrap();
+        let mut groups = chunk_groups(&mode, &all, &skip);
+        // a server a group is banned from takes none of its day chunks either (`Pool::banned`): by config, ranked or
+        // not, and by rank for a while, which the groups' orders already worked out say
+        if sched.ctx.pool.ranks() && !groups.is_empty() {
+            let tier = sched.ctx.pool.indexing_tier();
+            let cache = sched.rank_cache(&all, &tier);
+            groups.retain(|g| !cache.banned(g, server));
+        } else {
+            groups.retain(|g| !sched.ctx.pool.banned(g, server));
+        }
+        groups
+    };
     if groups.is_empty() {
         return None;
     }
@@ -686,10 +957,31 @@ async fn take_sweep(sched: &Scheduler, server: usize, db: &Db) -> Option<String>
         skip.keys().filter(|(_, s)| *s == server).map(|(g, _)| g.clone()).collect()
     };
     let mode = sched.settings.read().unwrap().mode.clone();
-    let groups: Vec<String> = chunk_groups(&mode, &sched.groups.read().unwrap(), &skip)
-        .into_iter()
-        .filter(|g| sched.ctx.pool.pick_server_in(&tier, g) != server && !sched.ctx.pool.banned_for_good(g, server))
-        .collect();
+    let groups: Vec<String> = {
+        let all = sched.groups.read().unwrap();
+        let groups = chunk_groups(&mode, &all, &skip);
+        let pool = &sched.ctx.pool;
+        if pool.ranks() && !groups.is_empty() {
+            // by rank, from the groups' orders worked out already, and without writing where each goes (`RankView`)
+            let cache = sched.rank_cache(&all, &tier);
+            let view = pool.rank_view();
+            groups
+                .into_iter()
+                .filter(|g| {
+                    let on = match cache.idx.get(g.as_str()) {
+                        Some(&i) => cache.on(i as usize, g, &view),
+                        None => Some(server),
+                    };
+                    on != Some(server) && !pool.banned_for_good(g, server)
+                })
+                .collect()
+        } else {
+            groups
+                .into_iter()
+                .filter(|g| pool.pick_server_in(&tier, g) != server && !pool.banned_for_good(g, server))
+                .collect()
+        }
+    };
     let found = match crate::indexer::sweep_to_take(db, sched.ctx.pool.host(server), groups).await {
         Ok(found) => found,
         Err(e) => {
@@ -743,14 +1035,36 @@ async fn next_work(sched: &Scheduler, server: usize, db: &Db, after_sweep: bool)
     take_chunk(sched, server, db).await.map(|chunk| Work::Chunk(chunk, false))
 }
 
+/// longest an idle worker naps when groups go by rank
+const RANKED_IDLE_MAX: Duration = Duration::from_secs(5);
+
+/// How long a worker on `server` that found nothing to do naps, its `idle`th time in a row. A second, but by rank
+/// every group is the best server's and the workers of the others mostly find nothing (~375 of prod's ~450): those
+/// nap twice as long each time up to `RANKED_IDLE_MAX`, a bit apart soo they dont all wake at once. With that many,
+/// one still looks every few hundredths of a second, for a group the best server has no worker free for.
+fn idle_nap(ranked: bool, idle: u32, server: usize) -> Duration {
+    let base = Duration::from_secs(1);
+    if !ranked {
+        return base;
+    }
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().subsec_nanos();
+    let jitter = Duration::from_millis((u64::from(nanos) + server as u64 * 97) % 250);
+    (base * 2u32.saturating_pow(idle.min(8))).min(RANKED_IDLE_MAX) + jitter
+}
+
 /// One worker on `server`: index whichever of its groups is due next, again and again.
 /// All workers share one db connection, soo their writes queue up in order
 /// instead of racing for sqlite's write lock (and timing out on a busy db).
 async fn worker(sched: Arc<Scheduler>, server: usize, db: Db) {
     let mut after_sweep = false;
+    // naps in a row with nothing to do
+    let mut idle = 0u32;
     while !sched.stopping() {
         let work = next_work(&sched, server, &db, after_sweep).await;
         after_sweep = matches!(work, Some(Work::Sweep(_) | Work::Chunk(_, true)));
+        if work.is_some() {
+            idle = 0;
+        }
         let group = match work {
             Some(Work::Group(group)) => group,
             // help with a split group's day chunks. not marked busy, a
@@ -781,7 +1095,8 @@ async fn worker(sched: Arc<Scheduler>, server: usize, db: Db) {
                 continue;
             }
             None => {
-                nap(Duration::from_secs(1), || sched.stopping()).await;
+                nap(idle_nap(sched.ctx.pool.ranks(), idle, server), || sched.stopping()).await;
+                idle += 1;
                 continue;
             }
         };
@@ -901,6 +1216,7 @@ async fn watch_config(sched: Arc<Scheduler>, servers: Vec<UsenetServer>) {
             println!("groups changed: {} -> {}", current.len(), groups.len());
             sched.ctx.states.set_tracked(&groups);
             *current = groups;
+            sched.groups_changed.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -982,6 +1298,9 @@ async fn run_servers(
         sweeping: Mutex::new(HashSet::new()),
         chunking: Mutex::new(HashSet::new()),
         wait_until: Mutex::new(HashMap::new()),
+        wait_pruned: Mutex::new(None),
+        groups_changed: AtomicU64::new(0),
+        rank_cache: Mutex::new(None),
         errors: Mutex::new(HashMap::new()),
         failed: Mutex::new(HashMap::new()),
         stats,
@@ -1534,6 +1853,9 @@ mod tests {
             sweeping: Default::default(),
             chunking: Default::default(),
             wait_until: Default::default(),
+            wait_pruned: Default::default(),
+            groups_changed: Default::default(),
+            rank_cache: Default::default(),
             errors: Default::default(),
             failed: Default::default(),
             stats: Arc::new(Mutex::new(Stats::new())),
@@ -1560,6 +1882,174 @@ mod tests {
         sched.busy.lock().unwrap().remove("g1");
         assert_eq!(sched.take_group(1), None, "a has a worker free again: nothing more for b");
         assert_eq!(sched.take_group(0).as_deref(), Some("g3"));
+    }
+
+    /// by rank, a worker of a server down the list that has nothing to take finds that out fast: prod has 3087 groups
+    /// on 9 servers and ~375 workers that aren't the best server's, and a scan of every group per call held the
+    /// scheduler's locks soo long the indexer read ~50 headers/s
+    #[test]
+    fn by_rank_a_take_on_a_server_down_the_list_is_quick() {
+        let servers: Vec<UsenetServer> =
+            (0..9).map(|i| UsenetServer::new(&format!("s{i}.test"), "u", "p", 119)).collect();
+        let pool = Pool::new(&servers)
+            .with_ranking(&crate::config::IndexingConfig { ranked: true, ..Default::default() }, None);
+        let groups: Vec<String> = (0..3000).map(|i| format!("alt.binaries.g{i}")).collect();
+        let mut sched = scheduler(pool, groups);
+        sched.plan = (0..9).map(|i| (i, 50)).collect();
+        let top = sched.ctx.pool.rank_order(&sched.ctx.pool.indexing_tier(), "alt.binaries.g0")[0];
+        let other = (0..9).find(|&s| s != top).unwrap();
+        // the best server busy with some of its groups, not all of its workers
+        for _ in 0..10 {
+            assert!(sched.take_group(top).is_some());
+        }
+        assert_eq!(sched.take_group(other), None, "nothing for a server down the list while the best has room");
+        let calls = 200;
+        let start = Instant::now();
+        for _ in 0..calls {
+            assert_eq!(sched.take_group(other), None);
+        }
+        let each = start.elapsed() / calls;
+        println!("take_group on a server down the list: {each:?} a call");
+        assert!(each < Duration::from_micros(200), "{each:?} a call");
+
+        // the worst: the best server full and every other group resting, soo the overflow looks at each in vain
+        for _ in 10..50 {
+            assert!(sched.take_group(top).is_some());
+        }
+        let later = Instant::now() + Duration::from_secs(600);
+        for g in sched.groups.read().unwrap().iter() {
+            if !sched.busy.lock().unwrap().contains_key(g) {
+                sched.wait_until.lock().unwrap().insert(g.clone(), later);
+            }
+        }
+        let start = Instant::now();
+        for _ in 0..calls {
+            assert_eq!(sched.take_group(other), None);
+        }
+        let each = start.elapsed() / calls;
+        println!("take_group finding nothing while the best server is full: {each:?} a call");
+        // ~0.1 ms in a release build, ~1.7 ms in a debug one
+        assert!(each < Duration::from_millis(10), "{each:?} a call");
+    }
+
+    /// by rank, `take_group` picks what a look at every group in turn picks (the scan it had before `RankCache`), with
+    /// bans, parked groups, groups handed down the list, resting and busy ones, and full servers
+    #[test]
+    fn by_rank_a_take_picks_what_a_look_at_every_group_does() {
+        let servers: Vec<UsenetServer> =
+            (0..4).map(|i| UsenetServer::new(&format!("s{i}.test"), "u", "p", 119)).collect();
+        let groups: Vec<String> = (0..60).map(|i| format!("g{i}")).collect();
+        let cfg = crate::config::IndexingConfig {
+            ranked: true,
+            ban: vec![("g3".into(), vec!["s0.test".into()]), ("g7".into(), vec!["s0.test".into(), "s1.test".into()])],
+            ..Default::default()
+        };
+        let pool = Pool::new(&servers).with_ranking(&cfg, None);
+        for _ in 0..3 {
+            pool.strike("g5", 0, "test");
+        }
+        let mut sched = scheduler(pool, groups.clone());
+        sched.plan = vec![(0, 6), (1, 3), (2, 2), (3, 2)];
+        *sched.media.write().unwrap() = vec!["g9".into(), "g11".into()];
+        let mut seed = 7u64;
+        let mut rand = move |n: usize| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as usize % n
+        };
+
+        // the scan before: every group in turn, nothing written while looking
+        let expect = |sched: &Scheduler, server: usize| -> Option<String> {
+            let pool = &sched.ctx.pool;
+            let tier = pool.indexing_tier();
+            let busy = sched.busy.lock().unwrap();
+            let wait = sched.wait_until.lock().unwrap();
+            let failed = sched.failed.lock().unwrap();
+            let next = sched.next.lock().unwrap().get(&server).copied().unwrap_or(0);
+            let view = pool.rank_view();
+            let now = Instant::now();
+            let resting = |g: &String| wait.get(g).is_some_and(|u| *u > now);
+            let on = |g: &String| match failed.get(g) {
+                Some(p) => pool.fallback_in(&tier, g, &p.servers),
+                None => view
+                    .pick(&pool.rank_order(&tier, g), g)
+                    .or_else(|| tier.first().copied().filter(|&i| !pool.banned_for_good(g, i))),
+            };
+            let free = |g: &String| !busy.contains_key(g) && !resting(g) && on(g) == Some(server);
+            let media = sched.media.read().unwrap();
+            let on_media = media.iter().filter(|g| busy.contains_key(*g) && on(g) == Some(server)).count();
+            if on_media < sched.media_share(server)
+                && let Some(g) = media.iter().find(|g| groups.contains(g) && free(g))
+            {
+                return Some(g.clone());
+            }
+            for step in 0..groups.len() {
+                let g = &groups[(next + step) % groups.len()];
+                if free(g) {
+                    return Some(g.clone());
+                }
+            }
+            let mut taken: HashMap<usize, usize> = HashMap::new();
+            for &s in busy.values() {
+                *taken.entry(s).or_insert(0) += 1;
+            }
+            let full = |s: usize| taken.get(&s).copied().unwrap_or(0) >= sched.workers_of(s);
+            for step in 0..groups.len() {
+                let g = &groups[(next + step) % groups.len()];
+                if busy.contains_key(g) || resting(g) || failed.contains_key(g) {
+                    continue;
+                }
+                let Some(now_on) = on(g).filter(|&s| s != server && full(s)) else { continue };
+                let order = pool.rank_order(&tier, g);
+                let Some(at) = order.iter().position(|&s| s == server) else { continue };
+                if order[..at].iter().all(|&s| s == now_on || full(s)) {
+                    return Some(g.clone());
+                }
+            }
+            None
+        };
+
+        let (mut took, mut nothing) = ([0; 4], 0);
+        for round in 0..400 {
+            match rand(10) {
+                // a pass ends
+                0..=2 => {
+                    let busy: Vec<String> = sched.busy.lock().unwrap().keys().cloned().collect();
+                    if !busy.is_empty() {
+                        let g = &busy[rand(busy.len())];
+                        sched.busy.lock().unwrap().remove(g);
+                        if rand(3) == 0 {
+                            let until = Instant::now() + Duration::from_secs(60);
+                            sched.wait_until.lock().unwrap().insert(g.clone(), until);
+                        }
+                    }
+                }
+                3 if rand(4) == 0 => {
+                    let g = groups[rand(groups.len())].clone();
+                    let server = rand(4);
+                    sched
+                        .failed
+                        .lock()
+                        .unwrap()
+                        .insert(g, Parked { since: Instant::now(), servers: vec![server], stood_in: vec![] });
+                }
+                4 if rand(3) == 0 => sched.ctx.pool.assign(&groups[rand(groups.len())], rand(4)),
+                5 if rand(20) == 0 => {
+                    sched.wait_until.lock().unwrap().clear();
+                    sched.failed.lock().unwrap().clear();
+                }
+                _ => {}
+            }
+            let server = rand(4);
+            let want = expect(&sched, server);
+            assert_eq!(sched.take_group(server), want, "round {round}, server {server}");
+            if want.is_some() {
+                took[server] += 1;
+            } else {
+                nothing += 1;
+            }
+        }
+        println!("taken per server {took:?}, nothing {nothing}");
+        assert!(took.iter().all(|&n| n > 0) && nothing > 0, "every server took some: {took:?}, {nothing}");
     }
 
     /// by rank, a server parked on a group three times in a day is banned from it for a day

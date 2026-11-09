@@ -524,7 +524,123 @@ struct Bans {
     fixed: std::collections::HashSet<(String, usize)>,
     /// (group, server) -> (strikes, last strike, banned until), unix seconds
     learned: HashMap<(String, usize), (u32, i64, i64)>,
+    /// the groups `fixed` or `learned` name, soo one they dont is let go of without building a key
+    groups: std::collections::HashSet<String>,
     path: Option<std::path::PathBuf>,
+}
+
+impl Bans {
+    /// whether `group` is banned from server `i`, for good (`fixed`) or until a time after `now`
+    fn has(&self, group: &str, i: usize, for_good: bool) -> bool {
+        if !self.groups.contains(group) {
+            return false;
+        }
+        let key = (group.to_string(), i);
+        self.fixed.contains(&key)
+            || (!for_good && self.learned.get(&key).is_some_and(|&(_, _, until)| until > unix_now()))
+    }
+}
+
+/// With groups going by rank: the server each group was given and since when (`Pool::assign`), and the same by server,
+/// soo a scan for one server's groups (`RankView::given_to`) doesnt look at every group. A group on the best server of
+/// all isn't in here (`RankView::keep`), soo it's empty while every group is on that one.
+#[derive(Default)]
+struct Assigned {
+    by_group: HashMap<String, (usize, Instant)>,
+    by_server: HashMap<usize, std::collections::HashSet<String>>,
+    /// when entries `HOME_RETRY` old were last let go of
+    pruned: Option<Instant>,
+}
+
+impl Assigned {
+    fn insert(&mut self, group: &str, i: usize, since: Instant) {
+        if let Some((old, _)) = self.by_group.insert(group.to_string(), (i, since))
+            && old != i
+            && let Some(set) = self.by_server.get_mut(&old)
+        {
+            set.remove(group);
+        }
+        self.by_server.entry(i).or_default().insert(group.to_string());
+    }
+
+    fn remove(&mut self, group: &str) {
+        if let Some((old, _)) = self.by_group.remove(group)
+            && let Some(set) = self.by_server.get_mut(&old)
+        {
+            set.remove(group);
+        }
+    }
+
+    /// entries `retry` old count for nothing any more (see `RankView::pick`): let go of them once a minute
+    fn prune(&mut self, retry: Duration) {
+        if self.pruned.is_some_and(|t| t.elapsed() < Duration::from_secs(60)) {
+            return;
+        }
+        self.pruned = Some(Instant::now());
+        let old: Vec<String> =
+            self.by_group.iter().filter(|(_, (_, since))| since.elapsed() >= retry).map(|(g, _)| g.clone()).collect();
+        for g in old {
+            self.remove(&g);
+        }
+    }
+}
+
+/// A look at where groups go by rank (`Pool::ranked_pick`) for a scan over many of them: which servers have requests
+/// waiting for a connection is read once for the lot, and nothing is written while looking.
+pub struct RankView<'a> {
+    pool: &'a Pool,
+    assigned: std::sync::MutexGuard<'a, Assigned>,
+    saturated: Vec<bool>,
+}
+
+impl RankView<'_> {
+    /// whether server `i` was short of connections when the view was taken (`Pool::saturated`)
+    pub fn saturated(&self, i: usize) -> bool {
+        self.saturated.get(i).copied().unwrap_or(false)
+    }
+
+    pub fn any_saturated(&self) -> bool {
+        self.saturated.contains(&true)
+    }
+
+    /// whether `group`'s entry (`Pool::assign`) keeps it on server `s` among `order`
+    fn keeps(&self, order: &[usize], group: &str) -> Option<usize> {
+        let &(s, since) = self.assigned.by_group.get(group)?;
+        (order.contains(&s)
+            && !self.saturated(s)
+            && (order.first() == Some(&s) || since.elapsed() < self.pool.home_retry))
+            .then_some(s)
+    }
+
+    /// The server `ranked_pick` gives `group`, whose `Pool::rank_order` is `order`, without writing anything; none
+    /// when `order` is empty.
+    pub fn pick(&self, order: &[usize], group: &str) -> Option<usize> {
+        let first = *order.first()?;
+        Some(self.keeps(order, group).or_else(|| order.iter().copied().find(|&i| !self.saturated(i))).unwrap_or(first))
+    }
+
+    /// the groups given to server `i` (`Pool::assign`), some perhaps not kept there any more (see `pick`)
+    pub fn given_to(&self, i: usize) -> impl Iterator<Item = &str> {
+        self.assigned.by_server.get(&i).into_iter().flatten().map(String::as_str)
+    }
+
+    /// After `group` was taken by server `i`, which `pick` gave it: what `ranked_pick` would have written. Nothing for
+    /// the best server of all: first in every order it's in, a group goes there with or without an entry.
+    pub fn keep(&mut self, order: &[usize], group: &str, i: usize) {
+        if order.is_empty() || self.keeps(order, group) == Some(i) {
+            return;
+        }
+        if self.pool.rank.first() == Some(&i) {
+            self.assigned.remove(group);
+        } else {
+            self.assigned.insert(group, i, Instant::now());
+        }
+    }
+
+    /// `Pool::assign`
+    pub fn assign(&mut self, group: &str, i: usize) {
+        self.assigned.insert(group, i, Instant::now());
+    }
 }
 
 fn unix_now() -> i64 {
@@ -1895,7 +2011,9 @@ pub struct Pool {
     /// groups not read from some servers (`Bans`), when groups go by rank
     bans: Mutex<Bans>,
     /// with `rank`: the server each group was given and since when, soo it stays there while that one serves it
-    assigned: Mutex<HashMap<String, (usize, Instant)>>,
+    assigned: Mutex<Assigned>,
+    /// counts every change to `bans`, soo what's worked out from them can tell it's out of date (`bans_version`)
+    bans_changed: AtomicU64,
     /// a group starts on a server it hasn't been reading at the time already read (`IndexingConfig::time_cursors`)
     time_cursors: bool,
     /// (group, server): GROUPs in a row the server said it doesnt carry the group although it indexed it before
@@ -2119,7 +2237,8 @@ impl Pool {
             homes: Mutex::new(HashMap::new()),
             rank: Vec::new(),
             bans: Mutex::new(Bans::default()),
-            assigned: Mutex::new(HashMap::new()),
+            assigned: Mutex::new(Assigned::default()),
+            bans_changed: AtomicU64::new(0),
             time_cursors: false,
             misses: Mutex::new(HashMap::new()),
             home_retry: HOME_RETRY,
@@ -2160,10 +2279,12 @@ impl Pool {
             for h in hosts {
                 if let Some(i) = (0..self.servers.len()).find(|&i| self.is_host(i, h)) {
                     bans.fixed.insert((group.clone(), i));
+                    bans.groups.insert(group.clone());
                 }
             }
         }
         if !cfg.ranks() {
+            *self.bans_changed.get_mut() += u64::from(!bans.groups.is_empty());
             self.bans = Mutex::new(bans);
             return self;
         }
@@ -2178,9 +2299,11 @@ impl Pool {
                 let (Ok(strikes), Ok(last), Ok(until)) = (strikes.parse(), last.parse(), until.parse()) else { continue };
                 if let Some(i) = (0..self.servers.len()).find(|&i| self.host(i) == *host) {
                     bans.learned.insert((group.to_string(), i), (strikes, last, until));
+                    bans.groups.insert(group.to_string());
                 }
             }
         }
+        *self.bans_changed.get_mut() += u64::from(!bans.groups.is_empty());
         self.bans = Mutex::new(bans);
         self
     }
@@ -2203,15 +2326,34 @@ impl Pool {
 
     /// whether `group` isn't read from server `i` (`Bans`)
     pub fn banned(&self, group: &str, i: usize) -> bool {
-        let bans = self.bans.lock().unwrap();
-        let key = (group.to_string(), i);
-        bans.fixed.contains(&key) || bans.learned.get(&key).is_some_and(|&(_, _, until)| until > unix_now())
+        self.bans_changed.load(Ordering::Relaxed) != 0 && self.bans.lock().unwrap().has(group, i, false)
     }
 
     /// whether config bans `group` from server `i` (`IndexingConfig::ban`): it's never read from there, whatever else
     /// is left
     pub fn banned_for_good(&self, group: &str, i: usize) -> bool {
-        self.bans.lock().unwrap().fixed.contains(&(group.to_string(), i))
+        self.bans_changed.load(Ordering::Relaxed) != 0 && self.bans.lock().unwrap().has(group, i, true)
+    }
+
+    /// Goes up with every change to the bans (none yet: 0), soo what's worked out from them (a group's `rank_order`)
+    /// can be kept until it does, or until `next_ban_end`.
+    pub fn bans_version(&self) -> u64 {
+        self.bans_changed.load(Ordering::Relaxed)
+    }
+
+    /// when the first learned ban still on ends, unix seconds (`i64::MAX`: none is on)
+    pub fn next_ban_end(&self) -> i64 {
+        let now = unix_now();
+        let bans = self.bans.lock().unwrap();
+        bans.learned.values().map(|&(_, _, until)| until).filter(|&until| until > now).min().unwrap_or(i64::MAX)
+    }
+
+    /// A look at where groups go by rank, for a scan over many (`RankView`). While it's held the pool's own picks by
+    /// rank (`pick_server_in`, `assign`) wait for it, soo it's never held across one.
+    pub fn rank_view(&self) -> RankView<'_> {
+        let mut assigned = self.assigned.lock().unwrap();
+        assigned.prune(self.home_retry);
+        RankView { pool: self, assigned, saturated: (0..self.servers.len()).map(|i| self.saturated(i)).collect() }
     }
 
     /// `candidates` without the servers config bans `group` from
@@ -2227,6 +2369,7 @@ impl Pool {
         }
         let now = unix_now();
         let mut bans = self.bans.lock().unwrap();
+        bans.groups.insert(group.to_string());
         let e = bans.learned.entry((group.to_string(), i)).or_insert((0, 0, 0));
         if now - e.1 > BAN_FOR {
             e.0 = 0;
@@ -2236,6 +2379,7 @@ impl Pool {
         if e.0 >= BAN_STRIKES {
             e.0 = 0;
             e.2 = now + BAN_FOR;
+            self.bans_changed.fetch_add(1, Ordering::Relaxed);
             println!("{group}: {} {why} again, not read from it for a day", self.host(i));
         }
         self.save_bans(&bans);
@@ -2246,6 +2390,8 @@ impl Pool {
         let now = unix_now();
         let mut bans = self.bans.lock().unwrap();
         bans.learned.insert((group.to_string(), i), (0, now, now + BAN_FOR));
+        bans.groups.insert(group.to_string());
+        self.bans_changed.fetch_add(1, Ordering::Relaxed);
         self.save_bans(&bans);
     }
 
@@ -2270,15 +2416,24 @@ impl Pool {
     /// while (learned) in the hashed order, soo strikes alone never leave a group with none; config bans always count,
     /// and a group banned from every one left isn't read until another frees up.
     pub fn rank_order(&self, candidates: &[usize], group: &str) -> Vec<usize> {
+        self.rank_order_why(candidates, group).0
+    }
+
+    /// `rank_order`, and whether it's the one for a group banned from every candidate (its servers banned too)
+    pub fn rank_order_why(&self, candidates: &[usize], group: &str) -> (Vec<usize>, bool) {
         let order: Vec<usize> =
             self.rank.iter().copied().filter(|i| candidates.contains(i) && !self.banned(group, *i)).collect();
-        if order.is_empty() { self.ranked(&self.not_banned_for_good(candidates, group), group) } else { order }
+        if order.is_empty() {
+            (self.ranked(&self.not_banned_for_good(candidates, group), group), true)
+        } else {
+            (order, false)
+        }
     }
 
     /// `group` goes to server `i` and stays there while it serves it, `HOME_RETRY` at most when it isn't the best
     /// (`ranked_pick`): a group taken by a server down its list because the ones above had no worker free.
     pub fn assign(&self, group: &str, i: usize) {
-        self.assigned.lock().unwrap().insert(group.to_string(), (i, Instant::now()));
+        self.assigned.lock().unwrap().insert(group, i, Instant::now());
     }
 
     /// whether server `i` is short of connections: more requests waiting for one than a tenth of its limit (two at
@@ -2293,21 +2448,13 @@ impl Pool {
     /// elsewhere, soo it doesnt flap between servers (each move costs a date search, see `time_cursors`).
     fn ranked_pick(&self, tier: &[usize], group: &str) -> usize {
         let order = self.rank_order(tier, group);
-        let mut assigned = self.assigned.lock().unwrap();
-        if let Some(&(s, since)) = assigned.get(group)
-            && order.contains(&s)
-            && !self.saturated(s)
-            && (order.first() == Some(&s) || since.elapsed() < self.home_retry)
-        {
-            return s;
-        }
-        let pick = order
-            .iter()
-            .copied()
-            .find(|&i| !self.saturated(i))
-            .or_else(|| order.first().copied())
-            .unwrap_or_else(|| tier.first().copied().unwrap_or(0));
-        assigned.insert(group.to_string(), (pick, Instant::now()));
+        let mut view = self.rank_view();
+        let Some(pick) = view.pick(&order, group) else {
+            let pick = tier.first().copied().unwrap_or(0);
+            view.assign(group, pick);
+            return pick;
+        };
+        view.keep(&order, group, pick);
         pick
     }
 
@@ -3129,7 +3276,7 @@ impl Pool {
             if let Ok(r) = self.select_on(i, group).await {
                 println!("{group} not on {}, using {}", self.servers[prefer].cfg.host, self.servers[i].cfg.host);
                 if self.ranks() {
-                    self.assigned.lock().unwrap().insert(group.to_string(), (i, Instant::now()));
+                    self.assigned.lock().unwrap().insert(group, i, Instant::now());
                     return Ok((i, r));
                 }
                 let mut homes = self.homes.lock().unwrap();
