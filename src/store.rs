@@ -802,6 +802,52 @@ pub const UPLOAD_ROUTES: ShardTable = ShardTable {
 /// put it anyway. Less when two of the release's windows are nearer.
 pub(crate) const ROUTE_SLACK_SECS: i64 = 90;
 
+/// What a save reads off one article without the database (its Date, what its message-id says), worked out by
+/// `prepare` before the slice reaches the shard's writer: the writer is what limits how fast slices are saved, and
+/// this is a tenth of its time otherwise.
+#[derive(Debug, Default)]
+pub(crate) struct ArticleFacts {
+    date: Option<i64>,
+    id: crate::discovery::IdFacts,
+}
+
+impl ArticleFacts {
+    fn of(a: &Article) -> ArticleFacts {
+        ArticleFacts { date: crate::dates::naive_timestamp(&a.date), id: crate::discovery::id_facts(&a.message_id) }
+    }
+}
+
+/// One release's `ArticleFacts`, an article each in order, and whether a file name in it is a program
+/// (`junk::is_executable`).
+#[derive(Debug, Default)]
+pub(crate) struct PreparedRelease {
+    articles: Vec<ArticleFacts>,
+    executable: bool,
+}
+
+/// The prepared releases of slices, by where each release's articles are in memory: a release the save takes as it
+/// came finds its facts, and one it cut into pieces (`route_uploads`, `split_old_rows`) works them out itself.
+pub(crate) type Prepared = HashMap<usize, PreparedRelease>;
+
+/// `Prepared` for a slice's releases, for `ShardWriter::save_prepared`. Off the writer's thread.
+pub(crate) fn prepare(releases: &[Release]) -> Prepared {
+    releases
+        .iter()
+        .map(|r| {
+            let prepared = PreparedRelease {
+                articles: r.articles.iter().map(ArticleFacts::of).collect(),
+                executable: r.articles.iter().any(|a| a.filename.as_deref().is_some_and(crate::junk::is_executable)),
+            };
+            (r.articles.as_ptr() as usize, prepared)
+        })
+        .collect()
+}
+
+/// A release's prepared facts, when they are its own: the same articles, as many.
+fn prepared_for<'p>(prepared: &'p Prepared, release: &Release) -> Option<&'p PreparedRelease> {
+    prepared.get(&(release.articles.as_ptr() as usize)).filter(|p| p.articles.len() == release.articles.len())
+}
+
 /// One save's articles of one file, as `file_timing` keeps them. `from_variants`
 /// counts runs of one From in arrival order, soo a poster that rotates
 /// identities counts high and a steady one stays at 1; `from_hash` is the From
@@ -830,13 +876,22 @@ struct Timing {
 }
 
 impl Timing {
-    fn fold(&mut self, a: &Article, key: &IdKey) {
+    /// `facts`: what `prepare` read off the article already, or None to read it here
+    fn fold(&mut self, a: &Article, key: &IdKey, facts: Option<&ArticleFacts>) {
         self.articles += 1;
-        if let Some(ts) = crate::dates::naive_timestamp(&a.date) {
+        let here;
+        let facts = match facts {
+            Some(f) => f,
+            None => {
+                here = ArticleFacts::of(a);
+                &here
+            }
+        };
+        if let Some(ts) = facts.date {
             self.first_date = Some(self.first_date.map_or(ts, |f| f.min(ts)));
             self.last_date = Some(self.last_date.map_or(ts, |l| l.max(ts)));
         }
-        let facts = crate::discovery::id_facts(&a.message_id);
+        let facts = &facts.id;
         if let Some(tool) = facts.tool {
             self.tool.get_or_insert(tool.code());
         }
@@ -844,9 +899,9 @@ impl Timing {
             self.clock_first = Some(self.clock_first.map_or(ms, |f| f.min(ms)));
             self.clock_last = Some(self.clock_last.map_or(ms, |l| l.max(ms)));
         }
-        if let (Some(host), Some(hw_key), Some(n)) = (facts.hw_host, facts.hw_key, facts.hw_n) {
-            self.hw_host.get_or_insert(host);
-            self.hw_key.get_or_insert(hw_key);
+        if let (Some(host), Some(hw_key), Some(n)) = (&facts.hw_host, &facts.hw_key, facts.hw_n) {
+            self.hw_host.get_or_insert_with(|| host.clone());
+            self.hw_key.get_or_insert_with(|| hw_key.clone());
             self.hw_n_first = Some(self.hw_n_first.map_or(n, |f| f.min(n)));
             self.hw_n_last = Some(self.hw_n_last.map_or(n, |l| l.max(n)));
         }
@@ -2697,7 +2752,19 @@ impl ShardWriter {
         ids: &Ids,
         batches: impl IntoIterator<Item = &'a [Release]>,
     ) -> Result<()> {
-        let r = self.save_in_transaction(conn, ids, batches);
+        self.save_prepared(conn, ids, batches, &Prepared::new())
+    }
+
+    /// `save`, with what `prepare` worked out of the releases beforehand (none needed: what isnt there is worked out
+    /// here).
+    pub(crate) fn save_prepared<'a>(
+        &mut self,
+        conn: &mut Connection,
+        ids: &Ids,
+        batches: impl IntoIterator<Item = &'a [Release]>,
+        prepared: &Prepared,
+    ) -> Result<()> {
+        let r = self.save_in_transaction(conn, ids, batches, prepared);
         // domains inserted by a save that rolled back have no row: a later
         // save must not use their ids
         match r {
@@ -2712,6 +2779,7 @@ impl ShardWriter {
         conn: &mut Connection,
         ids: &Ids,
         batches: impl IntoIterator<Item = &'a [Release]>,
+        prepared: &Prepared,
     ) -> Result<()> {
         let shard = self.shard;
         // late articles of a frozen release thaw it first (`frozen::thaw_incoming`)
@@ -2804,6 +2872,7 @@ impl ShardWriter {
 
             for release in releases.iter().map(Cow::as_ref) {
                 let t = Instant::now();
+                let ready = prepared_for(prepared, release);
                 let collection =
                     release.collection.as_deref().map(|c| collection_row(&tx, &key, c, release)).transpose()?;
                 let name = collection.as_ref().map_or(release.name.as_str(), |c| c.name.as_str());
@@ -2816,7 +2885,13 @@ impl ShardWriter {
                 {
                     continue;
                 }
-                if release.articles.iter().any(|a| a.filename.as_deref().is_some_and(crate::junk::is_executable)) {
+                let executable = match ready {
+                    Some(p) => p.executable,
+                    None => {
+                        release.articles.iter().any(|a| a.filename.as_deref().is_some_and(crate::junk::is_executable))
+                    }
+                };
+                if executable {
                     crate::junk::remember(&tx, name, &release.group, crate::junk::EXECUTABLE, now)?;
                     if let Some(c) = &collection {
                         crate::junk::remember_collection(&tx, c.key)?;
@@ -2864,9 +2939,9 @@ impl ShardWriter {
 
                 let t = Instant::now();
                 // articles by file, in arrival order
-                let mut by_file: IndexMap<&str, Vec<&Article>> = IndexMap::new();
-                for a in release.articles.iter().filter(|a| !a.message_id.is_empty()) {
-                    by_file.entry(a.filename.as_deref().unwrap_or("")).or_default().push(a);
+                let mut by_file: IndexMap<&str, Vec<(usize, &Article)>> = IndexMap::new();
+                for (i, a) in release.articles.iter().enumerate().filter(|(_, a)| !a.message_id.is_empty()) {
+                    by_file.entry(a.filename.as_deref().unwrap_or("")).or_default().push((i, a));
                 }
 
                 // and whether each might be a copy of a sealed article (see `SealedCache`). A part its file has
@@ -2887,13 +2962,13 @@ impl ShardWriter {
                     let index = others.then_some((release_id, &key));
                     let before = added.len();
                     let mut timing = Timing::default();
-                    for a in articles {
+                    for (i, a) in articles {
                         if add_segment(&tx, domains, &f, index, a, &mut sealed)? {
                             let unsure = f.sealed && sealed.guessed;
                             // an article that may be a copy of one in the blob isn't timed: sealing again can drop
                             // it, and nothing takes it back out of the timing row, so its counts would stay
                             if !unsure {
-                                timing.fold(a, &key);
+                                timing.fold(a, &key, ready.map(|p| &p.articles[i]));
                             }
                             if unsure {
                                 // maybe a copy of what the blob has: only its part
@@ -4327,6 +4402,84 @@ mod tests {
         let n: i64 = conn.query_row("select count(*) from releases", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 1, "a gone row isnt made again");
     }
+    #[test]
+    fn a_prepared_save_keeps_what_an_unprepared_one_does() {
+        let art = |id: &str, part: i64, file: &str, date: &str| Article {
+            message_id: id.into(),
+            subject: format!("\"{file}\" yEnc ({part}/3)"),
+            author: "p <p@x>".into(),
+            date: date.into(),
+            number: part as u64 + 100,
+            lines: 10,
+            filename: Some(file.into()),
+            part: Some(part),
+            total_parts: Some(3),
+            bytes: 100,
+            ..Default::default()
+        };
+        let releases = vec![
+            Release {
+                name: "Rel".into(),
+                group: "alt.binaries.t".into(),
+                articles: vec![
+                    art("<1730295651235.a1b2c3@nyuu>", 1, "a.rar", "Mon, 04 Nov 2024 10:00:00 +0000"),
+                    art("<1730295651299.a1b2c4@nyuu>", 2, "a.rar", "Mon, 04 Nov 2024 10:00:05 +0000"),
+                    art("<1730295652000.a1b2c5@nyuu>", 1, "a.par2", "2024-11-04 10:00:09"),
+                ],
+                ..Default::default()
+            },
+            Release {
+                name: "Prog".into(),
+                group: "alt.binaries.t".into(),
+                articles: vec![art("<x1@y>", 1, "setup.exe", "Mon, 04 Nov 2024 10:00:00 +0000")],
+                ..Default::default()
+            },
+        ];
+        let saved = |prepared: bool| {
+            let dir = tempfile::tempdir().unwrap();
+            let main = dir.path().join("atlas.db");
+            db::create_db_at(&main).unwrap();
+            let shard = shard_of("alt.binaries.t");
+            let mut conn = db::open_shard(&shard_path(&main, shard)).unwrap();
+            let ready = if prepared { prepare(&releases) } else { Prepared::new() };
+            assert_eq!(ready.len(), if prepared { 2 } else { 0 });
+            ShardWriter::new(shard).save_prepared(&mut conn, &Ids::new(&main), [releases.as_slice()], &ready).unwrap();
+            let rows: Vec<String> = conn
+                .prepare(
+                    "select r.name, f.filename, t.first_date, t.last_date, t.tool, t.clock_first, t.clock_last,
+                            t.articles from file_timing t join files f on f.id = t.file_id
+                     join releases r on r.id = t.release_id order by f.filename",
+                )
+                .unwrap()
+                .query_map([], |r| {
+                    Ok(format!(
+                        "{} {} {:?} {:?} {:?} {:?} {:?} {}",
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<i64>>(2)?,
+                        r.get::<_, Option<i64>>(3)?,
+                        r.get::<_, Option<i64>>(4)?,
+                        r.get::<_, Option<i64>>(5)?,
+                        r.get::<_, Option<i64>>(6)?,
+                        r.get::<_, i64>(7)?
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            rows
+        };
+        let plain = saved(false);
+        assert_eq!(plain.len(), 2, "both files of Rel, and nothing of the program: {plain:?}");
+        assert!(plain.iter().all(|r| r.starts_with("Rel ") && !r.contains(" None None None None ")), "{plain:?}");
+        assert_eq!(saved(true), plain);
+        // a release that isnt the one prepared (a piece the save cut) finds nothing, and works it out itself
+        let ready = prepare(&releases);
+        let piece = Release { articles: releases[0].articles[..1].to_vec(), ..releases[0].clone() };
+        assert!(prepared_for(&ready, &piece).is_none());
+        assert!(prepared_for(&ready, &releases[0]).is_some());
+    }
+
     #[test]
     fn file_timing_folds_each_save() {
         let dir = tempfile::tempdir().unwrap();

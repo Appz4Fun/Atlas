@@ -353,6 +353,8 @@ impl Drop for Writers {
 
 struct SaveJob {
     releases: Vec<Release>,
+    /// what of them needs no database, worked out before the job reached the writer (`store::prepare`)
+    prepared: crate::store::Prepared,
     done: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
 }
 
@@ -533,12 +535,16 @@ fn writer(
 
         let t = std::time::Instant::now();
         let span = crate::metrics::span("db.save_batch");
+        let mut prepared = crate::store::Prepared::new();
+        for job in &mut batch {
+            prepared.extend(std::mem::take(&mut job.prepared));
+        }
         let result = match &mut opened {
-            Ok(conn) => {
-                db::with_full_flush(conn, |conn| store.save(conn, ids, batch.iter().map(|job| job.releases.as_slice())))
-                    .and_then(|saved| saved)
-                    .map_err(|e| e.to_string())
-            }
+            Ok(conn) => db::with_full_flush(conn, |conn| {
+                store.save_prepared(conn, ids, batch.iter().map(|job| job.releases.as_slice()), &prepared)
+            })
+            .and_then(|saved| saved)
+            .map_err(|e| e.to_string()),
             Err(e) => Err(format!("couldnt open {}: {e}", path.display())),
         };
         if result.is_err() {
@@ -784,9 +790,16 @@ impl Db {
     pub(crate) async fn save(&self, releases: Vec<Release>) -> Result<()> {
         // a slice is one group, soo one shard
         let Some(shard) = releases.first().map(|r| crate::store::shard_of(&r.group)) else { return Ok(()) };
+        // the writer is what limits saving: what needs no database is worked out here, on another thread
+        let (releases, prepared) = tokio::task::spawn_blocking(move || {
+            let prepared = crate::store::prepare(&releases);
+            (releases, prepared)
+        })
+        .await
+        .map_err(|e| anyhow!("preparing a save failed: {e}"))?;
         let (done, saved) = tokio::sync::oneshot::channel();
         crate::profile::LOAD.writer_queued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if self.saves[shard].send(WriterJob::Save(SaveJob { releases, done })).is_err() {
+        if self.saves[shard].send(WriterJob::Save(SaveJob { releases, prepared, done })).is_err() {
             crate::profile::LOAD.writer_queued.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             return Err(anyhow!("db writer stopped"));
         }
@@ -3004,7 +3017,9 @@ mod tests {
         drop(gone);
         crate::profile::LOAD.writer_queued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let shard = crate::store::shard_of("alt.binaries.t");
-        shared.saves[shard].send(WriterJob::Save(SaveJob { releases: vec![release("dropped")], done })).unwrap();
+        shared.saves[shard]
+            .send(WriterJob::Save(SaveJob { releases: vec![release("dropped")], prepared: Default::default(), done }))
+            .unwrap();
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         rt.block_on(shared.save(vec![release("kept")])).unwrap();
         drop(shared);
