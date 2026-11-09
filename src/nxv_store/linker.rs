@@ -196,7 +196,8 @@ pub struct Links {
     pub uploads: HashMap<String, UploadRec>,
 }
 
-/// First line of a `links.rec` written with commit markers: each append ends with `C\t<n>`, and a pass's lines are
+/// First line of a `links.rec` written with commit markers: each append ends with `C\t<n>\tok` (the `ok` soo a marker
+/// cut short and glued to a newline never reads as a smaller count), and a pass's lines are
 /// applied only once its marker is read whole. A file without it is from before markers: its whole lines all count.
 const LINKS_HEADER: &str = "V\t2\n";
 
@@ -343,7 +344,8 @@ impl Links {
                 apply(&mut l, line);
             } else if let Some(n) = line.strip_prefix("C\t") {
                 // the marker's own append is the last `n` lines; any before them are of an append cut short
-                if let Ok(n) = n.parse::<usize>()
+                if let Some((n, "ok")) = n.split_once('\t')
+                    && let Ok(n) = n.parse::<usize>()
                     && n <= pending.len()
                 {
                     for line in &pending[pending.len() - n..] {
@@ -384,34 +386,57 @@ impl Links {
                     n += 1;
                 }
             }
-            out.push_str(&format!("C\t{n}\n"));
+            out.push_str(&format!("C\t{n}\tok\n"));
             write_atomic(&path, out.as_bytes())?;
         }
         Ok((l, ids))
     }
 
-    /// Lines appended and made durable with their commit marker after them, then applied (`I` lines aside).
+    /// Lines appended and made durable with their commit marker after them, then applied (`I` lines aside). On a
+    /// write or flush error the file is cut back to its length before, soo no fragment is left for the next append
+    /// to glue onto; a fragment left anyway (a crash mid-write) is closed off with a newline first.
     pub fn append(&mut self, lines: &[String]) -> Result<()> {
+        use std::os::unix::fs::FileExt;
         if lines.is_empty() {
             return Ok(());
         }
         let existed = self.path.exists();
-        let f = OpenOptions::new().create(true).append(true).open(&self.path)?;
-        let mut w = &f;
+        let f = OpenOptions::new().create(true).read(true).append(true).open(&self.path)?;
+        let len = f.metadata()?.len();
         let mut buf = String::new();
-        if !existed {
+        if len == 0 {
             buf.push_str(LINKS_HEADER);
+        } else {
+            let mut last = [0u8; 1];
+            f.read_exact_at(&mut last, len - 1)?;
+            if last[0] != b'\n' {
+                buf.push('\n');
+            }
         }
         for l in lines {
             buf.push_str(l);
         }
-        buf.push_str(&format!("C\t{}\n", lines.len()));
-        w.write_all(buf.as_bytes())?;
-        if existed {
-            full_flush(&f)?;
-        } else {
-            let d = File::open(self.path.parent().unwrap_or(Path::new(".")))?;
-            sync_all_durable(&[&f, &d])?;
+        buf.push_str(&format!("C\t{}\tok\n", lines.len()));
+        let wrote = (|| -> std::io::Result<()> {
+            let mut w = &f;
+            #[cfg(test)]
+            if let Some(k) = TEAR_AFTER.take() {
+                w.write_all(&buf.as_bytes()[..k.min(buf.len())])?;
+                return Err(std::io::Error::other("torn for a test"));
+            }
+            w.write_all(buf.as_bytes())?;
+            if existed {
+                full_flush(&f)
+            } else {
+                let d = File::open(self.path.parent().unwrap_or(Path::new(".")))?;
+                sync_all_durable(&[&f, &d])
+            }
+        })();
+        if let Err(e) = wrote {
+            if let Err(t) = f.set_len(len) {
+                eprintln!("header store linker: couldnt cut {} back after a failed append: {t}", self.path.display());
+            }
+            return Err(e).with_context(|| format!("appending to {}", self.path.display()));
         }
         for l in lines {
             if id_line(l).is_none() {
@@ -420,6 +445,12 @@ impl Links {
         }
         Ok(())
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The next append on this thread writes this many bytes and then fails.
+    static TEAR_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 // ---------------------------------------------------------------- linked-ids.rec
@@ -1129,8 +1160,12 @@ pub fn tried_through(release: &str, generation: i64, count: i64) -> bool {
     let mut l = links.lock().unwrap_or_else(|e| e.into_inner());
     if l.uploads.get(release).is_some_and(|u| u.generation == generation && u.probed < count) {
         let line = format!("P\t{release}\t{generation}\t{count}\n");
+        // a failed append may leave the file torn: fail-stop like a pass's note, and the next start reads it back
         if let Err(e) = l.append(&[line]) {
-            eprintln!("header store linker: couldnt note guesses tried for {release}: {e:#}");
+            eprintln!(
+                "header store linker: couldnt note guesses tried for {release}: {e:#}; exiting soo recovery runs"
+            );
+            std::process::exit(70);
         }
     }
     true
@@ -1462,6 +1497,39 @@ mod tests {
     }
 
     #[test]
+    fn a_fragment_without_a_newline_doesnt_swallow_the_next_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LINKS_FILE);
+        let mut l = Links::open(dir.path(), 1000).unwrap();
+        l.append(&[Links::place_line("p@x", &a_place("xref-upload-1"))]).unwrap();
+        // a torn append: part of a probe line, and a marker cut to look like a smaller count
+        for frag in ["P\txref-upload-1\t0", "F\t1000\tq@x\txref-up", "I\t1000\taa,b\nC\t1"] {
+            OpenOptions::new().append(true).open(&path).unwrap().write_all(frag.as_bytes()).unwrap();
+            let mut whole = Links::id_lines(&[0x11], 1000);
+            whole.push(Links::place_line("r@x", &a_place("xref-upload-3")));
+            l.append(&whole).unwrap();
+            let (l2, ids) = Links::open_with_ids(dir.path(), 1000).unwrap();
+            assert!(l2.places.contains_key("p@x") && l2.places.contains_key("r@x"), "after {frag:?}");
+            assert!(!l2.places.contains_key("q@x"));
+            assert!(ids.contains_key(&0x11) && !ids.contains_key(&0xaa) && !ids.contains_key(&0xb), "after {frag:?}");
+        }
+    }
+
+    #[test]
+    fn a_failed_append_leaves_the_file_as_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LINKS_FILE);
+        let mut l = Links::open(dir.path(), 1000).unwrap();
+        l.append(&[Links::place_line("p@x", &a_place("xref-upload-1"))]).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        // a write that fails part way through
+        TEAR_AFTER.set(Some(20));
+        assert!(l.append(&[Links::place_line("q@x", &a_place("xref-upload-2"))]).is_err());
+        assert!(!l.places.contains_key("q@x"), "not applied");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
     fn a_file_from_before_markers_is_read_whole_and_rewritten_with_them() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(LINKS_FILE);
@@ -1471,7 +1539,7 @@ mod tests {
         assert!(l.places.contains_key("p@x"));
         assert_eq!(ids.len(), 2);
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.starts_with(LINKS_HEADER) && text.ends_with("C\t2\n"), "{text}");
+        assert!(text.starts_with(LINKS_HEADER) && text.ends_with("C\t2\tok\n"), "{text}");
         let (l, ids) = Links::open_with_ids(dir.path(), 1000).unwrap();
         assert!(l.places.contains_key("p@x"));
         assert_eq!(ids.len(), 2);
