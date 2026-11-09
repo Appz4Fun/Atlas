@@ -18,10 +18,11 @@ pub const DEFAULT_CONNECTIONS: u32 = 10;
 pub const DEFAULT_PRIORITY: i64 = 99;
 /// article numbers the indexer takes on per pass over a group (50 requests)
 pub const DEFAULT_BATCH_SIZE: u64 = 500_000;
-/// with `parallel_groups` unset, one group runs per this many connections
-pub const CONNECTIONS_PER_GROUP: usize = 5;
-/// sanity cap on groups indexed at once
-pub const MAX_PARALLEL_GROUPS: usize = 256;
+/// with `parallel_groups` unset, one group runs per this many connections: one each, soo no connection waits for a
+/// group to give it work
+pub const CONNECTIONS_PER_GROUP: usize = 1;
+/// sanity cap on groups indexed at once (above any real connection count)
+pub const MAX_PARALLEL_GROUPS: usize = 4096;
 /// What `index_mode` can be: new headers only, old ones only, or both.
 pub const INDEX_MODES: [&str; 3] = ["dynamic", "live", "backfill"];
 /// Names of config.toml keys something outside atlas writes (a container's init script, say), comma separated in
@@ -2212,8 +2213,8 @@ mod tests {
     #[test]
     fn workers_follow_connections() {
         let auto = Config::default();
-        assert_eq!(auto.workers_per_server(&[25, 25, 25, 25]), vec![5, 5, 5, 5]);
-        assert_eq!(auto.workers_per_server(&[10, 3]), vec![2, 1], "at least one each");
+        assert_eq!(auto.workers_per_server(&[25, 25, 25, 25]), vec![25, 25, 25, 25]);
+        assert_eq!(auto.workers_per_server(&[10, 0]), vec![10, 1], "at least one each");
 
         let fixed = Config { parallel_groups: Some(20), ..Config::default() };
         assert_eq!(fixed.workers_per_server(&[25, 25, 25, 25]), vec![5, 5, 5, 5]);
