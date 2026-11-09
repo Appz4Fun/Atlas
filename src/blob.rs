@@ -72,7 +72,7 @@ pub fn encode(segs: &[Seg]) -> Vec<u8> {
 
 /// A sealed-log place of a blob restored under other domain numbers (`remap_blob`): the segments in the log carry
 /// the numbers they were sealed with, which this copy keeps on from `base`. `SHIFTED_TAG`, `base` (8 bytes, little endian),
-/// then the place. A blob kept here is renumbered as it's copied instead (`shift_blob`).
+/// then the place. A blob kept here is renumbered as it's copied instead (`remap_blob`).
 pub const SHIFTED_TAG: [u8; 5] = *b"\xFFSHF1";
 
 /// `place` (a sealed-log place) with its segments' domains to be read on from `base`.
