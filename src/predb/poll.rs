@@ -126,6 +126,8 @@ struct Poller<'a> {
     first: bool,
     /// titles in the first answer
     rows: Option<i64>,
+    /// walking history, where a 400 or 404 means no more pages
+    in_history: bool,
 }
 
 impl Poller<'_> {
@@ -155,6 +157,14 @@ impl Poller<'_> {
         }
         if reply.status == 403 && self.spec.key == "predatabase" {
             return Err(Trouble::RateLimited(wait_seconds(&reply, self.now_after(), RATE_LIMIT_DEFAULT)));
+        }
+        // Past the deepest page a source serves (predb.club stops near page 1000, xREL's P2P list
+        // near 255), it answers 400 or 404 instead of an empty list: in history, that is the end, not
+        // a failure. Newer pages and gaps keep failing on it, so a passing error can't close a gap.
+        if self.in_history && page_num > 1 && matches!(reply.status, 400 | 404) {
+            // history stays ended, so say where: lowering feeds.history_read below history_pages walks on from here
+            println!("predb: {} history ends at page {page_num} (HTTP {})", self.spec.key, reply.status);
+            return Ok(Vec::new());
         }
         if reply.status != 200 {
             return Err(Trouble::Failed(format!("HTTP {}", reply.status)));
@@ -301,6 +311,7 @@ fn walk(conn: &mut Connection, p: &mut Poller<'_>, row: &Row, cfg: &PredbConfig)
     }
 
     // history, on purpose only
+    p.in_history = true;
     let (mut read, mut page) = (row.history_read, row.history_page.max(2));
     while budget > 0 && read < i64::from(cfg.history_pages) {
         if past_the_end(spec, page) {
@@ -411,6 +422,7 @@ pub fn poll_source(
         now,
         first: true,
         rows: None,
+        in_history: false,
     };
     let span = crate::metrics::span("predb.poll_feed");
     let walked = walk(conn, &mut poller, &row, cfg);

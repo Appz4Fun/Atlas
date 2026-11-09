@@ -534,3 +534,64 @@ fn an_older_file_gains_the_column() {
     let conn = create(&path).unwrap();
     assert!(conn.prepare("select last_rows from feeds").is_ok());
 }
+
+/// predb.club at history page 1002 and xREL P2P at 256 answered HTTP 400 on every poll, which failed
+/// the whole poll and backed the source off, new titles and all.
+#[test]
+fn a_400_past_the_deepest_history_page_ends_history_not_the_poll() {
+    for (key, deep) in [("predb_club", 1002u32), ("xrel_p2p", 256)] {
+        let mut f = fixture();
+        let feed = spec(key).unwrap();
+        let body = |list: &[String]| {
+            if key == "xrel_p2p" {
+                let rows: Vec<_> = list.iter().map(|t| json!({"dirname": t})).collect();
+                json!({"list": rows}).to_string()
+            } else {
+                page(list)
+            }
+        };
+        let known = titles(100, 5);
+        f.import(feed, &known);
+        f.had_a_success(feed);
+        f.conn
+            .execute(
+                "update feeds set history_page = ?1, history_read = ?2, failures = 28 where source = ?3",
+                params![deep, deep - 2, feed.id],
+            )
+            .unwrap();
+        let fresh = titles(900, 3);
+        f.script(feed, 1, &body(&[fresh.clone(), known.clone()].concat()));
+        f.script(feed, 2, &body(&known));
+        f.fetch.reply(&page_url(feed, deep, 100), 400, r#"{"error":"page too deep"}"#);
+        let config = PredbConfig { history_pages: 1_000_000, ..cfg() };
+        assert_eq!(f.poll(feed, &config), PollEnd::CaughtUp, "{key}");
+        assert_eq!((f.field(feed.id, "failures"), f.field(feed.id, "history_read")), (0, 1_000_000), "{key}");
+        assert_eq!(f.stored(), 8, "{key}: the new titles on page 1 are in");
+        f.requests();
+        f.script(feed, 1, &body(&known));
+        assert_eq!(f.poll(feed, &config), PollEnd::CaughtUp, "{key}");
+        assert_eq!(f.requests().len(), 1, "{key}: history is done, so the deep page isn't asked again");
+    }
+}
+
+#[test]
+fn a_400_on_the_first_page_is_still_a_failure() {
+    let mut f = fixture();
+    f.had_a_success(club());
+    f.fetch.reply(&page_url(club(), 1, 100), 400, "bad request");
+    assert!(matches!(f.poll(club(), &cfg()), PollEnd::Failed(_)));
+    assert_eq!(f.field(1, "failures"), 1);
+}
+
+#[test]
+fn a_400_on_a_newer_page_still_fails_and_keeps_the_gap() {
+    let mut f = fixture();
+    f.import(club(), &titles(100, 5));
+    f.had_a_success(club());
+    f.conn.execute("update feeds set resume_page = 5, gap_floor = 1 where source = 1", []).unwrap();
+    f.script(club(), 1, &page(&titles(900, 5)));
+    f.fetch.reply(&page_url(club(), 2, 100), 400, "maintenance");
+    assert!(matches!(f.poll(club(), &cfg()), PollEnd::Failed(_)));
+    assert!(f.field(1, "resume_page") > 0, "the gap stays open");
+    assert_eq!(f.field(1, "gap_floor"), 1);
+}

@@ -3070,6 +3070,11 @@ pub fn replay_predb_at(main: &Path, apply: bool, log: &dyn Fn(&str)) -> anyhow::
         let page: i64 = r.get(3)?;
         let zst: Vec<u8> = r.get(4)?;
         let fetched_at: i64 = r.get(5)?;
+        if crate::predb::feeds::RETIRED.iter().any(|(k, _, _)| *k == key) {
+            // its parser is gone with it
+            println!("predb replay: skipping raw_predb_log id={id} from retired source {key}");
+            continue;
+        }
         let spec = crate::predb::feeds::spec(&key)
             .ok_or_else(|| anyhow::anyhow!("unknown predb source '{key}' in raw_predb_log id={id}"))?;
         let body =
