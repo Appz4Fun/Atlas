@@ -691,6 +691,10 @@ const SLICES_BUFFERED: usize = 4;
 /// unsaved budget in one burst and every other pass waits while it saves
 /// them one by one
 pub const STREAM_SLICES: usize = 2 * SLICES_BUFFERED;
+/// `STREAM_SLICES` of a day chunk's pass: forward backfill holds every group to the slowest one's day
+/// (`chunks::LOCKSTEP_DAYS`), and one day of the biggest groups is tens of millions of article numbers, soo a chunk
+/// takes many connections at once while the rest wait on it. The unsaved budget still bounds them all
+pub const CHUNK_STREAM_SLICES: usize = 32;
 
 /// `fut`'s output, or None as soon as `stop` is set: stopping doesnt wait on
 /// a provider that went quiet mid reply. Dropping a request part way is safe,
@@ -3965,8 +3969,8 @@ impl Pool {
     ///
     /// Every slice holds its room in the pool's unsaved budget (`Unsaved`)
     /// until the receiver drops it, soo a receiver keeps it until the slice is
-    /// parsed. At most `STREAM_SLICES` of a stream hold room at once, soo one
-    /// stream cant take the whole budget while its receiver saves slice after
+    /// parsed. At most `width` (`STREAM_SLICES`, `CHUNK_STREAM_SLICES` for a day chunk) of a
+    /// stream hold room at once, soo one stream cant take the whole budget while its receiver saves slice after
     /// slice. A slice takes its slot, then its room, then a connection, and the
     /// slices of one stream take room in order, one waiting at a time. Nothing
     /// that holds room waits for more: a slice holding some is fetching (and
@@ -3977,14 +3981,16 @@ impl Pool {
         group: &str,
         server: usize,
         slices: Vec<(u64, u64)>,
+        width: usize,
         stop: Arc<AtomicBool>,
     ) -> tokio::sync::mpsc::Receiver<HeaderSlice> {
         let i = server;
+        let width = width.max(1);
         // several groups can stream from one server at once, the server's
         // semaphore keeps the total at its `connections`
-        let workers = self.connections(i).max(1).min(slices.len().max(1)).min(STREAM_SLICES);
+        let workers = self.connections(i).max(1).min(slices.len().max(1)).min(width);
         let (tx, rx) = tokio::sync::mpsc::channel(SLICES_BUFFERED);
-        let slots = Arc::new(Semaphore::new(STREAM_SLICES));
+        let slots = Arc::new(Semaphore::new(width));
         let queue = Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::from(slices)));
         let halt = Arc::new(AtomicBool::new(false));
 

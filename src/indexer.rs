@@ -62,6 +62,8 @@ pub struct GroupRunState {
     pub first_post_days: HashMap<String, (i64, Option<Instant>)>,
     /// XOVER slices a server refused with a 5xx, still being tried again (see `RunStates::refused`)
     pub refused: Vec<Refused>,
+    /// its last backfill turn went live instead (`live_first`): the next one is its own
+    pub backfill_deferred: bool,
 }
 
 /// A slice of `key`'s numbers (a cursor key, soo one server's) its server
@@ -113,6 +115,7 @@ impl Default for GroupRunState {
             keeps_from: HashMap::new(),
             first_post_days: HashMap::new(),
             refused: Vec::new(),
+            backfill_deferred: false,
         }
     }
 }
@@ -1177,8 +1180,13 @@ where
         let g = group.to_string();
         on_db(db, move |conn| Ok(crate::chunks::is_split(conn, &g)?)).await?
     };
-    if live_first(&settings.mode, phase, split, last - state.live_cursor, settings.request_size) {
-        phase = Phase::Live;
+    if phase == Phase::Backfill {
+        let deferred = ctx.states.with(group, |st| st.backfill_deferred);
+        let first = live_first(&settings.mode, phase, split, last - state.live_cursor, settings.request_size, deferred);
+        ctx.states.with(group, |st| st.backfill_deferred = first);
+        if first {
+            phase = Phase::Live;
+        }
     }
     let backfilling = settings.mode == "backfill" || (settings.mode != "live" && phase == Phase::Backfill);
     if backfilling
@@ -1270,12 +1278,21 @@ where
     }
 }
 
+/// Slices a pass of `kind` streams at once (`Pool::stream_headers`): a day chunk's many more, it holds every group's
+/// forward backfill behind it (`nntp::CHUNK_STREAM_SLICES`).
+fn stream_width(kind: &str) -> usize {
+    if kind == "CHUNK" { crate::nntp::CHUNK_STREAM_SLICES } else { crate::nntp::STREAM_SLICES }
+}
+
 /// Whether a dynamic mode pass whose turn is backfill goes live instead: a split group's whose live side is more than
 /// a slice behind. Its day chunks are taken by any server's free workers too (`take_chunk`), and one can hold its home's
 /// worker for over an hour, while its new posts waited: after a restart every group's first turn is backfill, and on
 /// prod alias and rail claimed a day chunk each and their live cursors stood still for hours.
-fn live_first(mode: &str, phase: Phase, split: bool, behind: i64, slice: u64) -> bool {
-    mode != "live" && mode != "backfill" && phase == Phase::Backfill && split && behind > slice as i64
+/// Never twice in a row (`deferred`: its last backfill turn went live already): a big group is always more than a
+/// slice behind by its next turn, and on prod its own frontier day was never claimed, holding every group's
+/// backfill behind it (`chunks::LOCKSTEP_DAYS`).
+fn live_first(mode: &str, phase: Phase, split: bool, behind: i64, slice: u64, deferred: bool) -> bool {
+    mode != "live" && mode != "backfill" && phase == Phase::Backfill && split && !deferred && behind > slice as i64
 }
 
 /// Whether split `group`'s cursor backfill on `host` may sweep: no day
@@ -2277,7 +2294,8 @@ impl Pass<'_> {
         let slices = make_slices(start.max(0) as u64, end.max(0) as u64, size, kind == "BACKFILL");
         let total = slices.len();
 
-        let mut rx = pool.stream_headers(group, self.server, slices, self.ctx.stop.clone());
+        let width = stream_width(kind);
+        let mut rx = pool.stream_headers(group, self.server, slices, width, self.ctx.stop.clone());
         let mut saved = Progress::default();
         let mut done = 0;
         let mut finished = Finished::default();
@@ -3027,15 +3045,39 @@ mod tests {
     #[test]
     fn a_split_group_behind_on_its_live_side_goes_live_first() {
         // behind by more than a slice: live, whatever the turn
-        assert!(live_first("dynamic", Phase::Backfill, true, 100_001, 100_000));
+        assert!(live_first("dynamic", Phase::Backfill, true, 100_001, 100_000, false));
         // a slice or less behind (a busy group always is a little): its turn
-        assert!(!live_first("dynamic", Phase::Backfill, true, 100_000, 100_000));
+        assert!(!live_first("dynamic", Phase::Backfill, true, 100_000, 100_000, false));
         // not split: its backfill has no other takers, turns as before
-        assert!(!live_first("dynamic", Phase::Backfill, false, 10_000_000, 100_000));
+        assert!(!live_first("dynamic", Phase::Backfill, false, 10_000_000, 100_000, false));
         // the modes that do one side only, and a live turn anyway
-        assert!(!live_first("backfill", Phase::Backfill, true, 10_000_000, 100_000));
-        assert!(!live_first("live", Phase::Backfill, true, 10_000_000, 100_000));
-        assert!(!live_first("dynamic", Phase::Live, true, 10_000_000, 100_000));
+        assert!(!live_first("backfill", Phase::Backfill, true, 10_000_000, 100_000, false));
+        assert!(!live_first("live", Phase::Backfill, true, 10_000_000, 100_000, false));
+        assert!(!live_first("dynamic", Phase::Live, true, 10_000_000, 100_000, false));
+    }
+
+    #[test]
+    fn a_day_chunk_streams_wider_than_other_passes() {
+        assert_eq!(stream_width("CHUNK"), crate::nntp::CHUNK_STREAM_SLICES);
+        assert!(crate::nntp::CHUNK_STREAM_SLICES >= 4 * crate::nntp::STREAM_SLICES);
+        for kind in ["LIVE", "BACKFILL", "SWEEP"] {
+            assert_eq!(stream_width(kind), crate::nntp::STREAM_SLICES);
+        }
+    }
+
+    /// A big split group is always far behind on its live side, yet every other backfill turn is its own: its frontier
+    /// day gets claimed, not starved by live passes forever.
+    #[test]
+    fn a_split_groups_own_backfill_turn_is_never_put_off_twice_in_a_row() {
+        let (mut deferred, mut own) = (false, 0);
+        for _ in 0..10 {
+            let first = live_first("dynamic", Phase::Backfill, true, 68_000_000, 100_000, deferred);
+            deferred = first;
+            own += usize::from(!first);
+        }
+        assert_eq!(own, 5, "every other backfill turn");
+        // put off once, the next turn is its own however far behind
+        assert!(!live_first("dynamic", Phase::Backfill, true, 68_000_000, 100_000, true));
     }
 
     #[test]

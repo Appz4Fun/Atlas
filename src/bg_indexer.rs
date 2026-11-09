@@ -318,8 +318,8 @@ struct Scheduler {
     chunk_errors: Mutex<HashMap<(String, usize), u32>>,
     /// servers one of whose workers sweeps a split group (see `take_sweep`)
     sweeping: Mutex<HashSet<usize>>,
-    /// servers one of whose workers runs a day chunk ahead of its due groups (see `next_work`)
-    chunking: Mutex<HashSet<usize>>,
+    /// per server, how many of its workers run a day chunk now (see `next_work`)
+    chunking: Mutex<HashMap<usize, usize>>,
     /// groups resting after going idle or after an error
     wait_until: Mutex<HashMap<String, Instant>>,
     /// when `wait_until` was last rid of groups done resting
@@ -497,6 +497,54 @@ impl Scheduler {
     /// How many of `server`'s workers may be on the groups big releases come from at once: half, and one at least.
     fn media_share(&self, server: usize) -> usize {
         (self.workers_of(server) / 2).max(1)
+    }
+
+    /// workers of `server` that run day chunks ahead of its due groups at once (`next_work`): one per
+    /// `STREAM_SLICES` of its connections, at most half its workers. Forward backfill holds every group to the slowest
+    /// one's day (`chunks::LOCKSTEP_DAYS`): with one a server, on prod about nine chunks ran at a time and some 450
+    /// connections sat idle while the biggest groups' first day waited.
+    fn chunk_share(&self, server: usize) -> usize {
+        (self.ctx.pool.connections(server) / crate::nntp::STREAM_SLICES).clamp(1, self.chunk_most(server))
+    }
+
+    /// workers of `server` that run day chunks at once while it has due groups: half its workers, the other half
+    /// keep its groups' live sides going. A worker with nothing else to do takes one past it (`next_work`).
+    fn chunk_most(&self, server: usize) -> usize {
+        (self.workers_of(server) / 2).max(1)
+    }
+
+    /// A day chunk worker's place on `server`, while fewer than `most` of its workers run one. Given back with
+    /// `chunk_done`.
+    fn start_chunk(&self, server: usize, most: usize) -> bool {
+        let mut chunking = self.chunking.lock().unwrap();
+        let n = chunking.entry(server).or_insert(0);
+        if *n >= most {
+            return false;
+        }
+        *n += 1;
+        true
+    }
+
+    fn chunk_done(&self, server: usize) {
+        let mut chunking = self.chunking.lock().unwrap();
+        if let Some(n) = chunking.get_mut(&server) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                chunking.remove(&server);
+            }
+        }
+    }
+
+    /// `take_chunk` in a day chunk worker's place on `server` (`start_chunk`), given back when there is none.
+    async fn take_chunk_within(&self, server: usize, db: &Db, most: usize) -> Option<crate::chunks::Claim> {
+        if !self.start_chunk(server, most) {
+            return None;
+        }
+        let chunk = take_chunk(self, server, db).await;
+        if chunk.is_none() {
+            self.chunk_done(server);
+        }
+        chunk
     }
 
     fn take_group(&self, server: usize) -> Option<String> {
@@ -998,7 +1046,8 @@ async fn take_sweep(sched: &Scheduler, server: usize, db: &Db) -> Option<String>
 /// What a worker does next.
 enum Work {
     Group(String),
-    /// a day chunk, and whether it is the server's one ahead of its due groups (`Scheduler::chunking`)
+    /// a day chunk, in one of the server's day chunk worker places (`Scheduler::start_chunk`), and whether it went
+    /// ahead of the server's due groups
     Chunk(crate::chunks::Claim, bool),
     Sweep(String),
 }
@@ -1007,11 +1056,11 @@ enum Work {
 /// chunks are done (see `take_sweep`) comes first, before its normal groups,
 /// soo home groups that keep every worker busy dont hold it off until what
 /// it would find ages out. One worker per server sweeps at a time, the
-/// others index their groups or take day chunks; one worker per server also
-/// runs a day chunk ahead of its groups. `after_sweep`: the worker's last pick
-/// was a sweep or a day chunk ahead of its groups, soo a due group of its own
-/// goes before the next.
-async fn next_work(sched: &Scheduler, server: usize, db: &Db, after_sweep: bool) -> Option<Work> {
+/// others index their groups or take day chunks: up to `chunk_share` workers of a server run a day chunk ahead of
+/// its groups, up to `chunk_most` when the worker's last pass found nothing (`found_nothing`), and a worker that
+/// would go idle takes one whatever the count. `after_sweep`: the worker's last pick was a sweep or a day chunk ahead
+/// of its groups, soo a due group of its own goes before the next.
+async fn next_work(sched: &Scheduler, server: usize, db: &Db, after_sweep: bool, found_nothing: bool) -> Option<Work> {
     // right after a sweep (or a chunk ahead of its groups) a due normal group goes
     // first, soo a worker that is alone on its server alternates instead of sweeping forever
     if after_sweep && let Some(group) = sched.take_group(server) {
@@ -1020,19 +1069,19 @@ async fn next_work(sched: &Scheduler, server: usize, db: &Db, after_sweep: bool)
     if let Some(group) = take_sweep(sched, server, db).await {
         return Some(Work::Sweep(group));
     }
-    // one worker a server runs day chunks ahead of its due groups: with thousands of groups a worker is never idle,
-    // and a split group's own backfill turn goes live while it is behind (`indexer::live_first`), soo on prod the
-    // groups holding the newest month never took their days and 4.8 million older ones waited behind them
-    if sched.chunking.lock().unwrap().insert(server) {
-        if let Some(chunk) = take_chunk(sched, server, db).await {
-            return Some(Work::Chunk(chunk, true));
-        }
-        sched.chunking.lock().unwrap().remove(&server);
+    // workers run day chunks ahead of their due groups: with thousands of groups a worker is never idle, soo one
+    // waiting for none to be due never took a chunk, and the lockstep (`chunks::LOCKSTEP_DAYS`) holds every group's
+    // backfill to the slowest day. A worker whose pass found nothing (a live side with nothing new, a backfill turn
+    // waiting on the lockstep) is better put on the frontier days than on the next GROUP
+    let most = if found_nothing { sched.chunk_most(server) } else { sched.chunk_share(server) };
+    if let Some(chunk) = sched.take_chunk_within(server, db, most).await {
+        return Some(Work::Chunk(chunk, true));
     }
     if let Some(group) = sched.take_group(server) {
         return Some(Work::Group(group));
     }
-    take_chunk(sched, server, db).await.map(|chunk| Work::Chunk(chunk, false))
+    // nothing due: a chunk rather than idle, however many run
+    sched.take_chunk_within(server, db, usize::MAX).await.map(|chunk| Work::Chunk(chunk, false))
 }
 
 /// longest an idle worker naps when groups go by rank
@@ -1057,10 +1106,13 @@ fn idle_nap(ranked: bool, idle: u32, server: usize) -> Duration {
 /// instead of racing for sqlite's write lock (and timing out on a busy db).
 async fn worker(sched: Arc<Scheduler>, server: usize, db: Db) {
     let mut after_sweep = false;
+    // the last group pass saved no article: the next pick may be a day chunk (see `next_work`)
+    let mut found_nothing = false;
     // naps in a row with nothing to do
     let mut idle = 0u32;
     while !sched.stopping() {
-        let work = next_work(&sched, server, &db, after_sweep).await;
+        let work = next_work(&sched, server, &db, after_sweep, found_nothing).await;
+        found_nothing = false;
         after_sweep = matches!(work, Some(Work::Sweep(_) | Work::Chunk(_, true)));
         if work.is_some() {
             idle = 0;
@@ -1069,16 +1121,14 @@ async fn worker(sched: Arc<Scheduler>, server: usize, db: Db) {
             Some(Work::Group(group)) => group,
             // help with a split group's day chunks. not marked busy, a
             // group's chunks run on several servers at once
-            Some(Work::Chunk(chunk, ahead)) => {
+            Some(Work::Chunk(chunk, _)) => {
                 let settings = sched.settings.read().unwrap().clone();
                 let stats = sched.stats.clone();
                 let group = chunk.group.clone();
                 let mut progress = |p: &Progress| stats.lock().unwrap().tick(p, &group);
                 let run = crate::indexer::run_chunk(&sched.ctx, &settings, &db, &chunk, server, &mut progress);
                 let result = unless_stopped(&sched.ctx.stop, run).await;
-                if ahead {
-                    sched.chunking.lock().unwrap().remove(&server);
-                }
+                sched.chunk_done(server);
                 let Some(result) = result else { break };
                 sched.finish_chunk(chunk.group, server, result);
                 continue;
@@ -1118,6 +1168,7 @@ async fn worker(sched: Arc<Scheduler>, server: usize, db: Db) {
         let mut ran_on = server;
         let pass = run_pass_on(&sched.ctx, &settings, &db, &group, server, &mut progress, &mut ran_on);
         let Some(result) = unless_stopped(&sched.ctx.stop, pass).await else { break };
+        found_nothing = matches!(&result, Ok(p) if p.articles == 0);
         sched.finish(&group, ran_on, stood_in.is_some(), result);
     }
 }
@@ -1296,7 +1347,7 @@ async fn run_servers(
         skip: Mutex::new(HashMap::new()),
         chunk_errors: Mutex::new(HashMap::new()),
         sweeping: Mutex::new(HashSet::new()),
-        chunking: Mutex::new(HashSet::new()),
+        chunking: Mutex::new(HashMap::new()),
         wait_until: Mutex::new(HashMap::new()),
         wait_pruned: Mutex::new(None),
         groups_changed: AtomicU64::new(0),
@@ -1707,6 +1758,17 @@ pub fn run() -> i32 {
             Ok(day) if day > 0 => ui::print(&format!("backfill reads forward from day {day} to live")),
             Ok(_) => {}
             Err(e) => ui::warn(&format!("couldnt set the forward backfill's start: {e:#}")),
+        }
+        // one indexer runs on a database (the pid file): day chunks its servers still hold claimed are a killed run's,
+        // which would hold their days, and the forward backfill's frontier, for `CLAIM_TIMEOUT`
+        let hosts = crate::nntp::server_keys(&usable_servers(&config));
+        match db::open_at(&main)
+            .map_err(anyhow::Error::from)
+            .and_then(|c| Ok(crate::chunks::release_left_over(&c, &hosts)?))
+        {
+            Ok(n) if n > 0 => ui::print(&format!("{n} day chunks left claimed by the last run given back")),
+            Ok(_) => {}
+            Err(e) => ui::warn(&format!("couldnt give back the day chunks the last run left claimed: {e:#}")),
         }
     }
 
@@ -2232,15 +2294,15 @@ mod tests {
         let db = shared_db(conn);
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
-            assert!(matches!(next_work(&sched, server, &db, false).await, Some(Work::Sweep(g)) if g == "done"));
+            assert!(matches!(next_work(&sched, server, &db, false, false).await, Some(Work::Sweep(g)) if g == "done"));
             // one sweeper per server: the others keep to their groups
-            assert!(matches!(next_work(&sched, server, &db, false).await, Some(Work::Group(_))));
-            assert!(matches!(next_work(&sched, server, &db, false).await, Some(Work::Group(_))));
+            assert!(matches!(next_work(&sched, server, &db, false, false).await, Some(Work::Group(_))));
+            assert!(matches!(next_work(&sched, server, &db, false, false).await, Some(Work::Group(_))));
         });
     }
 
-    /// one worker a server runs a day chunk ahead of its due groups, the others keep to their groups, and that worker
-    /// takes a due group of its own next
+    /// a server of two workers runs one day chunk ahead of its due groups (`chunk_share`), the other keeps to its
+    /// groups, and that worker takes a due group of its own next
     #[test]
     fn one_worker_a_server_runs_a_day_chunk_ahead_of_due_groups() {
         let dir = tempfile::tempdir().unwrap();
@@ -2258,14 +2320,70 @@ mod tests {
         let db = shared_db(conn);
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
-            let first = next_work(&sched, server, &db, false).await;
+            let first = next_work(&sched, server, &db, false, false).await;
             assert!(matches!(&first, Some(Work::Chunk(c, true)) if c.group == "split" && c.day == 20_000));
             // the slot is taken: the next workers keep to their groups
-            assert!(matches!(next_work(&sched, server, &db, false).await, Some(Work::Group(_))));
+            assert!(matches!(next_work(&sched, server, &db, false, false).await, Some(Work::Group(_))));
             // the slot given back, that worker takes a group of its own first
-            sched.chunking.lock().unwrap().remove(&server);
-            assert!(matches!(next_work(&sched, server, &db, true).await, Some(Work::Group(_))));
-            assert!(matches!(next_work(&sched, server, &db, false).await, Some(Work::Chunk(_, true))));
+            sched.chunk_done(server);
+            assert!(matches!(next_work(&sched, server, &db, true, false).await, Some(Work::Group(_))));
+            assert!(matches!(next_work(&sched, server, &db, false, false).await, Some(Work::Chunk(_, true))));
+        });
+    }
+
+    /// Day chunk workers scale with a server's connections: up to one per `STREAM_SLICES` of them run frontier days
+    /// ahead of due groups, a worker whose pass found nothing joins them up to half the server's workers, and one with
+    /// nothing due takes a chunk whatever the count
+    #[test]
+    fn day_chunk_workers_scale_with_a_servers_connections() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+        let mut servers = [UsenetServer::new("a.test", "u", "p", 119), UsenetServer::new("b.test", "u", "p", 119)];
+        for s in &mut servers {
+            s.connections = Some(64);
+        }
+        let pool = Pool::new(&servers);
+        let conn = db::open_at(&main).unwrap();
+        // big groups' frontier day, one chunk each
+        let splits: Vec<String> = (0..40).map(|i| format!("big{i}")).collect();
+        for g in &splits {
+            crate::chunks::add(&conn, g, 20_000, 20_000).unwrap();
+        }
+        let server = 0;
+        let homes: Vec<String> =
+            (0..).map(|i| format!("home{i}")).filter(|g| pool.pick_server(g) == server).take(64).collect();
+        let mut groups = homes.clone();
+        groups.extend(splits.iter().cloned());
+        let mut sched = scheduler(pool, groups);
+        sched.plan = vec![(0, 64), (1, 64)];
+        assert_eq!(sched.chunk_share(server), 64 / crate::nntp::STREAM_SLICES);
+        assert_eq!(sched.chunk_most(server), 32);
+        let db = shared_db(conn);
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let mut chunks = 0;
+            for _ in 0..sched.chunk_share(server) {
+                let w = next_work(&sched, server, &db, false, false).await;
+                assert!(matches!(w, Some(Work::Chunk(_, true))));
+                chunks += 1;
+            }
+            // the share is taken: a worker with due groups keeps to them
+            assert!(matches!(next_work(&sched, server, &db, false, false).await, Some(Work::Group(_))));
+            // one whose pass found nothing takes a frontier day, up to half the workers
+            while chunks < sched.chunk_most(server) {
+                assert!(matches!(next_work(&sched, server, &db, false, true).await, Some(Work::Chunk(_, true))));
+                chunks += 1;
+            }
+            assert!(matches!(next_work(&sched, server, &db, false, true).await, Some(Work::Group(_))));
+            assert_eq!(sched.chunking.lock().unwrap().get(&server), Some(&32));
+            // a place given back is taken again
+            sched.chunk_done(server);
+            assert!(matches!(next_work(&sched, server, &db, false, true).await, Some(Work::Chunk(_, true))));
+            // nothing due on this server: a chunk past the count rather than idle
+            sched.busy.lock().unwrap().extend(sched.groups.read().unwrap().iter().map(|g| (g.clone(), 1)));
+            assert!(matches!(next_work(&sched, server, &db, false, false).await, Some(Work::Chunk(_, false))));
+            assert_eq!(sched.chunking.lock().unwrap().get(&server), Some(&33));
         });
     }
 
@@ -2303,12 +2421,12 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
             // the sweep first, as before
-            assert!(matches!(next_work(&sched, server, &db, false).await, Some(Work::Sweep(g)) if g == "done"));
+            assert!(matches!(next_work(&sched, server, &db, false, false).await, Some(Work::Sweep(g)) if g == "done"));
             sched.sweeping.lock().unwrap().remove(&server);
             // then the due home group, though the sweep is still due
-            assert!(matches!(next_work(&sched, server, &db, true).await, Some(Work::Group(g)) if g == home));
+            assert!(matches!(next_work(&sched, server, &db, true, false).await, Some(Work::Group(g)) if g == home));
             // and the sweep again after the group
-            assert!(matches!(next_work(&sched, server, &db, false).await, Some(Work::Sweep(g)) if g == "done"));
+            assert!(matches!(next_work(&sched, server, &db, false, false).await, Some(Work::Sweep(g)) if g == "done"));
         });
     }
 

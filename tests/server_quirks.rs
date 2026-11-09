@@ -33,7 +33,8 @@ fn lowers_connections_to_what_the_provider_allows() {
 
     let slices: Vec<(u64, u64)> = (0..20).map(|i| (i * 20 + 1, i * 20 + 20)).collect();
     let (ok, failed) = pool.block_on(async {
-        let mut rx = pool.pool.stream_headers(GROUP, 0, slices, Arc::new(AtomicBool::new(false)));
+        let mut rx =
+            pool.pool.stream_headers(GROUP, 0, slices, atlas::nntp::STREAM_SLICES, Arc::new(AtomicBool::new(false)));
         let (mut ok, mut failed) = (0, 0);
         while let Some(slice) = rx.recv().await {
             if slice.result.is_ok() { ok += 1 } else { failed += 1 }
@@ -64,7 +65,8 @@ fn a_lowered_connection_limit_climbs_back() {
     pool.connect().unwrap();
     let slices: Vec<(u64, u64)> = (0..20).map(|i| (i * 20 + 1, i * 20 + 20)).collect();
     let ok = pool.block_on(async {
-        let mut rx = pool.pool.stream_headers(GROUP, 0, slices, Arc::new(AtomicBool::new(false)));
+        let mut rx =
+            pool.pool.stream_headers(GROUP, 0, slices, atlas::nntp::STREAM_SLICES, Arc::new(AtomicBool::new(false)));
         let mut ok = 0;
         while let Some(slice) = rx.recv().await {
             ok += slice.result.is_ok() as usize;
