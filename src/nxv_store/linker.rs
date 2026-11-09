@@ -194,9 +194,16 @@ pub struct Links {
     path: PathBuf,
     pub places: HashMap<String, PlaceRec>,
     pub uploads: HashMap<String, UploadRec>,
-    /// message-id hashes of the articles linked, from `I` lines (written in the same append as the places they go
-    /// with, soo a pass is noted whole or not at all), and those lines' times for the life check
-    pub ids: HashMap<u64, i64>,
+}
+
+/// First line of a `links.rec` written with commit markers: each append ends with `C\t<n>`, and a pass's lines are
+/// applied only once its marker is read whole. A file without it is from before markers: its whole lines all count.
+const LINKS_HEADER: &str = "V\t2\n";
+
+/// The time and message-id hashes of an `I` line.
+fn id_line(line: &str) -> Option<(i64, impl Iterator<Item = u64> + '_)> {
+    let (at, list) = line.strip_prefix("I\t")?.split_once('\t')?;
+    Some((at.parse().ok()?, list.split(',').filter_map(|x| u64::from_str_radix(x, 16).ok())))
 }
 
 fn csv<T: std::fmt::Display>(v: impl IntoIterator<Item = T>) -> String {
@@ -246,17 +253,8 @@ impl Links {
             .collect()
     }
 
+    /// A place, upload or probe line applied; `I` lines aren't held here (their ids go to [`LinkedIds`]).
     fn apply(&mut self, line: &str) {
-        if let Some(rest) = line.strip_prefix("I\t") {
-            if let Some((at, list)) = rest.split_once('\t')
-                && let Ok(at) = at.parse::<i64>()
-            {
-                for h in list.split(',').filter_map(|x| u64::from_str_radix(x, 16).ok()) {
-                    self.ids.insert(h, at);
-                }
-            }
-            return;
-        }
         let f: Vec<&str> = line.split('\t').collect();
         let num = |s: &str| s.parse::<i64>().ok();
         match f.as_slice() {
@@ -315,47 +313,84 @@ impl Links {
 
     /// The records in `dir`, those older than their life dropped; the file rewritten when most of it is dead.
     pub fn open(dir: &Path, now: i64) -> Result<Links> {
+        Ok(Links::open_with_ids(dir, now)?.0)
+    }
+
+    /// [`Links::open`], and the message-id hashes of its `I` lines (with their times), handed out rather than kept.
+    pub fn open_with_ids(dir: &Path, now: i64) -> Result<(Links, HashMap<u64, i64>)> {
         let path = dir.join(LINKS_FILE);
-        let mut l = Links { path: path.clone(), places: HashMap::new(), uploads: HashMap::new(), ids: HashMap::new() };
+        let mut l = Links { path: path.clone(), places: HashMap::new(), uploads: HashMap::new() };
+        let mut ids: HashMap<u64, i64> = HashMap::new();
         let text = match std::fs::read(&path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
+        let text = String::from_utf8_lossy(&text);
+        let marked = text.starts_with(LINKS_HEADER);
+        let mut apply = |l: &mut Links, line: &str| match id_line(line) {
+            Some((at, hs)) => hs.for_each(|h| {
+                ids.insert(h, at);
+            }),
+            None => l.apply(line),
+        };
         let mut lines = 0usize;
-        // a torn last line (no newline) was never acknowledged: dropped
-        for line in String::from_utf8_lossy(&text).split_inclusive('\n').filter_map(|x| x.strip_suffix('\n')) {
+        // lines of an append whose marker isn't read yet; a torn last line (no newline) was never acknowledged
+        let mut pending: Vec<&str> = Vec::new();
+        for line in text.split_inclusive('\n').filter_map(|x| x.strip_suffix('\n')) {
             lines += 1;
-            l.apply(line);
+            if !marked {
+                apply(&mut l, line);
+            } else if let Some(n) = line.strip_prefix("C\t") {
+                // the marker's own append is the last `n` lines; any before them are of an append cut short
+                if let Ok(n) = n.parse::<usize>()
+                    && n <= pending.len()
+                {
+                    for line in &pending[pending.len() - n..] {
+                        apply(&mut l, line);
+                    }
+                }
+                pending.clear();
+            } else if line != LINKS_HEADER.trim_end() {
+                pending.push(line);
+            }
         }
+        let torn = !pending.is_empty() || !text.ends_with('\n') || !marked;
         let before = now - LINKS_LIFE;
         l.places.retain(|_, p| p.added >= before);
         l.uploads.retain(|_, u| u.added >= before);
-        l.ids.retain(|_, at| *at >= before);
-        let live = l.places.len() + l.uploads.len() + l.ids.len() / IDS_PER_LINE;
-        if lines > 2 * live + 1000 || !text.is_empty() && !text.ends_with(b"\n") {
-            let mut out = String::new();
+        ids.retain(|_, at| *at >= before);
+        let mut by_time: BTreeMap<i64, Vec<u64>> = BTreeMap::new();
+        for (h, at) in &ids {
+            by_time.entry(*at).or_default().push(*h);
+        }
+        // a rewrite writes each time's ids in as few lines as hold them
+        let id_lines: usize = by_time.values().map(|v| v.len().div_ceil(IDS_PER_LINE)).sum();
+        let live = l.places.len() + l.uploads.len() + id_lines + 2;
+        if lines > 2 * live + 1000 || torn {
+            let mut out = String::from(LINKS_HEADER);
+            let mut n = 0usize;
             for (poster, p) in &l.places {
                 out.push_str(&Links::place_line(poster, p));
+                n += 1;
             }
             for (release, u) in &l.uploads {
                 out.push_str(&Links::upload_line(release, u));
-            }
-            let mut by_time: BTreeMap<i64, Vec<u64>> = BTreeMap::new();
-            for (h, at) in &l.ids {
-                by_time.entry(*at).or_default().push(*h);
+                n += 1;
             }
             for (at, hashes) in by_time {
                 for line in Links::id_lines(&hashes, at) {
                     out.push_str(&line);
+                    n += 1;
                 }
             }
+            out.push_str(&format!("C\t{n}\n"));
             write_atomic(&path, out.as_bytes())?;
         }
-        Ok(l)
+        Ok((l, ids))
     }
 
-    /// Lines appended and made durable, then applied.
+    /// Lines appended and made durable with their commit marker after them, then applied (`I` lines aside).
     pub fn append(&mut self, lines: &[String]) -> Result<()> {
         if lines.is_empty() {
             return Ok(());
@@ -364,9 +399,13 @@ impl Links {
         let f = OpenOptions::new().create(true).append(true).open(&self.path)?;
         let mut w = &f;
         let mut buf = String::new();
+        if !existed {
+            buf.push_str(LINKS_HEADER);
+        }
         for l in lines {
             buf.push_str(l);
         }
+        buf.push_str(&format!("C\t{}\n", lines.len()));
         w.write_all(buf.as_bytes())?;
         if existed {
             full_flush(&f)?;
@@ -375,7 +414,9 @@ impl Links {
             sync_all_durable(&[&f, &d])?;
         }
         for l in lines {
-            self.apply(l.trim_end_matches('\n'));
+            if id_line(l).is_none() {
+                self.apply(l.trim_end_matches('\n'));
+            }
         }
         Ok(())
     }
@@ -525,10 +566,10 @@ impl Linker {
     /// A linker with its state in `dir` (a scratch folder, for trying it on a copy).
     pub fn open_in(dir: &Path, now: i64) -> Result<Linker> {
         std::fs::create_dir_all(dir)?;
-        let links = Links::open(dir, now)?;
+        let (links, linked) = Links::open_with_ids(dir, now)?;
         // articles linked: those of `links.rec`'s `I` lines, and of the older `linked-ids.rec`
         let mut ids = LinkedIds::open(dir, now)?;
-        ids.extend(links.ids.keys().copied());
+        ids.extend(linked.into_keys());
         Ok(Linker { state: State::load(dir)?, links: Arc::new(Mutex::new(links)), ids, dir: dir.to_path_buf() })
     }
 
@@ -1381,6 +1422,83 @@ mod tests {
         assert!(l.places.is_empty() && l.uploads.is_empty());
     }
 
+    fn a_place(release: &str) -> PlaceRec {
+        let place = Place {
+            leads: "1".into(),
+            oldest: 900,
+            release: release.into(),
+            group: "g".into(),
+            file: 1,
+            files: 2,
+            parts: 4,
+        };
+        PlaceRec { place, firsts: [(7, 100)].into(), added: 1000 }
+    }
+
+    #[test]
+    fn a_pass_cut_short_applies_none_of_its_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LINKS_FILE);
+        let mut l = Links::open(dir.path(), 1000).unwrap();
+        let mut whole = Links::id_lines(&[0x11], 1000);
+        whole.push(Links::place_line("p@x", &a_place("xref-upload-1")));
+        l.append(&whole).unwrap();
+        // a pass whose ids and first place reached the disk, but not its last place nor its marker
+        let mut cut = Links::id_lines(&[0xaa, 0xbb], 1000).concat();
+        cut.push_str(&Links::place_line("q@x", &a_place("xref-upload-2")));
+        OpenOptions::new().append(true).open(&path).unwrap().write_all(cut.as_bytes()).unwrap();
+        let (l2, ids) = Links::open_with_ids(dir.path(), 1000).unwrap();
+        assert!(l2.places.contains_key("p@x") && ids.contains_key(&0x11), "the whole pass stands");
+        assert!(!l2.places.contains_key("q@x"), "no place of the cut pass");
+        assert!(!ids.contains_key(&0xaa) && !ids.contains_key(&0xbb), "no id of the cut pass");
+        // cut lines followed by a whole append (no reopen between): only the whole one counts
+        OpenOptions::new().append(true).open(&path).unwrap().write_all(cut.as_bytes()).unwrap();
+        l.append(&[Links::place_line("r@x", &a_place("xref-upload-3"))]).unwrap();
+        assert!(!l.places.contains_key("q@x"), "the appending handle never held the cut pass");
+        let (l3, ids) = Links::open_with_ids(dir.path(), 1000).unwrap();
+        assert!(l3.places.contains_key("p@x") && l3.places.contains_key("r@x"));
+        assert!(!l3.places.contains_key("q@x") && !ids.contains_key(&0xaa));
+        assert_eq!(ids.len(), 1);
+    }
+
+    #[test]
+    fn a_file_from_before_markers_is_read_whole_and_rewritten_with_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LINKS_FILE);
+        let old = format!("{}I\t1000\taa,bb\n", Links::place_line("p@x", &a_place("xref-upload-1")));
+        std::fs::write(&path, old).unwrap();
+        let (l, ids) = Links::open_with_ids(dir.path(), 1000).unwrap();
+        assert!(l.places.contains_key("p@x"));
+        assert_eq!(ids.len(), 2);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with(LINKS_HEADER) && text.ends_with("C\t2\n"), "{text}");
+        let (l, ids) = Links::open_with_ids(dir.path(), 1000).unwrap();
+        assert!(l.places.contains_key("p@x"));
+        assert_eq!(ids.len(), 2);
+    }
+
+    #[test]
+    fn a_live_file_is_not_rewritten_on_open() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LINKS_FILE);
+        let mut l = Links::open(dir.path(), 1000).unwrap();
+        // ids enough for several lines a pass, a few passes at different times
+        for pass in 0..5u64 {
+            let hashes: Vec<u64> = (0..(IDS_PER_LINE as u64 * 2 + 7)).map(|i| pass << 32 | i).collect();
+            let mut lines = Links::id_lines(&hashes, 1000 + pass as i64);
+            lines.push(Links::place_line(&format!("p{pass}@x"), &a_place("xref-upload-1")));
+            l.append(&lines).unwrap();
+        }
+        let ino = std::fs::metadata(&path).unwrap().ino();
+        for _ in 0..3 {
+            let (l, ids) = Links::open_with_ids(dir.path(), 1000).unwrap();
+            assert_eq!(l.places.len(), 5);
+            assert_eq!(ids.len(), 5 * (IDS_PER_LINE * 2 + 7));
+        }
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), ino, "not rewritten");
+    }
+
     #[test]
     fn a_day_pass_links_an_upload_across_groups_once_and_late_parts_join_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -1496,6 +1614,7 @@ mod tests {
         let first_i = text.find("I\t").unwrap();
         let first_f = text.find("F\t").unwrap();
         assert!(first_i < first_f, "the ids go first in the append");
+        assert!(text.starts_with(LINKS_HEADER) && text.trim_end().rsplit('\n').next().unwrap().starts_with("C\t"));
         assert!(!state.join(IDS_FILE).exists(), "nothing written apart");
         let lk2 = Linker::open_in(&state, now).unwrap();
         assert_eq!(lk2.ids.len(), 1 + 3 * 4, "read back from the links");
