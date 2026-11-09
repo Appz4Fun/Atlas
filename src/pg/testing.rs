@@ -28,7 +28,7 @@ impl Schema {
         static N: AtomicUsize = AtomicUsize::new(0);
         let name = format!("t_{}_{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed));
         let mut c = postgres::Client::connect(&url, postgres::NoTls).expect("connecting to the test server");
-        c.batch_execute(&format!("drop schema if exists {name} cascade; create schema {name}")).unwrap();
+        c.batch_execute(&format!("drop schema if exists \"{name}\" cascade; create schema \"{name}\"")).unwrap();
         let pool = Pool::new(&StorageConfig {
             backend: super::Backend::Postgres,
             url: url.clone(),
@@ -44,7 +44,7 @@ impl Schema {
 impl Drop for Schema {
     fn drop(&mut self) {
         if let Ok(mut c) = postgres::Client::connect(&self.url, postgres::NoTls) {
-            let _ = c.batch_execute(&format!("drop schema if exists {} cascade", self.name));
+            let _ = c.batch_execute(&format!("drop schema if exists \"{}\" cascade", self.name));
         }
     }
 }

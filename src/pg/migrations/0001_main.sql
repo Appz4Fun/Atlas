@@ -120,3 +120,28 @@ create index spots_seen_key on spots_seen (nzb_key) where nzb_key is not null;
 create index spots_seen_ref on spots_seen (nzb_ref) where nzb_ref is not null;
 create index spots_seen_release on spots_seen (release_id) where release_id is not null;
 create index spots_seen_todo on spots_seen (state, number);
+
+-- parts asked of the servers for a release's own ids (src/inferred.rs)
+create table inferred_asked (
+    release_id bigint primary key,
+    next_at    bigint not null
+);
+create table inferred_ids (
+    message_id text primary key,
+    next_at    bigint not null,
+    tries      bigint not null
+);
+
+-- posts the repair pass has tried (src/repair.rs)
+create table repair_tried (
+    release_id bigint primary key,
+    at         bigint not null,
+    permille   bigint
+);
+create table repair_older (
+    shard  bigint primary key,
+    before bigint
+);
+
+-- the id counter starts where SQLite's does (store::create_main)
+insert into meta (key, value) values ('next_seq', 1);

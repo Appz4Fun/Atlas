@@ -14,8 +14,8 @@ pub fn run(c: &mut Client, schema: &str) -> Result<Vec<i32>, postgres::Error> {
     // held to the end of this transaction: a second process waits here, then finds the versions applied
     tx.execute("select pg_advisory_xact_lock(hashtext('atlas.migrate.' || $1))", &[&schema])?;
     tx.batch_execute(&format!(
-        "create schema if not exists {schema};
-         set local search_path to {schema};
+        "create schema if not exists \"{schema}\";
+         set local search_path to \"{schema}\";
          create table if not exists schema_migrations (
              version    integer primary key,
              name       text not null,
@@ -45,7 +45,7 @@ pub fn version(c: &mut Client, schema: &str) -> Result<i32, postgres::Error> {
     if !has.get::<_, bool>(0) {
         return Ok(0);
     }
-    let row = c.query_one(&format!("select coalesce(max(version), 0) from {schema}.schema_migrations"), &[])?;
+    let row = c.query_one(&format!("select coalesce(max(version), 0) from \"{schema}\".schema_migrations"), &[])?;
     Ok(row.get(0))
 }
 
