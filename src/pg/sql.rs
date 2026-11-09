@@ -244,6 +244,11 @@ pub trait Sql {
         self.query(sql, params)
     }
     /// Statements without parameters, `;`-separated.
+    /// The first row of `query`, reading no further (as rusqlite's `query_row` did).
+    fn query_first(&self, sql: &str, params: &[Value]) -> Result<Option<Row>> {
+        Ok(self.query(sql, params)?.into_iter().next())
+    }
+
     fn batch(&self, sql: &str) -> Result<()>;
     /// Whether the table exists (in the schema queries name tables in).
     fn has_table(&self, table: &str) -> Result<bool>;
@@ -257,7 +262,7 @@ pub trait Sql {
 impl dyn Sql + '_ {
     /// The first row, when there is one.
     pub fn row(&self, sql: &str, params: &[Value]) -> Result<Option<Row>> {
-        Ok(self.query(sql, params)?.into_iter().next())
+        self.query_first(sql, params)
     }
 
     /// The first column of the first row; an error when there's no row.
@@ -393,11 +398,18 @@ fn sqlite_value(v: rusqlite::types::ValueRef<'_>) -> Result<Value> {
 }
 
 fn sqlite_rows(stmt: &mut rusqlite::Statement<'_>, params: &[Value]) -> Result<Vec<Row>> {
+    sqlite_rows_upto(stmt, params, usize::MAX)
+}
+
+/// At most `most` rows: the statement isn't stepped past them.
+fn sqlite_rows_upto(stmt: &mut rusqlite::Statement<'_>, params: &[Value], most: usize) -> Result<Vec<Row>> {
     let n = stmt.column_count();
 
     let mut rows = stmt.query(rusqlite::params_from_iter(params))?;
     let mut out = Vec::new();
-    while let Some(r) = rows.next()? {
+    while out.len() < most
+        && let Some(r) = rows.next()?
+    {
         let mut row = Vec::with_capacity(n);
         for i in 0..n {
             row.push(sqlite_value(r.get_ref(i)?)?);
@@ -418,6 +430,10 @@ impl Sql for rusqlite::Connection {
 
     fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>> {
         sqlite_rows(&mut *self.prepare_cached(&sqlite_sql(sql))?, params)
+    }
+
+    fn query_first(&self, sql: &str, params: &[Value]) -> Result<Option<Row>> {
+        Ok(sqlite_rows_upto(&mut *self.prepare_cached(&sqlite_sql(sql))?, params, 1)?.into_iter().next())
     }
 
     fn execute_uncached(&self, sql: &str, params: &[Value]) -> Result<usize> {
@@ -463,6 +479,9 @@ impl Sql for rusqlite::Transaction<'_> {
     }
     fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>> {
         Sql::query(&**self, sql, params)
+    }
+    fn query_first(&self, sql: &str, params: &[Value]) -> Result<Option<Row>> {
+        Sql::query_first(&**self, sql, params)
     }
     fn execute_uncached(&self, sql: &str, params: &[Value]) -> Result<usize> {
         Sql::execute_uncached(&**self, sql, params)

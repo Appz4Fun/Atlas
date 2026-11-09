@@ -4,7 +4,7 @@
 
 use rusqlite::Connection;
 
-use crate::pg::sql::{Result, Sql, vals};
+use crate::pg::sql::{Dialect, Result, Sql, vals};
 
 /// a claim older than this is taken over (its worker died or was stopped)
 pub const CLAIM_TIMEOUT: i64 = 30 * 60;
@@ -461,7 +461,7 @@ fn frontier_by(db: &dyn Sql, groups: &[(String, i64)], now: i64, newest: bool) -
         return Ok(None);
     }
     let (order, most) = if newest { ("desc", "max") } else { ("asc", "min") };
-    let rows = values_rows(groups.len(), &["text", "bigint"], 0);
+    let rows = values_rows(db.dialect(), groups.len(), &["text", "bigint"], 0);
     let sql = format!(
         "with wanted (g, oldest) as (values {rows}),
               days (day, stale) as (
@@ -521,7 +521,7 @@ fn claim_wanted(db: &dyn Sql, groups: &[(String, i64)], host: &str, now: i64) ->
         return Ok(None);
     }
     let n = groups.len() * 2;
-    let rows = values_rows(groups.len(), &["text", "bigint"], 0);
+    let rows = values_rows(db.dialect(), groups.len(), &["text", "bigint"], 0);
     let sql = format!(
         "with wanted (g, oldest) as (values {rows})
          update backfill_chunks set state = ${a}, server = ${b}, claimed_at = ${c}
@@ -570,7 +570,7 @@ fn claim_ordered(
 ) -> Result<Option<Claim>> {
     let (order, pick, best) = if oldest_first { ("asc", "<=", "asc") } else { ("desc", ">=", "desc") };
     let n = ranges.len() * 4;
-    let rows = values_rows(ranges.len(), &["text", "bigint", "bigint", "bigint"], 0);
+    let rows = values_rows(db.dialect(), ranges.len(), &["text", "bigint", "bigint", "bigint"], 0);
     let sql = format!(
         "with wanted (g, oldest, newest, media) as (values {rows}),
               candidates (grp, media, p_day, s_day) as materialized (
@@ -635,9 +635,10 @@ fn first(rows: Vec<crate::pg::sql::Row>) -> Result<Option<crate::pg::sql::Row>> 
     }
 }
 
-/// SQL: `n` rows of a `values` list of parameters cast to `types`, numbered on from `$first + 1`. Cast, as
-/// Postgres can't tell a parameter's type in a `values` list.
-fn values_rows(n: usize, types: &[&str], first: usize) -> String {
+/// SQL: `n` rows of a `values` list of parameters cast to `types`, numbered on from `$first + 1`. Cast on Postgres,
+/// which can't tell a parameter's type in a `values` list; not on SQLite, where thousands of casts slowed every claim
+/// down by about half (the values bind as their own type there anyway).
+fn values_rows(dialect: Dialect, n: usize, types: &[&str], first: usize) -> String {
     let mut p = first;
     (0..n)
         .map(|_| {
@@ -645,7 +646,10 @@ fn values_rows(n: usize, types: &[&str], first: usize) -> String {
                 .iter()
                 .map(|t| {
                     p += 1;
-                    format!("cast(${p} as {t})")
+                    match dialect {
+                        Dialect::Postgres => format!("cast(${p} as {t})"),
+                        Dialect::Sqlite => format!("${p}"),
+                    }
                 })
                 .collect();
             format!("({})", cols.join(", "))
@@ -654,16 +658,19 @@ fn values_rows(n: usize, types: &[&str], first: usize) -> String {
         .join(", ")
 }
 
-/// The parameters of `values_rows(groups.len(), &["text", "bigint"], 0)`.
+/// The parameters of `values_rows(_, groups.len(), &["text", "bigint"], 0)`.
 fn group_values(groups: &[(String, i64)]) -> Vec<crate::pg::sql::Value> {
     groups.iter().flat_map(|(g, oldest)| [g.into(), (*oldest).into()]).collect()
 }
 
 /// SQL: the groups a reopen takes in, as the CTE `staged (name)`: its parameters from `$3` on (see `staged_values`).
 /// A group no chunk has stands for nothing, soo none makes it an empty list.
-fn staged(groups: &[String]) -> String {
-    let rows =
-        if groups.is_empty() { "(cast(null as text))".to_string() } else { values_rows(groups.len(), &["text"], 2) };
+fn staged(dialect: Dialect, groups: &[String]) -> String {
+    let rows = if groups.is_empty() {
+        "(cast(null as text))".to_string()
+    } else {
+        values_rows(dialect, groups.len(), &["text"], 2)
+    };
     format!("with staged (name) as (values {rows})")
 }
 
@@ -694,7 +701,7 @@ pub fn reopen_done(db: &dyn Sql, since: i64, done_before: Option<i64>, groups: &
              update backfill_chunks set state = {PENDING}, server = null, claimed_at = null, done_at = null,
                     failures = null, failed_at = null, reread = 1
              where {reopens}",
-            staged = staged(groups),
+            staged = staged(db.dialect(), groups),
             reopens = reopens(),
         ),
         &staged_values(since, done_before, groups),
@@ -705,7 +712,7 @@ pub fn reopen_done(db: &dyn Sql, since: i64, done_before: Option<i64>, groups: &
 /// same days are left alone for being of a group not in `groups`.
 pub fn done_since(db: &dyn Sql, since: i64, done_before: Option<i64>, groups: &[String]) -> Result<(i64, i64, i64)> {
     let values = staged_values(since, done_before, groups);
-    let staged = staged(groups);
+    let staged = staged(db.dialect(), groups);
     let r = first(db.query_uncached(
         &format!(
             "{staged} select count(*), count(distinct grp) from backfill_chunks where {reopens}",
