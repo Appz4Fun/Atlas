@@ -20,6 +20,7 @@ use nntp_xover_engine::streamer::{NxvRangeCursor, XoverStreamScratch};
 
 use crate::nxv_store::store::{KeepSet, Store, StoreConfig};
 use crate::parser::Release;
+use crate::store::Prepared;
 
 fn arg<T: std::str::FromStr>(args: &[String], flag: &str, default: T) -> T {
     args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()).unwrap_or(default)
@@ -143,7 +144,7 @@ fn run(args: &[String]) -> Result<()> {
         Store::open(StoreConfig::new(&store_dir), KeepSet { live_from: i64::MIN / 2, ..KeepSet::default() })?;
     let store = Arc::new(store);
     let (slice_tx, slice_rx) = std::sync::mpsc::sync_channel::<Slice>(parsers * 2);
-    let (parsed_tx, parsed_rx) = tokio::sync::mpsc::channel::<(usize, Vec<Release>)>(tasks * 2);
+    let (parsed_tx, parsed_rx) = tokio::sync::mpsc::channel::<(usize, Vec<Release>, Prepared)>(tasks * 2);
     let reader = {
         let (store, stop) = (Arc::clone(&store), Arc::clone(&stop));
         std::thread::spawn(move || read_slices(&store, slice, rows, slice_tx, &stop))
@@ -159,11 +160,13 @@ fn run(args: &[String]) -> Result<()> {
                 let Ok((group, lines)) = next else { return };
                 let t = Instant::now();
                 let releases = parse(&group, &lines);
+                // as the indexer's parse step does: what the writer would otherwise work out
+                let prepared = crate::store::prepare(&releases);
                 parse_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 if releases.is_empty() {
                     continue;
                 }
-                if tx.blocking_send((lines.len(), releases)).is_err() {
+                if tx.blocking_send((lines.len(), releases, prepared)).is_err() {
                     return;
                 }
             }
@@ -205,8 +208,8 @@ fn run(args: &[String]) -> Result<()> {
             handles.push(tokio::spawn(async move {
                 loop {
                     let next = rx.lock().await.recv().await;
-                    let Some((n, releases)) = next else { return Ok::<(), anyhow::Error>(()) };
-                    db.save(releases).await?;
+                    let Some((n, releases, prepared)) = next else { return Ok::<(), anyhow::Error>(()) };
+                    db.save_prepared(releases, prepared).await?;
                     saved_rows.fetch_add(n as u64, Ordering::Relaxed);
                 }
             }));

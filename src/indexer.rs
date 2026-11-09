@@ -788,15 +788,16 @@ impl Db {
     /// (its pass didnt finish, soo the cursor didnt move past it); once the
     /// writer has it, it gets saved.
     pub(crate) async fn save(&self, releases: Vec<Release>) -> Result<()> {
+        let prepared = crate::store::prepare(&releases);
+        self.save_prepared(releases, prepared).await
+    }
+
+    /// `save`, with what of the releases needs no database worked out already (`store::prepare`, on a parse thread):
+    /// the writer is what limits saving. The job is queued before the first await, soo a dropped future after that
+    /// still has its slice saved.
+    pub(crate) async fn save_prepared(&self, releases: Vec<Release>, prepared: crate::store::Prepared) -> Result<()> {
         // a slice is one group, soo one shard
         let Some(shard) = releases.first().map(|r| crate::store::shard_of(&r.group)) else { return Ok(()) };
-        // the writer is what limits saving: what needs no database is worked out here, on another thread
-        let (releases, prepared) = tokio::task::spawn_blocking(move || {
-            let prepared = crate::store::prepare(&releases);
-            (releases, prepared)
-        })
-        .await
-        .map_err(|e| anyhow!("preparing a save failed: {e}"))?;
         let (done, saved) = tokio::sync::oneshot::channel();
         crate::profile::LOAD.writer_queued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if self.saves[shard].send(WriterJob::Save(SaveJob { releases, prepared, done })).is_err() {
@@ -2398,10 +2399,12 @@ async fn parse_and_save(
             let mut releases: Vec<Release> =
                 crate::collections::group_articles(&group, articles).into_values().collect();
             releases.extend(uploads);
-            anyhow::Ok((releases, skipped))
+            // what the writer would otherwise work out itself (the articles dont move from here on)
+            let prepared = crate::store::prepare(&releases);
+            anyhow::Ok((releases, skipped, prepared))
         }
     };
-    let (mut releases, skipped) =
+    let (mut releases, skipped, prepared) =
         tokio::task::spawn_blocking(parsing).await.map_err(|e| anyhow!("parse task failed: {e}"))??;
     crate::profile::PARSE.add_since(t);
     crate::profile::Load::add_since(&crate::profile::LOAD.parse_ns, t);
@@ -2432,7 +2435,7 @@ async fn parse_and_save(
     let count = releases.len() as i64;
     {
         let span = crate::metrics::span("indexer.wait_for_save");
-        let saved = db.save(releases).await;
+        let saved = db.save_prepared(releases, prepared).await;
         if saved.is_err() {
             span.failed();
         }
