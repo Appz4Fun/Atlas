@@ -11,6 +11,7 @@
 //! run again even when the first try's commit landed and only its answer was lost (see `with_retry`).
 
 pub mod migrate;
+pub mod sql;
 #[cfg(test)]
 pub mod testing;
 

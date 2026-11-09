@@ -329,6 +329,20 @@ pub fn get_meta(conn: &Connection, key: &str) -> Result<Option<i64>> {
     conn.query_row("select value from main.meta where key = ?", [key], |r| r.get(0)).optional()
 }
 
+/// A number from the main database's `meta` table, on either backend.
+pub fn meta(db: &dyn crate::pg::sql::Sql, key: &str) -> crate::pg::sql::Result<Option<i64>> {
+    Ok(db.opt::<Option<i64>>("select value from meta where key = $1", crate::pg::sql::vals![key])?.flatten())
+}
+
+/// Keep a number in the main database's `meta` table, on either backend.
+pub fn put_meta(db: &dyn crate::pg::sql::Sql, key: &str, value: i64) -> crate::pg::sql::Result<()> {
+    db.execute(
+        "insert into meta (key, value) values ($1, $2) on conflict (key) do update set value = excluded.value",
+        crate::pg::sql::vals![key, value],
+    )?;
+    Ok(())
+}
+
 /// Keep a number in the main database's `meta` table.
 pub fn set_meta(conn: &Connection, key: &str, value: i64) -> Result<()> {
     conn.execute("insert or replace into main.meta (key, value) values (?, ?)", params![key, value])?;
