@@ -531,6 +531,10 @@ fn claim_wanted(db: &dyn Sql, groups: &[(String, i64)], host: &str, now: i64) ->
     let stale = now - CLAIM_TIMEOUT;
     let row = db.tx(|tx| {
         tx.lock("atlas.backfill_claim")?;
+        // a write first, soo SQLite takes the main database's write lock now, waiting its turn: a deferred
+        // transaction that reads first fails at once (no busy wait) when another connection wrote in between. Not
+        // `begin immediate`, which would lock every attached shard too
+        tx.execute("update backfill_wanted set at = at where 0 = 1", vals![])?;
         // the days asked for alone, each claimed by its key below: joined to the chunks, SQLite's plan (no stats for
         // the small table) scanned all of backfill_chunks by its day index first
         let asked = tx.query("select grp, day from backfill_wanted order by day desc, grp", vals![])?;
