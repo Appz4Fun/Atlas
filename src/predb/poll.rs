@@ -162,7 +162,7 @@ impl Poller<'_> {
         // near 255), it answers 400 or 404 instead of an empty list: in history, that is the end, not
         // a failure. Newer pages and gaps keep failing on it, so a passing error can't close a gap.
         if self.in_history && page_num > 1 && matches!(reply.status, 400 | 404) {
-            // history stays ended, so say where: raising history_pages walks on from here
+            // history stays ended, so say where: lowering feeds.history_read below history_pages walks on from here
             println!("predb: {} history ends at page {page_num} (HTTP {})", self.spec.key, reply.status);
             return Ok(Vec::new());
         }
