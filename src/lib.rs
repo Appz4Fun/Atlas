@@ -48,6 +48,7 @@ pub mod par2;
 pub mod parity;
 pub mod parser;
 pub mod paths;
+pub mod pg;
 pub mod postprocess;
 pub mod predb;
 pub mod probe;
