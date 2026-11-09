@@ -436,6 +436,8 @@ pub(super) struct FileBytes<'a> {
     parts: std::collections::HashMap<(usize, i64), (u64, Vec<u8>)>,
     /// the bytes of those parts
     held: u64,
+    /// parts that came to nothing, not asked for again
+    failed: std::collections::HashSet<(usize, i64)>,
 }
 
 impl<'a> FileBytes<'a> {
@@ -449,6 +451,7 @@ impl<'a> FileBytes<'a> {
             segments: vec![None; n],
             parts: std::collections::HashMap::new(),
             held: 0,
+            failed: std::collections::HashSet::new(),
         }
     }
 
@@ -457,6 +460,17 @@ impl<'a> FileBytes<'a> {
         if let Some(got) = self.parts.get(&(v, part)) {
             return Ok(Some(got.clone()));
         }
+        if self.failed.contains(&(v, part)) {
+            return Ok(None);
+        }
+        let got = self.fetch_part(fetch, v, part)?;
+        if got.is_none() {
+            self.failed.insert((v, part));
+        }
+        Ok(got)
+    }
+
+    fn fetch_part(&mut self, fetch: &mut Fetch<'_>, v: usize, part: i64) -> Result<Option<(u64, Vec<u8>)>, StepError> {
         let Some(file) = self.volumes[v] else { return Ok(None) };
         let Some(got) = fetch(file, part)? else { return Ok(None) };
         let len = got.1.len() as u64;
@@ -671,6 +685,24 @@ fn mp4_frames(
 /// The keyframes of a Matroska video for the stills, as (position, frame, time in ms), and its video track.
 fn mkv_frames(ctx: &mut StepCtx<'_>, files: &[FileInfo], first: &FileInfo) -> Result<Option<Frames>, StepError> {
     let Some((track, stored)) = track_of(ctx, first)? else { return Ok(None) };
+    // by the file's own index of its keyframes, as an MP4's `moov` is read: a scan from a position finds one only
+    // when a keyframe falls within the few articles read, and an encode with one every ten seconds rarely has one
+    let volumes = if stored {
+        volume_slots(&first.filename, moviehash::volumes(&first.filename, files))
+    } else {
+        Some(vec![Some(first)])
+    };
+    let mut frames = match volumes {
+        Some(volumes) => {
+            mkv_cued_frames(&mut |file: &FileInfo, part: i64| read(ctx, file, part), volumes, stored, &track)?
+                .unwrap_or_default()
+        }
+        None => Vec::new(),
+    };
+    if frames.len() == POSITIONS.len() {
+        return Ok(Some((track, frames)));
+    }
+    // the positions the Cues gave no keyframe for are scanned for one
     let layout = if stored {
         let volumes = moviehash::volumes(&first.filename, files);
         if volumes.is_empty() {
@@ -680,14 +712,98 @@ fn mkv_frames(ctx: &mut StepCtx<'_>, files: &[FileInfo], first: &FileInfo) -> Re
     } else {
         Layout::Plain(first)
     };
-    let mut frames = Vec::new();
     for percent in POSITIONS {
+        if frames.iter().any(|f| f.0 == percent) {
+            continue;
+        }
         let Some((file, part)) = part_at(&layout, percent) else { continue };
         let Some((frame, at)) = keyframe_from(ctx, &layout, file, part, track.number)? else { continue };
         let at_ms = track.millis(at);
+        // the keyframe a cue gave another position, found again by the scan: one picture, once
+        if frames.iter().any(|f| f.2 == at_ms) {
+            continue;
+        }
         frames.push((percent, frame, at_ms));
     }
+    frames.sort_by_key(|f| f.0);
     Ok(Some((track, frames)))
+}
+
+/// Bytes of a Matroska file's start read for its SeekHead.
+const MKV_FRONT: u64 = 64 << 10;
+/// The most a Cues element is read for: a cue a keyframe for three hours of video is well under this.
+const MAX_CUES: u64 = 4 << 20;
+/// Bytes read from a cued cluster's start, before the frame begun there says how many more it needs.
+const CLUSTER_READ: u64 = 1 << 20;
+/// The shortest read tried near a file's end.
+const MIN_CLUSTER_STEP: u64 = 4 << 10;
+
+/// The keyframes of a Matroska file for the stills, as (position, frame, time in ms), by its Cues: the cluster each
+/// position's nearest cue points at, read from its start. None when the file has no Cues its SeekHead names.
+fn mkv_cued_frames(
+    fetch: &mut Fetch<'_>,
+    volumes: Vec<Option<&FileInfo>>,
+    stored: bool,
+    track: &mkv::VideoTrack,
+) -> Result<Option<Vec<(u8, Vec<u8>, i64)>>, StepError> {
+    let mut bytes = FileBytes::new(volumes, stored);
+    let Some(front) = bytes.range(fetch, 0, MKV_FRONT)? else { return Ok(None) };
+    let Some((segment, cues_at)) = mkv::cues_from_front(&front) else { return Ok(None) };
+    let Some(head) = bytes.range(fetch, cues_at, cues_at.saturating_add(16))? else { return Ok(None) };
+    let Some(len) = mkv::cues_len(&head).filter(|len| *len <= MAX_CUES) else { return Ok(None) };
+    let Some(end) = cues_at.checked_add(len) else { return Ok(None) };
+    let Some(cues) = bytes.range(fetch, cues_at, end)? else { return Ok(None) };
+    let points = mkv::cue_points(&cues, track.number);
+    let mut frames = Vec::new();
+    let mut used = Vec::new();
+    for percent in POSITIONS {
+        // two positions on one cue (a short film, or cues far apart) would be one picture twice: the scan tries
+        // the second
+        let Some((_, cluster)) = mkv::cue_at(&points, percent).filter(|(_, c)| !used.contains(c)) else { continue };
+        used.push(cluster);
+        let Some(from) = segment.checked_add(cluster) else { continue };
+        // one that leads to no keyframe is left to the scan: its cluster's first articles were all it cost
+        if let Some((frame, timestamp)) = cued_keyframe(fetch, &mut bytes, from, track.number)? {
+            frames.push((percent, frame, track.millis(timestamp)));
+        }
+    }
+    Ok(Some(frames))
+}
+
+/// The keyframe at the start of the cluster at `from`: its bytes and its timestamp, in the segment's ticks. A
+/// cluster's start is read, then as much more as the frame begun there says it needs; near the file's end a
+/// shorter first read is tried.
+fn cued_keyframe(
+    fetch: &mut Fetch<'_>,
+    bytes: &mut FileBytes<'_>,
+    from: u64,
+    track: u64,
+) -> Result<Option<(Vec<u8>, i64)>, StepError> {
+    let mut data = None;
+    let mut step = CLUSTER_READ;
+    while data.is_none() && step >= MIN_CLUSTER_STEP {
+        let Some(to) = from.checked_add(step) else { return Ok(None) };
+        data = bytes.range(fetch, from, to)?;
+        step /= 4;
+    }
+    let Some(mut data) = data.filter(|d| !d.is_empty()) else { return Ok(None) };
+    for _ in 0..2 {
+        match mkv::find_keyframe(&data, track) {
+            Found::Frame { start, len, timestamp } => return Ok(Some((data[start..start + len].to_vec(), timestamp))),
+            Found::Partial { start, len, .. } => {
+                let (Some(at), Some(to)) =
+                    (from.checked_add(data.len() as u64), from.checked_add((start + len) as u64))
+                else {
+                    return Ok(None);
+                };
+                let Some(more) = bytes.range(fetch, at, to)?.filter(|m| !m.is_empty()) else { return Ok(None) };
+                data.extend(more);
+            }
+            // a cued cluster starts with its keyframe: none in its first bytes is none at all
+            _ => return Ok(None),
+        }
+    }
+    Ok(None)
 }
 
 /// MP4 sample entries of the video the decoders read, as the probe names them.
@@ -759,9 +875,11 @@ impl Step for StillsStep {
         cfg.archive.enabled
     }
     /// Bit 1: every Matroska video gets stills, not only those of 100 MiB or more, soo smaller ones already
-    /// processed are looked at again. Bit 2: each still has a perceptual hash.
+    /// processed are looked at again. Bit 2: each still has a perceptual hash. Bit 4: a Matroska file's keyframes
+    /// are found by its Cues, soo the many done with none found by the scan are looked at again (one with its
+    /// stills all kept fetches nothing).
     fn config_stamp(&self) -> u64 {
-        1 | 2
+        1 | 2 | 4
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let retry = |e: rusqlite::Error| StepError::Retry(e.to_string());
@@ -889,6 +1007,10 @@ impl Step for StillsStep {
                 ],
             ));
         }
+        // fewer than it has already (a run asked for again whose reads came to less): what it has stays
+        if made < kept.iter().filter(|(h, _)| still_file(h).is_some_and(|f| f.exists())).count() {
+            return Ok(Outcome { matched: true, ..Outcome::default() });
+        }
         if !raw_saved.is_empty() {
             crate::raw_store::put_stills(&rel_name, &rel_group, &content_id, &raw_saved);
         }
@@ -948,6 +1070,44 @@ mod tests {
         assert!(!still_matches((25, Some(4_000), hash), (50, Some(4_000), !hash)), "another picture");
         assert!(still_matches((25, None, hash), (25, Some(4_000), hash)), "no time: by position");
         assert!(!still_matches((25, None, hash), (50, Some(4_000), hash)));
+    }
+
+    #[test]
+    fn a_matroska_files_cues_find_a_keyframe_for_each_position() {
+        let data = std::fs::read(format!("{}/tests/fixtures/hevc/clip.mkv", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let track = mkv::video_track(&data).unwrap();
+        // posted whole, in articles of 16 KiB, each read counted
+        const ARTICLE: usize = 16 << 10;
+        let film = file("clip.mkv", data.len().div_ceil(ARTICLE) as i64);
+        let mut reads = Vec::new();
+        let mut fetch = |_: &FileInfo, part: i64| -> Result<Option<(u64, Vec<u8>)>, StepError> {
+            reads.push(part);
+            let from = (part as usize - 1) * ARTICLE;
+            Ok(data.get(from..data.len().min(from + ARTICLE)).map(|b| (from as u64, b.to_vec())))
+        };
+        let frames = mkv_cued_frames(&mut fetch, vec![Some(&film)], false, &track).unwrap().unwrap();
+        assert_eq!(frames.iter().map(|f| f.0).collect::<Vec<_>>(), POSITIONS.to_vec());
+        let times: Vec<i64> = frames.iter().map(|f| f.2).collect();
+        assert!(times.windows(2).all(|w| w[0] < w[1]), "{times:?}");
+        for (_, frame, _) in &frames {
+            assert!(still_of(&track, frame).is_some(), "each one decodes");
+        }
+        // each article fetched once, however many reads it's in
+        let mut unique = reads.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), reads.len(), "{reads:?}");
+        // a cue pointing past any file's end: nothing, at once
+        let mut none = |_: &FileInfo, _: i64| -> Result<Option<(u64, Vec<u8>)>, StepError> { Ok(None) };
+        let mut bytes = FileBytes::new(vec![Some(&film)], false);
+        assert!(cued_keyframe(&mut none, &mut bytes, u64::MAX - 10, track.number).unwrap().is_none());
+        // a file whose front names no Cues: none, for the scan to try
+        let mut front_only = |_: &FileInfo, part: i64| -> Result<Option<(u64, Vec<u8>)>, StepError> {
+            let mut bytes = vec![0x1A, 0x45, 0xDF, 0xA3, 0x80];
+            bytes.resize(ARTICLE, 0);
+            Ok((part == 1).then_some((0, bytes)))
+        };
+        assert!(mkv_cued_frames(&mut front_only, vec![Some(&film)], false, &track).unwrap().is_none());
     }
 
     #[test]

@@ -17,6 +17,16 @@ const REFERENCE_BLOCK: u32 = 0xFB;
 /// What may come before a cluster's timestamp
 const CRC32: u32 = 0xBF;
 const VOID: u32 = 0xEC;
+const SEEK_HEAD: u32 = 0x114D_9B74;
+const SEEK: u32 = 0x4DBB;
+const SEEK_ID: u32 = 0x53AB;
+const SEEK_POSITION: u32 = 0x53AC;
+const CUES: u32 = 0x1C53_BB6B;
+const CUE_POINT: u32 = 0xBB;
+const CUE_TIME: u32 = 0xB3;
+const CUE_TRACK_POSITIONS: u32 = 0xB7;
+const CUE_TRACK: u32 = 0xF7;
+const CUE_CLUSTER_POSITION: u32 = 0xF1;
 
 /// The most a keyframe may be: a 2160p IDR at a high bit rate is a few MB.
 pub const MAX_KEYFRAME: usize = 16 << 20;
@@ -143,6 +153,96 @@ fn display_size(video: &[u8]) -> Option<(u64, u64)> {
         }
     }
     Some((w.filter(|w| *w > 0)?, h.filter(|h| *h > 0)?))
+}
+
+/// Where a file's segment body starts and where its Cues element is, both from the file's start, by the SeekHead
+/// in its first bytes. None when the front has no SeekHead naming the Cues: a file written as a stream.
+pub fn cues_from_front(front: &[u8]) -> Option<(u64, u64)> {
+    let mut at = 0;
+    while let Some((id, size, start)) = element(front, at) {
+        if id == SEGMENT {
+            let mut child = start;
+            while let Some((id, size, body_at)) = element(front, child) {
+                if id == CLUSTER {
+                    return None;
+                }
+                let size = usize::try_from(size?).ok()?;
+                if id == SEEK_HEAD {
+                    let body = front.get(body_at..body_at.checked_add(size)?)?;
+                    for (_, seek) in children(body).filter(|(id, _)| *id == SEEK) {
+                        let (mut target, mut position) = (None, None);
+                        for (id, v) in children(seek) {
+                            match id {
+                                SEEK_ID => target = Some(uint(v)),
+                                SEEK_POSITION => position = Some(uint(v)),
+                                _ => {}
+                            }
+                        }
+                        if target == Some(u64::from(CUES)) {
+                            let segment = start as u64;
+                            return Some((segment, segment.checked_add(position?)?));
+                        }
+                    }
+                }
+                child = body_at.checked_add(size)?;
+            }
+            return None;
+        }
+        at = start.checked_add(usize::try_from(size?).ok()?)?;
+    }
+    None
+}
+
+/// How many bytes the Cues element starting `head` takes, header and all, by its header. None when `head` isn't
+/// the start of a Cues element.
+pub fn cues_len(head: &[u8]) -> Option<u64> {
+    let (id, size, start) = element(head, 0)?;
+    (id == CUES).then_some(())?;
+    size?.checked_add(start as u64)
+}
+
+/// The cue points of `track` in a whole Cues element: (time in the segment's ticks, the cluster's position from the
+/// segment body's start), in the order they're listed.
+pub fn cue_points(cues: &[u8], track: u64) -> Vec<(u64, u64)> {
+    let Some((CUES, Some(size), start)) = element(cues, 0) else { return Vec::new() };
+    let Some(body) = usize::try_from(size).ok().and_then(|size| cues.get(start..start.checked_add(size)?)) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (_, point) in children(body).filter(|(id, _)| *id == CUE_POINT) {
+        let mut time = None;
+        let mut cluster = None;
+        for (id, v) in children(point) {
+            match id {
+                CUE_TIME => time = Some(uint(v)),
+                CUE_TRACK_POSITIONS => {
+                    let (mut number, mut position) = (None, None);
+                    for (id, v) in children(v) {
+                        match id {
+                            CUE_TRACK => number = Some(uint(v)),
+                            CUE_CLUSTER_POSITION => position = Some(uint(v)),
+                            _ => {}
+                        }
+                    }
+                    if number == Some(track) {
+                        cluster = cluster.or(position);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let (Some(time), Some(cluster)) = (time, cluster) {
+            out.push((time, cluster));
+        }
+    }
+    out
+}
+
+/// The cue point nearest `percent` of the way through, by time: the last point's time stands for the length.
+pub fn cue_at(points: &[(u64, u64)], percent: u8) -> Option<(u64, u64)> {
+    let last = points.iter().map(|p| p.0).max()?;
+    let target = u128::from(last) * u128::from(percent) / 100;
+    points.iter().copied().min_by_key(|(time, _)| u128::from(*time).abs_diff(target))
 }
 
 /// A keyframe found in a run of bytes. Its timestamp is in the segment's ticks: see [`VideoTrack::millis`].
@@ -300,6 +400,24 @@ mod tests {
         let t = video_track(&fixture()).unwrap();
         assert_eq!((t.number, &t.codec), (1, &Codec::Hevc));
         assert_eq!(t.private[0], 1, "hvcC version");
+    }
+
+    #[test]
+    fn the_cues_say_where_each_keyframe_s_cluster_starts() {
+        let data = fixture();
+        let t = video_track(&data).unwrap();
+        let (segment, cues_at) = cues_from_front(&data[..4096]).unwrap();
+        let len = cues_len(&data[cues_at as usize..]).unwrap();
+        let points = cue_points(&data[cues_at as usize..(cues_at + len) as usize], t.number);
+        assert!(points.len() >= 3, "{points:?}");
+        for (_, cluster) in &points {
+            let at = (segment + cluster) as usize;
+            assert_eq!(&data[at..at + 4], &[0x1F, 0x43, 0xB6, 0x75], "a cluster starts there");
+        }
+        let (first, last) = (cue_at(&points, 0).unwrap(), cue_at(&points, 100).unwrap());
+        assert!(first.0 < last.0);
+        assert!(cue_points(&data[cues_at as usize..(cues_at + len) as usize], t.number + 7).is_empty());
+        assert!(cues_len(&data[..16]).is_none(), "not a Cues element");
     }
 
     #[test]
