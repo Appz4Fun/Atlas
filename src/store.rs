@@ -1086,12 +1086,50 @@ pub(crate) fn put_file(conn: &Connection, f: &FileState) -> Result<()> {
     Ok(())
 }
 
+/// `add_segment_with`, its statements prepared for the one article.
+#[cfg(test)]
+pub(crate) fn add_segment(
+    conn: &Connection,
+    domains: &mut Domains,
+    f: &FileState,
+    index: Option<(i64, &IdKey)>,
+    a: &Article,
+    sealed: &mut SealedCache,
+) -> Result<bool> {
+    add_segment_with(conn, &mut SegmentStatements::new(conn)?, domains, f, index, a, sealed)
+}
+
+/// The statements `add_segment` runs for each article, prepared once for a whole save: taking each from the
+/// connection's cache again for every article (hashing its SQL to find it) was a few percent of the writer's time.
+pub(crate) struct SegmentStatements<'c> {
+    index_lookup: rusqlite::CachedStatement<'c>,
+    stored: rusqlite::CachedStatement<'c>,
+    insert: rusqlite::CachedStatement<'c>,
+    index_insert: rusqlite::CachedStatement<'c>,
+}
+
+impl<'c> SegmentStatements<'c> {
+    pub(crate) fn new(conn: &'c Connection) -> Result<SegmentStatements<'c>> {
+        Ok(SegmentStatements {
+            index_lookup: conn
+                .prepare_cached("select file_id from release_ids where release_id = ? and id_hash = ?")?,
+            stored: conn.prepare_cached("select 1 from segments where file_id = ? and local = ? and domain = ?")?,
+            insert: conn.prepare_cached(
+                "insert or ignore into segments (file_id, local, domain, part, bytes) values (?, ?, ?, ?, ?)",
+            )?,
+            index_insert: conn
+                .prepare_cached("insert or ignore into release_ids (release_id, id_hash, file_id) values (?, ?, ?)")?,
+        })
+    }
+}
+
 /// Add one article to a file; false when it was already there, as a row or
 /// in the file's sealed blob, or in another file of its release (`index`,
 /// the release and the hash key when it has more than one file: one
 /// message-id saved under two parsed file names is one article).
-pub(crate) fn add_segment(
+pub(crate) fn add_segment_with(
     conn: &Connection,
+    stmts: &mut SegmentStatements<'_>,
     domains: &mut Domains,
     f: &FileState,
     index: Option<(i64, &IdKey)>,
@@ -1108,19 +1146,15 @@ pub(crate) fn add_segment(
         LOOKUPS.set(LOOKUPS.get() + 1);
     }
     if let (Some((release_id, _)), Some(hash)) = (index, hash)
-        && let Some(file_id) = conn
-            .prepare_cached("select file_id from release_ids where release_id = ? and id_hash = ?")?
-            .query_row(params![release_id, hash], |r| r.get::<_, i64>(0))
-            .optional()?
+        && let Some(file_id) =
+            stmts.index_lookup.query_row(params![release_id, hash], |r| r.get::<_, i64>(0)).optional()?
         && (file_id != f.id || f.sealed)
     {
         return Ok(false);
     }
     let (local, domain) = domains.encode(conn, &a.message_id)?;
-    let stored = |sealed: &mut SealedCache, local: &[u8], domain: i64| -> Result<bool> {
-        let row = conn
-            .prepare_cached("select 1 from segments where file_id = ? and local = ? and domain = ?")?
-            .exists(params![f.id, local, domain])?;
+    let mut stored = |sealed: &mut SealedCache, local: &[u8], domain: i64| -> Result<bool> {
+        let row = stmts.stored.exists(params![f.id, local, domain])?;
         Ok(row || (f.sealed && sealed.contains(conn, f.id, local, domain)?))
     };
     if f.sealed && sealed.contains(conn, f.id, &local, domain)? {
@@ -1143,9 +1177,7 @@ pub(crate) fn add_segment(
             return Ok(false);
         }
     }
-    let added = conn
-        .prepare_cached("insert or ignore into segments (file_id, local, domain, part, bytes) values (?, ?, ?, ?, ?)")?
-        .execute(params![f.id, local, domain, a.part, a.bytes])?;
+    let added = stmts.insert.execute(params![f.id, local, domain, a.part, a.bytes])?;
     if added > 0 && f.sealed && sealed.guessed {
         conn.prepare_cached(
             "insert or replace into held_back (file_id, message_id, subject, part, total_parts, file_total, again)
@@ -1164,8 +1196,7 @@ pub(crate) fn add_segment(
     if added > 0
         && let (Some((release_id, _)), Some(hash)) = (index, hash)
     {
-        conn.prepare_cached("insert or ignore into release_ids (release_id, id_hash, file_id) values (?, ?, ?)")?
-            .execute(params![release_id, hash, f.id])?;
+        stmts.index_insert.execute(params![release_id, hash, f.id])?;
     }
     Ok(added > 0)
 }
@@ -2818,6 +2849,7 @@ impl ShardWriter {
             )?;
             let mut update_stats = tx
                 .prepare_cached("update releases set size = ?, complete = ?, parts = ?, file_total = ? where id = ?")?;
+            let mut segment_stmts = SegmentStatements::new(&tx)?;
 
             // nothing is ever saved for a blocked group, whichever path it came by
             let mut releases: Vec<Cow<'_, Release>> = Vec::new();
@@ -2963,7 +2995,7 @@ impl ShardWriter {
                     let before = added.len();
                     let mut timing = Timing::default();
                     for (i, a) in articles {
-                        if add_segment(&tx, domains, &f, index, a, &mut sealed)? {
+                        if add_segment_with(&tx, &mut segment_stmts, domains, &f, index, a, &mut sealed)? {
                             let unsure = f.sealed && sealed.guessed;
                             // an article that may be a copy of one in the blob isn't timed: sealing again can drop
                             // it, and nothing takes it back out of the timing row, so its counts would stay
