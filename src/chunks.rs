@@ -4,7 +4,7 @@
 
 use rusqlite::Connection;
 
-use crate::pg::sql::{Result, Sql, vals};
+use crate::pg::sql::{Dialect, Result, Sql, vals};
 
 /// a claim older than this is taken over (its worker died or was stopped)
 pub const CLAIM_TIMEOUT: i64 = 30 * 60;
@@ -159,6 +159,7 @@ pub fn reach_back(db: &dyn Sql, group: &str, oldest_day: i64, oldest_at: i64) ->
     db.tx(|tx| {
         // what's added depends on the window's floor: read as it is, not as it was before a change to it commits
         tx.lock(&speculative_lock(group))?;
+        tx.write_first("backfill_chunks", "state")?;
         let Some(old) = self::oldest_day(tx, group)? else { return Ok(0) };
         // never past the window of days only the deepest server has
         let spec = speculative(tx, group)?;
@@ -461,7 +462,7 @@ fn frontier_by(db: &dyn Sql, groups: &[(String, i64)], now: i64, newest: bool) -
         return Ok(None);
     }
     let (order, most) = if newest { ("desc", "max") } else { ("asc", "min") };
-    let rows = values_rows(groups.len(), &["text", "bigint"], 0);
+    let rows = values_rows(db.dialect(), groups.len(), &["text", "bigint"], 0);
     let sql = format!(
         "with wanted (g, oldest) as (values {rows}),
               days (day, stale) as (
@@ -520,29 +521,46 @@ fn claim_wanted(db: &dyn Sql, groups: &[(String, i64)], host: &str, now: i64) ->
     if !db.exists("select 1 from backfill_wanted limit 1", vals![])? {
         return Ok(None);
     }
-    let n = groups.len() * 2;
-    let rows = values_rows(groups.len(), &["text", "bigint"], 0);
-    let sql = format!(
-        "with wanted (g, oldest) as (values {rows})
-         update backfill_chunks set state = ${a}, server = ${b}, claimed_at = ${c}
-         where (grp, day) = (
-             select c.grp, c.day from backfill_wanted r
-             join wanted w on w.g = r.grp
-             join backfill_chunks c on c.grp = r.grp and c.day = r.day
-             where c.day >= w.oldest and (c.state = {PENDING} or (c.state = {CLAIMED} and c.claimed_at < ${d}))
-             order by c.day desc, c.grp limit 1)
-           -- picked from the rows as they were when this began: on Postgres another connection's finish or reach
-           -- back may have changed it since, and only this is checked again then
-           and (state = {PENDING} or (state = {CLAIMED} and claimed_at < ${d}))
-         returning grp, day, coalesce(reread, 0)",
-        a = n + 1,
-        b = n + 2,
-        c = n + 3,
-        d = n + 4,
-    );
-    let mut values = group_values(groups);
-    values.extend([CLAIMED.into(), host.into(), now.into(), (now - CLAIM_TIMEOUT).into()]);
-    claim_one(db, &sql, &values, host, now)
+    // the few days asked for are read and checked against `groups` here: joined in SQL with a values list of every
+    // group, SQLite's plan for it walked the whole chunk table on prod, under the main connection's lock
+    // a group listed twice is open from the older of its days, as the join with every entry was
+    let mut oldest: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
+    for (g, o) in groups {
+        let e = oldest.entry(g.as_str()).or_insert(*o);
+        *e = (*e).min(*o);
+    }
+    let stale = now - CLAIM_TIMEOUT;
+    let row = db.tx(|tx| {
+        tx.lock("atlas.backfill_claim")?;
+        tx.write_first("backfill_chunks", "state")?;
+        // the days asked for alone, each claimed by its key below: joined to the chunks, SQLite's plan (no stats for
+        // the small table) scanned all of backfill_chunks by its day index first
+        let asked = tx.query("select grp, day from backfill_wanted order by day desc, grp", vals![])?;
+        for r in asked {
+            let (grp, day): (String, i64) = (r.get(0)?, r.get(1)?);
+            if oldest.get(grp.as_str()).is_none_or(|o| day < *o) {
+                continue;
+            }
+            let claimed = tx
+                .query(
+                    &format!(
+                        "update backfill_chunks set state = $1, server = $2, claimed_at = $3
+                         where grp = $4 and day = $5 and (state = {PENDING} or (state = {CLAIMED} and claimed_at < $6))
+                         returning grp, day, coalesce(reread, 0)"
+                    ),
+                    vals![CLAIMED, host, now, grp.as_str(), day, stale],
+                )?
+                .into_iter()
+                .next();
+            // a day done or claimed fresh since it was asked for: the next one
+            if claimed.is_some() {
+                return Ok(claimed);
+            }
+        }
+        Ok(None)
+    })?;
+    let Some(r) = row else { return Ok(None) };
+    Ok(Some(Claim { group: r.get(0)?, day: r.get(1)?, server: host.to_string(), claimed_at: now, reread: r.get(2)? }))
 }
 
 /// The chunk `claim` takes after the days asked for: of each group its newest day pending or with a stale claim, then
@@ -570,7 +588,7 @@ fn claim_ordered(
 ) -> Result<Option<Claim>> {
     let (order, pick, best) = if oldest_first { ("asc", "<=", "asc") } else { ("desc", ">=", "desc") };
     let n = ranges.len() * 4;
-    let rows = values_rows(ranges.len(), &["text", "bigint", "bigint", "bigint"], 0);
+    let rows = values_rows(db.dialect(), ranges.len(), &["text", "bigint", "bigint", "bigint"], 0);
     let sql = format!(
         "with wanted (g, oldest, newest, media) as (values {rows}),
               candidates (grp, media, p_day, s_day) as materialized (
@@ -635,9 +653,10 @@ fn first(rows: Vec<crate::pg::sql::Row>) -> Result<Option<crate::pg::sql::Row>> 
     }
 }
 
-/// SQL: `n` rows of a `values` list of parameters cast to `types`, numbered on from `$first + 1`. Cast, as
-/// Postgres can't tell a parameter's type in a `values` list.
-fn values_rows(n: usize, types: &[&str], first: usize) -> String {
+/// SQL: `n` rows of a `values` list of parameters cast to `types`, numbered on from `$first + 1`. Cast on Postgres,
+/// which can't tell a parameter's type in a `values` list; not on SQLite, where thousands of casts slowed every claim
+/// down by about half (the values bind as their own type there anyway).
+fn values_rows(dialect: Dialect, n: usize, types: &[&str], first: usize) -> String {
     let mut p = first;
     (0..n)
         .map(|_| {
@@ -645,7 +664,10 @@ fn values_rows(n: usize, types: &[&str], first: usize) -> String {
                 .iter()
                 .map(|t| {
                     p += 1;
-                    format!("cast(${p} as {t})")
+                    match dialect {
+                        Dialect::Postgres => format!("cast(${p} as {t})"),
+                        Dialect::Sqlite => format!("${p}"),
+                    }
                 })
                 .collect();
             format!("({})", cols.join(", "))
@@ -654,16 +676,19 @@ fn values_rows(n: usize, types: &[&str], first: usize) -> String {
         .join(", ")
 }
 
-/// The parameters of `values_rows(groups.len(), &["text", "bigint"], 0)`.
+/// The parameters of `values_rows(_, groups.len(), &["text", "bigint"], 0)`.
 fn group_values(groups: &[(String, i64)]) -> Vec<crate::pg::sql::Value> {
     groups.iter().flat_map(|(g, oldest)| [g.into(), (*oldest).into()]).collect()
 }
 
 /// SQL: the groups a reopen takes in, as the CTE `staged (name)`: its parameters from `$3` on (see `staged_values`).
 /// A group no chunk has stands for nothing, soo none makes it an empty list.
-fn staged(groups: &[String]) -> String {
-    let rows =
-        if groups.is_empty() { "(cast(null as text))".to_string() } else { values_rows(groups.len(), &["text"], 2) };
+fn staged(dialect: Dialect, groups: &[String]) -> String {
+    let rows = if groups.is_empty() {
+        "(cast(null as text))".to_string()
+    } else {
+        values_rows(dialect, groups.len(), &["text"], 2)
+    };
     format!("with staged (name) as (values {rows})")
 }
 
@@ -694,7 +719,7 @@ pub fn reopen_done(db: &dyn Sql, since: i64, done_before: Option<i64>, groups: &
              update backfill_chunks set state = {PENDING}, server = null, claimed_at = null, done_at = null,
                     failures = null, failed_at = null, reread = 1
              where {reopens}",
-            staged = staged(groups),
+            staged = staged(db.dialect(), groups),
             reopens = reopens(),
         ),
         &staged_values(since, done_before, groups),
@@ -705,7 +730,7 @@ pub fn reopen_done(db: &dyn Sql, since: i64, done_before: Option<i64>, groups: &
 /// same days are left alone for being of a group not in `groups`.
 pub fn done_since(db: &dyn Sql, since: i64, done_before: Option<i64>, groups: &[String]) -> Result<(i64, i64, i64)> {
     let values = staged_values(since, done_before, groups);
-    let staged = staged(groups);
+    let staged = staged(db.dialect(), groups);
     let r = first(db.query_uncached(
         &format!(
             "{staged} select count(*), count(distinct grp) from backfill_chunks where {reopens}",
@@ -897,7 +922,10 @@ pub fn forget_deepest(db: &dyn Sql, group: &str, server: &str) -> Result<()> {
 /// still to do (pending or claimed) on a day the server keeps.
 pub fn waiting(db: &dyn Sql, groups: &[(String, i64)]) -> Result<bool> {
     for (g, oldest) in groups {
-        if db.exists("select 1 from backfill_chunks where grp = $1 and day >= $2 and state != 2", vals![g, *oldest])? {
+        if db.exists(
+            "select 1 from backfill_chunks where grp = $1 and day >= $2 and state != 2 limit 1",
+            vals![g, *oldest],
+        )? {
             return Ok(true);
         }
     }
@@ -907,7 +935,7 @@ pub fn waiting(db: &dyn Sql, groups: &[(String, i64)]) -> Result<bool> {
 /// Whether every day chunk of split `group` is done.
 pub fn chunks_done(db: &dyn Sql, group: &str) -> Result<bool> {
     Ok(is_split(db, group)?
-        && !db.exists("select 1 from backfill_chunks where grp = $1 and state != 2", vals![group])?)
+        && !db.exists("select 1 from backfill_chunks where grp = $1 and state != 2 limit 1", vals![group])?)
 }
 
 /// The split generation of `group`: counts the times its split reached back

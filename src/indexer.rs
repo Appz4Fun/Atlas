@@ -940,6 +940,7 @@ fn cursors_or_adopted(
         // the move as one, soo a load of the same key at the same moment can't delete what this one just renamed
         let moved = conn.tx(|tx| {
             tx.lock("atlas.adopt_cursors")?;
+            tx.write_first("groups", "name")?;
             if db::get_group_state(tx, key)?.is_some() {
                 return Ok(true);
             }
@@ -1767,6 +1768,7 @@ async fn reach_further(db: &Db, group: &str, (_day, floor, oldest): (i64, i64, O
         // from the same row, on Postgres
         Ok(db.tx(|conn| -> crate::pg::sql::Result<usize> {
             conn.lock(&crate::chunks::speculative_lock(&g))?;
+            conn.write_first("backfill_chunks", "state")?;
             let Some(mut s) = crate::chunks::speculative(conn, &g)? else { return Ok(0) };
             // a day of a window the reach has moved past is not the current one's
             if floor != s.runner_up_day - s.reach {
@@ -1776,7 +1778,7 @@ async fn reach_further(db: &Db, group: &str, (_day, floor, oldest): (i64, i64, O
             s.articles += dated;
             // the window is judged when its last day is done, not when its oldest is
             let running = conn.exists(
-                "select 1 from backfill_chunks where grp = $1 and day >= $2 and day < $3 and state != 2",
+                "select 1 from backfill_chunks where grp = $1 and day >= $2 and day < $3 and state != 2 limit 1",
                 vals![g.as_str(), floor, floor + SPECULATIVE_WINDOW],
             )?;
             let further = !running && s.articles >= SPECULATIVE_YIELD * s.days && first < floor;
@@ -1988,6 +1990,7 @@ where
                 // written over, and the days it just added dropped
                 Ok(db.tx(|conn| {
                     conn.lock(&crate::chunks::speculative_lock(&g))?;
+                    conn.write_first("backfill_chunks", "state")?;
                     let s = match crate::chunks::speculative(conn, &g)? {
                         Some(s) => crate::chunks::Speculative { runner_up_day: r, ..s },
                         None => crate::chunks::Speculative {
