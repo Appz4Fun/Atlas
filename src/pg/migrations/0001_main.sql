@@ -1,8 +1,9 @@
 -- What atlas.db holds today: groups and their cursors, the backfill chunk queue and its bookkeeping, the
--- spotnet queues, and the main meta counters. Times are unix seconds, as in SQLite.
+-- spotnet queues, and the main meta counters. Times are unix seconds, as in SQLite. Text keys sort and compare
+-- bytewise (collate "C"), as SQLite's do, whatever the database's collation.
 
 create table groups (
-    name            text primary key,
+    name            text collate "C" primary key,
     live_cursor     bigint,
     backfill_cursor bigint,
     first_article   bigint,
@@ -14,13 +15,15 @@ create table groups (
     start_posted    bigint
 );
 
+-- value is a number; text_value holds the few that aren't (a converted install's source_uuid and file stamps)
 create table meta (
-    key   text primary key,
-    value bigint
+    key        text collate "C" primary key,
+    value      bigint,
+    text_value text
 );
 
 create table backfill_chunks (
-    grp        text not null,
+    grp        text collate "C" not null,
     day        bigint not null,
     state      bigint not null,
     server     text,
@@ -35,19 +38,19 @@ create index idx_backfill_chunks_day_state on backfill_chunks (day, state);
 create index idx_backfill_chunks_grp_state_day on backfill_chunks (grp, state, day desc, claimed_at);
 
 create table backfill_deepest (
-    grp          text primary key,
+    grp          text collate "C" primary key,
     server       text not null,
     oldest_at    bigint,
     runner_up_at bigint
 );
 
 create table backfill_media (
-    grp      text primary key,
+    grp      text collate "C" primary key,
     releases bigint not null
 );
 
 create table backfill_speculative (
-    grp           text primary key,
+    grp           text collate "C" primary key,
     runner_up_day bigint not null,
     reach         bigint not null,
     days          bigint not null,
@@ -55,27 +58,27 @@ create table backfill_speculative (
 );
 
 create table backfill_sweep_gen (
-    grp text primary key,
+    grp text collate "C" primary key,
     gen bigint not null
 );
 
 create table backfill_sweeps (
-    grp    text not null,
-    server text not null,
+    grp    text collate "C" not null,
+    server text collate "C" not null,
     primary key (grp, server)
 );
 
 create table backfill_wanted (
-    grp text not null,
+    grp text collate "C" not null,
     day bigint not null,
     at  bigint not null,
     primary key (grp, day)
 );
 
-create table spot_blacklist (spotter text primary key);
+create table spot_blacklist (spotter text collate "C" primary key);
 
 create table spot_comments (
-    message_id text primary key,
+    message_id text collate "C" primary key,
     spot       text not null,
     at         bigint not null,
     rating     bigint not null default 0,
@@ -90,14 +93,14 @@ create index spot_comments_spot on spot_comments (spot);
 create index spot_comments_waiting on spot_comments (at) where state = 0;
 
 create table spot_disposals (
-    message_id text not null,
-    spotter    text not null default '',
+    message_id text collate "C" not null,
+    spotter    text collate "C" not null default '',
     at         bigint not null,
     primary key (message_id, spotter)
 );
 
 create table spot_reports (
-    message_id text primary key,
+    message_id text collate "C" primary key,
     spot       text not null,
     at         bigint not null,
     poster     text,
@@ -106,7 +109,7 @@ create table spot_reports (
 create index spot_reports_spot on spot_reports (spot);
 
 create table spots_seen (
-    message_id text primary key,
+    message_id text collate "C" primary key,
     number     bigint not null,
     state      bigint not null default 0,
     tries      bigint not null default 0,
@@ -127,7 +130,7 @@ create table inferred_asked (
     next_at    bigint not null
 );
 create table inferred_ids (
-    message_id text primary key,
+    message_id text collate "C" primary key,
     next_at    bigint not null,
     tries      bigint not null
 );

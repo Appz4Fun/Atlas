@@ -152,6 +152,21 @@ impl Pool {
         if config.get_connect_timeout().is_none() {
             config.connect_timeout(Duration::from_secs(5));
         }
+        // a server gone without a reset (a crash, a partition) is noticed in about 30 seconds, not the kernel's 15
+        // minutes of retransmits: keepalives on an idle connection, a user timeout on one waiting for an answer
+        let url = storage.url.to_ascii_lowercase();
+        if !url.contains("keepalives_idle") {
+            config.keepalives_idle(Duration::from_secs(30));
+        }
+        if config.get_keepalives_interval().is_none() {
+            config.keepalives_interval(Duration::from_secs(10));
+        }
+        if config.get_keepalives_retries().is_none() {
+            config.keepalives_retries(3);
+        }
+        if !url.contains("tcp_user_timeout") {
+            config.tcp_user_timeout(Duration::from_secs(30));
+        }
         if !storage.allow_plaintext {
             for host in config.get_hosts() {
                 if let postgres::config::Host::Tcp(h) = host
@@ -252,10 +267,12 @@ impl Pool {
         let mut wait = Duration::from_secs(1);
         let mut said = false;
         loop {
-            let mut reused = false;
+            let (mut reused, mut closed) = (false, false);
             let tried = self.get().and_then(|mut c| {
                 reused = c.reused;
-                work(&mut c)
+                let r = work(&mut c);
+                closed = r.is_err() && c.is_closed();
+                r
             });
             match tried {
                 Ok(v) => {
@@ -264,6 +281,9 @@ impl Pool {
                     }
                     return Ok(v);
                 }
+                // a reused connection the server ended while it sat idle (a restart, `idle_session_timeout`): the
+                // others idle may be gone too, and a new one is tried at once, whatever the error said
+                Err(_) if reused && closed && !stop.load(Ordering::Relaxed) => self.drop_idle(),
                 Err(e) if is_unreachable(&e) && !stop.load(Ordering::Relaxed) => {
                     self.drop_idle();
                     if reused {
@@ -302,7 +322,14 @@ fn sleep_unless_stopped(d: Duration, stop: &AtomicBool) {
 pub fn is_unreachable(e: &postgres::Error) -> bool {
     use postgres::error::SqlState;
     match e.code() {
-        None => e.is_closed() || std::error::Error::source(e).is_some_and(|s| s.is::<std::io::Error>()),
+        // not PermissionDenied: a url with no user the OS can't name, or a server that isn't the session kind asked
+        // for (`target_session_attrs`), both config mistakes
+        None => {
+            e.is_closed()
+                || std::error::Error::source(e)
+                    .and_then(|s| s.downcast_ref::<std::io::Error>())
+                    .is_some_and(|io| io.kind() != std::io::ErrorKind::PermissionDenied)
+        }
         Some(code) => [
             SqlState::ADMIN_SHUTDOWN,
             SqlState::CRASH_SHUTDOWN,
@@ -312,6 +339,7 @@ pub fn is_unreachable(e: &postgres::Error) -> bool {
             SqlState::CONNECTION_DOES_NOT_EXIST,
             SqlState::SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION,
             SqlState::TOO_MANY_CONNECTIONS,
+            SqlState::IDLE_SESSION_TIMEOUT,
         ]
         .contains(code),
     }
@@ -458,6 +486,17 @@ mod tests {
         let again: i32 = t.pool.with_retry(&stop, |c| Ok(c.query_one("select pg_backend_pid()", &[])?.get(0))).unwrap();
         assert_ne!(again, pid);
         assert!(started.elapsed() < Duration::from_millis(900), "no backoff wait for a connection that was idle");
+    }
+
+    #[test]
+    fn an_idle_session_timeout_is_retried_on_a_new_connection() {
+        let Some(t) = testing::Schema::new() else { return };
+        let stop = AtomicBool::new(false);
+        // a connection the server ends on its own after 200ms idle (57P05, not one of the outage states)
+        t.pool.with_retry(&stop, |c| c.batch_execute("set idle_session_timeout = 200")).unwrap();
+        std::thread::sleep(Duration::from_millis(600));
+        let got: i32 = t.pool.with_retry(&stop, |c| Ok(c.query_one("select 1", &[])?.get(0))).unwrap();
+        assert_eq!(got, 1);
     }
 
     #[test]

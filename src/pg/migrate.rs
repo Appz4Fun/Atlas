@@ -13,9 +13,13 @@ pub fn run(c: &mut Client, schema: &str) -> Result<Vec<i32>, postgres::Error> {
     let mut tx = c.transaction()?;
     // held to the end of this transaction: a second process waits here, then finds the versions applied
     tx.execute("select pg_advisory_xact_lock(hashtext('atlas.migrate.' || $1))", &[&schema])?;
+    // only made when missing: `create schema if not exists` needs the right to create schemas in the database even
+    // when it's there, which a role given a schema made for it by hand hasn't got
+    if tx.query_opt("select 1 from pg_namespace where nspname = $1", &[&schema])?.is_none() {
+        tx.batch_execute(&format!("create schema \"{schema}\""))?;
+    }
     tx.batch_execute(&format!(
-        "create schema if not exists \"{schema}\";
-         set local search_path to \"{schema}\";
+        "set local search_path to \"{schema}\";
          create table if not exists schema_migrations (
              version    integer primary key,
              name       text not null,
