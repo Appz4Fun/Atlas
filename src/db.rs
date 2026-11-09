@@ -164,8 +164,11 @@ pub fn open_shard(path: &Path) -> Result<Connection> {
     set_up(Connection::open_with_flags(path, flags)?)
 }
 
+/// How long a connection waits on a lock someone else holds (`set_up`).
+pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn set_up(conn: Connection) -> Result<Connection> {
-    conn.busy_timeout(Duration::from_secs(30))?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
     // bundled sqlite turns these on by default, python's didnt. purge deletes
     // releases before their articles and old dbs can hold orphans.
     conn.execute_batch("pragma foreign_keys = off")?;
@@ -174,15 +177,40 @@ fn set_up(conn: Connection) -> Result<Connection> {
     // cut could keep a cursor and lose the save before it, soo the shard writers
     // commit with `synchronous = full` (indexer::writer)
     conn.execute_batch("pragma synchronous = normal")?;
+    // macOS's fsync leaves the writes in the drive's cache, which may write them out in any order: once a WAL
+    // starts over, a power cut could keep its new start and lose pages a checkpoint copied into the main file,
+    // which the WAL no longer holds. F_FULLFSYNC on each checkpoint, a few a second (elsewhere a plain fsync)
+    conn.execute_batch("pragma checkpoint_fullfsync = on")?;
     crate::filters::register_sql(&conn)?;
     Ok(conn)
 }
+
+/// Run `save` with each commit flushed past the drive's cache (F_FULLFSYNC on macOS, elsewhere a plain fsync):
+/// for the shard writers' saves, which the group cursors in atlas.db move past once committed. macOS's fsync
+/// leaves them in the drive's cache, soo after a power cut a cursor could be kept and the save before it lost.
+/// Saves only: a flush costs about 17ms, nothing next to a save (seconds, under one a second on prod), but the
+/// writers' many small stage transactions, which no cursor waits for, would spend most of their time on it.
+pub fn with_full_flush<T>(conn: &mut Connection, save: impl FnOnce(&mut Connection) -> T) -> Result<T> {
+    conn.execute_batch("pragma fullfsync = on")?;
+    let saved = save(conn);
+    // the save is committed (or not) by now: failing here would only have it fetched and saved again
+    if let Err(e) = conn.execute_batch("pragma fullfsync = off") {
+        eprintln!("couldnt turn fullfsync off again after a save: {e}");
+    }
+    Ok(saved)
+}
+
+/// statements a writer's connection keeps prepared (`tune_for_writing`)
+pub(crate) const WRITER_STATEMENTS: usize = 256;
 
 /// Tune a connection for heavy indexing writes: a big page cache, no
 /// checkpointing on commit (`checkpointer` copies the WAL into the main file on
 /// its own thread, the writer's `Checkpoints::for_writer` lets the WAL start over), and a WAL file
 /// cut back to 1GB whenever it starts over.
 pub fn tune_for_writing(conn: &Connection) -> Result<()> {
+    // a save runs some forty statements, a writer's stage work more: with rusqlite's 16 they pushed each other out
+    // and were prepared again over and over
+    conn.set_prepared_statement_cache_capacity(WRITER_STATEMENTS);
     conn.execute_batch(
         "pragma cache_size = -1048576;
          pragma temp_store = memory;
@@ -194,10 +222,37 @@ pub fn tune_for_writing(conn: &Connection) -> Result<()> {
 /// A passive checkpoint of every database of `conn`, for the tests. The writer
 /// uses `Checkpoints::checkpoint_if_due`, which checkpoints only the databases
 /// that are due: one over all of them would copy the shard's whole WAL whenever
-/// its frozen file came due.
+/// its frozen file came due. False when SQLite said it was busy (another
+/// checkpoint held it up), soo it may have copied nothing.
 #[cfg(test)]
-fn finish_checkpoint(conn: &Connection) -> Result<()> {
-    conn.query_row("pragma wal_checkpoint(passive)", [], |_| Ok(()))
+fn finish_checkpoint(conn: &Connection) -> Result<bool> {
+    conn.query_row("pragma wal_checkpoint(passive)", [], |r| r.get::<_, i64>(0)).map(|busy| busy == 0)
+}
+
+/// A passive checkpoint of `conn`'s database `schema` alone. False when SQLite
+/// said it was busy, soo it may have copied nothing.
+fn passive_checkpoint(conn: &Connection, schema: &str) -> Result<bool> {
+    let quoted = schema.replace('"', "\"\"");
+    conn.query_row(&format!("pragma \"{quoted}\".wal_checkpoint(passive)"), [], |r| r.get::<_, i64>(0))
+        .map(|busy| busy == 0)
+}
+
+/// For the writer, once its WAL got past twice `RESTART_BYTES`: copy all of it
+/// and wait up to `RESTART_WAIT` for readers that still read from it, soo the
+/// next transaction starts the WAL over. A passive checkpoint can copy all of a
+/// WAL and still not let it start over: a reader that began before the copy
+/// finished keeps its place in the WAL, and with the shards saved to nearly
+/// nonstop there is nearly always one, soo the WAL kept growing to the 8GB
+/// truncate in `checkpointer` (3.3GB on prod with all of it copied). Readers
+/// that begin once all is copied read the main file and dont hold it up.
+/// Only `schema`'s WAL, not every attached database's.
+/// False when a reader was still there when the wait ran out.
+fn restart_checkpoint(conn: &Connection, schema: &str) -> Result<bool> {
+    let quoted = schema.replace('"', "\"\"");
+    conn.busy_timeout(RESTART_WAIT)?;
+    let busy = conn.query_row(&format!("pragma \"{quoted}\".wal_checkpoint(restart)"), [], |r| r.get::<_, i64>(0));
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    Ok(busy? == 0)
 }
 
 /// Frames in the WAL of `conn`'s database `schema` (main, or an attached one),
@@ -231,6 +286,12 @@ const RESTART_BYTES: i64 = 256 << 20;
 /// saves. Past twice `RESTART_BYTES` it copies whatever waits, soo the WAL
 /// stays bounded with no background copying (a writer without a checkpointer).
 const WRITER_COPY_BYTES: i64 = 8 << 20;
+/// How long the writer waits for readers before starting a big WAL over
+/// (`restart_checkpoint`): the saves wait as long.
+const RESTART_WAIT: Duration = Duration::from_millis(100);
+/// After a restart a reader held up, the writer tries again only after this
+/// long, soo a long reader doesnt cost every save `RESTART_WAIT`.
+const RESTART_RETRY: Duration = Duration::from_secs(5);
 /// `pragma wal_autocheckpoint` for a connection that writes the shards now
 /// and then while the indexer runs, such as the word index's taking from
 /// `word_queue`: SQLite's default (1000 frames, 4MB) counts the whole WAL, and
@@ -256,6 +317,18 @@ pub struct Checkpoints {
     copy_bytes: i64,
     age: Duration,
     last: Instant,
+    /// no restart before this, after one a reader held up
+    restart_after: Instant,
+}
+
+/// What `Checkpoints::due` says to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Due {
+    No,
+    /// a passive checkpoint
+    Copy,
+    /// the writer's WAL is twice as big as it should get: copy all and start it over (`restart_checkpoint`)
+    Restart,
 }
 
 impl Checkpoints {
@@ -271,39 +344,65 @@ impl Checkpoints {
     }
 
     fn new(due_bytes: i64, whole_wal: bool, age: Duration) -> Self {
-        Checkpoints { due_bytes, whole_wal, copy_bytes: WRITER_COPY_BYTES, age, last: Instant::now() }
+        let now = Instant::now();
+        Checkpoints { due_bytes, whole_wal, copy_bytes: WRITER_COPY_BYTES, age, last: now, restart_after: now }
     }
 
     /// Whether any of `conn`'s databases (main and the attached ones) is due a
     /// checkpoint. One whose WAL SQLite fails to read is (as every time before
     /// #228); one it says isnt in WAL mode never is.
     pub fn due(&self, conn: &Connection) -> Result<bool> {
-        Ok(!self.due_schemas(conn)?.is_empty())
+        Ok(self.what_is_due(conn)? != Due::No)
     }
 
-    /// Those of `conn`'s databases that are due (see `due`).
-    fn due_schemas(&self, conn: &Connection) -> Result<Vec<String>> {
+    /// The most any of `conn`'s databases is due (see `due`).
+    fn what_is_due(&self, conn: &Connection) -> Result<Due> {
+        let due = self.due_schemas(conn)?;
+        Ok(if due.iter().any(|(_, d)| *d == Due::Restart) {
+            Due::Restart
+        } else if due.is_empty() {
+            Due::No
+        } else {
+            Due::Copy
+        })
+    }
+
+    /// Those of `conn`'s databases that are due, each with what it is due.
+    fn due_schemas(&self, conn: &Connection) -> Result<Vec<(String, Due)>> {
         let schemas: Vec<String> = conn
             .prepare_cached("select name from pragma_database_list where name != 'temp'")?
             .query_map([], |r| r.get(0))?
             .collect::<Result<_>>()?;
-        Ok(schemas.into_iter().filter(|schema| self.due_one(conn, schema).unwrap_or(true)).collect())
+        Ok(schemas
+            .into_iter()
+            .filter_map(|schema| match self.due_one(conn, &schema) {
+                Ok(Due::No) => None,
+                Ok(due) => Some((schema, due)),
+                Err(_) => Some((schema, Due::Copy)),
+            })
+            .collect())
     }
 
-    fn due_one(&self, conn: &Connection, schema: &str) -> Result<bool> {
+    fn due_one(&self, conn: &Connection, schema: &str) -> Result<Due> {
         // not in WAL mode: there is nothing to copy
-        let Some((log, copied)) = wal_frames(conn, schema)? else { return Ok(false) };
+        let Some((log, copied)) = wal_frames(conn, schema)? else { return Ok(Due::No) };
         let waiting = log - copied;
+        // the writer's WAL, twice as big as it should get: started over even with all of it copied, which a
+        // reader kept from happening on its own
+        let restart = || -> Result<bool> {
+            Ok(self.whole_wal && log > 0 && Instant::now() >= self.restart_after && {
+                log * page_size(conn, schema)? >= 2 * self.due_bytes
+            })
+        };
         if waiting <= 0 {
-            return Ok(false);
+            return Ok(if restart()? { Due::Restart } else { Due::No });
         }
-        let quoted = schema.replace('"', "\"\"");
-        let page_size = conn
-            .prepare_cached(&format!("pragma \"{quoted}\".page_size"))?
-            .query_row([], |r| r.get::<_, i64>(0))?
-            .max(512);
+        if restart()? {
+            return Ok(Due::Restart);
+        }
+        let page_size = page_size(conn, schema)?;
         let aged = self.last.elapsed() >= self.age;
-        Ok(if self.whole_wal {
+        let due = if self.whole_wal {
             // the writer copies a little at most, also when its age comes: the background copying does the bulk. Not
             // soo for an attached database (the frozen file), which the background copying may not have (one made
             // after it started): its age copies whatever waits
@@ -312,26 +411,34 @@ impl Checkpoints {
             log >= 2 * self.due_bytes || ((aged || log >= self.due_bytes) && little)
         } else {
             aged || waiting * page_size >= self.due_bytes
-        })
+        };
+        Ok(if due { Due::Copy } else { Due::No })
     }
 
-    /// A passive checkpoint of each of `conn`'s databases that is `due`, and only
-    /// those: one over all of them would copy all of the shard's WAL whenever the
-    /// frozen file came due, past `copy_bytes`. Returns whether any ran.
+    /// A checkpoint of each of `conn`'s databases that is `due`, and only those: one over all of them would copy
+    /// all of the shard's WAL whenever the frozen file came due, past `copy_bytes`. Passive, or for a writer whose
+    /// WAL got too big, one that starts it over. Returns whether any ran. One SQLite said was busy doesnt count as
+    /// done for `age`.
     pub fn checkpoint_if_due(&mut self, conn: &Connection) -> Result<bool> {
         let due = self.due_schemas(conn)?;
         if due.is_empty() {
             return Ok(false);
         }
-        let mut copied = true;
-        for schema in &due {
-            let quoted = schema.replace('"', "\"\"");
-            let busy: i64 =
-                conn.query_row(&format!("pragma \"{quoted}\".wal_checkpoint(passive)"), [], |r| r.get(0))?;
-            // busy: checkpointed elsewhere just then, and copied nothing here. The age rule asks again next time
-            copied &= busy == 0;
+        let mut done = true;
+        for (schema, what) in &due {
+            done &= match what {
+                Due::No => true,
+                Due::Copy => passive_checkpoint(conn, schema)?,
+                Due::Restart => {
+                    let restarted = restart_checkpoint(conn, schema)?;
+                    if !restarted {
+                        self.restart_after = Instant::now() + RESTART_RETRY;
+                    }
+                    restarted
+                }
+            };
         }
-        if copied {
+        if done {
             self.last = Instant::now();
         }
         Ok(true)
@@ -390,6 +497,11 @@ pub fn checkpointer(stop: std::sync::Arc<std::sync::atomic::AtomicBool>) -> std:
     })
 }
 
+fn page_size(conn: &Connection, schema: &str) -> Result<i64> {
+    let quoted = schema.replace('"', "\"\"");
+    Ok(conn.prepare_cached(&format!("pragma \"{quoted}\".page_size"))?.query_row([], |r| r.get::<_, i64>(0))?.max(512))
+}
+
 fn wal_path(db: &Path) -> std::path::PathBuf {
     let mut p = db.as_os_str().to_owned();
     p.push("-wal");
@@ -414,7 +526,7 @@ pub fn create_db_holding(path: &Path) -> anyhow::Result<Option<WriteGuard>> {
     // a conversion's swap cut short leaves no main database: finished or
     // undone first, alone (busy means someone is using the database, soo it's there)
     if (!path.try_exists()? || crate::convert::is_empty_interloper(path))
-        && let Ok(_alone) = crate::compact::Lock::take(path)
+        && let Ok(_alone) = crate::compact::Lock::take_unchecked(path)
         && let Some(said) = crate::convert::recover_cut_swap(path)?
     {
         crate::ui::warn(&said);
@@ -435,9 +547,11 @@ pub fn create_db_holding(path: &Path) -> anyhow::Result<Option<WriteGuard>> {
 /// shards would hand out their ids again. A shard that cant be removed is an
 /// error, with the main database left in place.
 pub fn wipe(main: &Path) -> anyhow::Result<()> {
-    let _exclusive = crate::compact::Lock::take(main)?;
+    let _exclusive = crate::compact::Lock::take_unchecked(main)?;
     let mut dbs = Vec::new();
-    for shard in store::shard_paths(main) {
+    // the shards from before one shard too, should a wipe come before their merge
+    for shard in (0..crate::merge_shards::LEGACY_SHARDS).map(|s| crate::merge_shards::legacy_shard_path(main, s)) {
+        dbs.push(crate::frozen::path(&shard));
         let copy = crate::compact::with_suffix(&shard, "compact");
         dbs.push(crate::compact::with_suffix(&copy, "check"));
         dbs.push(copy);
@@ -474,6 +588,19 @@ pub fn create_db_at(path: &Path) -> anyhow::Result<()> {
         refuse_orphaned_shards(path)?;
     }
     let conn = create_at(path)?;
+    // shards half merged: only `atlas --merge-shards --apply` may go on with them
+    if crate::merge_shards::in_progress(&conn)? {
+        anyhow::bail!("a shard merge is in progress: run `atlas --merge-shards --apply` to finish it before indexing");
+    }
+    // the shards from before one shard: their releases would be out of sight, their ids handed out again
+    let legacy = crate::merge_shards::legacy_leftovers(path);
+    if !legacy.is_empty() {
+        anyhow::bail!(
+            "{} files of the shards from before the move to one shard are still here ({}): run `atlas --merge-shards --apply` first",
+            legacy.len(),
+            legacy.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+        );
+    }
 
     // wal soo the indexer can write while search reads
     conn.query_row("pragma journal_mode = wal", [], |_| Ok(()))?;
@@ -487,11 +614,19 @@ pub fn create_db_at(path: &Path) -> anyhow::Result<()> {
     )?;
 
     // the server's first/last article numbers per group, for progress and ETA, and
-    // the post date at both ends of what has been indexed (article number + unix time)
+    // the post date at both ends of what has been indexed (article number + unix time), and
+    // the posting time the live cursor began reading from (`set_start_posted`)
     let group_columns = columns(&conn, "groups")?;
-    for col in ["first_article", "last_article", "low_article", "low_posted", "high_article", "high_posted"] {
+    for col in
+        ["first_article", "last_article", "low_article", "low_posted", "high_article", "high_posted", "start_posted"]
+    {
         if !group_columns.contains(col) {
             conn.execute(&format!("alter table groups add column {col} INTEGER"), [])?;
+            // rows from before it may have started anywhere (a stand-in jumped to the newest article): they count as
+            // having begun now, soo no cursor moves up past a range they never read
+            if col == "start_posted" {
+                conn.execute("update groups set start_posted = strftime('%s','now')", [])?;
+            }
         }
     }
 
@@ -504,6 +639,11 @@ pub fn create_db_at(path: &Path) -> anyhow::Result<()> {
     let used = has_progress(&conn)?;
     store::create_main(&conn)?;
     create_shards(path, used)?;
+    // a merged shard finished by a build that didn't note its first one-shard id: noted now, while it can be told
+    // best effort: without it the linker reckons the id from what the shard holds
+    if let Err(e) = crate::merge_shards::note_one_shard_from(path, &conn) {
+        crate::ui::warn(&format!("couldnt note the first one-shard release id: {e:#}"));
+    }
     if fresh && !used {
         crate::raw_store::restore_backfill_deepest(path, &conn);
     }
@@ -871,6 +1011,14 @@ pub fn update_live_cursor(conn: &Connection, group: &str, article: i64) -> Resul
     Ok(())
 }
 
+/// Remember the posting time a row's live cursor began reading from (cursor key), when it is started or jumped:
+/// the time it was found by, or now when it starts at the newest article. Nothing posted before that is read through
+/// on this row; NULL (a row from before this was kept) counts as long ago.
+pub fn set_start_posted(conn: &Connection, group: &str, posted: i64) -> Result<()> {
+    conn.execute("update groups set start_posted = ? where name = ?", params![posted, group])?;
+    Ok(())
+}
+
 pub fn update_backfill_cursor(conn: &Connection, group: &str, article: i64) -> Result<()> {
     conn.execute(
         "insert into groups(name, live_cursor, backfill_cursor) values(?, ?, ?)
@@ -955,9 +1103,9 @@ mod tests {
         assert!(copying_less.due(&conn).unwrap(), "past twice as big the writer copies whatever waits");
         reader.execute_batch("commit").unwrap();
         finish_checkpoint(&conn).unwrap();
-        assert!(!writer.due(&conn).unwrap(), "all copied: the next transaction starts the WAL over anyway");
+        assert_eq!(writer.what_is_due(&conn).unwrap(), Due::Restart, "all copied, but twice as big: started over");
         fill(&conn, 10);
-        assert!(!writer.due(&conn).unwrap(), "and it did");
+        assert!(!writer.due(&conn).unwrap(), "the next transaction started it over, with no reader there");
 
         // whatever waits, once it waited long enough
         finish_checkpoint(&conn).unwrap();
@@ -969,6 +1117,59 @@ mod tests {
         aged_writer.copy_bytes = 0;
         assert!(!aged_writer.due(&conn).unwrap(), "but it copies only a little: more waits than it would");
         assert!(aged.checkpoint_if_due(&conn).unwrap());
+    }
+
+    /// A reader that began before all was copied keeps the WAL from starting over, soo the writer starts it over
+    /// once it got twice as big, and gives up for a while when the reader outlasts the wait.
+    #[test]
+    fn the_writer_starts_a_big_wal_over_past_a_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.db");
+        let conn = wal_db(&path);
+        let mut writer = Checkpoints::new(256 << 10, true, Duration::from_secs(3600));
+        fill(&conn, 700);
+        // reading what is in the WAL, from before it is copied
+        let reader = Connection::open(&path).unwrap();
+        reader.execute_batch("begin").unwrap();
+        let _: i64 = reader.query_row("select count(*) from t", [], |r| r.get(0)).unwrap();
+        assert!(finish_checkpoint(&conn).unwrap());
+        let (log, copied) = wal_frames(&conn, "main").unwrap().unwrap();
+        assert_eq!(log, copied, "all copied");
+        fill(&conn, 10);
+        let (grown, _) = wal_frames(&conn, "main").unwrap().unwrap();
+        assert!(grown > log, "the reader kept it from starting over");
+
+        assert!(writer.checkpoint_if_due(&conn).unwrap(), "a restart was tried");
+        assert!(writer.restart_after > Instant::now(), "the reader outlasted it: not again for a while");
+        assert_eq!(
+            writer.what_is_due(&conn).unwrap(),
+            Due::Copy,
+            "what came after the reader waits, and no restart for a while"
+        );
+
+        reader.execute_batch("commit").unwrap();
+        writer.restart_after = Instant::now();
+        assert!(writer.checkpoint_if_due(&conn).unwrap());
+        fill(&conn, 10);
+        let (log, _) = wal_frames(&conn, "main").unwrap().unwrap();
+        assert!(log < 20, "started over: {log} frames");
+    }
+
+    /// Every connection flushes its checkpoints past the drive's cache, and a save's flush ends with the save.
+    #[test]
+    fn checkpoints_and_saves_are_flushed_past_the_drive_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        create_db_at(&main).unwrap();
+        let mut conn = open_at(&main).unwrap();
+        let flag = |conn: &Connection, name: &str| -> i64 {
+            conn.query_row(&format!("pragma {name}"), [], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(flag(&conn, "checkpoint_fullfsync"), 1);
+        assert_eq!(flag(&conn, "fullfsync"), 0);
+        let during = with_full_flush(&mut conn, |conn| flag(conn, "fullfsync")).unwrap();
+        assert_eq!(during, 1, "on while saving");
+        assert_eq!(flag(&conn, "fullfsync"), 0, "and off again for the stage's transactions");
     }
 
     /// The writer's connection has the shard's frozen file attached: its WAL counts too, and one not in WAL mode
@@ -1079,7 +1280,7 @@ mod tests {
         assert!(!was_kept(&main));
         assert!(was_kept(&main));
 
-        let shard = &store::shard_paths(&main)[3];
+        let shard = &store::shard_paths(&main)[store::SHARDS - 1];
         let swapped = dir.path().join("swapped.db");
         fs::copy(shard, &swapped).unwrap();
         fs::rename(&swapped, shard).unwrap();
@@ -1279,7 +1480,7 @@ mod tests {
         assert!(next.unwrap() > 1);
 
         // what a compaction leaves behind, and the sidecars of a shard
-        let shard = store::shard_path(&main, 2);
+        let shard = store::shard_path(&main, store::SHARDS - 1);
         let leftovers = [
             crate::compact::with_suffix(&shard, "compact"),
             crate::compact::with_suffix(&shard, "precompact"),

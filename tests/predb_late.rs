@@ -175,7 +175,9 @@ fn the_budget_stops_between_shards() {
         calls.set(n + 1);
         if n >= 2 { start + Duration::from_secs(3) } else { start }
     };
-    let n = nominate(&shards(&h), T, &clock, &AtomicBool::new(false)).unwrap();
+    // the shards twice over, so there is a shard after the first to stop before even with one shard
+    let twice: Vec<Connection> = shards(&h).into_iter().chain(shards(&h)).collect();
+    let n = nominate(&twice, T, &clock, &AtomicBool::new(false)).unwrap();
     assert!(n.out_of_budget, "{n:?}");
     assert_eq!(n.phrases, 1);
     assert_eq!(n.ids, [h.id_of(T)], "the other routes still ran");

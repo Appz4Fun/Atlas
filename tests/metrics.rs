@@ -242,7 +242,7 @@ fn a_shard_out_of_the_way_fails_the_walk_instead_of_undercounting() {
     let main = dir.path().join("atlas.db");
     db::create_db_at(&main).unwrap();
     assert!(catalog::scan(&main, &AtomicBool::new(false)).unwrap().is_some());
-    std::fs::remove_file(store::shard_path(&main, 3)).unwrap();
+    std::fs::remove_file(store::shard_path(&main, store::SHARDS - 1)).unwrap();
     assert!(catalog::scan(&main, &AtomicBool::new(false)).is_err());
 }
 

@@ -115,7 +115,8 @@ struct Row {
 const ROW_COLUMNS: &str = "r.id, r.name, r.display_name, r.group_name, r.poster, r.posted_date, coalesce(r.size, 0),
     coalesce(r.complete, 0), coalesce(r.parts, 0), r.file_total, coalesce(r.is_obfuscated, 0), r.name_source,
     s.release_id is not null, coalesce(s.done, 0), coalesce(s.failed, 0), coalesce(s.db_attempts, 0),
-    coalesce(s.net_attempts, 0), coalesce(s.parts_seen, 0), coalesce(s.rerun_gen, 0), coalesce(s.net_transient, 0)";
+    coalesce(s.net_attempts, 0), coalesce(s.parts_seen, 0), coalesce(s.rerun_gen, 0), coalesce(s.net_transient, 0),
+    (select kind from spots where release_id = r.id)";
 
 fn read_row(r: &SqlRow<'_>, at: usize, shard: usize) -> rusqlite::Result<Row> {
     let col = |i: usize| at + i;
@@ -134,6 +135,7 @@ fn read_row(r: &SqlRow<'_>, at: usize, shard: usize) -> rusqlite::Result<Row> {
             file_total: r.get(col(9))?,
             is_obfuscated: r.get::<_, i64>(col(10))? != 0,
             name_source: r.get(col(11))?,
+            spot_kind: crate::spotnet::Kind::parse(r.get::<_, Option<String>>(col(20))?.as_deref()),
         },
         has_state: r.get(col(12))?,
         done: r.get(col(13))?,
@@ -699,6 +701,7 @@ impl Inner {
             deadline: Instant::now() + STEP_DEADLINE,
             lane_can_fetch: false,
             crcs: Vec::new(),
+            pictures: false,
         };
         let mut failure = false;
         let mut queue_at: Option<i64> = None;
@@ -803,6 +806,7 @@ impl Inner {
             }
             if step.needs() == Needs::Bodies {
                 match rules::body_gate(rules, &facts(&row), &summary) {
+                    BodyGate::Outside if step.asked_for(conn, row.info.id) => {}
                     BodyGate::Outside => {
                         a.set_done |= bit;
                         done |= bit;
@@ -1022,6 +1026,7 @@ impl Inner {
             }
             if step.needs() == Needs::Bodies {
                 match gate {
+                    BodyGate::Outside if step.asked_for(conn, id) => {}
                     BodyGate::Outside => {
                         a.set_done |= bit;
                         self.stats.unmatched.fetch_add(1, Relaxed);
@@ -1078,6 +1083,7 @@ impl Inner {
                 deadline: Instant::now() + STEP_DEADLINE,
                 lane_can_fetch: step.needs() == Needs::Bodies,
                 crcs: Vec::new(),
+                pictures: false,
             };
             let ran = run_step(step.as_ref(), &mut ctx);
             let now = chrono::Utc::now().timestamp();
@@ -1092,6 +1098,10 @@ impl Inner {
                     }
                     if let Some(until) = o.wait_until {
                         a.writes.extend(std::mem::take(&mut o.writes).into_iter().map(|w| (bit, w)));
+                        // the reruns its kept writes ask for stand too: a step after it in this visit saw none of them
+                        let other = self.steps.iter().filter(|s| s.id() != step.id()).fold(0, |m, s| m | mask(s.id()));
+                        a.clear |= o.rerun & other;
+                        a.net_mask |= o.rerun & other & a.net_steps;
                         // what it waits for needn't hold up the steps after it
                         waiting = Some(waiting.map_or(until, |w: i64| w.min(until)));
                         a.net_attempts = Some(attempts_before);
@@ -1100,7 +1110,11 @@ impl Inner {
                     } else {
                         self.count_done(&o);
                         a.set_done |= bit;
-                        a.net_mask &= !bit;
+                        // one an earlier step of this visit asked for again ran on what that saw before its writes
+                        // were in: it stays owed
+                        if a.clear & bit == 0 {
+                            a.net_mask &= !bit;
+                        }
                         a.net_attempts = Some(0);
                         a.net_transient = Some(0);
                         a.net_next_at = Some(0);
@@ -1290,8 +1304,12 @@ pub(crate) fn seed_shard(
     once("pp_probe_encrypted_pw", &|| crate::probe::step::rerun_encrypted_with_password(conn, now))?;
     // once, for the movies and TV saved incomplete before a whole video named as its release, or a PAR2 set naming
     // only files there, counted over the subject counter (`store::release_complete`); and again once a whole RAR set
-    // named as its release counted too
-    if meta("pp_complete_by_files")?.is_none() || meta("pp_complete_by_rar_set")?.is_none() {
+    // named as its release counted too, and once more for a whole video beside its PAR2 set and side files (a post's
+    // `thumbnail.jpg` that came as a row of its own)
+    if meta("pp_complete_by_files")?.is_none()
+        || meta("pp_complete_by_rar_set")?.is_none()
+        || meta("pp_complete_by_video_side_files")?.is_none()
+    {
         // through the queue: a row visited before, when its body steps waited on completeness (`BodyGate::NotYet`),
         // has no queue row left to bring it back
         let fixed = crate::store::recheck_movie_tv_complete(conn)?;
@@ -1304,6 +1322,7 @@ pub(crate) fn seed_shard(
         eprintln!("shard {shard}: one-off seed pp_complete_by_files queued {} releases", fixed.len());
         set("pp_complete_by_files", now)?;
         set("pp_complete_by_rar_set", now)?;
+        set("pp_complete_by_video_side_files", now)?;
     }
     // once, for the movie and TV probes from before the probe kept the server's body CRC: a HEAD each. The step
     // does nothing for a release it wasn't asked about, soo it is marked seen here and starts no walk of every row

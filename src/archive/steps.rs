@@ -51,6 +51,51 @@ pub(crate) fn tail_articles(ctx: &StepCtx<'_>, file: &FileInfo) -> Result<Vec<Se
     Ok(if last_is_there { segs } else { Vec::new() })
 }
 
+/// The articles to try as the first piece of an upload linked from its headers (`xref`), and their volumes: the parts
+/// that were the first a group got of each volume (`xref::leads`, else its first `xref::LEADS`), volume by volume, the
+/// `xref::HEAD_PROBES` after the ones tried before (`xref::tried`). Also how many were tried before and of which
+/// generation, and whether any are left after these, when the upload is known.
+#[allow(clippy::type_complexity)]
+fn xref_heads<'a>(
+    ctx: &StepCtx<'_>,
+    files: &'a [FileInfo],
+) -> Result<(Vec<(Head<'a>, SegmentRef)>, Option<(i64, i64)>, bool), StepError> {
+    let volumes = select::volumes(files);
+    let name = ctx.release().name.clone();
+    let tried = crate::xref::tried(&name);
+    let (heads, left) = xref_order(&volumes, tried.map_or(0, |(n, _)| n.max(0) as usize), |f| {
+        let leads = crate::xref::file_of(&f.filename).map(|k| crate::xref::leads(&name, k)).unwrap_or_default();
+        let pick = if leads.is_empty() { SegmentPick::First(crate::xref::LEADS) } else { SegmentPick::Parts(leads) };
+        ctx.segments(f.id, &pick).map_err(retry)
+    })?;
+    let heads = heads.into_iter().map(|(f, seg)| (Head { file: f, tail: f, probe: true }, seg)).collect();
+    Ok((heads, tried, left))
+}
+
+/// Of `volumes`, each with what `leads` gives of it in turn, the `xref::HEAD_PROBES` after the first `skip`, and
+/// whether any are left after those.
+pub(super) fn xref_order<'a, E>(
+    volumes: &[&'a FileInfo],
+    skip: usize,
+    mut leads: impl FnMut(&FileInfo) -> Result<Vec<SegmentRef>, E>,
+) -> Result<(Vec<(&'a FileInfo, SegmentRef)>, bool), E> {
+    let mut out = Vec::new();
+    let mut seen = 0;
+    for &f in volumes {
+        for seg in leads(f)? {
+            seen += 1;
+            if seen <= skip {
+                continue;
+            }
+            if out.len() >= crate::xref::HEAD_PROBES {
+                return Ok((out, true));
+            }
+            out.push((f, seg));
+        }
+    }
+    Ok((out, false))
+}
+
 /// One whole article, within every budget. None: skip this candidate.
 pub(crate) fn fetch_one(ctx: &mut StepCtx<'_>, seg: &SegmentRef, file: &str) -> Result<Option<Vec<u8>>, StepError> {
     let wanted =
@@ -77,6 +122,16 @@ pub(crate) fn whole_file(
     ctx: &mut StepCtx<'_>,
     file: &FileInfo,
     left: &mut usize,
+) -> Result<Option<Vec<u8>>, StepError> {
+    whole_file_within(ctx, file, left, nzb::MAX_NZB_BYTES)
+}
+
+/// `whole_file`, for a file of at most `max_bytes`.
+pub(crate) fn whole_file_within(
+    ctx: &mut StepCtx<'_>,
+    file: &FileInfo,
+    left: &mut usize,
+    max_bytes: usize,
 ) -> Result<Option<Vec<u8>>, StepError> {
     let parts = file.expected.unwrap_or(0).max(file.parts_seen);
     if parts < 1 || parts as usize > *left {
@@ -106,7 +161,7 @@ pub(crate) fn whole_file(
         }
         let Some(body) = body else { return Ok(None) };
         whole.extend(body);
-        if whole.len() > nzb::MAX_NZB_BYTES {
+        if whole.len() > max_bytes {
             return Ok(None);
         }
     }
@@ -1168,6 +1223,51 @@ fn part_of(
     Ok(body)
 }
 
+/// A file split over RAR volumes has its whole CRC32 only in the last volume's header: the first volume's is its own
+/// part's. When the listing has such a file, its set's last volume's first article is read (its start, within the
+/// budget) and the CRC of each file it closes, the same name and size, is taken: the file key a split film has no
+/// other way to. Encrypted headers are read with the password the listing was read with, or not at all.
+fn last_volume_crcs(
+    ctx: &mut StepCtx<'_>,
+    head: &Head<'_>,
+    listing: &mut Listing,
+    password: Option<&str>,
+    left: &mut usize,
+) -> Result<(), StepError> {
+    let open = |f: &InnerFile| f.crc32.is_none() && f.size.is_some_and(|s| s > 0);
+    if head.probe || head.tail.id == head.file.id || *left == 0 || !listing.files.iter().any(open) {
+        return Ok(());
+    }
+    if listing.headers_encrypted && password.is_none() {
+        return Ok(());
+    }
+    // an extra the listing doesn't depend on: only a stop ends the step, any other error leaves the CRC unknown
+    let Some(seg) = first_article(ctx, head.tail).or_else(optional)? else { return Ok(()) };
+    *left -= 1;
+    let Some(body) = fetch_start(ctx, &seg, &head.tail.filename).or_else(optional)? else { return Ok(()) };
+    if !matches!(identify(&body), Format::Rar4 | Format::Rar5) {
+        return Ok(());
+    }
+    let last = if listing.headers_encrypted { rar::list_with_password(&body, password) } else { rar::list(&body) };
+    close_split_files(listing, &last);
+    Ok(())
+}
+
+/// An optional read's error as nothing read, unless it is a stop.
+fn optional<T>(e: StepError) -> Result<Option<T>, StepError> {
+    if matches!(e, StepError::Stopped) { Err(e) } else { Ok(None) }
+}
+
+/// Each file of `listing` with no CRC takes the one `last` (its set's last volume, read from its start) gives the
+/// file of the same name and size.
+pub(super) fn close_split_files(listing: &mut Listing, last: &Listing) {
+    for f in listing.files.iter_mut().filter(|f| f.crc32.is_none()) {
+        if let Some(t) = last.files.iter().find(|t| t.crc32.is_some() && t.name == f.name && t.size == f.size) {
+            f.crc32 = t.crc32;
+        }
+    }
+}
+
 /// 7z's header may be at its end, in up to its set's last two articles.
 fn seven_list(
     ctx: &mut StepCtx<'_>,
@@ -1277,20 +1377,73 @@ impl Step for ListStep {
         let gap = Duration::from_secs(60) / limits.probes_per_minute.max(1) as u32;
         // an NFO read looking for a password, kept for the probe and the other steps
         let mut nfo_writes = Vec::new();
-        for head in select::plan(&files, limits.probe_files.max(0) as usize) {
-            let Some(seg) = first_article(ctx, head.file)? else { continue };
+        // an upload linked from its headers (`xref`) has its parts in a guessed order: its volumes' likely first pieces
+        // are each tried, and only an archive's start is taken
+        let xref = crate::xref::is_upload(&rel_name);
+        // with no first piece among this run's guesses, when the next run tries the next volumes
+        let mut xref_again = None;
+        // how many of the upload's guesses were tried before this run, and whether more are left after this run's
+        let mut xref_tried = None;
+        let mut xref_left = false;
+        let heads: Vec<(Head<'_>, Option<SegmentRef>)> = if xref {
+            left = left.max(crate::xref::HEAD_PROBES);
+            let (heads, tried, left) = xref_heads(ctx, &files)?;
+            xref_tried = tried;
+            xref_left = left;
+            heads.into_iter().map(|(h, s)| (h, Some(s))).collect()
+        } else {
+            select::plan(&files, limits.probe_files.max(0) as usize).into_iter().map(|h| (h, None)).collect()
+        };
+        for (k, (head, picked)) in heads.into_iter().enumerate() {
+            let seg = match picked {
+                Some(seg) => seg,
+                None => {
+                    let Some(seg) = first_article(ctx, head.file)? else { continue };
+                    seg
+                }
+            };
             if left == 0 {
                 break;
             }
             left -= 1;
-            let body = if head.probe {
+            let body = if xref {
+                // each guess is noted as tried once fetched, soo a run cut short (deadline, stop) goes on from there; a
+                // refusal is the run's body budget spent: the rest wait for a run with a fresh one
+                self.wait_for_slot(ctx, gap)?;
+                let wanted = BodyRequest {
+                    message_id: seg.message_id.clone(),
+                    file: head.file.filename.clone(),
+                    max_bytes: Some(PROBE_PREFIX),
+                };
+                let got = match ctx.fetch_prefix(&wanted)?.got {
+                    Got::Refused(_) => {
+                        xref_again = Some(chrono::Utc::now().timestamp() + 300);
+                        break;
+                    }
+                    Got::Body(body) => Some(body),
+                    Got::Missing | Got::TooBig => None,
+                };
+                // a guess that is no archive's start is noted as tried; one that is stays first in line until its list
+                // is read, soo a run cut short reading the rest of it starts there again
+                let is_start = got.as_deref().is_some_and(|b| {
+                    matches!(identify(b), Format::Rar4 | Format::Rar5 | Format::Zip | Format::SevenZip)
+                });
+                if !is_start && let Some((before, generation)) = xref_tried {
+                    crate::xref::tried_through(&rel_name, generation, before + k as i64 + 1);
+                }
+                got
+            } else if head.probe {
                 self.wait_for_slot(ctx, gap)?;
                 fetch_start(ctx, &seg, &head.file.filename)?
             } else {
                 fetch_one(ctx, &seg, &head.file.filename)?
             };
             let Some(body) = body else { continue };
-            match identify(&body) {
+            let format = identify(&body);
+            if xref && !matches!(format, Format::Rar4 | Format::Rar5 | Format::Zip | Format::SevenZip) {
+                continue;
+            }
+            match format {
                 Format::Rar4 | Format::Rar5 => {
                     let mut listing = rar::list(&body);
                     let mut pw_found = None;
@@ -1306,6 +1459,7 @@ impl Step for ListStep {
                             }
                         }
                     }
+                    last_volume_crcs(ctx, &head, &mut listing, pw_found.as_deref(), &mut left)?;
                     let wrapper_encrypted = listing.encrypted;
                     let has_inner_nzb = listing.files.iter().any(|f| select::classify(&f.name) == Kind::Nzb);
                     let pw_available = pw_found.is_some();
@@ -1489,6 +1643,10 @@ impl Step for ListStep {
                 return Ok(outcome);
             }
         }
-        Ok(Outcome::default())
+        // guesses left after this run's: an hour on, the next ones
+        if xref_again.is_none() && xref_tried.is_some() && xref_left {
+            xref_again = Some(chrono::Utc::now().timestamp() + 3600);
+        }
+        Ok(Outcome { wait_until: xref_again, ..Default::default() })
     }
 }

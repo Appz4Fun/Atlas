@@ -209,7 +209,7 @@ pub struct Summary {
 /// The tables a release's rows are in, besides `releases`, `files` and what hangs off a file: every registered table
 /// keyed by release, but for what only makes sense live (the queue, freezing's own tables).
 fn release_tables() -> impl Iterator<Item = (&'static str, &'static str)> {
-    const LIVE_ONLY: &[&str] = &["pp_queue", "freeze_pending", "freeze_exempt"];
+    const LIVE_ONLY: &[&str] = &["pp_queue", "freeze_pending", "freeze_exempt", "release_indexed"];
     SHARD_TABLES.iter().filter(|t| !LIVE_ONLY.contains(&t.name)).filter_map(|t| t.release_key.map(|key| (t.name, key)))
 }
 
@@ -661,7 +661,7 @@ impl Ticker {
 }
 
 /// Whether `e` is another connection holding the lock: worth trying again, not a failure.
-fn is_busy(e: &rusqlite::Error) -> bool {
+pub(crate) fn is_busy(e: &rusqlite::Error) -> bool {
     matches!(e.sqlite_error_code(), Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
 }
 
@@ -730,7 +730,10 @@ pub enum Domains {
     /// into a live shard: looked up by their text, and the ids in blobs changed to match (a blob in the sealed log is
     /// fetched and kept in the shard when they differ)
     Map,
-    /// into a scratch copy of its own shard: with the ids they had, blobs as they are
+    /// into a scratch copy: with the ids they had, blobs as they are (nothing fetched from the sealed log). A payload
+    /// some of whose ids another payload gave other suffixes (shards folded into one, `merge_shards`) goes in whole on
+    /// from a base past them, its blobs marked to be read on from it (`blob::remap_blob`). The copy's `domains` takes
+    /// one suffix under several ids for that (`merge_shards::domains_not_unique`)
     Keep,
 }
 
@@ -738,21 +741,66 @@ pub enum Domains {
 /// files get new ids, soo they can't meet files saved since. Returns the release's parts.
 pub fn restore(conn: &Connection, schema: &str, p: &Payload, how: Domains) -> Result<i64> {
     let mut domain_of: HashMap<i64, i64> = HashMap::new();
-    for (old, suffix) in &p.domains {
-        if how == Domains::Keep {
-            conn.prepare_cached(&format!("insert or ignore into {schema}.domains (id, suffix) values (?1, ?2)"))?
-                .execute(params![old, suffix])?;
-            domain_of.insert(*old, *old);
-            continue;
+    // Keep: what the payload's ids are moved on by, 0 unless one of them is another suffix's here
+    let mut base = 0i64;
+    let suffix_at = |id: i64| -> Result<Option<String>> {
+        conn.prepare_cached(&format!("select suffix from {schema}.domains where id = ?1"))?
+            .query_row([id], |r| r.get(0))
+            .optional()
+    };
+    // Map: the base the payload's ids already read right on from here, when they do, soo its blobs needn't be
+    // decoded (a sealed-log place fetched) to be renumbered: 0 for a payload frozen since the shards were folded
+    // into one, `shard << 32` for one frozen in a folded shard before (`merge_shards` keeps its domains there)
+    let reads_same = |base: i64| -> Result<bool> {
+        for (old, suffix) in &p.domains {
+            if suffix_at(old + base)?.as_deref() != Some(suffix.as_str()) {
+                return Ok(false);
+            }
         }
+        Ok(true)
+    };
+    let mut kept_base: Option<i64> = None;
+    if how == Domains::Map {
+        let release_id = p
+            .table("releases")
+            .and_then(|r| r.rows.first().and_then(|row| int(r.column("id").map(|c| &row[c]))))
+            .unwrap_or(0);
+        let shard = release_id.rem_euclid(crate::merge_shards::LEGACY_SHARDS as i64);
+        if reads_same(0)? {
+            kept_base = Some(0);
+        } else if shard != 0 && reads_same(shard << 32)? {
+            kept_base = Some(shard << 32);
+        }
+    }
+    if how == Domains::Keep {
+        let fits = |base: i64| -> Result<bool> {
+            for (old, suffix) in &p.domains {
+                if suffix_at(old + base)?.is_some_and(|there| &there != suffix) {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        };
+        while !fits(base)? {
+            base += 1 << 40;
+        }
+        for (old, suffix) in &p.domains {
+            if suffix_at(old + base)?.is_none() {
+                conn.prepare_cached(&format!("insert into {schema}.domains (id, suffix) values (?1, ?2)"))?
+                    .execute(params![old + base, suffix])?;
+            }
+            domain_of.insert(*old, old + base);
+        }
+    }
+    for (old, suffix) in p.domains.iter().filter(|_| how == Domains::Map) {
         let found: Option<i64> = conn
-            .prepare_cached(&format!("select id from {schema}.domains where suffix = ?1"))?
+            .prepare_cached(&format!("select id from {schema}.domains where suffix = ?1 order by id limit 1"))?
             .query_row([suffix], |r| r.get(0))
             .optional()?;
         let new = match found {
             Some(d) => d,
             None => {
-                conn.prepare_cached(&format!("insert into {schema}.domains (suffix) values (?1)"))?
+                conn.prepare_cached(&crate::store::NEW_DOMAIN.replace("domains", &format!("{schema}.domains")))?
                     .execute([suffix])?;
                 conn.last_insert_rowid()
             }
@@ -760,7 +808,7 @@ pub fn restore(conn: &Connection, schema: &str, p: &Payload, how: Domains) -> Re
         domain_of.insert(*old, new);
     }
     let same_domains = domain_of.iter().all(|(a, b)| a == b);
-    let domain = |d: i64| if d == 0 { 0 } else { domain_of.get(&d).copied().unwrap_or(d) };
+    let domain = |d: i64| if d == 0 { 0 } else { domain_of.get(&d).copied().unwrap_or(d + base) };
 
     let mut parts = 0;
     if let Some(r) = p.table("releases") {
@@ -777,7 +825,15 @@ pub fn restore(conn: &Connection, schema: &str, p: &Payload, how: Domains) -> Re
             "insert",
             &["id"],
             &mut |c, v| match (c, v) {
-                ("blob", Value::Blob(b)) if !same_domains => {
+                ("blob", Value::Blob(b)) if how == Domains::Map && !same_domains && kept_base == Some(0) => {
+                    Ok(Value::Blob(b))
+                }
+                ("blob", Value::Blob(b)) if how == Domains::Map && !same_domains && kept_base.is_some() => {
+                    crate::blob::remap_blob(&b, kept_base.unwrap_or(0), &domain_of)
+                        .map(Value::Blob)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+                }
+                ("blob", Value::Blob(b)) if how == Domains::Map && !same_domains => {
                     let mut segs =
                         crate::blob::decode(&b).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
                     for s in &mut segs {
@@ -785,6 +841,9 @@ pub fn restore(conn: &Connection, schema: &str, p: &Payload, how: Domains) -> Re
                     }
                     Ok(Value::Blob(crate::blob::encode(&segs)))
                 }
+                ("blob", Value::Blob(b)) if base != 0 => crate::blob::remap_blob(&b, base, &HashMap::new())
+                    .map(Value::Blob)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e))),
                 (_, v) => Ok(v),
             },
             |conn, row| {
@@ -1072,7 +1131,7 @@ const SCRATCH: &str = "
     create table {s}.files (id INTEGER PRIMARY KEY, release_id INTEGER NOT NULL, filename TEXT NOT NULL, subject TEXT,
         subject_part INTEGER, subject_mid TEXT, expected INTEGER, file_total INTEGER, seen BLOB NOT NULL,
         touched_at INTEGER, blob BLOB);
-    create table {s}.domains (id INTEGER PRIMARY KEY, suffix TEXT NOT NULL UNIQUE);
+    create table {s}.domains (id INTEGER PRIMARY KEY, suffix TEXT NOT NULL);
     create table {s}.segments (file_id INTEGER NOT NULL, local BLOB NOT NULL, domain INTEGER NOT NULL, part INTEGER,
         bytes INTEGER, primary key (file_id, local, domain)) without rowid;";
 
@@ -1111,6 +1170,8 @@ pub fn unfrozen_copy(main: &Path, shard: usize) -> anyhow::Result<Option<PathBuf
     crate::store::create_shard(&copy)?;
     let conn = crate::db::open_shard(&copy)?;
     crate::postprocess::schema::migrate(&conn)?;
+    // payloads of shards folded into one: one suffix under each shard's id (`Domains::Keep`)
+    crate::merge_shards::domains_not_unique(&conn)?;
     let tx = conn.unchecked_transaction()?;
     let mut stmt = frozen.prepare("select id, payload from frozen_releases order by id")?;
     let mut rows = stmt.query([])?;

@@ -31,7 +31,9 @@ fn copies_are_found_across_shards_and_go_with_their_release() {
     let main = home.path().join("atlas.db");
 
     let groups: Vec<String> = (0..64).map(|n| format!("alt.binaries.g{n}")).collect();
-    let in_shard = |s: usize| groups.iter().find(|g| store::shard_of(g) == s).unwrap().as_str();
+    let in_shard = |s: usize| {
+        groups.iter().filter(|g| store::shard_of(g) == s % store::SHARDS).nth(s / store::SHARDS).unwrap().as_str()
+    };
     let (first, shard_a) = release(&main, "Movie.Rar5-A", in_shard(0));
     let (twin, shard_b) = release(&main, "Movie.Rar5.Repost-B", in_shard(1));
     let (alt, shard_c) = release(&main, "Movie.Seven-C", in_shard(2));
@@ -104,9 +106,13 @@ fn copies_are_found_across_shards_and_go_with_their_release() {
     // upload, an xpost, not a separate upload of it, while the repost under other message-ids stays a twin
     let xpost_group = in_shard(4);
     store::save(&main, &[Release { group: xpost_group.into(), ..release_of("Movie.Rar5-A", "x.bin", 2, 2) }]).unwrap();
-    let shard_e = db::open_shard(&store::shard_path(&main, 4)).unwrap();
-    let xpost: i64 =
-        shard_e.query_row("select id from releases where name = 'Movie.Rar5-A'", [], |r| r.get(0)).unwrap();
+    let shard_e = db::open_shard(&store::shard_path(&main, 4 % store::SHARDS)).unwrap();
+    // by group too: the first upload shares the name, and may share the shard
+    let xpost: i64 = shard_e
+        .query_row("select id from releases where name = 'Movie.Rar5-A' and group_name = ?", [xpost_group], |r| {
+            r.get(0)
+        })
+        .unwrap();
     shard_e.execute(SET_POSTED, rusqlite::params![xpost, b"same-posted".as_slice()]).unwrap();
     shard_e.execute(SET_CONTENT, rusqlite::params![xpost, b"same-content".as_slice()]).unwrap();
     let conn = db::open().unwrap();
@@ -149,7 +155,7 @@ fn copies_are_found_across_shards_and_go_with_their_release() {
     let mut tri = Vec::new();
     for (name, s, articles) in rows {
         store::save(&main, &[Release { group: in_shard(s).into(), articles, ..release_of(name, "f1", 0, 2) }]).unwrap();
-        let shard = db::open_shard(&store::shard_path(&main, s)).unwrap();
+        let shard = db::open_shard(&store::shard_path(&main, s % store::SHARDS)).unwrap();
         let id: i64 = shard.query_row("select id from releases where name = ?", [name], |r| r.get(0)).unwrap();
         shard.execute(SET_POSTED, rusqlite::params![id, b"tri-posted".as_slice()]).unwrap();
         tri.push(id);
@@ -164,7 +170,7 @@ fn copies_are_found_across_shards_and_go_with_their_release() {
     assert_eq!(cluster.iter().map(|r| r.id).collect::<Vec<_>>(), tri);
     assert_eq!(atlas::duplicates::xposts_of_earlier(&conn, &cluster), [false, true, true], "C ties through B");
     for (s, id) in [(5usize, tri[0]), (6, tri[1]), (7, tri[2])] {
-        let shard = db::open_shard(&store::shard_path(&main, s)).unwrap();
+        let shard = db::open_shard(&store::shard_path(&main, s % store::SHARDS)).unwrap();
         shard.execute("delete from release_fingerprint where release_id = ?", [id]).unwrap();
     }
     drop(conn);

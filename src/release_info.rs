@@ -276,11 +276,21 @@ fn contents_of(conn: &Connection, ids: &[i64], recovery: &[i64], with_bytes: Byt
     };
     let mut bytes: HashMap<String, i64> = HashMap::new();
     if read_bytes {
+        // each file's blob count and a sum of its rows (`blob_bytes`): no article is read. A shard the indexer
+        // hasn't given the column yet (a web process started first) is walked article by article, as before
         for id in ids {
-            store::each_article(conn, *id, &mut |article| {
-                *bytes.entry(article.filename.unwrap_or_default()).or_default() += article.bytes.unwrap_or(0);
-                Ok(())
-            })?;
+            match crate::blob_bytes::of_release(conn, *id) {
+                Ok(files) => {
+                    for (filename, b) in files {
+                        *bytes.entry(filename).or_default() += b;
+                    }
+                }
+                Err(e) if e.to_string().contains("no such column") => store::each_article(conn, *id, &mut |article| {
+                    *bytes.entry(article.filename.unwrap_or_default()).or_default() += article.bytes.unwrap_or(0);
+                    Ok(())
+                })?,
+                Err(e) => return Err(e),
+            }
         }
     }
     for file in &mut totals.list {
@@ -308,6 +318,49 @@ fn contents_of(conn: &Connection, ids: &[i64], recovery: &[i64], with_bytes: Byt
         }
     }
     Ok(totals)
+}
+
+/// Whether a release misses data that its recovery volumes can rebuild: whole once a client repairs it, as NZBGet and
+/// SABnzbd do on their own. Goes by the article counts and, once read, the PAR2 set's blocks; else by the bytes its
+/// files keep counted (`blob_bytes`). A file whose sealed blob isn't counted yet leaves the bytes unknown, and the
+/// answer no: a list of results doesn't wait on the sealed log. Data missing whole files isn't counted as missing
+/// (`Contents::repairable`), soo a post whose counter says a file is missing gets no too.
+pub fn repair_needed(conn: &Connection, id: i64) -> Result<bool> {
+    let mut c = contents_of(conn, &[id], &[], Bytes::None)?;
+    if c.data_articles_seen >= c.data_articles_expected || c.recovery_articles_seen == 0 {
+        return Ok(false);
+    }
+    // a file that never turned up isn't in the counts: what's there could cover the gaps it can see, and not it
+    if !union_files(conn, &[id])?.every_file_here() {
+        return Ok(false);
+    }
+    if verdict_needs_bytes(&c) {
+        let Some(bytes) = crate::blob_bytes::counted_of_release(conn, id)? else { return Ok(false) };
+        for (filename, size) in bytes {
+            if is_recovery_volume(&filename) {
+                c.recovery_bytes += size;
+            } else if !is_par2(&filename) {
+                c.data_bytes += size;
+            }
+        }
+    }
+    Ok(c.repairable())
+}
+
+/// Whether `repair_needed`'s answer for this release waits on byte counts its files don't have yet: data missing,
+/// recovery there, every file here, no PAR2 set read, and a sealed blob uncounted. Counting its blobs
+/// (`blob_bytes::count_release`) settles it.
+pub fn repair_waits_on_counts(conn: &Connection, id: i64) -> Result<bool> {
+    let c = contents_of(conn, &[id], &[], Bytes::None)?;
+    if c.data_articles_seen >= c.data_articles_expected || c.recovery_articles_seen == 0 || !verdict_needs_bytes(&c) {
+        return Ok(false);
+    }
+    Ok(union_files(conn, &[id])?.every_file_here() && crate::blob_bytes::counted_of_release(conn, id)?.is_none())
+}
+
+/// The ones of `ids` that need a repair to be whole (`repair_needed`).
+pub fn repair_needed_of(conn: &Connection, ids: &[i64]) -> HashSet<i64> {
+    ids.iter().copied().filter(|id| repair_needed(conn, *id).unwrap_or(false)).collect()
 }
 
 /// A row that holds nothing but PAR2 data. A fully obfuscated upload posts every file under its own random subject and
@@ -393,11 +446,14 @@ fn sort_groups(out: &mut [GroupPosting]) {
     out.sort_by(|a, b| b.articles.cmp(&a.articles).then_with(|| a.group.cmp(&b.group)));
 }
 
+/// The most rows of one name a lookup reads: what eight shards' lookups of 64 each read together, before one shard.
+const NAME_ROWS: usize = 64 * crate::merge_shards::LEGACY_SHARDS;
+
 pub fn groups_of_with(conn: &Connection, name: &str) -> Result<Vec<GroupPosting>> {
     let mut out = Vec::new();
     for s in 0..store::SHARDS {
         let mut stmt = conn.prepare_cached(&format!(
-            "select group_name, coalesce(parts, 0), id from s{s}.releases where name = ?1 limit 64"
+            "select group_name, coalesce(parts, 0), id from s{s}.releases where name = ?1 limit {NAME_ROWS}"
         ))?;
         let rows = stmt.query_map([name], |r| {
             Ok(GroupPosting {
@@ -450,12 +506,15 @@ pub struct SplitPost {
     pub lead: Option<i64>,
     /// of a linked upload, the rows of recovery data: their files' names don't say so
     pub recovery: Vec<i64>,
+    /// rows of small files posted beside the post under subjects of their own, found by its PAR2 set
+    /// (`archive::link::BESIDE_FILES`): never the one listed
+    pub beside: Vec<i64>,
 }
 
 impl SplitPost {
     /// The one to list. A search that isn't about one group shows only this.
     pub fn listed_id(&self) -> i64 {
-        self.lead.unwrap_or_else(|| self.ids.iter().copied().max().unwrap_or(0))
+        self.lead.unwrap_or_else(|| self.ids.iter().copied().filter(|id| !self.beside.contains(id)).max().unwrap_or(0))
     }
 }
 
@@ -609,7 +668,7 @@ pub fn linked_post_with(conn: &Connection, id: i64) -> Result<Option<SplitPost>>
         each_whole &= union_files(conn, &[*row])?.complete_by_files();
     }
     let complete = files.len() as i64 >= wanted && each_whole;
-    Ok(Some(SplitPost { ids, groups, size, complete, lead: Some(lead), recovery }))
+    Ok(Some(SplitPost { ids, groups, size, complete, lead: Some(lead), recovery, beside: Vec::new() }))
 }
 
 /// All of the post a row is part of: an upload linked by its PAR2 set, or the same post cut across groups or files.
@@ -624,6 +683,85 @@ pub fn whole_post_from_catalog(conn: &Connection, release: &crate::search::Relea
 }
 
 fn whole_post_from(conn: &Connection, release: &crate::search::ReleaseRow, catalog: bool) -> Result<Option<SplitPost>> {
+    // a small file posted beside a post answers as the row it was found by: every row of the post gets one answer
+    if let Some(owner) = crate::archive::link::beside_owner(conn, release.id)?
+        && owner != release.id
+        && let Some(row) = crate::search::get_release_with(conn, owner)?
+    {
+        let post = post_alone(conn, &row, catalog)?;
+        return with_beside(conn, owner, post);
+    }
+    let post = post_alone(conn, release, catalog)?;
+    with_beside(conn, release.id, post)
+}
+
+/// `post` (or the release `id` alone) with the rows of small files found beside any of its rows added: each has to be
+/// whole too. Unchanged when there are none.
+fn with_beside(conn: &Connection, id: i64, post: Option<SplitPost>) -> Result<Option<SplitPost>> {
+    let rows = post.as_ref().map_or_else(|| vec![id], |p| p.ids.clone());
+    let mut extra: Vec<i64> = Vec::new();
+    for row in &rows {
+        for found in crate::archive::link::beside_rows(conn, *row)? {
+            if !rows.contains(&found) && !extra.contains(&found) {
+                extra.push(found);
+            }
+        }
+    }
+    if extra.is_empty() {
+        return Ok(post);
+    }
+    let alone = post.is_none();
+    let mut post = match post {
+        Some(post) => post,
+        None => {
+            let Some((group, size)) = group_and_size(conn, id)? else { return Ok(None) };
+            // whole as the release was, by the PAR2 set's check that vouched for it, or repairable as it was listed
+            let complete = single_post_complete(conn, id)? || vouched_complete(conn, id)? || repair_needed(conn, id)?;
+            SplitPost {
+                ids: vec![id],
+                groups: vec![group],
+                size,
+                complete,
+                lead: None,
+                recovery: Vec::new(),
+                beside: Vec::new(),
+            }
+        }
+    };
+    // the files of a release counted with the one found beside it can be whole together: `[5/6]` posted apart
+    let mut all = post.ids.clone();
+    all.extend(&extra);
+    let together = post.lead.is_none() && union_files(conn, &all)?.complete();
+    for row in extra {
+        let Some((group, bytes)) = group_and_size(conn, row)? else { continue };
+        // an extra that isn't all here yet takes nothing from the post: it was found by its first article alone
+        post.size += bytes;
+        if !post.groups.contains(&group) {
+            post.groups.push(group);
+            post.groups.sort_unstable();
+        }
+        if let Err(at) = post.ids.binary_search(&row) {
+            post.ids.insert(at, row);
+        }
+        post.beside.push(row);
+    }
+    if together && (alone || post.recovery.is_empty()) {
+        post.complete = true;
+    }
+    Ok(Some(post))
+}
+
+/// Whether a release's own row says it's whole (`releases.complete`), as the PAR2 set's check can vouch.
+fn vouched_complete(conn: &Connection, id: i64) -> Result<bool> {
+    let s = store::shard_of_id(id);
+    Ok(conn
+        .prepare_cached(&format!("select coalesce(complete, 0) from s{s}.releases where id = ?1"))?
+        .query_row([id], |r| r.get::<_, i64>(0))
+        .optional()?
+        .is_some_and(|c| c != 0))
+}
+
+fn post_alone(conn: &Connection, release: &crate::search::ReleaseRow, catalog: bool) -> Result<Option<SplitPost>> {
     if let Some(post) = linked_post_with(conn, release.id)? {
         if let Ok(Some(mut split)) = split_post_from(conn, release, catalog)
             && post.ids.iter().all(|id| split.ids.binary_search(id).is_ok())
@@ -660,13 +798,37 @@ pub fn split_post_with(conn: &Connection, release: &crate::search::ReleaseRow) -
 /// `split_post_with`, its candidate rows from the shared catalog when `catalog` and catalog reads are on.
 fn split_post_from(conn: &Connection, release: &crate::search::ReleaseRow, catalog: bool) -> Result<Option<SplitPost>> {
     let posted = names_with(conn, release.id)?.map_or(release.name.clone(), |n| n.posted);
-    let exact = exact_split_post(conn, &posted, release, catalog)?;
+    let video = video_name_twin(conn, release.id, &posted)?;
+    let exact = exact_split_post(conn, &posted, video.as_deref(), release, catalog)?;
     if let Some(stem_post) = split_stem_post(conn, &posted, release, catalog)?
         && exact.as_ref().is_none_or(|e| stem_post.ids.len() > e.ids.len())
     {
         return Ok(Some(stem_post));
     }
     Ok(exact)
+}
+
+/// The other name a group's row of this post can have: the post's video's file name, when the video's first article
+/// was the first that group saw of the post (`Name.mkv` beside the `Name` of the groups where a PAR2 file came first),
+/// or, for that row, the name without it. Each article went to one group, so every row has the video's parts and asks
+/// for the other name.
+fn video_name_twin(conn: &Connection, id: i64, posted: &str) -> Result<Option<String>> {
+    let lower = posted.to_ascii_lowercase();
+    if let Some(ext) = store::VIDEO_EXTENSIONS.iter().find(|ext| lower.ends_with(*ext)) {
+        let stem = &posted[..posted.len() - ext.len()];
+        return Ok((!stem.trim().is_empty()).then(|| stem.to_string()));
+    }
+    let s = store::shard_of_id(id);
+    let files: Vec<String> = conn
+        .prepare_cached(&format!("select filename from s{s}.files where release_id = ?"))?
+        .query_map([id], |r| r.get(0))?
+        .collect::<Result<_>>()?;
+    Ok(files.into_iter().find(|file| {
+        file.len() > posted.len()
+            && file.is_char_boundary(posted.len())
+            && file[..posted.len()] == *posted
+            && store::VIDEO_EXTENSIONS.iter().any(|ext| file[posted.len()..].eq_ignore_ascii_case(ext))
+    }))
 }
 
 /// A row named as a post, in some shard.
@@ -737,13 +899,19 @@ fn first_per_shard(rows: Vec<(usize, String, Named)>, per_shard: usize) -> Vec<N
 fn catalog_named(
     conn: &Connection,
     posted: &str,
+    video: Option<&str>,
     release: &crate::search::ReleaseRow,
 ) -> Result<Option<(Vec<Named>, Vec<Named>)>> {
     let Some(rows) = crate::shared_catalog::reader::named(posted, None) else { return Ok(None) };
     if !rows.iter().any(|r| r.id == release.id) {
         return Ok(None);
     }
-    let all = reread_candidates(conn, &rows, |name| name == posted)?;
+    let mut all = reread_candidates(conn, &rows, |name| name == posted)?;
+    if let Some(video) = video {
+        let Some(rows) = crate::shared_catalog::reader::named(video, None) else { return Ok(None) };
+        all.extend(reread_candidates(conn, &rows, |name| name == video)?);
+        all.sort_by(|a, b| (a.0, a.2.group.as_bytes()).cmp(&(b.0, b.2.group.as_bytes())));
+    }
     let same: Vec<(usize, String, Named)> = all
         .iter()
         .filter(|(_, _, n)| n.poster == release.poster)
@@ -755,18 +923,19 @@ fn catalog_named(
             )
         })
         .collect();
-    Ok(Some((first_per_shard(same, 64), first_per_shard(all, 64))))
+    Ok(Some((first_per_shard(same, NAME_ROWS), first_per_shard(all, NAME_ROWS))))
 }
 
 fn exact_split_post(
     conn: &Connection,
     posted: &str,
+    video: Option<&str>,
     release: &crate::search::ReleaseRow,
     catalog: bool,
 ) -> Result<Option<SplitPost>> {
     let named_rows = |sql: fn(usize) -> String, poster: Option<&Option<String>>| -> Result<Vec<Named>> {
         let mut out = Vec::new();
-        for s in 0..store::SHARDS {
+        for (s, posted) in (0..store::SHARDS).flat_map(|s| std::iter::once(posted).chain(video).map(move |n| (s, n))) {
             let mut stmt = conn.prepare_cached(&sql(s))?;
             let read = |r: &rusqlite::Row<'_>| {
                 Ok(Named {
@@ -785,7 +954,7 @@ fn exact_split_post(
         }
         Ok(out)
     };
-    let from_catalog = if catalog { catalog_named(conn, posted, release)? } else { None };
+    let from_catalog = if catalog { catalog_named(conn, posted, video, release)? } else { None };
     if catalog {
         let source = if from_catalog.is_some() { "catalog" } else { "shards" };
         crate::metrics::names::SHARED_CATALOG_READS.inc(&[("lookup", "split_post"), ("source", source)], 1);
@@ -825,7 +994,15 @@ fn same_poster_post(conn: &Connection, rows: &[&Named]) -> Result<Option<SplitPo
     if !files.one_upload() {
         return Ok(None);
     }
-    Ok(Some(SplitPost { ids, groups, size, complete: files.complete(), lead: None, recovery: Vec::new() }))
+    Ok(Some(SplitPost {
+        ids,
+        groups,
+        size,
+        complete: files.complete(),
+        lead: None,
+        recovery: Vec::new(),
+        beside: Vec::new(),
+    }))
 }
 
 /// The most rows of one name looked at for a post whose groups each got a poster of their own.
@@ -932,7 +1109,18 @@ fn post_of(rows: Vec<&Named>, copies: &[(&Named, i64)], union: UnionFiles) -> Op
     ids.sort_unstable();
     let mut covers = ids.clone();
     covers.extend(copies.iter().filter(|(_, of)| ids.contains(of)).map(|(n, _)| n.id));
-    Some((SplitPost { ids, groups, size, complete: union.complete(), lead: None, recovery: Vec::new() }, covers))
+    Some((
+        SplitPost {
+            ids,
+            groups,
+            size,
+            complete: union.complete(),
+            lead: None,
+            recovery: Vec::new(),
+            beside: Vec::new(),
+        },
+        covers,
+    ))
 }
 
 #[derive(Clone)]
@@ -1084,7 +1272,15 @@ fn try_stem_subset(conn: &Connection, stem: &str, subset: &[StemCandidate]) -> R
     if !files.one_stem_upload(stem) {
         return Ok(None);
     }
-    Ok(Some(SplitPost { ids, groups, size, complete: files.complete(), lead: None, recovery: Vec::new() }))
+    Ok(Some(SplitPost {
+        ids,
+        groups,
+        size,
+        complete: files.complete(),
+        lead: None,
+        recovery: Vec::new(),
+        beside: Vec::new(),
+    }))
 }
 
 /// A shard's rows of one name and poster. `+poster` keeps the lookup on the name index: with no statistics SQLite
@@ -1093,7 +1289,7 @@ fn try_stem_subset(conn: &Connection, stem: &str, subset: &[StemCandidate]) -> R
 fn split_post_sql(s: usize) -> String {
     format!(
         "select id, group_name, coalesce(size, 0), julianday(posted_date), poster from s{s}.releases
-         where name = ?1 and +poster is ?2 and not atlas_blocked(group_name) limit 64"
+         where name = ?1 and +poster is ?2 and not atlas_blocked(group_name) limit {NAME_ROWS}"
     )
 }
 
@@ -1101,7 +1297,7 @@ fn split_post_sql(s: usize) -> String {
 fn named_rows_sql(s: usize) -> String {
     format!(
         "select id, group_name, coalesce(size, 0), julianday(posted_date), poster from s{s}.releases
-         where name = ?1 and not atlas_blocked(group_name) limit 64"
+         where name = ?1 and not atlas_blocked(group_name) limit {NAME_ROWS}"
     )
 }
 
@@ -1141,6 +1337,8 @@ struct UnionFiles {
     conflict: bool,
     /// whether any file carries a 0-indexed `[0/N]` or `[00/N]` counter
     zero_indexed: bool,
+    /// each release's name
+    names: BTreeSet<String>,
 }
 
 impl UnionFiles {
@@ -1223,15 +1421,23 @@ impl UnionFiles {
             && self.files.values().all(|f| f.expected.is_some_and(|want| store::is_exactly(&f.seen, want)))
     }
 
-    /// Whether every file the post says it has is there with exactly its parts.
+    /// Whether every file the post says it has is there with exactly its parts, or every file there is whole and they
+    /// are one video named as the post beside side files (`store::one_video_named`): the counter can count a
+    /// `thumbnail.jpg` that came as a row of its own.
     fn complete(&self) -> bool {
+        !self.files.is_empty()
+            && self.files.values().all(|f| f.expected.is_some_and(|want| store::is_exactly(&f.seen, want)))
+            && self.every_file_here()
+    }
+
+    /// Whether every file the post's counter says it has is here, whole or not (`complete` also wants them whole).
+    fn every_file_here(&self) -> bool {
         if self.file_totals.len() > 1 {
             return false;
         }
         let total = self.file_totals.iter().copied().flatten().next_back();
-        !self.files.is_empty()
-            && total.is_none_or(|total| self.files.len() as i64 == total + i64::from(self.zero_indexed))
-            && self.files.values().all(|f| f.expected.is_some_and(|want| store::is_exactly(&f.seen, want)))
+        total.is_none_or(|total| self.files.len() as i64 == total + i64::from(self.zero_indexed))
+            || store::one_video_named(self.names.iter().map(String::as_str), self.files.keys().map(String::as_str))
     }
 }
 
@@ -1299,6 +1505,12 @@ fn union_files(conn: &Connection, ids: &[i64]) -> Result<UnionFiles> {
                 r.get::<_, Option<String>>(4)?,
             ))
         })?;
+        let name: Option<String> = conn
+            .prepare_cached(&format!("select name from s{s}.releases where id = ?"))?
+            .query_row([id], |r| r.get(0))
+            .optional()?
+            .flatten();
+        union.names.extend(name);
         let mut filenames = BTreeSet::new();
         for row in rows {
             let (filename, expected, seen, total, subject) = row?;
@@ -1742,23 +1954,24 @@ mod tests {
             ))
             .unwrap();
         }
-        // ids carry their shard: id = seq * 8 + shard
-        let id = |seq: i64, shard: i64| seq * 8 + shard;
+        // ids carry their shard; with one shard the second is the same, and the cap leaves its rows out
+        let (a, b) = (0usize, store::SHARDS - 1);
+        let id = |seq: i64, shard: usize| store::global_id(seq, shard);
         for i in 0..70 {
             conn.execute(
-                "insert into s1.releases values (?1, 'Post', ?2, 10, '2026-11-07 12:00:00', 'p@x')",
-                rusqlite::params![id(100 + (69 - i), 1), format!("a.b.g{i:03}")],
+                &format!("insert into s{a}.releases values (?1, 'Post', ?2, 10, '2026-11-07 12:00:00', 'p@x')"),
+                rusqlite::params![id(100 + (69 - i), a), format!("a.b.g{i:03}")],
             )
             .unwrap();
         }
         conn.execute_batch(&format!(
-            "insert into s2.releases values ({}, 'Post', 'a.b.other', 99, '2026-11-07 13:00:00', 'q@x');
-             insert into s2.releases values ({}, 'Post', '{}', 1, null, 'p@x');
-             insert into s2.releases values ({}, 'Renamed', 'a.b.moved', 1, null, 'p@x');",
-            id(500, 2),
-            id(600, 2),
+            "insert into s{b}.releases values ({}, 'Post', 'a.b.other', 99, '2026-11-07 13:00:00', 'q@x');
+             insert into s{b}.releases values ({}, 'Post', '{}', 1, null, 'p@x');
+             insert into s{b}.releases values ({}, 'Renamed', 'a.b.moved', 1, null, 'p@x');",
+            id(500, b),
+            id(600, b),
             "x".repeat(1_000),
-            id(700, 2)
+            id(700, b)
         ))
         .unwrap();
         let catalog_row = |i: i64| NamedRow {
@@ -1770,28 +1983,31 @@ mod tests {
             posted: None,
             poster: None,
         };
-        let mut candidates: Vec<NamedRow> = (100..170).map(|seq| catalog_row(id(seq, 1))).collect();
+        let mut candidates: Vec<NamedRow> = (100..170).map(|seq| catalog_row(id(seq, a))).collect();
         // a row the shard deleted, a blocked group, and one renamed since
         candidates.extend([
-            catalog_row(id(800, 2)),
-            catalog_row(id(500, 2)),
-            catalog_row(id(600, 2)),
-            catalog_row(id(700, 2)),
+            catalog_row(id(800, b)),
+            catalog_row(id(500, b)),
+            catalog_row(id(600, b)),
+            catalog_row(id(700, b)),
         ]);
         let rows = reread_candidates(&conn, &candidates, |name| name == "Post").unwrap();
         let named = first_per_shard(rows, 64);
-        let shard1: Vec<&str> =
-            named.iter().filter(|n| store::shard_of_id(n.id) == 1).map(|n| n.group.as_str()).collect();
-        assert_eq!(shard1.len(), 64, "the first 64 of the shard");
-        assert_eq!((shard1[0], shard1[63]), ("a.b.g000", "a.b.g063"), "by group name, as the (name, group) index");
-        let other = named.iter().find(|n| n.id == id(500, 2)).unwrap();
-        assert_eq!(
-            (other.group.as_str(), other.bytes, other.poster.as_deref()),
-            ("a.b.other", 99, Some("q@x")),
-            "the shard's row, not the catalog's"
-        );
-        assert!(other.date.is_some_and(|d| d > 2_461_000.0), "julianday from the shard's own sql");
-        for gone in [id(800, 2), id(600, 2), id(700, 2)] {
+        let first: Vec<&str> =
+            named.iter().filter(|n| store::shard_of_id(n.id) == a).map(|n| n.group.as_str()).collect();
+        assert_eq!(first.len(), 64, "the first 64 of the shard");
+        assert_eq!((first[0], first[63]), ("a.b.g000", "a.b.g063"), "by group name, as the (name, group) index");
+        assert!(named.iter().filter(|n| n.group.starts_with("a.b.g")).all(|n| n.bytes == 10), "the shard's rows");
+        if a != b {
+            let other = named.iter().find(|n| n.id == id(500, b)).unwrap();
+            assert_eq!(
+                (other.group.as_str(), other.bytes, other.poster.as_deref()),
+                ("a.b.other", 99, Some("q@x")),
+                "the shard's row, not the catalog's"
+            );
+            assert!(other.date.is_some_and(|d| d > 2_461_000.0), "julianday from the shard's own sql");
+        }
+        for gone in [id(800, b), id(600, b), id(700, b)] {
             assert!(!named.iter().any(|n| n.id == gone), "deleted, blocked or renamed: {gone}");
         }
     }
@@ -1946,6 +2162,34 @@ mod tests {
     }
 
     #[test]
+    fn a_thumbnail_found_beside_a_release_is_a_file_of_its_post() {
+        let (_dir, conn) = all_shards();
+        let g = "alt.binaries.a";
+        let (film, index) = ("Some.Film.2160p.mp4", "Some.Film.2160p.par2");
+        put_row(&conn, 1, "Some.Film.2160p", g, "a@x", &[(film, &[1, 2, 3], 3), (index, &[1], 1)]);
+        put_row(&conn, 2, "00-thumbnail.jpg", g, "b@x", &[("00-thumbnail.jpg", &[1], 1)]);
+        let (lead, thumb) = (store::global_id(1, store::shard_of(g)), store::global_id(2, store::shard_of(g)));
+        let s = store::shard_of(g);
+        // as the link step writes it
+        conn.execute(
+            &format!("insert into s{s}.beside_files (row_id, release_id, par2_file) values (?2, ?1, x'07')"),
+            rusqlite::params![lead, thumb],
+        )
+        .unwrap();
+        for id in [lead, thumb] {
+            let post = whole_post_with(&conn, &row_of(&conn, if id == lead { 1 } else { 2 }, g)).unwrap().unwrap();
+            assert_eq!(post.ids, [lead, thumb], "row {id}");
+            assert_eq!((post.lead, post.listed_id()), (None, lead), "listed as the release, never the thumbnail");
+            assert!(post.recovery.is_empty(), "the film isn't a recovery volume");
+            assert!(post.complete);
+        }
+        let post = whole_post_with(&conn, &row_of(&conn, 2, g)).unwrap().unwrap();
+        let contents = contents_of_split(&conn, &post).unwrap();
+        assert_eq!((contents.files, contents.par2_files, contents.recovery_volumes), (3, 1, 0));
+        assert!(contents.list.iter().any(|f| f.name == "00-thumbnail.jpg"), "in the NZB's list");
+    }
+
+    #[test]
     fn a_releases_counts_without_its_bytes_are_the_same_counts() {
         let (_dir, conn) = linked_shard();
         for id in [8, 16, 24] {
@@ -1989,6 +2233,62 @@ mod tests {
         // and where they do, the verdict changes with them, which is why they're read
         let sized = Contents { data_bytes: 90_000, recovery_bytes: 20_000, ..half.clone() };
         assert!(sized.repairable() && !half.repairable());
+    }
+
+    #[test]
+    fn a_release_missing_what_its_recovery_volumes_rebuild_needs_a_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+        let group = "alt.binaries.a";
+        // 9 of a video's 10 parts, and `recovery` parts of a recovery volume: each article 1,000 bytes
+        let release = |name: &str, recovery: i64| -> i64 {
+            let article = |file: &str, part: i64, of: i64| crate::parser::Article {
+                message_id: format!("<{name}.{file}.{part}@x>"),
+                subject: format!("{name} \"{file}\" yEnc ({part}/{of})"),
+                author: "p <p@x>".into(),
+                filename: Some(file.into()),
+                part: Some(part),
+                total_parts: Some(of),
+                bytes: 1_000,
+                ..Default::default()
+            };
+            let video = format!("{name}.mkv");
+            let volume = format!("{name}.vol00+05.par2");
+            let mut articles: Vec<_> = (1..=9).map(|p| article(&video, p, 10)).collect();
+            articles.extend((1..=recovery).map(|p| article(&volume, p, 5)));
+            let r = crate::parser::Release { name: name.into(), group: group.into(), articles, ..Default::default() };
+            store::save(&main, &[r]).unwrap();
+            let shard = db::open_shard(&store::shard_path(&main, store::shard_of(group))).unwrap();
+            shard.query_row("select id from releases where name = ?1", [name], |r| r.get(0)).unwrap()
+        };
+        let enough = release("Film.A.2020.1080p-X", 2);
+        let short = release("Film.B.2020.1080p-X", 0);
+        let conn = db::open_with_shards(&main).unwrap();
+        assert!(repair_needed(&conn, enough).unwrap(), "1 part missing, 2 parts of recovery");
+        assert!(!repair_needed(&conn, short).unwrap(), "no recovery there");
+        assert_eq!(repair_needed_of(&conn, &[enough, short]), HashSet::from([enough]));
+        // the counter says a third file that never turned up (a RAR volume): the volumes can't be known to cover it.
+        // One video named as the release would be all of it (`store::one_video_named`)
+        let s = store::shard_of(group);
+        conn.execute(
+            &format!(
+                "update s{s}.files set file_total = 3,
+                        filename = replace(filename, '.mkv', '.part1.rar') where release_id = ?1"
+            ),
+            [enough],
+        )
+        .unwrap();
+        assert!(!repair_needed(&conn, enough).unwrap(), "a whole file missing");
+        conn.execute(&format!("update s{s}.files set file_total = 2 where release_id = ?1"), [enough]).unwrap();
+        assert!(repair_needed(&conn, enough).unwrap(), "both files the counter says");
+        assert!(!repair_waits_on_counts(&conn, enough).unwrap(), "its bytes are all counted");
+        // a sealed blob not counted yet: the bytes aren't known without the sealed log, soo no
+        conn.execute(&format!("update s{s}.files set blob = x'00', blob_bytes = null where release_id = ?1"), [enough])
+            .unwrap();
+        assert!(!repair_needed(&conn, enough).unwrap());
+        assert!(repair_waits_on_counts(&conn, enough).unwrap(), "counting its blob settles it");
+        assert!(!repair_waits_on_counts(&conn, short).unwrap(), "no recovery: nothing to wait on");
     }
 
     #[test]
@@ -2376,12 +2676,27 @@ mod tests {
         files: &[(&str, &[i64], i64)],
         posted: &str,
     ) {
+        put_row_counted(conn, id, name, group, poster, files, posted, 2);
+    }
+
+    /// `put_row_at` under a counter of `total` files: the film is `[1/total]`, every other file `[2/total]`.
+    #[allow(clippy::too_many_arguments)]
+    fn put_row_counted(
+        conn: &Connection,
+        id: i64,
+        name: &str,
+        group: &str,
+        poster: &str,
+        files: &[(&str, &[i64], i64)],
+        posted: &str,
+        total: i64,
+    ) {
         let s = store::shard_of(group);
         let id = store::global_id(id, s);
         conn.execute(
             &format!(
                 "insert into s{s}.releases (id, name, group_name, poster, posted_date, size, complete, parts, file_total)
-                 values (?1, ?2, ?3, ?4, ?7, ?5, 0, ?6, 2)"
+                 values (?1, ?2, ?3, ?4, ?7, ?5, 0, ?6, ?8)"
             ),
             rusqlite::params![
                 id,
@@ -2390,7 +2705,8 @@ mod tests {
                 poster,
                 files.iter().map(|f| f.1.len() as i64 * 100).sum::<i64>(),
                 files.iter().map(|f| f.1.len() as i64).sum::<i64>(),
-                posted
+                posted,
+                total
             ],
         )
         .unwrap();
@@ -2402,16 +2718,21 @@ mod tests {
             conn.execute(
                 &format!(
                     "insert into s{s}.files (id, release_id, filename, subject, expected, file_total, seen)
-                     values (?1, ?2, ?3, ?4, ?5, 2, ?6)"
+                     values (?1, ?2, ?3, ?4, ?5, ?7, ?6)"
                 ),
                 rusqlite::params![
                     id * 16 + at as i64,
                     id,
                     file,
                     // the post's counter: the film first, its volumes second, whichever row has them
-                    format!("[{}/2] - \"{file}\" yEnc ({}/{of})", if file.ends_with(".mkv") { 1 } else { 2 }, parts[0]),
+                    format!(
+                        "[{}/{total}] - \"{file}\" yEnc ({}/{of})",
+                        if file.ends_with(".mkv") { 1 } else { 2 },
+                        parts[0]
+                    ),
                     of,
-                    bits
+                    bits,
+                    total
                 ],
             )
             .unwrap();
@@ -2448,6 +2769,78 @@ mod tests {
             assert_eq!(post.ids, want, "row {i} gets the same answer");
             assert!(post.complete);
             assert_eq!(post.groups, [a, b, c, d]);
+        }
+    }
+
+    #[test]
+    fn a_release_counted_with_its_thumbnail_is_whole_once_the_thumbnail_is_found() {
+        let (_dir, conn) = all_shards();
+        let g = "alt.binaries.a";
+        // `[n/4]`: a film not named as the post and two volumes here, the thumbnail posted apart as one of the four
+        put_row_counted(
+            &conn,
+            1,
+            "Some.Album.2026",
+            g,
+            "a@x",
+            &[
+                ("Some.Film.2160p.mkv", &[1, 2], 2),
+                ("Some.Film.2160p.par2", &[1], 1),
+                ("Some.Film.2160p.vol0+1.par2", &[1], 1),
+            ],
+            "2026-11-03 07:36:18",
+            4,
+        );
+        let lead = row_of(&conn, 1, g).id;
+        assert!(!single_post_complete(&conn, lead).unwrap(), "three of the four files");
+        put_row_counted(
+            &conn,
+            2,
+            "00-thumbnail.jpg",
+            g,
+            "b@x",
+            &[("00-thumbnail.jpg", &[1], 1)],
+            "2026-11-03 07:36:19",
+            4,
+        );
+        let thumb = row_of(&conn, 2, g).id;
+        conn.execute(
+            &format!("insert into s{}.beside_files (row_id, release_id) values (?2, ?1)", store::shard_of(g)),
+            rusqlite::params![lead, thumb],
+        )
+        .unwrap();
+        let post = whole_post_with(&conn, &row_of(&conn, 1, g)).unwrap().unwrap();
+        assert!(post.complete, "the four files together");
+    }
+
+    #[test]
+    fn a_post_cut_across_groups_keeps_its_rows_beside_a_thumbnail_one_of_them_found() {
+        let (_dir, conn) = all_shards();
+        let name = "Some.Film.2007.2160p.UHD.BluRay.REMUX.DV.HDR.HEVC.Atmos-GRP";
+        let (mkv, vol) = ("Some.Film.mkv", "Some.Film.vol00+01.par2");
+        let (a, b, c) = ("alt.binaries.a", "alt.binaries.b", "alt.binaries.c");
+        put_row(&conn, 1, name, a, "x1@nyuu", &[(mkv, &[1, 4, 7], 8), (vol, &[1], 2)]);
+        put_row(&conn, 2, name, b, "x2@nyuu", &[(mkv, &[2, 5, 8], 8), (vol, &[2], 2)]);
+        put_row(&conn, 3, name, c, "x3@nyuu", &[(mkv, &[3, 6], 8)]);
+        put_row(&conn, 9, "00-thumbnail.jpg", a, "x9@nyuu", &[("00-thumbnail.jpg", &[1], 1)]);
+        let (lead, thumb) = (row_of(&conn, 1, a).id, row_of(&conn, 9, a).id);
+        let s = store::shard_of(a);
+        conn.execute(
+            &format!("insert into s{s}.beside_files (row_id, release_id, par2_file) values (?2, ?1, x'07')"),
+            rusqlite::params![lead, thumb],
+        )
+        .unwrap();
+        let mut want: Vec<i64> =
+            [(1, a), (2, b), (3, c), (9, a)].iter().map(|(i, g)| row_of(&conn, *i, g).id).collect();
+        want.sort_unstable();
+        // every row of the post, the thumbnail's too, gets the one answer
+        for (i, g) in [(1, a), (2, b), (3, c), (9, a)] {
+            let post = whole_post_with(&conn, &row_of(&conn, i, g)).unwrap().unwrap();
+            assert_eq!(post.ids, want, "row {i}");
+            assert!(post.complete, "row {i}");
+            assert_eq!(post.lead, None, "row {i}: no lead, soo the cut file stays one file");
+            assert_ne!(post.listed_id(), thumb, "row {i}");
+            assert_eq!(post.groups, [a, b, c], "row {i}");
         }
     }
 
@@ -2632,5 +3025,85 @@ mod tests {
         // the missing parts, but under another subject: not shown to be the same file
         put_row(&conn, 3, name, c, "x3@nyuu", &[("Some.Film.mp4", &[2, 4], 4)]);
         assert_eq!(whole_post_with(&conn, &row_of(&conn, 1, a)).unwrap(), None);
+    }
+
+    #[test]
+    fn a_split_post_is_whole_without_the_thumbnail_its_counter_counts() {
+        let (_dir, conn) = all_shards();
+        let name = "Some.Film.1997.2160p.MA.WEB-DL.DDP5.1.H.265-GRP";
+        let (mkv, vol) = (
+            "Some.Film.1997.2160p.MA.WEB-DL.DDP5.1.H.265-GRP.mkv",
+            "Some.Film.1997.2160p.MA.WEB-DL.DDP5.1.H.265-GRP.vol00-01.par2",
+        );
+        let (a, b, c, d) = ("alt.binaries.a", "alt.binaries.b", "alt.binaries.c", "alt.binaries.d");
+        // `[3/3] - "thumbnail.jpg"` went to a row of its own: the film and its volume are all there is, across 4 groups
+        let at = "2026-11-07 10:49:51";
+        put_row_counted(&conn, 1, name, a, "x1@nyuu", &[(mkv, &[1, 5], 8), (vol, &[1], 2)], at, 3);
+        put_row_counted(&conn, 2, name, b, "x2@nyuu", &[(mkv, &[2, 6], 8), (vol, &[2], 2)], at, 3);
+        put_row_counted(&conn, 3, name, c, "x3@nyuu", &[(mkv, &[3, 7], 8)], at, 3);
+        put_row_counted(&conn, 4, name, d, "x1@nyuu", &[(mkv, &[4, 8], 8)], at, 3);
+        for (i, g) in [(1, a), (2, b), (3, c), (4, d)] {
+            let row = row_of(&conn, i, g);
+            let post = whole_post_with(&conn, &row).unwrap().unwrap_or_else(|| panic!("row {i}"));
+            assert_eq!(post.ids.len(), 4, "row {i}");
+            assert!(post.complete, "row {i}");
+            assert!(!single_post_complete(&conn, row.id).unwrap(), "row {i} alone has half the film");
+        }
+        // a part of the film gone: not whole
+        conn.execute(
+            &format!("update s{}.files set seen = x'00' where release_id = ?1 and filename = ?2", store::shard_of(d)),
+            rusqlite::params![row_of(&conn, 4, d).id, mkv],
+        )
+        .unwrap();
+        let post = whole_post_with(&conn, &row_of(&conn, 1, a)).unwrap();
+        let post = post.expect("the four rows are still one post");
+        assert_eq!(post.ids.len(), 4);
+        assert!(!post.complete, "a part of the film is gone");
+    }
+
+    #[test]
+    fn a_group_row_named_as_the_film_joins_the_split_post() {
+        let (_dir, conn) = all_shards();
+        let name = "Some.Film.1965.2160p.UHD.BluRay.x265-GRP";
+        let (mkv, vol) =
+            ("Some.Film.1965.2160p.UHD.BluRay.x265-GRP.mkv", "Some.Film.1965.2160p.UHD.BluRay.x265-GRP.vol00-01.par2");
+        let (a, b, c, d) = ("alt.binaries.a", "alt.binaries.b", "alt.binaries.c", "alt.binaries.d");
+        let at = "2026-11-07 10:49:51";
+        // the film's first article came first in group a, so its row took the film's name; elsewhere a PAR2 file did
+        put_row_counted(&conn, 1, mkv, a, "x1@nyuu", &[(mkv, &[1, 5], 8)], at, 3);
+        put_row_counted(&conn, 2, name, b, "x2@nyuu", &[(mkv, &[2, 6], 8), (vol, &[1], 2)], at, 3);
+        put_row_counted(&conn, 3, name, c, "x3@nyuu", &[(mkv, &[3, 7], 8), (vol, &[2], 2)], at, 3);
+        put_row_counted(&conn, 4, name, d, "x1@nyuu", &[(mkv, &[4, 8], 8)], at, 3);
+        for (i, g) in [(1, a), (2, b), (3, c), (4, d)] {
+            let row = row_of(&conn, i, g);
+            let post = whole_post_with(&conn, &row).unwrap().unwrap_or_else(|| panic!("row {i}"));
+            assert_eq!(post.ids.len(), 4, "row {i}");
+            assert!(post.complete, "row {i}");
+        }
+        // another film's row named only like it: not part of the post
+        put_row_counted(
+            &conn,
+            5,
+            "Some.Film.1965.2160p.UHD.BluRay.x265-GRP.mkv.1",
+            b,
+            "x9@nyuu",
+            &[(mkv, &[1], 8)],
+            at,
+            3,
+        );
+        let post = whole_post_with(&conn, &row_of(&conn, 2, b)).unwrap().unwrap();
+        assert_eq!(post.ids.len(), 4);
+    }
+
+    #[test]
+    fn a_film_whose_counter_says_more_files_is_whole_only_when_named_as_its_post() {
+        let (_dir, conn) = all_shards();
+        let (a, b) = ("alt.binaries.a", "alt.binaries.b");
+        let at = "2026-11-07 10:49:51";
+        // the whole film alone in one row, its counter counting a thumbnail: named as the row, or not
+        put_row_counted(&conn, 1, "Film.2020.2160p-G", a, "x@nyuu", &[("Film.2020.2160p-G.mkv", &[1, 2], 2)], at, 3);
+        put_row_counted(&conn, 2, "Film.2020.2160p-G", b, "y@nyuu", &[("abc.mkv", &[1, 2], 2)], at, 3);
+        assert!(single_post_complete(&conn, row_of(&conn, 1, a).id).unwrap());
+        assert!(!single_post_complete(&conn, row_of(&conn, 2, b).id).unwrap());
     }
 }

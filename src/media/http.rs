@@ -52,10 +52,15 @@ fn agent(base: &str) -> ureq::Agent {
         .max_redirects(0)
         .user_agent(concat!("atlas/", env!("CARGO_PKG_VERSION")));
     // a test's loopback server must not go through a proxy from the environment
-    if base.starts_with("http://127.0.0.1") {
+    if loopback(base) {
         b = b.proxy(None);
     }
     b.build().into()
+}
+
+/// A test's fixture server answers from routes that change under it, soo nothing it says is kept.
+fn loopback(base: &str) -> bool {
+    base.starts_with("http://127.0.0.1")
 }
 
 #[derive(Default)]
@@ -70,6 +75,8 @@ pub struct Client {
     agent: ureq::Agent,
     bucket: Mutex<Bucket>,
     pause: Mutex<Pause>,
+    /// a loopback base is a test's fixture server: its answers are never cached
+    cache: bool,
 }
 
 pub enum Reply {
@@ -89,6 +96,7 @@ impl Client {
             agent: agent(base),
             bucket: Mutex::new(Bucket::new(per_minute, Instant::now())),
             pause: Mutex::default(),
+            cache: !loopback(base),
         }
     }
 
@@ -131,7 +139,8 @@ impl Client {
 
     /// `url` holds any key, soo it's never logged and never in a `Trouble`.
     pub fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<Reply, Trouble> {
-        if let Some((200, cached_body)) = crate::raw_store::get_http_cache(self.name, url)
+        if self.cache
+            && let Some((200, cached_body)) = crate::raw_store::get_http_cache(self.name, url)
             && let Ok(json) = serde_json::from_str::<Value>(&cached_body)
         {
             return Ok(Reply::Json(json));
@@ -143,7 +152,7 @@ impl Client {
             request = request.header(*name, *value);
         }
         let sent = request.call();
-        self.counted(&span, is_outage(&sent), self.answer(sent, Some(url)))
+        self.counted(&span, is_outage(&sent), self.answer(sent, self.cache.then_some(url)))
     }
 
     /// As `get`, with a body that can hold a key.

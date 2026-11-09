@@ -50,8 +50,15 @@ pub fn create_main(conn: &Connection) -> Result<()> {
         create index if not exists spots_seen_todo on spots_seen(state, number);
         create index if not exists spots_seen_ref on spots_seen(nzb_ref) where nzb_ref is not null;
         create index if not exists spots_seen_key on spots_seen(nzb_key) where nzb_key is not null;
-        create index if not exists spots_seen_release on spots_seen(release_id) where release_id is not null;",
+        create index if not exists spots_seen_release on spots_seen(release_id) where release_id is not null;
+        create table if not exists spot_disposals (
+            message_id TEXT NOT NULL,
+            spotter TEXT NOT NULL DEFAULT '',
+            at INTEGER NOT NULL,
+            PRIMARY KEY (message_id, spotter)
+        ) without rowid;",
     )?;
+    super::blacklist::create(conn)?;
     super::comments::create(conn)
 }
 
@@ -129,22 +136,69 @@ pub fn note_read(conn: &mut Connection, server: &str, last: u64, spots: &[Noted]
     Ok(added)
 }
 
+/// A spot (or comment) removed with a `DISPOSE`, `DELETE` or `REMOVE` in `free.pt`: by a Spotnet moderator
+/// (`spotter` empty), or by its own spotter (`spotter` their id), which holds only for that spotter's posts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Disposal {
+    pub message_id: String,
+    pub spotter: String,
+    /// when the command was posted
+    pub at: i64,
+}
+
+/// How long after a spot its spotter's own removal of it holds, as in Spotweb: five days.
+pub const OWN_DISPOSAL_SECS: i64 = 5 * 86_400;
+
+/// SQL for whether the row `s` (with its spot's `message_id`, and its spotter id in column `spotter`) was removed:
+/// by a disposal, aliased `d`, or because its spotter is on the blacklist (`blacklist`). `created` is the column
+/// with when the spot was made, when the row has one: a spotter's own removal holds only `OWN_DISPOSAL_SECS` after
+/// it.
+pub(crate) fn disposed_sql(d: &str, s: &str, spotter: &str, created: Option<&str>) -> String {
+    // 0: the spot's XML had no date, so not known, as NULL
+    let made = created.map_or(format!("{d}.at"), |c| format!("coalesce(nullif({s}.{c}, 0), {d}.at)"));
+    format!(
+        "(exists (select 1 from main.spot_disposals {d} where {d}.message_id = {s}.message_id
+            and ({d}.spotter = '' or ({d}.spotter = {s}.{spotter} and {d}.at - {made} <= {OWN_DISPOSAL_SECS})))
+          or exists (select 1 from main.spot_blacklist {d}_b where {d}_b.spotter = {s}.{spotter}))"
+    )
+}
+
+/// Notes removals read in the overview. Kept whatever they name, now or later: a spot noted, saved or commented on
+/// after its removal is still removed (`todo`, `spots_of`, `comments::about`). Returns how many were new.
+pub fn note_disposals(conn: &mut Connection, disposals: &[Disposal]) -> Result<usize> {
+    let tx = conn.transaction()?;
+    let mut added = 0;
+    {
+        let mut insert =
+            tx.prepare_cached("insert or ignore into spot_disposals (message_id, spotter, at) values (?, ?, ?)")?;
+        for d in disposals {
+            added += insert.execute(params![d.message_id, d.spotter, d.at])?;
+        }
+    }
+    tx.commit()?;
+    Ok(added)
+}
+
 /// Spots to fetch. Half of `limit` goes to the oldest waiting, whoever posted them, so every spot gets its turn
 /// however many new ones come in. The rest goes to each spotter's newest, a spotter at a time in turn
 /// (`PER_SPOTTER` deep at most).
 pub fn todo(conn: &Connection, limit: usize) -> Result<Vec<String>> {
     let oldest: Vec<String> = conn
-        .prepare_cached("select message_id from spots_seen where state = ?1 order by number limit ?2")?
+        .prepare_cached(&format!(
+            "select message_id from spots_seen where state = ?1 and not {} order by number limit ?2",
+            seen_disposed()
+        ))?
         .query_map(params![TODO, (limit / 2) as i64], |r| r.get(0))?
         .collect::<Result<_>>()?;
     let newest: Vec<String> = conn
-        .prepare_cached(
+        .prepare_cached(&format!(
             "select message_id from (
                 select message_id, number,
                     row_number() over (partition by coalesce(spotter, '') order by number desc) as turn
-                from spots_seen where state = ?1
+                from spots_seen where state = ?1 and not {}
              ) where turn <= ?2 order by turn, number desc limit ?3",
-        )?
+            seen_disposed()
+        ))?
         .query_map(params![TODO, PER_SPOTTER, limit as i64], |r| r.get(0))?
         .collect::<Result<_>>()?;
     let mut out = oldest;
@@ -161,11 +215,21 @@ pub fn todo(conn: &Connection, limit: usize) -> Result<Vec<String>> {
 
 /// Spots waiting to be fetched.
 pub fn waiting(conn: &Connection) -> Result<i64> {
-    conn.query_row("select count(*) from spots_seen where state = ?", [TODO], |r| r.get(0))
+    conn.query_row(
+        &format!("select count(*) from spots_seen where state = ? and not {}", seen_disposed()),
+        [TODO],
+        |r| r.get(0),
+    )
+}
+
+/// Whether the `spots_seen` row was removed: a spot waiting has no `created`, so a spotter's own removal holds
+/// whenever it came.
+fn seen_disposed() -> String {
+    disposed_sql("d", "spots_seen", "spotter", None)
 }
 
 /// Gives up on spots waiting past `TODO_DAYS` and on the oldest past `MAX_TODO`, and forgets the ones that came to
-/// nothing past `KEEP_DAYS`. Saved ones stay. Returns the rows it changed.
+/// nothing past `KEEP_DAYS`, and removals of nothing kept. Saved ones stay. Returns the rows it changed.
 pub fn prune(conn: &Connection, now: i64) -> Result<usize> {
     let day = 86_400;
     let mut n = conn.execute(
@@ -180,6 +244,14 @@ pub fn prune(conn: &Connection, now: i64) -> Result<usize> {
     n += conn.execute(
         "delete from spots_seen where state not in (?1, ?2) and at < ?3",
         params![TODO, SAVED, now - KEEP_DAYS * day],
+    )?;
+    // a removal is kept as long as what it removes may be: a spot waiting, or a saved spot or a comment (kept for
+    // good)
+    n += conn.execute(
+        "delete from spot_disposals where at < ?1
+            and message_id not in (select message_id from spots_seen where state in (?2, ?3))
+            and message_id not in (select message_id from spot_comments)",
+        params![now - KEEP_DAYS * day, SAVED, TODO],
     )?;
     Ok(n)
 }
@@ -340,9 +412,39 @@ pub fn placement(
     if files.is_empty() {
         return Ok(Placement::Taken);
     }
-    // every message-id of the release, sealed files' too, by their keyed hash, with the file it's in
     let key = crate::store::IdKey::of(conn)?;
-    crate::store::index_release(conn, &key, id)?;
+    let names: Vec<(i64, String)> = conn
+        .prepare_cached("select id, filename from files where release_id = ?")?
+        .query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_>>()?;
+    // a spot naming a file the release doesn't have (with articles to tell by) is another post: nothing to read
+    if !files.iter().all(|(filename, ids)| ids.is_empty() || names.iter().any(|(_, n)| n == filename)) {
+        return Ok(Placement::Taken);
+    }
+    // a one-file release's index isn't kept up by saves: one made before is not to be trusted
+    let indexed = names.len() > 1 && crate::store::is_indexed(conn, id)?;
+    if !indexed {
+        // no index kept (one file, or pruned once quiet): each named file's ids streamed past the spot's own, without
+        // making an index that saves wouldnt keep up or that would only be pruned again
+        let mut suffixes = Default::default();
+        for (filename, ids) in files.iter().filter(|(_, ids)| !ids.is_empty()) {
+            let mut wanted: std::collections::HashSet<i64> = ids.iter().map(|m| key.hash(&format!("<{m}>"))).collect();
+            for (file_id, _) in names.iter().filter(|(_, n)| n == filename) {
+                if wanted.is_empty() {
+                    break;
+                }
+                crate::store::file_id_hashes(conn, &key, *file_id, &mut suffixes, |h| {
+                    wanted.remove(&h);
+                    Ok(!wanted.is_empty())
+                })?;
+            }
+            if !wanted.is_empty() {
+                return Ok(Placement::Taken);
+            }
+        }
+        return Ok(Placement::SamePost(id));
+    }
+    // every message-id of the release, sealed files' too, by their keyed hash, with the file it's in
     let mut file_of = conn.prepare_cached(
         "select f.filename from release_ids r join files f on f.id = r.file_id where r.release_id = ? and r.id_hash = ?",
     )?;
@@ -362,7 +464,7 @@ pub fn placement(
 /// newest first, so an older copy of a spot comes after the edit that replaced it.
 fn put(conn: &Connection, release_id: i64, row: &SpotRow) -> Result<()> {
     let spot = &row.spot;
-    conn.execute(
+    let changed = conn.execute(
         "insert into spots (release_id, message_id, kind, title, poster, tag, spotter_id, category,
             subcats, size, imdb_id, created, nzb_key, xml) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          on conflict(release_id) do update set message_id = excluded.message_id, kind = excluded.kind,
@@ -387,7 +489,33 @@ fn put(conn: &Connection, release_id: i64, row: &SpotRow) -> Result<()> {
             row.xml,
         ],
     )?;
+    // the spot's kind is a hint for the release's category (`spotnet::category`): the step looks again
+    if changed > 0 {
+        recategorize(conn, release_id)?;
+    }
     Ok(())
+}
+
+/// Queues release `id` for the category step again, on its shard's writer.
+fn recategorize(conn: &Connection, id: i64) -> Result<()> {
+    let now = chrono::Utc::now().timestamp();
+    crate::postprocess::rerun_on(conn, id, crate::postprocess::step::mask(crate::category::step::STEP), now)
+}
+
+/// Once per shard: queues every release saved from a spot before the spot's kind was a category hint for the
+/// category step again. Returns how many.
+pub fn recategorize_all(conn: &Connection) -> Result<usize> {
+    const DONE: &str = "spot_category_hint";
+    if crate::store::get_meta(conn, DONE)?.is_some() {
+        return Ok(0);
+    }
+    let ids: Vec<i64> =
+        conn.prepare("select release_id from spots")?.query_map([], |r| r.get(0))?.collect::<Result<_>>()?;
+    for id in &ids {
+        recategorize(conn, *id)?;
+    }
+    crate::store::set_meta(conn, DONE, 1)?;
+    Ok(ids.len())
 }
 
 /// What a release's spot says, for its page, its row and the API.
@@ -403,7 +531,8 @@ pub struct Tagged {
     pub subcats: String,
 }
 
-/// The spots of these releases, by release id, from each one's shard.
+/// The spots of these releases, by release id, from each one's shard. A spot that was removed (`Disposal`) leaves
+/// its release untagged.
 pub fn spots_of(ids: &[i64]) -> Result<HashMap<i64, Tagged>> {
     if ids.is_empty() {
         return Ok(HashMap::new());
@@ -420,8 +549,9 @@ pub fn spots_of_with(conn: &Connection, ids: &[i64]) -> Result<HashMap<i64, Tagg
     for (shard, list) in by_shard {
         let sql = format!(
             "select release_id, message_id, kind, title, coalesce(poster, ''), coalesce(tag, ''), spotter_id, imdb_id,
-                coalesce(subcats, '') from s{shard}.spots where release_id in ({})",
-            list.join(",")
+                coalesce(subcats, '') from s{shard}.spots s where release_id in ({}) and not {}",
+            list.join(","),
+            disposed_sql("d", "s", "spotter_id", Some("created"))
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([], |r| {
@@ -470,6 +600,25 @@ pub struct Detail {
     /// categories, size, when it was made)
     pub spot: FullSpot,
     pub xml: Xml,
+    /// when the spot was removed, and by whom
+    pub removed: Option<Removed>,
+}
+
+/// A spot's removal, for its release page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Removed {
+    /// when the removal was posted; 0 for the blacklist, which says no when
+    pub at: i64,
+    pub by: RemovedBy,
+}
+
+/// Who took a spot back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemovedBy {
+    Moderator,
+    Spotter,
+    /// its spotter is on the Spotnet blacklist
+    Blacklist,
 }
 
 /// Release `id`'s spot, from its shard, when it has one.
@@ -500,7 +649,7 @@ pub fn detail_of_with(conn: &Connection, id: i64) -> Result<Option<Detail>> {
             Ok((parts, columns, r.get::<_, Option<String>>(10)?))
         })
         .optional()?;
-    Ok(row.map(|((message_id, spotter_id, imdb_id), columns, xml)| {
+    let row = row.map(|((message_id, spotter_id, imdb_id), columns, xml)| {
         let parsed = xml.as_deref().filter(|x| !x.is_empty()).and_then(super::full::parse);
         let state = match (&parsed, &xml) {
             (Some(_), _) => Xml::Kept,
@@ -508,8 +657,37 @@ pub fn detail_of_with(conn: &Connection, id: i64) -> Result<Option<Detail>> {
             (None, Some(_)) => Xml::Gone,
         };
         let imdb_id = parsed.as_ref().map_or(imdb_id, FullSpot::imdb_id);
-        Detail { message_id, spotter_id, imdb_id, spot: parsed.unwrap_or(columns), xml: state }
-    }))
+        Detail { message_id, spotter_id, imdb_id, spot: parsed.unwrap_or(columns), xml: state, removed: None }
+    });
+    let Some(mut detail) = row else { return Ok(None) };
+    detail.removed = removal(conn, &detail.message_id, detail.spotter_id.as_deref(), detail.spot.created)?;
+    Ok(Some(detail))
+}
+
+/// The removal of spot `message_id`, posted by `spotter_id` and made at `created` (0: not known), when there is
+/// one that holds (`disposed_sql`): a moderator's first, then the spotter's own, then the blacklist.
+fn removal(conn: &Connection, message_id: &str, spotter_id: Option<&str>, created: i64) -> Result<Option<Removed>> {
+    let posted = conn
+        .query_row(
+            &format!(
+                "select at, spotter = '' from main.spot_disposals
+             where message_id = ?1
+                and (spotter = '' or (spotter = ?2 and at - coalesce(nullif(?3, 0), at) <= {OWN_DISPOSAL_SECS}))
+             order by spotter = '' desc, at limit 1"
+            ),
+            params![message_id, spotter_id, created],
+            |r| {
+                let by = if r.get(1)? { RemovedBy::Moderator } else { RemovedBy::Spotter };
+                Ok(Removed { at: r.get(0)?, by })
+            },
+        )
+        .optional()?;
+    if posted.is_some() {
+        return Ok(posted);
+    }
+    let listed =
+        conn.query_row("select 1 from main.spot_blacklist where spotter = ?", [spotter_id], |_| Ok(())).optional()?;
+    Ok(listed.map(|()| Removed { at: 0, by: RemovedBy::Blacklist }))
 }
 
 /// Spots of this shard saved before their XML was kept: (release id, spot message-id), at most `limit`, in no
@@ -573,10 +751,30 @@ mod tests {
         assert_eq!(state, GAVE_UP);
     }
 
+    /// A shard's tables: tagging a release touches its row and the stage's queue (`recategorize`).
+    fn tagging_shard(conn: &Connection) {
+        conn.execute_batch("create table releases (id INTEGER PRIMARY KEY, name TEXT, group_name TEXT)").unwrap();
+        for table in [&crate::postprocess::schema::PP_STATE, &crate::postprocess::schema::PP_QUEUE] {
+            conn.execute_batch(table.create).unwrap();
+            for (column, kind) in table.added {
+                conn.execute_batch(&format!("alter table {} add column {column} {kind}", table.name)).unwrap();
+            }
+        }
+    }
+
+    fn queued(conn: &Connection) -> Vec<i64> {
+        conn.prepare("select release_id from pp_queue order by release_id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap()
+    }
+
     #[test]
     fn tags_the_release_by_name_and_group_and_copies_by_nzb() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("create table releases (id INTEGER PRIMARY KEY, name TEXT, group_name TEXT)").unwrap();
+        tagging_shard(&conn);
         conn.execute("insert into releases values (5, 'Movie (2026)', 'alt.binaries.x')", []).unwrap();
         conn.execute_batch(SPOTS.create).unwrap();
         let spot = FullSpot {
@@ -596,6 +794,8 @@ mod tests {
         assert_eq!(tag_copy(&conn, &row).unwrap(), None);
         assert_eq!(tag(&conn, "Movie (2026)", "alt.binaries.y", &row).unwrap(), None);
         assert_eq!(tag(&conn, "Movie (2026)", "alt.binaries.x", &row).unwrap(), Some(5));
+        assert_eq!(queued(&conn), [5], "the category step looks again, with the spot's kind");
+        conn.execute("delete from pp_queue", []).unwrap();
         // an edit of the spot, retitled, with the same NZB: the same release, the newer spot
         let edited = FullSpot { title: "Movie (2026) edited".into(), ..spot.clone() };
         let again = SpotRow { message_id: "m2@spot.net".into(), spot: edited, ..row.clone() };
@@ -612,14 +812,30 @@ mod tests {
             ("m2@spot.net", "Movie (2026) edited", "tt1234567", 1)
         );
         // a release that went (junk) leaves its spot row behind for the trigger, not for copies
+        assert_eq!(queued(&conn), [5]);
         conn.execute("delete from releases where id = 5", []).unwrap();
         assert_eq!(tag_copy(&conn, &row).unwrap(), None);
     }
 
     #[test]
+    fn spot_releases_are_queued_for_their_category_once() {
+        let conn = Connection::open_in_memory().unwrap();
+        tagging_shard(&conn);
+        conn.execute_batch(SPOTS.create).unwrap();
+        conn.execute_batch("create table meta (key TEXT PRIMARY KEY, value INTEGER)").unwrap();
+        conn.execute("insert into releases values (8, 'A', 'g'), (16, 'B', 'g'), (24, 'C', 'g')", []).unwrap();
+        conn.execute("insert into spots (release_id, message_id, kind, title) values (8, 'a', 'movie', 'A'), (24, 'c', 'series', 'C')", []).unwrap();
+        assert_eq!(recategorize_all(&conn).unwrap(), 2);
+        assert_eq!(queued(&conn), [8, 24]);
+        conn.execute("delete from pp_queue", []).unwrap();
+        assert_eq!(recategorize_all(&conn).unwrap(), 0, "once");
+        assert!(queued(&conn).is_empty());
+    }
+
+    #[test]
     fn an_older_copy_keeps_the_newer_spot() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("create table releases (id INTEGER PRIMARY KEY, name TEXT, group_name TEXT)").unwrap();
+        tagging_shard(&conn);
         conn.execute("insert into releases values (5, 'Movie (2026)', 'g')", []).unwrap();
         conn.execute_batch(SPOTS.create).unwrap();
         let spot = |title: &str, created| FullSpot { title: title.into(), created, ..FullSpot::default() };
@@ -700,7 +916,7 @@ mod tests {
     #[test]
     fn a_frozen_release_keeps_its_row_when_a_copy_comes() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("create table releases (id INTEGER PRIMARY KEY, name TEXT, group_name TEXT)").unwrap();
+        tagging_shard(&conn);
         conn.execute_batch(SPOTS.create).unwrap();
         let row = SpotRow {
             message_id: "m@spot.net".into(),
@@ -756,6 +972,13 @@ mod tests {
         assert_eq!(place(&[("a.mkv", "a@x"), ("evil.mkv", "evil@x")]), Placement::Taken);
         assert_eq!(place(&[("setup.exe", "a@x")]), Placement::Taken);
         assert_eq!(place(&[]), Placement::Taken);
+        // with its index pruned: the same answers, and none made again
+        conn.execute("delete from release_ids", []).unwrap();
+        assert_eq!(place(&[("a.mkv", "a@x"), ("b.par2", "b@x")]), Placement::SamePost(id));
+        assert_eq!(place(&[("b.par2", "a@x")]), Placement::Taken, "a real article under another file's name");
+        assert_eq!(place(&[("a.mkv", "a@x"), ("evil.mkv", "evil@x")]), Placement::Taken);
+        let indexed: i64 = conn.query_row("select count(*) from release_ids", [], |r| r.get(0)).unwrap();
+        assert_eq!(indexed, 0);
         // tagged with the same NZB: the same post
         let tag_it =
             "insert into spots (release_id, message_id, kind, title, nzb_key) values (?, 'm', 'movie', 'T', 'k')";
@@ -763,16 +986,54 @@ mod tests {
         assert_eq!(place(&[]), Placement::SamePost(id));
     }
 
+    /// A spot checked against a one-file release compares its ids there and then, and leaves no index behind: saves
+    /// dont keep a one-file release's index up.
+    #[test]
+    fn a_spot_on_a_one_file_release_leaves_no_index() {
+        let path = tempfile::tempdir().unwrap();
+        let shard = path.path().join("s.db");
+        crate::store::create_shard(&shard).unwrap();
+        let mut conn = crate::db::open_shard(&shard).unwrap();
+        let mut writer = crate::store::ShardWriter::new(0);
+        let ids = crate::store::Ids::new(&path.path().join("main.db"));
+        let main = Connection::open(path.path().join("main.db")).unwrap();
+        crate::store::create_main(&main).unwrap();
+        let release = crate::parser::Release {
+            name: "Title".into(),
+            group: "alt.binaries.g".into(),
+            articles: vec![crate::parser::Article {
+                message_id: "<a@x>".into(),
+                filename: Some("a.mkv".into()),
+                release_name: Some("Title".into()),
+                part: Some(1),
+                total_parts: Some(1),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        writer.save(&mut conn, &ids, [std::slice::from_ref(&release)]).unwrap();
+        let files = |f: &str, id: &str| vec![(f.to_string(), vec![id.to_string()])];
+        assert!(matches!(
+            placement(&conn, "Title", "alt.binaries.g", "k", &files("a.mkv", "a@x")).unwrap(),
+            Placement::SamePost(_)
+        ));
+        assert_eq!(placement(&conn, "Title", "alt.binaries.g", "k", &files("b.mkv", "a@x")).unwrap(), Placement::Taken);
+        assert_eq!(placement(&conn, "Title", "alt.binaries.g", "k", &files("a.mkv", "z@x")).unwrap(), Placement::Taken);
+        let indexed: i64 = conn.query_row("select count(*) from release_ids", [], |r| r.get(0)).unwrap();
+        assert_eq!(indexed, 0);
+    }
+
     #[test]
     fn spots_of_reads_each_shard() {
-        let conn = Connection::open_in_memory().unwrap();
-        let (a, b) = (crate::store::global_id(1, 0), crate::store::global_id(1, 3));
-        for shard in [0, 3] {
+        let conn = main_db();
+        let last = crate::store::SHARDS - 1;
+        let (a, b) = (crate::store::global_id(1, 0), crate::store::global_id(3, last));
+        for shard in std::collections::BTreeSet::from([0, last]) {
             conn.execute(&format!("attach ':memory:' as s{shard}"), []).unwrap();
             conn.execute_batch(&SPOTS.create.replace("exists spots", &format!("exists s{shard}.spots"))).unwrap();
         }
         conn.execute("insert into s0.spots (release_id, message_id, kind, title, poster) values (?, 'a@spot.net', 'movie', 'A', 'p')", [a]).unwrap();
-        conn.execute("insert into s3.spots (release_id, message_id, kind, title, imdb_id) values (?, 'b@spot.net', 'series', 'B', 'tt1')", [b]).unwrap();
+        conn.execute(&format!("insert into s{last}.spots (release_id, message_id, kind, title, imdb_id) values (?, 'b@spot.net', 'series', 'B', 'tt1')"), [b]).unwrap();
         let found = spots_of_with(&conn, &[a, b, crate::store::global_id(2, 0)]).unwrap();
         assert_eq!(found.len(), 2);
         assert_eq!(found[&a].poster, "p");
@@ -781,9 +1042,92 @@ mod tests {
     }
 
     #[test]
+    fn removed_spots_are_not_fetched_tagged_or_shown_as_spots() {
+        let mut conn = main_db();
+        let day = 86_400;
+        let spots = vec![
+            ("mod@spot.net".to_string(), 1, Some("aaa".to_string())),
+            ("own@spot.net".to_string(), 2, Some("bbb".to_string())),
+            ("forged@spot.net".to_string(), 3, Some("ccc".to_string())),
+            ("kept@spot.net".to_string(), 4, Some("ddd".to_string())),
+        ];
+        note_read(&mut conn, "s", 4, &spots, 0).unwrap();
+        let d = |id: &str, spotter: &str, at: i64| Disposal { message_id: id.into(), spotter: spotter.into(), at };
+        let removals = [
+            d("mod@spot.net", "", 10),
+            d("own@spot.net", "bbb", 10),
+            // a spotter's own removal of someone else's spot holds for nothing
+            d("forged@spot.net", "bbb", 10),
+            // and its spotter removing it late holds only while it waits (no `created` yet)
+            d("late@spot.net", "eee", 10 * day),
+        ];
+        assert_eq!(note_disposals(&mut conn, &removals).unwrap(), 4);
+        assert_eq!(note_disposals(&mut conn, &removals).unwrap(), 0, "noted once");
+        assert_eq!(todo(&conn, 10).unwrap(), ["forged@spot.net", "kept@spot.net"]);
+        assert_eq!(waiting(&conn).unwrap(), 2);
+        // noted after its removal: still not fetched
+        note_read(&mut conn, "s", 5, &[("late@spot.net".to_string(), 5, Some("eee".to_string()))], 0).unwrap();
+        assert_eq!(todo(&conn, 10).unwrap(), ["forged@spot.net", "kept@spot.net"]);
+
+        // saved ones lose their tag, and their page says why
+        conn.execute("attach ':memory:' as s0", []).unwrap();
+        conn.execute_batch(&SPOTS.create.replace("exists spots", "exists s0.spots")).unwrap();
+        let ids: Vec<i64> = (1..=5).map(|n| crate::store::global_id(n, 0)).collect();
+        for (id, (spot, spotter, created)) in ids.iter().zip([
+            ("mod@spot.net", "aaa", 0),
+            ("own@spot.net", "bbb", 0),
+            ("forged@spot.net", "ccc", 0),
+            ("kept@spot.net", "ddd", 0),
+            ("late@spot.net", "eee", 1),
+        ]) {
+            conn.execute(
+                "insert into s0.spots (release_id, message_id, kind, title, spotter_id, created) values (?, ?, 'movie', 'T', ?, ?)",
+                params![id, spot, spotter, created],
+            )
+            .unwrap();
+        }
+        let tagged = spots_of_with(&conn, &ids).unwrap();
+        let mut left: Vec<&str> = tagged.values().map(|t| t.message_id.as_str()).collect();
+        left.sort();
+        assert_eq!(left, ["forged@spot.net", "kept@spot.net", "late@spot.net"], "removed past five days of the spot");
+        let removed = |n: usize| detail_of_with(&conn, ids[n]).unwrap().unwrap().removed;
+        assert_eq!(removed(0), Some(Removed { at: 10, by: RemovedBy::Moderator }));
+        assert_eq!(removed(1), Some(Removed { at: 10, by: RemovedBy::Spotter }));
+        assert_eq!(removed(2), None);
+        assert_eq!(removed(4), None);
+
+        // a blacklisted spotter: their saved spot loses its tag, and their waiting one isn't fetched
+        conn.execute("insert into spot_blacklist (spotter) values ('ddd')", []).unwrap();
+        assert_eq!(removed(3), Some(Removed { at: 0, by: RemovedBy::Blacklist }));
+        assert!(!spots_of_with(&conn, &ids).unwrap().contains_key(&ids[3]));
+        assert_eq!(todo(&conn, 10).unwrap(), ["forged@spot.net"]);
+        conn.execute("delete from spot_blacklist", []).unwrap();
+
+        // removals of nothing kept go after `KEEP_DAYS`; one of a saved spot or a spot still waiting stays
+        let saved = Settled { state: SAVED, release_id: Some(ids[0]), ..Default::default() };
+        settle(&conn, "mod@spot.net", Some(&saved), 0).unwrap();
+        let skipped = Settled { state: SKIPPED, ..Default::default() };
+        settle(&conn, "forged@spot.net", Some(&skipped), 0).unwrap();
+        // an old removal of a spot just noted (an overview read far back) stays while the spot waits
+        let now = KEEP_DAYS * day + 11;
+        note_disposals(&mut conn, &[d("fresh@spot.net", "", 5)]).unwrap();
+        note_read(&mut conn, "s", 6, &[("fresh@spot.net".to_string(), 6, None)], now).unwrap();
+        prune(&conn, now).unwrap();
+        let kept: Vec<String> = conn
+            .prepare("select message_id from spot_disposals order by message_id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap();
+        assert_eq!(kept, ["fresh@spot.net", "late@spot.net", "mod@spot.net"]);
+        assert!(todo(&conn, 10).unwrap().is_empty(), "{:?}", todo(&conn, 10));
+    }
+
+    #[test]
     fn a_frozen_release_with_the_title_counts_as_another_post() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("create table releases (id INTEGER PRIMARY KEY, name TEXT, group_name TEXT)").unwrap();
+        tagging_shard(&conn);
         conn.execute_batch(SPOTS.create).unwrap();
         let files = vec![("a.mkv".to_string(), vec!["a@x".to_string()])];
         assert_eq!(placement(&conn, "Title", "g", "k", &files).unwrap(), Placement::Free);
@@ -799,7 +1143,7 @@ mod tests {
     #[test]
     fn a_name_is_in_use_live_or_frozen() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("create table releases (id INTEGER PRIMARY KEY, name TEXT, group_name TEXT)").unwrap();
+        tagging_shard(&conn);
         conn.execute("insert into releases values (1, 'Live', 'g')", []).unwrap();
         assert!(name_in_use(&conn, "Live", "g").unwrap());
         assert!(!name_in_use(&conn, "Frozen", "g").unwrap());
@@ -812,14 +1156,14 @@ mod tests {
     }
     #[test]
     fn the_page_reads_the_spot_whole_or_from_its_columns() {
-        let conn = Connection::open_in_memory().unwrap();
-        let id = crate::store::global_id(4, 2);
-        conn.execute("attach ':memory:' as s2", []).unwrap();
-        conn.execute_batch(&SPOTS.create.replace("exists spots", "exists s2.spots")).unwrap();
+        let conn = main_db();
+        let id = crate::store::global_id(4, 0);
+        conn.execute("attach ':memory:' as s0", []).unwrap();
+        conn.execute_batch(&SPOTS.create.replace("exists spots", "exists s0.spots")).unwrap();
         assert_eq!(detail_of_with(&conn, id).unwrap(), None);
         // saved before the XML was kept: what the columns say
         conn.execute(
-            "insert into s2.spots (release_id, message_id, kind, title, poster, category, subcats, size, imdb_id, created)
+            "insert into s0.spots (release_id, message_id, kind, title, poster, category, subcats, size, imdb_id, created)
              values (?, 'm@spot.net', 'movie', 'Old', 'p', 0, 'a9|d5|z0|', 42, 'tt1234567', 100)",
             [id],
         )
@@ -847,9 +1191,11 @@ mod tests {
         assert!(set_xml(&shard, id, "m@spot.net", xml).unwrap());
         assert!(!set_xml(&shard, id, "m@spot.net", "").unwrap(), "only once");
         assert!(missing_xml(&shard, 10).unwrap().is_empty());
-        shard.execute("attach ':memory:' as s2", []).unwrap();
-        shard.execute_batch(&SPOTS.create.replace("exists spots", "exists s2.spots")).unwrap();
-        shard.execute("insert into s2.spots select * from main.spots", []).unwrap();
+        shard.execute("attach ':memory:' as s0", []).unwrap();
+        shard.execute_batch(&SPOTS.create.replace("exists spots", "exists s0.spots")).unwrap();
+        shard.execute("insert into s0.spots select * from main.spots", []).unwrap();
+        shard.execute_batch("create table meta (key TEXT PRIMARY KEY, value INTEGER)").unwrap();
+        create_main(&shard).unwrap();
         let d = detail_of_with(&shard, id).unwrap().unwrap();
         assert_eq!(d.xml, Xml::Kept);
         assert_eq!(d.imdb_id, None, "the XML has no IMDb link");
@@ -857,7 +1203,7 @@ mod tests {
         assert_eq!(d.spot.description, "Line one\npw: hunter2");
         assert_eq!(d.spot.newsreader, "SpotPost 2");
         // read again and gone: the columns, not tried again
-        shard.execute("update s2.spots set xml = ''", []).unwrap();
+        shard.execute("update s0.spots set xml = ''", []).unwrap();
         assert_eq!(detail_of_with(&shard, id).unwrap().unwrap().xml, Xml::Gone);
     }
 }

@@ -566,7 +566,8 @@ fn a_blocked_group_makes_no_request() {
     let mut h = fresh();
     let group = "alt.binaries.pictures.erotica.teen";
     let shard = store::shard_of(group);
-    let id = store::global_id(1, shard);
+    // a seq well past the ones the saves give out: with one shard, the stage's releases share this shard
+    let id = store::global_id(1_000_000, shard);
     let conn = db::open_shard(&store::shard_path(&h.main, shard)).unwrap();
     conn.execute(
         "insert into releases (id, name, group_name, poster, posted_date, size, complete, parts, is_obfuscated)
@@ -838,7 +839,8 @@ fn a_big_title_goes_in_chunks() {
     let _fan = fan_out(&media, &db);
     wait_for("both passes", || fan_done(&h));
     assert_eq!(count(&shards[0], "select count(*) from media_release where tvdb_id = 3001"), 2_500);
-    assert!(media.fanout_jobs.load(Ordering::Relaxed) >= 3 * 3 * 2);
+    // 3 chunks a shard, in each of the two passes
+    assert!(media.fanout_jobs.load(Ordering::Relaxed) >= 3 * shards.len() as u64 * 2);
 }
 
 #[test]
@@ -847,11 +849,11 @@ fn a_row_that_slips_past_pass_one_is_caught_by_pass_two() {
     let (media, db, shards) = owing(&h, 1);
     let _fan = fan_out(&media, &db);
     wait_for("pass one", || count(&shards[0], "select count(*) from media_release where tvdb_id = 3001") == 1);
-    shards[1]
-        .execute("insert into media_release (release_id, kind, title_key, quality) values (99, 1, 42, 0)", [])
-        .unwrap();
+    // another shard than the first when there is one
+    let late = &shards[1 % shards.len()];
+    late.execute("insert into media_release (release_id, kind, title_key, quality) values (99, 1, 42, 0)", []).unwrap();
     wait_for("pass two", || fan_done(&h));
-    assert_eq!(count(&shards[1], "select tvdb_id from media_release where release_id = 99"), 3001);
+    assert_eq!(count(late, "select tvdb_id from media_release where release_id = 99"), 3001);
 }
 
 #[test]

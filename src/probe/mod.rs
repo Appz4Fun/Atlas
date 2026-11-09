@@ -170,6 +170,15 @@ pub struct ProbeInfo {
     pub sfv: BTreeMap<String, u32>,
     /// the OpenSubtitles hash of the video, or of the one inside a stored RAR set
     pub moviehash: Option<String>,
+    /// the release whose probe had already read this same Matroska mux: `media` and `moviehash` are what it read,
+    /// soo the file's start and end weren't read a second time (`step::same_mux_media`)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_from: Option<i64>,
+    /// the probe's config stamp, when its reads of the media ran to their end: the whole header, the encoder's
+    /// settings and a bare Matroska file's end Tags. Only such a probe lends its media (`step::same_mux_media`), and
+    /// one that borrowed carries its lender's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_whole: Option<u64>,
 }
 
 /// The CRC32 a Highwinds-family server or Usenet.Farm stamps on an article it received: over the body as posted,

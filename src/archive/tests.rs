@@ -663,6 +663,56 @@ mod select_tests {
     }
 
     #[test]
+    fn an_xref_uploads_volumes_are_its_files_of_the_part_count_most_share() {
+        let f = [
+            file("u-00001", 1),
+            file("u-00003", 293),
+            file("u-00002", 293),
+            file("u-00004", 91),
+            file("u-00005", 469),
+            file("u-00006", 293),
+        ];
+        assert_eq!(
+            volumes(&f).iter().map(|f| f.filename.as_str()).collect::<Vec<_>>(),
+            ["u-00002", "u-00003", "u-00006"]
+        );
+        // no two alike: the largest
+        assert_eq!(volumes(&[file("a", 10), file("b", 30), file("c", 2)])[0].filename, "b");
+        assert!(volumes(&[file("a", 1), file("b", 2)]).is_empty());
+    }
+
+    #[test]
+    fn an_xref_uploads_guesses_go_volume_by_volume_round_by_round() {
+        let seg = |name: &str, part: i64| crate::store::SegmentRef {
+            message_id: format!("{name}-{part}"),
+            part: Some(part),
+            bytes: 1,
+        };
+        // volumes with different counts of leads: every lead is tried once, over the rounds
+        let many: Vec<FileInfo> = (0..20).map(|k| file(&format!("v{k:02}"), 293)).collect();
+        let vols: Vec<&FileInfo> = many.iter().collect();
+        let leads = |v: &FileInfo| {
+            let n = if v.filename.ends_with('3') { 12 } else { 6 };
+            Ok::<_, ()>((1..=n).map(|p| seg(&v.filename, p)).collect::<Vec<_>>())
+        };
+        let total = 18 * 6 + 2 * 12;
+        let mut tried = Vec::new();
+        let mut round = 0;
+        loop {
+            let (got, left) = super::super::steps::xref_order(&vols, round * crate::xref::HEAD_PROBES, leads).unwrap();
+            assert!(got.len() <= crate::xref::HEAD_PROBES);
+            tried.extend(got.into_iter().map(|(_, s)| s.message_id));
+            round += 1;
+            if !left {
+                break;
+            }
+        }
+        assert_eq!(tried.len(), total);
+        assert_eq!(tried.iter().collect::<std::collections::HashSet<_>>().len(), total, "none twice");
+        assert_eq!(tried[0], "v00-1");
+    }
+
+    #[test]
     fn select_plan_table() {
         let f = [file("x.part02.rar", 5), file("x.part01.rar", 5), file("x.part03.rar", 5)];
         let p = plan(&f, 2);
@@ -1138,6 +1188,35 @@ fn rar5_keeps_each_files_crc_time_and_host_and_its_owner() {
     assert_eq!(l.packer.as_deref(), Some("RAR5 · v0 · m0 · dict 512k · Unix · times unix-ns"));
     let owner = l.owner.expect("an owner");
     assert!(owner.0.contains("u=user:g=group:uid=1000:gid=100"));
+}
+
+#[test]
+fn a_split_files_whole_crc_comes_from_its_last_volume() {
+    // RAR4: the first volume's header says split after (0x02), the last's split before (0x01) with the file's CRC
+    let first = r4_block(0x74, 0x0002, &r4_fields_with(b"a.mkv", 2, 0x0bad_0bad, 0), Some(0));
+    let last = r4_block(0x74, 0x0001, &r4_fields_with(b"a.mkv", 2, 0x1122_3344, 0), Some(0));
+    let mut listing = rar::list(&rar4(&[r4_main(0x0001), first]));
+    assert_eq!(listing.files[0].crc32, None);
+    let closing = rar::list(&rar4(&[r4_main(0x0001), last]));
+    assert_eq!(closing.files[0].crc32, Some(0x1122_3344));
+    super::steps::close_split_files(&mut listing, &closing);
+    assert_eq!(listing.files[0].crc32, Some(0x1122_3344));
+    // another file of the same name and size in another set is no match: only `close_split_files`' caller pairs
+    // sets, and a different size never closes
+    let split = r4_block(0x74, 0x0002, &r4_fields_with(b"a.mkv", 2, 0, 0), Some(0));
+    let mut other = rar::list(&rar4(&[r4_main(0x0001), split]));
+    other.files[0].size = other.files[0].size.map(|s| s + 1);
+    super::steps::close_split_files(&mut other, &closing);
+    assert_eq!(other.files[0].crc32, None);
+    // RAR5: header flags 0x08 alone, the last part, keep the CRC; 0x10, a part with more after it, don't
+    let r5 = |flags: u64| {
+        let fields = r5_fields_with(b"a.mkv", 0xcafe_f00d, 0, 0);
+        let inner = [&vint(2)[..], &vint(flags | 2), &vint(1), &fields].concat();
+        let body = [vint(inner.len() as u64), inner].concat();
+        let block = [&crc32(&body).to_le_bytes()[..], &body, b"x"].concat();
+        rar::list(&rar5(&[r5_main(), block])).files[0].crc32
+    };
+    assert_eq!((r5(0x08), r5(0x18), r5(0x10)), (Some(0xcafe_f00d), None, None));
 }
 
 #[test]

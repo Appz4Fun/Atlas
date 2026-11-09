@@ -228,16 +228,40 @@ pub struct Unparsable {
     pub other: (u64, i64),
 }
 
+/// What the subject of an article no subject rule reads looks like (`Unparsable`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shape {
+    /// ngPost `-x`: the subject is the Message-ID's local part
+    IdSubject,
+    /// one random token of 16+ letters and digits, and nothing else
+    Token,
+    Other,
+}
+
+/// The shape of `article`'s subject, which `parse_subject` doesn't read.
+pub fn unparsable_shape(article: &Article) -> Shape {
+    shape_of(&article.subject, &article.message_id)
+}
+
+/// `unparsable_shape` of a subject and message-id as an article holds them.
+pub fn shape_of(subject: &str, message_id: &str) -> Shape {
+    let subject = subject.trim();
+    let local = message_id.trim_matches(|c| c == '<' || c == '>').split('@').next().unwrap_or("");
+    if !subject.is_empty() && subject == local {
+        Shape::IdSubject
+    } else if subject.len() >= 16 && subject.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        Shape::Token
+    } else {
+        Shape::Other
+    }
+}
+
 impl Unparsable {
     pub fn note(&mut self, article: &Article) {
-        let subject = article.subject.trim();
-        let local = article.message_id.trim_matches(|c| c == '<' || c == '>').split('@').next().unwrap_or("");
-        let slot = if !subject.is_empty() && subject == local {
-            &mut self.id_subject
-        } else if subject.len() >= 16 && subject.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
-            &mut self.token
-        } else {
-            &mut self.other
+        let slot = match unparsable_shape(article) {
+            Shape::IdSubject => &mut self.id_subject,
+            Shape::Token => &mut self.token,
+            Shape::Other => &mut self.other,
         };
         slot.0 += 1;
         slot.1 += article.bytes.max(0);

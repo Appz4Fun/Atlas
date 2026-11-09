@@ -6,7 +6,7 @@ use indexmap::IndexMap;
 
 use crate::atomic::write_atomic;
 use crate::dates::article_timestamp;
-use crate::search::{ArticleRow, ReleaseRow, get_articles, get_release};
+use crate::search::{ArticleRow, ReleaseRow, get_release};
 use crate::ui;
 
 pub fn nzb_filename(name: &str, release_id: Option<i64>) -> String {
@@ -195,6 +195,119 @@ fn describe(g: &FileGap) -> String {
     )
 }
 
+/// The segments one file lacks, named by its own message-ids: a poster (PowerPost and its kin) that ids every part
+/// `part{N}of{T}.{rest}` gives each missing part's id outright. A server that never showed us an article may still
+/// have it, and another provider of a downloader's may too, soo the NZB lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InferredFile {
+    /// which file of `files(articles)` it is, from 0
+    pub file: usize,
+    pub filename: String,
+    pub total: i64,
+    /// the parts added, each a whole row copied from the file's own with its number, id and size put in
+    pub rows: Vec<ArticleRow>,
+}
+
+impl InferredFile {
+    fn describe(&self) -> String {
+        let parts: Vec<String> =
+            self.rows.iter().take(GAP_LIST).filter_map(|r| r.part).map(|p| p.to_string()).collect();
+        let more = if self.rows.len() > GAP_LIST { ",..." } else { "" };
+        format!(
+            "{}: {} of {} parts listed by the partNofT pattern of its ids, not seen on our servers: {}{more}",
+            self.filename,
+            self.rows.len(),
+            self.total,
+            parts.join(",")
+        )
+    }
+}
+
+/// `id` (with or without its `<>`) split as `part{p}of{total}.{rest}`, written just soo (no leading zeros):
+/// the rest, or None.
+fn pattern_rest(id: &str, p: i64, total: i64) -> Option<&str> {
+    // a number exactly as `{n}` writes it
+    fn number(s: &str, n: i64) -> Option<&str> {
+        let digits = s.bytes().take_while(u8::is_ascii_digit).count();
+        let (head, tail) = s.split_at(digits);
+        (digits > 0 && !(digits > 1 && head.starts_with('0')) && head.parse() == Ok(n)).then_some(tail)
+    }
+    let id = id.trim_matches(['<', '>']);
+    let rest = number(id.strip_prefix("part")?, p)?;
+    let rest = number(rest.strip_prefix("of")?, total)?.strip_prefix('.')?;
+    // the rest has to be an id's own tail: something@domain, nothing that could be another counter
+    let (left, domain) = rest.split_once('@')?;
+    (!left.is_empty() && !domain.is_empty() && !rest.contains(['<', '>', ' '])).then_some(rest)
+}
+
+/// The most common of `sizes`, the larger on a tie. None: no sizes.
+fn common_size(sizes: impl Iterator<Item = i64>) -> Option<i64> {
+    let mut counts: std::collections::BTreeMap<i64, usize> = std::collections::BTreeMap::new();
+    for s in sizes {
+        *counts.entry(s).or_default() += 1;
+    }
+    counts.into_iter().max_by_key(|&(size, n)| (n, size)).map(|(size, _)| size)
+}
+
+/// For each file of `articles` whose ids prove the `part{N}of{T}.{rest}` pattern, the parts it lacks. Proven means:
+/// a file name; one part count T (2..=MAX_PARTS) on every article; every article numbered 1..=T and its id exactly
+/// `part{its number}of{T}.{rest}`, one rest throughout; at least two parts known, and at least half of T, soo a
+/// couple of articles can't call up a hundred thousand segments. Any file short of that gets nothing: an id is
+/// never guessed past what the file's own ids say.
+pub fn inferred_segments(articles: &[ArticleRow]) -> Vec<InferredFile> {
+    let mut out = Vec::new();
+    for (index, file) in files(articles).into_iter().enumerate() {
+        let Some(filename) = file[0].filename.clone() else { continue };
+        let Some(total) = file[0].total_parts else { continue };
+        if !(2..=crate::parser::MAX_PARTS).contains(&total) || file.iter().any(|a| a.total_parts != Some(total)) {
+            continue;
+        }
+        let mut rest: Option<&str> = None;
+        let mut known = std::collections::BTreeSet::new();
+        let proven = file.iter().all(|a| {
+            let Some(p) = a.part.filter(|p| (1..=total).contains(p)) else { return false };
+            let Some(r) = pattern_rest(&a.message_id, p, total) else { return false };
+            known.insert(p);
+            *rest.get_or_insert(r) == r
+        });
+        let Some(rest) = rest.filter(|_| proven && known.len() >= 2 && known.len() as i64 * 2 >= total) else {
+            continue;
+        };
+        if known.len() as i64 == total {
+            continue;
+        }
+        // a missing part is as big as the file's parts mostly are; the last is never seen when it's the one missing
+        let size = common_size(file.iter().filter(|a| a.part != Some(total)).filter_map(|a| a.bytes))
+            .or_else(|| common_size(file.iter().filter_map(|a| a.bytes)));
+        let rows = (1..=total)
+            .filter(|p| !known.contains(p))
+            .map(|p| ArticleRow {
+                message_id: format!("<part{p}of{total}.{rest}>"),
+                part: Some(p),
+                bytes: size,
+                ..file[0].clone()
+            })
+            .collect();
+        out.push(InferredFile { file: index, filename, total, rows });
+    }
+    out
+}
+
+/// `articles` with the `inferred` rows put in among their files' own, each such file in part order; every other file
+/// keeps its order, soo the NZB lists the same files in the same order.
+fn with_inferred(articles: &[ArticleRow], inferred: &[InferredFile]) -> Vec<ArticleRow> {
+    let mut out = Vec::with_capacity(articles.len() + inferred.iter().map(|f| f.rows.len()).sum::<usize>());
+    for (index, file) in files(articles).into_iter().enumerate() {
+        let mut rows: Vec<ArticleRow> = file.into_iter().cloned().collect();
+        if let Some(f) = inferred.iter().find(|f| f.file == index) {
+            rows.extend(f.rows.iter().cloned());
+            rows.sort_by_key(|a| a.part);
+        }
+        out.extend(rows);
+    }
+    out
+}
+
 /// An NZB and what it lacks: `gaps` is empty for a whole release.
 #[derive(Clone, Debug)]
 pub struct NzbBuild {
@@ -223,11 +336,20 @@ pub(crate) fn render_checked(
     if whole && !release.complete {
         gaps.extend(missing_files(articles));
     }
-    let mut xml = render_nzb_in(release, articles, groups);
-    if !gaps.is_empty() {
+    // the gaps are what the store holds; the segments a file's own ids name past that go in the NZB, said so
+    let inferred = inferred_segments(articles);
+    let mut xml = if inferred.is_empty() {
+        render_nzb_in(release, articles, groups)
+    } else {
+        render_nzb_in(release, &with_inferred(articles, &inferred), groups)
+    };
+    if !gaps.is_empty() || !inferred.is_empty() {
         let mut meta = String::new();
         for g in &gaps {
             let _ = writeln!(meta, "    <meta type=\"x-atlas-incomplete\">{}</meta>", escape_text(&describe(g)));
+        }
+        for f in &inferred {
+            let _ = writeln!(meta, "    <meta type=\"x-atlas-inferred\">{}</meta>", escape_text(&f.describe()));
         }
         xml = xml.replacen("  </head>", &format!("{meta}  </head>"), 1);
     }
@@ -315,11 +437,18 @@ pub fn build_nzb_checked(release_id: i64) -> Result<Option<NzbBuild>> {
 /// all of them: it only makes its files with all of them.
 /// Also returns the rows the articles came from: the release's own, or every row of its post.
 pub(crate) fn inventory(release: &ReleaseRow) -> crate::db::Result<(Vec<ArticleRow>, Vec<String>, Vec<i64>)> {
-    let conn = crate::db::open()?;
-    if let Some(post) = crate::release_info::whole_post_with(&conn, release)? {
+    inventory_with(&crate::db::open()?, release)
+}
+
+/// `inventory` on `conn`, which has the shards attached.
+pub(crate) fn inventory_with(
+    conn: &rusqlite::Connection,
+    release: &ReleaseRow,
+) -> crate::db::Result<(Vec<ArticleRow>, Vec<String>, Vec<i64>)> {
+    if let Some(post) = crate::release_info::whole_post_with(conn, release)? {
         let mut rows = Vec::new();
         for id in &post.ids {
-            rows.push((*id, crate::store::articles(&conn, *id)?));
+            rows.push((*id, crate::store::articles(conn, *id)?));
         }
         // the rows of a linked upload are separate files, where a post cut across groups is one file under one name
         if post.lead.is_some() {
@@ -329,7 +458,7 @@ pub(crate) fn inventory(release: &ReleaseRow) -> crate::db::Result<(Vec<ArticleR
         all.sort_by(|a, b| (&a.filename, a.part, &a.message_id).cmp(&(&b.filename, b.part, &b.message_id)));
         return Ok((all, post.groups, post.ids));
     }
-    Ok((get_articles(release.id)?, vec![release.group_name.clone()], vec![release.id]))
+    Ok((crate::store::articles(conn, release.id)?, vec![release.group_name.clone()], vec![release.id]))
 }
 
 /// A file whose name another row already has keeps its own <file>: the name the NZB groups it by gets its row's id.
@@ -381,6 +510,73 @@ pub fn build_nzb_file_checked(release_id: i64, file: usize) -> Result<Option<Nzb
     crate::metrics::timed("nzb.build_file", || one_file_nzb(release_id, file))
 }
 
+/// One file of a release, as its listing and `t=files` show it: where the whole NZB puts it, from 1.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListedFile {
+    pub n: usize,
+    /// None: its articles had no file name, soo only `n` picks it
+    pub name: Option<String>,
+    /// as posted: the articles' bytes, yEnc and all
+    pub bytes: i64,
+    pub articles: usize,
+}
+
+/// The files of `articles` in the order the whole NZB lists them.
+fn listed(articles: &[ArticleRow]) -> Vec<ListedFile> {
+    files(articles)
+        .into_iter()
+        .enumerate()
+        .map(|(at, file)| ListedFile {
+            n: at + 1,
+            name: file.first().and_then(|a| a.filename.clone()),
+            bytes: file.iter().filter_map(|a| a.bytes).sum(),
+            articles: file.len(),
+        })
+        .collect()
+}
+
+/// The files a release's whole NZB lists, gaps filled from its copies as `t=get` fills them. None: no such release.
+pub fn file_list(release_id: i64) -> Result<Option<Vec<ListedFile>>> {
+    crate::metrics::timed("nzb.file_list", || {
+        let Some(release) = get_release(release_id)? else { return Ok(None) };
+        let (articles, _) = filled_inventory(&release)?;
+        Ok(Some(listed(&articles)))
+    })
+}
+
+/// The articles of every file named `name` in the whole NZB of `articles`: the one file, or, in an upload linked by
+/// its PAR2 set, each row's file of that name, which the NZB keeps apart as `name #id` and a release page lists as one.
+fn files_named(articles: &[ArticleRow], name: &str) -> Vec<ArticleRow> {
+    let apart = format!("{name} #");
+    files(articles)
+        .into_iter()
+        .filter(|file| {
+            file.first().and_then(|a| a.filename.as_deref()).is_some_and(|f| {
+                f == name
+                    || f.strip_prefix(&apart).is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+            })
+        })
+        .flatten()
+        .cloned()
+        .collect()
+}
+
+/// One file of a release as its own NZB, picked by its name: a release page links each file this way, since its
+/// list is sorted by name and not in the NZB's order.
+pub fn build_nzb_named_checked(release_id: i64, name: &str) -> Result<Option<NzbBuild>> {
+    crate::metrics::timed("nzb.build_file", || {
+        let Some(release) = get_release(release_id)? else { return Ok(None) };
+        let (articles, groups) = filled_inventory(&release)?;
+        let one = files_named(&articles, name);
+        if name.is_empty() || one.is_empty() {
+            return Ok(None);
+        }
+        let built = render_checked(&release, &one, &groups, false);
+        note_gaps(&release, &built);
+        Ok(Some(built))
+    })
+}
+
 fn one_file_nzb(release_id: i64, file: usize) -> Result<Option<NzbBuild>> {
     let Some(release) = get_release(release_id)? else { return Ok(None) };
     let (articles, groups) = filled_inventory(&release)?;
@@ -425,6 +621,42 @@ pub fn generate_nzb(release_id: i64, output_dir: Option<&Path>) -> Result<PathBu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn files_are_listed_and_picked_in_the_nzbs_order() {
+        let art = |file: Option<&str>, part: i64, bytes: i64| ArticleRow {
+            message_id: format!("<{file:?}{part}@x>"),
+            filename: file.map(String::from),
+            part: Some(part),
+            total_parts: Some(2),
+            bytes: Some(bytes),
+            subject: None,
+            poster: None,
+            posted_date: None,
+        };
+        let articles =
+            [art(Some("b.mkv"), 1, 10), art(Some("a.par2"), 1, 3), art(Some("b.mkv"), 2, 5), art(None, 1, 7)];
+        let list = listed(&articles);
+        assert_eq!(
+            list,
+            vec![
+                ListedFile { n: 1, name: Some("b.mkv".into()), bytes: 15, articles: 2 },
+                ListedFile { n: 2, name: Some("a.par2".into()), bytes: 3, articles: 1 },
+                ListedFile { n: 3, name: None, bytes: 7, articles: 1 },
+            ]
+        );
+        assert_eq!(files_named(&articles, "a.par2").len(), 1);
+        assert!(files_named(&articles, "c.nfo").is_empty());
+        assert_eq!(files_named(&articles, "b.mkv").len(), 2);
+        // a linked upload's second row of the same name, kept apart in the NZB, comes along
+        let linked = [
+            art(Some("v.par2"), 1, 1),
+            art(Some("v.par2 #42"), 1, 1),
+            art(Some("v.par2 #x"), 1, 1),
+            art(Some("v.par2 #"), 1, 1),
+        ];
+        assert_eq!(files_named(&linked, "v.par2").len(), 2);
+    }
 
     #[test]
     fn filenames_are_safe() {
@@ -681,5 +913,99 @@ mod tests {
         assert_eq!(ids(3), vec![articles[2].message_id.clone()]);
         assert!(nth_file(&articles, 4).is_none());
         assert!(nth_file(&articles, 0).is_none());
+    }
+
+    fn powerpost(file: &str, part: i64, total: i64, token: &str, bytes: i64) -> ArticleRow {
+        ArticleRow {
+            message_id: format!("<part{part}of{total}.{token}@bzh29>"),
+            bytes: Some(bytes),
+            ..counted(file, 1, 1, part, total)
+        }
+    }
+
+    fn post(file: &str, total: i64, have: &[i64], token: &str) -> Vec<ArticleRow> {
+        have.iter().map(|&p| powerpost(file, p, total, token, if p == total { 300 } else { 640 })).collect()
+    }
+
+    #[test]
+    fn a_proven_pattern_lists_the_missing_parts() {
+        let articles = post("a.rar", 6, &[1, 2, 4, 6], "tok$A");
+        let inferred = inferred_segments(&articles);
+        assert_eq!(inferred.len(), 1);
+        let ids: Vec<&str> = inferred[0].rows.iter().map(|r| r.message_id.as_str()).collect();
+        assert_eq!(ids, ["<part3of6.tok$A@bzh29>", "<part5of6.tok$A@bzh29>"]);
+        assert!(inferred[0].rows.iter().all(|r| r.bytes == Some(640) && r.filename.as_deref() == Some("a.rar")));
+
+        let built = render_checked(&release(), &articles, &["alt.binaries.test".into()], true);
+        // the store still lacks them: the gap stays, and the NZB says which parts it filled in
+        assert!(!built.complete());
+        assert!(built.xml.contains("<meta type=\"x-atlas-incomplete\">a.rar: 4 of 6 parts, missing 3,5</meta>"));
+        assert!(built.xml.contains("<meta type=\"x-atlas-inferred\">a.rar: 2 of 6 parts"));
+        assert!(built.xml.contains("not seen on our servers: 3,5</meta>"));
+        let numbers: Vec<&str> = built.xml.match_indices("number=\"").map(|(i, _)| &built.xml[i + 8..i + 9]).collect();
+        assert_eq!(numbers, ["1", "2", "3", "4", "5", "6"]);
+        assert!(built.xml.contains("<segment bytes=\"640\" number=\"3\">part3of6.tok$A@bzh29</segment>"));
+        assert!(built.xml.contains("<segment bytes=\"300\" number=\"6\">part6of6.tok$A@bzh29</segment>"));
+    }
+
+    #[test]
+    fn a_missing_last_part_takes_the_common_size() {
+        let inferred = inferred_segments(&post("a.rar", 4, &[1, 2], "t"));
+        let sizes: Vec<(Option<i64>, Option<i64>)> = inferred[0].rows.iter().map(|r| (r.part, r.bytes)).collect();
+        assert_eq!(sizes, [(Some(3), Some(640)), (Some(4), Some(640))]);
+    }
+
+    #[test]
+    fn only_a_proven_pattern_is_filled_in() {
+        let none = |articles: Vec<ArticleRow>| assert!(inferred_segments(&articles).is_empty(), "{articles:?}");
+        // two tokens in one file
+        let mut mixed = post("a.rar", 6, &[1, 2], "one");
+        mixed.extend(post("a.rar", 6, &[4], "two"));
+        none(mixed);
+        // an id whose number isn't the segment's
+        let mut off = post("a.rar", 6, &[1, 2], "t");
+        off[1].part = Some(3);
+        none(off);
+        // an id whose total isn't the file's
+        let mut total = post("a.rar", 6, &[1, 2], "t");
+        total[0].message_id = "<part1of7.t@bzh29>".into();
+        none(total);
+        // leading zeros aren't the pattern
+        let mut zeros = post("a.rar", 6, &[1, 2], "t");
+        zeros[0].message_id = "<part01of6.t@bzh29>".into();
+        none(zeros);
+        // one known part proves nothing
+        none(post("a.rar", 6, &[2], "t"));
+        // nor do two of a hundred thousand
+        none(post("a.rar", 100_000, &[1, 2], "t"));
+        none(post("a.rar", 7, &[1, 2, 3], "t"));
+        // ids of another shape
+        none(vec![part("a.rar", 1, 3), part("a.rar", 3, 3)]);
+        // no file name
+        let mut unnamed = post("a.rar", 6, &[1, 2], "t");
+        unnamed.iter_mut().for_each(|a| a.filename = None);
+        none(unnamed);
+        // a whole file needs nothing
+        none(post("a.rar", 3, &[1, 2, 3], "t"));
+        // no domain
+        let mut bare = post("a.rar", 6, &[1, 2], "t");
+        bare.iter_mut().for_each(|a| a.message_id = a.message_id.replace("@bzh29", ""));
+        none(bare);
+    }
+
+    #[test]
+    fn other_files_and_known_segments_are_left_as_they_are() {
+        let mut articles = vec![part("z.nfo", 1, 2)];
+        articles.extend(post("a.rar", 4, &[1, 3, 4], "t"));
+        let plain = render_nzb(&release(), &articles);
+        let built = render_checked(&release(), &articles, &["alt.binaries.test".into()], false);
+        assert!(built.xml.find("z.nfo").unwrap() < built.xml.find("a.rar").unwrap());
+        for line in plain.lines().filter(|l| l.contains("<segment")) {
+            assert!(built.xml.contains(line), "{line}");
+        }
+        assert_eq!(built.xml.matches("<segment").count(), plain.matches("<segment").count() + 1);
+        assert!(built.xml.contains("part2of4.t@bzh29"));
+        // the listing still counts what the store holds
+        assert_eq!(listed(&articles).iter().map(|f| f.articles).sum::<usize>(), 4);
     }
 }

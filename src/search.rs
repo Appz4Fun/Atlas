@@ -629,11 +629,12 @@ mod tests {
 
     /// groups in different shards
     fn groups_in_shards(n: usize) -> Vec<String> {
+        // as many shards as there are, then groups that share them
         let mut found: Vec<String> = Vec::new();
         let mut shards = std::collections::HashSet::new();
-        for i in 0.. {
+        for i in 0..100_000 {
             let group = format!("alt.binaries.t{i}");
-            if shards.insert(store::shard_of(&group)) {
+            if shards.insert(store::shard_of(&group)) || shards.len() == store::SHARDS {
                 found.push(group);
                 if found.len() == n {
                     break;

@@ -54,7 +54,12 @@ The Rust version replaces the original Python version. It keeps the same menus, 
 | Web UI & Newznab API | [`tiny_http`](https://github.com/tiny-http/tiny-http) + embedded [`htmx`](https://htmx.org) and Oxide CSS |
 | Compression & archives | [`zstd`](https://github.com/gyscos/zstd-rs), [`flate2`](https://github.com/rust-lang/flate2-rs), [`lzma-rs`](https://github.com/gendx/lzma-rs), and native RAR/7z/ZIP/PPMd/bzip2/lz4 decoders |
 | yEnc decoding | [`nntmux-yenc`](https://github.com/xbmc4lyfe/newznab-tmux) shared with `newznab-tmux` |
+| Audio fingerprints | [`rusty-chromaprint`](https://github.com/darksv/rusty-chromaprint) and [`symphonia`](https://github.com/pdeljanov/Symphonia), plus the external [`filmcraft-ac3`](https://crates.io/crates/filmcraft-ac3) for AC-3 and E-AC-3 (optional, see below) |
 | System stats | [`sysinfo`](https://github.com/GuillaumeGomez/sysinfo) |
+
+### External dependency: `filmcraft-ac3`
+
+AC-3 and E-AC-3 audio prints use [`filmcraft-ac3`](https://crates.io/crates/filmcraft-ac3), a pure-Rust decoder (MIT or Apache-2.0) from outside the project. It is on by default through the `ac3` Cargo feature. To build without it, run `just build-no-ac3` or `cargo build --release --no-default-features`; AC-3 and E-AC-3 tracks then get no audio print.
 
 rustup installs the pinned toolchain the first time you build, and the `just` recipes always use it, even when another Rust installation, such as Homebrew's, comes first on your `PATH`.
 
@@ -69,7 +74,7 @@ rustup installs the pinned toolchain the first time you build, and the `just` re
 - **TV and movie IDs.** Atlas stores each release's title, season, and episode, and answers searches by TVDB, IMDb, TMDB, TVMaze, and Trakt ID once you turn on a provider. Fetches posters, backdrops, cast, runtimes, and IMDb/Rotten Tomatoes/Metacritic/TMDB/Trakt scores.
 - **Group posts into releases.** Atlas parses subjects into releases, merges cross-group posts and PAR2-linked obfuscated multi-file uploads, marks incomplete sets, and recovers the real names of obfuscated posts from their PAR2, archive, or NFO files and 30+ PreDB feeds.
 - **Deep article & container probes.** Without downloading the release, Atlas inspects yEnc headers, RAR4/RAR5/7z/ZIP archives (up to 10 nested compressed layers), MKV/MP4 video/audio/subtitle streams, HDR10/HLG/Dolby Vision profiles, x264/x265 encoder settings, chapters, cover art, H.264/HEVC video stills, and OpenSubtitles hashes.
-- **Serve a Newznab API** for Prowlarr, NZBHydra2, Sonarr, and Radarr: `search`, `tvsearch`, `movie`, `music`, `book`, `caps`, and `get`, which downloads an NZB (or a single file with `file=N`), its gaps filled from any twin of the same bytes.
+- **Serve a Newznab API** for Prowlarr, NZBHydra2, Sonarr, and Radarr: `search`, `tvsearch`, `movie`, `music`, `book`, `caps`, and `get`, which downloads an NZB (or a single file with `file=N`, listed by `t=files`), its gaps filled from any twin of the same bytes.
 - **Search from the terminal** in one group or all groups, or use **AI search**, which turns a request like `find me 4k hdr movies` into groups and keywords with a local [Ollama](https://ollama.com) model.
 - **Watch progress** on the live dashboard, dig into CPU, memory, backfill, content, post-processing, and per-server numbers on the 6-page terminal stats dashboard, or scrape Prometheus metrics with the 7 included Grafana dashboards.
 - **Keep everything local** in an 8-shard SQLite database with zstd-sealed article blobs and an FTS5 full-text index.
@@ -315,7 +320,7 @@ The background indexer reads `config.toml` again every 5 seconds:
 
 - New groups, `index_mode`, `batch_size`, `request_size`, and `auto_run_compact` apply immediately.
 - Changes to servers, logins, `connections`, `parallel_groups`, or `max_unsaved_headers` rebuild the connection pool. A login you fix in the file, or in **Settings > Usenet servers**, takes effect within a few seconds.
-- `api_host` and `api_port` apply when the API restarts. Restart Atlas, or use **Settings > Change API port**.
+- `api_host` and `api_port` apply when the API restarts. Restart Atlas, use **Settings > Change API port**, or save a new address on the Web UI's Settings page, which moves the API there within a second.
 - `metrics` applies when Atlas restarts.
 
 ### Measure connection limits
@@ -401,6 +406,14 @@ Atlas seals each file that is complete, or untouched for three days, into one zs
 A release ID tells Atlas which file holds the release, and IDs keep counting up across all 8 files in the order releases are added, so the newest releases still come first.
 
 Sealed articles can live on another machine, on a big disk. Run the service in `sealed-log/` with `docker compose up -d --build` there, and set `sealed_log.addr` and `sealed_log.offload = true` in `config.toml`. The indexer then moves blobs of 1 KB or more from files untouched for a day: it appends them, reads each back and compares, and only then swaps the blob in `files.blob` for its place in the log. With the indexer stopped, `atlas --sealed-log-move` does the same at full speed. An NZB needs the service up to read those articles, and indexing goes on without it. A shard with articles there can't be compacted, because that would pull them all back, so turn `auto_run_compact` off and reclaim the freed pages with `VACUUM` while the indexer is stopped.
+
+### The overview archive
+
+With `overview_archive.enabled = true`, every XOVER (and XZVER) listing the indexer fetches is also kept exactly as the server sent it, outside SQLite, in `overview/<server>/<group>/` next to the databases. A shard reset or a new parser can then read a group's headers back from disk instead of asking the provider again. The rows are stored by `nntp-xover-engine` (its README has the format and the measurements): columnar blocks of up to 65,536 rows that a reader maps and uses in place, each with a message-id filter and index, so `atlas --overview SERVER GROUP START-END` answers a range and `atlas --overview SERVER GROUP '<message-id>'` finds one article without the provider; `atlas --overview SERVER GROUP stats` prints the sizes and `atlas --overview SERVER GROUP verify` reads every row back, checking each block against its hash. SERVER is the server's key as the indexer names it in its metrics: its host, or `host:port`, plus `#key` for a second account. The writer gathers a group's rows for up to 30 seconds or 4,096 rows and appends them to the group's `tail.nxv` as one block; once that holds 65,536 rows they are sorted into a segment file, and all but the newest `keep_hot` segments are zstd compressed with their routing data left readable. On real alt.binaries listings the cold segments take from about a third to an eighth of the raw size, depending on how obfuscated the group is. Writing happens on its own thread and never holds up a fetch: if it falls behind, batches are dropped and counted rather than waited for.
+
+### The header store
+
+With `header_store.enabled = true`, every listing the indexer fetches is also kept, for as long as linking needs it, in `header-store/<group>/<day>.nxv` next to the databases: `.nxv` blocks of one server, one group and one UTC day, appended to a day file by one writer, with a 64-byte entry per block in `<day>.nxvi`. Rows wait in per-slab logs, made durable every 100 ms, before a slice counts as read; a slab is sealed into a block once full or idle. A day file goes once nothing keeps it: the live window, the days around a backfill day being read, and days with hours not linked yet. The store's linker reads those blocks a day at a time and ties uploads whose every article has a random subject (and a random poster per file) back together across groups, by poster, posting time and groups, saving each as one release. `atlas --header-store link-day --store DIR --day YYYY-MM-DD` runs that linker over a copy of the store without saving anything. Without the store such articles are counted as unparsable and dropped.
 
 ### Measuring the sealed log
 
@@ -562,13 +575,14 @@ When you turn it on, Atlas contacts the third parties you list, and walks your e
 | `xrel` | `api.xrel.to` | Scene titles | The same, and never over 900 requests an hour |
 | `xrel_p2p` | `api.xrel.to` | P2P titles | The same |
 | `predb_org` | `predb.org` | History, through `history_pages` | The same |
-| `predb_ovh` | `predb.ovh` | Scene titles | The same |
 | `srrdb` | `api.srrdb.com` | Scene titles, with no pre time | The same |
 | `predatabase` | `predataba.se` | The newest ten titles | One request a poll |
 | `predb_me`, `scnsrc_me`, `eztv`, `nfodb`, `one_techno`, `one_gabba`, `ddlvalley`, `hdencode`, `hdencode_tv`, `mp3scene`, `gload`, `hdworld`, `movieblog`, `scnlog` | Each one's RSS feed | Recent titles | One request a poll |
 | `apibay`, `knaben` | `apibay.org`, `api.knaben.org` | Recent movie and TV names | One request a poll |
 | `crowdnfo`, `nima4k`, `g4u`, `gabber`, `seriousaboutsound` | Each site's listing page | Recent titles | One request a poll. A site that changes its page reads as no rows, and backs off |
 | `nswdb`, `3dsdb`, `dats_pciso_1998`, `nzedb_archive` | Each one's whole catalogue | Older titles | One request a week |
+
+`predb_ovh` is retired: its domain stopped resolving. A config that still lists it logs that once and skips it. When a history page past the first answers HTTP 400 or 404, the source has run out of pages: history ends there, the log says at which page, and the poll still counts as a success. On newer pages it is still a failure.
 
 All of these go in the `predb` object:
 
@@ -758,6 +772,12 @@ The search box's More fields searches on Usenet group, poster, email, size (`123
 
 With a Google Gemini API key configured in **Settings** (or via `GEMINI_API_KEY`), the **Ask AI** search bar translates natural-language queries (for example, `4K Dolby Vision remuxes of Dune, biggest first`) into search terms, categories, quality filters, and sort order. Nothing from your index is sent to Google—only your question and the list of available categories and filter names. If the configured Gemini model is busy (`503`/`429`), Atlas retries and automatically falls back across Gemini Flash models.
 
+### Settings in the browser
+
+**Settings**, in the masthead, edits what the terminal's Settings menu edits, behind the same sign in: the Usenet servers (add, change, remove; host, login, port, SSL, connections, priority, and whether a server indexes or only serves downloads), the indexer mode, groups indexed at once and the header cap, the groups to index (including provider search and add/remove), the API address, and the metadata provider keys. It writes `config.toml` the way the terminal does (the file is replaced whole, never half written) and the indexer picks the change up within a few seconds, as above. A password or key is write-only: the page says whether one is saved, never what it is, and an empty field keeps it. Every form carries a token tied to your sign in, so a page on another site can't change your settings with your browser's cookie; a form kept open across a restart of Atlas says so and has to be sent again.
+
+Where something outside Atlas owns a setting, the page shows it read-only instead of taking a change the next start would undo: the servers and the API address when `ATLAS_NNTP_*` is set, the mode when `ATLAS_INDEX_MODE` is, and any `config.toml` key named in `ATLAS_MANAGED_KEYS` (for example `ATLAS_MANAGED_KEYS=api_key,groups,parallel_groups` for a container whose start script writes those).
+
 Every page in the Web UI includes a persistent footer displaying the compile-time build metadata (`Atlas - Rust Edition`, authors, latest tag/version, git commit link, copyright year, GPL v3.0 license link, compiled Rust version, UTC compilation timestamp, and Patreon support link).
 
 [htmx](https://htmx.org) (0BSD) is built into the binary from `assets/`, so the page needs no internet access. The look is [Oxide](https://appz4fun.github.io/RustyGet/design-system.html), the design system of RustyGet, in light and dark.
@@ -780,7 +800,8 @@ Atlas provides a Newznab-compatible API, the protocol that Prowlarr, NZBHydra2, 
 | `movie` | Movie search by `q`. It takes IDs when a provider is on. | Yes |
 | `music`, `audio` | Music search by `q`. | Yes |
 | `book` | Book search by `q`. | Yes |
-| `get` | The NZB for a release, by `id`. Add `file=N` for one of its files alone, counting from 1 in the order the whole NZB lists them. | Yes |
+| `get` | The NZB for a release, by `id`. Add `file=N` for one of its files alone, counting from 1 in the order the whole NZB lists them. Or `name=` with a file's name, as the release page links each file. | Yes |
+| `files` | Not in the Newznab spec. The files a release's NZB lists, by `id`: `<file n="N" name="..." size="..." articles="..."/>` each, where `n` is the `file=N` that `get` takes. A file whose articles carry no name has no `name`. Frozen releases have no list. | Yes |
 
 A search by an ID that's on (see [TV and movie IDs](#tv-and-movie-ids)) returns the releases with that ID, and when it finds nothing a `q` next to it searches by name. An ID that's off counts as not given: alone it returns an empty result rather than an error, and next to `q` it searches by `q`.
 
@@ -868,7 +889,7 @@ Turn a provider on to fill in IDs, with no restart. Each title is asked once, ho
 
 Search results in the [web UI](#web-ui) have quick filters for resolution, HDR and source, and tags for copies and any score already fetched. In the API, each item also carries `poster`, `group`, `resolution`, `video`, `audio`, `hdr`, `source`, `language` and `team` attributes read from its name, and `twins` and `alts` when it has copies.
 
-Opening a release in the [web UI](#web-ui) also shows its overview, cast, dates and poster from TMDB, its ratings from OMDb when `media.omdb.api_key` is set (a free key from omdbapi.com), and its Trakt rating when Trakt is on. These are fetched when the page opens, and the indexer also fetches them in the background for every title with an id, at `media.details_per_minute` titles a minute (120 by default, 0 turns it off). So results show thumbnails and scores without anyone opening a release. They're kept for 30 days in `atlas.details.db`, with posters in `posters/`, at most 4 GB. A show TMDB has no record of comes from TheTVDB when `media.tvdb.api_key` is set, and the page has a backdrop where TMDB has one. With neither key, the page leaves all this out. In results, Best rated sorts by the scores already kept, with the rest last. Any provider's `requests_per_minute` can be `-1` for no limit, for a plan that has none.
+Opening a release in the [web UI](#web-ui) also shows its overview, cast, dates and poster from TMDB, its ratings from OMDb when `media.omdb.api_key` is set (a free key from omdbapi.com), and its Trakt rating when Trakt is on. These are fetched when the page opens, and the indexer also fetches them in the background for every title with an id, at `media.details_per_minute` titles a minute (120 by default, 0 turns it off). So results show thumbnails and scores without anyone opening a release. They're kept for 30 days in `atlas.details.db`, with posters in `posters/`, at most 4 GB. A show TMDB has no record of comes from TheTVDB when `media.tvdb.api_key` is set, and the page has a backdrop where TMDB has one. With neither key, the page leaves all this out. In results, Best rated sorts by the scores already kept, with the rest last. The Rated 6+, 7+ and 8+ chips keep only releases whose title has a kept score that high (IMDb, else TMDB, else Trakt, out of 10), leaving unrated ones out; the count above the results then reads "Up to". With a sort, they filter the sorted window of 2,000. Any provider's `requests_per_minute` can be `-1` for no limit, for a plan that has none.
 
 **AlloCiné numbers are read as titles.** French groups (FRQC, GL0P, SUPPLY, BYOR and others) name a release after its AlloCiné page, as in `AC31594.2024.S02E05.Love.and.Be.Loved.MULTi…-BYOR` for series 31594, Dark Matter, or `AC317772.2026.MULTi.VFF…-FRQC` for film 317772, Matchbox: The Movie. A name with an episode is a series, and one without is a film: AlloCiné numbers the two apart. Atlas asks Wikidata, which lists most AlloCiné numbers beside their IMDb, TMDB and TVDB IDs, and those IDs go on the release with no search. Where Wikidata has no entry, the AlloCiné page gives the title (the original one where it shows it) and the year. Either way the providers are then asked by that title, never by the number. `media.allocine.enabled: false` turns it off. Each number is asked once, like any title.
 
@@ -1021,6 +1042,7 @@ The screenshots come from a real instance, with its address, host name and news 
 | `ATLAS_AI_MODEL` | Ollama model for AI search. Default: `qwen3:4b`. |
 | `GEMINI_API_KEY` | Google Gemini API key for **Ask AI** in the Web UI (can also be saved in **Settings** in the Web UI). |
 | `ATLAS_NO_KEYRING` | Skips the OS keyring and keeps passwords in `config.toml`. |
+| `ATLAS_MANAGED_KEYS` | Comma-separated `config.toml` keys something outside Atlas writes (a container's start script, say), such as `api_key,groups,parallel_groups`. The Web UI's Settings page shows them read-only. |
 | `ATLAS_PROFILE` | Set to `1` to log a timing breakdown of the indexer every 30 seconds. |
 | `ATLAS_SAB_HOST`, `ATLAS_SAB_PORT`, `ATLAS_SAB_DIR`, `ATLAS_PYTHON` | Optional SABnzbd handoff. See [Direct downloads](#direct-downloads-with-sabnzbd). |
 
@@ -1051,6 +1073,7 @@ Common tasks are [just](https://github.com/casey/just) recipes. Run `just` to li
 | `just format` | Runs `cargo fmt`. CI runs `just format-check` and `just lint`. |
 | `just lint` | Runs `cargo clippy` with warnings treated as errors. |
 | `just build`, `just build-release` | Optimized build in `target/release/atlas`. |
+| `just build-no-ac3` | Optimized build without the external `filmcraft-ac3` decoder. |
 | `just build-debug` | Debug build in `target/debug/atlas`. |
 | `just build-remote`, `just build-remote-release` | Optimized build on another machine over SSH, copied back to `target/remote/release/atlas`. |
 | `just build-remote-debug` | The same, as a debug build. |

@@ -2,6 +2,7 @@
 //! whether an archive is passworded, from the first bytes of its articles.
 
 pub mod aes;
+pub mod beside;
 pub mod facts;
 pub mod follow;
 pub mod link;

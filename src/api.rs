@@ -1,6 +1,7 @@
 //! Newznab compatible api for prowlarr / sonarr / radarr.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::io::Read;
 use std::sync::{Arc, Mutex, Once};
 use std::thread::{self, JoinHandle};
@@ -150,6 +151,7 @@ pub fn handle(path: &str, query: &str, base: &str, api_key: &str) -> ApiResponse
 
     match t {
         Some("get") => get_nzb(&args),
+        Some("files") => files_list(&args),
         Some(kind @ ("search" | "tvsearch" | "movie" | "music" | "audio" | "book")) => {
             let on = crate::media::query::cached_id_params();
             if let Some(ids) = crate::media::query::from_args(kind, &args, &on) {
@@ -367,7 +369,10 @@ fn search(q: &str, args: &HashMap<String, String>, base: &str, api_key: &str) ->
     });
 
     match found {
-        Ok((listed, frozen_categories)) => {
+        Ok((mut listed, frozen_categories)) => {
+            if !deep {
+                listed.total = match_count(q, filter.as_ref());
+            }
             let ids: Vec<i64> = listed.rows.iter().map(|release| release.id).collect();
             let mut categories = crate::category::categories_of(&ids).unwrap_or_else(|e| {
                 eprintln!("api categories failed: {e}");
@@ -382,6 +387,22 @@ fn search(q: &str, args: &HashMap<String, String>, base: &str, api_key: &str) ->
             eprintln!("api search failed: {e}");
             ApiResponse::error(900, "Search failed")
         }
+    }
+}
+
+/// How many releases match a search, for Newznab's `total`: the full count, the same on every page, which clients
+/// page by. Counted the way the search finds them, incomplete ones too, soo it can be more than paging reaches. None
+/// where there's no count to be had cheaply (a category filter without the word index): `total` is then what was
+/// listed up to this page, as before.
+fn match_count(q: &str, filter: Option<&crate::category::CatFilter>) -> Option<i64> {
+    if crate::word_index::searchable(q)
+        && let Some(index) = crate::word_index::ready()
+    {
+        return index.count(q, filter, &[]).ok().and_then(|n| i64::try_from(n).ok());
+    }
+    match filter {
+        None if !q.trim().is_empty() => crate::search::count_all_releases(q).ok(),
+        _ => None,
     }
 }
 
@@ -459,8 +480,12 @@ struct Listed {
     rows: Vec<crate::search::ReleaseRow>,
     posts: Vec<Option<crate::release_info::SplitPost>>,
     complete: Vec<bool>,
+    /// of the complete ones, those whole only once a client repairs them from their PAR2 volumes
+    repair: Vec<bool>,
     /// rows the search gave, listed or not: none means nothing matched at all
     read: usize,
+    /// how many match in all, every page alike (Newznab's `total`), where the search can count them
+    total: Option<i64>,
 }
 
 impl Listed {
@@ -469,23 +494,31 @@ impl Listed {
             .iter()
             .map(|r| conn.and_then(|conn| crate::release_info::whole_post_with(conn, r).ok().flatten()))
             .collect();
-        let complete = rows.iter().zip(&posts).map(|(r, post)| listed_complete(conn, r, post.as_ref())).collect();
-        Listed { read: rows.len(), rows, posts, complete }
+        let (complete, repair) =
+            rows.iter().zip(&posts).map(|(r, post)| listed_complete(conn, r, post.as_ref())).unzip();
+        Listed { read: rows.len(), rows, posts, complete, repair, total: None }
     }
 }
 
 /// Whether a row is whole the way the web page shows it (`web::Search::fold_split_post`): all of its post when it's
 /// part of one, else its own flag, or its files by the counter rule of now when the flag was saved by an older one.
+/// Or whole once repaired: a row missing data its PAR2 volumes can rebuild (`release_info::repair_needed`) is listed,
+/// with that said (the second answer), as a client repairs it on its own.
 fn listed_complete(
     conn: Option<&rusqlite::Connection>,
     r: &crate::search::ReleaseRow,
     post: Option<&crate::release_info::SplitPost>,
-) -> bool {
+) -> (bool, bool) {
     match post {
-        Some(post) => post.complete,
+        Some(post) => (post.complete, false),
+        None if r.complete
+            || conn.is_some_and(|conn| crate::release_info::single_post_complete(conn, r.id).unwrap_or(false)) =>
+        {
+            (true, false)
+        }
         None => {
-            r.complete
-                || conn.is_some_and(|conn| crate::release_info::single_post_complete(conn, r.id).unwrap_or(false))
+            let repair = conn.is_some_and(|conn| crate::release_info::repair_needed(conn, r.id).unwrap_or(false));
+            (repair, repair)
         }
     }
 }
@@ -519,7 +552,9 @@ fn page<E>(
         let read = rows.len() as i64;
         listed.read += rows.len();
         let batch = Listed::of(conn, rows);
-        for ((r, post), complete) in batch.rows.into_iter().zip(batch.posts).zip(batch.complete) {
+        for (((r, post), complete), repair) in
+            batch.rows.into_iter().zip(batch.posts).zip(batch.complete).zip(batch.repair)
+        {
             if listed.rows.len() as i64 >= limit {
                 break;
             }
@@ -530,6 +565,7 @@ fn page<E>(
                 listed.rows.push(r);
                 listed.posts.push(post);
                 listed.complete.push(true);
+                listed.repair.push(repair);
             }
         }
         at += read;
@@ -567,7 +603,9 @@ fn rss_listed(
     media: &HashMap<i64, crate::media::query::MediaAttrs>,
     on: &crate::media::query::IdParams,
 ) -> ApiResponse {
-    let Listed { rows: releases, posts: wholes, complete, .. } = listed;
+    let Listed { rows: releases, posts: wholes, complete, repair, total, .. } = listed;
+    // never less than this page reaches
+    let total = total.unwrap_or(0).max(offset + releases.len() as i64);
     let releases = &releases[..];
     let ids: Vec<i64> = releases.iter().map(|r| r.id).collect();
     let copies = crate::duplicates::counts(&ids).unwrap_or_default();
@@ -578,15 +616,19 @@ fn rss_listed(
         .iter()
         .zip(wholes)
         .zip(complete)
+        .zip(repair)
         .zip(keep)
         .filter(|(_, keep)| *keep)
-        .map(|(((r, whole), complete), _)| {
+        .map(|((((r, whole), complete), repair), _)| {
             let nzb_url = format!("{base}/api?t=get&id={}&apikey={api_key}", r.id);
             // listed only with `incomplete=1` (`wants_incomplete`): said soo, not passed off as whole
-            let incomplete = if complete {
-                ""
-            } else {
+            // and one whole once repaired from its PAR2 volumes says that: a client that won't repair can skip it
+            let incomplete = if !complete {
                 "<newznab:attr name=\"complete\" value=\"0\"/>"
+            } else if repair {
+                "<newznab:attr name=\"repair\" value=\"1\"/>"
+            } else {
+                ""
             };
             let size = whole.map_or(r.size.unwrap_or(0), |post| post.size);
             let password = passwords
@@ -596,7 +638,7 @@ fn rss_listed(
             let attrs = media.get(&r.id).map_or(String::new(), |a| a.xml(on));
             let attrs = format!("{attrs}{}{incomplete}", release_attrs(r, copies.get(&r.id), spots.get(&r.id)));
             format!(
-                "    <item>      <title>{}</title>      <guid isPermaLink=\"false\">{}</guid>      <link>{}</link>      <size>{size}</size>      <pubDate>{}</pubDate>      <enclosure url=\"{}\" type=\"application/x-nzb\" length=\"{size}\"/>      <newznab:attr name=\"category\" value=\"{category}\"/>{attrs}{password}    </item>",
+                "    <item>      <title>{}</title>      <guid isPermaLink=\"false\">{}</guid>      <link>{}</link>      <size>{size}</size>      <pubDate>{}</pubDate>      <enclosure url=\"{}\" type=\"application/x-nzb\" length=\"{size}\"/>      <newznab:attr name=\"category\" value=\"{category}\"/><newznab:attr name=\"size\" value=\"{size}\"/>{attrs}{password}    </item>",
                 escape(&r.name),
                 r.id,
                 escape(&nzb_url),
@@ -621,7 +663,7 @@ fn rss_listed(
     </channel>
 </rss>"#,
         escape(base),
-        offset + releases.len() as i64,
+        total,
     );
 
     ApiResponse::xml(200, xml)
@@ -632,7 +674,7 @@ pub(crate) fn get_nzb(args: &HashMap<String, String>) -> ApiResponse {
 
     let Ok(Some(release)) = get_release(release_id) else {
         // a frozen release's NZB is built from its frozen row, left frozen (only the whole of it)
-        if args.contains_key("file") {
+        if args.contains_key("file") || args.contains_key("name") {
             return ApiResponse::not_found();
         }
         return match crate::frozen::nzb(&crate::paths::database(), release_id) {
@@ -646,15 +688,43 @@ pub(crate) fn get_nzb(args: &HashMap<String, String>) -> ApiResponse {
     };
 
     // `file` isnt in the Newznab spec: one file of the release, and one that isnt there is a miss
-    let built = match args.get("file") {
-        Some(file) => file.trim().parse().ok().map_or(Ok(None), |file| build_nzb_file_checked(release_id, file)),
-        None => build_nzb_checked(release_id),
+    // `name`, neither: one file by its name, as a release page links it
+    let built = match (args.get("file"), args.get("name")) {
+        (Some(file), _) => file.trim().parse().ok().map_or(Ok(None), |file| build_nzb_file_checked(release_id, file)),
+        (None, Some(name)) => crate::nzb::build_nzb_named_checked(release_id, name),
+        (None, None) => build_nzb_checked(release_id),
     };
     let Ok(Some(built)) = built else {
         return ApiResponse::not_found();
     };
 
     nzb_response(&release, release_id, built.xml, &built.gaps)
+}
+
+/// `t=files`, not in the Newznab spec: the files a release's NZB lists, each with the `file=N` that `t=get` takes for
+/// it alone. Frozen releases have no list: their NZB comes whole only.
+fn files_list(args: &HashMap<String, String>) -> ApiResponse {
+    let release_id = args.get("id").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
+    match crate::nzb::file_list(release_id) {
+        Ok(Some(files)) => ApiResponse::xml(200, files_xml(release_id, &files)),
+        Ok(None) => ApiResponse::error(300, "No such item"),
+        Err(e) => {
+            eprintln!("api files failed: {e}");
+            ApiResponse::error(900, "Couldn't read the release's files")
+        }
+    }
+}
+
+fn files_xml(release_id: i64, files: &[crate::nzb::ListedFile]) -> String {
+    let mut out =
+        format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<files id=\"{release_id}\" count=\"{}\">\n", files.len());
+    for f in files {
+        let name =
+            f.name.as_deref().map(|n| format!(" name=\"{}\"", escape(n).replace('"', "&quot;"))).unwrap_or_default();
+        let _ = writeln!(out, "  <file n=\"{}\"{name} size=\"{}\" articles=\"{}\"/>", f.n, f.bytes, f.articles);
+    }
+    out.push_str("</files>\n");
+    out
 }
 
 fn nzb_response(
@@ -694,6 +764,7 @@ fn endpoint_of(path: &str, query: &str) -> Endpoint {
     match parse_query(query).get("t").map(String::as_str) {
         Some("caps") => named("caps", "api.caps"),
         Some("get") => named("get", "api.get"),
+        Some("files") => named("files", "api.files"),
         Some("search") => named("search", "api.search"),
         Some("tvsearch") => named("tvsearch", "api.tvsearch"),
         Some("movie") => named("movie", "api.movie"),
@@ -732,6 +803,11 @@ fn respond(mut request: Request, api_key: &str, fallback_host: &str) {
         let _ = request.as_reader().take(MAX_FORM_BODY + 1).read_to_string(&mut body);
         let too_long = body.len() as u64 > MAX_FORM_BODY;
         let htmx = request.headers().iter().any(|h| h.field.equiv("HX-Request"));
+        let csrf = request
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv(crate::web_settings::CSRF_HEADER))
+            .map(|h| h.value.as_str().to_string());
         if too_long {
             ApiResponse {
                 status: 413,
@@ -742,7 +818,7 @@ fn respond(mut request: Request, api_key: &str, fallback_host: &str) {
                 failed: false,
             }
         } else {
-            crate::web::post(path, &body, cookies.as_deref(), htmx, &base, api_key)
+            crate::web::post(path, &body, cookies.as_deref(), htmx, csrf.as_deref(), &base, api_key)
                 .unwrap_or_else(ApiResponse::not_found)
         }
     } else {
@@ -888,6 +964,25 @@ mod tests {
     }
 
     #[test]
+    fn files_lists_each_files_number_and_escapes_names() {
+        use crate::nzb::ListedFile;
+        let xml = files_xml(
+            7,
+            &[
+                ListedFile { n: 1, name: Some("a&b <1> \" n=\"9.mkv".into()), bytes: 15, articles: 2 },
+                ListedFile { n: 2, name: None, bytes: 3, articles: 1 },
+            ],
+        );
+        assert!(xml.contains("<files id=\"7\" count=\"2\">"), "{xml}");
+        assert!(
+            xml.contains("<file n=\"1\" name=\"a&amp;b &lt;1&gt; &quot; n=&quot;9.mkv\" size=\"15\" articles=\"2\"/>"),
+            "{xml}"
+        );
+        assert!(xml.contains("<file n=\"2\" size=\"3\" articles=\"1\"/>"), "{xml}");
+        assert_eq!(handle("/api", "t=files&id=1", "http://x", "key").status, 401, "it needs the key");
+    }
+
+    #[test]
     fn caps_needs_no_key_and_others_do() {
         let r = handle("/api", "t=caps", "http://x", "key");
         assert_eq!(r.status, 200);
@@ -988,6 +1083,7 @@ mod tests {
                 complete: false,
                 lead: None,
                 recovery: Vec::new(),
+                beside: Vec::new(),
             })
         };
         // the post of rows 1, 2 and 4 stands as row 4, its highest id; row 3 is a post of its own
@@ -1156,7 +1252,14 @@ mod tests {
     #[test]
     fn rss_flags_an_incomplete_release() {
         let rows = rows_every(2, 2);
-        let listed = Listed { rows, posts: vec![None, None], complete: vec![false, true], read: 2 };
+        let listed = Listed {
+            rows,
+            posts: vec![None, None],
+            complete: vec![false, true],
+            repair: vec![false, false],
+            read: 2,
+            total: None,
+        };
         let body = rss_listed(
             "http://x",
             "k",
@@ -1171,5 +1274,33 @@ mod tests {
         assert_eq!(body.matches(r#"<newznab:attr name="complete" value="0"/>"#).count(), 1, "{body}");
         let first = body.split("<item>").nth(1).unwrap();
         assert!(first.contains("<title>r1</title>") && first.contains(r#"name="complete" value="0""#), "{first}");
+    }
+
+    /// one whole once repaired from its PAR2 volumes is listed as complete, and says it needs the repair
+    #[test]
+    fn rss_flags_a_release_that_needs_a_repair() {
+        let listed = Listed {
+            rows: rows_every(2, 2),
+            posts: vec![None, None],
+            complete: vec![true, true],
+            repair: vec![true, false],
+            read: 2,
+            total: None,
+        };
+        let body = rss_listed(
+            "http://x",
+            "k",
+            0,
+            listed,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &Default::default(),
+        )
+        .body;
+        assert!(!body.contains(r#"name="complete""#), "{body}");
+        let items: Vec<&str> = body.split("<item>").skip(1).collect();
+        assert!(items[0].contains(r#"<newznab:attr name="repair" value="1"/>"#), "{}", items[0]);
+        assert!(!items[1].contains(r#"name="repair""#), "{}", items[1]);
     }
 }

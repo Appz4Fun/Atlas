@@ -6,9 +6,9 @@ Deliberately not done, with why, so it can be picked up later.
 
 The 2026-11-02 metadata and linking research lives in [research/](research/README.md). Its own list of what is left to build (probe fixes, archive and container facts, twin and alt keys, linking split posts) is [research/TODO.md](research/TODO.md).
 
-## Result totals count releases, not rows
+## Result totals count releases, not rows (past one window)
 
-The total over each results page (`web::Search::total`) counts releases in the word index, or in the database for field searches. A page shows a post spread over several groups, and an upload linked by its PAR2 set, as one row, soo the total can be more than the rows. With "Hide copies" or "Hide incomplete" on, the total says "Up to": what they leave out is worked out per row as it's shown. Fix: keep in the index whether a release is folded into another (`upload_link` rows that aren't the lead; split posts need their grouping stored first), whether it's a later copy, and whether its whole post is complete, with triggers queueing a release when any of them change, and count without them.
+The total over each results page (`web::Search::total`) counts releases in the word index, or in the database for field searches. A page shows a post spread over several groups, and an upload linked by its PAR2 set, as one row, soo that count can be more than the rows. With "Hide copies", "Hide incomplete" or a rating chip on, it says "Up to". For a search paged from its window (a sort, "Hide incomplete" or a rating chip, without "Hide copies"), when the count is 2,000 (`SORT_WINDOW`) or less, the page then asks `/ui/total`, which counts the rows the window's background fill rendered, leaving out folded rows, incomplete and unrated ones. That count matches the pages exactly. Plain and "Hide copies" searches, which fold a page at a time, and bigger searches keep the index's count. Fix for those: keep in the index whether a release is folded into another (`upload_link` rows that aren't the lead; split posts need their grouping stored first), whether it's a later copy, and whether its whole post is complete, with triggers queueing a release when any of them change, and count without them. This needs a full rebuild of the word index.
 
 ## Lent articles are not yet checked against the set
 
@@ -31,7 +31,6 @@ Atlas gathers these into one release per upload (`filters::gather_per_article`).
 - **Two uploads can share a release.** The key is shape, poster, and day, so same-shaped uploads by one poster on one day merge. A downloader may then fail on that NZB. A poster that changes with nearly every article is left out of the key, which makes this likelier. Fix: split on article number gaps or post time gaps, which needs a look at real uploads.
 - **Two same-sized files with no file counter share a file row,** so one `<file>` can list a part number twice. Fix: the same as above, or number duplicates into a second file when building the NZB.
 - **They have no real name.** Nothing in the subject gives one. Fix: read a piece's yEnc `name=`, if an upload leaves it unobfuscated, or match PAR2 hashes.
-- **`t=get&file=N` isn't advertised.** It isn't in the Newznab spec, and results don't list a release's files. Fix: a files attribute on results, or a `t=files` listing.
 - **AI search still drops them** (`src/ai.rs`), since it has no use for a release it can't name.
 
 ## Uploads obfuscated per article, with no counter
@@ -52,7 +51,6 @@ A post with a weak name, such as numbered files, has its poster and day in its k
 - `scene_archive_sql`: needs a local dump file, and none is on hand. `--predb-import` covers plain title lists.
 - `predatabase` reads only the newest ten titles a poll. Its history needs a cursor and an API key.
 - The WebSocket streams and the IRC scraper. The streams carry predb.club and predb.net, which are polled. IRC needs its own login.
-- `predb.ovh`'s host no longer resolves. Its code stays in case it returns.
 
 ## Per-function CPU dispatch
 

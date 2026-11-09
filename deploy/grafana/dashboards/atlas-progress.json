@@ -403,7 +403,7 @@
    "id": 8,
    "type": "stat",
    "title": "Day chunks ETA",
-   "description": "Days left at the last hour's pace.",
+   "description": "Days left at the last 6 hours' pace.",
    "datasource": {
     "type": "prometheus",
     "uid": "victoriametrics"
@@ -416,7 +416,7 @@
    },
    "targets": [
     {
-     "expr": "(atlas_backfill_chunks{host=\"$host\",state=\"total\"} - ignoring(state) atlas_backfill_chunks{host=\"$host\",state=\"done\"}) / ignoring(state) (atlas_backfill_chunks{host=\"$host\",state=\"done_last_hour\"} > 0) * 3600",
+     "expr": "(atlas_backfill_chunks{host=\"$host\",state=\"total\"} - ignoring(state) atlas_backfill_chunks{host=\"$host\",state=\"done\"}) / ignoring(state) (deriv(atlas_backfill_chunks{host=\"$host\",state=\"done\"}[6h:5m]) > 0)",
      "legendFormat": "__auto",
      "editorMode": "code",
      "instant": true,
@@ -445,7 +445,7 @@
        "options": {
         "match": "null",
         "result": {
-         "text": "none done this hour",
+         "text": "none done in 6 h",
          "index": 0
         }
        }
@@ -4270,7 +4270,7 @@
   {
    "id": 46,
    "type": "row",
-   "title": "Shared catalog",
+   "title": "Message-id index",
    "collapsed": false,
    "panels": [],
    "gridPos": {
@@ -4282,6 +4282,313 @@
   },
   {
    "id": 47,
+   "type": "timeseries",
+   "title": "Index rows pruned a minute, per shard",
+   "description": "release_ids rows taken from releases quiet for 3 days. The space goes to each shard's free pages and is reused.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 96
+   },
+   "targets": [
+    {
+     "expr": "rate(atlas_release_ids_events_total{host=\"$host\",event=\"pruned_rows\"}[5m]) * 60",
+     "legendFormat": "shard {{shard}}",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 8,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "unit": "short"
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "shard 0"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#3987e5"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "shard 1"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#d95926"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "shard 2"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#199e70"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "shard 3"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#c98500"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "shard 4"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#d55181"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "shard 5"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#008300"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "shard 6"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#9085e9"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "shard 7"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#e66767"
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 48,
+   "type": "timeseries",
+   "title": "Releases indexed and pruned a minute",
+   "description": "Indexed counts every full index: a release's second file, and a pruned release that got a late article. A rise in indexed with pruning on means rebuilds.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "victoriametrics"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 96
+   },
+   "targets": [
+    {
+     "expr": "sum(rate(atlas_release_ids_events_total{host=\"$host\",event=\"indexed\"}[5m])) * 60",
+     "legendFormat": "indexed",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    },
+    {
+     "expr": "sum(rate(atlas_release_ids_events_total{host=\"$host\",event=\"pruned_releases\"}[5m])) * 60",
+     "legendFormat": "pruned",
+     "editorMode": "code",
+     "instant": false,
+     "range": true,
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "victoriametrics"
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 8,
+      "lineWidth": 1,
+      "showPoints": "never",
+      "spanNulls": false,
+      "drawStyle": "line",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "unit": "short"
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "indexed"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#3987e5"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "pruned"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#d95926"
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "showLegend": true,
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "transformations": []
+  },
+  {
+   "id": 49,
+   "type": "row",
+   "title": "Shared catalog",
+   "collapsed": false,
+   "panels": [],
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 104
+   }
+  },
+  {
+   "id": 50,
    "type": "stat",
    "title": "Outbox waiting",
    "description": "Changes waiting in the shards' outboxes for the publisher to send to Postgres.",
@@ -4293,7 +4600,7 @@
     "h": 4,
     "w": 6,
     "x": 0,
-    "y": 96
+    "y": 105
    },
    "targets": [
     {
@@ -4340,7 +4647,7 @@
    "transformations": []
   },
   {
-   "id": 48,
+   "id": 51,
    "type": "stat",
    "title": "Oldest waiting",
    "description": "How long the oldest waiting change has waited, over every shard.",
@@ -4352,7 +4659,7 @@
     "h": 4,
     "w": 6,
     "x": 6,
-    "y": 96
+    "y": 105
    },
    "targets": [
     {
@@ -4407,7 +4714,7 @@
    "transformations": []
   },
   {
-   "id": 49,
+   "id": 52,
    "type": "stat",
    "title": "Upserts a minute",
    "description": "",
@@ -4419,7 +4726,7 @@
     "h": 4,
     "w": 6,
     "x": 12,
-    "y": 96
+    "y": 105
    },
    "targets": [
     {
@@ -4466,7 +4773,7 @@
    "transformations": []
   },
   {
-   "id": 50,
+   "id": 53,
    "type": "stat",
    "title": "Deletes a minute",
    "description": "",
@@ -4478,7 +4785,7 @@
     "h": 4,
     "w": 6,
     "x": 18,
-    "y": 96
+    "y": 105
    },
    "targets": [
     {
@@ -4525,7 +4832,7 @@
    "transformations": []
   },
   {
-   "id": 51,
+   "id": 54,
    "type": "timeseries",
    "title": "Outbox per shard",
    "description": "",
@@ -4537,7 +4844,7 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 100
+    "y": 109
    },
    "targets": [
     {
@@ -4711,7 +5018,7 @@
    "transformations": []
   },
   {
-   "id": 52,
+   "id": 55,
    "type": "timeseries",
    "title": "Oldest waiting per shard",
    "description": "",
@@ -4723,7 +5030,7 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 100
+    "y": 109
    },
    "targets": [
     {
@@ -4897,7 +5204,7 @@
    "transformations": []
   },
   {
-   "id": 53,
+   "id": 56,
    "type": "timeseries",
    "title": "Sent a minute",
    "description": "Rows the publisher wrote to Postgres (upsert) or took out of it (delete).",
@@ -4909,7 +5216,7 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 100
+    "y": 109
    },
    "targets": [
     {
@@ -4965,7 +5272,7 @@
    "transformations": []
   },
   {
-   "id": 54,
+   "id": 57,
    "type": "row",
    "title": "Errors",
    "collapsed": false,
@@ -4974,11 +5281,11 @@
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 108
+    "y": 117
    }
   },
   {
-   "id": 55,
+   "id": 58,
    "type": "stat",
    "title": "Step panics in range",
    "description": "",
@@ -4990,7 +5297,7 @@
     "h": 4,
     "w": 6,
     "x": 0,
-    "y": 109
+    "y": 118
    },
    "targets": [
     {
@@ -5041,7 +5348,7 @@
    "transformations": []
   },
   {
-   "id": 56,
+   "id": 59,
    "type": "stat",
    "title": "Step errors in range",
    "description": "",
@@ -5053,7 +5360,7 @@
     "h": 4,
     "w": 6,
     "x": 6,
-    "y": 109
+    "y": 118
    },
    "targets": [
     {
@@ -5104,7 +5411,7 @@
    "transformations": []
   },
   {
-   "id": 57,
+   "id": 60,
    "type": "stat",
    "title": "Function errors in range",
    "description": "",
@@ -5116,7 +5423,7 @@
     "h": 4,
     "w": 6,
     "x": 12,
-    "y": 109
+    "y": 118
    },
    "targets": [
     {
@@ -5167,7 +5474,7 @@
    "transformations": []
   },
   {
-   "id": 58,
+   "id": 61,
    "type": "stat",
    "title": "Indexer errors in range",
    "description": "",
@@ -5179,7 +5486,7 @@
     "h": 4,
     "w": 6,
     "x": 18,
-    "y": 109
+    "y": 118
    },
    "targets": [
     {
@@ -5230,7 +5537,7 @@
    "transformations": []
   },
   {
-   "id": 59,
+   "id": 62,
    "type": "timeseries",
    "title": "Step errors and panics, by step",
    "description": "",
@@ -5242,7 +5549,7 @@
     "h": 8,
     "w": 8,
     "x": 0,
-    "y": 113
+    "y": 122
    },
    "targets": [
     {
@@ -5298,7 +5605,7 @@
    "transformations": []
   },
   {
-   "id": 60,
+   "id": 63,
    "type": "timeseries",
    "title": "Step panics, by step",
    "description": "",
@@ -5310,7 +5617,7 @@
     "h": 8,
     "w": 8,
     "x": 8,
-    "y": 113
+    "y": 122
    },
    "targets": [
     {
@@ -5366,7 +5673,7 @@
    "transformations": []
   },
   {
-   "id": 61,
+   "id": 64,
    "type": "timeseries",
    "title": "Function errors, the top 8",
    "description": "",
@@ -5378,7 +5685,7 @@
     "h": 8,
     "w": 8,
     "x": 16,
-    "y": 113
+    "y": 122
    },
    "targets": [
     {

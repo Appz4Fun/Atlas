@@ -161,7 +161,7 @@ Release names are scene style, like Dune.Part.Two.2024.2160p.UHD.BluRay.REMUX.DV
 Fields:
 - q: words that must all appear in the name, separated by spaces: title words, year, S01E02 or S01 for a season, codec or audio words. Leave out filler like "movies", "show", "find", "latest", "good". Leave out what a filter or the category already says. Empty to list the newest releases.
 - cat: one category id from the list below, or "all". Pick the narrowest one that surely fits; "all" when unsure.
-- filters: any of {filters}. 2160p is 4K/UHD. DV is Dolby Vision. HDR is HDR10 or HDR10+. Remux is an untouched disc copy. "Hide copies" when the request asks for no duplicates or reposts.
+- filters: any of {filters}. 2160p is 4K/UHD. DV is Dolby Vision. HDR is HDR10 or HDR10+. Remux is an untouched disc copy. "Hide copies" when the request asks for no duplicates or reposts. "Hide spots" only when the request asks to leave out Spotnet spots.
 - group: a Usenet group, only when the request names one, like alt.binaries.teevee.
 - poster: who posted it, only when the request names one.
 - team: the release group after the dash, only when the request names one, like FLUX or NTb.
