@@ -563,7 +563,15 @@ pub struct Domains {
     /// rows this writer inserted in its open transaction: they move to `ids`
     /// once it commits, and are gone if it rolls back
     staged: HashMap<String, i64>,
+    /// the table was read
+    loaded: bool,
+    /// `ids` has every row of the table (it had at most `DOMAIN_TABLE_MAX`): a domain not there has no row, and
+    /// isnt looked up. Only the shard's writer adds rows, and only through here
+    complete: bool,
 }
+
+/// domains a writer keeps all of in memory, when the table has no more (`Domains::complete`)
+const DOMAIN_TABLE_MAX: usize = 1_000_000;
 
 /// domains a writer keeps in memory at most, known and not yet known
 const DOMAIN_CACHE: usize = 100_000;
@@ -582,13 +590,19 @@ impl Domains {
     /// (local blob, domain id) for a message-id; domain 0 = stored whole
     pub(crate) fn encode(&mut self, conn: &Connection, id: &str) -> Result<(Vec<u8>, i64)> {
         let Some((local, suffix)) = split_message_id(id) else { return Ok((whole(id), 0)) };
+        if !self.loaded {
+            self.load(conn)?;
+        }
         if let Some(d) = self.ids.get(suffix).or_else(|| self.staged.get(suffix)) {
             return Ok((pack_local(local), *d));
         }
-        let found: Option<i64> = conn
-            .prepare_cached("select id from domains where suffix = ? order by id limit 1")?
-            .query_row([suffix], |r| r.get(0))
-            .optional()?;
+        let found: Option<i64> = if self.complete {
+            None
+        } else {
+            conn.prepare_cached("select id from domains where suffix = ? order by id limit 1")?
+                .query_row([suffix], |r| r.get(0))
+                .optional()?
+        };
         let domain = match found {
             Some(d) => d,
             None => {
@@ -611,8 +625,31 @@ impl Domains {
         Ok((pack_local(local), domain))
     }
 
+    /// Every row of the table into `ids`, when it has at most `DOMAIN_TABLE_MAX`; a suffix with two rows (folded
+    /// shards) by its lowest id, as the lookup takes it.
+    fn load(&mut self, conn: &Connection) -> Result<()> {
+        self.loaded = true;
+        let rows: i64 = conn.prepare_cached("select count(*) from domains")?.query_row([], |r| r.get(0))?;
+        if rows as usize > DOMAIN_TABLE_MAX {
+            return Ok(());
+        }
+        let mut stmt = conn.prepare("select suffix, min(id) from domains group by suffix")?;
+        let all = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        self.ids.clear();
+        for row in all {
+            let (suffix, id) = row?;
+            self.ids.insert(suffix, id);
+        }
+        self.complete = true;
+        Ok(())
+    }
+
     fn remember(&mut self, suffix: String, domain: i64) {
-        if self.ids.len() >= DOMAIN_CACHE {
+        if self.complete && self.ids.len() >= DOMAIN_TABLE_MAX {
+            // too many to keep all: back to looking up what isnt kept
+            self.complete = false;
+            self.ids.clear();
+        } else if !self.complete && self.ids.len() >= DOMAIN_CACHE {
             self.ids.clear();
         }
         self.ids.insert(suffix, domain);
@@ -927,6 +964,9 @@ pub(crate) struct FileState {
     pub seen: Vec<u8>,
     /// its articles are in `files.blob` (plus any rows that came later)
     pub sealed: bool,
+    /// made by this save, and no article stored whole in it yet: nothing in it was stored another way that
+    /// `add_segment` has to look for (whole before its domain got a row, or text from before the packing)
+    pub fresh: std::cell::Cell<bool>,
 }
 
 impl FileState {
@@ -970,6 +1010,7 @@ pub(crate) fn file(conn: &Connection, release_id: i64, filename: &str) -> Result
                 file_total: r.get(5)?,
                 seen: r.get(6)?,
                 sealed: r.get(7)?,
+                fresh: std::cell::Cell::new(false),
             })
         })
         .optional()?;
@@ -978,7 +1019,7 @@ pub(crate) fn file(conn: &Connection, release_id: i64, filename: &str) -> Result
     }
     conn.prepare_cached("insert into files (release_id, filename, seen) values (?, ?, x'')")?
         .execute(params![release_id, filename])?;
-    Ok(FileState { id: conn.last_insert_rowid(), ..FileState::default() })
+    Ok(FileState { id: conn.last_insert_rowid(), fresh: std::cell::Cell::new(true), ..FileState::default() })
 }
 
 pub(crate) fn put_file(conn: &Connection, f: &FileState) -> Result<()> {
@@ -1030,12 +1071,17 @@ pub(crate) fn add_segment(
     if f.sealed && sealed.contains(conn, f.id, &local, domain)? {
         return Ok(false);
     }
+    // a file this save made has only what this save put in it
+    let fresh = f.fresh.get();
+    if domain == 0 {
+        f.fresh.set(false);
+    }
     // an article saved before its domain got a row is stored whole: dont save it twice
-    if domain != 0 && stored(sealed, &whole(&a.message_id), 0)? {
+    if domain != 0 && !fresh && stored(sealed, &whole(&a.message_id), 0)? {
         return Ok(false);
     }
     // a row from before locals were packed by alphabet has the same local stored as text
-    if (DIGITS..=BASE64_URL).contains(&local[0]) {
+    if !fresh && (DIGITS..=BASE64_URL).contains(&local[0]) {
         let mut legacy = vec![TEXT];
         legacy.extend_from_slice(unpack_local(&local).as_bytes());
         if stored(sealed, &legacy, domain)? {
@@ -3973,6 +4019,62 @@ mod tests {
         );
         let segments: i64 = conn.query_row("select count(*) from segments", [], |r| r.get(0)).unwrap();
         assert_eq!(segments, 2);
+    }
+
+    #[test]
+    fn a_file_this_save_made_is_fresh_till_something_is_stored_whole_in_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("atlas.s0.db");
+        create_shard(&path).unwrap();
+        let conn = db::open_at(&path).unwrap();
+        let made = file(&conn, 9, "b.rar").unwrap();
+        assert!(made.fresh.get(), "just made: nothing in it but what this save adds");
+        assert!(!file(&conn, 9, "b.rar").unwrap().fresh.get(), "looked up: it may hold anything");
+        let mut domains = Domains::default();
+        // a shared domain's article is packed and leaves the file fresh
+        for n in 0..SHARED_AFTER {
+            domains.encode(&conn, &format!("<{n:032x}@ngPost>")).unwrap();
+        }
+        let packed = Article { message_id: format!("<{:032x}@ngPost>", 99), part: Some(1), ..Default::default() };
+        assert!(add_segment(&conn, &mut domains, &made, None, &packed, &mut SealedCache::new()).unwrap());
+        assert!(made.fresh.get());
+        assert!(!add_segment(&conn, &mut domains, &made, None, &packed, &mut SealedCache::new()).unwrap(), "twice");
+        // one stored whole makes it look again
+        let whole = Article { message_id: "<abc@Rand1>".into(), part: Some(2), ..Default::default() };
+        assert!(add_segment(&conn, &mut domains, &made, None, &whole, &mut SealedCache::new()).unwrap());
+        assert!(!made.fresh.get());
+        let segments: i64 = conn.query_row("select count(*) from segments", [], |r| r.get(0)).unwrap();
+        assert_eq!(segments, 2);
+    }
+
+    #[test]
+    fn a_writer_keeps_the_whole_domain_table_and_looks_nothing_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("atlas.s0.db");
+        create_shard(&path).unwrap();
+        let conn = db::open_at(&path).unwrap();
+        conn.execute_batch("insert into domains (id, suffix) values (7, '@x>'), (9, '@y>')").unwrap();
+        let mut domains = Domains::default();
+        assert_eq!(domains.encode(&conn, "<a1@x>").unwrap().1, 7);
+        assert!(domains.complete && domains.ids.len() == 2, "every row read at once");
+        assert_eq!(domains.encode(&conn, "<a1@y>").unwrap().1, 9);
+        // one not in the table gets its row from the third article on, as before
+        let got: Vec<i64> = (0..4).map(|n| domains.encode(&conn, &format!("<{n}@z>")).unwrap().1).collect();
+        assert_eq!(&got[..2], &[0, 0]);
+        assert!(got[2] > 9 && got[2] < 1 << 32 && got[3] == got[2]);
+        domains.committed();
+        assert_eq!(domains.ids.get("@z>"), Some(&got[2]));
+        // a rolled back row is forgotten, and made again
+        let mut again = Domains::default();
+        let tx = conn.unchecked_transaction().unwrap();
+        let rolled: Vec<i64> = (0..3).map(|n| again.encode(&tx, &format!("<{n}@w>")).unwrap().1).collect();
+        assert!(rolled[2] > 0);
+        tx.rollback().unwrap();
+        again.rolled_back();
+        let redone: Vec<i64> = (0..3).map(|n| again.encode(&conn, &format!("<{n}@w>")).unwrap().1).collect();
+        assert!(redone[2] > 0);
+        let rows: i64 = conn.query_row("select count(*) from domains where suffix = '@w>'", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 1);
     }
 
     #[test]
