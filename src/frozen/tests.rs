@@ -958,7 +958,7 @@ fn payloads_whose_ids_another_payload_gave_other_suffixes_keep_their_message_ids
 }
 
 #[test]
-fn a_release_whose_ids_read_the_same_thaws_without_fetching_its_sealed_blobs() {
+fn a_release_whose_domain_ids_are_unchanged_thaws_without_fetching_its_sealed_blobs() {
     // its file's blob is a place in the sealed log (which this test has no address for, soo a fetch would fail)
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(&SCRATCH.replace("{s}.", "")).unwrap();

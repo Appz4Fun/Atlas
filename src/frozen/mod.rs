@@ -748,17 +748,6 @@ pub fn restore(conn: &Connection, schema: &str, p: &Payload, how: Domains) -> Re
             .query_row([id], |r| r.get(0))
             .optional()
     };
-    // Map: whether the payload's ids already read right here, soo its blobs needn't be decoded (a sealed-log place
-    // fetched) to be renumbered
-    let reads_same = || -> Result<bool> {
-        for (old, suffix) in &p.domains {
-            if suffix_at(*old)?.as_deref() != Some(suffix.as_str()) {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    };
-    let ids_read_same = how == Domains::Map && reads_same()?;
     if how == Domains::Keep {
         let fits = |base: i64| -> Result<bool> {
             for (old, suffix) in &p.domains {
@@ -812,7 +801,6 @@ pub fn restore(conn: &Connection, schema: &str, p: &Payload, how: Domains) -> Re
             "insert",
             &["id"],
             &mut |c, v| match (c, v) {
-                ("blob", Value::Blob(b)) if how == Domains::Map && !same_domains && ids_read_same => Ok(Value::Blob(b)),
                 ("blob", Value::Blob(b)) if how == Domains::Map && !same_domains => {
                     let mut segs =
                         crate::blob::decode(&b).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;

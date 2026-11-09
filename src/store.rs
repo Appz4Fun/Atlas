@@ -460,8 +460,7 @@ pub(crate) fn split_message_id(id: &str) -> Option<(&str, &str)> {
     Some((&inner[..at], &inner[at..]))
 }
 
-/// A new domain row, under the next id below `1 << 32`: ids from there on are a restored payload's own
-/// (`frozen::Domains::Keep`), and a small id keeps segment rows and blobs short.
+/// A new domain row, under the next id below `1 << 32`: a small id keeps segment rows and blobs short.
 pub(crate) const NEW_DOMAIN: &str = "insert into domains (id, suffix) values ((select coalesce(max(id), 0) + 1 from domains where id < 4294967296), ?1)";
 
 /// `domains` without its unique index on the suffix, for a copy that takes one suffix under several ids (a
@@ -2973,7 +2972,6 @@ struct CollectionRow {
 /// A new one takes the slice's name; when another release in the group has
 /// that, with 8 digits of the key's hash after it, as `a [4]` has its count.
 fn collection_row(tx: &Connection, key: &IdKey, collection: &str, release: &Release) -> Result<CollectionRow> {
-    // a folded shard's row was adopted already, at the top of the save loop
     let hash = key.hash(collection);
     // a purge can leave a row here, whose release is gone: it finds nothing
     let known: Option<(String, bool)> = tx
