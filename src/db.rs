@@ -580,9 +580,12 @@ pub fn create_db_at(path: &Path) -> anyhow::Result<()> {
     )?;
 
     // the server's first/last article numbers per group, for progress and ETA, and
-    // the post date at both ends of what has been indexed (article number + unix time)
+    // the post date at both ends of what has been indexed (article number + unix time), and
+    // the posting time the live cursor began reading from (`set_start_posted`)
     let group_columns = columns(&conn, "groups")?;
-    for col in ["first_article", "last_article", "low_article", "low_posted", "high_article", "high_posted"] {
+    for col in
+        ["first_article", "last_article", "low_article", "low_posted", "high_article", "high_posted", "start_posted"]
+    {
         if !group_columns.contains(col) {
             conn.execute(&format!("alter table groups add column {col} INTEGER"), [])?;
         }
@@ -966,6 +969,14 @@ pub fn update_live_cursor(conn: &Connection, group: &str, article: i64) -> Resul
          on conflict(name) do update set live_cursor = excluded.live_cursor",
         params![group, article, article],
     )?;
+    Ok(())
+}
+
+/// Remember the posting time a row's live cursor began reading from (cursor key), when it is started or jumped:
+/// the time it was found by, or now when it starts at the newest article. Nothing posted before that is read through
+/// on this row; NULL (a row from before this was kept) counts as long ago.
+pub fn set_start_posted(conn: &Connection, group: &str, posted: i64) -> Result<()> {
+    conn.execute("update groups set start_posted = ? where name = ?", params![posted, group])?;
     Ok(())
 }
 

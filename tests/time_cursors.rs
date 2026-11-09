@@ -78,9 +78,21 @@ impl Setup {
         atlas::db::group_progress(&conn).unwrap().into_iter().find(|p| p.key == key).unwrap().live_cursor
     }
 
+    /// server `i`'s live cursor set back to `to`, as if it had read from there: what it began reading from is
+    /// forgotten (counts as long ago)
     fn set_cursor(&self, i: usize, to: i64) {
         let key = format!("{GROUP}@{}", self.pool.host(i).to_lowercase());
-        atlas::db::update_live_cursor(&atlas::db::open_at(&self.main).unwrap(), &key, to).unwrap();
+        let conn = atlas::db::open_at(&self.main).unwrap();
+        atlas::db::update_live_cursor(&conn, &key, to).unwrap();
+        conn.execute("update groups set start_posted = null where name = ?", [&key]).unwrap();
+    }
+
+    /// server `i`'s row as if a pass cut short saved the newest slice, `article` posted at `posted`, but not the ones
+    /// below it: its cursor stays where it was
+    fn save_newest_slice(&self, i: usize, article: i64, posted: i64) {
+        let key = format!("{GROUP}@{}", self.pool.host(i).to_lowercase());
+        let conn = atlas::db::open_at(&self.main).unwrap();
+        atlas::db::save_group_dates(&conn, &key, (article, posted), (article, posted)).unwrap();
     }
 }
 
@@ -196,5 +208,79 @@ fn cursors_saved_per_server_before_are_kept_or_moved_up() {
         // A is read through about 106 now (the middle of its newest slice), soo B starts an hour before that
         assert!((1..=20).contains(&b.articles), "from about an hour before where A is, not 41-110: {}", b.articles);
         assert_eq!(s.cursor(1), (B + 110) as i64);
+    });
+}
+
+/// The time an hourly post `n` is dated (see `hourly`).
+fn posted(n: u64) -> i64 {
+    chrono::DateTime::parse_from_rfc3339("2026-10-20T00:00:00+00:00").unwrap().timestamp() + n as i64 * 3600
+}
+
+/// A's row isn't read through (a pass cut short saved 100 but not 61-99), soo when A goes down B stands in from its
+/// newest article. Once A is back its own cursor must not move up to where B is read through: B never read 61-150,
+/// and nobody else did either. A goes on from its own cursor.
+#[test]
+fn a_home_with_a_gap_doesnt_skip_to_a_stand_in_that_started_at_the_top() {
+    let s = setup(true, 60);
+    let ctx = context(&s.pool);
+    runtime().block_on(async {
+        s.pool.connect().await.unwrap();
+        let db = shared_db(atlas::db::open_at(&s.main).unwrap());
+        run_pass(&ctx, &live(false, false), &db, GROUP, 0, &mut |_| {}).await.unwrap();
+        s.set_cursor(0, 0);
+        run_pass(&ctx, &live(false, false), &db, GROUP, 0, &mut |_| {}).await.unwrap();
+        assert_eq!(s.cursor(0), 60);
+        s.add(61, 100);
+        s.save_newest_slice(0, 100, posted(100));
+
+        // A goes down; B, with no row of its own and none read through to start from, starts at its newest
+        s.servers[0].dropped.store(true, Ordering::SeqCst);
+        s.add(101, 150);
+        let first = run_pass(&ctx, &live(true, true), &db, GROUP, 1, &mut |_| {}).await.unwrap();
+        assert_eq!(first.articles, 0, "B starts at its newest article");
+        s.add(151, 160);
+        let next = run_pass(&ctx, &live(true, false), &db, GROUP, 1, &mut |_| {}).await.unwrap();
+        assert_eq!(next.articles, 10);
+
+        // A is back: it reads on from 60, not from about where B is read through
+        s.servers[0].dropped.store(false, Ordering::SeqCst);
+        let back = run_pass(&ctx, &live(false, false), &db, GROUP, 0, &mut |_| {}).await.unwrap();
+        assert!(back.articles >= 90, "61-150, which nobody read, are read: {}", back.articles);
+        assert_eq!(s.cursor(0), 160);
+    });
+}
+
+/// A's row is read through (to 60), but B, a stand-in from the top with time cursors off, began reading only after
+/// 100. With time cursors on A must not move up to where B is read through: 61-100 were read by nobody.
+#[test]
+fn a_cursor_moves_up_only_to_a_row_that_began_reading_by_its_own_time() {
+    let s = setup(false, 60);
+    let ctx = context(&s.pool);
+    runtime().block_on(async {
+        s.pool.connect().await.unwrap();
+        let db = shared_db(atlas::db::open_at(&s.main).unwrap());
+        run_pass(&ctx, &live(false, false), &db, GROUP, 0, &mut |_| {}).await.unwrap();
+        s.set_cursor(0, 0);
+        run_pass(&ctx, &live(false, false), &db, GROUP, 0, &mut |_| {}).await.unwrap();
+        assert_eq!(s.cursor(0), 60);
+
+        s.servers[0].dropped.store(true, Ordering::SeqCst);
+        s.add(61, 100);
+        let first = run_pass(&ctx, &live(true, true), &db, GROUP, 1, &mut |_| {}).await.unwrap();
+        assert_eq!(first.articles, 0, "without time cursors B starts at its newest article");
+        s.add(101, 110);
+        let next = run_pass(&ctx, &live(true, false), &db, GROUP, 1, &mut |_| {}).await.unwrap();
+        assert_eq!(next.articles, 10);
+        s.servers[0].dropped.store(false, Ordering::SeqCst);
+    });
+
+    let pool = pool_on(&s.ports, true);
+    let ctx = context(&pool);
+    runtime().block_on(async {
+        pool.connect().await.unwrap();
+        let db = shared_db(atlas::db::open_at(&s.main).unwrap());
+        let a = run_pass(&ctx, &live(false, false), &db, GROUP, 0, &mut |_| {}).await.unwrap();
+        assert_eq!(a.articles, 50, "A goes on from its own cursor: 61-110");
+        assert_eq!(s.cursor(0), 110);
     });
 }

@@ -516,9 +516,9 @@ const MOVE_AFTER: u32 = 3;
 const BAN_STRIKES: u32 = 3;
 const BAN_FOR: i64 = 24 * 3600;
 
-/// The (group, server) pairs a group isn't read from, when groups go by rank: from config for good, and learned (a
-/// server that said it doesnt carry the group, or kept failing it) for `BAN_FOR`, kept in a file soo a restart keeps
-/// them. Servers are named in the file by `Pool::host`.
+/// The (group, server) pairs a group isn't read from: from config for good (ranked or not), and learned when groups go
+/// by rank (a server that said it doesnt carry the group, or kept failing it) for `BAN_FOR`, kept in a file soo a
+/// restart keeps them. Servers are named in the file by `Pool::host`.
 #[derive(Default)]
 struct Bans {
     fixed: std::collections::HashSet<(String, usize)>,
@@ -2151,17 +2151,10 @@ impl Pool {
     }
 
     /// Groups go to servers by rank (`IndexingConfig`): the hosts `prefer` names first in its order, the rest after by
-    /// connections, most first; `ban` keeps groups off servers for good, and what's learned is kept in `bans_file`.
-    /// Nothing changes when the config doesnt rank.
+    /// connections, most first; what's learned is kept in `bans_file`. `ban` keeps groups off servers for good, by
+    /// rank or not; apart from that nothing changes when the config doesnt rank.
     pub fn with_ranking(mut self, cfg: &crate::config::IndexingConfig, bans_file: Option<std::path::PathBuf>) -> Self {
         self.time_cursors = cfg.time_cursors;
-        if !cfg.ranks() {
-            return self;
-        }
-        let mut order: Vec<usize> = (0..self.servers.len()).collect();
-        let place = |i: usize| cfg.prefer.iter().position(|h| self.is_host(i, h)).unwrap_or(usize::MAX);
-        order.sort_by_key(|&i| (place(i), std::cmp::Reverse(self.servers[i].cfg.connections()), i));
-        self.rank = order;
         let mut bans = Bans { path: bans_file.clone(), ..Bans::default() };
         for (group, hosts) in &cfg.ban {
             for h in hosts {
@@ -2170,6 +2163,14 @@ impl Pool {
                 }
             }
         }
+        if !cfg.ranks() {
+            self.bans = Mutex::new(bans);
+            return self;
+        }
+        let mut order: Vec<usize> = (0..self.servers.len()).collect();
+        let place = |i: usize| cfg.prefer.iter().position(|h| self.is_host(i, h)).unwrap_or(usize::MAX);
+        order.sort_by_key(|&i| (place(i), std::cmp::Reverse(self.servers[i].cfg.connections()), i));
+        self.rank = order;
         if let Some(text) = bans_file.and_then(|p| std::fs::read_to_string(p).ok()) {
             for line in text.lines() {
                 let f: Vec<&str> = line.split('\t').collect();
@@ -2205,6 +2206,17 @@ impl Pool {
         let bans = self.bans.lock().unwrap();
         let key = (group.to_string(), i);
         bans.fixed.contains(&key) || bans.learned.get(&key).is_some_and(|&(_, _, until)| until > unix_now())
+    }
+
+    /// whether config bans `group` from server `i` (`IndexingConfig::ban`): it's never read from there, whatever else
+    /// is left
+    pub fn banned_for_good(&self, group: &str, i: usize) -> bool {
+        self.bans.lock().unwrap().fixed.contains(&(group.to_string(), i))
+    }
+
+    /// `candidates` without the servers config bans `group` from
+    fn not_banned_for_good(&self, candidates: &[usize], group: &str) -> Vec<usize> {
+        candidates.iter().copied().filter(|&i| !self.banned_for_good(group, i)).collect()
     }
 
     /// A strike against server `i` for `group` (a pass there parked): `BAN_STRIKES` within `BAN_FOR` ban it from the
@@ -2254,12 +2266,13 @@ impl Pool {
         }
     }
 
-    /// `candidates` in rank order, servers `group` is banned from left out (all of them, in the hashed order, when
-    /// every one is banned: a group is never left with none)
+    /// `candidates` in rank order, servers `group` is banned from left out. When every one is, those banned only for a
+    /// while (learned) in the hashed order, soo strikes alone never leave a group with none; config bans always count,
+    /// and a group banned from every one left isn't read until another frees up.
     pub fn rank_order(&self, candidates: &[usize], group: &str) -> Vec<usize> {
         let order: Vec<usize> =
             self.rank.iter().copied().filter(|i| candidates.contains(i) && !self.banned(group, *i)).collect();
-        if order.is_empty() { self.ranked(candidates, group) } else { order }
+        if order.is_empty() { self.ranked(&self.not_banned_for_good(candidates, group), group) } else { order }
     }
 
     /// `group` goes to server `i` and stays there while it serves it, `HOME_RETRY` at most when it isn't the best
@@ -2504,19 +2517,28 @@ impl Pool {
                     home = Home { server: back, since: Instant::now(), back: None };
                     homes.insert(group.to_string(), home);
                 }
-                if tier.contains(&home.server) {
+                if tier.contains(&home.server) && !self.banned_for_good(group, home.server) {
                     return home.server;
                 }
             }
         }
 
         // a server that is down only moves its own groups: the others keep the
-        // server they get with every indexing server up
-        let first = self.spread_over(&self.indexing_servers(), group);
+        // server they get with every indexing server up. servers config bans
+        // the group from are left out (all banned: see `server_for_in`)
+        let allowed = |t: &[usize]| Some(self.not_banned_for_good(t, group)).filter(|a| !a.is_empty());
+        let first =
+            self.spread_over(&allowed(&self.indexing_servers()).unwrap_or_else(|| self.indexing_servers()), group);
         if tier.contains(&first) {
             return first;
         }
-        self.spread_over(tier, group)
+        self.spread_over(&allowed(tier).unwrap_or_else(|| tier.to_vec()), group)
+    }
+
+    /// `pick_server_in`, none when that's a server config bans the group from (it's banned from every one left): the
+    /// group isn't read until a server it may be read from is free.
+    pub fn server_for_in(&self, tier: &[usize], group: &str) -> Option<usize> {
+        Some(self.pick_server_in(tier, group)).filter(|&i| !self.banned_for_good(group, i))
     }
 
     /// `group`'s server among `tier`, by its hash weighted by connections.
@@ -2550,13 +2572,14 @@ impl Pool {
         }
         let home = self.pick_server_in(&self.indexing_servers(), group);
         let back = self.homes.lock().unwrap().get(group).and_then(|h| h.back);
-        std::iter::once(home).chain(back.filter(|&b| b != home)).collect()
+        std::iter::once(home).chain(back.filter(|&b| b != home)).filter(|&i| !self.banned_for_good(group, i)).collect()
     }
 
     /// The server `group`'s passes go to while the ones in `not` are failing it: the first `ranked` gives among the
-    /// rest of `tier`, none when no other is left.
+    /// rest of `tier` that config doesnt ban it from, none when no other is left.
     pub fn fallback_in(&self, tier: &[usize], group: &str, not: &[usize]) -> Option<usize> {
-        let rest: Vec<usize> = tier.iter().copied().filter(|i| !not.contains(i)).collect();
+        let rest: Vec<usize> =
+            tier.iter().copied().filter(|&i| !not.contains(&i) && !self.banned_for_good(group, i)).collect();
         if self.ranks() {
             return self.rank_order(&rest, group).first().copied();
         }
@@ -3099,7 +3122,8 @@ impl Pool {
 
         // indexing servers only: one with `index: false` (a metered block
         // account) is for article lookups, never a group's home
-        let indexing: Vec<usize> = self.indexing_servers().into_iter().filter(|&i| i != prefer).collect();
+        let indexing: Vec<usize> =
+            self.indexing_servers().into_iter().filter(|&i| i != prefer && !self.banned_for_good(group, i)).collect();
         let order = if self.ranks() { self.rank_order(&indexing, group) } else { self.ranked(&indexing, group) };
         for i in order {
             if let Ok(r) = self.select_on(i, group).await {
@@ -5923,12 +5947,75 @@ mod ranked_tests {
         assert!(p.banned("g", 2));
         assert_eq!(p.pick_server("g"), 1);
         assert_eq!(p.pick_server("h"), 2, "other groups stay on the best");
-        // banned from every server, a group still gets one
+        assert_eq!(p.server_for_in(&[0, 1, 2], "g"), Some(1));
+        // banned by config from every server, a group gets none, and none to fail over to
         let all = IndexingConfig {
             ban: vec![("g".into(), vec!["a.example".into(), "b.example".into(), "c.example".into()])],
             ..prefer(&["c.example"])
         };
-        assert_eq!(pool(&all, None).rank_order(&[0, 1, 2], "g").len(), 3);
+        let p = pool(&all, None);
+        assert!(p.rank_order(&[0, 1, 2], "g").is_empty());
+        assert_eq!(p.server_for_in(&[0, 1, 2], "g"), None);
+        assert_eq!(p.fallback_in(&[0, 1, 2], "g", &[]), None);
+        assert!(p.homes_of("g").is_empty());
+        // banned by config from the one left, a group fails over to no other
+        let some = IndexingConfig { ban: vec![("g".into(), vec!["a.example".into()])], ..prefer(&["c.example"]) };
+        assert_eq!(pool(&some, None).fallback_in(&[0, 1, 2], "g", &[1, 2]), None);
+    }
+
+    #[test]
+    fn strikes_on_every_server_left_still_leave_a_group_one() {
+        let p = pool(&prefer(&["c.example"]), None);
+        for i in 0..3 {
+            for _ in 0..BAN_STRIKES {
+                p.strike("g", i, "failed");
+            }
+        }
+        assert!((0..3).all(|i| p.banned("g", i)));
+        assert_eq!(p.rank_order(&[0, 1, 2], "g").len(), 3, "banned for a while only: still read");
+        assert!(p.server_for_in(&[0, 1, 2], "g").is_some());
+        // a config ban counts even then
+        let cfg = IndexingConfig { ban: vec![("g".into(), vec!["a.example".into()])], ..prefer(&["c.example"]) };
+        let p = pool(&cfg, None);
+        for i in 1..3 {
+            for _ in 0..BAN_STRIKES {
+                p.strike("g", i, "failed");
+            }
+        }
+        assert_eq!(p.rank_order(&[0, 1, 2], "g").len(), 2);
+        assert!(!p.rank_order(&[0, 1, 2], "g").contains(&0));
+    }
+
+    #[test]
+    fn a_config_ban_alone_counts_without_ranking() {
+        let cfg = IndexingConfig { ban: vec![("g".into(), vec!["c.example".into()])], ..Default::default() };
+        let p = pool(&cfg, None);
+        assert!(!p.ranks(), "a ban alone doesnt rank");
+        assert!(p.banned("g", 2));
+        let groups: Vec<String> = (0..200).map(|i| format!("alt.binaries.g{i}")).collect();
+        let off = pool(&IndexingConfig::default(), None);
+        assert!(groups.iter().any(|g| off.pick_server(g) == 2), "c gets groups when nothing bans them");
+        let all = [0, 1, 2];
+        let p = pool(
+            &IndexingConfig {
+                ban: groups.iter().map(|g| (g.clone(), vec!["c.example".into()])).collect(),
+                ..Default::default()
+            },
+            None,
+        );
+        for g in &groups {
+            assert_ne!(p.pick_server(g), 2, "{g} kept off c");
+            assert!(!p.homes_of(g).contains(&2));
+            assert_ne!(p.fallback_in(&all, g, &[0]), Some(2));
+        }
+        assert_eq!(p.fallback_in(&all, "alt.binaries.g0", &[0, 1]), None);
+        // and banned from every server, the group isn't read
+        let every = IndexingConfig {
+            ban: vec![("g".into(), vec!["a.example".into(), "b.example".into(), "c.example".into()])],
+            ..Default::default()
+        };
+        assert_eq!(pool(&every, None).server_for_in(&all, "g"), None);
+        assert!(pool(&every, None).homes_of("g").is_empty());
     }
 
     #[test]

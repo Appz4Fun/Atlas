@@ -386,9 +386,9 @@ impl Scheduler {
 
         failed.retain(|_, parked| parked.since.elapsed() < FAILED_RETRY);
         wait.retain(|_, until| *until > now);
-        // the server a group's passes go to: a parked one's stand-in
+        // the server a group's passes go to: a parked one's stand-in. none when config bans it from every server left
         let on = |g: &String| match failed.get(g) {
-            None => Some(pool.pick_server_in(&tier, g)),
+            None => pool.server_for_in(&tier, g),
             Some(parked) => pool.fallback_in(&tier, g, &parked.servers),
         };
         let free = |g: &String| !busy.contains_key(g) && !wait.contains_key(g) && on(g) == Some(server);
@@ -653,7 +653,8 @@ async fn take_chunk(sched: &Scheduler, server: usize, db: &Db) -> Option<crate::
     };
     let mode = sched.settings.read().unwrap().mode.clone();
     let mut groups = chunk_groups(&mode, &sched.groups.read().unwrap(), &skip);
-    // by rank, a server a group is banned from takes none of its day chunks either (`Pool::banned`)
+    // a server a group is banned from takes none of its day chunks either (`Pool::banned`): by config, ranked or not,
+    // and by rank for a while
     groups.retain(|g| !sched.ctx.pool.banned(g, server));
     if groups.is_empty() {
         return None;
@@ -687,7 +688,7 @@ async fn take_sweep(sched: &Scheduler, server: usize, db: &Db) -> Option<String>
     let mode = sched.settings.read().unwrap().mode.clone();
     let groups: Vec<String> = chunk_groups(&mode, &sched.groups.read().unwrap(), &skip)
         .into_iter()
-        .filter(|g| sched.ctx.pool.pick_server_in(&tier, g) != server)
+        .filter(|g| sched.ctx.pool.pick_server_in(&tier, g) != server && !sched.ctx.pool.banned_for_good(g, server))
         .collect();
     let found = match crate::indexer::sweep_to_take(db, sched.ctx.pool.host(server), groups).await {
         Ok(found) => found,
@@ -1685,6 +1686,40 @@ mod tests {
             assert!(take_sweep(&sched, server, &db).await.is_none());
             assert!(matches!(take_chunk(&sched, server, &db).await, Some(c) if c.group == "busy"));
         });
+    }
+
+    /// a config `ban` alone, without ranking: the banned server takes none of the group's live passes or day chunks,
+    /// and banned from every server the group isn't read at all
+    #[test]
+    fn a_config_ban_alone_keeps_a_group_off_a_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("atlas.db");
+        db::create_db_at(&main).unwrap();
+        let ban = |hosts: &[&str]| crate::config::IndexingConfig {
+            ban: vec![("g".into(), hosts.iter().map(|h| h.to_string()).collect())],
+            ..Default::default()
+        };
+        let servers = [UsenetServer::new("a.test", "u", "p", 119), UsenetServer::new("b.test", "u", "p", 119)];
+        let home = Pool::new(&servers).pick_server("g");
+        let pool = Pool::new(&servers).with_ranking(&ban(&[servers[home].host.as_str()]), None);
+        assert!(!pool.ranks());
+        let conn = db::open_at(&main).unwrap();
+        crate::chunks::add(&conn, "g", 20_000, 10_000).unwrap();
+        let mut sched = scheduler(pool, vec!["g".into()]);
+        sched.plan = vec![(0, 1), (1, 1)];
+        assert_eq!(sched.take_group(home), None, "not on the server it's banned from");
+        assert_eq!(sched.take_group(1 - home).as_deref(), Some("g"));
+        let db = shared_db(conn);
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            assert!(take_chunk(&sched, home, &db).await.is_none(), "none of its day chunks either");
+            assert!(matches!(take_chunk(&sched, 1 - home, &db).await, Some(c) if c.group == "g"));
+        });
+
+        let pool = Pool::new(&servers).with_ranking(&ban(&["a.test", "b.test"]), None);
+        let mut sched = scheduler(pool, vec!["g".into()]);
+        sched.plan = vec![(0, 1), (1, 1)];
+        assert_eq!((sched.take_group(0), sched.take_group(1)), (None, None), "banned from both: not read");
     }
 
     /// home groups that keep every worker busy dont hold a due sweep off

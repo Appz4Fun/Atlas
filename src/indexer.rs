@@ -955,7 +955,15 @@ fn cursors_or_adopted(
 /// (`read_through`): the first article posted `TIME_CURSOR_MARGIN` before the time it's read through, never before
 /// `own`, the server's own cursor. `own` as it is when `server` is about as far, or it was already moved up to that
 /// time (`RunStates::aligned`, soo a server where nothing new turns up isn't searched again every pass). None with
-/// time cursors off, or when no other server read the group: then a cursor starts at the newest article as always.
+/// time cursors off, or when no other server read the group (none it may move up to): then a new cursor starts at the
+/// newest article as always, and an own one stays where it is (or jumps to the newest, from the top).
+///
+/// An own cursor (unless `jump`, a stand-in's start from the top, which leaves what's below it to the group's home
+/// anyway) moves up only when its own row is read through, and only to rows that began reading
+/// (`db::set_start_posted`) by the time it's read through itself, give or take the margin: else what's between its
+/// cursor and where the other row began would be read by nobody. With the cursor, the time it starts reading from
+/// when it's started or moved up by date (for `db::set_start_posted`).
+#[allow(clippy::too_many_arguments)]
 async fn time_cursor_start(
     ctx: &PassContext,
     db: &Db,
@@ -964,33 +972,44 @@ async fn time_cursor_start(
     server: usize,
     (first, last): (i64, i64),
     own: Option<i64>,
-) -> Result<Option<i64>> {
+    jump: bool,
+) -> Result<Option<(i64, Option<i64>)>> {
     if !ctx.pool.time_cursors() || last < first.max(1) {
         return Ok(None);
     }
+    let guarded = own.is_some() && !jump;
     let (g, k) = (group.to_string(), key.to_string());
-    let (others, here) = on_db(db, move |conn| Ok(read_through(conn, &g, &k)?)).await?;
+    let (others, here) = on_db(db, move |conn| {
+        let (others, here) = read_through(conn, &g, &k)?;
+        Ok(match (guarded, here) {
+            (true, Some(h)) => (read_through_since(conn, &g, &k, h + TIME_CURSOR_MARGIN)?, here),
+            (true, None) => (None, None),
+            (false, _) => (others, here),
+        })
+    })
+    .await?;
     let Some(through) = others else { return Ok(None) };
     let target = through - TIME_CURSOR_MARGIN;
     if let Some(own) = own
         && (here.is_some_and(|h| h >= target) || ctx.states.aligned(key) == Some(through))
     {
-        return Ok(Some(own));
+        return Ok(Some((own, None)));
     }
     let at = ctx.pool.article_at(server, group, first as u64, last as u64, target).await? as i64;
     ctx.states.set_aligned(key, through);
     let found = (at - 1).clamp(first - 1, last);
     let start = own.map_or(found, |own| own.max(found));
-    if Some(start) != own {
-        let when = chrono::DateTime::from_timestamp(through, 0).map(|d| d.format("%Y-%m-%d %H:%M").to_string());
-        println!(
-            "[CURSOR] {group}: {} goes on from {start}, where it's read through elsewhere ({} UTC){}",
-            ctx.pool.host(server),
-            when.unwrap_or_default(),
-            own.map(|o| format!(", its own cursor was {o}")).unwrap_or_default(),
-        );
+    if Some(start) == own {
+        return Ok(Some((start, None)));
     }
-    Ok(Some(start))
+    let when = chrono::DateTime::from_timestamp(through, 0).map(|d| d.format("%Y-%m-%d %H:%M").to_string());
+    println!(
+        "[CURSOR] {group}: {} goes on from {start}, where it's read through elsewhere ({} UTC){}",
+        ctx.pool.host(server),
+        when.unwrap_or_default(),
+        own.map(|o| format!(", its own cursor was {o}")).unwrap_or_default(),
+    );
+    Ok(Some((start, Some(target))))
 }
 
 /// How far before the time a group is read through a server that hasn't been reading it starts
@@ -1012,6 +1031,22 @@ pub fn read_through(conn: &Connection, group: &str, key: &str) -> Result<(Option
            and high_posted is not null and live_cursor is not null and high_article <= live_cursor",
         rusqlite::params![prefix, group, key],
         |r| Ok((r.get(0)?, r.get(1)?)),
+    )?)
+}
+
+/// `read_through`'s time on the other servers, from only the rows that began reading (`db::set_start_posted`) at or
+/// before `began_by`: what an own cursor read through up to then may move up to. A row from before that was kept
+/// counts as begun long ago.
+pub fn read_through_since(conn: &Connection, group: &str, key: &str, began_by: i64) -> Result<Option<i64>> {
+    let prefix = format!("{group}@");
+    Ok(conn.query_row(
+        "select max(high_posted)
+         from groups
+         where (name = ?2 or substr(name, 1, length(?1)) = ?1) and name != ?3
+           and high_posted is not null and live_cursor is not null and high_article <= live_cursor
+           and (start_posted is null or start_posted <= ?4)",
+        rusqlite::params![prefix, group, key, began_by],
+        |r| r.get(0),
     )?)
 }
 
@@ -1069,20 +1104,35 @@ where
     // whose own cursor fell behind while others read it moves up to it
     let state = match load_cursors(ctx, db, &key, group, server).await? {
         Some(mut s) if settings.fallback && settings.from_top && last >= s.live_cursor => {
-            let to = time_cursor_start(ctx, db, group, &key, server, (first, last), Some(s.live_cursor)).await?;
-            let to = to.unwrap_or(last);
+            let to = time_cursor_start(ctx, db, group, &key, server, (first, last), Some(s.live_cursor), true).await?;
+            let (to, began) = to.unwrap_or((last, Some(chrono::Utc::now().timestamp())));
+            let began = began.filter(|_| to != s.live_cursor);
             let k = key.clone();
-            on_db(db, move |conn| Ok(db::update_live_cursor(conn, &k, to)?)).await?;
+            on_db(db, move |conn| {
+                db::update_live_cursor(conn, &k, to)?;
+                if let Some(b) = began {
+                    db::set_start_posted(conn, &k, b)?;
+                }
+                Ok(())
+            })
+            .await?;
             s.live_cursor = to;
             s
         }
         Some(mut s) if last >= s.live_cursor => {
-            if let Some(to) =
-                time_cursor_start(ctx, db, group, &key, server, (first, last), Some(s.live_cursor)).await?
+            if let Some((to, began)) =
+                time_cursor_start(ctx, db, group, &key, server, (first, last), Some(s.live_cursor), false).await?
                 && to > s.live_cursor
             {
                 let k = key.clone();
-                on_db(db, move |conn| Ok(db::update_live_cursor(conn, &k, to)?)).await?;
+                on_db(db, move |conn| {
+                    db::update_live_cursor(conn, &k, to)?;
+                    if let Some(b) = began {
+                        db::set_start_posted(conn, &k, b)?;
+                    }
+                    Ok(())
+                })
+                .await?;
                 s.live_cursor = to;
             }
             s
@@ -1090,9 +1140,17 @@ where
         // first time both cursors start at the top (or where it's read through, with time cursors). if the server
         // renumbered (last went backwards) the group got reset soo start over the same way
         _ => {
-            let start = time_cursor_start(ctx, db, group, &key, server, (first, last), None).await?.unwrap_or(last);
+            let (start, began) = time_cursor_start(ctx, db, group, &key, server, (first, last), None, false)
+                .await?
+                .unwrap_or((last, None));
+            let began = began.unwrap_or_else(|| chrono::Utc::now().timestamp());
             let k = key.clone();
-            on_db(db, move |conn| Ok(db::init_group_state(conn, &k, start)?)).await?;
+            on_db(db, move |conn| {
+                db::init_group_state(conn, &k, start)?;
+                db::set_start_posted(conn, &k, began)?;
+                Ok(())
+            })
+            .await?;
             if !settings.fallback {
                 ctx.states.with(group, |st| st.phase = Phase::Backfill);
             }
@@ -1548,7 +1606,12 @@ where
         Some(s) => s.backfill_cursor.min(last),
         None => {
             let k = key.clone();
-            on_db(db, move |conn| Ok(db::init_group_state(conn, &k, last)?)).await?;
+            on_db(db, move |conn| {
+                db::init_group_state(conn, &k, last)?;
+                db::set_start_posted(conn, &k, chrono::Utc::now().timestamp())?;
+                Ok(())
+            })
+            .await?;
             last
         }
     };
