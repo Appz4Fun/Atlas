@@ -1759,6 +1759,11 @@ async fn drop_older_days(db: &Db, group: &str, day: i64) {
 /// window's oldest and the window's days held enough a day, chunks for the
 /// days before it, back to the server's first post (`oldest`). Best effort:
 /// a failure is only logged.
+/// The lock a group's speculative window is changed under (`Sql::lock`).
+fn speculative_lock(group: &str) -> String {
+    format!("atlas.speculative.{group}")
+}
+
 async fn reach_further(db: &Db, group: &str, (_day, floor, oldest): (i64, i64, Option<i64>), dated: i64) {
     let first = oldest.map_or(floor, crate::chunks::unix_day);
     let g = group.to_string();
@@ -1766,7 +1771,7 @@ async fn reach_further(db: &Db, group: &str, (_day, floor, oldest): (i64, i64, O
         // read, counted and written back as one: two days of the window finishing at once would else both count
         // from the same row, on Postgres
         Ok(db.tx(|conn| -> crate::pg::sql::Result<usize> {
-            conn.lock(&format!("atlas.speculative.{g}"))?;
+            conn.lock(&speculative_lock(&g))?;
             let Some(mut s) = crate::chunks::speculative(conn, &g)? else { return Ok(0) };
             // a day of a window the reach has moved past is not the current one's
             if floor != s.runner_up_day - s.reach {
@@ -1983,16 +1988,24 @@ where
     let floor = match runner_up_day {
         Some(r) => {
             let g = group.to_string();
-            let dropped = on_db(db, move |conn| {
-                let s = match crate::chunks::speculative(conn, &g)? {
-                    Some(s) => crate::chunks::Speculative { runner_up_day: r, ..s },
-                    None => {
-                        crate::chunks::Speculative { runner_up_day: r, reach: SPECULATIVE_WINDOW, days: 0, articles: 0 }
-                    }
-                };
-                crate::chunks::set_speculative(conn, &g, &s)?;
-                let floor = r - s.reach;
-                Ok((floor, crate::chunks::drop_before(conn, &g, floor)?))
+            let dropped = on_db(db, move |db| {
+                // under the window's lock, as `reach_further` changes it: else its count or extension could be
+                // written over, and the days it just added dropped
+                Ok(db.tx(|conn| {
+                    conn.lock(&speculative_lock(&g))?;
+                    let s = match crate::chunks::speculative(conn, &g)? {
+                        Some(s) => crate::chunks::Speculative { runner_up_day: r, ..s },
+                        None => crate::chunks::Speculative {
+                            runner_up_day: r,
+                            reach: SPECULATIVE_WINDOW,
+                            days: 0,
+                            articles: 0,
+                        },
+                    };
+                    crate::chunks::set_speculative(conn, &g, &s)?;
+                    let floor = r - s.reach;
+                    Ok((floor, crate::chunks::drop_before(conn, &g, floor)?))
+                })?)
             })
             .await;
             let floor = match dropped {
