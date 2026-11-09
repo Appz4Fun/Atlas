@@ -284,9 +284,9 @@ pub const SOURCES: &[FeedSpec] = &[
     },
 ];
 
-/// Sources dropped from `SOURCES`, and why. Their ids are never reused.
-pub const RETIRED: &[(&str, &str)] =
-    &[("predb_ovh", "predb.ovh no longer resolves in DNS and never answered a request")];
+/// Sources dropped from `SOURCES`: key, id and why. Their ids are never reused.
+pub const RETIRED: &[(&str, i64, &str)] =
+    &[("predb_ovh", 6, "predb.ovh no longer resolves in DNS and never answered a request")];
 
 pub fn spec(key: &str) -> Option<&'static FeedSpec> {
     SOURCES.iter().find(|s| s.key == key)
@@ -507,6 +507,9 @@ mod tests {
             assert!(ids.insert(source.id) && keys.insert(source.key), "{}", source.key);
             assert!(source.id > 0 && source.id < 100, "100 is a file's: {}", source.key);
             assert!(source.endpoint.starts_with("https://"), "{}", source.key);
+        }
+        for (key, id, _) in RETIRED {
+            assert!(ids.insert(*id) && keys.insert(*key), "a retired source's id or key is taken: {key}");
         }
         assert_eq!(SOURCES.len(), 32);
     }

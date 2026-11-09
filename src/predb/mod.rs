@@ -109,8 +109,8 @@ fn feed_thread(shared: Arc<Shared>, fetch: Option<Arc<dyn Fetch>>) {
             }
             let Some(spec) = feeds::spec(key) else {
                 if unknown.insert(key.clone()) {
-                    match feeds::RETIRED.iter().find(|(k, _)| k == key) {
-                        Some((_, why)) => println!("predb: {key} is retired ({why}), ignoring it"),
+                    match feeds::RETIRED.iter().find(|(k, _, _)| k == key) {
+                        Some((_, _, why)) => println!("predb: {key} is retired ({why}), ignoring it"),
                         None => println!("predb: no source named {key}, ignoring it"),
                     }
                 }

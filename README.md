@@ -582,7 +582,7 @@ When you turn it on, Atlas contacts the third parties you list, and walks your e
 | `crowdnfo`, `nima4k`, `g4u`, `gabber`, `seriousaboutsound` | Each site's listing page | Recent titles | One request a poll. A site that changes its page reads as no rows, and backs off |
 | `nswdb`, `3dsdb`, `dats_pciso_1998`, `nzedb_archive` | Each one's whole catalogue | Older titles | One request a week |
 
-`predb_ovh` is retired: its domain stopped resolving. A config that still lists it logs that once and skips it. When a history page past the first answers HTTP 400 or 404, the source has run out of pages: history ends there and the poll still counts as a success. On newer pages it is still a failure.
+`predb_ovh` is retired: its domain stopped resolving. A config that still lists it logs that once and skips it. When a history page past the first answers HTTP 400 or 404, the source has run out of pages: history ends there, the log says at which page, and the poll still counts as a success. On newer pages it is still a failure.
 
 All of these go in the `predb` object:
 
