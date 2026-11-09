@@ -91,13 +91,15 @@ impl BodyFetcher {
     /// Why this body mustnt be fetched, all before any bytes move. Part 4's
     /// `fetch_prefix` asks too.
     /// A picture is refused unless `pictures`: a step that reads pictures on purpose asks for them
-    /// (`StepCtx::allow_pictures`).
+    /// (`StepCtx::allow_pictures`). Such a step only runs on a release outside the size bounds for a picture asked
+    /// for on its page (`Step::asked_for`), soo its pictures aren't held to them.
     pub(crate) fn refusal(&self, release: &ReleaseInfo, file: &str, used: i64, pictures: bool) -> Option<&'static str> {
         let c = self.config.read().unwrap();
         if filters::group_blocked(&release.group) {
             Some("blocked group")
-        } else if (release.size < c.body_min_size_bytes && !PAR2.is_match(file))
-            || (c.body_max_size_bytes > 0 && release.size > c.body_max_size_bytes)
+        } else if !(pictures && IMAGE.is_match(file))
+            && ((release.size < c.body_min_size_bytes && !PAR2.is_match(file))
+                || (c.body_max_size_bytes > 0 && release.size > c.body_max_size_bytes))
         {
             Some("outside the size bounds")
         } else if !pictures && IMAGE.is_match(file) {

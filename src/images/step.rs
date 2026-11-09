@@ -338,8 +338,8 @@ pub struct Request {
     pub requested_at: i64,
     pub done_at: Option<i64>,
     pub outcome: Option<String>,
-    /// unanswered, but the pictures step is done with its release all the same: the release was passed over (a
-    /// release turned down for reading, or one of no size), and no run will answer it
+    /// unanswered, but the pictures step isn't owed on its release all the same: the release was passed over (turned
+    /// down for reading, not complete enough yet, of no size, or the step is off), and no run is on its way to answer it
     pub passed_over: bool,
 }
 
@@ -350,7 +350,7 @@ pub fn requests(conn: &rusqlite::Connection, ids: &[i64]) -> Vec<Request> {
         let s = store::shard_of_id(id);
         let sql = format!(
             "select q.file, q.requested_at, q.done_at, q.outcome,
-                    coalesce((p.done | p.failed) & ?2 != 0 and coalesce(p.net_left, 0) & ?2 = 0, 0)
+                    (p.release_id is not null and coalesce(p.net_left, 0) & ?2 = 0)
              from s{s}.picture_requests q left join s{s}.pp_state p on p.release_id = q.release_id
              where q.release_id = ?1 order by q.file"
         );
@@ -641,6 +641,15 @@ impl Step for ImagesStep {
                 None if parts_of(file) as usize > left => {
                     unfinished |= was_asked;
                     continue;
+                }
+                // a picture asked for on the page is bounded by `left`, not by `bodies_per_release`: one bigger than
+                // that could never be read, as a run's fetches start from none
+                None if was_asked => {
+                    let used = ctx.used_bodies;
+                    ctx.used_bodies = 0;
+                    let body = crate::archive::steps::whole_file_within(ctx, file, &mut left, max_bytes);
+                    ctx.used_bodies = used;
+                    body?
                 }
                 None => crate::archive::steps::whole_file_within(ctx, file, &mut left, max_bytes)?,
             };

@@ -806,6 +806,7 @@ impl Inner {
             }
             if step.needs() == Needs::Bodies {
                 match rules::body_gate(rules, &facts(&row), &summary) {
+                    BodyGate::Outside if step.asked_for(conn, row.info.id) => {}
                     BodyGate::Outside => {
                         a.set_done |= bit;
                         done |= bit;

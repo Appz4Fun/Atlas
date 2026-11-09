@@ -51,6 +51,8 @@ const PICTURE_NAMES: &[&str] = &[
 const MAX_SHORT: usize = 2;
 /// Leading characters two posters' local parts share, at least, to be one upload's when they aren't the same.
 const POSTER_PREFIX: usize = 8;
+/// Index entries read, at most, for one range the thumbnail lookup scans.
+const SCANNED: usize = 4_096;
 
 static FILE_COUNTER: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"\[(\d+)\s*/\s*(\d+)\]").unwrap());
 
@@ -83,10 +85,12 @@ pub fn by_name(ctx: &mut StepCtx<'_>, files: &[FileInfo], picture_found: bool) -
         }
         out.matched = true;
         if crate::probe::nfo_store::stored(ctx.conn(), me.id).is_none() {
-            // one that can't be read now is read on a later run: a wait here would hold back the release's later
-            // steps, and the reruns this run asks for
-            if let NfoRead::Text(text) = read_nfo(ctx, &file)? {
-                out.writes.push(crate::probe::nfo_store::keep(me.id, &file.filename, &text));
+            // one that can't be read now (out of budget, a server down) is read on a later run: the step waits, which
+            // holds back none of the release's later steps, and keeps the reruns this run asks for
+            match read_nfo(ctx, &file)? {
+                NfoRead::Text(text) => out.writes.push(crate::probe::nfo_store::keep(me.id, &file.filename, &text)),
+                NfoRead::Later => out.wait_until = Some(chrono::Utc::now().timestamp() + RESUME_SECS),
+                NfoRead::Never => {}
             }
         }
     }
@@ -344,50 +348,72 @@ fn thumbnail_beside(
     let by_poster = conn
         .query_row("select 1 from sqlite_master where type = 'index' and name = 'idx_release_poster'", [], |_| Ok(()))
         .is_ok();
-    let mut found: Vec<(i64, String, Option<String>, Option<f64>)> = Vec::new();
-    let mut look = |sql: &str, key: &str| -> Result<(), StepError> {
+    // ids from an index alone (its entries hold the id), near this release's, reading at most `SCANNED` entries: a
+    // range of a busy poster, or of a name every upload's thumbnail has, can't cost more than that
+    let mut ids: Vec<i64> = Vec::new();
+    let mut scan = |sql: &str, values: &[&dyn rusqlite::ToSql]| -> Result<(), StepError> {
         let mut stmt = conn.prepare_cached(sql).map_err(retry)?;
-        let rows = stmt
-            .query_map(params![key, low, high, me, posted, from, to], |r| {
-                Ok((r.get(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default(), r.get(2)?, r.get(3)?))
-            })
-            .map_err(retry)?;
-        for row in rows {
-            found.push(row.map_err(retry)?);
+        let mut rows = stmt.query(values).map_err(retry)?;
+        let mut read = 0;
+        while let Some(row) = rows.next().map_err(retry)? {
+            let id: i64 = row.get(0).map_err(retry)?;
+            if (low..=high).contains(&id) && id != me && !ids.contains(&id) {
+                ids.push(id);
+            }
+            read += 1;
+            if read >= SCANNED {
+                break;
+            }
         }
         Ok(())
     };
-    const COLUMNS: &str =
-        "select r.id, r.name, r.poster, abs(julianday(r.posted_date) - julianday(?5)) from releases r";
-    const NEAR: &str = "r.id between ?2 and ?3 and r.id != ?4 and +r.posted_date between ?6 and ?7";
+    let bare = |poster: &str| -> Option<String> {
+        let (local, _) = poster.split_once('@')?;
+        (local.len() >= POSTER_PREFIX + 2 && !local.contains(['<', ' ', '"']))
+            .then(|| local[..POSTER_PREFIX].to_string())
+    };
     if by_poster {
         for poster in posters {
-            look(&format!("{COLUMNS} indexed by idx_release_poster where r.poster = ?1 and {NEAR}"), poster)?;
+            // the poster itself, sought to the ids near this release's
+            scan(
+                "select id from releases indexed by idx_release_poster where poster = ?1 and id between ?2 and ?3",
+                &[poster, &low, &high],
+            )?;
             // a bare address: the rows sharing its local part's prefix, as a tool makes one up per upload
-            if let Some(prefix) = poster
-                .split('@')
-                .next()
-                .filter(|local| local.len() >= POSTER_PREFIX + 2 && !local.contains(['<', ' ']) && poster.contains('@'))
-                .and_then(|local| local.get(..POSTER_PREFIX))
-            {
-                look(
-                    &format!(
-                        "{COLUMNS} indexed by idx_release_poster
-                         where r.poster >= ?1 and r.poster < ?1 || char(127) and {NEAR}"
-                    ),
-                    prefix,
+            if let Some(prefix) = bare(poster) {
+                scan(
+                    "select id from releases indexed by idx_release_poster where poster >= ?1 and poster < ?1 || char(127)",
+                    &[&prefix],
                 )?;
             }
         }
-    } else {
-        // a shard without the poster index (`--search-indexes`): by name, its index's ids bounding the rows read
+    }
+    // a shard without the poster index (`--search-indexes`), or a poster written `Name <address>`, whose made-up
+    // address no range of the poster column reaches: by name
+    if !by_poster || posters.iter().any(|p| p.contains('<')) {
         for name in PICTURE_NAMES {
             let mut chars = name.chars();
             let upper = chars.next().map(|c| c.to_ascii_uppercase().to_string() + chars.as_str()).unwrap_or_default();
             for name in [*name, upper.as_str()] {
-                look(&format!("{COLUMNS} where r.name >= ?1 and r.name < ?1 || char(127) and {NEAR}"), name)?;
+                scan("select id from releases where name >= ?1 and name < ?1 || char(127)", &[&name])?;
             }
         }
+    }
+    let mut found: Vec<(i64, String, Option<String>, Option<f64>)> = Vec::new();
+    let mut stmt = conn
+        .prepare_cached(
+            "select id, name, poster, abs(julianday(posted_date) - julianday(?2)) from releases
+             where id = ?1 and posted_date between ?3 and ?4",
+        )
+        .map_err(retry)?;
+    for id in ids {
+        let row = stmt
+            .query_row(params![id, posted, from, to], |r| {
+                Ok((r.get(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default(), r.get(2)?, r.get(3)?))
+            })
+            .optional()
+            .map_err(retry)?;
+        found.extend(row);
     }
     let mut seen: HashSet<i64> = HashSet::new();
     let mut best: Option<(f64, i64)> = None;

@@ -4147,7 +4147,7 @@ fn picture_state(
     }
     match requests.iter().filter(|q| q.file == name).max_by_key(|q| q.requested_at) {
         Some(q) if q.done_at.is_none() && q.passed_over => {
-            PictureState::Failed("this release isn't read for pictures".to_string())
+            PictureState::Failed("the pictures step isn't reading this release".to_string())
         }
         Some(q) if q.done_at.is_none() => PictureState::Queued(
             crate::web_pending::step_eta(q.release_id, "images").unwrap_or_else(|| "soon".to_string()),
