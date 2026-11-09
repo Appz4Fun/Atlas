@@ -446,7 +446,7 @@ pub fn frontier(db: &dyn Sql, groups: &[(String, i64)], now: i64) -> Result<Opti
          select max(day) from newest",
         resting = not_resting(now)
     );
-    db.one(&sql, &group_values(groups))
+    first(db.query_uncached(&sql, &group_values(groups))?)?.map_or(Ok(None), |r| r.get(0))
 }
 
 /// The oldest day any of `groups` still has to do or is doing, from each one's `oldest` on: (group, first day). The
@@ -472,7 +472,7 @@ pub fn frontier_oldest(db: &dyn Sql, groups: &[(String, i64)], now: i64) -> Resu
          select min(day) from oldest",
         resting = not_resting(now)
     );
-    db.one(&sql, &group_values(groups))
+    first(db.query_uncached(&sql, &group_values(groups))?)?.map_or(Ok(None), |r| r.get(0))
 }
 
 /// Groups the big releases the indexer is after mostly come from, at least `MEDIA_MIN` each: their backfill goes
@@ -519,6 +519,9 @@ fn claim_wanted(db: &dyn Sql, groups: &[(String, i64)], host: &str, now: i64) ->
              join backfill_chunks c on c.grp = r.grp and c.day = r.day
              where c.day >= w.oldest and (c.state = {PENDING} or (c.state = {CLAIMED} and c.claimed_at < ${d}))
              order by c.day desc, c.grp limit 1)
+           -- picked from the rows as they were when this began: on Postgres another connection's finish or reach
+           -- back may have changed it since, and only this is checked again then
+           and (state = {PENDING} or (state = {CLAIMED} and claimed_at < ${d}))
          returning grp, day, coalesce(reread, 0)",
         a = n + 1,
         b = n + 2,
@@ -583,6 +586,8 @@ fn claim_ordered(
          where (grp, day) = (
              select grp, day from best where day is not null
              order by day {best}, media desc, grp limit 1)
+           -- as in `claim_wanted`: still claimable when the update gets to it
+           and (state = {PENDING} or (state = {CLAIMED} and claimed_at < ${stale}))
          returning grp, day, coalesce(reread, 0)",
         resting = not_resting(now),
         stale = n + 1,
@@ -603,10 +608,18 @@ fn claim_ordered(
 fn claim_one(db: &dyn Sql, sql: &str, values: &[crate::pg::sql::Value], host: &str, now: i64) -> Result<Option<Claim>> {
     let row = db.tx(|tx| {
         tx.lock("atlas.backfill_claim")?;
-        tx.row(sql, values)
+        Ok(tx.query_uncached(sql, values)?.into_iter().next())
     })?;
     let Some(r) = row else { return Ok(None) };
     Ok(Some(Claim { group: r.get(0)?, day: r.get(1)?, server: host.to_string(), claimed_at: now, reread: r.get(2)? }))
+}
+
+/// The first of `rows`; an error past one, which a query here never returns.
+fn first(rows: Vec<crate::pg::sql::Row>) -> Result<Option<crate::pg::sql::Row>> {
+    match rows.len() {
+        0 | 1 => Ok(rows.into_iter().next()),
+        n => Err(crate::pg::sql::Error::Value(format!("{n} rows where one was expected"))),
+    }
 }
 
 /// SQL: `n` rows of a `values` list of parameters cast to `types`, numbered on from `$first + 1`. Cast, as
@@ -662,7 +675,7 @@ fn reopens() -> String {
 /// read dropped and a later build keeps, as the headers of uploads obfuscated per article (`xref`). Articles saved
 /// already are passed over on the second read. A day put back once isn't put back again (`reread`). The count.
 pub fn reopen_done(db: &dyn Sql, since: i64, done_before: Option<i64>, groups: &[String]) -> Result<usize> {
-    db.execute(
+    db.execute_uncached(
         &format!(
             "{staged}
              update backfill_chunks set state = {PENDING}, server = null, claimed_at = null, done_at = null,
@@ -680,24 +693,24 @@ pub fn reopen_done(db: &dyn Sql, since: i64, done_before: Option<i64>, groups: &
 pub fn done_since(db: &dyn Sql, since: i64, done_before: Option<i64>, groups: &[String]) -> Result<(i64, i64, i64)> {
     let values = staged_values(since, done_before, groups);
     let staged = staged(groups);
-    let r = db
-        .row(
-            &format!(
-                "{staged} select count(*), count(distinct grp) from backfill_chunks where {reopens}",
-                reopens = reopens()
-            ),
-            &values,
-        )?
-        .unwrap_or_default();
+    let r = first(db.query_uncached(
+        &format!(
+            "{staged} select count(*), count(distinct grp) from backfill_chunks where {reopens}",
+            reopens = reopens()
+        ),
+        &values,
+    )?)?
+    .unwrap_or_default();
     let (chunks, over) = (r.get(0)?, r.get(1)?);
     // `not in` a list holding the null of no groups is never true: none staged leaves every done chunk out
-    let untracked = db.one(
+    let untracked = first(db.query_uncached(
         &format!(
             "{staged} select count(*) from backfill_chunks
              where {DONE_SINCE} and grp not in (select name from staged where name is not null)"
         ),
         &values,
-    )?;
+    )?)?
+    .map_or(Ok(0), |r| r.get(0))?;
     Ok((chunks, over, untracked))
 }
 
@@ -1510,7 +1523,7 @@ mod tests {
         assert_eq!(claim(&c_c, &groups, "c", 1000).unwrap(), None);
     }
 
-    /// Postgres's claim takes a row lock: workers claiming at once on their own connections each get a day of
+    /// Claims on Postgres take turns (`Sql::lock`): workers claiming at once on their own connections each get a day of
     /// their own, none twice
     #[test]
     fn claims_at_once_on_postgres_get_a_day_each() {

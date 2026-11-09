@@ -234,6 +234,15 @@ pub trait Sql {
     fn execute(&self, sql: &str, params: &[Value]) -> Result<usize>;
     /// Every row a query returns.
     fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>>;
+    /// `execute` for a statement whose text is built per call (a list of n values, a time written in): not kept
+    /// in SQLite's statement cache, where it would push out the statements run over and over.
+    fn execute_uncached(&self, sql: &str, params: &[Value]) -> Result<usize> {
+        self.execute(sql, params)
+    }
+    /// `query` for a query whose text is built per call (see `execute_uncached`).
+    fn query_uncached(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>> {
+        self.query(sql, params)
+    }
     /// Statements without parameters, `;`-separated.
     fn batch(&self, sql: &str) -> Result<()>;
     /// Whether the table exists (in the schema queries name tables in).
@@ -331,7 +340,14 @@ pub fn sqlite_sql(sql: &str) -> std::borrow::Cow<'_, str> {
                 out.push_str(&sql[i..end]);
                 i = end;
             }
-            b'$' if b.get(i + 1).is_some_and(u8::is_ascii_digit) => {
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                let end = sql[i + 2..].find("*/").map_or(b.len(), |n| i + 2 + n + 2);
+                out.push_str(&sql[i..end]);
+                i = end;
+            }
+            b'$' if b.get(i + 1).is_some_and(u8::is_ascii_digit)
+                && !(i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_')) =>
+            {
                 out.push('?');
                 i += 1;
             }
@@ -371,6 +387,21 @@ fn sqlite_value(v: rusqlite::types::ValueRef<'_>) -> Result<Value> {
     })
 }
 
+fn sqlite_rows(stmt: &mut rusqlite::Statement<'_>, params: &[Value]) -> Result<Vec<Row>> {
+    let n = stmt.column_count();
+
+    let mut rows = stmt.query(rusqlite::params_from_iter(params))?;
+    let mut out = Vec::new();
+    while let Some(r) = rows.next()? {
+        let mut row = Vec::with_capacity(n);
+        for i in 0..n {
+            row.push(sqlite_value(r.get_ref(i)?)?);
+        }
+        out.push(Row(row));
+    }
+    Ok(out)
+}
+
 impl Sql for rusqlite::Connection {
     fn dialect(&self) -> Dialect {
         Dialect::Sqlite
@@ -381,18 +412,15 @@ impl Sql for rusqlite::Connection {
     }
 
     fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>> {
-        let mut stmt = self.prepare_cached(&sqlite_sql(sql))?;
-        let n = stmt.column_count();
-        let mut rows = stmt.query(rusqlite::params_from_iter(params))?;
-        let mut out = Vec::new();
-        while let Some(r) = rows.next()? {
-            let mut row = Vec::with_capacity(n);
-            for i in 0..n {
-                row.push(sqlite_value(r.get_ref(i)?)?);
-            }
-            out.push(Row(row));
-        }
-        Ok(out)
+        sqlite_rows(&mut *self.prepare_cached(&sqlite_sql(sql))?, params)
+    }
+
+    fn execute_uncached(&self, sql: &str, params: &[Value]) -> Result<usize> {
+        Ok(self.prepare(&sqlite_sql(sql))?.execute(rusqlite::params_from_iter(params))?)
+    }
+
+    fn query_uncached(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>> {
+        sqlite_rows(&mut self.prepare(&sqlite_sql(sql))?, params)
     }
 
     fn batch(&self, sql: &str) -> Result<()> {
@@ -431,6 +459,12 @@ impl Sql for rusqlite::Transaction<'_> {
     fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>> {
         Sql::query(&**self, sql, params)
     }
+    fn execute_uncached(&self, sql: &str, params: &[Value]) -> Result<usize> {
+        Sql::execute_uncached(&**self, sql, params)
+    }
+    fn query_uncached(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>> {
+        Sql::query_uncached(&**self, sql, params)
+    }
     fn batch(&self, sql: &str) -> Result<()> {
         Sql::batch(&**self, sql)
     }
@@ -467,8 +501,15 @@ impl postgres::types::ToSql for Value {
                 Type::FLOAT4 => (*f as f32).to_sql(ty, out),
                 _ => Err(format!("a number for a parameter of type {ty}").into()),
             },
-            Value::Text(s) => s.as_str().to_sql(ty, out),
-            Value::Blob(b) => b.as_slice().to_sql(ty, out),
+            // their bytes are taken as is by any type: an 8-byte text for a bigint would read as a number
+            Value::Text(s) => match *ty {
+                Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME | Type::UNKNOWN => s.as_str().to_sql(ty, out),
+                _ => Err(format!("text for a parameter of type {ty}").into()),
+            },
+            Value::Blob(b) => match *ty {
+                Type::BYTEA => b.as_slice().to_sql(ty, out),
+                _ => Err(format!("a blob for a parameter of type {ty}").into()),
+            },
         }
     }
 
@@ -629,6 +670,7 @@ mod tests {
         assert_eq!(sqlite_sql("select 'it''s $1', $2"), "select 'it''s $1', ?2");
         assert_eq!(sqlite_sql("select 'é', $1"), "select 'é', ?1");
         assert_eq!(sqlite_sql("select $x"), "select $x");
+        assert_eq!(sqlite_sql("select /* $1 */ a$1, $2"), "select /* $1 */ a$1, ?2");
     }
 
     fn check(db: &dyn Sql) {
@@ -674,6 +716,11 @@ mod tests {
         });
         assert!(r.is_err());
         assert_eq!(db.one::<i64>("select count(*) from t", vals![]).unwrap(), 3);
+        assert_eq!(db.query_uncached("select k from t where n = $1", vals![10i64]).unwrap().len(), 1);
+        if db.dialect() == Dialect::Postgres {
+            // text is never taken for a number's bytes
+            assert!(db.one::<i64>("select count(*) from t where n = $1", vals!["20000101"]).is_err());
+        }
     }
 
     #[test]
