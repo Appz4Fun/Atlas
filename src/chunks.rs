@@ -159,6 +159,7 @@ pub fn reach_back(db: &dyn Sql, group: &str, oldest_day: i64, oldest_at: i64) ->
     db.tx(|tx| {
         // what's added depends on the window's floor: read as it is, not as it was before a change to it commits
         tx.lock(&speculative_lock(group))?;
+        tx.write_first("backfill_chunks", "state")?;
         let Some(old) = self::oldest_day(tx, group)? else { return Ok(0) };
         // never past the window of days only the deepest server has
         let spec = speculative(tx, group)?;
@@ -531,10 +532,7 @@ fn claim_wanted(db: &dyn Sql, groups: &[(String, i64)], host: &str, now: i64) ->
     let stale = now - CLAIM_TIMEOUT;
     let row = db.tx(|tx| {
         tx.lock("atlas.backfill_claim")?;
-        // a write first, soo SQLite takes the main database's write lock now, waiting its turn: a deferred
-        // transaction that reads first fails at once (no busy wait) when another connection wrote in between. Not
-        // `begin immediate`, which would lock every attached shard too
-        tx.execute("update backfill_wanted set at = at where 0 = 1", vals![])?;
+        tx.write_first("backfill_chunks", "state")?;
         // the days asked for alone, each claimed by its key below: joined to the chunks, SQLite's plan (no stats for
         // the small table) scanned all of backfill_chunks by its day index first
         let asked = tx.query("select grp, day from backfill_wanted order by day desc, grp", vals![])?;

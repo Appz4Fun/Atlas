@@ -301,6 +301,17 @@ impl dyn Sql + '_ {
         Ok(())
     }
 
+    /// In a transaction on SQLite, takes the write lock of `table`'s database now, waiting its turn as any write
+    /// does: a deferred transaction that reads before it writes fails at once (no busy wait) when another connection
+    /// wrote in between, in WAL. Not `begin immediate`, which would lock every attached database too. `column` is
+    /// any of the table's columns. Nothing on Postgres, where `lock` serializes what needs it.
+    pub fn write_first(&self, table: &str, column: &str) -> Result<()> {
+        if self.dialect() == Dialect::Sqlite {
+            self.execute(&format!("update {table} set {column} = {column} where 0 = 1"), &[])?;
+        }
+        Ok(())
+    }
+
     /// `f`'s answer, run in a transaction (see `Sql::transaction`).
     pub fn tx<T>(&self, f: impl FnOnce(&dyn Sql) -> Result<T>) -> Result<T> {
         let mut f = Some(f);
