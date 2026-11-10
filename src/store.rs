@@ -771,7 +771,7 @@ const PART_BLOCK_RECORD: usize = PART_BLOCK_BYTES + 1;
 const LEGACY_PART_LIMIT: i64 = 100_000;
 
 fn sparse_parts(bits: &[u8]) -> bool {
-    bits.last() == Some(&0) && bits.len() % PART_BLOCK_RECORD == 1
+    bits.len() > PART_BLOCK_RECORD && bits.last() == Some(&0) && bits.len() % PART_BLOCK_RECORD == 1
 }
 
 fn part_blocks(bits: &[u8]) -> impl Iterator<Item = (usize, &[u8])> {

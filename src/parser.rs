@@ -340,14 +340,13 @@ pub fn is_complete(articles: &[Article]) -> bool {
             return false;
         };
 
-        // python compared {a.part} (which can hold None) to range(1, n+1)
-        let zero_based = file_articles.iter().any(|a| a.part == Some(0));
-        let mut parts: BTreeSet<Option<i64>> = BTreeSet::new();
-        parts.extend(file_articles.iter().map(|a| a.part));
-        let wanted: BTreeSet<Option<i64>> =
-            if zero_based { (0..expected).map(Some).collect() } else { (1..=expected).map(Some).collect() };
-
-        if parts != wanted {
+        let parts: BTreeSet<_> = file_articles.iter().map(|a| a.part).collect();
+        let first = i64::from(!parts.contains(&Some(0)));
+        if expected <= 0
+            || parts.len() as i64 != expected
+            || parts.first() != Some(&Some(first))
+            || parts.last() != Some(&Some(expected - (1 - first)))
+        {
             return false;
         }
     }
@@ -390,6 +389,8 @@ mod tests {
         assert!(parse_subject(r#""a.rar" yEnc (2/1)"#).is_none());
         assert!(parse_subject(r#""a.rar" yEnc (1/1000000)"#).is_none());
         assert!(parse_subject(r#""a.rar" yEnc (1/1)"#).is_some());
+        assert!(parse_subject(r#""a.rar" yEnc (234450/234450)"#).is_some());
+        assert!(parse_subject(r#""a.rar" yEnc (1/250001)"#).is_none());
     }
 
     #[test]
