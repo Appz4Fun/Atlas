@@ -52,7 +52,17 @@ fn prepare_source_table<'source>(
     table: &str,
     names: &[&str],
 ) -> Result<rusqlite::Statement<'source>> {
-    let fields = names.iter().copied()
+    let mut columns = source.prepare("select name from pragma_table_xinfo(?1, 'main')")?;
+    for column in columns.query_map([table], |row| row.get::<_, String>(0))? {
+        let column = column?;
+        ensure!(
+            names.contains(&column.as_str()) && !(table == "meta" && column == "text_value"),
+            "unsupported SQLite column {table}.{column} would be dropped"
+        );
+    }
+    let fields = names
+        .iter()
+        .copied()
         .map(|name| match (table, name) {
             ("meta", "value") => "case when typeof(source.value) <> 'text' then source.value end".into(),
             ("meta", "text_value") => "case when typeof(source.value) = 'text' then source.value end".into(),

@@ -85,9 +85,13 @@ impl Entry {
         if !view.verify_body() {
             return None;
         }
+        Some(Self::from_view(view, offset, seq, day))
+    }
+
+    fn from_view(view: NxvBlockView<'_>, offset: u64, seq: u32, day: i64) -> Entry {
         let h = view.header;
         let meta = view.store_meta();
-        Some(Entry {
+        Entry {
             offset,
             len: h.total_block_bytes,
             rows: h.row_count,
@@ -100,14 +104,18 @@ impl Entry {
             server: meta.server_id,
             flags: h.flags,
             posters: view.poster_count(),
-        })
+        }
     }
 }
 
 /// The entry a new block gets, given where it goes (`offset`, `seq`); None when it isn't a block.
 pub fn entry_for(block: &[u8], offset: u64, seq: u32, day: i64) -> Option<Entry> {
     let aligned = nntp_xover_engine::container::AlignedBytes::from_slice(block);
-    Entry::of_block(&aligned, 0, seq, day).map(|e| Entry { offset, ..e })
+    let view = NxvBlockView::from_mmap_slice(&aligned).ok()?;
+    if !view.verify_body() || (view.is_cold() && view.verify_cold_body().is_err()) {
+        return None;
+    }
+    Some(Entry::from_view(view, offset, seq, day))
 }
 
 struct Writer {
@@ -363,6 +371,10 @@ fn heal(arena: &File, index: &File, day: i64) -> Result<(Vec<Entry>, u64, Healed
         healed.cut_arena_bytes = arena_len - end;
         arena.set_len(end)?;
         fsync_only(arena)?;
+        full_flush(arena)?;
+    }
+    if healed.rolled_forward > 0 && healed.cut_arena_bytes == 0 {
+        // A stopped process can leave complete blocks in cache before the arena's durability barrier.
         full_flush(arena)?;
     }
     if dirty {

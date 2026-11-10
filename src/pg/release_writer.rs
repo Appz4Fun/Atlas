@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 use anyhow::{Result, ensure};
 use postgres::binary_copy::BinaryCopyInWriter;
 use postgres::types::Type;
-use postgres::{Client, Transaction};
+use postgres::{Client, IsolationLevel, Transaction};
 use sha2::{Digest, Sha256};
 
 use crate::parser::{Article, Release};
@@ -62,7 +62,8 @@ pub fn save(client: &mut Client, releases: &[Release], now: i64) -> Result<SaveS
         return Ok(SaveStats::default());
     }
 
-    let mut tx = client.transaction()?;
+    // A group writer that waited on the advisory lock must see the preceding commit.
+    let mut tx = client.build_transaction().isolation_level(IsolationLevel::ReadCommitted).start()?;
     tx.batch_execute(CREATE_STAGE)?;
     let mut stats = SaveStats::default();
     for (group, releases) in groups {
@@ -341,8 +342,11 @@ const UPDATE_RELEASES_AND_QUEUE: &str = "
         select release_id, count(*) as parts, sum(bytes)::bigint as bytes, max(file_total) as file_total
         from pg_temp.atlas_release_input where release_id is not null group by release_id
     ), metadata as (
-        select distinct on (release_id) release_id, poster, posted_date, display_name, is_obfuscated
+        select distinct on (release_id) release_id, poster, posted_date, is_obfuscated
         from pg_temp.atlas_release_input where release_id is not null order by release_id, ordinal desc
+    ), display_names as (
+        select distinct on (release_id) release_id, display_name from pg_temp.atlas_release_input
+        where release_id is not null and display_name is not null order by release_id, ordinal desc
     ), completion as (
         select c.release_id, count(*) as files, bool_and(f.complete) as all_whole,
             bool_or(f.zero_file_index) as zero_indexed
@@ -353,9 +357,10 @@ const UPDATE_RELEASES_AND_QUEUE: &str = "
             complete = f.all_whole and (greatest(r.file_total, c.file_total) is null or
                 f.files = greatest(r.file_total, c.file_total) + case when f.zero_indexed then 1 else 0 end),
             poster = m.poster, posted_date = m.posted_date,
-            display_name = case when r.name_source is null then coalesce(m.display_name, r.display_name) else r.display_name end,
+            display_name = case when r.name_source is null then coalesce(d.display_name, r.display_name) else r.display_name end,
             is_obfuscated = case when r.name_source is null and not r.is_collection then m.is_obfuscated else r.is_obfuscated end
         from changes c join metadata m using (release_id) join completion f using (release_id)
+        left join display_names d using (release_id)
         where r.id = c.release_id
         returning r.id, r.complete
     )
@@ -418,6 +423,19 @@ mod tests {
             row.get::<_, i64>("due_at"),
             103 + crate::store::COMPLETE_SETTLE_SECS.load(std::sync::atomic::Ordering::Relaxed)
         );
+    }
+
+    #[test]
+    fn later_unnamed_fragments_keep_the_last_display_name_in_a_batch() {
+        let Some(test) = crate::pg::testing::Schema::new() else { return };
+        let mut client = test.pool.get().unwrap();
+        let first = release("sample", "sample.rar", "<first@example.test>", 1);
+        let mut named = release("sample", "sample.rar", "<named@example.test>", 1);
+        named.display_name = Some("Name from overview".into());
+        let last = release("sample", "sample.rar", "<last@example.test>", 2);
+        save(&mut client, &[first, named, last], 100).unwrap();
+        let row = client.query_one("select display_name from releases", &[]).unwrap();
+        assert_eq!(row.get::<_, Option<String>>(0).as_deref(), Some("Name from overview"));
     }
 
     #[test]

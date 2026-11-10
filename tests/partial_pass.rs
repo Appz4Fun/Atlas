@@ -34,7 +34,8 @@ fn a_failed_slice_keeps_the_slices_that_made_it() {
     let mut server = Server::new(posts);
     let s = Arc::get_mut(&mut server).unwrap();
     s.any_group = true;
-    *s.drop_xover_at.lock().unwrap() = Some(FAILS_AT);
+    // A closed connection is retried transparently. Refuse this slice once so the pass itself fails.
+    *s.refuse_xover.lock().unwrap() = Some((FAILS_AT, 1));
     let port = spawn_server(server.clone());
     let pool = Arc::new(Pool::new(&[mock(port, "secret", 1, 1)]));
 
@@ -62,9 +63,8 @@ fn a_failed_slice_keeps_the_slices_that_made_it() {
         pool.connect().await.unwrap();
 
         let first = run_pass(&ctx, &settings, &db, group, 0, &mut |_| {}).await;
-        assert!(first.is_err(), "the dropped XOVER fails the pass");
-        let before = (POSTS - (FAILS_AT + REQUEST - 1)) / REQUEST;
-        assert_eq!(releases(&main), before as i64, "the slices fetched before the failure are saved");
+        assert!(first.is_err(), "the refused XOVER fails the pass");
+        assert_eq!(releases(&main), (POSTS / REQUEST - 1) as i64, "every successful slice is saved");
 
         for _ in 0..20 {
             run_pass(&ctx, &settings, &db, group, 0, &mut |_| {}).await.unwrap();
@@ -76,6 +76,7 @@ fn a_failed_slice_keeps_the_slices_that_made_it() {
     });
 
     assert_eq!(releases(&main), (POSTS / REQUEST) as i64, "every slice saved");
-    // the failed one twice, the ones before it once: the cursor moved past them
-    assert_eq!(server.xovers.load(Ordering::SeqCst), (POSTS / REQUEST + 1) as usize, "slices fetched again");
+    // Only the contiguous newest slices move the cursor: retry the gap and the older slices below it.
+    let retried = (FAILS_AT + REQUEST - 1) / REQUEST;
+    assert_eq!(server.xovers.load(Ordering::SeqCst), (POSTS / REQUEST + retried) as usize, "slices fetched again");
 }

@@ -30,7 +30,7 @@ fn arg<T: std::str::FromStr>(args: &[String], flag: &str, default: T) -> T {
     args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
-fn pg_target(args: &[String]) -> Result<Option<(&str, &str)>> {
+fn pg_target(args: &[String], replay_url: Option<String>) -> Result<Option<(StorageConfig, &str)>> {
     let value = |flag: &str| -> Result<Option<&str>> {
         args.iter()
             .position(|arg| arg == flag)
@@ -50,7 +50,15 @@ fn pg_target(args: &[String]) -> Result<Option<(&str, &str)>> {
                 "--pg-schema must be a lowercase name starting with atlas_replay_"
             );
             ensure!(!database.is_empty(), "--pg-database must name the expected database");
-            Ok(Some((database, schema)))
+            let url = replay_url.filter(|url| !url.trim().is_empty()).context("set ATLAS_REPLAY_PG_URL for replay")?;
+            let config = StorageConfig {
+                backend: crate::pg::Backend::Postgres,
+                url,
+                schema: schema.to_owned(),
+                ..StorageConfig::default()
+            };
+            config.check()?;
+            Ok(Some((config, database)))
         }
         _ => anyhow::bail!("use --pg-database and --pg-schema together"),
     }
@@ -225,18 +233,7 @@ fn postgres_counts(pool: &Pool) -> Result<(i64, i64, i64, i64)> {
 fn run(args: &[String]) -> Result<()> {
     let store_dir = PathBuf::from(args.iter().skip_while(|a| *a != "--store").nth(1).context("--store DIR")?);
     let db_dir = PathBuf::from(args.iter().skip_while(|a| *a != "--db").nth(1).context("--db DIR")?);
-    let pg = pg_target(args)?
-        .map(|(database, schema)| {
-            let mut config = crate::config::storage_config();
-            if let Ok(url) = std::env::var("ATLAS_REPLAY_PG_URL") {
-                config.url = url;
-            }
-            config.schema = schema.to_owned();
-            config.backend = crate::pg::Backend::Postgres;
-            config.check()?;
-            Ok::<_, anyhow::Error>((config, database))
-        })
-        .transpose()?;
+    let pg = pg_target(args, std::env::var("ATLAS_REPLAY_PG_URL").ok())?;
     let (rows, slice, tasks, parsers) = (
         arg(args, "--rows", u64::MAX),
         arg(args, "--slice", 20_000usize),
@@ -409,12 +406,16 @@ mod tests {
     #[test]
     fn postgres_replay_requires_a_named_staging_destination() {
         let args = |words: &[&str]| words.iter().map(ToString::to_string).collect::<Vec<_>>();
-        assert!(pg_target(&args(&["--pg-database", "atlas_test"])).is_err());
-        assert!(pg_target(&args(&["--pg-database", "atlas_test", "--pg-schema", "public"])).is_err());
-        assert!(pg_target(&args(&["--pg-database", "--pg-schema", "atlas_replay_test"])).is_err());
-        assert_eq!(
-            pg_target(&args(&["--pg-database", "atlas_test", "--pg-schema", "atlas_replay_test"])).unwrap(),
-            Some(("atlas_test", "atlas_replay_test"))
-        );
+        let url = || Some("host=localhost dbname=atlas_test".to_owned());
+        assert!(pg_target(&args(&["--pg-database", "atlas_test"]), url()).is_err());
+        assert!(pg_target(&args(&["--pg-database", "atlas_test", "--pg-schema", "public"]), url()).is_err());
+        assert!(pg_target(&args(&["--pg-database", "--pg-schema", "atlas_replay_test"]), url()).is_err());
+        let target = args(&["--pg-database", "atlas_test", "--pg-schema", "atlas_replay_test"]);
+        assert!(pg_target(&target, None).is_err());
+        assert!(pg_target(&target, Some(" ".into())).is_err());
+        let (config, database) = pg_target(&target, url()).unwrap().unwrap();
+        assert_eq!(database, "atlas_test");
+        assert_eq!(config.schema, "atlas_replay_test");
+        assert_eq!(config.url, url().unwrap());
     }
 }
