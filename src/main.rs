@@ -24,6 +24,9 @@ fn main() -> ExitCode {
     if has("--restore-keep") {
         return ExitCode::from(atlas::keep_export::run_restore(&args) as u8);
     }
+    if has("--save-replay") {
+        return ExitCode::from(atlas::save_replay::run_cli(&args) as u8);
+    }
 
     match atlas::config::migrate_to_toml() {
         Ok(Some(path)) => eprintln!("config.json is now {}, and the old file is config.json.bak-toml", path.display()),
@@ -47,8 +50,6 @@ fn main() -> ExitCode {
         atlas::raw_store::run_replay_predb(&args)
     } else if has("--header-store") {
         atlas::nxv_store::tools::run_cli(&args)
-    } else if has("--save-replay") {
-        atlas::save_replay::run_cli(&args)
     } else if has("--export-keep") {
         atlas::keep_export::run(&args)
     } else if has("--reset-shards") {
