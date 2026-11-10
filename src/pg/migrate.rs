@@ -5,7 +5,10 @@
 use postgres::Client;
 
 /// Every migration, in order: (version, name, SQL).
-pub const MIGRATIONS: &[(i32, &str, &str)] = &[(1, "main", include_str!("migrations/0001_main.sql"))];
+pub const MIGRATIONS: &[(i32, &str, &str)] = &[
+    (1, "main", include_str!("migrations/0001_main.sql")),
+    (2, "header_blocks", include_str!("migrations/0002_header_blocks.sql")),
+];
 
 /// Bring the schema `schema` up to the last migration. Returns the versions applied now.
 pub fn run(c: &mut Client, schema: &str) -> Result<Vec<i32>, postgres::Error> {
