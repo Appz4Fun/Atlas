@@ -11,6 +11,7 @@
 //! run again even when the first try's commit landed and only its answer was lost (see `with_retry`).
 
 pub mod header_blocks;
+pub mod main_import;
 pub mod migrate;
 pub mod release_writer;
 pub mod sql;
