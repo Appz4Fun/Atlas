@@ -348,7 +348,8 @@ const MAX_BATCH: usize = 32;
 /// while it was busy in one transaction, and the shards save in parallel.
 #[derive(Clone)]
 pub struct Db {
-    conn: Arc<Mutex<Connection>>,
+    conn: Arc<MainConnection>,
+    native: Option<crate::pg::ingest::Native>,
     saves: Vec<std::sync::mpsc::SyncSender<WriterJob>>,
     /// each shard writer's lane for small jobs someone waits on (`on_writer_first`): read between saves, ahead of
     /// both the saves and the stage work queued in `saves`
@@ -356,6 +357,118 @@ pub struct Db {
     /// last field: dropping the final clone closes the queues above, then waits
     /// for the writer threads to finish what they were doing
     _writers: Arc<Writers>,
+}
+
+pub use crate::pg::ingest::PgWriteLimits;
+
+enum MainConnection {
+    Sqlite(Mutex<Connection>),
+    Postgres(Arc<crate::pg::Pool>),
+}
+
+impl MainConnection {
+    fn with_sql<T>(&self, f: impl FnOnce(&dyn Sql) -> Result<T>) -> Result<T> {
+        let t = std::time::Instant::now();
+        match self {
+            Self::Sqlite(conn) => {
+                let conn = conn.lock().map_err(|_| anyhow!("the database connection is poisoned"))?;
+                crate::profile::DB_WAIT.add_since(t);
+                f(&*conn)
+            }
+            Self::Postgres(pool) => {
+                let conn = pool.get()?;
+                crate::profile::DB_WAIT.add_since(t);
+                f(&crate::pg::sql::Pg::new(conn))
+            }
+        }
+    }
+}
+
+/// Opt-in native indexer storage. The destination must already exist and be migrated; this never opens SQLite
+/// or creates a schema. Background services using SQLite-only stage callbacks still require their own port.
+pub fn shared_postgres_db(
+    config: &crate::pg::StorageConfig,
+    expected_database: &str,
+    limits: PgWriteLimits,
+) -> Result<Db> {
+    anyhow::ensure!(config.is_postgres(), "native indexer storage requires the PostgreSQL backend");
+    anyhow::ensure!(!expected_database.is_empty(), "the expected PostgreSQL database is required");
+    limits.check()?;
+    let pool = Arc::new(crate::pg::Pool::new(config)?);
+    {
+        let mut conn = pool.get()?;
+        let row = conn.query_one("select current_database(), current_schema()", &[])?;
+        let actual: String = row.get(0);
+        let schema: Option<String> = row.get(1);
+        anyhow::ensure!(actual == expected_database, "PostgreSQL database differs from the expected destination");
+        anyhow::ensure!(
+            schema.as_deref() == Some(config.schema.as_str()),
+            "PostgreSQL schema differs from the expected destination"
+        );
+        let version = crate::pg::migrate::version(&mut conn, &config.schema)?;
+        let latest = crate::pg::migrate::MIGRATIONS.last().expect("storage migrations").0;
+        anyhow::ensure!(version == latest, "native indexer storage requires the current migrated schema");
+    }
+    Ok(Db {
+        conn: Arc::new(MainConnection::Postgres(pool.clone())),
+        native: Some(crate::pg::ingest::Native::new(pool, limits)?),
+        saves: Vec::new(),
+        firsts: Vec::new(),
+        _writers: Arc::new(Writers(Vec::new())),
+    })
+}
+
+#[cfg(test)]
+mod postgres_backend_tests {
+    use super::*;
+
+    #[test]
+    fn postgres_indexer_saves_releases_and_cursors_without_sqlite() {
+        let Some(schema) = crate::pg::testing::Schema::new() else { return };
+        let mut conn = schema.pool.get().unwrap();
+        let database: String = conn.query_one("select current_database()", &[]).unwrap().get(0);
+        let config = crate::pg::StorageConfig {
+            backend: crate::pg::Backend::Postgres,
+            url: schema.url.clone(),
+            schema: schema.name.clone(),
+            allow_plaintext: true,
+            ..Default::default()
+        };
+        assert!(shared_postgres_db(&config, "wrong_database", PgWriteLimits::default()).is_err());
+        let db = shared_postgres_db(&config, &database, PgWriteLimits::default()).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            on_sqlite_db(&db, |_| panic!("PostgreSQL must not run SQLite schema upkeep")).await.unwrap();
+            on_db(&db, |sql| Ok(crate::store::put_meta(sql, "native_indexer_test", 17)?)).await.unwrap();
+            db.save(vec![Release {
+                name: "Example.Release".into(),
+                group: "example.test".into(),
+                poster: "poster".into(),
+                date: "2026-01-01T00:00:00Z".into(),
+                articles: vec![crate::parser::Article {
+                    subject: "\"Example.Release.rar\" yEnc (1/1)".into(),
+                    message_id: "<one@example.test>".into(),
+                    filename: Some("Example.Release.rar".into()),
+                    part: Some(1),
+                    total_parts: Some(1),
+                    bytes: 100,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }])
+            .await
+            .unwrap();
+        });
+        assert_eq!(
+            conn.query_one("select value from meta where key='native_indexer_test'", &[]).unwrap().get::<_, i64>(0),
+            17
+        );
+        assert_eq!(conn.query_one("select count(*) from releases", &[]).unwrap().get::<_, i64>(0), 1);
+        assert_eq!(conn.query_one("select count(*) from files", &[]).unwrap().get::<_, i64>(0), 1);
+        assert_eq!(conn.query_one("select count(*) from segments", &[]).unwrap().get::<_, i64>(0), 1);
+        assert!(db.on_writer(0, "db.stage.test", Box::new(|_| panic!("SQLite stage work"))).is_err());
+        assert!(db.on_writer_first(0, "db.stage.test", Box::new(|_| panic!("SQLite stage work"))).is_err());
+    }
 }
 
 /// The writer threads, joined when dropped.
@@ -431,7 +544,13 @@ fn shared_db_idling(conn: Connection, every: Duration) -> Db {
         firsts.push(first);
         writers.push(handle);
     }
-    Db { conn: Arc::new(Mutex::new(conn)), saves, firsts, _writers: Arc::new(Writers(writers)) }
+    Db {
+        conn: Arc::new(MainConnection::Sqlite(Mutex::new(conn))),
+        native: None,
+        saves,
+        firsts,
+        _writers: Arc::new(Writers(writers)),
+    }
 }
 
 /// A shard's writer: saves what comes in, and between saves (or after
@@ -777,6 +896,7 @@ impl Db {
         kind: &'static str,
         work: StageWork,
     ) -> Result<std::sync::mpsc::Receiver<std::result::Result<(), String>>> {
+        anyhow::ensure!(self.native.is_none(), "SQLite stage work is unavailable on native PostgreSQL storage");
         let (done, answer) = std::sync::mpsc::sync_channel(1);
         self.saves[shard]
             .send(WriterJob::Stage(StageJob { kind, work, done }))
@@ -794,6 +914,7 @@ impl Db {
         kind: &'static str,
         work: StageWork,
     ) -> Result<std::sync::mpsc::Receiver<std::result::Result<(), String>>> {
+        anyhow::ensure!(self.native.is_none(), "SQLite stage work is unavailable on native PostgreSQL storage");
         let (done, answer) = std::sync::mpsc::sync_channel(1);
         self.firsts[shard].send(StageJob { kind, work, done }).map_err(|_| anyhow!("db writer stopped"))?;
         // a writer waiting for work wakes; a full queue means it's busy, and looks at the lane between saves anyway
@@ -806,6 +927,9 @@ impl Db {
     /// (its pass didnt finish, soo the cursor didnt move past it); once the
     /// writer has it, it gets saved.
     pub(crate) async fn save(&self, releases: Vec<Release>) -> Result<()> {
+        if let Some(native) = &self.native {
+            return native.save(releases).await;
+        }
         let prepared = crate::store::prepare(&releases);
         self.save_prepared(releases, prepared).await
     }
@@ -814,6 +938,10 @@ impl Db {
     /// the writer is what limits saving. The job is queued before the first await, soo a dropped future after that
     /// still has its slice saved.
     pub(crate) async fn save_prepared(&self, releases: Vec<Release>, prepared: crate::store::Prepared) -> Result<()> {
+        if let Some(native) = &self.native {
+            drop(prepared);
+            return native.save(releases).await;
+        }
         // a slice is one group, soo one shard
         let Some(shard) = releases.first().map(|r| crate::store::shard_of(&r.group)) else { return Ok(()) };
         let (done, saved) = tokio::sync::oneshot::channel();
@@ -830,7 +958,15 @@ impl Db {
 /// them, soo there's nothing to do.
 pub(crate) async fn on_sqlite_db(db: &Db, f: impl FnOnce(&Connection) -> Result<()> + Send + 'static) -> Result<()> {
     let conn = db.conn.clone();
-    tokio::task::spawn_blocking(move || f(&conn.lock().unwrap())).await.map_err(|e| anyhow!("db task failed: {e}"))?
+    tokio::task::spawn_blocking(move || match &*conn {
+        MainConnection::Sqlite(conn) => {
+            let conn = conn.lock().map_err(|_| anyhow!("the database connection is poisoned"))?;
+            f(&conn)
+        }
+        MainConnection::Postgres(_) => Ok(()),
+    })
+    .await
+    .map_err(|e| anyhow!("db task failed: {e}"))?
 }
 
 pub(crate) async fn on_db<T: Send + 'static>(
@@ -838,14 +974,7 @@ pub(crate) async fn on_db<T: Send + 'static>(
     f: impl FnOnce(&dyn Sql) -> Result<T> + Send + 'static,
 ) -> Result<T> {
     let conn = db.conn.clone();
-    tokio::task::spawn_blocking(move || {
-        let t = std::time::Instant::now();
-        let conn = conn.lock().unwrap();
-        crate::profile::DB_WAIT.add_since(t);
-        f(&*conn)
-    })
-    .await
-    .map_err(|e| anyhow!("db task failed: {e}"))?
+    tokio::task::spawn_blocking(move || conn.with_sql(f)).await.map_err(|e| anyhow!("db task failed: {e}"))?
 }
 
 /// Everything a pass needs, cheap to clone into tasks.
@@ -1722,10 +1851,7 @@ impl Drop for GiveBackOnDrop<'_> {
             return;
         }
         // best effort and quick: one update, only while this claim still owns it
-        let r = match self.db.conn.lock() {
-            Ok(conn) => crate::chunks::release(&*conn, self.chunk).map(|_| ()).map_err(anyhow::Error::from),
-            Err(_) => Err(anyhow!("the database connection is poisoned")),
-        };
+        let r = self.db.conn.with_sql(|conn| Ok(crate::chunks::release(conn, self.chunk)?));
         if let Err(e) = r {
             let (group, day) = (&self.chunk.group, self.chunk.day);
             println!("[CHUNK] {group} day {day}: couldnt give the chunk back when stopped: {e:#}");
@@ -2610,6 +2736,7 @@ async fn parse_and_save(
     let t = std::time::Instant::now();
     let parsing = {
         let group = group.to_string();
+        let prepare_sqlite = db.native.is_none();
         move || {
             let _span = crate::metrics::span("indexer.parse_slice");
             // articles whose every subject is random are left to the header store's linker (`xref::hold`)
@@ -2619,7 +2746,8 @@ async fn parse_and_save(
                 crate::collections::group_articles(&group, articles).into_values().collect();
             releases.extend(uploads);
             // what the writer would otherwise work out itself (the articles dont move from here on)
-            let prepared = crate::store::prepare(&releases);
+            let prepared =
+                if prepare_sqlite { crate::store::prepare(&releases) } else { crate::store::Prepared::new() };
             anyhow::Ok((releases, skipped, prepared))
         }
     };
