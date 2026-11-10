@@ -13,6 +13,7 @@
 pub mod header_blocks;
 pub mod main_import;
 pub mod migrate;
+pub mod release_reader;
 pub mod release_writer;
 pub mod sql;
 #[cfg(test)]
