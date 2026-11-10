@@ -200,7 +200,7 @@ fn seen_of(conn: &rusqlite::Connection, id: i64) -> rusqlite::Result<i64> {
     let rows = stmt.query_map([id], |r| r.get::<_, Vec<u8>>(0))?;
     let mut n = 0i64;
     for seen in rows {
-        n += seen?.iter().map(|b| i64::from(b.count_ones())).sum::<i64>();
+        n += crate::store::seen_count(&seen?);
     }
     Ok(n)
 }

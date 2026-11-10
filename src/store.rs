@@ -764,35 +764,129 @@ pub(crate) fn decode(local: &[u8], suffix: Option<&str>) -> String {
 
 // ---------------------------------------------------------------- part bitmaps
 
-/// one bit per part number present
-pub(crate) fn insert_part(bits: &mut Vec<u8>, part: i64) {
-    // a bad part number from a broken subject shouldnt allocate a huge bitmap
-    if !(0..=crate::parser::MAX_PARTS).contains(&part) {
+// Legacy bitmaps end in a nonzero byte. A trailing zero marks a bitmap made of
+// sorted blocks, each with a one-byte index and 256 bytes of part bits.
+const PART_BLOCK_BYTES: usize = 256;
+const PART_BLOCK_RECORD: usize = PART_BLOCK_BYTES + 1;
+const LEGACY_PART_LIMIT: i64 = 100_000;
+
+fn sparse_parts(bits: &[u8]) -> bool {
+    bits.len() > PART_BLOCK_RECORD && bits.last() == Some(&0) && bits.len() % PART_BLOCK_RECORD == 1
+}
+
+fn part_blocks(bits: &[u8]) -> impl Iterator<Item = (usize, &[u8])> {
+    let sparse = sparse_parts(bits);
+    bits.chunks(if sparse { PART_BLOCK_RECORD } else { PART_BLOCK_BYTES })
+        .enumerate()
+        .filter_map(move |(index, block)| {
+            if sparse {
+                (block.len() == PART_BLOCK_RECORD).then(|| (usize::from(block[0]), &block[1..]))
+            } else {
+                Some((index, block))
+            }
+        })
+}
+
+fn part_byte(bits: &[u8], byte: usize) -> u8 {
+    if !sparse_parts(bits) {
+        return bits.get(byte).copied().unwrap_or(0);
+    }
+    let index = byte / PART_BLOCK_BYTES;
+    part_blocks(bits)
+        .find(|(block, _)| *block == index)
+        .map_or(0, |(_, block)| block[byte % PART_BLOCK_BYTES])
+}
+
+fn add_part_byte(bits: &mut Vec<u8>, byte: usize, value: u8) {
+    if value == 0 {
         return;
     }
-    let (byte, bit) = ((part / 8) as usize, part % 8);
-    if bits.len() <= byte {
-        bits.resize(byte + 1, 0);
+    if !sparse_parts(bits) {
+        if byte <= LEGACY_PART_LIMIT as usize / 8 {
+            if bits.len() <= byte {
+                bits.resize(byte + 1, 0);
+            }
+            bits[byte] |= value;
+            return;
+        }
+        let mut sparse = Vec::new();
+        for (index, block) in part_blocks(bits).filter(|(_, block)| block.iter().any(|&b| b != 0)) {
+            sparse.push(index as u8);
+            sparse.extend_from_slice(block);
+            sparse.resize(sparse.len() + PART_BLOCK_BYTES - block.len(), 0);
+        }
+        sparse.push(0);
+        *bits = sparse;
     }
-    bits[byte] |= 1 << bit;
+    let index = (byte / PART_BLOCK_BYTES) as u8;
+    let at = bits[..bits.len() - 1]
+        .chunks_exact(PART_BLOCK_RECORD)
+        .take_while(|block| block[0] < index)
+        .count()
+        * PART_BLOCK_RECORD;
+    if at == bits.len() - 1 || bits[at] != index {
+        let mut block = [0; PART_BLOCK_RECORD];
+        block[0] = index;
+        bits.splice(at..at, block);
+    }
+    bits[at + 1 + byte % PART_BLOCK_BYTES] |= value;
 }
 
-/// whether `part` is in a file's seen parts (as `insert_part` puts it there)
+pub(crate) fn insert_part(bits: &mut Vec<u8>, part: i64) {
+    if (0..=crate::parser::MAX_PARTS).contains(&part) {
+        add_part_byte(bits, (part / 8) as usize, 1 << (part % 8));
+    }
+}
+
 pub(crate) fn has_part(bits: &[u8], part: i64) -> bool {
     (0..=crate::parser::MAX_PARTS).contains(&part)
-        && bits.get((part / 8) as usize).is_some_and(|b| b & (1 << (part % 8)) != 0)
+        && part_byte(bits, (part / 8) as usize) & (1 << (part % 8)) != 0
 }
 
-/// exactly parts 1..=expected, or exactly 0..expected for a file numbered from 0, nothing else
-/// (as `parser::is_complete` and `nzb::gaps` count them)
+fn part_bytes(bits: &[u8]) -> impl Iterator<Item = (usize, u8)> {
+    part_blocks(bits).flat_map(|(index, block)| {
+        block.iter().enumerate().filter_map(move |(offset, &byte)| {
+            (byte != 0).then_some((index * PART_BLOCK_BYTES + offset, byte))
+        })
+    })
+}
+
+pub(crate) fn same_parts(left: &[u8], right: &[u8]) -> bool {
+    part_bytes(left).eq(part_bytes(right))
+}
+
+pub(crate) fn adds_parts(ours: &[u8], theirs: &[u8], expected: Option<i64>) -> bool {
+    part_bytes(theirs).any(|(index, byte)| {
+        let new = byte & !part_byte(ours, index);
+        new != 0 && expected.is_none_or(|end| (index * 8 + new.trailing_zeros() as usize) as i64 <= end)
+    })
+}
+
+pub(crate) fn parts_overlap(left: &[u8], right: &[u8]) -> bool {
+    part_bytes(right).any(|(index, byte)| part_byte(left, index) & byte != 0)
+}
+
+pub(crate) fn merge_parts(left: &mut Vec<u8>, right: &[u8]) -> bool {
+    let mut overlap = false;
+    for (index, byte) in part_bytes(right) {
+        overlap |= part_byte(left, index) & byte != 0;
+        add_part_byte(left, index, byte);
+    }
+    overlap
+}
+
+/// Exactly parts 1..=expected or exactly 0..expected for zero-based files.
 pub(crate) fn is_exactly(bits: &[u8], expected: i64) -> bool {
     if expected <= 0 {
         return false;
     }
-    let zero_based = bits.first().is_some_and(|b| b & 1 == 1);
-    let count: i64 = bits.iter().map(|b| i64::from(b.count_ones())).sum();
-    let highest = bits.iter().rposition(|b| *b != 0).map(|i| i as i64 * 8 + 7 - i64::from(bits[i].leading_zeros()));
-    count == expected && highest == Some(if zero_based { expected - 1 } else { expected })
+    let mut count = 0;
+    let mut highest = None;
+    for (index, byte) in part_bytes(bits) {
+        count += i64::from(byte.count_ones());
+        highest = Some(index as i64 * 8 + 7 - i64::from(byte.leading_zeros()));
+    }
+    count == expected && highest == Some(expected - i64::from(has_part(bits, 0)))
 }
 
 /// When each release's `release_ids` were last made in full (`index_release`): a release indexed again without a
@@ -3426,7 +3520,7 @@ pub enum SegmentPick {
 
 /// How many parts a `seen` bitmap has.
 pub fn seen_count(bits: &[u8]) -> i64 {
-    bits.iter().map(|b| i64::from(b.count_ones())).sum()
+    part_bytes(bits).map(|(_, byte)| i64::from(byte.count_ones())).sum()
 }
 
 /// What deleting a release took.
@@ -4223,6 +4317,31 @@ mod tests {
         }
         assert!(global_id(11, 0) > global_id(10, SHARDS - 1), "a later seq sorts after, whatever the shard");
         assert_eq!(shard_path(Path::new("/x/atlas.db"), 3), PathBuf::from("/x/atlas.s3.db"));
+    }
+
+    #[test]
+    fn sparse_part_sets_preserve_legacy_bits_and_bound_high_parts() {
+        let mut legacy = vec![0b110];
+        let mut high = Vec::new();
+        insert_part(&mut high, 234_450);
+        insert_part(&mut high, 1_099_511_627_776);
+        assert_eq!(high.len(), PART_BLOCK_RECORD + 1);
+        assert_eq!(seen_count(&high), 1);
+        assert!(has_part(&high, 234_450));
+        assert!(!has_part(&high, 234_449));
+        assert!(!is_exactly(&high, 234_450));
+        assert!(!parts_overlap(&high, &legacy));
+        assert!(adds_parts(&legacy, &high, Some(234_450)));
+        assert!(!adds_parts(&legacy, &high, Some(234_449)));
+        assert!(!merge_parts(&mut legacy, &high));
+        assert!(parts_overlap(&high, &legacy));
+        assert!(merge_parts(&mut high, &legacy));
+        assert!(same_parts(&legacy, &high));
+        let mut complete = Vec::new();
+        for part in 1..=250_000 {
+            insert_part(&mut complete, part);
+        }
+        assert!(is_exactly(&complete, 250_000));
     }
 
     #[test]
