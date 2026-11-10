@@ -3,6 +3,7 @@
 //! profiling the release writer. It never touches the live databases: `--db` is a folder of its own (made if need be),
 //! used as the app folder for the run. To exercise the native PostgreSQL release writer, also pass
 //! `--pg-database NAME --pg-schema atlas_replay_NAME` and set `ATLAS_REPLAY_PG_URL`.
+//! With `--pg-header-source ID`, the replay also archives every sealed NXV block it reads to that schema.
 //!
 //! Lines come group by group, round robin, in slices of `--slice` rows (the indexer's slices), parsed on `--parsers`
 //! threads the way `indexer::parse_and_save` does (articles obfuscated per article go to the header store, which the
@@ -23,33 +24,33 @@ use nntp_xover_engine::streamer::{NxvRangeCursor, XoverStreamScratch};
 use crate::nxv_store::segment::Entry;
 use crate::nxv_store::store::{KeepSet, Store, StoreConfig};
 use crate::parser::Release;
-use crate::pg::{Pool, StorageConfig};
+use crate::pg::{Pool, StorageConfig, header_blocks};
 use crate::store::Prepared;
 
 fn arg<T: std::str::FromStr>(args: &[String], flag: &str, default: T) -> T {
     args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
+fn flag_value<'a>(args: &'a [String], flag: &str) -> Result<Option<&'a str>> {
+    args.iter()
+        .position(|arg| arg == flag)
+        .map(|i| {
+            args.get(i + 1)
+                .map(String::as_str)
+                .filter(|v| !v.starts_with("--") && !v.is_empty())
+                .with_context(|| format!("{flag} requires a value"))
+        })
+        .transpose()
+}
+
 fn pg_target(args: &[String]) -> Result<Option<(&str, &str)>> {
-    let value = |flag: &str| -> Result<Option<&str>> {
-        args.iter()
-            .position(|arg| arg == flag)
-            .map(|i| {
-                args.get(i + 1)
-                    .map(String::as_str)
-                    .filter(|v| !v.starts_with("--"))
-                    .with_context(|| format!("{flag} requires a value"))
-            })
-            .transpose()
-    };
-    match (value("--pg-database")?, value("--pg-schema")?) {
+    match (flag_value(args, "--pg-database")?, flag_value(args, "--pg-schema")?) {
         (None, None) => Ok(None),
         (Some(database), Some(schema)) => {
             ensure!(
                 crate::pg::valid_schema(schema) && schema.starts_with("atlas_replay_"),
                 "--pg-schema must be a lowercase name starting with atlas_replay_"
             );
-            ensure!(!database.is_empty(), "--pg-database must name the expected database");
             Ok(Some((database, schema)))
         }
         _ => anyhow::bail!("use --pg-database and --pg-schema together"),
@@ -86,11 +87,14 @@ impl Writer {
 fn open_pg_replay(config: StorageConfig, database: &str) -> Result<Writer> {
     let pool = Pool::new(&config)?;
     let mut conn = pool.get().context("connecting to the replay database")?;
-    let actual: String = conn.query_one("select current_database()", &[])?.get(0);
+    let mut tx = conn.transaction()?;
+    let actual: String = tx.query_one("select current_database()", &[])?.get(0);
     ensure!(actual == database, "connected to {actual}, expected {database}");
     // Deliberately refuse to reuse a previous replay. The schema remains available for parity queries.
-    conn.batch_execute(&format!("create schema \"{}\"", pool.schema())).context("creating a fresh replay schema")?;
-    crate::pg::migrate::run(&mut conn, pool.schema())?;
+    tx.execute("select pg_advisory_xact_lock(hashtext('atlas.migrate.' || $1))", &[&pool.schema()])?;
+    tx.batch_execute(&format!("create schema \"{}\"", pool.schema())).context("creating a fresh replay schema")?;
+    crate::pg::migrate::run_in_transaction(&mut tx, pool.schema())?;
+    tx.commit()?;
     drop(conn);
     Ok(Writer::Postgres(Arc::new(pool)))
 }
@@ -107,14 +111,64 @@ pub fn run_cli(args: &[String]) -> i32 {
 
 /// One slice: its group and its overview lines.
 type Slice = (String, Vec<Vec<u8>>);
-type GroupCursor = (String, Vec<(Arc<memmap2::Mmap>, Entry)>, usize);
+type MappedBlock = (Arc<memmap2::Mmap>, Entry);
+type GroupCursor = (String, Vec<MappedBlock>, usize);
+
+struct HeaderArchive {
+    pool: Arc<Pool>,
+    source: String,
+    blocks: Vec<(String, MappedBlock)>,
+    bytes: usize,
+    rows: u64,
+}
+
+impl HeaderArchive {
+    fn push(&mut self, group: &str, block: &MappedBlock) -> Result<()> {
+        self.bytes += block.1.len as usize;
+        self.blocks.push((group.to_owned(), block.clone()));
+        if self.bytes >= 8 * 1024 * 1024 {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        if self.blocks.is_empty() {
+            return Ok(());
+        }
+        let mut blocks = Vec::with_capacity(self.blocks.len());
+        let mut rows = 0;
+        for (group, (map, entry)) in &self.blocks {
+            let start = usize::try_from(entry.offset)?;
+            let end = start.checked_add(entry.len as usize).context("header block end offset overflows")?;
+            let bytes = map.get(start..end).context("header block extends past its segment")?;
+            let day = entry.min_ts.div_euclid(86_400);
+            blocks.push(header_blocks::Block::new(group, day, *entry, bytes)?);
+            rows += u64::from(entry.rows);
+        }
+        let mut conn = self.pool.get()?;
+        let inserted = header_blocks::append(&mut conn, &self.source, &blocks)?;
+        ensure!(inserted == blocks.len() as u64, "the fresh archive contains a duplicate block key");
+        self.rows += rows;
+        self.blocks.clear();
+        self.bytes = 0;
+        Ok(())
+    }
+}
 
 fn limit_slice(lines: &mut Vec<Vec<u8>>, sent: u64, limit: u64) {
     lines.truncate(usize::try_from(limit - sent).unwrap_or(usize::MAX));
 }
 
 /// The store's lines, group by group round robin, in slices of `slice` rows, sent to `tx` until `rows` are sent.
-fn read_slices(store: &Store, slice: usize, rows: u64, tx: std::sync::mpsc::SyncSender<Slice>, stop: &AtomicBool) {
+fn read_slices(
+    store: &Store,
+    slice: usize,
+    rows: u64,
+    tx: std::sync::mpsc::SyncSender<Slice>,
+    stop: &AtomicBool,
+    mut archive: Option<HeaderArchive>,
+) -> Result<Option<u64>> {
     let mut groups = store.group_names();
     groups.sort();
     // each group's blocks, read one after another
@@ -134,10 +188,14 @@ fn read_slices(store: &Store, slice: usize, rows: u64, tx: std::sync::mpsc::Sync
             let (group, blocks, at) = &mut cursors[k];
             let mut lines = Vec::with_capacity(slice);
             while lines.len() < slice && *at < blocks.len() {
-                let (map, e) = &blocks[*at];
+                let block = &blocks[*at];
+                let (map, e) = block;
                 *at += 1;
                 let Ok(view) = NxvBlockView::from_mmap_slice(&map[e.offset as usize..]) else { continue };
                 let Ok(mut cur) = NxvRangeCursor::new_for_art_range(view, 0, u64::MAX) else { continue };
+                if let Some(archive) = &mut archive {
+                    archive.push(group, block)?;
+                }
                 loop {
                     scratch.wire_buf.clear();
                     if !cur.format_next_row(&mut scratch) {
@@ -152,7 +210,7 @@ fn read_slices(store: &Store, slice: usize, rows: u64, tx: std::sync::mpsc::Sync
                 limit_slice(&mut lines, sent, rows);
                 sent += lines.len() as u64;
                 if tx.send((group.clone(), lines)).is_err() {
-                    return;
+                    return Ok(None);
                 }
             }
             if done {
@@ -162,6 +220,11 @@ fn read_slices(store: &Store, slice: usize, rows: u64, tx: std::sync::mpsc::Sync
             }
         }
     }
+    if let Some(mut archive) = archive {
+        archive.flush()?;
+        return Ok(Some(archive.rows));
+    }
+    Ok(None)
 }
 
 /// A slice's releases, parsed as `indexer::parse_and_save` does (without names from bodies, which need servers).
@@ -225,6 +288,7 @@ fn postgres_counts(pool: &Pool) -> Result<(i64, i64, i64, i64)> {
 fn run(args: &[String]) -> Result<()> {
     let store_dir = PathBuf::from(args.iter().skip_while(|a| *a != "--store").nth(1).context("--store DIR")?);
     let db_dir = PathBuf::from(args.iter().skip_while(|a| *a != "--db").nth(1).context("--db DIR")?);
+    let archive_source = flag_value(args, "--pg-header-source")?;
     let pg = pg_target(args)?
         .map(|(database, schema)| {
             let mut config = crate::config::storage_config();
@@ -237,6 +301,7 @@ fn run(args: &[String]) -> Result<()> {
             Ok::<_, anyhow::Error>((config, database))
         })
         .transpose()?;
+    ensure!(archive_source.is_none() || pg.is_some(), "--pg-header-source requires a PostgreSQL replay");
     let (rows, slice, tasks, parsers) = (
         arg(args, "--rows", u64::MAX),
         arg(args, "--slice", 20_000usize),
@@ -269,12 +334,18 @@ fn run(args: &[String]) -> Result<()> {
         Store::open(StoreConfig::new(&store_dir), KeepSet { live_from: i64::MIN / 2, ..KeepSet::default() })?;
     let sqlite = matches!(&writer, Writer::Sqlite(_));
     let checkpointer = sqlite.then(|| crate::db::checkpointer(stop.clone()));
+    let archive = match (&writer, archive_source) {
+        (Writer::Postgres(pool), Some(source)) => {
+            Some(HeaderArchive { pool: pool.clone(), source: source.to_owned(), blocks: Vec::new(), bytes: 0, rows: 0 })
+        }
+        _ => None,
+    };
 
     let (slice_tx, slice_rx) = std::sync::mpsc::sync_channel::<Slice>(parsers * 2);
     let (parsed_tx, parsed_rx) = tokio::sync::mpsc::channel::<(usize, Vec<Release>, Prepared)>(tasks * 2);
     let reader = {
         let (store, stop) = (Arc::clone(&store), Arc::clone(&stop));
-        std::thread::spawn(move || read_slices(&store, slice, rows, slice_tx, &stop))
+        std::thread::spawn(move || read_slices(&store, slice, rows, slice_tx, &stop, archive))
     };
     let slice_rx = Arc::new(std::sync::Mutex::new(slice_rx));
     let parse_ns = Arc::new(AtomicU64::new(0));
@@ -366,7 +437,7 @@ fn run(args: &[String]) -> Result<()> {
     }
     let closed = store.close();
     result?;
-    reader_result?;
+    let archived_rows = reader_result??;
     anyhow::ensure!(!parser_panicked, "a replay parser panicked");
     closed?;
     let rows = processed_rows.load(Ordering::Relaxed);
@@ -392,6 +463,9 @@ fn run(args: &[String]) -> Result<()> {
     println!(
         "{save_rows} headers in slices that produced releases; persisted {releases} releases, {files} files, {parts} parts"
     );
+    if let Some(archived_rows) = archived_rows {
+        println!("archived {archived_rows} headers in complete NXV blocks");
+    }
     Ok(())
 }
 
