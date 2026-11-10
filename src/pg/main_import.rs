@@ -47,8 +47,22 @@ fn quote(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
-fn source_query<'a>(table: &str, names: impl Iterator<Item = &'a str>) -> String {
+fn prepare_source_table<'source>(
+    source: &'source Connection,
+    table: &str,
+    names: &[&str],
+) -> Result<rusqlite::Statement<'source>> {
+    let mut columns = source.prepare("select name from pragma_table_xinfo(?1, 'main')")?;
+    for column in columns.query_map([table], |row| row.get::<_, String>(0))? {
+        let column = column?;
+        ensure!(
+            names.contains(&column.as_str()) && !(table == "meta" && column == "text_value"),
+            "unsupported SQLite column {table}.{column} would be dropped"
+        );
+    }
     let fields = names
+        .iter()
+        .copied()
         .map(|name| match (table, name) {
             ("meta", "value") => "case when typeof(source.value) <> 'text' then source.value end".into(),
             ("meta", "text_value") => "case when typeof(source.value) = 'text' then source.value end".into(),
@@ -56,7 +70,7 @@ fn source_query<'a>(table: &str, names: impl Iterator<Item = &'a str>) -> String
         })
         .collect::<Vec<_>>()
         .join(", ");
-    format!("select {fields} from main.{} as source", quote(table))
+    Ok(source.prepare(&format!("select {fields} from main.{} as source", quote(table)))?)
 }
 
 fn source_tables(source: &Connection) -> Result<Vec<&'static str>> {
@@ -172,7 +186,8 @@ fn copy_table(source: &Connection, target: &mut postgres::Transaction<'_>, schem
     let types: Vec<_> = columns.iter().map(|col| col.type_().clone()).collect();
     let kinds = types.iter().map(Kind::from_postgres).collect::<Result<Vec<_>>>()?;
     let fields = columns.iter().map(|col| quote(col.name())).collect::<Vec<_>>().join(", ");
-    let mut statement = source.prepare(&source_query(table, columns.iter().map(|col| col.name())))?;
+    let names: Vec<_> = columns.iter().map(|col| col.name()).collect();
+    let mut statement = prepare_source_table(source, table, &names)?;
     let mut rows = statement.query([])?;
     let mut writer =
         BinaryCopyInWriter::new(target.copy_in(&format!("copy {qualified} ({fields}) from stdin binary"))?, &types);
@@ -300,20 +315,32 @@ mod tests {
              insert into meta values ('counter', 17), ('label', 'example'), ('missing', null), ('real', 1.25);",
         )
         .unwrap();
-        let columns = [("key", Kind::Text), ("value", Kind::Int), ("text_value", Kind::Text)];
-        let sql = source_query("meta", columns.iter().map(|(name, _)| *name));
-        let mut stmt = c.prepare(&format!("{sql} order by source.key")).unwrap();
+        let mut stmt = prepare_source_table(&c, "meta", &["key", "value", "text_value"]).unwrap();
         let mut rows = stmt.query([]).unwrap();
-        let kinds = columns.map(|(_, kind)| kind);
         let mut values = Vec::new();
-        let mut next = || {
-            read_source_row(rows.next().unwrap().unwrap(), &kinds, &mut values)?;
-            Ok::<_, anyhow::Error>(values.clone())
-        };
-        assert_eq!(next().unwrap(), [Cell::Text("counter".into()), Cell::Int(17), Cell::Null]);
-        assert_eq!(next().unwrap(), [Cell::Text("label".into()), Cell::Null, Cell::Text("example".into())]);
-        assert_eq!(next().unwrap(), [Cell::Text("missing".into()), Cell::Null, Cell::Null]);
-        assert!(next().is_err());
+        let mut by_key = std::collections::BTreeMap::new();
+        while let Some(row) = rows.next().unwrap() {
+            let key: String = row.get(0).unwrap();
+            let result = read_source_row(row, &[Kind::Text, Kind::Int, Kind::Text], &mut values);
+            by_key.insert(key, result.map(|()| values[1..].to_vec()));
+        }
+        assert_eq!(by_key.remove("counter").unwrap().unwrap(), [Cell::Int(17), Cell::Null]);
+        assert_eq!(by_key.remove("label").unwrap().unwrap(), [Cell::Null, Cell::Text("example".into())]);
+        assert_eq!(by_key.remove("missing").unwrap().unwrap(), [Cell::Null, Cell::Null]);
+        assert!(by_key.remove("real").unwrap().is_err());
+        assert!(by_key.is_empty());
+    }
+
+    #[test]
+    fn source_columns_cannot_be_silently_dropped() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "create table groups (name text primary key, live_cursor integer, future_cursor integer);
+             insert into groups values ('test.group', 700, 125);",
+        )
+        .unwrap();
+        let error = prepare_source_table(&c, "groups", &["name", "live_cursor"]).err().unwrap();
+        assert!(error.to_string().contains("future_cursor"));
     }
 
     fn sqlite_snapshot(dir: &Path) -> std::path::PathBuf {
