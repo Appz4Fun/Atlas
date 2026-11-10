@@ -2,9 +2,10 @@
 //! day's sequence numbers must remain stable within that generation.
 
 use anyhow::{Context, Result, ensure};
-use postgres::Client;
 use postgres::binary_copy::BinaryCopyInWriter;
-use postgres::types::Type;
+use postgres::fallible_iterator::FallibleIterator;
+use postgres::types::{ToSql, Type};
+use postgres::{Client, IsolationLevel};
 
 use crate::nxv_store::segment::{ENTRY_LEN, Entry, entry_for};
 
@@ -21,6 +22,7 @@ impl<'a> Block<'a> {
     pub fn new(group: &'a str, day: i64, entry: Entry, bytes: &'a [u8]) -> Result<Self> {
         ensure!(!group.is_empty() && !group.contains('\0'), "invalid header block group");
         ensure!(day.checked_mul(86_400).and_then(|start| start.checked_add(86_399)).is_some(), "invalid header day");
+        ensure!(entry.offset.is_multiple_of(64), "header block offset is not 64-byte aligned");
         ensure!(entry.len as usize == bytes.len(), "header block length differs from the manifest");
         ensure!(
             entry.rows > 0 && entry_for(bytes, entry.offset, entry.seq, day) == Some(entry),
@@ -37,7 +39,8 @@ pub fn append(conn: &mut Client, source: &str, blocks: &[Block<'_>]) -> Result<u
     if blocks.is_empty() {
         return Ok(0);
     }
-    let mut tx = conn.transaction()?;
+    // The conflict check needs a fresh snapshot if an overlapping append committed while we waited.
+    let mut tx = conn.build_transaction().isolation_level(IsolationLevel::ReadCommitted).start()?;
     tx.batch_execute(
         "set local synchronous_commit = on;
          create temporary table if not exists atlas_header_batch (like header_blocks) on commit delete rows;",
@@ -73,7 +76,7 @@ pub fn append(conn: &mut Client, source: &str, blocks: &[Block<'_>]) -> Result<u
         let conflict = tx.query_one(
             "select exists (
                select 1 from pg_temp.atlas_header_batch b join header_blocks h using (source, group_name, day, sequence)
-               where b.manifest <> h.manifest or b.payload <> h.payload
+               where b.header_count <> h.header_count or b.manifest <> h.manifest or b.payload <> h.payload
              )",
             &[],
         )?;
@@ -92,27 +95,33 @@ pub fn read_page(
     first_sequence: u32,
     limit: u32,
 ) -> Result<Vec<(Entry, Vec<u8>)>> {
-    conn.query(
-        "select manifest, payload from header_blocks
+    let (first_sequence, limit) = (i64::from(first_sequence), i64::from(limit));
+    let params: [&(dyn ToSql + Sync); 5] = [&source, &group, &day, &first_sequence, &limit];
+    let mut rows = conn.query_raw(
+        "select sequence, header_count, manifest, payload from header_blocks
          where source = $1 and group_name = $2 and day = $3 and sequence >= $4 order by sequence limit $5",
-        &[&source, &group, &day, &i64::from(first_sequence), &i64::from(limit)],
-    )?
-    .into_iter()
-    .map(|row| {
-        let manifest: &[u8] = row.get(0);
+        params,
+    )?;
+    let mut blocks = Vec::new();
+    while let Some(row) = rows.next()? {
+        let manifest: &[u8] = row.get(2);
         ensure!(manifest.len() == ENTRY_LEN, "invalid stored manifest");
         let entry = Entry::from_bytes(manifest);
-        let bytes: Vec<u8> = row.get(1);
-        Block::new(group, day, entry, &bytes).context("checking the stored header block")?;
-        Ok((entry, bytes))
-    })
-    .collect()
+        ensure!(
+            row.get::<_, i64>(0) == i64::from(entry.seq) && row.get::<_, i64>(1) == i64::from(entry.rows),
+            "stored header block key or count differs from its manifest"
+        );
+        let bytes: &[u8] = row.get(3);
+        Block::new(group, day, entry, bytes).context("checking the stored header block")?;
+        blocks.push((entry, bytes.to_vec()));
+    }
+    Ok(blocks)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nntp_xover_engine::container::NxvBlockBuilder;
+    use nntp_xover_engine::container::{AlignedBytes, NxvBlockBuilder, NxvBlockView, compress_block_to_cold};
 
     const DAY: i64 = 20_766;
     const GROUP: &str = "alt.binaries.test";
@@ -130,6 +139,33 @@ mod tests {
         assert!(Block::new(GROUP, DAY, entry, &bytes).is_ok());
         assert!(Block::new(GROUP, DAY, Entry { rows: entry.rows + 1, ..entry }, &bytes).is_err());
         assert!(Block::new(GROUP, DAY, entry, &bytes[..bytes.len() - 1]).is_err());
+        assert!(Block::new(GROUP, DAY, Entry { offset: 1, ..entry }, &bytes).is_err());
+    }
+
+    #[test]
+    fn a_cold_block_must_have_an_intact_compressed_body() {
+        let (_, hot) = fixture();
+        let mut bytes = compress_block_to_cold(&hot, 1).unwrap();
+        let aligned = AlignedBytes::from_slice(&bytes);
+        let view = NxvBlockView::from_mmap_slice(&aligned).unwrap();
+        let entry = entry_for(&bytes, 0, 3, DAY).unwrap();
+        assert!(Block::new(GROUP, DAY, entry, &bytes).is_ok());
+        bytes[view.header.cold_prefix_bytes as usize + 8] ^= 0xff;
+        assert!(Block::new(GROUP, DAY, entry, &bytes).is_err());
+    }
+
+    #[test]
+    fn read_page_rejects_manifest_sequence_or_count_mismatches() {
+        let Some(schema) = crate::pg::testing::Schema::new() else { return };
+        let mut conn = schema.pool.get().unwrap();
+        let (entry, bytes) = fixture();
+        let block = Block::new(GROUP, DAY, entry, &bytes).unwrap();
+        append(&mut conn, "test-source", &[block]).unwrap();
+        conn.execute("update header_blocks set sequence = 2", &[]).unwrap();
+        assert!(read_page(&mut conn, "test-source", GROUP, DAY, 0, 10).is_err());
+        conn.execute("update header_blocks set sequence = 3, header_count = 2", &[]).unwrap();
+        assert!(read_page(&mut conn, "test-source", GROUP, DAY, 0, 10).is_err());
+        assert!(append(&mut conn, "test-source", &[block]).is_err());
     }
 
     #[test]
