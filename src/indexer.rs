@@ -423,6 +423,58 @@ mod postgres_backend_tests {
     use super::*;
 
     #[test]
+    fn cancelled_postgres_day_claim_is_released_off_the_async_worker() {
+        let Some(schema) = crate::pg::testing::Schema::new() else { return };
+        let mut admin = schema.pool.get().unwrap();
+        let database: String = admin.query_one("select current_database()", &[]).unwrap().get(0);
+        admin.execute("insert into backfill_chunks(grp,day,state,server,claimed_at) values ('example.test',1,1,'provider.test',50)", &[]).unwrap();
+        let db = shared_postgres_db(
+            &crate::pg::StorageConfig {
+                backend: crate::pg::Backend::Postgres,
+                url: schema.url.clone(),
+                schema: schema.name.clone(),
+                allow_plaintext: true,
+                ..Default::default()
+            },
+            &database,
+            PgWriteLimits::default(),
+        )
+        .unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        rt.block_on(async {
+            let (ready, started) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                let claim = crate::chunks::Claim {
+                    group: "example.test".into(),
+                    day: 1,
+                    server: "provider.test".into(),
+                    claimed_at: 50,
+                    reread: false,
+                };
+                let guard = GiveBackOnDrop { db: &db, chunk: &claim, armed: true };
+                ready.send(()).unwrap();
+                std::future::pending::<()>().await;
+                drop(guard);
+            });
+            started.await.unwrap();
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled(), "claim cleanup must not panic on a Tokio worker");
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let state: i64 = admin
+                .query_one("select state from backfill_chunks where grp='example.test' and day=1", &[])
+                .unwrap()
+                .get(0);
+            if state == 0 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "cancelled claim was not returned");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
     fn postgres_indexer_saves_releases_and_cursors_without_sqlite() {
         let Some(schema) = crate::pg::testing::Schema::new() else { return };
         let mut conn = schema.pool.get().unwrap();
@@ -1850,11 +1902,23 @@ impl Drop for GiveBackOnDrop<'_> {
         if !self.armed {
             return;
         }
-        // best effort and quick: one update, only while this claim still owns it
-        let r = self.db.conn.with_sql(|conn| Ok(crate::chunks::release(conn, self.chunk)?));
-        if let Err(e) = r {
-            let (group, day) = (&self.chunk.group, self.chunk.day);
-            println!("[CHUNK] {group} day {day}: couldnt give the chunk back when stopped: {e:#}");
+        let conn = self.db.conn.clone();
+        let postgres = matches!(&*conn, MainConnection::Postgres(_));
+        let claim = self.chunk.clone();
+        let release = move || {
+            if let Err(e) = conn.with_sql(|conn| Ok(crate::chunks::release(conn, &claim)?)) {
+                let (group, day) = (&claim.group, claim.day);
+                println!("[CHUNK] {group} day {day}: couldnt give the chunk back when stopped: {e:#}");
+            }
+        };
+        // Cancellation drops this guard on an async worker. PostgreSQL's synchronous client must never run
+        // there; owned state also lets cleanup finish after the cancelled pass has released its Db clone.
+        if !postgres {
+            release();
+        } else if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn_blocking(release);
+        } else {
+            release();
         }
     }
 }

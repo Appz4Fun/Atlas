@@ -1,5 +1,6 @@
 //! Bounded native saves shared by indexer passes and the NXV linker.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, ensure};
@@ -50,15 +51,100 @@ impl Native {
         })
     }
 
+    /// Completion covers every bounded commit. On failure or cancellation, callers must replay the input before
+    /// acknowledging its cursor/hours; the native writer deduplicates the pieces that already committed.
     pub async fn save(&self, releases: Vec<Release>) -> Result<()> {
+        if payload_bytes(&releases, releases.capacity()) <= self.limits.max_job_bytes as usize {
+            return self.save_job(releases).await;
+        }
+        // Keep the writer's whole-input executable rule even when a late fragment is in another commit.
+        let mut junk = HashMap::new();
+        for release in &releases {
+            if let Some(name) = release
+                .articles
+                .iter()
+                .filter_map(|a| a.filename.as_ref())
+                .find(|name| crate::junk::is_executable(name))
+            {
+                let (collection, key) = super::release_writer::identity(release);
+                junk.insert((release.group.clone(), collection, key), name.clone());
+            }
+        }
+        let mut submitted_junk = HashSet::new();
+        let mut batch = Vec::new();
+        let mut batch_bytes = 0;
+        for mut metadata in releases {
+            let (collection, key) = super::release_writer::identity(&metadata);
+            let key = (metadata.group.clone(), collection, key);
+            if let Some(name) = junk.get(&key) {
+                if submitted_junk.insert(key) {
+                    metadata.articles = vec![Article { filename: Some(name.clone()), ..Default::default() }];
+                    self.add_piece(metadata, &mut batch, &mut batch_bytes).await?;
+                }
+                continue;
+            }
+            let articles = std::mem::take(&mut metadata.articles);
+            let mut piece = metadata.clone();
+            let base = payload_bytes(std::slice::from_ref(&piece), 1);
+            let mut strings = 0usize;
+            for article in articles {
+                let heap = article_heap_bytes(&article);
+                let mut capacity = next_capacity(piece.articles.len(), piece.articles.capacity());
+                let projected = |capacity: usize, strings: usize| {
+                    base.saturating_add(strings).saturating_add(capacity.saturating_mul(std::mem::size_of::<Article>()))
+                };
+                if projected(capacity, strings.saturating_add(heap)) > self.limits.max_job_bytes as usize
+                    && !piece.articles.is_empty()
+                {
+                    self.add_piece(piece, &mut batch, &mut batch_bytes).await?;
+                    piece = metadata.clone();
+                    strings = 0;
+                    capacity = 1;
+                }
+                ensure!(
+                    projected(capacity, strings.saturating_add(heap)) <= self.limits.max_job_bytes as usize,
+                    "one native article or its release metadata exceeds max_job_bytes"
+                );
+                if capacity > piece.articles.capacity() {
+                    piece.articles.reserve_exact(capacity - piece.articles.len());
+                }
+                strings = strings.saturating_add(heap);
+                piece.articles.push(article);
+            }
+            if !piece.articles.is_empty() {
+                self.add_piece(piece, &mut batch, &mut batch_bytes).await?;
+            }
+        }
+        self.save_job(batch).await
+    }
+
+    async fn add_piece(&self, piece: Release, batch: &mut Vec<Release>, bytes: &mut usize) -> Result<()> {
+        let owned = payload_bytes(std::slice::from_ref(&piece), 1) - std::mem::size_of::<Release>();
+        let mut capacity = next_capacity(batch.len(), batch.capacity());
+        let projected = |bytes: usize, old: usize, new: usize| {
+            bytes.saturating_add(owned).saturating_add((new - old).saturating_mul(std::mem::size_of::<Release>()))
+        };
+        if projected(*bytes, batch.capacity(), capacity) > self.limits.max_job_bytes as usize && !batch.is_empty() {
+            self.save_job(std::mem::take(batch)).await?;
+            *bytes = 0;
+            capacity = 1;
+        }
+        let next = projected(*bytes, batch.capacity(), capacity);
+        ensure!(next <= self.limits.max_job_bytes as usize, "native release metadata exceeds max_job_bytes");
+        if capacity > batch.capacity() {
+            batch.reserve_exact(capacity - batch.len());
+        }
+        batch.push(piece);
+        *bytes = next;
+        Ok(())
+    }
+
+    async fn save_job(&self, releases: Vec<Release>) -> Result<()> {
         if releases.is_empty() {
             return Ok(());
         }
         let bytes = payload_bytes(&releases, releases.capacity());
-        ensure!(
-            bytes <= self.limits.max_job_bytes as usize,
-            "native save payload exceeds max_job_bytes; reduce the indexing request size"
-        );
+        ensure!(bytes <= self.limits.max_job_bytes as usize, "native job exceeds max_job_bytes");
         let memory = self.memory.clone().acquire_many_owned(bytes as u32).await?;
         let slot = self.slots.clone().acquire_owned().await?;
         let pool = self.pool.clone();
@@ -76,6 +162,18 @@ impl Native {
     }
 }
 
+fn next_capacity(len: usize, capacity: usize) -> usize {
+    if len < capacity { capacity } else { capacity.saturating_mul(2).max(1) }
+}
+
+fn article_heap_bytes(a: &Article) -> usize {
+    [&a.subject, &a.author, &a.date, &a.message_id, &a.references]
+        .into_iter()
+        .map(String::capacity)
+        .chain([&a.filename, &a.release_name].into_iter().flatten().map(String::capacity))
+        .fold(0, usize::saturating_add)
+}
+
 /// Owned allocation capacity, rather than string lengths or claimed article sizes.
 fn payload_bytes(releases: &[Release], capacity: usize) -> usize {
     let mut total = capacity.saturating_mul(std::mem::size_of::<Release>());
@@ -89,12 +187,7 @@ fn payload_bytes(releases: &[Release], capacity: usize) -> usize {
         }
         add(r.articles.capacity().saturating_mul(std::mem::size_of::<Article>()));
         for a in &r.articles {
-            for s in [&a.subject, &a.author, &a.date, &a.message_id, &a.references] {
-                add(s.capacity());
-            }
-            for s in [&a.filename, &a.release_name].into_iter().flatten() {
-                add(s.capacity());
-            }
+            add(article_heap_bytes(a));
         }
     }
     total.max(1)
@@ -104,6 +197,99 @@ fn payload_bytes(releases: &[Release], capacity: usize) -> usize {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn a_large_upload_is_saved_in_bounded_jobs_and_retries_do_not_requeue_it() {
+        let Some(schema) = crate::pg::testing::Schema::new() else { return };
+        let pool = Arc::new(
+            super::super::Pool::new(&super::super::StorageConfig {
+                backend: super::super::Backend::Postgres,
+                url: schema.url.clone(),
+                schema: schema.name.clone(),
+                allow_plaintext: true,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let native =
+            Native::new(pool, PgWriteLimits { max_pending_bytes: 4096, max_job_bytes: 4096, concurrent_saves: 2 })
+                .unwrap();
+        let releases = vec![Release {
+            name: "Large.Release".into(),
+            group: "example.test".into(),
+            articles: (1..=40)
+                .map(|part| Article {
+                    subject: "x".repeat(128),
+                    message_id: format!("<{part}@example.test>"),
+                    filename: Some("file.rar".into()),
+                    part: Some(part),
+                    total_parts: Some(40),
+                    bytes: 100,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }];
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(native.save(releases.clone())).unwrap();
+        let mut conn = schema.pool.get().unwrap();
+        let generation: i64 = conn.query_one("select generation from pp_queue", &[]).unwrap().get(0);
+        rt.block_on(native.save(releases)).unwrap();
+        assert_eq!(conn.query_one("select generation from pp_queue", &[]).unwrap().get::<_, i64>(0), generation);
+        assert_eq!(conn.query_one("select count(*) from releases", &[]).unwrap().get::<_, i64>(0), 1);
+        assert_eq!(conn.query_one("select count(*) from files", &[]).unwrap().get::<_, i64>(0), 1);
+        assert_eq!(conn.query_one("select count(*) from segments", &[]).unwrap().get::<_, i64>(0), 40);
+        assert!(conn.query_one("select complete from files", &[]).unwrap().get::<_, bool>(0));
+    }
+
+    #[test]
+    fn a_late_executable_prevents_earlier_pieces_from_becoming_visible() {
+        let Some(schema) = crate::pg::testing::Schema::new() else { return };
+        let pool = Arc::new(
+            super::super::Pool::new(&super::super::StorageConfig {
+                backend: super::super::Backend::Postgres,
+                url: schema.url.clone(),
+                schema: schema.name.clone(),
+                allow_plaintext: true,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let native =
+            Native::new(pool, PgWriteLimits { max_pending_bytes: 4096, max_job_bytes: 4096, concurrent_saves: 2 })
+                .unwrap();
+        let mut conn = schema.pool.get().unwrap();
+        // A consumer must never observe the apparently clean prefix of an upload already known to contain a program.
+        conn.batch_execute(
+            "create function reject_exposure() returns trigger language plpgsql as $$
+            begin raise exception 'unsafe upload became visible'; end $$;
+            create trigger reject_exposure before insert on releases for each row execute function reject_exposure();",
+        )
+        .unwrap();
+        let clean = Release {
+            name: "Blocked.Release".into(),
+            group: "example.test".into(),
+            articles: (1..=40)
+                .map(|part| Article {
+                    subject: "x".repeat(128),
+                    message_id: format!("<{part}@example.test>"),
+                    filename: Some("file.rar".into()),
+                    part: Some(part),
+                    total_parts: Some(40),
+                    bytes: 100,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let mut late = clean.clone();
+        late.articles = vec![Article { filename: Some("setup.exe".into()), ..Default::default() }];
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(native.save(vec![clean.clone(), late])).unwrap();
+        rt.block_on(native.save(vec![clean])).unwrap();
+        assert_eq!(conn.query_one("select count(*) from releases", &[]).unwrap().get::<_, i64>(0), 0);
+        assert_eq!(conn.query_one("select count(*) from release_writer_junk", &[]).unwrap().get::<_, i64>(0), 1);
+    }
 
     fn release(group: &str, letter: char) -> Vec<Release> {
         vec![Release {
