@@ -1528,7 +1528,7 @@ impl UnionFiles {
         self.files.len() == other.files.len()
             && self.files.iter().all(|(name, f)| {
                 other.files.get(name).is_some_and(|o| {
-                    o.expected == f.expected && o.subject == f.subject && trimmed(&o.seen) == trimmed(&f.seen)
+                    o.expected == f.expected && o.subject == f.subject && store::same_parts(&o.seen, &f.seen)
                 })
             })
     }
@@ -1556,8 +1556,8 @@ impl UnionFiles {
             Some(f) => {
                 let same =
                     f.expected.is_some() && f.expected == o.expected && f.subject.is_some() && f.subject == o.subject;
-                let both = f.seen.iter().zip(&o.seen).any(|(a, b)| a & b != 0);
-                adds |= adds_parts(&f.seen, &o.seen, o.expected);
+                let both = store::parts_overlap(&f.seen, &o.seen);
+                adds |= store::adds_parts(&f.seen, &o.seen, o.expected);
                 if both {
                     shared = true;
                     return same && f.subject.as_deref().is_some_and(subject_has_size);
@@ -1583,7 +1583,7 @@ impl UnionFiles {
     fn shares_parts(&self, other: &UnionFiles) -> bool {
         self.files
             .iter()
-            .any(|(name, f)| other.files.get(name).is_some_and(|o| f.seen.iter().zip(&o.seen).any(|(a, b)| a & b != 0)))
+            .any(|(name, f)| other.files.get(name).is_some_and(|o| store::parts_overlap(&f.seen, &o.seen)))
     }
 
     /// The parts there are, each once however many rows hold it.
@@ -1626,20 +1626,6 @@ impl UnionFiles {
         total.is_none_or(|total| self.files.len() as i64 == total + i64::from(self.zero_indexed))
             || store::one_video_named(self.names.iter().map(String::as_str), self.files.keys().map(String::as_str))
     }
-}
-
-/// Whether `theirs` has a part `ours` lacks, among the file's `expected` parts (a stray bit past them adds nothing).
-fn adds_parts(ours: &[u8], theirs: &[u8], expected: Option<i64>) -> bool {
-    theirs.iter().enumerate().any(|(at, b)| {
-        let new = b & !ours.get(at).copied().unwrap_or(0);
-        (0..8).any(|bit| new >> bit & 1 == 1 && expected.is_none_or(|e| (at * 8 + bit) as i64 <= e))
-    })
-}
-
-/// A `seen` bitmap without its trailing empty bytes, soo two of different lengths compare by their bits.
-fn trimmed(bits: &[u8]) -> &[u8] {
-    let end = bits.iter().rposition(|b| *b != 0).map_or(0, |at| at + 1);
-    &bits[..end]
 }
 
 /// A subject without the number that changes from part to part: the N in `(N/M)`, or in `[N/M]` for a post where
@@ -1726,18 +1712,9 @@ fn union_files(conn: &Connection, ids: &[i64]) -> Result<UnionFiles> {
                     // the same part of one file in two rows is the same article only where the subject names the
                     // file by its size as well: without it, two files of a name can't be told apart
                     let sized = !disagree && subject.as_deref().is_some_and(subject_has_size);
-                    if file.seen.len() < seen.len() {
-                        file.seen.resize(seen.len(), 0);
-                    }
-                    for (slot, bits) in file.seen.iter_mut().zip(seen) {
-                        if *slot & bits != 0 {
-                            if sized {
-                                union.overlap = true;
-                            } else {
-                                union.conflict = true;
-                            }
-                        }
-                        *slot |= bits;
+                    if store::merge_parts(&mut file.seen, &seen) {
+                        union.overlap |= sized;
+                        union.conflict |= !sized;
                     }
                 }
             }

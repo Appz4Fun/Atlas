@@ -6,7 +6,7 @@ use regex::Regex;
 
 /// most parts a file can claim. a subject claiming more is forged: the part
 /// bitmap grows with the part number, so it would cost storage per header
-pub const MAX_PARTS: i64 = 100_000;
+pub const MAX_PARTS: i64 = 250_000;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Article {
