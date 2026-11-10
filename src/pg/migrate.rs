@@ -22,7 +22,7 @@ pub fn run(c: &mut Client, schema: &str) -> Result<Vec<i32>, postgres::Error> {
 }
 
 /// Apply migrations inside a caller's transaction so a staging import can commit schema and rows together.
-pub(super) fn run_in_transaction(
+pub(crate) fn run_in_transaction(
     tx: &mut postgres::Transaction<'_>,
     schema: &str,
 ) -> Result<Vec<i32>, postgres::Error> {
