@@ -4297,12 +4297,27 @@ fn image_facts(i: &crate::images::step::Image) -> String {
         if let Some(sampling) = &j.sampling {
             coding.push_str(&format!(" · {sampling}"));
         }
-        if j.precision != 8 {
+        if j.precision > 0 {
             coding.push_str(&format!(" · {} bit", j.precision));
         }
         facts.push(("Coding", coding));
+        if j.components > 0 {
+            facts.push(("Components", j.components.to_string()));
+        }
+        if let Some(transform) = j.adobe_transform {
+            let value = match transform {
+                0 => "0 (none)".to_string(),
+                1 => "1 (YCbCr)".to_string(),
+                2 => "2 (YCCK)".to_string(),
+                _ => transform.to_string(),
+            };
+            facts.push(("Adobe color transform", value));
+        }
         if let Some(q) = j.quality {
             facts.push(("Quality", if j.quality_exact { format!("{q}") } else { format!("about {q}") }));
+        }
+        if let Some(hash) = j.tables_hash {
+            facts.push(("Quantization table hash", format!("{hash:016x}")));
         }
         if let Some(v) = &j.jfif {
             facts.push(("JFIF", v.clone()));
@@ -4321,17 +4336,24 @@ fn image_facts(i: &crate::images::step::Image) -> String {
         };
         let text = [
             ("Camera", camera),
+            ("Camera serial", x.serial.clone()),
             ("Lens", x.lens.clone()),
             ("Taken", x.taken.clone()),
-            ("Software", x.software.clone().or_else(|| j.xmp.creator_tool.clone())),
+            ("Software", x.software.clone()),
+            ("XMP creator tool", j.xmp.creator_tool.clone()),
             ("Artist", x.artist.clone()),
             ("Copyright", x.copyright.clone()),
             ("Description", x.description.clone()),
             ("Comment", j.comment.clone()),
             ("Image id", x.unique_id.clone()),
-            ("Document id", j.xmp.original_document_id.clone().or_else(|| j.xmp.document_id.clone())),
+            ("XMP document ID", j.xmp.document_id.clone()),
+            ("XMP original document ID", j.xmp.original_document_id.clone()),
+            ("XMP instance ID", j.xmp.instance_id.clone()),
         ];
         facts.extend(text.into_iter().filter_map(|(k, v)| v.map(|v| (k, v))));
+        if let Some(orientation) = x.orientation {
+            facts.push(("Orientation", orientation.to_string()));
+        }
         if let Some((lat, lon)) = x.gps {
             facts.push(("Location", format!("{lat:.5}, {lon:.5}")));
         }
@@ -5317,6 +5339,62 @@ mod tests {
         assert!(crate::web_settings::takes_post("/ui/settings/servers"));
         let forged = post("/ui/settings/servers", "host=x", Some(&cookie()), false, None, base, KEY).unwrap();
         assert_ne!(forged.status, 200, "{}", forged.body);
+    }
+
+    #[test]
+    fn pictures_show_jpeg_metadata_without_hiding_distinct_values() {
+        use crate::images::jpeg::{Exif, JpegInfo, Xmp};
+        use crate::images::step::Image;
+
+        let image = Image {
+            position: 0,
+            file: "cover.jpg".into(),
+            sha256: "a".repeat(64),
+            format: "jpeg".into(),
+            width: 640,
+            height: 480,
+            bytes: 900,
+            jpeg: Some(JpegInfo {
+                width: 640,
+                height: 480,
+                precision: 8,
+                components: 3,
+                process: "progressive".into(),
+                sampling: Some("4:2:0".into()),
+                adobe_transform: Some(1),
+                tables_hash: Some(0xabcd),
+                exif: Exif {
+                    software: Some("Camera firmware".into()),
+                    serial: Some("A<&>1".into()),
+                    orientation: Some(6),
+                    ..Default::default()
+                },
+                xmp: Xmp {
+                    creator_tool: Some("Photo editor".into()),
+                    document_id: Some("current-id".into()),
+                    original_document_id: Some("original-id".into()),
+                    instance_id: Some("instance-id".into()),
+                },
+                ..Default::default()
+            }),
+        };
+
+        let html = super::images_html(42, &[(42, image)]);
+        for fact in [
+            "<dt>Coding</dt><dd>progressive · 4:2:0 · 8 bit</dd>",
+            "<dt>Components</dt><dd>3</dd>",
+            "<dt>Adobe color transform</dt><dd>1 (YCbCr)</dd>",
+            "<dt>Quantization table hash</dt><dd>000000000000abcd</dd>",
+            "<dt>Orientation</dt><dd>6</dd>",
+            "<dt>Camera serial</dt><dd>A&lt;&amp;&gt;1</dd>",
+            "<dt>Software</dt><dd>Camera firmware</dd>",
+            "<dt>XMP creator tool</dt><dd>Photo editor</dd>",
+            "<dt>XMP document ID</dt><dd>current-id</dd>",
+            "<dt>XMP original document ID</dt><dd>original-id</dd>",
+            "<dt>XMP instance ID</dt><dd>instance-id</dd>",
+        ] {
+            assert!(html.contains(fact), "missing {fact} in {html}");
+        }
     }
 
     #[test]
