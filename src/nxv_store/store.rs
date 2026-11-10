@@ -30,14 +30,15 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 use super::segment::{ENTRY_LEN, Entry, Reserved, Segment, parse_day_name};
 use super::slab::{self, Sealed, Slab};
-use super::sync::{fsync_only, sync_all_durable};
+use super::sync::sync_all_durable;
 
 pub const DAY: i64 = 86_400;
 /// A slab's lines at most, in bytes: a block stays well under the format's 1 GiB limit whatever the line lengths.
 pub const SLAB_MAX_BYTES: usize = 256 << 20;
 /// Small recoveries stay open for deduplication against cursor rereads. Seal excess
 /// logs one at a time, so a backlog cannot be duplicated in memory at startup.
-const RECOVERY_OPEN_BYTES: u64 = 64 << 20;
+const RECOVERY_OPEN_BYTES: usize = 64 << 20;
+const RECOVERY_OPEN_LOGS: usize = 1024;
 const MAX_RECOVERY_LOG_BYTES: u64 = (SLAB_MAX_BYTES + slab::MAX_LINE + MAX_BLOCK_ROWS * 16) as u64;
 const LIVE_MEMORY_BUDGET: usize = 512 << 20;
 const FETCH_HEADROOM: usize = 16 << 20;
@@ -171,8 +172,6 @@ struct Slabs {
     full: Vec<Slab>,
     /// swaps done: rows pushed now belong to epoch `epoch + 1`
     epoch: u64,
-    /// logs replaced by replay, deleted once the slab their rows went to has synced
-    replaced: Vec<PathBuf>,
     /// a log was made since the last tick: the directory is synced with the next
     dir_dirty: bool,
     /// days the linker asked to have sealed at the next tick
@@ -213,6 +212,7 @@ struct Shared {
     wake_lock: Mutex<()>,
     wake: Condvar,
     memory: Arc<Semaphore>,
+    fetches: Arc<Semaphore>,
     memory_waiters: AtomicUsize,
     drain_requested: AtomicBool,
     /// rows refused because their day isn't kept, and repeats dropped at seal
@@ -240,6 +240,7 @@ impl Shared {
         }
         drop(f);
         self.memory.close();
+        self.fetches.close();
         let _g = self.synced_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.synced.notify_all();
     }
@@ -268,7 +269,18 @@ impl Drop for MemoryWaiter<'_> {
 
 // Charge the row arena, log frame, metadata and sealing scratch together.
 fn row_charge(line: &[u8]) -> usize {
-    line.len() * 4 + 256
+    if line.len() <= slab::MAX_LINE { line.len() * 4 + 256 } else { 0 }
+}
+
+fn listing_charge(lines: &[Vec<u8>]) -> usize {
+    lines.iter().fold(0, |sum, line| sum.saturating_add(row_charge(line)))
+}
+
+fn parse_row(line: &[u8]) -> Option<(u64, Option<i64>)> {
+    if line.len() > slab::MAX_LINE || line.contains(&b'\n') || line.contains(&b'\r') {
+        return None;
+    }
+    Some((slab::art_of(line)?, line.split(|&b| b == b'\t').nth(3).and_then(parse_rfc2822_to_epoch)))
 }
 
 pub struct Store {
@@ -291,6 +303,8 @@ pub struct Store {
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
     /// one tick at a time: two would interleave their writes to a log
     tick_lock: Mutex<()>,
+    /// Intake in progress when close starts must reach the final tick.
+    recording: RwLock<()>,
 }
 
 /// What `open` found and did.
@@ -367,9 +381,14 @@ impl Store {
         let servers = read_servers(&cfg.root)?;
         let mut opened = Opened::default();
         let mut groups = HashMap::new();
-        let mut recovery_budget = RECOVERY_OPEN_BYTES;
-        for entry in std::fs::read_dir(&cfg.root)?.flatten() {
-            let dir = entry.path();
+        let memory = Arc::new(Semaphore::new(cfg.memory_budget));
+        let mut recovery = RecoveryOpen {
+            memory: &memory,
+            bytes: RECOVERY_OPEN_BYTES.min(cfg.memory_budget),
+            logs: RECOVERY_OPEN_LOGS,
+        };
+        for entry in std::fs::read_dir(&cfg.root)? {
+            let dir = entry?.path();
             let Some(dname) = dir.file_name().and_then(|n| n.to_str()).map(str::to_string) else { continue };
             if !dir.is_dir() || dname == STATE_DIR {
                 continue;
@@ -378,7 +397,7 @@ impl Store {
             // nothing is deleted at open: what the keep set no longer holds goes once expiry is armed (after the
             // linker's first pass), soo a day the linker hasn't linked survives a restart
             let everything = KeepSet { live_from: i64::MIN / 2, ..KeepSet::default() };
-            let group = open_group(&dir, &name, &everything, &mut opened, &mut recovery_budget)?;
+            let group = open_group(&dir, &name, &everything, &mut opened, &mut recovery)?;
             groups.insert(name, group);
         }
         let shared = Arc::new(Shared {
@@ -388,7 +407,8 @@ impl Store {
             synced: Condvar::new(),
             wake_lock: Mutex::new(()),
             wake: Condvar::new(),
-            memory: Arc::new(Semaphore::new(cfg.memory_budget)),
+            memory,
+            fetches: Arc::new(Semaphore::new(cfg.memory_budget.div_ceil(FETCH_HEADROOM))),
             memory_waiters: AtomicUsize::new(0),
             drain_requested: AtomicBool::new(false),
             dropped_unkept: AtomicU64::new(0),
@@ -405,6 +425,7 @@ impl Store {
             seal_tx: Mutex::new(None),
             threads: Mutex::new(Vec::new()),
             tick_lock: Mutex::new(()),
+            recording: RwLock::new(()),
             expiry_armed: AtomicBool::new(false),
             keep_source: Mutex::new(None),
             recent_claims: Mutex::new(BTreeMap::new()),
@@ -525,15 +546,23 @@ impl Store {
     /// kept dropped (counted). The ticket says when the rows are durable.
     #[cfg(test)]
     pub fn record(&self, server: &str, group: &str, lines: &[Vec<u8>], clamp: Clamp) -> Result<Ticket> {
-        let bytes = self.listing_charge(lines)?;
-        let permit = Arc::clone(&self.shared.memory).try_acquire_many_owned(bytes)?;
-        self.record_charged(server, group, lines, clamp, permit)
+        let bytes = listing_charge(lines);
+        anyhow::ensure!(bytes <= self.cfg.memory_budget, "test listing exceeds the header store memory budget");
+        let permit = Arc::clone(&self.shared.memory).try_acquire_many_owned(bytes as u32)?;
+        self.record_charged(server, group, lines, clamp, None, permit)
     }
 
-    pub async fn wait_for_fetch(&self) -> Result<()> {
-        let headroom = FETCH_HEADROOM.min(self.cfg.memory_budget).max(1);
+    pub async fn wait_for_fetch(&self) -> Result<OwnedSemaphorePermit> {
+        let fetch = Arc::clone(&self.shared.fetches).acquire_owned().await?;
+        let headroom = FETCH_HEADROOM.min(self.cfg.memory_budget);
         drop(self.reserve_memory(headroom as u32).await?);
-        Ok(())
+        Ok(fetch)
+    }
+
+    fn request_drain(&self) {
+        let _guard = self.shared.wake_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.shared.drain_requested.store(true, Ordering::Release);
+        self.shared.wake.notify_one();
     }
 
     async fn reserve_memory(&self, bytes: u32) -> Result<OwnedSemaphorePermit> {
@@ -544,28 +573,72 @@ impl Store {
                 let _wait = crate::metrics::span("header_store.wait_memory");
                 self.shared.memory_waiters.fetch_add(1, Ordering::AcqRel);
                 let _waiting = MemoryWaiter(&self.shared.memory_waiters);
-                {
-                    let _guard = self.shared.wake_lock.lock().unwrap_or_else(|e| e.into_inner());
-                    self.shared.drain_requested.store(true, Ordering::Release);
-                    self.shared.wake.notify_one();
-                }
+                self.request_drain();
                 Ok(Arc::clone(&self.shared.memory).acquire_many_owned(bytes).await?)
             }
         }
     }
 
-    fn listing_charge(&self, lines: &[Vec<u8>]) -> Result<u32> {
-        let bytes = lines
-            .iter()
-            .filter(|line| line.len() <= slab::MAX_LINE)
-            .fold(0usize, |sum, line| sum.saturating_add(row_charge(line)));
-        anyhow::ensure!(bytes <= self.cfg.memory_budget, "overview listing exceeds the header store memory budget");
-        Ok(bytes as u32)
-    }
+    pub async fn record_live(
+        self: &Arc<Self>,
+        server: &str,
+        group: &str,
+        lines: Vec<Vec<u8>>,
+        clamp: Clamp,
+        fetch: Option<Arc<OwnedSemaphorePermit>>,
+    ) -> Result<(Vec<Vec<u8>>, Ticket)> {
+        let budget = self.cfg.memory_budget;
+        let charge = listing_charge(&lines);
+        if charge <= budget {
+            let permit = self.reserve_memory(charge as u32).await?;
+            let (store, server, group) = (Arc::clone(self), server.to_owned(), group.to_owned());
+            return tokio::task::spawn_blocking(move || {
+                let _fetch = fetch;
+                let ticket = store.record_charged(&server, &group, &lines, clamp, None, permit)?;
+                Ok((lines, ticket))
+            })
+            .await?;
+        }
 
-    pub async fn record_live(&self, server: &str, group: &str, lines: &[Vec<u8>], clamp: Clamp) -> Result<Ticket> {
-        let permit = self.reserve_memory(self.listing_charge(lines)?).await?;
-        self.record_charged(server, group, lines, clamp, permit)
+        // Oversized listings keep the whole response's date bounds and enter the slab pipeline in budgeted batches.
+        let mut batches = Vec::new();
+        let (mut start, mut bytes) = (0, 0);
+        for (i, line) in lines.iter().enumerate() {
+            let charge = row_charge(line);
+            anyhow::ensure!(charge <= budget, "overview row exceeds the header store memory budget");
+            if bytes + charge > budget {
+                batches.push((start..i, bytes));
+                start = i;
+                bytes = 0;
+            }
+            bytes += charge;
+        }
+        batches.push((start..lines.len(), bytes));
+        let dates: Vec<_> = lines.iter().filter_map(|line| parse_row(line)?.1).collect();
+        let bounds = Some((clamp.bounds(&dates), !dates.is_empty()));
+        drop(dates);
+
+        let lines = Arc::new(lines);
+        let mut days = BTreeMap::new();
+        let mut last = None;
+        for (range, bytes) in batches {
+            let permit = self.reserve_memory(bytes as u32).await?;
+            let (store, server, group) = (Arc::clone(self), server.to_owned(), group.to_owned());
+            let (batch, fetch) = (Arc::clone(&lines), fetch.clone());
+            let mut ticket = tokio::task::spawn_blocking(move || {
+                let _fetch = fetch;
+                store.record_charged(&server, &group, &batch[range], clamp, bounds, permit)
+            })
+            .await??;
+            for (day, count) in std::mem::take(&mut ticket.days) {
+                *days.entry(day).or_default() += count;
+            }
+            last = Some(ticket);
+        }
+        let mut ticket = last.expect("an oversized listing has at least one batch");
+        ticket.days = days.into_iter().collect();
+        let lines = Arc::try_unwrap(lines).expect("all recording batches finished");
+        Ok((lines, ticket))
     }
 
     fn record_charged(
@@ -574,12 +647,15 @@ impl Store {
         group: &str,
         lines: &[Vec<u8>],
         clamp: Clamp,
+        bounds: Option<((i64, i64), bool)>,
         permit: OwnedSemaphorePermit,
     ) -> Result<Ticket> {
+        let _recording = self.recording.read().unwrap_or_else(|e| e.into_inner());
+        anyhow::ensure!(!self.shared.stopping.load(Ordering::Acquire), "the header store stopped");
         if let Some(e) = self.failure() {
             bail!("the header store stopped: {e}");
         }
-        match self.record_inner(server, group, lines, clamp, permit) {
+        match self.record_inner(server, group, lines, clamp, bounds, permit) {
             Ok(t) => Ok(t),
             Err(e) => {
                 // rows that couldnt be kept must not let a cursor move: the store stops, and the slice's wait fails
@@ -596,29 +672,23 @@ impl Store {
         group: &str,
         lines: &[Vec<u8>],
         clamp: Clamp,
+        bounds: Option<((i64, i64), bool)>,
         mut permit: OwnedSemaphorePermit,
     ) -> Result<Ticket> {
         let sid = self.server_id(server)?;
         let g = self.group(group)?;
-        let parsed: Vec<Option<(u64, Option<i64>)>> = lines
-            .iter()
-            .map(|l| {
-                let art = slab::art_of(l)?;
-                if l.contains(&b'\n') || l.contains(&b'\r') || l.len() > slab::MAX_LINE {
-                    return None;
-                }
-                Some((art, l.split(|&b| b == b'\t').nth(3).and_then(parse_rfc2822_to_epoch)))
-            })
-            .collect();
-        let dates: Vec<i64> = parsed.iter().filter_map(|p| p.and_then(|(_, d)| d)).collect();
-        let (lo, hi) = clamp.bounds(&dates);
+        let parsed: Vec<_> = lines.iter().map(|line| parse_row(line)).collect();
+        let ((lo, hi), dated) = bounds.unwrap_or_else(|| {
+            let dates: Vec<_> = parsed.iter().filter_map(|p| p.and_then(|(_, d)| d)).collect();
+            (clamp.bounds(&dates), !dates.is_empty())
+        });
         // a read is on the slice's own day (its median): that day is kept however far behind the read is (a live
         // reader catching up after an outage, a slow group), soo its rows aren't refused; stray rows a day or more
         // from it still are
         let slice_day = ((lo + hi) / 2).div_euclid(DAY);
-        if !dates.is_empty() && !self.keep.read().unwrap_or_else(|e| e.into_inner()).keeps(slice_day) {
+        if dated && !self.keep.read().unwrap_or_else(|e| e.into_inner()).keeps(slice_day) {
             self.add_claimed(slice_day);
-        } else if !dates.is_empty() {
+        } else if dated {
             // refreshed while the read goes on
             if let Some(at) = self.recent_claims.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&slice_day) {
                 *at = Instant::now();
@@ -652,6 +722,9 @@ impl Store {
         }
         let epoch = s.epoch + 1;
         drop(s);
+        if self.shared.memory_waiters.load(Ordering::Acquire) > 0 {
+            self.request_drain();
+        }
         Ok(Ticket { group: g, epoch, shared: Arc::clone(&self.shared), days: days.into_iter().collect() })
     }
 
@@ -770,7 +843,7 @@ impl Store {
         let groups: Vec<Arc<Group>> = self.groups.read().unwrap_or_else(|e| e.into_inner()).values().cloned().collect();
         let mut writes: Vec<(Arc<File>, Vec<u8>)> = Vec::new();
         let mut dirs: Vec<PathBuf> = Vec::new();
-        let mut synced: Vec<(Arc<Group>, u64, Vec<PathBuf>)> = Vec::new();
+        let mut synced: Vec<(Arc<Group>, u64)> = Vec::new();
         let mut to_seal: Vec<(Arc<Group>, Slab)> = Vec::new();
         for g in &groups {
             let mut s = g.slabs.lock().unwrap_or_else(|e| e.into_inner());
@@ -802,7 +875,7 @@ impl Store {
                 dirs.push(g.dir.clone());
             }
             s.epoch += 1;
-            synced.push((Arc::clone(g), s.epoch, std::mem::take(&mut s.replaced)));
+            synced.push((Arc::clone(g), s.epoch));
             let leaving: Vec<Slab> = leaving.into_iter().filter(|sl| !sl.is_empty()).collect();
             {
                 let mut inflight = self.shared.inflight.lock().unwrap_or_else(|e| e.into_inner());
@@ -829,11 +902,9 @@ impl Store {
             self.shared.fail(e);
             return Err(anyhow!("header store: log sync failed"));
         }
-        for (g, epoch, replaced) in synced {
+        drop(writes);
+        for (g, epoch) in synced {
             g.synced_epoch.store(epoch, Ordering::Release);
-            for p in replaced {
-                let _ = std::fs::remove_file(p);
-            }
         }
         {
             let _g = self.shared.synced_lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -942,8 +1013,12 @@ impl Store {
 
     /// Seals and commits everything, then stops the threads. What `record` got after this isn't kept.
     pub fn close(&self) -> Result<()> {
-        self.shared.stopping.store(true, Ordering::Release);
         self.shared.memory.close();
+        self.shared.fetches.close();
+        {
+            let _recording = self.recording.write().unwrap_or_else(|e| e.into_inner());
+            self.shared.stopping.store(true, Ordering::Release);
+        }
         {
             let _g = self.shared.wake_lock.lock().unwrap_or_else(|e| e.into_inner());
             self.shared.wake.notify_all();
@@ -1012,7 +1087,6 @@ fn new_group(dir: PathBuf, name: &str, next_gen: u32) -> Group {
             open: HashMap::new(),
             full: Vec::new(),
             epoch: 0,
-            replaced: Vec::new(),
             dir_dirty: false,
             seal_days: BTreeSet::new(),
         }),
@@ -1052,19 +1126,25 @@ fn push_row<'a>(
     Ok(slab)
 }
 
+struct RecoveryOpen<'a> {
+    memory: &'a Arc<Semaphore>,
+    bytes: usize,
+    logs: usize,
+}
+
 /// A group at open: kept segments healed, others deleted; its logs deleted or replayed.
 fn open_group(
     dir: &Path,
     name: &str,
     keep: &KeepSet,
     opened: &mut Opened,
-    recovery_budget: &mut u64,
+    recovery: &mut RecoveryOpen<'_>,
 ) -> Result<Arc<Group>> {
     let mut segments = BTreeMap::new();
     let mut logs: Vec<(PathBuf, u16, i64, u32)> = Vec::new();
     let mut max_gen = 0u32;
-    for e in std::fs::read_dir(dir)?.flatten() {
-        let p = e.path();
+    for entry in std::fs::read_dir(dir)? {
+        let p = entry?.path();
         let Some(fname) = p.file_name().and_then(|n| n.to_str()).map(str::to_string) else { continue };
         if let Some(stem) = fname.strip_suffix(".nxv")
             && let Some(day) = parse_day_name(stem)
@@ -1085,24 +1165,29 @@ fn open_group(
             logs.push((p, server, day, slab_gen));
         }
     }
-    let g = Arc::new(new_group(dir.to_path_buf(), name, max_gen + 1));
+    let next_gen = max_gen.checked_add(1).context("header store slab generations exhausted")?;
+    let g = Arc::new(new_group(dir.to_path_buf(), name, next_gen));
     *g.segments.write().unwrap_or_else(|e| e.into_inner()) = segments;
     logs.sort_by_key(|l| l.3);
     {
         let mut s = g.slabs.lock().unwrap_or_else(|e| e.into_inner());
+        let mut synced_days = HashSet::new();
         for (path, server, day, slab_gen) in logs {
             if !keep.keeps(day) {
                 let _ = std::fs::remove_file(&path);
                 opened.logs_unkept += 1;
                 continue;
             }
-            let committed = g
-                .segments
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&day)
-                .is_some_and(|seg| seg.is_committed(server, slab_gen));
-            if committed {
+            let segment = g.segments.read().unwrap_or_else(|e| e.into_inner()).get(&day).cloned();
+            if let Some(segment) = segment.filter(|seg| seg.is_committed(server, slab_gen)) {
+                if synced_days.insert(day) {
+                    // A previous process may have stopped before flushing the recovered block or its name.
+                    sync_all_durable(&[
+                        &File::open(&segment.arena_path)?,
+                        &File::open(&segment.index_path)?,
+                        &File::open(dir)?,
+                    ])?;
+                }
                 let _ = std::fs::remove_file(&path);
                 opened.logs_already_committed += 1;
                 continue;
@@ -1115,20 +1200,29 @@ fn open_group(
                 .read_to_end(&mut bytes)
                 .with_context(|| format!("reading {}", path.display()))?;
             anyhow::ensure!(bytes.len() as u64 <= MAX_RECOVERY_LOG_BYTES, "slab log is too large: {}", path.display());
-            let log_bytes = bytes.len() as u64;
-            if log_bytes > *recovery_budget {
-                recover_sealed_log(&g, path, server, day, slab_gen, &bytes, opened)?;
-                continue;
-            }
-            *recovery_budget -= log_bytes;
-            for (ts, line) in slab::unframe(&bytes) {
+            let mut records = slab::records(&bytes);
+            let mut rows = Vec::new();
+            let mut charge = 0;
+            for (ts, line) in records.by_ref() {
                 if let Some(art) = slab::art_of(line) {
-                    push_row(&g, &mut s, server, day, art, ts, line, MAX_BLOCK_ROWS)?;
-                    opened.rows_replayed += 1;
+                    anyhow::ensure!(rows.len() < MAX_BLOCK_ROWS, "too many rows in {}", path.display());
+                    rows.push((art, ts, line));
+                    charge += row_charge(line);
                 }
             }
-            s.replaced.push(path);
+            opened.rows_replayed += rows.len();
             opened.logs_replayed += 1;
+            if rows.is_empty() {
+                std::fs::remove_file(&path)?;
+            } else if recovery.logs > 0 && charge <= recovery.bytes && !s.open.contains_key(&(server, day)) {
+                let permit = Arc::clone(recovery.memory).try_acquire_many_owned(charge as u32)?;
+                let sl = Slab::reopen(server, day, slab_gen, path, records.valid_len(), rows, permit)?;
+                s.open.insert((server, day), sl);
+                recovery.bytes -= charge;
+                recovery.logs -= 1;
+            } else {
+                recover_sealed_log(&g, path, server, day, slab_gen, rows, opened)?;
+            }
         }
     }
     Ok(g)
@@ -1140,27 +1234,19 @@ fn recover_sealed_log(
     server: u16,
     day: i64,
     slab_gen: u32,
-    bytes: &[u8],
+    mut rows: Vec<(u64, i64, &[u8])>,
     opened: &mut Opened,
 ) -> Result<()> {
-    let mut rows: Vec<_> =
-        slab::unframe(bytes).into_iter().filter_map(|(_, line)| slab::art_of(line).map(|art| (art, line))).collect();
-    opened.rows_replayed += rows.len();
-    rows.sort_by_key(|(art, _)| *art);
-    rows.dedup_by_key(|(art, _)| *art);
-    if rows.is_empty() {
-        std::fs::remove_file(&path)?;
-    } else {
-        // Retain the original generation so the next recovery recognizes a committed block
-        // even if a crash occurred before its log was unlinked.
-        let lines: Vec<_> = rows.into_iter().map(|(_, line)| line).collect();
-        let block = NxvBlockBuilder::build_hot_block_meta(&lines, BlockMeta { server_id: server, slab_gen })?;
-        let existed = group.segments.read().unwrap_or_else(|e| e.into_inner()).contains_key(&day);
-        opened.blocks +=
-            commit(&[Pending { group: Arc::clone(group), day, slab_gen, block, log: path, _memory: None }])?;
-        opened.segments += usize::from(!existed);
-    }
-    opened.logs_replayed += 1;
+    rows.sort_by_key(|(art, ..)| *art);
+    rows.dedup_by_key(|(art, ..)| *art);
+    // Keep the original generation so recovery recognizes a committed block even if its log survived.
+    let lines: Vec<_> = rows.into_iter().map(|(_, _, line)| line).collect();
+    let block = NxvBlockBuilder::build_hot_block_meta(&lines, BlockMeta { server_id: server, slab_gen })?;
+    let existed = group.segments.read().unwrap_or_else(|e| e.into_inner()).contains_key(&day);
+    opened.blocks += commit(&[Pending { group: Arc::clone(group), day, slab_gen, block, log: path, _memory: None }])?;
+    opened.segments += usize::from(!existed);
+    // Sequential startup recovery can touch many segments before housekeeping first runs.
+    group.segments.read().unwrap_or_else(|e| e.into_inner())[&day].close_if_idle(Duration::ZERO);
     Ok(())
 }
 
@@ -1188,7 +1274,10 @@ fn sealer(rx: Arc<Mutex<Receiver<SealJob>>>, tx: SyncSender<Pending>, shared: Ar
             crate::metrics::names::HEADER_STORE_DROPPED.inc(&[("reason", "repeat")], dropped_repeats as u64);
         }
         let refs: Vec<&[u8]> = lines.iter().map(|l| l.as_slice()).collect();
-        match NxvBlockBuilder::build_hot_block_meta(&refs, BlockMeta { server_id: server, slab_gen }) {
+        let block = NxvBlockBuilder::build_hot_block_meta(&refs, BlockMeta { server_id: server, slab_gen });
+        drop(refs);
+        drop(lines);
+        match block {
             Ok(block) => {
                 if tx.send(Pending { group, day, slab_gen, block, log: log_path, _memory: memory }).is_err() {
                     return;
@@ -1277,7 +1366,6 @@ fn commit(batch: &[Pending]) -> Result<usize> {
         let _ = std::fs::remove_file(&p.log);
     }
     // the logs' names gone durably is not needed: a log left behind is found committed at the next start
-    let _ = fsync_only;
     Ok(reserved.len())
 }
 
@@ -1333,9 +1421,74 @@ mod tests {
             let mut fetch = Box::pin(store.wait_for_fetch());
             assert!(tokio::time::timeout(Duration::from_millis(30), &mut fetch).await.is_err());
             drop(held);
-            tokio::time::timeout(Duration::from_secs(2), fetch).await.unwrap().unwrap();
+            drop(tokio::time::timeout(Duration::from_secs(2), fetch).await.unwrap().unwrap());
         });
         store.close().unwrap();
+    }
+
+    #[test]
+    fn fetch_admission_stays_held_while_the_response_is_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = StoreConfig { memory_budget: 8192, ..cfg(dir.path()) };
+        let (store, _) = Store::open(cfg, keep_all()).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        rt.block_on(async {
+            let mut next = Box::pin(store.wait_for_fetch());
+            {
+                let _first = store.wait_for_fetch().await.unwrap();
+                assert!(tokio::time::timeout(Duration::from_millis(30), &mut next).await.is_err());
+            }
+            drop(tokio::time::timeout(Duration::from_secs(2), next).await.unwrap().unwrap());
+        });
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn recovered_log_keeps_its_generation_and_accepts_rows_after_a_torn_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let group = dir.path().join("g");
+        std::fs::create_dir(&group).unwrap();
+        let day = day_of("2026-11-08");
+        let path = group.join(slab::log_name(1, day, 17));
+        std::fs::create_dir(dir.path().join(STATE_DIR)).unwrap();
+        std::fs::write(dir.path().join(STATE_DIR).join(SERVERS_FILE), "s\n").unwrap();
+        let mut bytes = Vec::new();
+        slab::frame(day * DAY, &line(1, "p@x", NOV8), &mut bytes);
+        bytes.extend_from_slice(b"torn");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let (store, opened) = Store::open(cfg(dir.path()), keep_all()).unwrap();
+        assert_eq!(opened.rows_replayed, 1);
+        assert!(store.shared.memory.available_permits() < store.cfg.memory_budget);
+        store.record("s", "g", &[line(2, "p@x", NOV8)], Clamp::Live { now: NOW }).unwrap();
+        store.tick().unwrap();
+        let appended = std::fs::read(&path).unwrap();
+        assert_eq!(slab::unframe(&appended).len(), 2);
+        store.close().unwrap();
+        let (_, entries) = store.day_blocks("g", day);
+        assert_eq!((entries.len(), entries[0].rows, entries[0].slab_gen), (1, 2, 17));
+    }
+
+    #[test]
+    fn a_listing_larger_than_the_intake_budget_is_recorded_in_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let lines = (1..=3).map(|art| line(art, "p@x", NOV8)).collect::<Vec<_>>();
+        let cfg = StoreConfig { memory_budget: row_charge(&lines[0]) * 2, ..cfg(dir.path()) };
+        let (store, _) = Store::open(cfg, keep_all()).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        let (_, ticket) = rt.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                store.record_live("s", "g", lines, Clamp::Live { now: NOW }, None),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        });
+        assert_eq!(ticket.days, [(day_of("2026-11-08"), 3)]);
+        store.close().unwrap();
+        ticket.wait(Duration::ZERO).unwrap();
+        assert_eq!(store.day_blocks("g", day_of("2026-11-08")).1.iter().map(|e| e.rows).sum::<u32>(), 3);
     }
 
     #[test]
@@ -1347,13 +1500,13 @@ mod tests {
         let (store, _) = Store::open(cfg, keep_all()).unwrap();
         let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
         rt.block_on(async {
-            store.record_live("s", "g", &lines, Clamp::Live { now: NOW }).await.unwrap();
+            store.record_live("s", "g", lines, Clamp::Live { now: NOW }, None).await.unwrap();
             // The log becomes durable during a normal tick, but its partial slab still holds capacity.
             store.tick().unwrap();
             assert_eq!(store.counters().2, 0);
             assert_eq!(store.shared.memory.available_permits(), budget / 2);
             // Capacity pressure seals it without waiting for the normal idle timer.
-            tokio::time::timeout(Duration::from_secs(5), store.wait_for_fetch()).await.unwrap().unwrap();
+            drop(tokio::time::timeout(Duration::from_secs(5), store.wait_for_fetch()).await.unwrap().unwrap());
             assert_eq!(store.counters().2, 1);
             assert_eq!(store.shared.memory.available_permits(), budget);
         });
@@ -1487,26 +1640,28 @@ mod tests {
                 slab::frame(ts, &line(art, "p@x", NOV8), &mut bytes);
             }
             std::fs::write(&path, &bytes).unwrap();
-            logs.push((path, bytes.len() as u64));
+            logs.push(path);
         }
         let mut opened = Opened::default();
-        let mut budget = logs[0].1;
-        let before_commit = std::fs::read(&logs[1].0).unwrap();
-        let g = open_group(&first, "g", &keep_all(), &mut opened, &mut budget).unwrap();
-        let h = open_group(&second, "h", &keep_all(), &mut opened, &mut budget).unwrap();
-        assert!(logs[0].0.exists());
+        let charge = row_charge(&line(1, "p@x", NOV8)) * 3;
+        let memory = Arc::new(Semaphore::new(charge));
+        let mut recovery = RecoveryOpen { memory: &memory, bytes: charge, logs: 2 };
+        let before_commit = std::fs::read(&logs[1]).unwrap();
+        let g = open_group(&first, "g", &keep_all(), &mut opened, &mut recovery).unwrap();
+        let h = open_group(&second, "h", &keep_all(), &mut opened, &mut recovery).unwrap();
+        assert!(logs[0].exists());
         assert_eq!(g.slabs.lock().unwrap().open.len(), 1);
         assert!(h.slabs.lock().unwrap().open.is_empty());
-        assert!(!logs[1].0.exists());
+        assert!(!logs[1].exists());
         let (_, entries) = h.segments.read().unwrap()[&day].snapshot();
         assert_eq!((entries.len(), entries[0].rows, entries[0].slab_gen), (1, 2, 2));
         drop(h);
 
-        std::fs::write(&logs[1].0, before_commit).unwrap();
-        let h = open_group(&second, "h", &keep_all(), &mut opened, &mut budget).unwrap();
+        std::fs::write(&logs[1], before_commit).unwrap();
+        let h = open_group(&second, "h", &keep_all(), &mut opened, &mut recovery).unwrap();
         assert_eq!(opened.logs_already_committed, 1);
         assert_eq!(h.segments.read().unwrap()[&day].block_count(), 1);
-        assert!(!logs[1].0.exists());
+        assert!(!logs[1].exists());
     }
 
     #[test]

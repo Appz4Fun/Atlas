@@ -20,6 +20,7 @@ use regex::Regex;
 
 use crate::config::UsenetServer;
 use crate::dates::to_iso_date;
+use crate::nxv_store::live::Fetch as HeaderFetch;
 use crate::parser::Article;
 
 #[derive(Debug)]
@@ -107,8 +108,8 @@ impl From<io::Error> for NntpError {
 
 pub type Result<T> = std::result::Result<T, NntpError>;
 
-async fn wait_for_header_store() -> Result<()> {
-    crate::nxv_store::live::wait_for_fetch().await.map_err(|error| NntpError::HeaderStore(format!("{error:#}")))
+async fn wait_for_header_store() -> Result<HeaderFetch> {
+    HeaderFetch::begin().await.map_err(|error| NntpError::HeaderStore(format!("{error:#}")))
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1315,33 +1316,45 @@ impl Conn {
 
     /// XOVER pulls a whole header range in one shot
     pub async fn xover(&mut self, start: u64, end: u64) -> Result<Vec<Overview>> {
-        self.xover_timed(start, end, None).await
+        let fetch = wait_for_header_store().await?;
+        self.xover_timed(start, end, None, &fetch).await
     }
 
-    async fn xover_timed(&mut self, start: u64, end: u64, deadline: Option<Duration>) -> Result<Vec<Overview>> {
-        wait_for_header_store().await?;
+    async fn xover_timed(
+        &mut self,
+        start: u64,
+        end: u64,
+        deadline: Option<Duration>,
+        fetch: &HeaderFetch,
+    ) -> Result<Vec<Overview>> {
         let measure = self.measure("XOVER", "nntp.xover");
-        let r = self.xover_unmeasured(start, end, deadline).await;
+        let r = self.xover_unmeasured(start, end, deadline, fetch).await;
         self.measured(measure, &r);
         r
     }
 
-    async fn xover_unmeasured(&mut self, start: u64, end: u64, deadline: Option<Duration>) -> Result<Vec<Overview>> {
+    async fn xover_unmeasured(
+        &mut self,
+        start: u64,
+        end: u64,
+        deadline: Option<Duration>,
+        fetch: &HeaderFetch,
+    ) -> Result<Vec<Overview>> {
         let wire = self.xover_raw_unmeasured(start, end);
         let lines = if let Some(limit) = deadline { within(limit, "XOVER", wire).await? } else { wire.await? };
-        self.archive(&lines).await?;
+        let lines = self.archive(lines, fetch).await?;
         Ok(lines.iter().filter_map(|l| parse_overview(l)).collect())
     }
 
-    /// A fetched listing to the overview archive, when it's on (`overview_archive`).
-    async fn archive(&mut self, lines: &[Vec<u8>]) -> Result<()> {
-        if let Some(group) = &self.group {
-            crate::nxv_store::live::record(&self.server, group, lines)
-                .await
-                .map_err(|error| NntpError::HeaderStore(format!("{error:#}")))?;
-            crate::overview_archive::record(&self.server, group, lines);
-        }
-        Ok(())
+    /// A fetched listing to the overview archives when enabled.
+    async fn archive(&mut self, lines: Vec<Vec<u8>>, fetch: &HeaderFetch) -> Result<Vec<Vec<u8>>> {
+        let Some(group) = &self.group else { return Ok(lines) };
+        let lines = fetch
+            .record(&self.server, group, lines)
+            .await
+            .map_err(|error| NntpError::HeaderStore(format!("{error:#}")))?;
+        crate::overview_archive::record(&self.server, group, &lines);
+        Ok(lines)
     }
 
     /// XOVER rows as the server sent them: dot-unstuffed, without the line
@@ -1385,23 +1398,36 @@ impl Conn {
     /// where `XFEATURE COMPRESS GZIP` returns `500` but `XZVER` returns `224`.
     /// Refuses to send `XZVER` on Highwinds backends where `XZVER` hangs on the wire.
     pub async fn xzver(&mut self, start: u64, end: u64) -> Result<Vec<Overview>> {
-        self.xzver_timed(start, end, None).await
+        let fetch = wait_for_header_store().await?;
+        self.xzver_timed(start, end, None, &fetch).await
     }
 
-    async fn xzver_timed(&mut self, start: u64, end: u64, deadline: Option<Duration>) -> Result<Vec<Overview>> {
-        wait_for_header_store().await?;
+    async fn xzver_timed(
+        &mut self,
+        start: u64,
+        end: u64,
+        deadline: Option<Duration>,
+        fetch: &HeaderFetch,
+    ) -> Result<Vec<Overview>> {
         let measure = self.measure("XZVER", "nntp.xzver");
-        let r = self.xzver_unmeasured(start, end, deadline).await;
+        let r = self.xzver_unmeasured(start, end, deadline, fetch).await;
         self.measured(measure, &r);
         r
     }
 
-    async fn xzver_unmeasured(&mut self, start: u64, end: u64, deadline: Option<Duration>) -> Result<Vec<Overview>> {
+    async fn xzver_unmeasured(
+        &mut self,
+        start: u64,
+        end: u64,
+        deadline: Option<Duration>,
+        fetch: &HeaderFetch,
+    ) -> Result<Vec<Overview>> {
         let wire = self.xzver_raw_unmeasured(start, end);
         let raw_lines = if let Some(limit) = deadline { within(limit, "XZVER", wire).await? } else { wire.await? };
-        if self.group.is_some() && (crate::overview_archive::enabled() || crate::nxv_store::live::enabled()) {
+        if self.group.is_some() && (crate::overview_archive::enabled() || fetch.enabled()) {
             let lines = decode_xzver_raw(&raw_lines)?;
-            self.archive(&lines).await?;
+            drop(raw_lines);
+            let lines = self.archive(lines, fetch).await?;
             return Ok(lines.iter().filter_map(|l| parse_overview(l)).collect());
         }
         decode_xzver_lines(&raw_lines)
@@ -3794,8 +3820,8 @@ impl Pool {
     /// server that refused compression it is an `XZVER` when that works there (see `wants_xzver`).
     async fn xover_once(&self, i: usize, group: &str, start: u64, end: u64, plain: bool) -> Result<Vec<Overview>> {
         let mut xzver_allowed = !plain;
+        let fetch = wait_for_header_store().await?;
         loop {
-            wait_for_header_store().await?;
             let mut lease = self.lease_for(i, Some(group), false).await?;
             if plain {
                 self.uncompressed(&mut lease).await?;
@@ -3817,17 +3843,17 @@ impl Pool {
             let (method, r) = if matches!(ask, Ask::No) {
                 let compressed = lease.conn.as_ref().is_some_and(|c| c.compressed);
                 let method = if compressed { "xover_gzip" } else { "xover" };
-                (method, lease.begin().xover_timed(start, end, Some(self.xover_deadline)).await)
+                (method, lease.begin().xover_timed(start, end, Some(self.xover_deadline), &fetch).await)
             } else {
                 let deadline =
                     if probing { self.xover_deadline.min(XZVER_PROBE_DEADLINE) } else { self.xover_deadline };
-                match lease.begin().xzver_timed(start, end, Some(deadline)).await {
+                match lease.begin().xzver_timed(start, end, Some(deadline), &fetch).await {
                     // nothing to tell it works by, and a server that ignores the range would read empty for good:
                     // the connection takes a plain XOVER of the slice, and the next listing probes
                     Ok(rows) if probing && rows.is_empty() => {
                         lease.busy = false;
                         requests = 2;
-                        let r = lease.begin().xover_timed(start, end, Some(self.xover_deadline)).await;
+                        let r = lease.begin().xover_timed(start, end, Some(self.xover_deadline), &fetch).await;
                         if r.as_ref().is_ok_and(|rows| !rows.is_empty()) {
                             // XOVER has rows XZVER said werent there
                             let e = NntpError::Protocol("XZVER answered empty where XOVER has headers".into());
@@ -3837,7 +3863,7 @@ impl Pool {
                     }
                     Ok(rows) => {
                         self.xzver_works(&lease.server);
-                        let (r, asked) = self.xzver_rest(&mut lease, rows, end, deadline).await;
+                        let (r, asked) = self.xzver_rest(&mut lease, rows, end, deadline, &fetch).await;
                         requests += asked;
                         ("xzver", r)
                     }
@@ -3862,7 +3888,7 @@ impl Pool {
                         self.xzver_failed(&lease.server, &e, probing, false);
                         lease.busy = false;
                         requests = 2;
-                        ("xover", lease.begin().xover_timed(start, end, Some(self.xover_deadline)).await)
+                        ("xover", lease.begin().xover_timed(start, end, Some(self.xover_deadline), &fetch).await)
                     }
                     // where it works, a wide slice that times out is halved like an XOVER's (see `xover_on`)
                     Err(e) if !probing && e.is_timeout() && wide => ("xzver", Err(e)),
@@ -3903,12 +3929,13 @@ impl Pool {
         mut rows: Vec<Overview>,
         end: u64,
         deadline: Duration,
+        fetch: &HeaderFetch,
     ) -> (Result<Vec<Overview>>, u64) {
         let mut asked = 0;
         while let Some(last) = rows.iter().map(|o| o.number).max().filter(|&n| n < end) {
             lease.busy = false;
             asked += 1;
-            match lease.begin().xzver_timed(last + 1, end, Some(deadline)).await {
+            match lease.begin().xzver_timed(last + 1, end, Some(deadline), fetch).await {
                 Ok(more) => {
                     let before = rows.len();
                     rows.extend(more.into_iter().filter(|o| o.number > last));
@@ -4921,6 +4948,62 @@ mod tests {
         assert!(!is_stale(None), "in use, or new");
         assert!(!is_stale(Some(Instant::now())));
         assert!(is_stale(Instant::now().checked_sub(STALE_IDLE)));
+    }
+
+    #[test]
+    fn a_completed_xover_can_wait_for_disk_past_its_wire_deadline() {
+        use crate::nxv_store::store::{KeepSet, Store, StoreConfig};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = Store::open(StoreConfig::new(dir.path()), KeepSet::default()).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().max_blocking_threads(1).enable_all().build().unwrap();
+        rt.block_on(async {
+            let fetch = HeaderFetch::begin_on(Arc::clone(&store)).await.unwrap();
+            let (unblock, stall) = std::sync::mpsc::channel::<()>();
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let worker = tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                let _ = stall.recv();
+            });
+            ready.await.unwrap();
+
+            let (client, server) = tokio::io::duplex(4096);
+            let mut conn = Conn::over(Box::new(client), Duration::from_secs(5));
+            conn.group = Some("g".into());
+            conn.server = "s".into();
+            let reply = tokio::spawn(async move {
+                let mut server = BufReader::new(server);
+                let mut cmd = String::new();
+                server.read_line(&mut cmd).await.unwrap();
+                assert_eq!(cmd, "XOVER 1-1\r\n");
+                server
+                    .get_mut()
+                    .write_all(b"224 overview follows\r\n1\ttest\tp\t\t<m@x>\t\t1\t1\r\n.\r\n")
+                    .await
+                    .unwrap();
+            });
+            let mut listing = Box::pin(conn.xover_timed(1, 1, Some(Duration::from_millis(100)), &fetch));
+            assert!(tokio::time::timeout(Duration::from_millis(300), &mut listing).await.is_err());
+            unblock.send(()).unwrap();
+            let rows = tokio::time::timeout(Duration::from_secs(5), listing).await.unwrap().unwrap();
+            assert_eq!(rows.iter().map(|row| row.number).collect::<Vec<_>>(), [1]);
+            reply.await.unwrap();
+            worker.await.unwrap();
+        });
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn a_stalled_xover_wire_still_times_out() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let fetch = wait_for_header_store().await.unwrap();
+            let (client, _server) = tokio::io::duplex(4096);
+            let mut conn = Conn::over(Box::new(client), Duration::from_secs(5));
+            let err = conn.xover_timed(1, 1, Some(Duration::from_millis(20)), &fetch).await.unwrap_err();
+            assert!(err.is_timeout());
+            assert!(err.breaks_connection());
+        });
     }
 
     /// A server that drops each connection's first XOVER without a word, as one does an idle connection it timed

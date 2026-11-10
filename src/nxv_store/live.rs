@@ -125,28 +125,22 @@ pub fn keep_now() -> KeepSet {
 }
 
 /// Opens the store when it's on. Call once, from the indexer; it starts the store's linker after.
-pub fn spawn(cfg: &crate::config::HeaderStoreConfig) {
+pub fn spawn(cfg: &crate::config::HeaderStoreConfig) -> anyhow::Result<()> {
     if !cfg.enabled {
-        return;
+        return Ok(());
     }
     let _ = STARTED.set(Instant::now());
     let root = cfg.root();
     let state_dir: PathBuf = root.join("_state");
     load_claimed(&state_dir);
-    let (store, opened) = match Store::open(StoreConfig::new(&root), keep_now()) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("header store: couldnt open {}: {e:#}; not recording", root.display());
-            return;
-        }
-    };
+    use anyhow::Context;
+    let (store, opened) = Store::open(StoreConfig::new(&root), keep_now())
+        .with_context(|| format!("opening header store {}", root.display()))?;
     eprintln!(
         "header store: {} segments, {} blocks; {} logs replayed ({} rows), {} already committed",
         opened.segments, opened.blocks, opened.logs_replayed, opened.rows_replayed, opened.logs_already_committed
     );
-    if STORE.set(Mutex::new(Some(Arc::clone(&store)))).is_err() {
-        return;
-    }
+    anyhow::ensure!(STORE.set(Mutex::new(Some(Arc::clone(&store)))).is_ok(), "header store already started");
     // housekeeping and refused rows ask for the keep set as of then
     store.set_keep_source(Arc::new(keep_now));
     // the store's linker arms expiry after its first pass; with a linker that can't read its state, nothing would, soo
@@ -176,30 +170,39 @@ pub fn spawn(cfg: &crate::config::HeaderStoreConfig) {
             }
         }
     });
-}
-
-/// Whether the store is recording, soo the connection layer knows to hand it listings.
-pub fn enabled() -> bool {
-    store().is_some()
-}
-
-pub async fn wait_for_fetch() -> anyhow::Result<()> {
-    if let Some(s) = store() {
-        s.wait_for_fetch().await?;
-    }
     Ok(())
 }
 
-/// Keep a fetched listing, waiting for byte capacity before copying it into the store.
-pub async fn record(server: &str, group: &str, lines: &[Vec<u8>]) -> anyhow::Result<()> {
-    let Some(s) = store() else { return Ok(()) };
-    if lines.is_empty() {
-        return Ok(());
+/// One admitted listing, held through NNTP reads and any detached disk work.
+pub struct Fetch(Option<(Arc<Store>, Arc<tokio::sync::OwnedSemaphorePermit>)>);
+
+impl Fetch {
+    pub async fn begin() -> anyhow::Result<Self> {
+        let Some(store) = store() else { return Ok(Self(None)) };
+        Self::begin_on(store).await
     }
-    let now = now();
-    let t = s.record_live(server, group, lines, Clamp::Unknown { now }).await?;
-    refresh_claimed(&t.days, now);
-    Ok(())
+
+    pub(crate) async fn begin_on(store: Arc<Store>) -> anyhow::Result<Self> {
+        let permit = Arc::new(store.wait_for_fetch().await?);
+        Ok(Self(Some((store, permit))))
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.0.is_some()
+    }
+
+    /// Keep a fetched listing, waiting for byte capacity before copying it into the store.
+    pub async fn record(&self, server: &str, group: &str, lines: Vec<Vec<u8>>) -> anyhow::Result<Vec<Vec<u8>>> {
+        let Some((store, fetch)) = &self.0 else { return Ok(lines) };
+        if lines.is_empty() {
+            return Ok(lines);
+        }
+        let now = now();
+        let (lines, ticket) =
+            store.record_live(server, group, lines, Clamp::Unknown { now }, Some(Arc::clone(fetch))).await?;
+        refresh_claimed(&ticket.days, now);
+        Ok(lines)
+    }
 }
 
 /// What a slice waits on before it counts as read: every row recorded for `group` so far durable. None when the

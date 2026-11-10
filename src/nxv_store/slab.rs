@@ -42,28 +42,49 @@ pub fn frame(ts: i64, line: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(line);
 }
 
-/// The records of a log's bytes, up to the first short or damaged one: (timestamp, line) each.
-pub fn unframe(bytes: &[u8]) -> Vec<(i64, &[u8])> {
-    let mut out = Vec::new();
-    let mut at = 0;
-    while at + RECORD_HEAD <= bytes.len() {
-        let len = u32::from_le_bytes(bytes[at..at + 4].try_into().expect("4 bytes")) as usize;
-        let crc = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().expect("4 bytes"));
-        if len == 0 || len > MAX_LINE || at + RECORD_HEAD + len > bytes.len() {
-            break;
+/// The valid prefix of a slab log. Stop at the first short or damaged record.
+pub struct Records<'a> {
+    bytes: &'a [u8],
+    end: usize,
+}
+
+impl Records<'_> {
+    pub fn valid_len(&self) -> usize {
+        self.end
+    }
+}
+
+impl<'a> Iterator for Records<'a> {
+    type Item = (i64, &'a [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let head = self.bytes.get(self.end..self.end + RECORD_HEAD)?;
+        let len = u32::from_le_bytes(head[..4].try_into().expect("4 bytes")) as usize;
+        if len == 0 || len > MAX_LINE {
+            return None;
         }
-        let ts_bytes = &bytes[at + 8..at + 16];
-        let line = &bytes[at + RECORD_HEAD..at + RECORD_HEAD + len];
+        let crc = u32::from_le_bytes(head[4..8].try_into().expect("4 bytes"));
+        let ts: &[u8; 8] = head[8..].try_into().expect("8 bytes");
+        let start = self.end + RECORD_HEAD;
+        let line = self.bytes.get(start..start + len)?;
         let mut h = crc32fast::Hasher::new();
-        h.update(ts_bytes);
+        h.update(ts);
         h.update(line);
         if h.finalize() != crc {
-            break;
+            return None;
         }
-        out.push((i64::from_le_bytes(ts_bytes.try_into().expect("8 bytes")), line));
-        at += RECORD_HEAD + len;
+        self.end = start + len;
+        Some((i64::from_le_bytes(*ts), line))
     }
-    out
+}
+
+pub fn records(bytes: &[u8]) -> Records<'_> {
+    Records { bytes, end: 0 }
+}
+
+#[cfg(test)]
+pub fn unframe(bytes: &[u8]) -> Vec<(i64, &[u8])> {
+    records(bytes).collect()
 }
 
 /// The article number a line starts with.
@@ -114,8 +135,34 @@ impl Slab {
             .create_new(true)
             .open(&log_path)
             .with_context(|| format!("making {}", log_path.display()))?;
+        Ok(Self::with_log(server, day, slab_gen, log_path, log))
+    }
+
+    /// Reuse the original generation and valid records. New writes go after the last complete frame.
+    pub fn reopen(
+        server: u16,
+        day: i64,
+        slab_gen: u32,
+        path: PathBuf,
+        valid_len: usize,
+        rows: Vec<(u64, i64, &[u8])>,
+        memory: OwnedSemaphorePermit,
+    ) -> Result<Self> {
+        let log = OpenOptions::new().read(true).append(true).open(&path)?;
+        if log.metadata()?.len() != valid_len as u64 {
+            log.set_len(valid_len as u64)?;
+        }
+        let mut slab = Self::with_log(server, day, slab_gen, path, log);
+        slab.charge(memory);
+        for (art, ts, line) in rows {
+            slab.add_row(art, ts, line);
+        }
+        Ok(slab)
+    }
+
+    fn with_log(server: u16, day: i64, slab_gen: u32, log_path: PathBuf, log: File) -> Self {
         let now = std::time::Instant::now();
-        Ok(Slab {
+        Self {
             server,
             day,
             slab_gen,
@@ -127,7 +174,7 @@ impl Slab {
             rows: Vec::new(),
             pending: Vec::new(),
             memory: None,
-        })
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -145,10 +192,14 @@ impl Slab {
 
     /// A row in memory and framed for the log (no system call).
     pub fn push(&mut self, art: u64, ts: i64, line: &[u8]) {
-        self.rows.push((art, ts, self.arena.len() as u32));
-        self.arena.extend_from_slice(line);
+        self.add_row(art, ts, line);
         frame(ts, line, &mut self.pending);
         self.last_row = std::time::Instant::now();
+    }
+
+    fn add_row(&mut self, art: u64, ts: i64, line: &[u8]) {
+        self.rows.push((art, ts, self.arena.len() as u32));
+        self.arena.extend_from_slice(line);
     }
 
     /// The framed bytes waiting for the log, taken (the batcher writes them outside the group's lock).
