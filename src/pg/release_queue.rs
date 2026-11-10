@@ -33,6 +33,7 @@ fn deadline(now: i64, limit: usize, lease_seconds: i64) -> Result<i64> {
 
 /// Lease the oldest due rows with a bounded, atomic statement. Locked rows are skipped, and expired leases
 /// become eligible without a separate sweeper. `now` and `due_at` are Unix seconds from the scheduler's clock.
+/// Settle returned claims against the same database and schema that issued them.
 pub fn claim(client: &mut Client, now: i64, limit: usize, lease_seconds: i64) -> Result<Vec<Claim>> {
     let lease_until = deadline(now, limit, lease_seconds)?;
     let limit = limit as i64;
@@ -61,12 +62,14 @@ pub fn claim(client: &mut Client, now: i64, limit: usize, lease_seconds: i64) ->
 }
 
 /// Acknowledge a claim. Commit postprocessing results only with `Applied` in the same transaction.
-/// Acquire any release locks before this queue lock, in the writer's order.
+/// Acquire any release locks before this queue lock, in the writer's order. If a caller already
+/// wrote results and receives another outcome, it must roll back those results.
 pub fn ack(tx: &mut Transaction<'_>, claim: &Claim, now: i64) -> Result<Outcome> {
     settle(tx, claim, now, None)
 }
 
 /// Reschedule the claimed generation at `due_at`. A newer generation keeps its own due time.
+/// The same transaction and lock-order requirements as [`ack`] apply.
 pub fn requeue(tx: &mut Transaction<'_>, claim: &Claim, now: i64, due_at: i64) -> Result<Outcome> {
     settle(tx, claim, now, Some(due_at))
 }
@@ -152,6 +155,10 @@ mod tests {
         assert_eq!(first.release_id, id);
         assert_eq!(first.lease_until, 110);
         assert!(claim(&mut client, 109, 1, 10).unwrap().is_empty());
+
+        let mut tx = client.transaction().unwrap();
+        assert_eq!(ack(&mut tx, &first, 110).unwrap(), Outcome::LeaseLost);
+        tx.commit().unwrap();
 
         let renewed = claim(&mut client, 110, 1, 10).unwrap().pop().unwrap();
         assert_ne!(renewed.token, first.token);
