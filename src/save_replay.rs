@@ -3,7 +3,8 @@
 //! profiling the release writer. It never touches the live databases: `--db` is a folder of its own (made if need be),
 //! used as the app folder for the run. To exercise the native PostgreSQL release writer, also pass
 //! `--pg-database NAME --pg-schema atlas_replay_NAME` and set `ATLAS_REPLAY_PG_URL`.
-//! With `--pg-header-source ID`, the replay also archives every sealed NXV block it reads to that schema.
+//! With `--pg-header-source ID`, the replay also archives the complete sealed NXV blocks that supply its rows.
+//! Release and header batches commit separately. A failed run may leave partial results in its staging schema.
 //!
 //! Lines come group by group, round robin, in slices of `--slice` rows (the indexer's slices), parsed on `--parsers`
 //! threads the way `indexer::parse_and_save` does (articles obfuscated per article go to the header store, which the
@@ -156,19 +157,15 @@ impl HeaderArchive {
     }
 }
 
-fn limit_slice(lines: &mut Vec<Vec<u8>>, sent: u64, limit: u64) {
-    lines.truncate(usize::try_from(limit - sent).unwrap_or(usize::MAX));
-}
-
 /// The store's lines, group by group round robin, in slices of `slice` rows, sent to `tx` until `rows` are sent.
 fn read_slices(
     store: &Store,
     slice: usize,
     rows: u64,
-    tx: std::sync::mpsc::SyncSender<Slice>,
+    tx: &std::sync::mpsc::SyncSender<Slice>,
     stop: &AtomicBool,
-    mut archive: Option<HeaderArchive>,
-) -> Result<Option<u64>> {
+    mut visit_block: impl FnMut(&str, &MappedBlock) -> Result<()>,
+) -> Result<()> {
     let mut groups = store.group_names();
     groups.sort();
     // each group's blocks, read one after another
@@ -184,19 +181,19 @@ fn read_slices(
     let mut scratch = XoverStreamScratch::new();
     while !cursors.is_empty() && sent < rows && !stop.load(Ordering::Relaxed) {
         let mut k = 0;
-        while k < cursors.len() && sent < rows {
+        while k < cursors.len() && sent < rows && !stop.load(Ordering::Relaxed) {
             let (group, blocks, at) = &mut cursors[k];
-            let mut lines = Vec::with_capacity(slice);
-            while lines.len() < slice && *at < blocks.len() {
+            let remaining = usize::try_from(rows - sent).unwrap_or(usize::MAX);
+            let target = slice.min(remaining);
+            let mut lines = Vec::with_capacity(target);
+            while lines.len() < target && *at < blocks.len() && !stop.load(Ordering::Relaxed) {
                 let block = &blocks[*at];
                 let (map, e) = block;
                 *at += 1;
                 let Ok(view) = NxvBlockView::from_mmap_slice(&map[e.offset as usize..]) else { continue };
                 let Ok(mut cur) = NxvRangeCursor::new_for_art_range(view, 0, u64::MAX) else { continue };
-                if let Some(archive) = &mut archive {
-                    archive.push(group, block)?;
-                }
-                loop {
+                let before = lines.len();
+                while lines.len() < remaining {
                     scratch.wire_buf.clear();
                     if !cur.format_next_row(&mut scratch) {
                         break;
@@ -204,14 +201,18 @@ fn read_slices(
                     let n = scratch.wire_buf.len().saturating_sub(2);
                     lines.push(scratch.wire_buf[..n].to_vec());
                 }
+                if lines.len() > before {
+                    visit_block(group, block)?;
+                }
+            }
+            if stop.load(Ordering::Relaxed) {
+                return Ok(());
             }
             let done = *at >= blocks.len();
             if !lines.is_empty() {
-                limit_slice(&mut lines, sent, rows);
                 sent += lines.len() as u64;
-                if tx.send((group.clone(), lines)).is_err() {
-                    return Ok(None);
-                }
+                tx.send((group.clone(), lines))
+                    .map_err(|_| anyhow::anyhow!("replay parsers stopped receiving slices"))?;
             }
             if done {
                 cursors.swap_remove(k);
@@ -220,11 +221,7 @@ fn read_slices(
             }
         }
     }
-    if let Some(mut archive) = archive {
-        archive.flush()?;
-        return Ok(Some(archive.rows));
-    }
-    Ok(None)
+    Ok(())
 }
 
 /// A slice's releases, parsed as `indexer::parse_and_save` does (without names from bodies, which need servers).
@@ -323,6 +320,7 @@ fn run(args: &[String]) -> Result<()> {
     // SAFETY: set before any other thread starts
     unsafe { std::env::set_var("ATLAS_HOME", &db_dir) };
     let main = db_dir.join("atlas.db");
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build()?;
     let stop = Arc::new(AtomicBool::new(false));
     let writer = if let Some((config, database)) = pg {
         open_pg_replay(config, database)?
@@ -343,9 +341,23 @@ fn run(args: &[String]) -> Result<()> {
 
     let (slice_tx, slice_rx) = std::sync::mpsc::sync_channel::<Slice>(parsers * 2);
     let (parsed_tx, parsed_rx) = tokio::sync::mpsc::channel::<(usize, Vec<Release>, Prepared)>(tasks * 2);
+    let started = Instant::now();
     let reader = {
         let (store, stop) = (Arc::clone(&store), Arc::clone(&stop));
-        std::thread::spawn(move || read_slices(&store, slice, rows, slice_tx, &stop, archive))
+        std::thread::spawn(move || {
+            let mut archive = archive;
+            read_slices(&store, slice, rows, &slice_tx, &stop, |group, block| {
+                if let Some(archive) = &mut archive {
+                    archive.push(group, block)?;
+                }
+                Ok(())
+            })?;
+            if let Some(mut archive) = archive.filter(|_| !stop.load(Ordering::Relaxed)) {
+                archive.flush()?;
+                return Ok(Some(archive.rows));
+            }
+            Ok::<_, anyhow::Error>(None)
+        })
     };
     let slice_rx = Arc::new(std::sync::Mutex::new(slice_rx));
     let parse_ns = Arc::new(AtomicU64::new(0));
@@ -367,12 +379,11 @@ fn run(args: &[String]) -> Result<()> {
             }
         }));
     }
+    drop(slice_rx);
     drop(parsed_tx);
 
     let processed_rows = Arc::new(AtomicU64::new(0));
     let rows_in_save_slices = Arc::new(AtomicU64::new(0));
-    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build()?;
-    let started = Instant::now();
     let report = {
         let (processed_rows, stop, main, parse_ns) =
             (Arc::clone(&processed_rows), Arc::clone(&stop), main.clone(), Arc::clone(&parse_ns));
@@ -402,11 +413,11 @@ fn run(args: &[String]) -> Result<()> {
     };
     let result: Result<()> = rt.block_on(async {
         let parsed_rx = Arc::new(tokio::sync::Mutex::new(parsed_rx));
-        let mut handles = Vec::new();
+        let mut workers = tokio::task::JoinSet::new();
         for _ in 0..tasks {
             let (rx, writer) = (Arc::clone(&parsed_rx), writer.clone());
             let (processed_rows, rows_in_save_slices) = (Arc::clone(&processed_rows), Arc::clone(&rows_in_save_slices));
-            handles.push(tokio::spawn(async move {
+            workers.spawn(async move {
                 loop {
                     let next = rx.lock().await.recv().await;
                     let Some((n, releases, prepared)) = next else { return Ok::<(), anyhow::Error>(()) };
@@ -416,16 +427,22 @@ fn run(args: &[String]) -> Result<()> {
                     }
                     processed_rows.fetch_add(n as u64, Ordering::Relaxed);
                 }
-            }));
+            });
         }
-        for h in handles {
-            h.await??;
+        while let Some(result) = workers.join_next().await {
+            if let Err(error) = result.context("a replay writer task failed").and_then(|result| result) {
+                stop.store(true, Ordering::Relaxed);
+                return Err(error);
+            }
         }
         Ok(())
     });
     let secs = started.elapsed().as_secs_f64();
     stop.store(true, Ordering::Relaxed);
     report.thread().unpark();
+    // An error drops the JoinSet, which stops the other async workers. Wait for any already
+    // running blocking saves to finish before inspecting the result or closing the replay.
+    drop(rt);
     let reader_result = reader.join().map_err(|_| anyhow::anyhow!("the replay reader panicked"));
     let mut parser_panicked = false;
     for p in parser_threads {
@@ -436,10 +453,18 @@ fn run(args: &[String]) -> Result<()> {
         let _ = checkpointer.join();
     }
     let closed = store.close();
-    result?;
-    let archived_rows = reader_result??;
-    anyhow::ensure!(!parser_panicked, "a replay parser panicked");
-    closed?;
+    let finished = result.and_then(|_| {
+        ensure!(!parser_panicked, "a replay parser panicked");
+        let archived_rows = reader_result??;
+        closed?;
+        Ok(archived_rows)
+    });
+    let archived_rows = match &writer {
+        Writer::Sqlite(_) => finished,
+        Writer::Postgres(pool) => {
+            finished.with_context(|| format!("staging schema {} may contain partial replay results", pool.schema()))
+        }
+    }?;
     let rows = processed_rows.load(Ordering::Relaxed);
     anyhow::ensure!(rows > 0, "the replay store supplied no headers");
     let (releases, files, parts, bytes) = match writer {
@@ -471,13 +496,35 @@ fn run(args: &[String]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{limit_slice, pg_target};
+    use super::*;
 
     #[test]
-    fn a_replay_stops_at_the_requested_row_count() {
-        let mut lines = vec![vec![1], vec![2], vec![3]];
-        limit_slice(&mut lines, 4, 6);
-        assert_eq!(lines, vec![vec![1], vec![2]]);
+    fn replay_visits_only_blocks_contributing_rows_to_the_limit() {
+        use crate::nxv_store::store::Clamp;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) =
+            Store::open(StoreConfig::new(dir.path()), KeepSet { live_from: i64::MIN / 2, ..KeepSet::default() })
+                .unwrap();
+        let line = |id, date| format!("{id}\tExample\tPoster\t{date}\t<{id}@example.test>\t\t1024\t8").into_bytes();
+        let clamp = Clamp::Live { now: 1_794_150_000 };
+        let group = "alt.binaries.test";
+        let first_day = "Sat, 07 Nov 2026 10:00:00 +0000";
+        let second_day = "Sun, 08 Nov 2026 10:00:00 +0000";
+        store.record("test", group, &[line(1, first_day), line(2, first_day), line(3, second_day)], clamp).unwrap();
+        store.close().unwrap();
+        assert_eq!(store.segments().len(), 2);
+
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut archived_rows = 0;
+        read_slices(&store, 20_000, 1, &tx, &AtomicBool::new(false), |_, (_, entry)| {
+            archived_rows += entry.rows;
+            Ok(())
+        })
+        .unwrap();
+        drop(tx);
+        assert_eq!(rx.into_iter().map(|(_, lines)| lines.len()).sum::<usize>(), 1);
+        assert_eq!(archived_rows, 2, "include the full first block only");
     }
 
     #[test]
