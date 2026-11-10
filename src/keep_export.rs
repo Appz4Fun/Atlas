@@ -336,52 +336,8 @@ pub fn to_postgres(pg: &mut postgres::Client, file: &Path, copied: &[Copied], st
         {
             bail!("{table} held {before} rows and this run has {}: refused (--force to replace it)", c.tally.rows);
         }
-        let defs = c.columns.iter().map(|col| format!("{} {}", quoted(&col.name), col.pg.sql())).collect::<Vec<_>>();
-        tx.batch_execute(&format!("drop table if exists {table}; create table {table} ({});", defs.join(", ")))?;
-        let types: Vec<postgres::types::Type> = c
-            .columns
-            .iter()
-            .map(|col| match col.pg {
-                PgKind::Int => postgres::types::Type::INT8,
-                PgKind::Real => postgres::types::Type::FLOAT8,
-                PgKind::Text => postgres::types::Type::TEXT,
-                PgKind::Blob => postgres::types::Type::BYTEA,
-            })
-            .collect();
-        {
-            let sink = tx.copy_in(&format!("copy {table} ({}) from stdin binary", select_list(&c.columns)))?;
-            let mut writer = postgres::binary_copy::BinaryCopyInWriter::new(sink, &types);
-            let mut stmt = conn.prepare(&format!("select {} from {}", select_list(&c.columns), quoted(&c.name)))?;
-            let mut rows = stmt.query([])?;
-            while let Some(r) = rows.next()? {
-                let mut vals: Vec<Box<dyn postgres::types::ToSql + Sync>> = Vec::with_capacity(c.columns.len());
-                for (i, col) in c.columns.iter().enumerate() {
-                    let v: Value = r.get(i)?;
-                    vals.push(match (col.pg, v) {
-                        (_, Value::Null) => match col.pg {
-                            PgKind::Int => Box::new(None::<i64>),
-                            PgKind::Real => Box::new(None::<f64>),
-                            PgKind::Text => Box::new(None::<String>),
-                            PgKind::Blob => Box::new(None::<Vec<u8>>),
-                        },
-                        (PgKind::Int, Value::Integer(i)) => Box::new(i),
-                        (PgKind::Real, Value::Real(f)) => Box::new(f),
-                        (PgKind::Text, Value::Text(t)) => Box::new(t),
-                        (PgKind::Blob, Value::Blob(b)) => Box::new(b),
-                        (kind, v) => {
-                            bail!("{}.{}: a {v:?} in a {kind:?} column can't go over as it is", c.name, col.name)
-                        }
-                    });
-                }
-                let refs: Vec<&(dyn postgres::types::ToSql + Sync)> = vals.iter().map(|b| b.as_ref()).collect();
-                writer.write(&refs)?;
-            }
-            writer.finish()?;
-        }
-        let back = pg_tally(&mut tx, &table, &c.columns)?;
-        if back != c.tally {
-            bail!("{table}: Postgres holds something else ({back:?} vs {:?})", c.tally);
-        }
+        tx.batch_execute(&format!("drop table if exists {table}"))?;
+        let back = copy_checked(&conn, &mut tx, &table, c)?;
         tx.execute(
             "insert into keep.runs (stamp, name, rows, digest) values ($1, $2, $3, $4)",
             &[&stamp, &c.name, &(back.rows as i64), &back.hex()],
@@ -390,6 +346,57 @@ pub fn to_postgres(pg: &mut postgres::Client, file: &Path, copied: &[Copied], st
     }
     tx.commit()?;
     Ok(())
+}
+
+/// Copy one table into a transaction and compare all of its rows before the caller commits.
+fn copy_checked(conn: &Connection, tx: &mut postgres::Transaction<'_>, table: &str, c: &Copied) -> Result<Tally> {
+    let defs = c.columns.iter().map(|col| format!("{} {}", quoted(&col.name), col.pg.sql())).collect::<Vec<_>>();
+    tx.batch_execute(&format!("create table {table} ({});", defs.join(", ")))?;
+    let types: Vec<postgres::types::Type> = c
+        .columns
+        .iter()
+        .map(|col| match col.pg {
+            PgKind::Int => postgres::types::Type::INT8,
+            PgKind::Real => postgres::types::Type::FLOAT8,
+            PgKind::Text => postgres::types::Type::TEXT,
+            PgKind::Blob => postgres::types::Type::BYTEA,
+        })
+        .collect();
+    {
+        let sink = tx.copy_in(&format!("copy {table} ({}) from stdin binary", select_list(&c.columns)))?;
+        let mut writer = postgres::binary_copy::BinaryCopyInWriter::new(sink, &types);
+        let mut stmt = conn.prepare(&format!("select {} from {}", select_list(&c.columns), quoted(&c.name)))?;
+        let mut rows = stmt.query([])?;
+        while let Some(r) = rows.next()? {
+            let mut vals: Vec<Box<dyn postgres::types::ToSql + Sync>> = Vec::with_capacity(c.columns.len());
+            for (i, col) in c.columns.iter().enumerate() {
+                let v: Value = r.get(i)?;
+                vals.push(match (col.pg, v) {
+                    (_, Value::Null) => match col.pg {
+                        PgKind::Int => Box::new(None::<i64>),
+                        PgKind::Real => Box::new(None::<f64>),
+                        PgKind::Text => Box::new(None::<String>),
+                        PgKind::Blob => Box::new(None::<Vec<u8>>),
+                    },
+                    (PgKind::Int, Value::Integer(i)) => Box::new(i),
+                    (PgKind::Real, Value::Real(f)) => Box::new(f),
+                    (PgKind::Text, Value::Text(t)) => Box::new(t),
+                    (PgKind::Blob, Value::Blob(b)) => Box::new(b),
+                    (kind, v) => {
+                        bail!("{}.{}: a {v:?} in a {kind:?} column can't go over as it is", c.name, col.name)
+                    }
+                });
+            }
+            let refs: Vec<&(dyn postgres::types::ToSql + Sync)> = vals.iter().map(|b| b.as_ref()).collect();
+            writer.write(&refs)?;
+        }
+        writer.finish()?;
+    }
+    let back = pg_tally(tx, table, &c.columns)?;
+    if back != c.tally {
+        bail!("{table}: Postgres holds something else ({back:?} vs {:?})", c.tally);
+    }
+    Ok(back)
 }
 
 /// The tally of a Postgres table, its rows streamed.
@@ -412,6 +419,92 @@ fn pg_tally(tx: &mut postgres::Transaction<'_>, table: &str, cols: &[Column]) ->
         t.add(&row, &mut buf);
     }
     Ok(t)
+}
+
+fn verify_snapshot(dir: &Path, conn: &Connection) -> Result<Vec<Copied>> {
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).context("reading manifest.json")?)?;
+    let manifest = manifest.as_object().context("snapshot manifest must be an object")?;
+    let tables = kept();
+    anyhow::ensure!(
+        manifest.get("_left_out").and_then(serde_json::Value::as_array).is_some_and(Vec::is_empty)
+            && manifest.len() == tables.len() + 2,
+        "snapshot is incomplete or has an unexpected table"
+    );
+    let mut copied = Vec::with_capacity(tables.len() + 1);
+    for name in tables.into_iter().map(|k| k.name).chain([FREEZE_EXEMPT]) {
+        let entry = manifest.get(name).with_context(|| format!("{name}: missing from manifest"))?;
+        let columns = columns(conn, "main", name)?;
+        anyhow::ensure!(!columns.is_empty(), "{name}: table missing from keep.db");
+        let tally = tally_sql(conn, &format!("select {} from {}", select_list(&columns), quoted(name)), &columns)?;
+        anyhow::ensure!(
+            entry["rows"].as_u64() == Some(tally.rows) && entry["digest"].as_str() == Some(tally.hex().as_str()),
+            "{name}: row count or digest does not match the manifest"
+        );
+        copied.push(Copied { name: name.into(), columns, tally, capped: false });
+    }
+    Ok(copied)
+}
+
+fn restore_postgres(
+    pg: &mut postgres::Client,
+    snapshot: &Connection,
+    copied: &[Copied],
+    database: &str,
+    schema: &str,
+) -> Result<()> {
+    anyhow::ensure!(
+        crate::pg::valid_schema(schema) && schema.starts_with("keep_restore_"),
+        "restore schema must start with keep_restore_ and be a plain lowercase name"
+    );
+    let mut tx = pg.transaction()?;
+    let actual: String = tx.query_one("select current_database()", &[])?.get(0);
+    anyhow::ensure!(actual == database, "connected to {actual}, expected {database}");
+    tx.batch_execute(&format!("create schema {}", quoted(schema)))?;
+    for c in copied {
+        let table = format!("{}.{}", quoted(schema), quoted(&c.name));
+        copy_checked(snapshot, &mut tx, &table, c).with_context(|| format!("restoring {table}"))?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn run_restore(args: &[String]) -> i32 {
+    let result = (|| -> Result<()> {
+        let value = |flag: &str| {
+            args.iter().skip_while(|a| *a != flag).nth(1).filter(|a| !a.starts_with("--")).map(String::as_str)
+        };
+        let dir = Path::new(value("--snapshot").context("--snapshot DIR is required")?);
+        let mut snapshot = Connection::open_with_flags(dir.join("keep.db"), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let snapshot = snapshot.transaction()?;
+        let copied = verify_snapshot(dir, &snapshot)?;
+        for c in &copied {
+            println!("  {}: {} rows, digest {}", c.name, c.tally.rows, c.tally.hex());
+        }
+        if args.iter().any(|arg| arg == "--apply") {
+            let database = value("--database").context("--database NAME is required with --apply")?;
+            let schema = value("--schema").context("--schema keep_restore_NAME is required with --apply")?;
+            let mut config = crate::config::storage_config();
+            if let Ok(url) = std::env::var("ATLAS_RESTORE_PG_URL") {
+                config.url = url;
+            }
+            anyhow::ensure!(!config.url.is_empty(), "set ATLAS_RESTORE_PG_URL or [storage] url for the destination");
+            config.schema = schema.to_owned();
+            let pool = crate::pg::Pool::new(&config)?;
+            let mut pg = pool.get()?;
+            restore_postgres(&mut pg, &snapshot, &copied, database, schema)?;
+            println!("Restored and verified {} tables in {database}.{schema}", copied.len());
+        } else {
+            println!("Verified {} snapshot tables against the manifest", copied.len());
+        }
+        Ok(())
+    })();
+    if let Err(e) = result {
+        eprintln!("keep restore: {e:#}");
+        1
+    } else {
+        0
+    }
 }
 
 /// `path` and the directory holding it flushed to disk.
@@ -536,6 +629,72 @@ pub fn run(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn restore_fixture(dir: &Path) -> Vec<Copied> {
+        let db = Connection::open(dir.join("keep.db")).unwrap();
+        let mut manifest = serde_json::Map::new();
+        let mut expected = Vec::new();
+        for name in kept().into_iter().map(|k| k.name).chain([FREEZE_EXEMPT]) {
+            db.execute_batch(&format!(
+                "create table {name} (id INTEGER, label TEXT, extra BLOB);
+                 insert into {name} values (1, 'original', x'0102'), (2, null, null);"
+            ))
+            .unwrap();
+            let cols = columns(&db, "main", name).unwrap();
+            let tally = tally_sql(&db, &format!("select * from {name}"), &cols).unwrap();
+            manifest.insert(name.into(), serde_json::json!({"rows": tally.rows, "digest": tally.hex()}));
+            expected.push(Copied { name: name.into(), columns: cols, tally, capped: false });
+        }
+        manifest.insert("_left_out".into(), serde_json::json!([]));
+        std::fs::write(dir.join("manifest.json"), serde_json::Value::Object(manifest).to_string()).unwrap();
+        expected
+    }
+
+    #[test]
+    fn restore_refuses_changed_rows_even_when_counts_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let expected = restore_fixture(dir.path());
+        let snapshot = Connection::open(dir.path().join("keep.db")).unwrap();
+        assert_eq!(verify_snapshot(dir.path(), &snapshot).unwrap().len(), expected.len());
+        snapshot.execute("update predb_titles set label = 'changed' where id = 1", []).unwrap();
+        assert!(verify_snapshot(dir.path(), &snapshot).unwrap_err().to_string().contains("predb_titles"));
+    }
+
+    #[test]
+    fn restore_refuses_incomplete_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        restore_fixture(dir.path());
+        let manifest = dir.path().join("manifest.json");
+        let mut json: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        json["_left_out"] = serde_json::json!(["predb_feeds"]);
+        std::fs::write(manifest, json.to_string()).unwrap();
+        let snapshot = Connection::open(dir.path().join("keep.db")).unwrap();
+        assert!(verify_snapshot(dir.path(), &snapshot).is_err());
+    }
+
+    #[test]
+    fn restore_to_a_new_schema_checks_rows_and_refuses_existing_schema() {
+        let Some(test) = crate::pg::testing::Schema::empty() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        restore_fixture(dir.path());
+        let snapshot = Connection::open(dir.path().join("keep.db")).unwrap();
+        let copied = verify_snapshot(dir.path(), &snapshot).unwrap();
+        let mut pg = test.pool.get().unwrap();
+        let destination = format!("keep_restore_{}", test.name);
+        let db: String = pg.query_one("select current_database()", &[]).unwrap().get(0);
+        assert!(restore_postgres(&mut pg, &snapshot, &copied, "wrong_db", &destination).is_err());
+        restore_postgres(&mut pg, &snapshot, &copied, &db, &destination).unwrap();
+        assert!(restore_postgres(&mut pg, &snapshot, &copied, &db, &destination).is_err());
+        let (label, extra): (String, Vec<u8>) = {
+            let row = pg
+                .query_one(&format!("select label, extra from {destination}.predb_titles where id = 1"), &[])
+                .unwrap();
+            (row.get(0), row.get(1))
+        };
+        pg.batch_execute(&format!("drop schema {destination} cascade")).unwrap();
+        assert_eq!(label, "original");
+        assert_eq!(extra, [1, 2]);
+    }
 
     #[test]
     fn the_digest_is_the_same_in_any_order_and_tells_kinds_apart() {
