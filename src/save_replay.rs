@@ -7,7 +7,8 @@
 //! threads the way `indexer::parse_and_save` does (articles obfuscated per article go to the header store, which the
 //! store's linker reads, soo they aren't saved here), and saved through the indexer's own writer (`shared_db`) by
 //! `--tasks` slices at once, as many as the indexer keeps waiting on it. Every ten seconds it prints rows saved per
-//! second, how busy the writer was, and the shard's size.
+//! second, how busy the writer was, and the shard's size. The input row rate includes slices that produced no
+//! releases. The final report also counts what actually persisted in the release and file tables.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -38,6 +39,22 @@ pub fn run_cli(args: &[String]) -> i32 {
 
 /// One slice: its group and its overview lines.
 type Slice = (String, Vec<Vec<u8>>);
+
+fn limit_slice(lines: &mut Vec<Vec<u8>>, sent: u64, limit: u64) {
+    lines.truncate(usize::try_from(limit - sent).unwrap_or(usize::MAX));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::limit_slice;
+
+    #[test]
+    fn a_replay_stops_at_the_requested_row_count() {
+        let mut lines = vec![vec![1], vec![2], vec![3]];
+        limit_slice(&mut lines, 4, 6);
+        assert_eq!(lines, vec![vec![1], vec![2]]);
+    }
+}
 
 /// The store's lines, group by group round robin, in slices of `slice` rows, sent to `tx` until `rows` are sent.
 fn read_slices(store: &Store, slice: usize, rows: u64, tx: std::sync::mpsc::SyncSender<Slice>, stop: &AtomicBool) {
@@ -75,6 +92,7 @@ fn read_slices(store: &Store, slice: usize, rows: u64, tx: std::sync::mpsc::Sync
             }
             let done = *at >= blocks.len();
             if !lines.is_empty() {
+                limit_slice(&mut lines, sent, rows);
                 sent += lines.len() as u64;
                 if tx.send((group.clone(), lines)).is_err() {
                     return;
@@ -119,6 +137,21 @@ fn files_size(main: &Path) -> u64 {
         .sum()
 }
 
+fn persisted_counts(main: &Path) -> Result<(i64, i64, i64)> {
+    let (mut releases, mut files, mut parts) = (0, 0, 0);
+    for path in crate::store::shard_paths(main).into_iter().filter(|path| path.exists()) {
+        let conn = rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let (shard_releases, shard_parts): (i64, i64) =
+            conn.query_row("select count(*), coalesce(sum(parts), 0) from releases", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?;
+        releases += shard_releases;
+        parts += shard_parts;
+        files += conn.query_row::<i64, _, _>("select count(*) from files", [], |row| row.get(0))?;
+    }
+    Ok((releases, files, parts))
+}
+
 fn run(args: &[String]) -> Result<()> {
     let store_dir = PathBuf::from(args.iter().skip_while(|a| *a != "--store").nth(1).context("--store DIR")?);
     let db_dir = PathBuf::from(args.iter().skip_while(|a| *a != "--db").nth(1).context("--db DIR")?);
@@ -128,24 +161,28 @@ fn run(args: &[String]) -> Result<()> {
         arg(args, "--tasks", 12usize),
         arg(args, "--parsers", 6usize),
     );
+    anyhow::ensure!(rows > 0 && slice > 0 && tasks > 0 && parsers > 0, "replay limits must be positive");
     let live = crate::paths::app_dir();
-    std::fs::create_dir_all(&db_dir)?;
     // compared resolved (relative paths, `..`, symlinks)
     let live_real = std::fs::canonicalize(&live).unwrap_or_else(|_| live.clone());
+    let store_dir = std::fs::canonicalize(&store_dir).context("resolving the header-store copy")?;
+    anyhow::ensure!(!store_dir.starts_with(&live_real), "--store must point to a copy outside {}", live.display());
+    std::fs::create_dir_all(&db_dir)?;
     let db_real = std::fs::canonicalize(&db_dir)?;
     anyhow::ensure!(!db_real.starts_with(&live_real), "--db must not be in the live app folder {}", live.display());
+    anyhow::ensure!(!db_real.starts_with(&store_dir), "--db must be outside the header-store copy");
+    anyhow::ensure!(std::fs::read_dir(&db_real)?.next().is_none(), "--db must be an empty scratch folder");
     // the run's app folder: the checkpointer and anything else looking for the database find the scratch one
     // SAFETY: set before any other thread starts
     unsafe { std::env::set_var("ATLAS_HOME", &db_dir) };
+    let (store, _) =
+        Store::open(StoreConfig::new(&store_dir), KeepSet { live_from: i64::MIN / 2, ..KeepSet::default() })?;
     let main = db_dir.join("atlas.db");
     crate::db::create_db_at(&main)?;
     let db = crate::indexer::shared_db(crate::db::open_at(&main)?);
     let stop = Arc::new(AtomicBool::new(false));
     let checkpointer = crate::db::checkpointer(stop.clone());
 
-    let (store, _) =
-        Store::open(StoreConfig::new(&store_dir), KeepSet { live_from: i64::MIN / 2, ..KeepSet::default() })?;
-    let store = Arc::new(store);
     let (slice_tx, slice_rx) = std::sync::mpsc::sync_channel::<Slice>(parsers * 2);
     let (parsed_tx, parsed_rx) = tokio::sync::mpsc::channel::<(usize, Vec<Release>, Prepared)>(tasks * 2);
     let reader = {
@@ -155,7 +192,7 @@ fn run(args: &[String]) -> Result<()> {
     let slice_rx = Arc::new(std::sync::Mutex::new(slice_rx));
     let parse_ns = Arc::new(AtomicU64::new(0));
     let mut parser_threads = Vec::new();
-    for _ in 0..parsers.max(1) {
+    for _ in 0..parsers {
         let (rx, tx, parse_ns) = (Arc::clone(&slice_rx), parsed_tx.clone(), Arc::clone(&parse_ns));
         parser_threads.push(std::thread::spawn(move || {
             loop {
@@ -166,9 +203,6 @@ fn run(args: &[String]) -> Result<()> {
                 // as the indexer's parse step does: what the writer would otherwise work out
                 let prepared = crate::store::prepare(&releases);
                 parse_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                if releases.is_empty() {
-                    continue;
-                }
                 if tx.blocking_send((lines.len(), releases, prepared)).is_err() {
                     return;
                 }
@@ -177,17 +211,21 @@ fn run(args: &[String]) -> Result<()> {
     }
     drop(parsed_tx);
 
-    let saved_rows = Arc::new(AtomicU64::new(0));
+    let processed_rows = Arc::new(AtomicU64::new(0));
+    let rows_in_save_slices = Arc::new(AtomicU64::new(0));
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build()?;
     let started = Instant::now();
     let report = {
-        let (saved_rows, stop, main, parse_ns) =
-            (Arc::clone(&saved_rows), Arc::clone(&stop), main.clone(), Arc::clone(&parse_ns));
+        let (processed_rows, stop, main, parse_ns) =
+            (Arc::clone(&processed_rows), Arc::clone(&stop), main.clone(), Arc::clone(&parse_ns));
         std::thread::spawn(move || {
             let (mut last_rows, mut last_busy, mut last_t) = (0u64, 0u64, Instant::now());
             while !stop.load(Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_secs(10));
-                let rows = saved_rows.load(Ordering::Relaxed);
+                std::thread::park_timeout(Duration::from_secs(10));
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let rows = processed_rows.load(Ordering::Relaxed);
                 let busy = crate::profile::LOAD.writer_busy_ns.load(Ordering::Relaxed);
                 let dt = last_t.elapsed().as_secs_f64();
                 println!(
@@ -206,14 +244,18 @@ fn run(args: &[String]) -> Result<()> {
     let result: Result<()> = rt.block_on(async {
         let parsed_rx = Arc::new(tokio::sync::Mutex::new(parsed_rx));
         let mut handles = Vec::new();
-        for _ in 0..tasks.max(1) {
-            let (rx, db, saved_rows) = (Arc::clone(&parsed_rx), db.clone(), Arc::clone(&saved_rows));
+        for _ in 0..tasks {
+            let (rx, db) = (Arc::clone(&parsed_rx), db.clone());
+            let (processed_rows, rows_in_save_slices) = (Arc::clone(&processed_rows), Arc::clone(&rows_in_save_slices));
             handles.push(tokio::spawn(async move {
                 loop {
                     let next = rx.lock().await.recv().await;
                     let Some((n, releases, prepared)) = next else { return Ok::<(), anyhow::Error>(()) };
-                    db.save_prepared(releases, prepared).await?;
-                    saved_rows.fetch_add(n as u64, Ordering::Relaxed);
+                    if !releases.is_empty() {
+                        db.save_prepared(releases, prepared).await?;
+                        rows_in_save_slices.fetch_add(n as u64, Ordering::Relaxed);
+                    }
+                    processed_rows.fetch_add(n as u64, Ordering::Relaxed);
                 }
             }));
         }
@@ -222,22 +264,34 @@ fn run(args: &[String]) -> Result<()> {
         }
         Ok(())
     });
+    let secs = started.elapsed().as_secs_f64();
     stop.store(true, Ordering::Relaxed);
-    let _ = reader.join();
+    report.thread().unpark();
+    let reader_result = reader.join().map_err(|_| anyhow::anyhow!("the replay reader panicked"));
+    let mut parser_panicked = false;
     for p in parser_threads {
-        let _ = p.join();
+        parser_panicked |= p.join().is_err();
     }
     let _ = report.join();
     let _ = checkpointer.join();
     drop(db);
-    let secs = started.elapsed().as_secs_f64();
-    let rows = saved_rows.load(Ordering::Relaxed);
+    let closed = store.close();
+    result?;
+    reader_result?;
+    anyhow::ensure!(!parser_panicked, "a replay parser panicked");
+    closed?;
+    let rows = processed_rows.load(Ordering::Relaxed);
+    anyhow::ensure!(rows > 0, "the replay store supplied no headers");
     println!(
-        "saved {rows} rows in {secs:.1}s: {:.0} rows/s; writer busy {:.1}s; db {:.2} GB",
+        "processed {rows} headers in {secs:.2}s: {:.0} headers/s; writer busy {:.1}s; db {:.2} GB",
         rows as f64 / secs,
         crate::profile::LOAD.writer_busy_ns.load(Ordering::Relaxed) as f64 / 1e9,
         files_size(&main) as f64 / 1e9
     );
-    let _ = store.close();
-    result
+    let (releases, files, parts) = persisted_counts(&main)?;
+    let save_rows = rows_in_save_slices.load(Ordering::Relaxed);
+    println!(
+        "{save_rows} headers in slices that produced releases; persisted {releases} releases, {files} files, {parts} parts"
+    );
+    Ok(())
 }
