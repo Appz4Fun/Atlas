@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use tokio::sync::OwnedSemaphorePermit;
 
 /// The most bytes one overview line may have in a log record.
 pub const MAX_LINE: usize = 1 << 20;
@@ -88,6 +89,8 @@ pub struct Slab {
     rows: Vec<(u64, i64, u32)>,
     /// framed records not yet written to the log
     pending: Vec<u8>,
+    /// Charged until the sealed block commits, including while queued.
+    memory: Option<OwnedSemaphorePermit>,
 }
 
 /// A sealed slab's rows, sorted by article number with repeats dropped, ready for the block builder.
@@ -98,6 +101,7 @@ pub struct Sealed {
     pub log_path: PathBuf,
     pub lines: Vec<Vec<u8>>,
     pub dropped_repeats: usize,
+    pub memory: Option<OwnedSemaphorePermit>,
 }
 
 impl Slab {
@@ -122,6 +126,7 @@ impl Slab {
             arena: Vec::new(),
             rows: Vec::new(),
             pending: Vec::new(),
+            memory: None,
         })
     }
 
@@ -155,6 +160,14 @@ impl Slab {
         !self.pending.is_empty()
     }
 
+    pub fn charge(&mut self, permit: OwnedSemaphorePermit) {
+        if let Some(held) = &mut self.memory {
+            held.merge(permit);
+        } else {
+            self.memory = Some(permit);
+        }
+    }
+
     fn line(&self, i: usize) -> &[u8] {
         let start = self.rows[i].2 as usize;
         let end = self.rows.get(i + 1).map_or(self.arena.len(), |r| r.2 as usize);
@@ -185,6 +198,7 @@ impl Slab {
             log_path: self.log_path,
             lines,
             dropped_repeats: dropped,
+            memory: self.memory,
         }
     }
 }

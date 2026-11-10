@@ -183,18 +183,23 @@ pub fn enabled() -> bool {
     store().is_some()
 }
 
-/// A fetched listing of `group` from `server`. A failure stops the store; the slice then fails at its `sync_point`,
-/// and is read again after the restart.
-pub fn record(server: &str, group: &str, lines: &[Vec<u8>]) {
-    let Some(s) = store() else { return };
+pub async fn wait_for_fetch() -> anyhow::Result<()> {
+    if let Some(s) = store() {
+        s.wait_for_fetch().await?;
+    }
+    Ok(())
+}
+
+/// Keep a fetched listing, waiting for byte capacity before copying it into the store.
+pub async fn record(server: &str, group: &str, lines: &[Vec<u8>]) -> anyhow::Result<()> {
+    let Some(s) = store() else { return Ok(()) };
     if lines.is_empty() {
-        return;
+        return Ok(());
     }
     let now = now();
-    match s.record(server, group, lines, Clamp::Unknown { now }) {
-        Ok(t) => refresh_claimed(&t.days, now),
-        Err(e) => eprintln!("header store: couldnt record {group}: {e:#}"),
-    }
+    let t = s.record_live(server, group, lines, Clamp::Unknown { now }).await?;
+    refresh_claimed(&t.days, now);
+    Ok(())
 }
 
 /// What a slice waits on before it counts as read: every row recorded for `group` so far durable. None when the
