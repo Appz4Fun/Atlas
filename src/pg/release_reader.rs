@@ -1,6 +1,6 @@
 //! Read a native PostgreSQL release and its segments from one snapshot.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{Context, Result};
 use postgres::fallible_iterator::FallibleIterator;
@@ -27,10 +27,17 @@ impl Inventory {
     /// Adapt this release's own rows for the existing NZB renderer.
     pub fn into_nzb_rows(self) -> (ReleaseRow, Vec<ArticleRow>) {
         let Self { release, files } = self;
+        let mut filenames = HashSet::new();
         let rows = files
             .into_iter()
             .flat_map(|InventoryFile { info, segments }| {
-                let filename = (!info.filename.is_empty()).then_some(info.filename);
+                let filename = match info.filename {
+                    name if name.is_empty() => None,
+                    name if filenames.insert(name.clone()) => Some(name),
+                    // The writer preserves distinct file IDs even when sanitizing their names gives the same text.
+                    // The renderer groups by filename, and a NUL cannot collide with a real PostgreSQL filename.
+                    name => Some(format!("{name}\0 #{}", info.id)),
+                };
                 let release = &release;
                 segments.into_iter().map(move |segment| ArticleRow {
                     message_id: segment.message_id,
@@ -158,6 +165,34 @@ mod tests {
         let built = crate::nzb::render_checked(&release, &rows, std::slice::from_ref(&release.group_name), true);
         assert!(built.complete());
         assert!(built.xml.contains("<segment bytes=\"17\" number=\"1\">part1@example.test</segment>"));
+    }
+
+    #[test]
+    fn nzb_keeps_native_files_with_the_same_display_filename_apart() {
+        let release = ReleaseRow { group_name: "alt.binaries.test".into(), ..ReleaseRow::default() };
+        let file = |id, part| InventoryFile {
+            info: FileInfo {
+                id,
+                filename: "a\u{fffd}.bin".into(),
+                subject: None,
+                subject_part: Some(part),
+                expected: Some(2),
+                file_total: None,
+                parts_seen: 1,
+                touched_at: None,
+                sealed: false,
+            },
+            segments: vec![SegmentRef {
+                message_id: format!("<part{part}@example.test>"),
+                part: Some(part),
+                bytes: 17,
+            }],
+        };
+        let inventory = Inventory { release, files: vec![file(10, 1), file(11, 2)] };
+        let (release, rows) = inventory.into_nzb_rows();
+        let built = crate::nzb::render_checked(&release, &rows, std::slice::from_ref(&release.group_name), true);
+        assert_eq!(built.xml.matches("  <file ").count(), 2);
+        assert!(!built.complete());
     }
 
     #[test]
