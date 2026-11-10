@@ -8,6 +8,7 @@ use postgres::Client;
 pub const MIGRATIONS: &[(i32, &str, &str)] = &[
     (1, "main", include_str!("migrations/0001_main.sql")),
     (2, "header_blocks", include_str!("migrations/0002_header_blocks.sql")),
+    (3, "release_writer", include_str!("migrations/0003_release_writer.sql")),
 ];
 
 /// Bring the schema `schema` up to the last migration. Returns the versions applied now.

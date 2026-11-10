@@ -1,7 +1,8 @@
 //! `atlas --save-replay --store DIR --db DIR [--rows N] [--slice N] [--tasks N] [--parsers N]`: replays real overview
 //! lines from a header store through the indexer's parse and save path into a scratch database, for measuring and
 //! profiling the release writer. It never touches the live databases: `--db` is a folder of its own (made if need be),
-//! used as the app folder for the run.
+//! used as the app folder for the run. To exercise the native PostgreSQL release writer, also pass
+//! `--pg-database NAME --pg-schema atlas_replay_NAME` and set `ATLAS_REPLAY_PG_URL`.
 //!
 //! Lines come group by group, round robin, in slices of `--slice` rows (the indexer's slices), parsed on `--parsers`
 //! threads the way `indexer::parse_and_save` does (articles obfuscated per article go to the header store, which the
@@ -15,16 +16,91 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use nntp_xover_engine::container::NxvBlockView;
 use nntp_xover_engine::streamer::{NxvRangeCursor, XoverStreamScratch};
 
+use crate::nxv_store::segment::Entry;
 use crate::nxv_store::store::{KeepSet, Store, StoreConfig};
 use crate::parser::Release;
+use crate::pg::{Pool, StorageConfig};
 use crate::store::Prepared;
 
 fn arg<T: std::str::FromStr>(args: &[String], flag: &str, default: T) -> T {
     args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+fn pg_target(args: &[String], replay_url: Option<String>) -> Result<Option<(StorageConfig, &str)>> {
+    let value = |flag: &str| -> Result<Option<&str>> {
+        args.iter()
+            .position(|arg| arg == flag)
+            .map(|i| {
+                args.get(i + 1)
+                    .map(String::as_str)
+                    .filter(|v| !v.starts_with("--"))
+                    .with_context(|| format!("{flag} requires a value"))
+            })
+            .transpose()
+    };
+    match (value("--pg-database")?, value("--pg-schema")?) {
+        (None, None) => Ok(None),
+        (Some(database), Some(schema)) => {
+            ensure!(
+                crate::pg::valid_schema(schema) && schema.starts_with("atlas_replay_"),
+                "--pg-schema must be a lowercase name starting with atlas_replay_"
+            );
+            ensure!(!database.is_empty(), "--pg-database must name the expected database");
+            let url = replay_url.filter(|url| !url.trim().is_empty()).context("set ATLAS_REPLAY_PG_URL for replay")?;
+            let config = StorageConfig {
+                backend: crate::pg::Backend::Postgres,
+                url,
+                schema: schema.to_owned(),
+                ..StorageConfig::default()
+            };
+            config.check()?;
+            Ok(Some((config, database)))
+        }
+        _ => anyhow::bail!("use --pg-database and --pg-schema together"),
+    }
+}
+
+#[derive(Clone)]
+enum Writer {
+    Sqlite(crate::indexer::Db),
+    Postgres(Arc<Pool>),
+}
+
+impl Writer {
+    async fn save(&self, releases: Vec<Release>, prepared: Prepared) -> Result<()> {
+        match self {
+            Self::Sqlite(db) => db.save_prepared(releases, prepared).await,
+            Self::Postgres(pool) => {
+                let pool = pool.clone();
+                tokio::task::spawn_blocking(move || {
+                    let mut conn = pool.get()?;
+                    let started = Instant::now();
+                    crate::pg::release_writer::save(&mut conn, &releases, chrono::Utc::now().timestamp())?;
+                    crate::profile::LOAD
+                        .writer_busy_ns
+                        .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    Ok(())
+                })
+                .await?
+            }
+        }
+    }
+}
+
+fn open_pg_replay(config: StorageConfig, database: &str) -> Result<Writer> {
+    let pool = Pool::new(&config)?;
+    let mut conn = pool.get().context("connecting to the replay database")?;
+    let actual: String = conn.query_one("select current_database()", &[])?.get(0);
+    ensure!(actual == database, "connected to {actual}, expected {database}");
+    // Deliberately refuse to reuse a previous replay. The schema remains available for parity queries.
+    conn.batch_execute(&format!("create schema \"{}\"", pool.schema())).context("creating a fresh replay schema")?;
+    crate::pg::migrate::run(&mut conn, pool.schema())?;
+    drop(conn);
+    Ok(Writer::Postgres(Arc::new(pool)))
 }
 
 pub fn run_cli(args: &[String]) -> i32 {
@@ -39,21 +115,10 @@ pub fn run_cli(args: &[String]) -> i32 {
 
 /// One slice: its group and its overview lines.
 type Slice = (String, Vec<Vec<u8>>);
+type GroupCursor = (String, Vec<(Arc<memmap2::Mmap>, Entry)>, usize);
 
 fn limit_slice(lines: &mut Vec<Vec<u8>>, sent: u64, limit: u64) {
     lines.truncate(usize::try_from(limit - sent).unwrap_or(usize::MAX));
-}
-
-#[cfg(test)]
-mod tests {
-    use super::limit_slice;
-
-    #[test]
-    fn a_replay_stops_at_the_requested_row_count() {
-        let mut lines = vec![vec![1], vec![2], vec![3]];
-        limit_slice(&mut lines, 4, 6);
-        assert_eq!(lines, vec![vec![1], vec![2]]);
-    }
 }
 
 /// The store's lines, group by group round robin, in slices of `slice` rows, sent to `tx` until `rows` are sent.
@@ -61,7 +126,7 @@ fn read_slices(store: &Store, slice: usize, rows: u64, tx: std::sync::mpsc::Sync
     let mut groups = store.group_names();
     groups.sort();
     // each group's blocks, read one after another
-    let mut cursors: Vec<(String, Vec<(Arc<memmap2::Mmap>, crate::nxv_store::segment::Entry)>, usize)> = groups
+    let mut cursors: Vec<GroupCursor> = groups
         .into_iter()
         .map(|g| {
             let blocks = store.blocks(&g, i64::MIN / 4, i64::MAX / 4);
@@ -152,9 +217,23 @@ fn persisted_counts(main: &Path) -> Result<(i64, i64, i64)> {
     Ok((releases, files, parts))
 }
 
+fn postgres_counts(pool: &Pool) -> Result<(i64, i64, i64, i64)> {
+    let row = pool.get()?.query_one(
+        "select (select count(*) from releases), (select count(*) from files),
+                (select count(*) from segments), (select coalesce(sum(parts), 0)::bigint from releases),
+                (select coalesce(sum(pg_total_relation_size(oid)), 0)::bigint from pg_class
+                 where relnamespace = current_schema()::regnamespace and relkind = 'r')",
+        &[],
+    )?;
+    let parts: i64 = row.get(2);
+    ensure!(parts == row.get::<_, i64>(3), "release part totals differ from the stored segments");
+    Ok((row.get(0), row.get(1), parts, row.get(4)))
+}
+
 fn run(args: &[String]) -> Result<()> {
     let store_dir = PathBuf::from(args.iter().skip_while(|a| *a != "--store").nth(1).context("--store DIR")?);
     let db_dir = PathBuf::from(args.iter().skip_while(|a| *a != "--db").nth(1).context("--db DIR")?);
+    let pg = pg_target(args, std::env::var("ATLAS_REPLAY_PG_URL").ok())?;
     let (rows, slice, tasks, parsers) = (
         arg(args, "--rows", u64::MAX),
         arg(args, "--slice", 20_000usize),
@@ -175,13 +254,18 @@ fn run(args: &[String]) -> Result<()> {
     // the run's app folder: the checkpointer and anything else looking for the database find the scratch one
     // SAFETY: set before any other thread starts
     unsafe { std::env::set_var("ATLAS_HOME", &db_dir) };
+    let main = db_dir.join("atlas.db");
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = if let Some((config, database)) = pg {
+        open_pg_replay(config, database)?
+    } else {
+        crate::db::create_db_at(&main)?;
+        Writer::Sqlite(crate::indexer::shared_db(crate::db::open_at(&main)?))
+    };
     let (store, _) =
         Store::open(StoreConfig::new(&store_dir), KeepSet { live_from: i64::MIN / 2, ..KeepSet::default() })?;
-    let main = db_dir.join("atlas.db");
-    crate::db::create_db_at(&main)?;
-    let db = crate::indexer::shared_db(crate::db::open_at(&main)?);
-    let stop = Arc::new(AtomicBool::new(false));
-    let checkpointer = crate::db::checkpointer(stop.clone());
+    let sqlite = matches!(&writer, Writer::Sqlite(_));
+    let checkpointer = sqlite.then(|| crate::db::checkpointer(stop.clone()));
 
     let (slice_tx, slice_rx) = std::sync::mpsc::sync_channel::<Slice>(parsers * 2);
     let (parsed_tx, parsed_rx) = tokio::sync::mpsc::channel::<(usize, Vec<Release>, Prepared)>(tasks * 2);
@@ -201,7 +285,7 @@ fn run(args: &[String]) -> Result<()> {
                 let t = Instant::now();
                 let releases = parse(&group, &lines);
                 // as the indexer's parse step does: what the writer would otherwise work out
-                let prepared = crate::store::prepare(&releases);
+                let prepared = if sqlite { crate::store::prepare(&releases) } else { Prepared::new() };
                 parse_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 if tx.blocking_send((lines.len(), releases, prepared)).is_err() {
                     return;
@@ -228,14 +312,15 @@ fn run(args: &[String]) -> Result<()> {
                 let rows = processed_rows.load(Ordering::Relaxed);
                 let busy = crate::profile::LOAD.writer_busy_ns.load(Ordering::Relaxed);
                 let dt = last_t.elapsed().as_secs_f64();
+                let sqlite_size =
+                    if sqlite { format!("  db {:.2} GB", files_size(&main) as f64 / 1e9) } else { String::new() };
                 println!(
-                    "{:>6.0}s  {:>11} rows  {:>8.0} rows/s  writer busy {:>4.0}%  parse {:>5.1} cores  db {:.2} GB",
+                    "{:>6.0}s  {:>11} rows  {:>8.0} rows/s  writer busy {:>4.0}%  parse {:>5.1} cores{sqlite_size}",
                     started.elapsed().as_secs_f64(),
                     rows,
                     (rows - last_rows) as f64 / dt,
                     (busy - last_busy) as f64 / 1e9 / dt * 100.0,
-                    parse_ns.swap(0, Ordering::Relaxed) as f64 / 1e9 / dt,
-                    files_size(&main) as f64 / 1e9
+                    parse_ns.swap(0, Ordering::Relaxed) as f64 / 1e9 / dt
                 );
                 (last_rows, last_busy, last_t) = (rows, busy, Instant::now());
             }
@@ -245,14 +330,14 @@ fn run(args: &[String]) -> Result<()> {
         let parsed_rx = Arc::new(tokio::sync::Mutex::new(parsed_rx));
         let mut handles = Vec::new();
         for _ in 0..tasks {
-            let (rx, db) = (Arc::clone(&parsed_rx), db.clone());
+            let (rx, writer) = (Arc::clone(&parsed_rx), writer.clone());
             let (processed_rows, rows_in_save_slices) = (Arc::clone(&processed_rows), Arc::clone(&rows_in_save_slices));
             handles.push(tokio::spawn(async move {
                 loop {
                     let next = rx.lock().await.recv().await;
                     let Some((n, releases, prepared)) = next else { return Ok::<(), anyhow::Error>(()) };
                     if !releases.is_empty() {
-                        db.save_prepared(releases, prepared).await?;
+                        writer.save(releases, prepared).await?;
                         rows_in_save_slices.fetch_add(n as u64, Ordering::Relaxed);
                     }
                     processed_rows.fetch_add(n as u64, Ordering::Relaxed);
@@ -273,8 +358,9 @@ fn run(args: &[String]) -> Result<()> {
         parser_panicked |= p.join().is_err();
     }
     let _ = report.join();
-    let _ = checkpointer.join();
-    drop(db);
+    if let Some(checkpointer) = checkpointer {
+        let _ = checkpointer.join();
+    }
     let closed = store.close();
     result?;
     reader_result?;
@@ -282,16 +368,54 @@ fn run(args: &[String]) -> Result<()> {
     closed?;
     let rows = processed_rows.load(Ordering::Relaxed);
     anyhow::ensure!(rows > 0, "the replay store supplied no headers");
+    let (releases, files, parts, bytes) = match writer {
+        Writer::Sqlite(db) => {
+            drop(db);
+            let (releases, files, parts) = persisted_counts(&main)?;
+            (releases, files, parts, files_size(&main) as f64)
+        }
+        Writer::Postgres(pool) => {
+            let (releases, files, parts, bytes) = postgres_counts(&pool)?;
+            (releases, files, parts, bytes as f64)
+        }
+    };
     println!(
         "processed {rows} headers in {secs:.2}s: {:.0} headers/s; writer busy {:.1}s; db {:.2} GB",
         rows as f64 / secs,
         crate::profile::LOAD.writer_busy_ns.load(Ordering::Relaxed) as f64 / 1e9,
-        files_size(&main) as f64 / 1e9
+        bytes / 1e9
     );
-    let (releases, files, parts) = persisted_counts(&main)?;
     let save_rows = rows_in_save_slices.load(Ordering::Relaxed);
     println!(
         "{save_rows} headers in slices that produced releases; persisted {releases} releases, {files} files, {parts} parts"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{limit_slice, pg_target};
+
+    #[test]
+    fn a_replay_stops_at_the_requested_row_count() {
+        let mut lines = vec![vec![1], vec![2], vec![3]];
+        limit_slice(&mut lines, 4, 6);
+        assert_eq!(lines, vec![vec![1], vec![2]]);
+    }
+
+    #[test]
+    fn postgres_replay_requires_a_named_staging_destination() {
+        let args = |words: &[&str]| words.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let url = || Some("host=localhost dbname=atlas_test".to_owned());
+        assert!(pg_target(&args(&["--pg-database", "atlas_test"]), url()).is_err());
+        assert!(pg_target(&args(&["--pg-database", "atlas_test", "--pg-schema", "public"]), url()).is_err());
+        assert!(pg_target(&args(&["--pg-database", "--pg-schema", "atlas_replay_test"]), url()).is_err());
+        let target = args(&["--pg-database", "atlas_test", "--pg-schema", "atlas_replay_test"]);
+        assert!(pg_target(&target, None).is_err());
+        assert!(pg_target(&target, Some(" ".into())).is_err());
+        let (config, database) = pg_target(&target, url()).unwrap().unwrap();
+        assert_eq!(database, "atlas_test");
+        assert_eq!(config.schema, "atlas_replay_test");
+        assert_eq!(config.url, url().unwrap());
+    }
 }
