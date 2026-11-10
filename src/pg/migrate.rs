@@ -9,12 +9,23 @@ pub const MIGRATIONS: &[(i32, &str, &str)] = &[
     (1, "main", include_str!("migrations/0001_main.sql")),
     (2, "header_blocks", include_str!("migrations/0002_header_blocks.sql")),
     (3, "release_writer", include_str!("migrations/0003_release_writer.sql")),
+    (4, "main_compat", include_str!("migrations/0004_main_compat.sql")),
 ];
 
 /// Bring the schema `schema` up to the last migration. Returns the versions applied now.
 pub fn run(c: &mut Client, schema: &str) -> Result<Vec<i32>, postgres::Error> {
-    assert!(super::valid_schema(schema), "schema {schema:?}");
     let mut tx = c.transaction()?;
+    let applied = run_in_transaction(&mut tx, schema)?;
+    tx.commit()?;
+    Ok(applied)
+}
+
+/// Apply migrations inside a caller's transaction so a staging import can commit schema and rows together.
+pub(super) fn run_in_transaction(
+    tx: &mut postgres::Transaction<'_>,
+    schema: &str,
+) -> Result<Vec<i32>, postgres::Error> {
+    assert!(super::valid_schema(schema), "schema {schema:?}");
     // held to the end of this transaction: a second process waits here, then finds the versions applied
     tx.execute("select pg_advisory_xact_lock(hashtext('atlas.migrate.' || $1))", &[&schema])?;
     // only made when missing: `create schema if not exists` needs the right to create schemas in the database even
@@ -40,7 +51,6 @@ pub fn run(c: &mut Client, schema: &str) -> Result<Vec<i32>, postgres::Error> {
         tx.execute("insert into schema_migrations (version, name) values ($1, $2)", &[&version, &name])?;
         applied.push(version);
     }
-    tx.commit()?;
     Ok(applied)
 }
 
