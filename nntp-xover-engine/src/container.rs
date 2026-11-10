@@ -47,6 +47,7 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use std::collections::HashMap;
+use std::io::Read;
 
 use crate::date::{DATE_BUF, STYLE_FREE_BITS, format_date, parse_date};
 
@@ -1416,8 +1417,7 @@ pub fn decompress_cold_block(cold: &[u8]) -> Result<AlignedBytes> {
     ensure!(view.is_cold(), "block is not cold");
     let h = *view.header;
     let prefix = h.cold_prefix_bytes as usize;
-    let flen = u32::from_le_bytes(cold.get(prefix..prefix + 4).context("cold block cut short")?.try_into()?) as usize;
-    let frame = cold.get(prefix + 8..prefix + 8 + flen).context("cold block cut short")?;
+    let frame = view.cold_frame()?;
     let body = zstd::bulk::decompress(frame, h.hot_block_bytes as usize - prefix)?;
     ensure!(body.len() == h.hot_block_bytes as usize - prefix, "cold block decompressed to the wrong length");
     ensure!(
@@ -1681,6 +1681,41 @@ impl<'a> NxvBlockView<'a> {
             return true;
         }
         xxhash_rust::xxh3::xxh3_64(&self.data[DATA_START..]) == self.body_hash()
+    }
+
+    /// Verify a cold block's body without allocating a full hot block.
+    pub fn verify_cold_body(&self) -> Result<()> {
+        ensure!(self.is_cold(), "block is not cold");
+        let prefix = self.header.cold_prefix_bytes as usize;
+        let expected = self.header.hot_block_bytes as usize - prefix;
+        let mut decoder = zstd::stream::read::Decoder::with_buffer(self.cold_frame()?)?.single_frame();
+        // The bulk NXV encoder uses the standard zstd levels (at most a 2^27-byte window).
+        let window_log = (usize::BITS - expected.saturating_sub(1).leading_zeros()).clamp(10, 27);
+        decoder.window_log_max(window_log)?;
+        let mut hash = xxhash_rust::xxh3::Xxh3::new();
+        hash.update(&self.data[DATA_START..prefix]);
+        let mut remaining = expected;
+        let mut buf = [0; 16 * 1024];
+        loop {
+            let capacity = buf.len().min(remaining + 1);
+            let n = decoder.read(&mut buf[..capacity])?;
+            if n == 0 {
+                break;
+            }
+            remaining = remaining.checked_sub(n).context("cold block decompressed to the wrong length")?;
+            hash.update(&buf[..n]);
+        }
+        ensure!(remaining == 0, "cold block decompressed to the wrong length");
+        ensure!(decoder.finish().is_empty(), "trailing bytes in cold block frame");
+        ensure!(hash.digest() == self.body_hash(), "cold block body does not match the hash in its header");
+        Ok(())
+    }
+
+    fn cold_frame(&self) -> Result<&'a [u8]> {
+        let prefix = self.header.cold_prefix_bytes as usize;
+        let frame = self.data.get(prefix..).context("cold block cut short")?;
+        let len = u32::from_le_bytes(frame.get(..4).context("cold block cut short")?.try_into()?) as usize;
+        frame.get(8..).and_then(|bytes| bytes.get(..len)).context("cold block cut short")
     }
 
     #[inline]
