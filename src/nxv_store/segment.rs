@@ -373,6 +373,10 @@ fn heal(arena: &File, index: &File, day: i64) -> Result<(Vec<Entry>, u64, Healed
         fsync_only(arena)?;
         full_flush(arena)?;
     }
+    if healed.rolled_forward > 0 && healed.cut_arena_bytes == 0 {
+        // A stopped process can leave complete blocks in cache before the arena's durability barrier.
+        full_flush(arena)?;
+    }
     if dirty {
         // written over in place first, then cut: a crash between leaves a manifest with its old tail, never empty
         let mut out = Vec::with_capacity(entries.len() * ENTRY_LEN);

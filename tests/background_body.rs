@@ -179,7 +179,8 @@ fn one_enormous_line_is_cut_at_the_cap_and_its_connection_goes() {
     let pool = Pool::new(&[mock(port, "secret", 2, 1)]);
     assert_eq!(rt.block_on(pool.background_body("<msg1@mock>", MIB)).unwrap(), BackgroundBody::TooBig);
     let wire = pool.server_stats()[0].wire_bytes;
-    assert!(wire < (MIB + (200 << 10)) as u64, "{wire} bytes off the wire");
+    // A capped line can read ahead by one 256 KiB socket buffer, plus the login and BODY replies.
+    assert!(wire < (MIB + (256 << 10) + 1024) as u64, "{wire} bytes off the wire");
     let accepted = state.accepted.load(Ordering::SeqCst);
     let _ = rt.block_on(pool.background_body("<msg9@mock>", MIB));
     assert_eq!(state.accepted.load(Ordering::SeqCst), accepted + 1, "the next request logs in again");
