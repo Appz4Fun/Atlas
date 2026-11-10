@@ -25,6 +25,22 @@ fn clip(codec: &str) -> Vec<u8> {
     std::fs::read(format!("{}/tests/fixtures/{codec}/clip.mkv", env!("CARGO_MANIFEST_DIR"))).unwrap()
 }
 
+/// Keep the picture data while giving a posting its own mux identity, so still sharing cannot skip extraction.
+fn distinct_mux(mut bytes: Vec<u8>, nonce: u8) -> Vec<u8> {
+    let uid = bytes.windows(3).position(|b| b == [0x73, 0xa4, 0x90]).unwrap() + 3;
+    bytes[uid] ^= nonce;
+    // This fixture's Info has a one-byte length and a leading CRC-32 element. Repair it after changing the UID.
+    let info = bytes.windows(4).rposition(|b| b == [0x15, 0x49, 0xa9, 0x66]).unwrap();
+    assert_ne!(bytes[info + 4] & 0x80, 0);
+    let start = info + 5;
+    let end = start + usize::from(bytes[info + 4] & 0x7f);
+    assert_eq!(&bytes[start..start + 2], &[0xbf, 0x84]);
+    assert!(uid >= start + 6 && uid + 16 <= end);
+    let checksum = crc32(&bytes[start + 6..end]);
+    bytes[start + 2..start + 6].copy_from_slice(&checksum.to_le_bytes());
+    bytes
+}
+
 /// The two volumes of a stored RAR4 set holding `inner` as `name`, the first with `split` bytes of it.
 fn volumes(name: &str, inner: &[u8], split: usize) -> (Vec<u8>, Vec<u8>) {
     let fields = r4_file_fields(name.as_bytes(), inner.len() as u32);
@@ -113,7 +129,7 @@ fn video_releases_get_three_stills_from_their_middles() {
     }
     let inner = clip("hevc");
     let plain = "Plain.Film.2001.1080p.WEB-DL.x265-GRP";
-    let mut posts = posts_of(1, 1, 1, &format!("{plain}.mkv"), &inner, CLAIMED);
+    let mut posts = posts_of(1, 1, 1, &format!("{plain}.mkv"), &distinct_mux(inner.clone(), 1), CLAIMED);
     let avc = "Avc.Film.2003.720p.HDTV.x264-GRP";
     let next = posts.len() as u64 + 1;
     // a small release, a few hundred KB, gets stills too
@@ -126,8 +142,9 @@ fn video_releases_get_three_stills_from_their_middles() {
     posts.extend(posts_of(next, 2, 2, &format!("{set}.r00"), &last, CLAIMED));
     // a still whose keyframe runs on into the next volume
     let split_set = "Split.Film.2003.1080p.BluRay.x265-GRP";
-    let at = split_in_a_keyframe(&format!("{split_set}.mkv"), &inner);
-    let (first, last) = volumes(&format!("{split_set}.mkv"), &inner, at);
+    let split_inner = distinct_mux(inner.clone(), 2);
+    let at = split_in_a_keyframe(&format!("{split_set}.mkv"), &split_inner);
+    let (first, last) = volumes(&format!("{split_set}.mkv"), &split_inner, at);
     let next = posts.len() as u64 + 1;
     posts.extend(posts_of(next, 1, 2, &format!("{split_set}.rar"), &first, CLAIMED));
     let next = posts.len() as u64 + 1;

@@ -1780,12 +1780,16 @@ pub fn run() -> i32 {
         let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, stop.clone());
     }
 
+    if let Err(e) = crate::nxv_store::live::spawn(&crate::config::header_store_config()) {
+        ui::error(&format!("not indexing: {e:#}"));
+        write_status(false, "", &config.index_mode, false, "stopped", true, 1);
+        return 1;
+    }
     crate::metrics::start(&config, crate::metrics::Role::Indexer);
     crate::sealed_store::spawn_offload(&config.sealed_log, stop.clone());
     crate::blob_bytes::spawn(&config.sealed_log, stop.clone());
     crate::shared_catalog::start(&config.shared_catalog, stop.clone());
     crate::overview_archive::spawn(&config.overview_archive);
-    crate::nxv_store::live::spawn(&crate::config::header_store_config());
     if config.metrics.enabled {
         crate::metrics::catalog::spawn(Duration::from_secs(config.metrics.catalog_every_secs), stop.clone());
     }
