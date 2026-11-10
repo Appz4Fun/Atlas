@@ -12,6 +12,7 @@
 
 pub mod header_blocks;
 pub mod migrate;
+pub mod release_writer;
 pub mod sql;
 #[cfg(test)]
 pub mod testing;
