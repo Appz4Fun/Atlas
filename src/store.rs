@@ -3520,7 +3520,7 @@ pub enum SegmentPick {
 
 /// How many parts a `seen` bitmap has.
 pub fn seen_count(bits: &[u8]) -> i64 {
-    bits.iter().map(|b| i64::from(b.count_ones())).sum()
+    part_bytes(bits).map(|(_, byte)| i64::from(byte.count_ones())).sum()
 }
 
 /// What deleting a release took.
@@ -4326,6 +4326,7 @@ mod tests {
         insert_part(&mut high, 234_450);
         insert_part(&mut high, 1_099_511_627_776);
         assert_eq!(high.len(), PART_BLOCK_RECORD + 1);
+        assert_eq!(seen_count(&high), 1);
         assert!(has_part(&high, 234_450));
         assert!(!has_part(&high, 234_449));
         assert!(!is_exactly(&high, 234_450));
