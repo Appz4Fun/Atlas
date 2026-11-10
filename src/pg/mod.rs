@@ -150,6 +150,23 @@ struct PoolState {
     open: usize,
 }
 
+impl Drop for Pool {
+    fn drop(&mut self) {
+        let state = self.state.get_mut().unwrap_or_else(|e| e.into_inner());
+        let clients = std::mem::take(&mut state.idle);
+        if clients.is_empty() {
+            return;
+        }
+        // postgres::Client owns a synchronous runtime, including during Drop. The final Arc may be released
+        // by an async indexer task; use a plain thread so cleanup is safe even while Tokio is shutting down.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            std::thread::spawn(move || drop(clients));
+        } else {
+            drop(clients);
+        }
+    }
+}
+
 impl Pool {
     pub fn new(storage: &StorageConfig) -> Result<Pool> {
         if !valid_schema(&storage.schema) {

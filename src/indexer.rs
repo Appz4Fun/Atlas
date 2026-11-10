@@ -386,6 +386,7 @@ impl MainConnection {
 
 /// Opt-in native indexer storage. The destination must already exist and be migrated; this never opens SQLite
 /// or creates a schema. Background services using SQLite-only stage callbacks still require their own port.
+/// Call during synchronous startup or on a blocking thread, as with the synchronous PostgreSQL pool itself.
 pub fn shared_postgres_db(
     config: &crate::pg::StorageConfig,
     expected_database: &str,
@@ -421,6 +422,33 @@ pub fn shared_postgres_db(
 #[cfg(test)]
 mod postgres_backend_tests {
     use super::*;
+
+    #[test]
+    fn final_postgres_db_owner_can_drop_inside_an_async_task() {
+        let Some(schema) = crate::pg::testing::Schema::new() else { return };
+        eprintln!("native teardown fixture: {}", schema.name);
+        let database: String = schema.pool.get().unwrap().query_one("select current_database()", &[]).unwrap().get(0);
+        let db = shared_postgres_db(
+            &crate::pg::StorageConfig {
+                backend: crate::pg::Backend::Postgres,
+                url: schema.url.clone(),
+                schema: schema.name.clone(),
+                allow_plaintext: true,
+                ..Default::default()
+            },
+            &database,
+            PgWriteLimits::default(),
+        )
+        .unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        rt.block_on(async {
+            tokio::spawn(async move {
+                drop(db);
+            })
+            .await
+            .unwrap();
+        });
+    }
 
     #[test]
     fn cancelled_postgres_day_claim_is_released_off_the_async_worker() {
