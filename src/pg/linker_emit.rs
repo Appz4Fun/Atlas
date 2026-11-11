@@ -174,10 +174,21 @@ mod tests {
     #[test]
     fn immutable_emission_replays_committed_save_before_receipt_without_renumbering() {
         let Some(schema) = crate::pg::testing::Schema::new() else { return };
-        let mut c = schema.pool.get().unwrap();
+        // A fresh direct client models reconnecting the persisted metadata and
+        // fixture writer connection; this does not exercise Owned lease restart.
+        let connect = || {
+            let mut client = postgres::Client::connect(&schema.url, postgres::NoTls).unwrap();
+            client.batch_execute(&format!("set search_path to \"{}\"", schema.name)).unwrap();
+            client
+        };
+        let mut c = connect();
+        let first_pid: i32 = c.query_one("select pg_backend_pid()", &[]).unwrap().get(0);
         let now = 1_800_000_000i64;
         let epoch: i64 = c
-            .query_one("insert into linker_epochs(logical_now,phase) values($1,'emit') returning id", &[&now])
+            .query_one(
+                "insert into linker_epochs(logical_now,phase,planned_rows) values($1,'emit',3) returning id",
+                &[&now],
+            )
             .unwrap()
             .get(0);
         let source: i64 = c
@@ -211,8 +222,12 @@ mod tests {
         assert_eq!(first.releases[0].articles[0].total_parts, Some(3));
         crate::pg::release_writer::save(&mut c, &first.releases, now).unwrap();
         let generation: i64 = c.query_one("select generation from pp_queue limit 1", &[]).unwrap().get(0);
-        // Crash boundary: writer committed, durable cursor still points before
-        // that page. Re-read the SAME sealed plan, then save and acknowledge it.
+        // Reconnect after writer commit with the receipt still absent. The
+        // sealed plan must replay unchanged on a different backend connection.
+        drop(c);
+        let mut c = connect();
+        let replay_pid: i32 = c.query_one("select pg_backend_pid()", &[]).unwrap().get(0);
+        assert_ne!(first_pid, replay_pid);
         let replay = page(&mut c, epoch, budget).unwrap();
         assert_eq!(replay.before, 0);
         assert_eq!(replay.releases[0].articles[0].subject, first.releases[0].articles[0].subject);
@@ -230,6 +245,11 @@ mod tests {
                 break;
             }
         }
+        // Reconnect again after receipts but before the final metadata ack.
+        drop(c);
+        let mut c = connect();
+        let ack_pid: i32 = c.query_one("select pg_backend_pid()", &[]).unwrap().get(0);
+        assert_ne!(replay_pid, ack_pid);
         let count: i64 = c.query_one("select count(*) from segments", &[]).unwrap().get(0);
         assert_eq!(count, 3);
         let state = c.query_one("select emitted,phase from linker_epochs where id=$1", &[&epoch]).unwrap();
@@ -238,6 +258,10 @@ mod tests {
         let remembered: i64 = c.query_one("select count(*) from linker_linked_ids", &[]).unwrap().get(0);
         assert_eq!(remembered, 3);
         assert!(page(&mut c, epoch, budget).unwrap().finished);
+        crate::pg::linker_plan::ack(&mut c, epoch).unwrap();
+        crate::pg::linker_plan::ack(&mut c, epoch).unwrap();
+        let phase: String = c.query_one("select phase from linker_epochs where id=$1", &[&epoch]).unwrap().get(0);
+        assert_eq!(phase, "done");
     }
 }
 
