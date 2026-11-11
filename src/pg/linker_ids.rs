@@ -125,7 +125,7 @@ fn checkpoint(
     time: Option<i64>,
     ids: &mut Vec<(i64, i64)>,
 ) -> Result<()> {
-    let mut tx = client.transaction()?;
+    let mut tx = super::linker::durable_transaction(client)?;
     // At most BATCH identities are held. Expired entries can be pruned later in
     // bounded pages without ever loading native membership into a HashSet.
     for &(hash, added) in ids.iter() {
@@ -173,7 +173,8 @@ pub(crate) fn import(client: &mut Client, dir: &Path, now: i64) -> Result<()> {
         identity.update(metadata.mtime().to_le_bytes());
         identity.update(metadata.mtime_nsec().to_le_bytes());
         let identity: [u8; 32] = identity.finalize().into();
-        client.execute(
+        super::linker::durable_execute(
+            client,
             "insert into linker_id_imports(name,source_identity) values($1,$2) on conflict do nothing",
             &[&name, &&identity[..]],
         )?;
@@ -244,13 +245,14 @@ pub(crate) fn import(client: &mut Client, dir: &Path, now: i64) -> Result<()> {
             }
         }
         checkpoint(client, name, offset, None, &mut ids)?;
-        client.execute("update linker_id_imports set complete=true where name=$1", &[&name])?;
+        super::linker::durable_execute(client, "update linker_id_imports set complete=true where name=$1", &[&name])?;
     }
     Ok(())
 }
 
 /// Native membership preserves canonical bytes, using SHA-256 only as an
 /// index. Historical hashes remain a separate conservative fallback.
+#[cfg(test)]
 pub(crate) fn contains(client: &mut Client, message: &[u8], now: i64) -> Result<bool> {
     let key: [u8; 32] = Sha256::digest(message).into();
     let hash = nntp_xover_engine::msgid_index::msgid_hash(message) as i64;
@@ -266,9 +268,11 @@ pub(crate) fn contains(client: &mut Client, message: &[u8], now: i64) -> Result<
 
 /// Invoke with the publication receipt. A hypothetical SHA-256 collision is
 /// an explicit error, never a silent merge of two different article IDs.
+#[cfg(test)]
 pub(crate) fn remember(client: &mut Client, message: &[u8], added: i64) -> Result<()> {
     let key: [u8; 32] = Sha256::digest(message).into();
-    let changed = client.execute(
+    let changed = super::linker::durable_execute(
+        client,
         "insert into linker_linked_ids values($1,$2,$3)
         on conflict(message_key) do update set added=greatest(linker_linked_ids.added,excluded.added)
         where linker_linked_ids.message_id=excluded.message_id",
@@ -283,12 +287,14 @@ pub(crate) fn remember(client: &mut Client, message: &[u8], added: i64) -> Resul
 pub(crate) fn prune(client: &mut Client, now: i64, budget: i64) -> Result<u64> {
     ensure!(budget > 0, "native linker expiry budget must be positive");
     let before = now.saturating_sub(8 * crate::xref::KEEP_SECS);
-    let n = client.execute(
+    let n = super::linker::durable_execute(
+        client,
         "delete from linker_linked_ids where ctid in
         (select ctid from linker_linked_ids where added<$1 order by added limit $2)",
         &[&before, &budget],
     )?;
-    let m = client.execute(
+    let m = super::linker::durable_execute(
+        client,
         "delete from linker_legacy_ids where ctid in
         (select ctid from linker_legacy_ids where added<$1 and not exists
             (select 1 from linker_id_imports where not complete) order by added limit $2)",

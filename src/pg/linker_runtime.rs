@@ -26,14 +26,20 @@ impl Drop for Guard {
 
 /// One bounded client step. SQL may externally sort arbitrarily large input;
 /// only scalar IDs and the configured row/byte page reach this process.
-pub(crate) async fn step(db: &Db, store: &Arc<Store>, epoch: i64, budget: Budget) -> Result<bool> {
+pub(crate) async fn step(
+    db: &Db,
+    store: &Arc<Store>,
+    epoch: i64,
+    budget: Budget,
+    cache: &mut super::linker_source::Cache,
+) -> Result<bool> {
     let phase = on_native_db(db, move |c| {
         Ok(c.query_one("select phase from linker_epochs where id=$1", &[&epoch])?.get::<_, String>(0))
     })
     .await?;
     match phase.as_str() {
         "stage" => {
-            if super::linker_source::step(db, store, epoch, budget).await? {
+            if super::linker_source::step(db, store, epoch, budget, cache).await? {
                 on_native_db(db, move |c| super::linker_epoch::scope(c, epoch)).await?;
             }
         }
@@ -86,6 +92,7 @@ pub(crate) async fn run(db: Db, store: Arc<Store>, stopping: impl Fn() -> bool) 
     })));
     let mut imported = false;
     let mut current = None;
+    let mut source_cache = super::linker_source::Cache::default();
     while !stopping() {
         let result: Result<bool> = async {
             if !imported {
@@ -93,6 +100,11 @@ pub(crate) async fn run(db: Db, store: Arc<Store>, stopping: impl Fn() -> bool) 
                 on_native_db(&db, move |c| super::linker_bootstrap::import(c, &dir, chrono::Utc::now().timestamp()))
                     .await?;
                 imported = true;
+            }
+            if current.is_none()
+                && on_native_db(&db, |c| super::linker_gc::step(c, chrono::Utc::now().timestamp(), 256)).await?
+            {
+                return Ok(false);
             }
             let epoch = match current {
                 Some(epoch) => epoch,
@@ -107,7 +119,7 @@ pub(crate) async fn run(db: Db, store: Arc<Store>, stopping: impl Fn() -> bool) 
                     epoch
                 }
             };
-            let done = step(&db, &store, epoch, Budget::default()).await?;
+            let done = step(&db, &store, epoch, Budget::default(), &mut source_cache).await?;
             let staged = on_native_db(&db, move |c| {
                 Ok(c.query_one("select phase<>'stage' from linker_epochs where id=$1", &[&epoch])?.get::<_, bool>(0))
             })
@@ -123,8 +135,19 @@ pub(crate) async fn run(db: Db, store: Arc<Store>, stopping: impl Fn() -> bool) 
         .await;
         match result {
             Ok(true) => {
-                current = None;
-                pause(&stopping).await;
+                source_cache = super::linker_source::Cache::default();
+                let completed = current.take().expect("completed native epoch");
+                let progressed=on_native_db(&db,move |c| Ok(c.query_one(
+                    "select planned_rows>0 or exists(select 1 from linker_epoch_hours where epoch=$1) from linker_epochs where id=$1",
+                    &[&completed])?.get::<_,bool>(0))).await;
+                match progressed {
+                    Ok(true) => tokio::task::yield_now().await,
+                    Ok(false) => pause(&stopping).await,
+                    Err(error) => {
+                        eprintln!("native header linker: could not read completed progress: {error:#}");
+                        pause(&stopping).await;
+                    }
+                }
             }
             Ok(false) => tokio::task::yield_now().await,
             Err(error) => {
@@ -201,6 +224,7 @@ mod tests {
             .unwrap();
             let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
             rt.block_on(async {
+                let mut source_cache = super::super::linker_source::Cache::default();
                 let source_dir = state.clone();
                 on_native_db(&db, move |c| super::super::linker_bootstrap::import(c, &source_dir, 120000))
                     .await
@@ -212,7 +236,7 @@ mod tests {
                         assert!(turn < 199, "reconciliation stopped making progress");
                         let resumed = on_native_db(&db, |c| super::super::linker_epoch::open(c, 130000)).await.unwrap();
                         assert_eq!(resumed, epoch);
-                        step(&db, &store, epoch, Budget { rows: 2, bytes: 1024 }).await.unwrap();
+                        step(&db, &store, epoch, Budget { rows: 2, bytes: 1024 }, &mut source_cache).await.unwrap();
                         let done = on_native_db(&db, move |c| {
                             Ok(c.query_one("select phase='done' from linker_epochs where id=$1", &[&epoch])?
                                 .get::<_, bool>(0))
@@ -284,9 +308,32 @@ mod tests {
             &[],
         )
         .unwrap();
+        c.batch_execute("create function require_durable_linker_write() returns trigger language plpgsql as $$ begin
+          if current_setting('synchronous_commit') <> 'on' then raise exception 'asynchronous native linker write'; end if;
+          if TG_OP='DELETE' then return old; else return new; end if; end $$;
+          do $$ declare tab record; begin for tab in select tablename from pg_tables where schemaname=current_schema() and tablename like 'linker_%' loop
+          execute format('create trigger require_durable_linker before insert or update or delete on %I for each row execute function require_durable_linker_write()',tab.tablename);
+          end loop; end $$").unwrap();
         drop(c);
+        let mut owner_client = postgres::Client::connect(&schema.url, postgres::NoTls).unwrap();
+        owner_client
+            .batch_execute(&format!("set search_path to \"{}\"; set synchronous_commit=off", schema.name))
+            .unwrap();
+        assert!(
+            owner_client
+                .query_one("select pg_try_advisory_lock(hashtext('atlas.indexer'),hashtext($1))", &[&schema.name])
+                .unwrap()
+                .get::<_, bool>(0)
+        );
+        let db = crate::indexer::owned_postgres_db(
+            db,
+            Arc::new(crate::pg::indexer_runtime::Owner::new(owner_client)),
+            crate::indexer::PgWriteLimits { max_pending_bytes: 4096, max_job_bytes: 4096, concurrent_saves: 1 },
+        )
+        .unwrap();
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
+            let mut source_cache = super::super::linker_source::Cache::default();
             for (now, expected) in [(120000i64, 12i64), (250000, 24)] {
                 let epoch = on_native_db(&db, move |c| super::super::linker_epoch::open(c, now)).await.unwrap();
                 let pin = store.pin_linker_retention();
@@ -309,7 +356,7 @@ mod tests {
                     .await
                     .unwrap();
                     actual.extend(emitted);
-                    if step(&db, &store, epoch, Budget { rows: 2, bytes: 1024 }).await.unwrap() {
+                    if step(&db, &store, epoch, Budget { rows: 2, bytes: 1024 }, &mut source_cache).await.unwrap() {
                         done = true;
                         break;
                     }
@@ -331,6 +378,7 @@ mod tests {
                         .unwrap();
                 assert_eq!(count, expected);
                 if expected == 12 {
+                    assert_eq!(source_cache.verifications, 1, "normal row pages rehashed the same raw block");
                     let callback_db = db.clone();
                     store.set_linker_coverage(Some(Arc::new(move |group, day, generation, count| {
                         on_native_db_sync(&callback_db, |c| {
@@ -344,6 +392,12 @@ mod tests {
                     }
                     assert!(store.segment_snapshot("group.example", 1).is_none());
                     store.set_linker_coverage(None);
+                    for turn in 0..2000 {
+                        assert!(turn < 1999, "completed epoch cleanup did not progress");
+                        if !on_native_db(&db, move |c| super::super::linker_gc::step(c, now, 2)).await.unwrap() {
+                            break;
+                        }
+                    }
                 }
             }
         });
@@ -364,7 +418,7 @@ mod tests {
         assert_eq!(c.query_one("select count(*) from linker_linked_ids", &[]).unwrap().get::<_, i64>(0), 24);
         assert_eq!(
             c.query_one("select count(*) from linker_staged_rows where published", &[]).unwrap().get::<_, i64>(0),
-            24
+            12
         );
         assert!(!dir.path().join("_state/links.rec").exists());
     }

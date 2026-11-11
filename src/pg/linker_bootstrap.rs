@@ -12,7 +12,8 @@ use std::path::Path;
 
 /// Finish any interrupted bootstrap and return its immutable migration clock.
 pub(crate) fn import(client: &mut Client, dir: &Path, now: i64) -> Result<i64> {
-    client.execute(
+    super::linker::durable_execute(
+        client,
         "insert into linker_bootstrap(singleton,logical_now) values(true,$1) on conflict do nothing",
         &[&now],
     )?;
@@ -24,7 +25,7 @@ pub(crate) fn import(client: &mut Client, dir: &Path, now: i64) -> Result<i64> {
     super::linker_ids::import(client, dir, now)?;
     super::linker_metadata::import(client, dir, now)?;
     import_state(client, &dir.join("linker.rec"))?;
-    client.execute("update linker_bootstrap set complete=true where singleton", &[])?;
+    super::linker::durable_execute(client, "update linker_bootstrap set complete=true where singleton", &[])?;
     Ok(now)
 }
 
@@ -79,7 +80,8 @@ fn import_state(client: &mut Client, path: &Path) -> Result<()> {
         }
     }
     ensure!(ended, "legacy linker state is cut short");
-    client.execute(
+    super::linker::durable_execute(
+        client,
         "insert into linker_id_imports(name,source_identity) values($1,$2) on conflict do nothing",
         &[&NAME, &&identity[..]],
     )?;
@@ -98,7 +100,7 @@ fn import_state(client: &mut Client, path: &Path) -> Result<()> {
             continue;
         }
         let f: Vec<_> = line.splitn(4, '\t').collect();
-        let mut tx = client.transaction()?;
+        let mut tx = super::linker::durable_transaction(client)?;
         tx.batch_execute("set local work_mem='4MB'")?;
         match f.as_slice() {
             ["L", a, b] => {
@@ -118,7 +120,7 @@ fn import_state(client: &mut Client, path: &Path) -> Result<()> {
         tx.execute("update linker_id_imports set offset_bytes=$2 where name=$1", &[&NAME, &index])?;
         tx.commit()?;
     }
-    client.execute("update linker_id_imports set complete=true where name=$1", &[&NAME])?;
+    super::linker::durable_execute(client, "update linker_id_imports set complete=true where name=$1", &[&NAME])?;
     Ok(())
 }
 

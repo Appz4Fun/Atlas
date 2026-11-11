@@ -28,10 +28,30 @@ pub(crate) struct Progress {
     pub complete: bool,
 }
 
-/// Stage one bounded page, preserving the rank of every original row. A source
-/// recreation is a different identity, and an identical prefix is safely read
-/// again: message deduplication happens later against immutable epoch ranking.
-/// Appends beyond the snapshot's count belong to a subsequent snapshot.
+/// A verified immutable block prefix. Retaining one mapping and digest avoids
+/// rehashing the entire block at each database page boundary. Recreated files
+/// and a different manifest entry cannot reuse this verification.
+pub(crate) struct VerifiedBlock {
+    pub(crate) identity: [u8; 32],
+    pub(crate) entry: Entry,
+    map: std::sync::Arc<memmap2::Mmap>,
+    digest: [u8; 32],
+}
+impl VerifiedBlock {
+    pub(crate) fn new(snapshot: &Snapshot, entry: Entry) -> Result<Self> {
+        ensure!((entry.seq as usize) < snapshot.count, "block is outside native linker snapshot");
+        let map = snapshot.map.as_ref().context("native linker snapshot has no mapping")?.clone();
+        let start = usize::try_from(entry.offset)?;
+        let end = start.checked_add(entry.len as usize).context("native linker block extent overflow")?;
+        let bytes = map.get(start..end).context("native linker source block is truncated")?;
+        let digest = Sha256::digest(bytes).into();
+        let view = NxvBlockView::from_mmap_slice(bytes).context("reading native linker source block")?;
+        ensure!(view.verify_body(), "native linker source block checksum failed");
+        Ok(Self { identity: snapshot.identity, entry, map, digest })
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn stage_block(
     client: &mut Client,
     snapshot: &Snapshot,
@@ -40,22 +60,29 @@ pub(crate) fn stage_block(
     entry: &Entry,
     budget: Budget,
 ) -> Result<Progress> {
+    stage_verified(client, &VerifiedBlock::new(snapshot, *entry)?, group, day, budget)
+}
+
+/// Stage one bounded page from a verified immutable block. A row checkpoint
+/// limits numeric prefix decoding independently of the durable row offset.
+pub(crate) fn stage_verified(
+    client: &mut Client,
+    block: &VerifiedBlock,
+    group: &str,
+    day: i64,
+    budget: Budget,
+) -> Result<Progress> {
     ensure!(budget.rows > 0 && budget.bytes > 0, "native linker staging budget must be positive");
-    ensure!((entry.seq as usize) < snapshot.count, "block is outside native linker snapshot");
-    let map = snapshot.map.as_ref().context("native linker snapshot has no mapping")?;
+    let entry = &block.entry;
     let start = usize::try_from(entry.offset)?;
     let end = start.checked_add(entry.len as usize).context("native linker block extent overflow")?;
-    let bytes = map.get(start..end).context("native linker source block is truncated")?;
-    let digest: [u8; 32] = Sha256::digest(bytes).into();
-    let view = NxvBlockView::from_mmap_slice(bytes).context("reading native linker source block")?;
-    ensure!(view.verify_body(), "native linker source block checksum failed");
-    let mut cursor = FieldCursor::new(view).context("opening native linker source cursor")?;
-    let mut tx = client.transaction()?;
+    let view = NxvBlockView::from_mmap_slice(&block.map[start..end]).context("reading verified native source block")?;
+    let mut tx = super::linker::durable_transaction(client)?;
     let source = tx.query_one(
         "insert into linker_source_blocks(group_name,day,generation,seq,digest,rows)
          values($1,$2,$3,$4,$5,$6) on conflict(group_name,day,generation,seq,digest)
          do update set rows=linker_source_blocks.rows returning id,scanned,complete,rows",
-        &[&group, &day, &&snapshot.identity[..], &(entry.seq as i64), &&digest[..], &(entry.rows as i64)],
+        &[&group, &day, &&block.identity[..], &(entry.seq as i64), &&block.digest[..], &(entry.rows as i64)],
     )?;
     let id: i64 = source.get(0);
     let before: i64 = source.get(1);
@@ -65,11 +92,10 @@ pub(crate) fn stage_block(
         tx.commit()?;
         return Ok(Progress { source: id, scanned: before, complete });
     }
-    // FieldCursor has no seek primitive. Re-reading the prefix after restart
-    // costs CPU, but retains no prefix rows and never repeats a committed page.
-    for _ in 0..before {
-        ensure!(cursor.next_row().is_some(), "native linker source ended before staged cursor");
-    }
+    // Resume from the format checkpoint: at most 128 numeric rows, with no
+    // committed-prefix strings reconstructed on normal pages or restart.
+    let mut cursor = FieldCursor::new_at_row(view, usize::try_from(before)?)
+        .context("opening native linker source cursor at durable offset")?;
     let mut scanned = before;
     let mut retained_bytes = 0usize;
     let mut read = 0usize;

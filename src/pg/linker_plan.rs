@@ -8,7 +8,7 @@ use postgres::{Client, Transaction};
 /// Copy active seeds in their legacy order, then widen them from late parts
 /// before fresh files are chained. Memberships stay normalized throughout.
 pub(crate) fn prepare(client: &mut Client, epoch: i64) -> Result<()> {
-    let mut tx = client.transaction()?;
+    let mut tx = super::linker::durable_transaction(client)?;
     tx.batch_execute("set local work_mem='4MB'")?;
     let state =
         tx.query_one("select phase,logical_now,seeds_prepared from linker_epochs where id=$1 for update", &[&epoch])?;
@@ -83,7 +83,7 @@ fn header(
 /// One late file is planned atomically in external SQL order, including its
 /// first-piece hints. Returns false when no late file remains.
 pub(crate) fn late_one(client: &mut Client, epoch: i64) -> Result<bool> {
-    let mut tx = client.transaction()?;
+    let mut tx = super::linker::durable_transaction(client)?;
     tx.batch_execute("set local work_mem='4MB'")?;
     let state = tx.query_one(
         "select phase,logical_now,next_plan_file,planned_rows from linker_epochs where id=$1 for update",
@@ -163,7 +163,7 @@ pub(crate) fn late_one(client: &mut Client, epoch: i64) -> Result<bool> {
 /// Plan one chained upload; return true when all plans are sealed for emission.
 /// A huge upload's ordering and metadata effects spill entirely in PostgreSQL.
 pub(crate) fn chain_one(client: &mut Client, epoch: i64) -> Result<bool> {
-    let mut tx = client.transaction()?;
+    let mut tx = super::linker::durable_transaction(client)?;
     tx.batch_execute("set local work_mem='4MB'")?;
     let state = tx.query_one(
         "select phase,logical_now,next_plan_file,planned_rows from linker_epochs where id=$1 for update",
@@ -330,7 +330,7 @@ pub(crate) fn chain_one(client: &mut Client, epoch: i64) -> Result<bool> {
 /// Commit metadata only after every immutable publication page was receipted.
 /// An ambiguous acknowledgement is safe to repeat; no file/part counters move.
 pub(crate) fn ack(client: &mut Client, epoch: i64) -> Result<()> {
-    let mut tx = client.transaction()?;
+    let mut tx = super::linker::durable_transaction(client)?;
     tx.batch_execute("set local work_mem='4MB'")?;
     let state =
         tx.query_one("select phase,emitted,planned_rows from linker_epochs where id=$1 for update", &[&epoch])?;
@@ -377,6 +377,44 @@ pub(crate) fn ack(client: &mut Client, epoch: i64) -> Result<()> {
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn delayed_file_remains_pending_until_its_whole_chain_is_ready() {
+        let Some(schema) = crate::pg::testing::Schema::new() else { return };
+        let mut c = schema.pool.get().unwrap();
+        let source:i64=c.query_one("insert into linker_source_blocks(group_name,day,generation,seq,digest,rows,scanned,complete) values('group.example',1,$1,0,$1,12,12,true) returning id",&[&&[1u8][..]]).unwrap().get(0);
+        for n in 1..=12i64 {
+            let message = format!("<delayed{n}@example.invalid>");
+            let key: [u8; 32] = Sha256::digest(message.as_bytes()).into();
+            let posted = if n <= 6 { 99000i64 } else { 103000 };
+            c.execute("insert into linker_staged_rows(source,ordinal,message_key,legacy_hash,message_id,poster,posted,group_id,article_number,bytes,lines) values($1,$2,$3,0,$4,$5,$6,1,$2,100,1)",&[&source,&n,&&key[..],&message.as_bytes(),&b"delayed@example.invalid".as_slice(),&posted]).unwrap();
+        }
+        for (hour, expected) in [(27i64, 0i64), (28, 12)] {
+            let epoch: i64 = c
+                .query_one("insert into linker_epochs(logical_now,phase) values(120000,'files') returning id", &[])
+                .unwrap()
+                .get(0);
+            c.execute("insert into linker_epoch_hours values($1,$2)", &[&epoch, &hour]).unwrap();
+            c.execute("insert into linker_selected_rows(epoch,source,source_ordinal,source_rank,again,is_new) select $1,source,ordinal,ordinal,false,true from linker_staged_rows where source=$2",&[&epoch,&source]).unwrap();
+            prepare(&mut c, epoch).unwrap();
+            super::super::linker_files::infer(&mut c, epoch).unwrap();
+            while !super::super::linker::plan_files(&mut c, epoch, 1).unwrap() {}
+            while !chain_one(&mut c, epoch).unwrap() {}
+            assert_eq!(
+                c.query_one("select count(*) from linker_emission_rows where epoch=$1", &[&epoch])
+                    .unwrap()
+                    .get::<_, i64>(0),
+                expected
+            );
+            let waiting = c
+                .query_one("select waiting_from from linker_epochs where id=$1", &[&epoch])
+                .unwrap()
+                .get::<_, Option<i64>>(0);
+            assert_eq!(waiting, if expected == 0 { Some(99000) } else { None });
+            c.execute("update linker_epochs set phase='ack',emitted=planned_rows where id=$1", &[&epoch]).unwrap();
+            ack(&mut c, epoch).unwrap();
+        }
+    }
 
     #[test]
     fn late_growth_and_fresh_seed_extension_share_one_generation() {

@@ -325,6 +325,8 @@ pub struct FieldCursor<'a> {
     window: (i64, i64),
     /// rows passed over for the window
     pub skipped: u64,
+    #[cfg(test)]
+    seek_decoded: usize,
 }
 
 impl<'a> FieldCursor<'a> {
@@ -343,7 +345,28 @@ impl<'a> FieldCursor<'a> {
             line: Vec::with_capacity(512),
             window: (i64::MIN, i64::MAX),
             skipped: 0,
+            #[cfg(test)]
+            seek_decoded: 0,
         })
+    }
+
+    /// Resume at a raw row ordinal using the format's 128-row checkpoints.
+    /// At most `SUB_BLOCK_ROWS` numeric rows are decoded to reach the offset;
+    /// skipped dictionary strings are not reconstructed. This bound applies
+    /// equally to ordinary page boundaries and process restart.
+    pub fn new_at_row(view: NxvBlockView<'a>, row: usize) -> Result<Self> {
+        anyhow::ensure!(row <= view.row_count(), "field cursor row out of range");
+        let mut cursor = Self::new(view)?;
+        let checkpoint = row.min(cursor.view.row_count().saturating_sub(1)) / SUB_BLOCK_ROWS;
+        cursor.dec = RowDecoder::at_sub_block(&cursor.view, checkpoint);
+        while cursor.dec.row < row {
+            cursor.dec.advance(&cursor.view, &cursor.h);
+            #[cfg(test)]
+            {
+                cursor.seek_decoded += 1;
+            }
+        }
+        Ok(cursor)
     }
 
     /// Only rows whose wall clock is in `from..=to` (rows kept literal always come, their date unread).
@@ -558,4 +581,30 @@ pub async fn stream_xover_range_tokio<W: AsyncWrite + Unpin>(
     writer: &mut W,
 ) -> Result<usize> {
     stream_xover_blocks_tokio(&[view], min_art, max_art, scratch, writer).await
+}
+
+#[cfg(test)]
+mod field_seek_tests {
+    use super::*;
+    use crate::container::{AlignedBytes, NxvBlockBuilder};
+    #[test]
+    fn field_cursor_seek_decodes_at_most_one_checkpoint_and_matches_sequential_rows() {
+        let lines = crate::corpus::generate_realistic_xover_corpus(513);
+        let refs: Vec<_> = lines.iter().map(Vec::as_slice).collect();
+        let block = AlignedBytes::from_slice(&NxvBlockBuilder::build_hot_block(&refs).unwrap());
+        let mut sequential = FieldCursor::new(NxvBlockView::from_mmap_slice(&block).unwrap()).unwrap();
+        for offset in 0..=513 {
+            let mut seek = FieldCursor::new_at_row(NxvBlockView::from_mmap_slice(&block).unwrap(), offset).unwrap();
+            assert!(seek.seek_decoded <= SUB_BLOCK_ROWS, "offset {offset} decoded {} prefix rows", seek.seek_decoded);
+            assert!(seek.cache.cached_author.is_empty(), "seek decoded skipped dictionary strings");
+            let expected = sequential.next_row().map(|r| {
+                (r.art, r.wall, r.subject.to_vec(), r.author.to_vec(), r.msgid.to_vec(), r.literal.map(<[u8]>::to_vec))
+            });
+            let actual = seek.next_row().map(|r| {
+                (r.art, r.wall, r.subject.to_vec(), r.author.to_vec(), r.msgid.to_vec(), r.literal.map(<[u8]>::to_vec))
+            });
+            assert_eq!(actual, expected, "resumed ordinal {offset}");
+        }
+        assert!(FieldCursor::new_at_row(NxvBlockView::from_mmap_slice(&block).unwrap(), 514).is_err());
+    }
 }

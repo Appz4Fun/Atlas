@@ -298,9 +298,19 @@ impl Drop for LinkerRetentionPin {
     }
 }
 
+/// A bounded metadata scan may return no segments while still advancing past
+/// empty groups. `after` records that progress independently of output rows.
+pub(crate) struct SegmentInventoryPage {
+    pub entries: Vec<(String, i64, usize)>,
+    pub after: Option<(String, i64)>,
+    pub complete: bool,
+    #[cfg(test)]
+    pub visited_groups: usize,
+}
+
 pub struct Store {
     cfg: StoreConfig,
-    groups: RwLock<HashMap<String, Arc<Group>>>,
+    groups: RwLock<BTreeMap<String, Arc<Group>>>,
     servers: Mutex<Vec<String>>,
     keep: RwLock<KeepSet>,
     shared: Arc<Shared>,
@@ -399,7 +409,7 @@ impl Store {
         let _ = super::sync::raise_open_files(65_536);
         let servers = read_servers(&cfg.root)?;
         let mut opened = Opened::default();
-        let mut groups = HashMap::new();
+        let mut groups = BTreeMap::new();
         let memory = Arc::new(Semaphore::new(cfg.memory_budget));
         let mut recovery = RecoveryOpen {
             memory: &memory,
@@ -838,35 +848,59 @@ impl Store {
     /// memory is proportional to `limit`, regardless of historical day count.
     /// An epoch must pin retention while inventory and source staging run.
     pub fn segment_page(&self, after: Option<(&str, i64)>, limit: usize) -> Vec<(String, i64, usize)> {
+        // Compatibility reader: callers historically stop at an empty result.
+        // Native staging/expiry use the bounded metadata continuation below.
+        self.segment_page_scan(after, limit, usize::MAX).entries
+    }
+
+    pub(crate) fn segment_inventory_page(&self, after: Option<(&str, i64)>, limit: usize) -> SegmentInventoryPage {
+        self.segment_page_scan(after, limit, limit)
+    }
+
+    fn segment_page_scan(&self, after: Option<(&str, i64)>, limit: usize, group_limit: usize) -> SegmentInventoryPage {
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+        let mut page = SegmentInventoryPage {
+            entries: Vec::with_capacity(limit),
+            after: after.map(|(g, d)| (g.to_owned(), d)),
+            complete: false,
+            #[cfg(test)]
+            visited_groups: 0,
+        };
         if limit == 0 {
-            return Vec::new();
+            return page;
         }
-        let mut page: BTreeMap<(String, i64), usize> = BTreeMap::new();
-        use std::ops::Bound::{Excluded, Unbounded};
-        for (name, g) in self.groups.read().unwrap_or_else(|e| e.into_inner()).iter() {
-            if after.is_some_and(|(group, _)| name.as_str() < group) {
-                continue;
+        let groups = self.groups.read().unwrap_or_else(|e| e.into_inner());
+        // MAX is a cursor for a fully visited group (including empty groups).
+        let lower = match after {
+            Some((g, i64::MAX)) => Excluded(g),
+            Some((g, _)) => Included(g),
+            None => Unbounded,
+        };
+        let mut groups = groups.range::<str, _>((lower, Unbounded));
+        for _ in 0..group_limit {
+            let Some((name, g)) = groups.next() else {
+                page.complete = true;
+                return page;
+            };
+            #[cfg(test)]
+            {
+                page.visited_groups += 1;
             }
             let lower = match after {
                 Some((group, day)) if group == name.as_str() => Excluded(day),
                 _ => Unbounded,
             };
             let segments = g.segments.read().unwrap_or_else(|e| e.into_inner());
-            // At most one page from each group's ordered manifest. A long
-            // history does not rescan all earlier days for every next page.
-            for (day, seg) in segments.range((lower, Unbounded)).take(limit) {
-                if page.len() == limit
-                    && page.last_key_value().is_some_and(|(k, _)| (name.as_str(), *day) >= (k.0.as_str(), k.1))
-                {
-                    continue;
-                }
-                page.insert((name.clone(), *day), seg.block_count());
-                if page.len() > limit {
-                    page.pop_last();
+            for (day, seg) in segments.range((lower, Unbounded)) {
+                page.entries.push((name.clone(), *day, seg.block_count()));
+                page.after = Some((name.clone(), *day));
+                if page.entries.len() == limit {
+                    return page;
                 }
             }
+            page.after = Some((name.clone(), i64::MAX));
         }
-        page.into_iter().map(|((g, d), n)| (g, d, n)).collect()
+        page
     }
 
     /// Pin one segment's published prefix without copying its manifest.
@@ -1120,9 +1154,9 @@ impl Store {
 
     fn covered_housekeeping(&self, coverage: &LinkerCoverage) {
         let after = self.coverage_cursor.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let page = self.segment_page(after.as_ref().map(|(g, d)| (g.as_str(), *d)), 64);
-        *self.coverage_cursor.lock().unwrap_or_else(|e| e.into_inner()) = page.last().map(|(g, d, _)| (g.clone(), *d));
-        for (name, day, _) in page {
+        let page = self.segment_inventory_page(after.as_ref().map(|(g, d)| (g.as_str(), *d)), 64);
+        *self.coverage_cursor.lock().unwrap_or_else(|e| e.into_inner()) = if page.complete { None } else { page.after };
+        for (name, day, _) in page.entries {
             let Some(snapshot) = self.segment_snapshot(&name, day) else { continue };
             snapshot.close_if_idle(self.cfg.writer_idle);
             if !self.expiry_armed.load(Ordering::Acquire)
@@ -1687,6 +1721,47 @@ mod tests {
         drop(store);
         let (again, _) = Store::open(cfg(dir.path()), keep_all()).unwrap();
         again.close().unwrap();
+    }
+
+    #[test]
+    fn bounded_inventory_advances_over_empty_groups_and_sparse_days() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = Store::open(cfg(dir.path()), keep_all()).unwrap();
+        for n in 0..25 {
+            let g = store.group(&format!("group{n:02}.example")).unwrap();
+            if n % 5 == 0 {
+                for day in [1, 1000, 100000] {
+                    let (seg, _) = Segment::open(&g.dir, day).unwrap();
+                    g.segments.write().unwrap().insert(day, seg);
+                }
+            }
+        }
+        let expected = store.segments();
+        let mut after = None;
+        let mut actual = Vec::new();
+        let mut visited = 0;
+        for turn in 0..100 {
+            assert!(turn < 99, "inventory cursor failed to advance");
+            let page = store.segment_inventory_page(after.as_ref().map(|(g, d): &(String, i64)| (g.as_str(), *d)), 3);
+            assert!(page.entries.len() <= 3 && page.visited_groups <= 3);
+            visited += page.visited_groups;
+            actual.extend(page.entries);
+            if page.complete {
+                break;
+            }
+            assert_ne!(page.after, after);
+            after = page.after;
+        }
+        assert_eq!(actual, expected);
+        assert!(visited <= 30, "revisited historical group prefixes: {visited}");
+        let first = store.segment_inventory_page(None, 3);
+        let g = store.group("before.example").unwrap();
+        let (seg, _) = Segment::open(&g.dir, 1).unwrap();
+        g.segments.write().unwrap().insert(1, seg);
+        let next = store.segment_inventory_page(first.after.as_ref().map(|(g, d)| (g.as_str(), *d)), 3);
+        assert!(next.entries.iter().all(|(g, _, _)| g != "before.example"));
+        assert_eq!(store.segment_inventory_page(None, 3).entries[0].0, "before.example");
+        store.close().unwrap();
     }
 
     #[test]

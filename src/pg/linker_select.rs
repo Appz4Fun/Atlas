@@ -11,7 +11,7 @@ use anyhow::{Result, ensure};
 use postgres::Client;
 
 pub(crate) fn select(client: &mut Client, epoch: i64) -> Result<()> {
-    let mut tx = client.transaction()?;
+    let mut tx = super::linker::durable_transaction(client)?;
     tx.batch_execute("set local work_mem='4MB'")?;
     let state = tx.query_one("select phase,logical_now,lo,hi from linker_epochs where id=$1 for update", &[&epoch])?;
     let phase: String = state.get(0);
@@ -54,7 +54,8 @@ pub(crate) fn select(client: &mut Client, epoch: i64) -> Result<()> {
 const CANDIDATES:&str="
 with eligible as (
  select s.source,s.ordinal,s.poster,s.message_key,s.message_id,b.group_name,b.day,b.seq,e.old_block,
-    (e.new_block or exists(select 1 from linker_epoch_hours h where h.epoch=$1 and h.hour=floor(s.posted::numeric/3600)::bigint)) as is_new
+    ((e.new_block and exists(select 1 from linker_linked_hours h where h.hour=floor(s.posted::numeric/3600)::bigint))
+      or exists(select 1 from linker_epoch_hours h where h.epoch=$1 and h.hour=floor(s.posted::numeric/3600)::bigint)) as is_new
  from linker_epoch_sources e join linker_source_blocks b on b.id=e.source join linker_staged_rows s on s.source=b.id
  where e.epoch=$1 and not s.published and (
     (e.old_block and s.posted between $2::bigint and $3::bigint) or
@@ -74,6 +75,54 @@ with eligible as (
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn legacy_priority_future_context_is_not_a_ready_late_part() {
+        let Some(schema) = crate::pg::testing::Schema::new() else { return };
+        let mut c = schema.pool.get().unwrap();
+        let epoch: i64 = c
+            .query_one(
+                "insert into linker_epochs(logical_now,phase,lo,hi) values(120000,'select',90000,111599) returning id",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        c.execute("insert into linker_epoch_hours values($1,27),($1,28)", &[&epoch]).unwrap();
+        c.batch_execute("insert into linker_linked_hours values(26)").unwrap();
+        let poster = b"placed@example.invalid".as_slice();
+        c.execute(
+            "insert into linker_places values($1,'xref-upload-generic','group.example',1,1,12,120000,120000)",
+            &[&poster],
+        )
+        .unwrap();
+        c.batch_execute(
+            "insert into linker_uploads values('xref-upload-generic','group.example',95400,95400,1,0,0,120000)",
+        )
+        .unwrap();
+        let source:i64=c.query_one("insert into linker_source_blocks(group_name,day,generation,seq,digest,rows,scanned,complete,legacy_priority) values('group.example',1,$1,0,$1,1,1,true,true) returning id",&[&&[1u8][..]]).unwrap().get(0);
+        c.execute("insert into linker_epoch_sources values($1,$2,true,true)", &[&epoch, &source]).unwrap();
+        let message = b"<future@example.invalid>".as_slice();
+        let key: [u8; 32] = Sha256::digest(message).into();
+        c.execute("insert into linker_staged_rows(source,ordinal,message_key,legacy_hash,message_id,poster,posted,group_id,article_number,bytes,lines) values($1,1,$2,0,$3,$4,104500,1,1,100,1)",&[&source,&&key[..],&message,&poster]).unwrap();
+        select(&mut c, epoch).unwrap();
+        assert_eq!(c.query_one("select count(*) from linker_late_rows", &[]).unwrap().get::<_, i64>(0), 0);
+        assert!(!c.query_one("select published from linker_staged_rows", &[]).unwrap().get::<_, bool>(0));
+        c.execute("update linker_epochs set phase='done' where id=$1", &[&epoch]).unwrap();
+        let next: i64 = c
+            .query_one(
+                "insert into linker_epochs(logical_now,phase,lo,hi) values(130000,'select',97200,115199) returning id",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        c.execute("insert into linker_epoch_hours values($1,29)", &[&next]).unwrap();
+        c.execute("insert into linker_epoch_sources values($1,$2,true,false)", &[&next, &source]).unwrap();
+        select(&mut c, next).unwrap();
+        assert_eq!(
+            c.query_one("select count(*) from linker_late_rows where epoch=$1", &[&next]).unwrap().get::<_, i64>(0),
+            1
+        );
+    }
 
     #[test]
     fn old_context_wins_cross_group_duplicate_and_future_rows_stay_pending() {

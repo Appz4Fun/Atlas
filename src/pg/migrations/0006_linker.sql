@@ -386,3 +386,24 @@ create index linker_late_plan_order on linker_late_files(epoch,encounter_rank) w
 create index linker_chain_plan_order on linker_chains(epoch,id) where not planned and file_count>0;
 create index linker_places_release_file on linker_places(release_name,file_number);
 create index linker_uploads_recent on linker_uploads(added);
+
+-- Completed bodies are disposed in bounded child-first pages. The last scalar
+-- epoch summary retains waiting_from for subsequent scope selection.
+alter table linker_epochs add column cleaned boolean not null default false;
+create index linker_cleanup_epochs on linker_epochs(id) where phase='done' and not cleaned;
+create index linker_published_rows on linker_staged_rows(source,ordinal) where published;
+
+-- Expired historical chains remain immutable output records, but leave the
+-- matching frontier permanently as sorted file starts advance.
+alter table linker_chains add column expired boolean not null default false;
+create index linker_pending_chains on linker_chains(epoch,first_posted,id desc)
+    where active_order is null and not expired;
+create index linker_active_chains on linker_chains(epoch,last_posted,first_posted)
+    where active_order is not null and not expired;
+
+-- Each continuation seeks directly past completed work; scalar LIMIT alone
+-- must not hide scans of all earlier blocks, release headers, or file parts.
+create index linker_unstaged_inventory on linker_epoch_inventory(epoch,group_name,day)
+    where scanned_blocks<blocks;
+create index linker_emission_header on linker_emission_files(epoch,release_name,group_name,id);
+create index linker_emission_file_rows on linker_emission_rows(epoch,file_id,part);

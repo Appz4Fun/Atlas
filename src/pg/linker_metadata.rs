@@ -211,7 +211,8 @@ pub(crate) fn import(client: &mut Client, dir: &Path, now: i64) -> Result<()> {
     digest.update(metadata.mtime().to_le_bytes());
     digest.update(metadata.mtime_nsec().to_le_bytes());
     let identity: [u8; 32] = digest.finalize().into();
-    client.execute(
+    super::linker::durable_execute(
+        client,
         "insert into linker_id_imports(name,source_identity) values($1,$2) on conflict do nothing",
         &[&NAME, &&identity[..]],
     )?;
@@ -239,13 +240,14 @@ pub(crate) fn import(client: &mut Client, dir: &Path, now: i64) -> Result<()> {
             if !matches!(tag, Some(b'F' | b'U' | b'P')) || record.byte()? != Some(b'\t') {
                 record.skip()?;
                 // No identifiers are buffered even for a giant I line.
-                client.execute(
+                super::linker::durable_execute(
+                    client,
                     "update linker_id_imports set offset_bytes=$2 where name=$1",
                     &[&NAME, &i64::try_from(offset)?],
                 )?;
                 continue;
             }
-            let mut tx = client.transaction()?;
+            let mut tx = super::linker::durable_transaction(client)?;
             let valid = match tag {
                 Some(b'F') => placement(&mut tx, &mut record)?,
                 Some(b'U') => upload(&mut tx, &mut record)?,
@@ -260,7 +262,8 @@ pub(crate) fn import(client: &mut Client, dir: &Path, now: i64) -> Result<()> {
                 tx.commit()?;
             } else {
                 tx.rollback()?;
-                client.execute(
+                super::linker::durable_execute(
+                    client,
                     "update linker_id_imports set offset_bytes=$2 where name=$1",
                     &[&NAME, &i64::try_from(offset)?],
                 )?;
@@ -268,7 +271,7 @@ pub(crate) fn import(client: &mut Client, dir: &Path, now: i64) -> Result<()> {
         }
     }
     let before = now.saturating_sub(8 * crate::xref::KEEP_SECS);
-    let mut tx = client.transaction()?;
+    let mut tx = super::linker::durable_transaction(client)?;
     tx.execute("delete from linker_places where added<$1", &[&before])?;
     tx.execute("delete from linker_uploads where added<$1", &[&before])?;
     tx.execute("update linker_id_imports set complete=true where name=$1", &[&NAME])?;

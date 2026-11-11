@@ -91,7 +91,7 @@ fn page(client: &mut Client, epoch: i64, budget: Budget) -> Result<Page> {
 }
 
 fn receipt(client: &mut Client, epoch: i64, before: i64, through: i64, finished: bool) -> Result<()> {
-    let mut tx = client.transaction()?;
+    let mut tx = super::linker::durable_transaction(client)?;
     let state =
         tx.query_one("select emitted,logical_now,phase from linker_epochs where id=$1 for update", &[&epoch])?;
     let current: i64 = state.get(0);

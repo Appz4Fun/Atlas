@@ -13,7 +13,7 @@ const MARGIN: i64 = 2 * HOUR;
 /// Resume the only incomplete epoch, or allocate a frozen logical clock for a
 /// new one. Called only on the fenced ownership session.
 pub(crate) fn open(client: &mut Client, now: i64) -> Result<i64> {
-    let mut tx = client.transaction()?;
+    let mut tx = super::linker::durable_transaction(client)?;
     tx.batch_execute("set local work_mem='4MB'")?;
     if let Some(row) = tx.query_opt("select id from linker_epochs where phase<>'done' order by id limit 1", &[])? {
         return Ok(row.get(0));
@@ -59,7 +59,7 @@ fn ready(tx: &mut Transaction<'_>, hour: i64, now: i64) -> Result<bool> {
 /// materializing historical day/hour sets. Returns false when no work is ready.
 /// Inventory and all its source blocks must already be durably staged.
 pub(crate) fn scope(client: &mut Client, epoch: i64) -> Result<bool> {
-    let mut tx = client.transaction()?;
+    let mut tx = super::linker::durable_transaction(client)?;
     tx.batch_execute("set local work_mem='4MB'")?;
     let state =
         tx.query_one("select phase,logical_now,inventory_sealed from linker_epochs where id=$1 for update", &[&epoch])?;
@@ -114,8 +114,9 @@ pub(crate) fn scope(client: &mut Client, epoch: i64) -> Result<bool> {
     }
     let waiting: Option<i64> = tx
         .query_opt(
-            "select coalesce((select waiting_from from linker_epochs where id<$1 and phase='done' order by id desc limit 1),
-                 (select waiting_from from linker_bootstrap where singleton))",
+            "select case when exists(select 1 from linker_epochs where id<$1 and phase='done')
+                 then (select waiting_from from linker_epochs where id<$1 and phase='done' order by id desc limit 1)
+                 else (select waiting_from from linker_bootstrap where singleton) end",
             &[&epoch],
         )?
         .and_then(|r| r.get(0));
@@ -163,6 +164,26 @@ pub(crate) fn scope(client: &mut Client, epoch: i64) -> Result<bool> {
 mod tests {
     use super::*;
     use std::collections::{BTreeMap, HashSet};
+
+    #[test]
+    fn cleared_waiting_summary_does_not_revive_bootstrap_delay() {
+        let Some(schema) = crate::pg::testing::Schema::new() else { return };
+        let mut c = schema.pool.get().unwrap();
+        c.batch_execute(
+            "insert into linker_bootstrap(singleton,logical_now,waiting_from) values(true,100000,90000);
+            insert into linker_epochs(logical_now,phase,waiting_from) values(100000,'done',null)",
+        )
+        .unwrap();
+        let epoch = open(&mut c, 200000).unwrap();
+        c.execute("update linker_epochs set inventory_sealed=true where id=$1", &[&epoch]).unwrap();
+        assert!(!scope(&mut c, epoch).unwrap());
+        assert_eq!(
+            c.query_one("select waiting_from from linker_epochs where id=$1", &[&epoch])
+                .unwrap()
+                .get::<_, Option<i64>>(0),
+            None
+        );
+    }
 
     #[test]
     fn epoch_scope_uses_frozen_inventory_and_three_hour_span() {

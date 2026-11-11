@@ -6,6 +6,26 @@
 use anyhow::{Context, Result, ensure};
 use postgres::Client;
 
+/// Coverage/publication receipts must survive a database restart before raw
+/// expiry can observe them, even when role/database/URL defaults disable WAL
+/// flush on commit. Keep this fence local to each transaction.
+pub(crate) fn durable_transaction(client: &mut Client) -> Result<postgres::Transaction<'_>> {
+    let mut tx = client.transaction()?;
+    tx.batch_execute("set local synchronous_commit=on")?;
+    Ok(tx)
+}
+
+pub(crate) fn durable_execute(
+    client: &mut Client,
+    query: &str,
+    params: &[&(dyn postgres::types::ToSql + Sync)],
+) -> Result<u64> {
+    let mut tx = durable_transaction(client)?;
+    let changed = tx.execute(query, params)?;
+    tx.commit()?;
+    Ok(changed)
+}
+
 /// Plan at most `budget` files. `true` means every staged file is assigned.
 /// Call only on the ownership session. Staging must finish before phase chain;
 /// the epoch's files and initial seeds are immutable from that point onward.
@@ -20,7 +40,7 @@ pub(crate) fn plan_files(client: &mut Client, epoch: i64, budget: usize) -> Resu
 }
 
 fn plan_one(client: &mut Client, epoch: i64) -> Result<bool> {
-    let mut tx = client.transaction()?;
+    let mut tx = durable_transaction(client)?;
     tx.batch_execute("set local work_mem='4MB'")?;
     let state = tx
         .query_one("select phase,active_serial,next_chain from linker_epochs where id=$1 for update", &[&epoch])
@@ -52,16 +72,16 @@ fn plan_one(client: &mut Client, epoch: i64) -> Result<bool> {
     // Seeds with the same start therefore activate in reverse seed order.
     // Keep activation order separate from chain order: same chooses the LAST
     // maximum, while within/read-since choose the FIRST minimum.
-    tx.execute(
+    let entered = tx.execute(
         "with entering as (
             select id,$3+row_number() over(order by first_posted,id desc) as ord
-            from linker_chains where epoch=$1 and active_order is null and first_posted<=$2
+            from linker_chains where epoch=$1 and active_order is null and not expired and first_posted<=$2
          ) update linker_chains c set active_order=e.ord from entering e where c.epoch=$1 and c.id=e.id",
         &[&epoch, &first.saturating_add(gap), &serial],
     )?;
-    let serial: i64 = tx
-        .query_one("select coalesce(max(active_order),$2) from linker_chains where epoch=$1", &[&epoch, &serial])?
-        .get(0);
+    let serial = serial.checked_add(i64::try_from(entered)?).context("native chain activation counter overflow")?;
+    tx.execute("update linker_chains set expired=true where epoch=$1 and active_order is not null and not expired and last_posted<$2",
+        &[&epoch,&first.saturating_sub(gap)])?;
     let pick = if articles == 1 {
         None
     } else {
@@ -115,8 +135,8 @@ const PICK: &str = "
 with candidates as (
  select c.*,
    (select count(*) from linker_chain_groups g where g.epoch=c.epoch and g.chain_id=c.id and g.kind=0) as groups
- from linker_chains c where c.epoch=$1 and c.active_order is not null
- and $3>=c.first_posted-$4 and $3<=c.last_posted+$4
+ from linker_chains c where c.epoch=$1 and c.active_order is not null and not c.expired
+ and c.first_posted<=$3::bigint+$4::bigint and c.last_posted>=$3::bigint-$4::bigint
 ), choices as (
  select id,0 as priority,-last_posted as a,case when index_only then 0 else 1 end::bigint as b,-active_order as d
  from candidates c where
@@ -270,6 +290,70 @@ mod tests {
                     .unwrap();
             assert_eq!((sync_pid, async_pid), (owner_pid, owner_pid));
         });
+    }
+
+    #[test]
+    fn durable_transactions_override_async_commit_and_flush_staged_wal() {
+        let Some(schema) = crate::pg::testing::Schema::new() else { return };
+        let mut c = schema.pool.get().unwrap();
+        c.batch_execute("set synchronous_commit=off").unwrap();
+        let mut tx = durable_transaction(&mut c).unwrap();
+        assert_eq!(tx.query_one("show synchronous_commit", &[]).unwrap().get::<_, String>(0), "on");
+        tx.execute("insert into meta(key,value) values('linker-durability-fixture',1)", &[]).unwrap();
+        let lsn: String = tx.query_one("select pg_current_wal_insert_lsn()::text", &[]).unwrap().get(0);
+        tx.commit().unwrap();
+        assert!(c.query_one("select pg_current_wal_flush_lsn()>=$1::text::pg_lsn", &[&lsn]).unwrap().get::<_, bool>(0));
+        assert_eq!(c.query_one("show synchronous_commit", &[]).unwrap().get::<_, String>(0), "off");
+        c.batch_execute("create function require_durable_linker() returns trigger language plpgsql as $$ begin
+            if current_setting('synchronous_commit') <> 'on' then raise exception 'asynchronous linker receipt'; end if; return new; end $$;
+            create trigger require_durable_linker before insert or update on linker_epochs for each row execute function require_durable_linker()").unwrap();
+        let epoch = super::super::linker_epoch::open(&mut c, 100000).unwrap();
+        durable_execute(&mut c, "update linker_epochs set inventory_sealed=true where id=$1", &[&epoch]).unwrap();
+        assert!(!super::super::linker_epoch::scope(&mut c, epoch).unwrap());
+    }
+
+    #[test]
+    fn historical_chains_leave_the_indexed_matching_frontier() {
+        let Some(schema) = crate::pg::testing::Schema::new() else { return };
+        let mut c = schema.pool.get().unwrap();
+        let epoch:i64=c.query_one("insert into linker_epochs(logical_now,phase,active_serial,next_chain) values(100000,'chain',10000,10000) returning id",&[]).unwrap().get(0);
+        c.execute("insert into linker_chains(epoch,id,first_posted,last_posted,index_only,active_order) select $1,n,0,0,false,n+1 from generate_series(0,9999) n",&[&epoch]).unwrap();
+        c.execute("insert into linker_files(epoch,id,poster,articles,first_posted,last_posted) values($1,0,$2,10,100000,100000),($1,1,$3,10,200000,200000)",&[&epoch,&b"one@example.invalid".as_slice(),&b"two@example.invalid".as_slice()]).unwrap();
+        c.execute("insert into linker_file_groups values($1,0,1),($1,1,1)", &[&epoch]).unwrap();
+        assert!(!plan_files(&mut c, epoch, 1).unwrap());
+        assert_eq!(
+            c.query_one(
+                "select count(*) from linker_chains where epoch=$1 and not expired and active_order is not null",
+                &[&epoch]
+            )
+            .unwrap()
+            .get::<_, i64>(0),
+            1
+        );
+        c.batch_execute("analyze linker_chains; analyze linker_chain_groups; analyze linker_file_groups").unwrap();
+        let explain = c
+            .query(
+                &format!("explain (analyze,buffers,format text) {PICK}"),
+                &[&epoch, &1i64, &200000i64, &crate::xref::GAP_SECS],
+            )
+            .unwrap();
+        let plan = explain.iter().map(|r| r.get::<_, String>(0)).collect::<Vec<_>>().join("\n");
+        assert!(plan.contains("linker_active_chains"), "matching did not use bounded frontier: {plan}");
+        assert!(!plan.contains("Seq Scan on linker_chains"), "matching scanned expired history: {plan}");
+        assert!(!plan_files(&mut c, epoch, 1).unwrap());
+        assert_eq!(
+            c.query_one("select active_serial from linker_epochs where id=$1", &[&epoch]).unwrap().get::<_, i64>(0),
+            10002
+        );
+        assert_eq!(
+            c.query_one(
+                "select count(*) from linker_chains where epoch=$1 and not expired and active_order is not null",
+                &[&epoch]
+            )
+            .unwrap()
+            .get::<_, i64>(0),
+            1
+        );
     }
 
     #[test]

@@ -10,7 +10,7 @@ use postgres::Client;
 /// only a previously placed poster's later material splits at JOIN_GAP.
 /// Source rank is its original old-block-before-late encounter order.
 pub(crate) fn infer(client: &mut Client, epoch: i64) -> Result<()> {
-    let mut tx = client.transaction()?;
+    let mut tx = super::linker::durable_transaction(client)?;
     tx.batch_execute("set local work_mem='4MB'")?;
     let phase: String = tx.query_one("select phase from linker_epochs where id=$1 for update", &[&epoch])?.get(0);
     if phase != "files" {

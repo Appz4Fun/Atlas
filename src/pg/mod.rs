@@ -18,6 +18,7 @@ mod linker_bootstrap;
 mod linker_emit;
 mod linker_epoch;
 mod linker_files;
+mod linker_gc;
 mod linker_ids;
 mod linker_legacy;
 mod linker_metadata;

@@ -11,10 +11,16 @@ use std::time::Duration;
 
 const INVENTORY_PAGE: usize = 32;
 
+#[derive(Default)]
+pub(crate) struct Cache {
+    block: Option<super::linker_stage::VerifiedBlock>,
+    pub(crate) verifications: u64,
+}
+
 /// Advance one barrier, inventory or NXV row page. True means staging is
 /// complete, including exact block source identities. Safe to retry after any
 /// ambiguous commit; the persisted high-watermarks never widen on replay.
-pub(crate) async fn step(db: &Db, store: &Arc<Store>, epoch: i64, budget: Budget) -> Result<bool> {
+pub(crate) async fn step(db: &Db, store: &Arc<Store>, epoch: i64, budget: Budget, cache: &mut Cache) -> Result<bool> {
     let state = on_native_db(db, move |c| {
         let r = c.query_one(
             "select phase,logical_now,flush_complete,flush_after_day,inventory_sealed,
@@ -39,13 +45,21 @@ pub(crate) async fn step(db: &Db, store: &Arc<Store>, epoch: i64, budget: Budget
             let source = Arc::clone(store);
             tokio::task::spawn_blocking(move || source.flush_days(&days, Duration::from_secs(300))).await??;
             on_native_db(db, move |c| {
-                c.execute("update linker_epochs set flush_after_day=$2 where id=$1", &[&epoch, &last])?;
+                super::linker::durable_execute(
+                    c,
+                    "update linker_epochs set flush_after_day=$2 where id=$1",
+                    &[&epoch, &last],
+                )?;
                 Ok(())
             })
             .await?;
         } else {
             on_native_db(db, move |c| {
-                c.execute("update linker_epochs set flush_complete=true where id=$1", &[&epoch])?;
+                super::linker::durable_execute(
+                    c,
+                    "update linker_epochs set flush_complete=true where id=$1",
+                    &[&epoch],
+                )?;
                 Ok(())
             })
             .await?;
@@ -54,16 +68,16 @@ pub(crate) async fn step(db: &Db, store: &Arc<Store>, epoch: i64, budget: Budget
     }
     if !state.4 {
         let after = state.5.as_deref().zip(state.6);
-        let page = store.segment_page(after, INVENTORY_PAGE);
-        let mut captured = Vec::with_capacity(page.len());
-        for (group, day, _) in page {
+        let page = store.segment_inventory_page(after, INVENTORY_PAGE);
+        let mut captured = Vec::with_capacity(page.entries.len());
+        for (group, day, _) in page.entries {
             let snapshot =
                 store.segment_snapshot(&group, day).context("native source disappeared while retention was pinned")?;
             captured.push((group, day, snapshot.identity, i64::try_from(snapshot.count)?));
         }
         let now = state.1;
         on_native_db(db, move |c| {
-            let mut tx = c.transaction()?;
+            let mut tx = super::linker::durable_transaction(c)?;
             let reconcile: bool = tx
                 .query_one(
                     "select coalesce((select not counts_reconciled from linker_bootstrap where singleton),false)",
@@ -90,13 +104,13 @@ pub(crate) async fn step(db: &Db, store: &Arc<Store>, epoch: i64, budget: Budget
                     tx.execute("insert into linker_day_seen values($1,$2) on conflict do nothing", &[day, &now])?;
                 }
             }
-            if let Some((group, day, _, _)) = captured.last() {
+            if let Some((group, day)) = &page.after {
                 tx.execute(
                     "update linker_epochs set inventory_after_group=$2,inventory_after_day=$3 where id=$1",
                     &[&epoch, group, day],
                 )?;
             }
-            if captured.len() < INVENTORY_PAGE {
+            if page.complete {
                 tx.execute("update linker_epochs set inventory_sealed=true where id=$1", &[&epoch])?;
                 tx.execute("update linker_bootstrap set counts_reconciled=true where singleton", &[])?;
             }
@@ -124,7 +138,10 @@ pub(crate) async fn step(db: &Db, store: &Arc<Store>, epoch: i64, budget: Budget
         }))
     })
     .await?;
-    let Some((group, day, generation, blocks, index, legacy)) = next else { return Ok(true) };
+    let Some((group, day, generation, blocks, index, legacy)) = next else {
+        cache.block = None;
+        return Ok(true);
+    };
     let snapshot =
         store.segment_snapshot(&group, day).context("native source disappeared before durable staging completed")?;
     ensure!(
@@ -138,17 +155,30 @@ pub(crate) async fn step(db: &Db, store: &Arc<Store>, epoch: i64, budget: Budget
         .next()
         .context("native source manifest entry missing")?;
     ensure!(entry.seq as i64 == index, "native source manifest sequence changed");
-    on_native_db(db,move|c| {
-        let progress=super::linker_stage::stage_block(c,&snapshot,&group,day,&entry,budget)?;
-        if progress.complete {
-            let mut tx=c.transaction()?;
-            tx.execute("insert into linker_inventory_blocks values($1,$2,$3,$4,$5) on conflict do nothing",&[&epoch,&group,&day,&index,&progress.source])?;
-            if index<legacy {tx.execute("update linker_source_blocks set legacy_priority=true where id=$1",&[&progress.source])?;}
-            tx.execute("update linker_epoch_inventory set scanned_blocks=$4+1 where epoch=$1 and group_name=$2 and day=$3 and scanned_blocks=$4",
-                &[&epoch,&group,&day,&index])?;
-            tx.commit()?;
-        }
-        Ok(())
+    let prior = cache.block.take();
+    let (verified,fresh,result)=on_native_db(db,move|c| {
+        let (verified,fresh)=match prior {
+            Some(block) if block.identity==snapshot.identity && block.entry==entry => (block,false),
+            _=>(super::linker_stage::VerifiedBlock::new(&snapshot,entry)?,true),
+        };
+        let result=(||->Result<()> {
+            let progress=super::linker_stage::stage_verified(c,&verified,&group,day,budget)?;
+            ensure!(progress.scanned<=i64::from(entry.rows),"native source cursor exceeds manifest rows");
+            if progress.complete {
+                ensure!(progress.scanned==i64::from(entry.rows),"native completed source cursor differs from manifest rows");
+                let mut tx=super::linker::durable_transaction(c)?;
+                tx.execute("insert into linker_inventory_blocks values($1,$2,$3,$4,$5) on conflict do nothing",&[&epoch,&group,&day,&index,&progress.source])?;
+                if index<legacy {tx.execute("update linker_source_blocks set legacy_priority=true where id=$1",&[&progress.source])?;}
+                tx.execute("update linker_epoch_inventory set scanned_blocks=$4+1 where epoch=$1 and group_name=$2 and day=$3 and scanned_blocks=$4",
+                    &[&epoch,&group,&day,&index])?;
+                tx.commit()?;
+            }
+            Ok(())
+        })();
+        Ok((verified,fresh,result))
     }).await?;
+    cache.block = Some(verified);
+    cache.verifications += u64::from(fresh);
+    result?;
     Ok(false)
 }
