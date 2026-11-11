@@ -60,6 +60,9 @@ fn xref_heads<'a>(
     ctx: &StepCtx<'_>,
     files: &'a [FileInfo],
 ) -> Result<(Vec<(Head<'a>, SegmentRef)>, Option<(i64, i64)>, bool), StepError> {
+    if crate::pg::linker_runtime::active() {
+        return Err(retry("native archive lead traversal requires the durable probe-window port"));
+    }
     let volumes = select::volumes(files);
     let name = ctx.release().name.clone();
     let tried = crate::xref::tried(&name);

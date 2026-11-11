@@ -14,6 +14,7 @@ const MARGIN: i64 = 2 * HOUR;
 /// new one. Called only on the fenced ownership session.
 pub(crate) fn open(client: &mut Client, now: i64) -> Result<i64> {
     let mut tx = client.transaction()?;
+    tx.batch_execute("set local work_mem='4MB'")?;
     if let Some(row) = tx.query_opt("select id from linker_epochs where phase<>'done' order by id limit 1", &[])? {
         return Ok(row.get(0));
     }

@@ -107,7 +107,12 @@ fn receipt(client: &mut Client, epoch: i64, before: i64, through: i64, finished:
         join linker_linked_ids i on i.message_key=s.message_key
         where e.epoch=$1 and e.ordinal>$2 and e.ordinal<=$3 and i.message_id<>s.message_id)",
         &[&epoch,&before,&through])?.get(0);
-    ensure!(!conflict, "native linker message identity digest collision");
+    let page_conflict:bool=tx.query_one("select exists(
+        select s.message_key from linker_emission_rows e
+        join linker_staged_rows s on s.source=e.source and s.ordinal=e.source_ordinal
+        where e.epoch=$1 and e.ordinal>$2 and e.ordinal<=$3 group by s.message_key having count(distinct s.message_id)>1)",
+        &[&epoch,&before,&through])?.get(0);
+    ensure!(!conflict && !page_conflict, "native linker message identity digest collision");
     tx.execute(
         "insert into linker_linked_ids(message_key,message_id,added)
         select distinct on(s.message_key) s.message_key,s.message_id,$4 from linker_emission_rows e
@@ -226,4 +231,9 @@ mod tests {
         assert_eq!(remembered, 3);
         assert!(page(&mut c, epoch, budget).unwrap().finished);
     }
+}
+
+#[cfg(test)]
+pub(super) fn test_page(client: &mut Client, epoch: i64, budget: Budget) -> Result<Vec<Release>> {
+    Ok(page(client, epoch, budget)?.releases)
 }

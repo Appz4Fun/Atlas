@@ -298,3 +298,91 @@ create table linker_bootstrap (
     counts_reconciled boolean not null default false,
     waiting_from bigint
 );
+alter table linker_epochs add column flush_after_day bigint;
+alter table linker_epochs add column flush_complete boolean not null default false;
+alter table linker_epochs add column inventory_after_group text;
+alter table linker_epochs add column inventory_after_day bigint;
+alter table linker_epochs add column seeds_prepared boolean not null default false;
+alter table linker_epochs add column next_plan_file bigint not null default 0;
+alter table linker_epochs add column planned_rows bigint not null default 0;
+alter table linker_chains add column planned boolean not null default false;
+create table linker_epoch_seeds (
+    epoch bigint not null references linker_epochs(id) on delete cascade,
+    id bigint not null,
+    release_name text not null,
+    group_name text not null,
+    first_posted bigint not null,
+    last_posted bigint not null,
+    files bigint not null,
+    generation bigint not null,
+    grown boolean not null default false,
+    primary key(epoch,id),
+    unique(epoch,release_name)
+);
+create table linker_seed_groups (
+    epoch bigint not null,
+    seed bigint not null,
+    group_id bigint not null,
+    primary key(epoch,seed,group_id),
+    foreign key(epoch,seed) references linker_epoch_seeds(epoch,id) on delete cascade
+);
+create table linker_late_files (
+    epoch bigint not null references linker_epochs(id) on delete cascade,
+    poster bytea not null,
+    encounter_rank bigint not null,
+    articles bigint not null,
+    planned boolean not null default false,
+    primary key(epoch,poster)
+);
+create table linker_planned_places (
+    epoch bigint not null references linker_epochs(id) on delete cascade,
+    poster bytea not null,
+    plan_file bigint not null,
+    release_name text not null,
+    group_name text not null,
+    file_number bigint not null,
+    file_total bigint not null,
+    parts bigint not null,
+    oldest bigint not null,
+    added bigint not null,
+    primary key(epoch,poster)
+);
+create table linker_planned_firsts (
+    epoch bigint not null,
+    poster bytea not null,
+    group_id bigint not null,
+    article_number bigint not null,
+    primary key(epoch,poster,group_id),
+    foreign key(epoch,poster) references linker_planned_places(epoch,poster) on delete cascade
+);
+create table linker_planned_leads (
+    epoch bigint not null,
+    poster bytea not null,
+    ordinal bigint not null,
+    part bigint not null,
+    primary key(epoch,poster,ordinal),
+    foreign key(epoch,poster) references linker_planned_places(epoch,poster) on delete cascade
+);
+create table linker_planned_uploads (
+    epoch bigint not null references linker_epochs(id) on delete cascade,
+    release_name text not null,
+    group_name text not null,
+    first_posted bigint not null,
+    last_posted bigint not null,
+    files bigint not null,
+    generation bigint not null,
+    probed bigint not null,
+    added bigint not null,
+    primary key(epoch,release_name)
+);
+create table linker_planned_upload_groups (
+    epoch bigint not null,
+    release_name text not null,
+    group_id bigint not null,
+    primary key(epoch,release_name,group_id),
+    foreign key(epoch,release_name) references linker_planned_uploads(epoch,release_name) on delete cascade
+);
+create index linker_late_plan_order on linker_late_files(epoch,encounter_rank) where not planned;
+create index linker_chain_plan_order on linker_chains(epoch,id) where not planned and file_count>0;
+create index linker_places_release_file on linker_places(release_name,file_number);
+create index linker_uploads_recent on linker_uploads(added);

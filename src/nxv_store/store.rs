@@ -886,6 +886,36 @@ impl Store {
         out
     }
 
+    /// A bounded page of still-open days for a native staging barrier.
+    pub fn open_days_page(&self, after: Option<i64>, limit: usize) -> Vec<i64> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut days = BTreeSet::new();
+        for g in self.groups.read().unwrap_or_else(|e| e.into_inner()).values() {
+            let slabs = g.slabs.lock().unwrap_or_else(|e| e.into_inner());
+            for slab in slabs.open.values().chain(slabs.full.iter()).filter(|s| !s.is_empty()) {
+                if after.is_some_and(|d| slab.day <= d) {
+                    continue;
+                }
+                days.insert(slab.day);
+                if days.len() > limit {
+                    days.pop_last();
+                }
+            }
+        }
+        for &day in self.shared.inflight.lock().unwrap_or_else(|e| e.into_inner()).values() {
+            if after.is_some_and(|d| day <= d) {
+                continue;
+            }
+            days.insert(day);
+            if days.len() > limit {
+                days.pop_last();
+            }
+        }
+        days.into_iter().collect()
+    }
+
     /// The published blocks of `group`'s segment of `day`, with the map they point into.
     pub fn day_blocks(&self, group: &str, day: i64) -> (Option<Arc<memmap2::Mmap>>, Vec<Entry>) {
         let Some(g) = self.groups.read().unwrap_or_else(|e| e.into_inner()).get(group).cloned() else {
