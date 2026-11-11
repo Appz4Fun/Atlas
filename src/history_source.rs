@@ -249,6 +249,22 @@ fn check_columns(conn: &Connection, table: &str, allowed: &[Column], optional: &
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     ensure!(!found.is_empty() && found.len() <= allowed.len(), "UnsupportedSchema: missing/extra catalog columns");
+    let (kind, without_rowid): (String, i64) =
+        conn.query_row("select type,wr from pragma_table_list where schema='main' and name=?1", [table], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
+    ensure!(
+        kind == "table" && found.iter().filter(|(_, pk, _, _)| *pk > 0).count() == 1,
+        "UnsupportedSchema: catalog requires one original primary key"
+    );
+    if table == "releases" || table == "frozen_releases" {
+        let indexed_pk: bool =
+            conn.query_row("select exists(select 1 from pragma_index_list(?1) where origin='pk')", [table], |r| {
+                r.get(0)
+            })?;
+        ensure!(without_rowid == 0 && !indexed_pk, "UnsupportedSchema: release cells require an integer rowid alias");
+    }
+
     let mut cols = Vec::new();
     for (name, pk, hidden, declared) in &found {
         ensure!(*hidden == 0, "UnsupportedSchema: generated catalog column");
@@ -806,6 +822,18 @@ pub(crate) mod tests {
         // later cases exercise paired files and all bounded cursor operations.
         (dir, m)
     }
+    #[test]
+    fn rejects_release_tables_without_incremental_rowids() {
+        let (_dir, mut m) = fixture();
+        let current = m.files.iter().find(|f| f.kind == SourceKind::Current).unwrap();
+        let c = Connection::open(&current.path).unwrap();
+        let sql: String = c.query_row("select sql from sqlite_schema where name='releases'", [], |r| r.get(0)).unwrap();
+        c.execute_batch(&format!("drop table releases;{sql} without rowid")).unwrap();
+        drop(c);
+        refresh(&mut m);
+        assert!(Source::open(m, 1 << 20).is_err(), "release cells require a validated incremental rowid table");
+    }
+
     #[test]
     fn opens_an_explicit_readonly_checkpoint() {
         let (_dir, m) = fixture();

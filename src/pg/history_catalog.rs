@@ -77,10 +77,16 @@ pub struct ReadProgress {
     pub rows: u64,
     pub complete: bool,
 }
+#[derive(Clone, Copy, Default, Debug)]
+pub struct ReadStats {
+    pub payload_bytes: u64,
+    pub max_payload_bytes: usize,
+}
 pub struct Snapshot<'a> {
     tx: postgres::Transaction<'a>,
     id: ImportId,
     pub gate_version: i64,
+    stats: ReadStats,
 }
 impl<'a> Snapshot<'a> {
     pub fn open(client: &'a mut postgres::Client, id: ImportId) -> Result<Self> {
@@ -96,7 +102,10 @@ impl<'a> Snapshot<'a> {
                 && row.get::<_, Option<Vec<u8>>>(3).is_some_and(|d| d.len() == 32),
             "IncompleteImport: internal inspection requires identity_ready"
         );
-        Ok(Self { tx, id, gate_version: row.get(1) })
+        Ok(Self { tx, id, gate_version: row.get(1), stats: Default::default() })
+    }
+    pub fn stats(&self) -> ReadStats {
+        self.stats
     }
     pub fn object(&mut self, id: i64) -> Result<ObjectHandle> {
         let row=self.tx.query_opt("select source_id,scope_release_id,object_kind,byte_length,digest,validated from history_objects where import_id=$1 and object_id=$2",&[&&self.id[..],&id])?.context("CorruptObject: referenced object is absent")?;
@@ -114,7 +123,7 @@ impl<'a> Snapshot<'a> {
             digest,
         })
     }
-    fn metadata(&mut self, object: i64, source: i64, key: i64, budget: ReadBudget) -> Result<Metadata> {
+    fn metadata(&mut self, object: i64, source: i64, key: i64, budget: ReadBudget) -> Result<(Metadata, ReadProgress)> {
         budget.check()?;
         let handle = self.object(object)?;
         ensure!(
@@ -127,26 +136,59 @@ impl<'a> Snapshot<'a> {
             handle.bytes <= 49152 && handle.bytes + 128 <= budget.bytes,
             "InsufficientBudget: metadata index admission"
         );
-        let admitted = budget.rows.min(((budget.bytes - handle.bytes) / 64 - 1) as u32);
+        // Admit extents before selecting bytea. The declared object length is
+        // untrusted: selecting whole chunks first can allocate many times that
+        // length before continuity validation rejects a corrupt object.
+        let admitted = budget.rows.saturating_sub(1).min(((budget.bytes - handle.bytes - 128) / 64) as u32);
         ensure!(admitted > 0, "InsufficientBudget: metadata row admission");
-        let rows=self.tx.query("select ordinal,byte_offset,bytes,digest from history_object_chunks where import_id=$1 and object_id=$2 order by ordinal limit $3",&[&&self.id[..],&object,&(i64::from(admitted)+1)])?;
-        ensure!(rows.len() <= admitted as usize, "InsufficientBudget: metadata chunk count");
-        let mut body = Vec::with_capacity(handle.bytes as usize);
-        let mut ordinal = 0i64;
-        for row in rows {
+        let rows=self.tx.query("select ordinal,byte_offset,octet_length(bytes)::bigint,digest from history_object_chunks where import_id=$1 and object_id=$2 order by ordinal limit $3",&[&&self.id[..],&object,&i64::from(admitted)])?;
+        ensure!(rows.len() < admitted as usize, "InsufficientBudget: metadata chunk count");
+        let mut total = 0u64;
+        let mut payload_rows = 0u64;
+        for (ordinal, row) in rows.iter().enumerate() {
             let offset: i64 = row.get(1);
-            let bytes: Vec<u8> = row.get(2);
-            let digest: Vec<u8> = row.get(3);
+            let length: i64 = row.get(2);
+            let digest: &[u8] = row.get(3);
             ensure!(
-                row.get::<_, i64>(0) == ordinal
+                row.get::<_, i64>(0) == ordinal as i64
                     && offset >= 0
-                    && offset as usize == body.len()
-                    && body.len() + bytes.len() <= handle.bytes as usize
-                    && Sha256::digest(&bytes).as_slice() == digest,
-                "CorruptObject: metadata chunk continuity/digest"
+                    && offset as u64 == total
+                    && length > 0
+                    && (length as u64) <= handle.bytes - total
+                    && digest.len() == 32,
+                "CorruptObject: metadata chunk extent"
             );
-            body.extend_from_slice(&bytes);
-            ordinal += 1;
+            total += length as u64;
+            payload_rows += (length as u64).div_ceil(u64::from(budget.chunk_bytes));
+        }
+        ensure!(total == handle.bytes, "CorruptObject: metadata extent total");
+        // Include the empty sentinel extent and bounded payload responses in
+        // the same lookup receipt; a Direct group read only gets the remainder.
+        let used_rows = rows.len() as u64 + 1 + payload_rows;
+        let used_bytes = 128 + (rows.len() as u64 + 1) * 64 + payload_rows * 128 + total;
+        ensure!(
+            used_rows <= u64::from(budget.rows) && used_bytes <= budget.bytes,
+            "InsufficientBudget: metadata payload admission"
+        );
+        let mut body = Vec::with_capacity(handle.bytes as usize);
+        for row in rows {
+            let ordinal: i64 = row.get(0);
+            let length: i64 = row.get(2);
+            let digest: Vec<u8> = row.get(3);
+            let mut hash = Sha256::new();
+            let mut offset = 0i64;
+            while offset < length {
+                let n = (length - offset).min(i64::from(budget.chunk_bytes)) as i32;
+                let payload = self.tx.query_one("select substring(bytes from $4+1 for $5) from history_object_chunks where import_id=$1 and object_id=$2 and ordinal=$3", &[&&self.id[..], &object, &ordinal, &i32::try_from(offset)?, &n])?;
+                let bytes: &[u8] = payload.get(0);
+                self.stats.payload_bytes += bytes.len() as u64;
+                self.stats.max_payload_bytes = self.stats.max_payload_bytes.max(bytes.len());
+                ensure!(bytes.len() == n as usize, "CorruptObject: short metadata range");
+                hash.update(bytes);
+                body.extend_from_slice(bytes);
+                offset += i64::from(n);
+            }
+            ensure!(hash.finalize().as_slice() == digest, "CorruptObject: metadata chunk digest");
         }
         ensure!(
             body.len() == handle.bytes as usize && Sha256::digest(&body).as_slice() == handle.digest,
@@ -166,7 +208,7 @@ impl<'a> Snapshot<'a> {
                 "CorruptObject: duplicate metadata column"
             );
         }
-        Ok(metadata)
+        Ok((metadata, ReadProgress { bytes: used_bytes, rows: used_rows, complete: true }))
     }
     pub fn lookup(&mut self, public_id: i64, purpose: LookupPurpose, budget: ReadBudget) -> Result<Lookup> {
         budget.check()?;
@@ -176,8 +218,14 @@ impl<'a> Snapshot<'a> {
         );
         let Some(row)=self.tx.query_opt("select v.source_id,v.metadata_object_id,v.frozen_header_object_id,v.frozen_payload_object_id from history_catalog c join history_release_variants v on v.import_id=c.import_id and v.source_id=c.selected_source_id and v.public_id=c.public_id where c.import_id=$1 and c.public_id=$2",&[&&self.id[..],&public_id])? else{return Ok(Lookup::Missing);};
         let source: i64 = row.get(0);
-        let metadata = self.metadata(row.get(1), source, public_id, budget)?;
+        let (metadata, used) = self.metadata(row.get(1), source, public_id, budget)?;
         if let LookupPurpose::Direct { group_blocked } = purpose {
+            let budget = ReadBudget {
+                rows: budget.rows - u32::try_from(used.rows)?,
+                bytes: budget.bytes - used.bytes,
+                ..budget
+            };
+            budget.check()?;
             let group = metadata.field(Column::Group).context("CorruptObject: group field is missing")?;
             let kind = match group {
                 Value::Inline { kind, .. } | Value::Bytes { kind, .. } => kind,
@@ -288,6 +336,8 @@ impl<'a> Snapshot<'a> {
                 ensure!(bytes.len() == n, "CorruptObject: short object range");
                 bytes
             };
+            self.stats.payload_bytes += bytes.len() as u64;
+            self.stats.max_payload_bytes = self.stats.max_payload_bytes.max(bytes.len());
             sink(&bytes)?;
             cursor.hash.update(&bytes)?;
             cursor.next += bytes.len() as u64;

@@ -73,6 +73,8 @@ pub struct StepReceipt {
 #[derive(Clone, Serialize, Deserialize, Default)]
 struct State {
     phase: u8,
+    #[serde(default)]
+    paired_main: Vec<super::history_companion::RelationReceipt>,
     manifest_offset: u64,
     manifest_ordinal: i64,
     manifest_digest: DigestState,
@@ -320,10 +322,42 @@ impl ImportOwner {
                 tx.commit()?;return Ok(id);
             }
         }
-        // Existing migration-only schemas are fresh only if every user table
-        // is empty except the migration's initial allocator. Unknown data is
-        // never overwritten. Main/ext populated targets require their future
-        // paired receipt integration and are rejected here.
+        // Existing owner receipts are issued in the original main/ext copy
+        // transaction. Statement guards invalidate them on later native DML;
+        // this session already holds the exclusive registration fence.
+        let main = source
+            .manifest()
+            .files
+            .iter()
+            .find(|f| f.kind == SourceKind::Main)
+            .context("SourceMismatch: main source")?;
+        let main_receipt = if has_history {
+            super::history_companion::paired(&mut tx, "main_import", source.manifest().main_receipt, main.digest)?
+        } else {
+            None
+        };
+        let ext_receipt = if has_history {
+            super::history_companion::paired(&mut tx, "ext", source.manifest().ext_receipt, main.digest)?
+        } else {
+            None
+        };
+        for (receipt, owns, scope) in [
+            (main_receipt.as_ref(), super::main_import::owns_table as fn(&str) -> bool, "main_compat_v1"),
+            (ext_receipt.as_ref(), super::ext::owns_table as fn(&str) -> bool, "ext_normalized_and_keep_v1"),
+        ] {
+            if let Some(receipt) = receipt {
+                ensure!(
+                    receipt.scope == scope
+                        && receipt
+                            .relations
+                            .iter()
+                            .enumerate()
+                            .all(|(i, r)| owns(&r.table)
+                                && !receipt.relations[..i].iter().any(|old| old.table == r.table)),
+                    "SourceMismatch: companion receipt relation inventory"
+                );
+            }
+        }
         let tables = tx.query(
             "select tablename::text from pg_tables where schemaname=$1 order by tablename",
             &[&self.expected.schema],
@@ -331,7 +365,14 @@ impl ImportOwner {
         ensure!(tables.len() <= 256, "DestinationMismatch: unexpected staging schema");
         for row in &tables {
             let table: String = row.get(0);
-            if table == "schema_migrations" {
+            if table == "schema_migrations" || table == "history_companion_receipts" {
+                continue;
+            }
+            if main_receipt
+                .iter()
+                .chain(ext_receipt.iter())
+                .any(|r| r.relations.iter().any(|relation| relation.table == table))
+            {
                 continue;
             }
             ensure!(super::valid_schema(&table), "DestinationMismatch: unexpected relation name");
@@ -358,7 +399,17 @@ impl ImportOwner {
             "update meta set value=greatest(value,$1) where key='next_seq'",
             &[&source.manifest().reserved_next_id],
         )?;
-        let mut state = State { next_object: 2, ..Default::default() };
+        if main_receipt.is_some() {
+            // Only this deliberate allocator derivation may clear the dirty
+            // flag set by the meta trigger. The receipt was clean and paired
+            // above while the exclusive owner fence excluded native writers.
+            ensure!(tx.execute("update history_companion_receipts set dirty=false,derived_allocator=$1 where owner_code='main_import' and receipt_digest=$2", &[&source.manifest().reserved_next_id, &&source.manifest().main_receipt[..]])? == 1, "SourceMismatch: companion allocator derivation");
+        }
+        let mut state = State {
+            next_object: 2,
+            paired_main: main_receipt.map_or_else(Vec::new, |receipt| receipt.relations),
+            ..Default::default()
+        };
         state.identity_digest.update(&id)?;
         let checkpoint = serde_json::to_vec(&state)?;
         tx.execute("insert into history_imports(import_id,source_fingerprint,contract_version,state,expected_database,expected_schema,expected_role,expected_owner,reserved_next_seq,checkpoint,manifest_object_id) values($1,$1,1,'loading',$2,$3,$4,$5,$6,$7,1)",&[&&id[..],&self.expected.database,&self.expected.schema,&self.expected.role,&self.expected.owner,&source.manifest().reserved_next_id,&checkpoint])?;
@@ -749,7 +800,13 @@ fn consume(source: &Source, state: &mut State, batch: &mut Batch, runtime: &mut 
                             if file.kind == SourceKind::Main { "main_import" } else { "pending_history" },
                         )
                     };
-                    batch.push(receipt(file.source_id, code, name, false, 0, [0; 32], owner))?;
+                    if file.kind == SourceKind::Main
+                        && let Some(verified) = state.paired_main.iter().find(|r| r.table == name)
+                    {
+                        batch.push(receipt(file.source_id, code, name, true, verified.rows, verified.digest, owner))?;
+                    } else {
+                        batch.push(receipt(file.source_id, code, name, false, 0, [0; 32], owner))?;
+                    }
                     batch.source_bytes += name.len() as u64;
                     batch.source_rows += 1;
                     state.register_table += 1;
@@ -1731,5 +1788,184 @@ mod tests {
             super::super::release_queue::claim(&mut c, 1, 1, 1).is_err(),
             "identity_ready must not activate native mutation"
         );
+    }
+    fn paired_main_fixture(case: &str, body: impl FnOnce(&mut ImportOwner, &Source, &mut postgres::Client)) {
+        let Some(base) = crate::pg::testing::Schema::empty() else { return };
+        let stage = format!("atlas_stage_{}", base.name);
+        let config = StorageConfig {
+            backend: super::super::Backend::Postgres,
+            url: base.url.clone(),
+            schema: stage.clone(),
+            allow_plaintext: true,
+            ..Default::default()
+        };
+        let _cleanup = crate::pg::testing::Schema {
+            name: stage.clone(),
+            url: base.url.clone(),
+            pool: super::super::Pool::new(&config).unwrap(),
+        };
+        let files = tempfile::tempdir().unwrap();
+        let main = super::super::main_import::tests::sqlite_snapshot(files.path());
+        let mut c = base.pool.get().unwrap();
+        let row = c
+            .query_one("select current_database(),current_user,current_setting('server_version_num')::integer", &[])
+            .unwrap();
+        let database: String = row.get(0);
+        super::super::main_import::import_snapshot(&main, &mut c, &database, &stage).unwrap();
+        c.batch_execute(&format!("set search_path to \"{stage}\"")).unwrap();
+        let receipt = super::super::history_companion::digest(&mut c, &stage, "main_import").unwrap();
+        assert!(receipt.is_some(), "the existing main owner must issue a source-pairing receipt");
+        let (_others, mut manifest) = crate::history_source::tests::fixture();
+        manifest.files.iter_mut().find(|f| f.kind == SourceKind::Main).unwrap().path = main;
+        manifest.main_receipt = if case == "wrong_receipt" { [9; 32] } else { receipt.unwrap() };
+        if case == "stale" {
+            c.execute("update meta set value=value where key='next_seq'", &[]).unwrap();
+        }
+        if case == "unknown" {
+            c.batch_execute("create table unexpected(value bigint);insert into unexpected values(7)").unwrap();
+        }
+        manifest.source_uuid = "test-source".into();
+        crate::history_source::tests::refresh(&mut manifest);
+        let source = Source::open(manifest, 1 << 20).unwrap();
+        let spool = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(spool.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let expected = ExpectedDestination {
+            database,
+            schema: stage,
+            role: row.get(1),
+            owner: row.get(1),
+            server_version: row.get(2),
+            staging_prefix: "atlas_stage_".into(),
+        };
+        let mut owner = ImportOwner::connect(config, expected, spool.path().into(), 4 * 1024 * 1024).unwrap();
+        body(&mut owner, &source, &mut c);
+    }
+    #[test]
+    fn verified_main_owner_receipt_pairs_a_populated_target() {
+        paired_main_fixture("valid", |owner, source, c| {
+            let id = owner.begin(source).unwrap();
+            let mut seq = 0;
+            loop {
+                let r = owner.step(source, id, seq, ImportBudget::default()).unwrap();
+                seq = r.sequence;
+                if r.complete {
+                    break;
+                }
+            }
+            owner.finish_identity(source, id).unwrap();
+            let complete: i64 = c
+                .query_one(
+                    "select count(*) from history_receipts where owner_code='main_import' and state='complete'",
+                    &[],
+                )
+                .unwrap()
+                .get(0);
+            assert!(complete >= 14, "verified main table coverage retained");
+            let receipt = c
+                .query_one(
+                    "select dirty,derived_allocator from history_companion_receipts where owner_code='main_import'",
+                    &[],
+                )
+                .unwrap();
+            assert!(!receipt.get::<_, bool>(0));
+            assert_eq!(receipt.get::<_, Option<i64>>(1), Some(900));
+        });
+    }
+    #[test]
+    fn stale_wrong_or_unowned_populated_targets_are_rejected() {
+        for case in ["stale", "wrong_receipt", "unknown"] {
+            paired_main_fixture(case, |owner, source, c| {
+                assert!(owner.begin(source).is_err(), "{case} target must fail closed");
+                let imports: i64 = c.query_one("select count(*) from history_imports", &[]).unwrap().get(0);
+                assert_eq!(imports, 0);
+            });
+        }
+    }
+    fn inspect_fixture(group_bytes: usize, body: impl FnOnce(&mut postgres::Client, ImportId)) {
+        let Some(test) = crate::pg::testing::Schema::empty() else { return };
+        let mut c = test.pool.get().unwrap();
+        let row = c
+            .query_one("select current_database(),current_user,current_setting('server_version_num')::integer", &[])
+            .unwrap();
+        let expected = ExpectedDestination {
+            database: row.get(0),
+            schema: test.name.clone(),
+            role: row.get(1),
+            owner: row.get(1),
+            server_version: row.get(2),
+            staging_prefix: "t_".into(),
+        };
+        let config = StorageConfig {
+            backend: super::super::Backend::Postgres,
+            url: test.url.clone(),
+            schema: test.name.clone(),
+            allow_plaintext: true,
+            ..Default::default()
+        };
+        let (_files, mut manifest) = crate::history_source::tests::fixture();
+        crate::history_source::tests::seed_current(&mut manifest, 1);
+        if group_bytes > 0 {
+            let path = manifest.files.iter().find(|f| f.kind == SourceKind::Current).unwrap().path.clone();
+            let s = rusqlite::Connection::open(path).unwrap();
+            s.execute("update releases set group_name=?1", ["g".repeat(group_bytes)]).unwrap();
+            drop(s);
+            crate::history_source::tests::refresh(&mut manifest);
+        }
+        let source = Source::open(manifest, 1 << 20).unwrap();
+        let spool = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(spool.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut owner = ImportOwner::connect(config, expected, spool.path().into(), 4 * 1024 * 1024).unwrap();
+        let id = owner.begin(&source).unwrap();
+        let mut sequence = 0;
+        loop {
+            let r = owner.step(&source, id, sequence, ImportBudget::default()).unwrap();
+            sequence = r.sequence;
+            if r.complete {
+                break;
+            }
+        }
+        owner.finish_identity(&source, id).unwrap();
+        body(&mut c, id);
+    }
+    #[test]
+    fn corrupt_metadata_payload_is_admitted_before_any_large_fetch() {
+        inspect_fixture(0, |c, id| {
+            c.execute("update history_object_chunks set bytes=$1 where object_id=(select metadata_object_id from history_release_variants where public_id=3)",&[&vec![b'x';65536]]).unwrap();
+            let mut snapshot = super::super::history_catalog::Snapshot::open(c, id).unwrap();
+            let budget = super::super::history_catalog::ReadBudget { rows: 8, bytes: 2048, chunk_bytes: 64 };
+            assert!(snapshot.lookup(3, super::super::history_catalog::LookupPurpose::Raw, budget).is_err());
+            assert!(
+                snapshot.stats().payload_bytes <= budget.bytes,
+                "corrupt metadata fetched {} bytes under a {} byte budget",
+                snapshot.stats().payload_bytes,
+                budget.bytes
+            );
+        });
+    }
+    #[test]
+    fn direct_policy_debits_the_same_aggregate_lookup_budget() {
+        inspect_fixture(8192, |c, id| {
+            let mut snapshot = super::super::history_catalog::Snapshot::open(c, id).unwrap();
+            let budget = super::super::history_catalog::ReadBudget { rows: 32, bytes: 8320, chunk_bytes: 65536 };
+            assert!(
+                snapshot
+                    .lookup(
+                        3,
+                        super::super::history_catalog::LookupPurpose::Direct { group_blocked: |_| false },
+                        budget
+                    )
+                    .is_err(),
+                "group policy may not receive a fresh full metadata budget"
+            );
+            assert!(snapshot.stats().payload_bytes <= budget.bytes);
+        });
     }
 }

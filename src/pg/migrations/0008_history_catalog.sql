@@ -1,5 +1,14 @@
 -- Hidden, source-qualified historical identity. No state in this migration
 -- enables native writes or a public reader.
+create table history_companion_receipts (
+    owner_code text primary key check(owner_code in ('main_import','ext')),
+    source_digest bytea not null check(octet_length(source_digest)=32),
+    receipt_digest bytea not null check(octet_length(receipt_digest)=32),
+    manifest bytea not null check(octet_length(manifest)<=65536),
+    dirty boolean not null default false,
+    derived_allocator bigint check(derived_allocator>0)
+);
+revoke all on history_companion_receipts from public;
 create table history_imports (
     import_id bytea primary key check(octet_length(import_id)=32),
     source_fingerprint bytea not null check(octet_length(source_fingerprint)=32),
@@ -116,17 +125,24 @@ revoke all on history_imports,history_sources,history_objects,history_object_chu
 -- also cover direct Sql cursor/metadata entrypoints. Volatile function queries
 -- recheck the gate after the ownership fence; import registration takes the
 -- identical fence before inserting its persistent gate.
-create function atlas_native_write_trigger() returns trigger language plpgsql volatile as $$
+create function atlas_native_write_guard(p_schema text) returns void language plpgsql volatile
+security definer set search_path=pg_catalog as $$
 declare blocked boolean;
 begin
-    execute format('select exists(select 1 from %I.history_imports)',TG_TABLE_SCHEMA) into blocked;
-    if blocked then
-        raise exception 'historical import blocks native mutations' using errcode='55000';
-    end if;
-    perform pg_catalog.pg_advisory_xact_lock_shared(pg_catalog.hashtext('atlas.indexer'),pg_catalog.hashtext(TG_TABLE_SCHEMA));
-    execute format('select exists(select 1 from %I.history_imports)',TG_TABLE_SCHEMA) into blocked;
-    if blocked then
-        raise exception 'historical import blocks native mutations' using errcode='55000';
+    execute format('select exists(select 1 from %I.history_imports)',p_schema) into blocked;
+    if blocked then raise exception 'historical import blocks native mutations' using errcode='55000'; end if;
+    perform pg_catalog.pg_advisory_xact_lock_shared(pg_catalog.hashtext('atlas.indexer'),pg_catalog.hashtext(p_schema));
+    execute format('select exists(select 1 from %I.history_imports)',p_schema) into blocked;
+    if blocked then raise exception 'historical import blocks native mutations' using errcode='55000'; end if;
+end $$;
+create function atlas_native_write_trigger() returns trigger language plpgsql volatile
+security definer set search_path=pg_catalog as $$
+begin
+    execute format('select %I.atlas_native_write_guard($1)',TG_TABLE_SCHEMA) using TG_TABLE_SCHEMA;
+    if TG_TABLE_NAME=any(array['groups','meta','backfill_chunks','backfill_deepest','backfill_media','backfill_speculative','backfill_sweep_gen','backfill_sweeps','backfill_wanted','spot_blacklist','spot_comments','spot_disposals','spot_reports','spots_seen','inferred_asked','inferred_ids','repair_tried','repair_older']) then
+        execute format('update %I.history_companion_receipts set dirty=true where owner_code=''main_import''',TG_TABLE_SCHEMA);
+    elsif left(TG_TABLE_NAME,4)='ext_' then
+        execute format('update %I.history_companion_receipts set dirty=true where owner_code=''ext''',TG_TABLE_SCHEMA);
     end if;
     return null;
 end $$;
@@ -136,7 +152,6 @@ begin
     for relation in select c.relname from pg_class c join pg_namespace n on n.oid=c.relnamespace
         where n.nspname=current_schema() and c.relkind='r'
         and c.relname<>'schema_migrations' and c.relname not like 'history\_%' escape '\'
-        and c.relname not like 'ext\_%' escape '\'
     loop
         execute format('create trigger atlas_history_write_gate before insert or update or delete or truncate on %I for each statement execute function atlas_native_write_trigger()',relation.relname);
     end loop;
