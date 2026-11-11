@@ -84,6 +84,65 @@ class ResourceGuardTests(unittest.TestCase):
         with patch.object(guard.sys, "platform", "linux"), patch.object(Path, "read_text", read_text):
             self.assertEqual(guard.process_usage(123), (49 * 1024, 123))
 
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin zombie group signal semantics")
+    def test_stop_reaps_a_zombie_only_owned_group_on_darwin(self):
+        child = subprocess.Popen(["/usr/bin/true"], start_new_session=True)
+        try:
+            deadline = time.monotonic() + 5
+            while True:
+                state = subprocess.check_output(
+                    ["ps", "-p", str(child.pid), "-o", "stat="], text=True).strip()
+                if state.startswith("Z"):
+                    break
+                self.assertLess(time.monotonic(), deadline, "child did not exit")
+                time.sleep(0.01)
+            # Do not poll/reap first: XNU reports EPERM for this zombie-only group.
+            guard.stop_child(child)
+            self.assertEqual(child.returncode, 0)
+        finally:
+            child.wait()
+
+    def test_zombie_group_probe_after_leader_exit_is_reaped(self):
+        from unittest.mock import Mock
+        child = Mock(pid=123)
+        child.poll.side_effect = [None, 0]
+        table = subprocess.CompletedProcess([], 0, stdout="123 Z\n456 S\n")
+        with patch.object(guard.sys, "platform", "darwin"), \
+                patch.object(os, "killpg", side_effect=[None, PermissionError(errno.EPERM, "denied")]) as send, \
+                patch.object(subprocess, "run", return_value=table):
+            guard.stop_child(child)
+            self.assertEqual([call.args[1] for call in send.call_args_list], [signal.SIGTERM, 0])
+            child.wait.assert_called_once()
+
+    def test_group_permission_failure_with_a_live_leader_is_not_ignored(self):
+        from unittest.mock import Mock
+        child = Mock(pid=123)
+        child.poll.return_value = None
+        with patch.object(os, "killpg", side_effect=PermissionError(errno.EPERM, "denied")):
+            with self.assertRaises(PermissionError):
+                guard.stop_child(child)
+
+    def test_group_permission_failure_with_a_live_descendant_is_not_ignored(self):
+        from unittest.mock import Mock
+        child = Mock(pid=123)
+        child.poll.return_value = 0
+        table = subprocess.CompletedProcess([], 0, stdout="123 S\n456 Z\n")
+        with patch.object(guard.sys, "platform", "darwin"), \
+                patch.object(os, "killpg", side_effect=PermissionError(errno.EPERM, "denied")), \
+                patch.object(subprocess, "run", return_value=table):
+            with self.assertRaises(PermissionError):
+                guard.stop_child(child)
+
+    def test_group_permission_failure_with_unreadable_inventory_is_not_ignored(self):
+        from unittest.mock import Mock
+        child = Mock(pid=123)
+        child.poll.return_value = 0
+        with patch.object(guard.sys, "platform", "darwin"), \
+                patch.object(os, "killpg", side_effect=PermissionError(errno.EPERM, "denied")), \
+                patch.object(subprocess, "run", side_effect=OSError("unavailable")):
+            with self.assertRaises(PermissionError):
+                guard.stop_child(child)
+
     def test_stop_escalates_for_a_child_ignoring_term(self):
         child = subprocess.Popen(
             [sys.executable, "-c",
