@@ -1038,6 +1038,11 @@ impl Db {
         Ok(answer)
     }
 
+    pub(crate) async fn save_native_at(&self, releases: Vec<Release>, logical_now: i64) -> Result<()> {
+        let native = self.native.as_ref().ok_or_else(|| anyhow!("replay saves require native PostgreSQL storage"))?;
+        native.save_at(releases, logical_now).await
+    }
+
     /// Save one slice's releases. Returns once they are committed. Dropping
     /// the future before the writer gets to the slice drops the slice too
     /// (its pass didnt finish, soo the cursor didnt move past it); once the

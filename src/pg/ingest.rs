@@ -77,6 +77,10 @@ impl Native {
         })
     }
 
+    pub(crate) async fn save_at(&self, releases: Vec<Release>, _logical_now: i64) -> Result<()> {
+        self.save(releases).await
+    }
+
     /// Completion covers every bounded commit. On failure or cancellation, callers must replay the input before
     /// acknowledging its cursor/hours; the native writer deduplicates the pieces that already committed.
     pub async fn save(&self, releases: Vec<Release>) -> Result<()> {
@@ -258,10 +262,15 @@ mod tests {
             ..Default::default()
         }];
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        rt.block_on(native.save(releases.clone())).unwrap();
+        rt.block_on(native.save_at(releases.clone(), 1234)).unwrap();
         let mut conn = schema.pool.get().unwrap();
+        assert_eq!(
+            conn.query_one("select touched_at from files", &[]).unwrap().get::<_, i64>(0),
+            1234,
+            "bounded pieces must keep their epoch's logical time"
+        );
         let generation: i64 = conn.query_one("select generation from pp_queue", &[]).unwrap().get(0);
-        rt.block_on(native.save(releases)).unwrap();
+        rt.block_on(native.save_at(releases, 1234)).unwrap();
         assert_eq!(conn.query_one("select generation from pp_queue", &[]).unwrap().get::<_, i64>(0), generation);
         assert_eq!(conn.query_one("select count(*) from releases", &[]).unwrap().get::<_, i64>(0), 1);
         assert_eq!(conn.query_one("select count(*) from files", &[]).unwrap().get::<_, i64>(0), 1);
