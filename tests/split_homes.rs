@@ -7,8 +7,9 @@
 
 mod common;
 
-use std::sync::Arc;
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use common::{Server, post_at, spawn_server};
@@ -48,14 +49,43 @@ fn a_server_without_the_group_doesnt_move_it() {
         std::env::set_var("ATLAS_SAB_DIR", home.path().join("no-sabnzbd"));
     }
 
-    let carrier = |offset| {
-        let mut s = Server::new(posts(offset));
-        let m = Arc::get_mut(&mut s).unwrap();
-        m.any_group = true;
-        m.xover_delay = Duration::from_millis(10);
-        s
+    // Keep the original connection weights (which choose the group's home),
+    // but one frontier worker per provider. Hold the first claimed responses
+    // until both carriers have real claims, independently of mock response speed.
+    let gate = Arc::new(ClaimGate::default());
+    let carrier_keys = [Arc::new(Mutex::new(String::new())), Arc::new(Mutex::new(String::new()))];
+    let carrier = |offset, key: Arc<Mutex<String>>| {
+        let mut state = Server::new(posts(offset));
+        let (main, gate) = (home.path().join("atlas.db"), gate.clone());
+        let server = Arc::get_mut(&mut state).unwrap();
+        server.any_group = true;
+        server.before_xover = Some(Arc::new(move || {
+            if gate.ready.load(Ordering::Acquire) {
+                return;
+            }
+            let key = key.lock().unwrap().clone();
+            let connection =
+                rusqlite::Connection::open_with_flags(&main, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+            connection.busy_timeout(Duration::from_secs(5)).unwrap();
+            let exists: bool = connection
+                .query_row("select exists(select 1 from sqlite_master where name='backfill_chunks')", [], |r| r.get(0))
+                .unwrap();
+            if !exists {
+                return;
+            }
+            let claimed: bool = connection
+                .query_row("select exists(select 1 from backfill_chunks where state=1 and server=?1)", [&key], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            drop(connection);
+            if claimed {
+                gate.wait(key);
+            }
+        }));
+        state
     };
-    let (a, b) = (carrier(1), carrier(500_001));
+    let (a, b) = (carrier(1, carrier_keys[0].clone()), carrier(500_001, carrier_keys[1].clone()));
     // answers 411 for SPLIT_GROUP
     let c = Server::new(posts(900_001));
     let (pa, pb, pc) = (spawn_server(a), spawn_server(b), spawn_server(c.clone()));
@@ -72,6 +102,7 @@ fn a_server_without_the_group_doesnt_move_it() {
         "groups": [SPLIT_GROUP],
         "index_mode": "backfill",
         "batch_size": 100,
+        "parallel_groups": 1,
         "request_size": 50,
         "split_min_backlog": 500
     });
@@ -80,7 +111,12 @@ fn a_server_without_the_group_doesnt_move_it() {
 
     let stop = Arc::new(AtomicBool::new(false));
     let cfg = atlas::config::load_config().unwrap();
+    assert_eq!(cfg.workers_per_server(&[4, 4, 4]), [1, 1, 1], "one frontier worker per provider");
+    assert_eq!(atlas::nntp::Pool::new(&cfg.servers).pick_server(SPLIT_GROUP), 1, "the fixture starts on localhost");
     let keys = atlas::nntp::server_keys(&cfg.servers);
+    for (slot, key) in carrier_keys.iter().zip(&keys[..2]) {
+        *slot.lock().unwrap() = key.clone();
+    }
     let runner = {
         let stop = stop.clone();
         std::thread::spawn(move || atlas::bg_indexer::run_until(cfg, stop))
@@ -101,6 +137,8 @@ fn a_server_without_the_group_doesnt_move_it() {
     stop.store(true, Ordering::Relaxed);
     assert_eq!(runner.join().unwrap(), 0);
 
+    assert!(!gate.timed_out.load(Ordering::Relaxed), "both carriers must claim before the response gate opens");
+    assert_eq!(*gate.seen.lock().unwrap(), keys[..2].iter().cloned().collect::<BTreeSet<_>>());
     let conn = atlas::db::open_with_shards(&main).unwrap();
     assert_eq!(atlas::store::totals(&conn).unwrap().1, 1200, "every post once");
 
@@ -127,4 +165,35 @@ fn a_server_without_the_group_doesnt_move_it() {
         .unwrap();
     assert!(c.accepted.load(Ordering::SeqCst) > 0, "the third server was asked");
     assert_eq!(chunk_servers, keys[..2].to_vec(), "only the carriers did chunks");
+}
+
+#[derive(Default)]
+struct ClaimGate {
+    seen: Mutex<BTreeSet<String>>,
+    changed: Condvar,
+    ready: AtomicBool,
+    timed_out: AtomicBool,
+}
+
+impl ClaimGate {
+    fn wait(&self, key: String) {
+        let mut seen = self.seen.lock().unwrap();
+        seen.insert(key);
+        if seen.len() == 2 {
+            self.ready.store(true, Ordering::Release);
+            self.changed.notify_all();
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !self.ready.load(Ordering::Acquire) {
+            let (held, waited) =
+                self.changed.wait_timeout(seen, deadline.saturating_duration_since(Instant::now())).unwrap();
+            seen = held;
+            if waited.timed_out() && !self.ready.load(Ordering::Acquire) {
+                self.timed_out.store(true, Ordering::Relaxed);
+                self.ready.store(true, Ordering::Release);
+                self.changed.notify_all();
+            }
+        }
+    }
 }
