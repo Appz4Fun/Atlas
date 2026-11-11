@@ -47,7 +47,7 @@ pub(crate) fn apply(tx: &mut Transaction<'_>, id: &[u8; 32], rows: &[Row], cache
         return Ok(Applied { round_trips: 0, mutations: 0, copy_bytes: 0 });
     }
     let mut mutations = 0u64;
-    let mut round_trips = 14;
+    let mut round_trips = 16;
     if cache.copy.is_none() {
         tx.batch_execute("create temporary table atlas_history_stage(tag smallint,a bigint,b bigint,c bigint,d bigint,e bigint,t text,x bytea,y bytea,z bytea,flag boolean,f bigint,g bigint,extra text) on commit delete rows")?;
         cache.copy = Some(tx.prepare("copy pg_temp.atlas_history_stage from stdin binary")?);
@@ -138,6 +138,13 @@ pub(crate) fn apply(tx: &mut Transaction<'_>, id: &[u8; 32], rows: &[Row], cache
         "insert into history_receipts(import_id,source_id,relation_code,relation_name,state,logical_rows,digest,owner_code) select distinct on(a,b) $1,a,b::integer,x,t,case when flag then c else null end,case when flag then y else null end,extra from atlas_history_stage where tag=8 order by a,b,flag desc on conflict(import_id,source_id,relation_code) do update set state=excluded.state,logical_rows=excluded.logical_rows,digest=excluded.digest where history_receipts.relation_name=excluded.relation_name and history_receipts.owner_code=excluded.owner_code and (history_receipts.state='pending' or (history_receipts.state,history_receipts.logical_rows,history_receipts.digest) is not distinct from(excluded.state,excluded.logical_rows,excluded.digest))",
         id,
     )?;
+    mutations += execute(
+        tx,
+        "insert into history_frozen_resolutions(import_id,source_id,public_id,header_object_id,metadata_object_id,differing_columns,oracle_code) select $1,a,b,c,d,x,t from atlas_history_stage where tag=12 on conflict do nothing",
+        id,
+    )?;
+    let conflict:bool=query(tx,"select exists(select 1 from atlas_history_stage s left join history_frozen_resolutions h on h.import_id=$1 and h.source_id=s.a and h.public_id=s.b where s.tag=12 and (h.source_id is null or (h.header_object_id,h.metadata_object_id,h.differing_columns,h.oracle_code) is distinct from(s.c,s.d,s.x,s.t)))",id)?.get(0);
+    ensure!(!conflict, "SourceMismatch: frozen resolution receipt differs");
     // Fixed count regardless of ordinary row/cell count; COPY protocol writes
     // are separately byte bounded. No destination round trip per source row.
     Ok(Applied { round_trips, mutations, copy_bytes: 21 + rows.iter().map(|r| r.bytes() - 139).sum::<u64>() })

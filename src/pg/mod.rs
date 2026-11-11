@@ -18,6 +18,7 @@ mod history_validator;
 pub mod history_import;
 mod history_stage;
 mod history_spool;
+pub mod history_catalog;
 pub(crate) mod indexer_runtime;
 pub mod ingest;
 pub(crate) mod linker;

@@ -17,6 +17,11 @@ pub enum SourceKind {
     Frozen,
 }
 #[derive(Clone, Serialize, Deserialize)]
+pub struct CatalogCounts {
+    pub releases: u64,
+    pub collections: u64,
+}
+#[derive(Clone, Serialize, Deserialize)]
 pub struct FileManifest {
     pub source_id: i64,
     pub kind: SourceKind,
@@ -26,6 +31,7 @@ pub struct FileManifest {
     pub byte_length: u64,
     pub digest: [u8; 32],
     pub schema_digest: [u8; 32],
+    pub catalog_counts: Option<CatalogCounts>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Manifest {
@@ -60,6 +66,7 @@ pub struct RowCursor {
 pub use crate::history_identity::{CellType, Column};
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CellRef {
+    pub fingerprint: [u8; 32],
     pub source_id: i64,
     pub relation: Relation,
     pub rowid: i64,
@@ -101,6 +108,23 @@ pub struct PageEnd {
 pub const DESCRIPTOR_ADMISSION: u64 = 512;
 pub const MAX_CHUNK: u32 = 65536;
 
+// The cursor is owned by Source and is dropped before Source's connections.
+// Keeping SQLite's overflow-page cursor avoids repeated prefix walks on a
+// giant cell. No raw handle or connection is serialized or exposed.
+struct RetainedCell {
+    handle: std::ptr::NonNull<rusqlite::ffi::sqlite3_blob>,
+    reference: CellRef,
+    indexed_until: u64,
+}
+impl Drop for RetainedCell {
+    fn drop(&mut self) {
+        // SAFETY: sqlite3_blob_open returned this owned handle; it is closed
+        // exactly once and Source's connection fields are still alive.
+        unsafe {
+            rusqlite::ffi::sqlite3_blob_close(self.handle.as_ptr());
+        }
+    }
+}
 struct FileSource {
     manifest: FileManifest,
     conn: Connection,
@@ -119,7 +143,16 @@ impl VerificationAdmission {
         Self { max_total_bytes, bytes_per_second: 32 * 1024 * 1024, read_chunk_bytes: 65536 }
     }
 }
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CellIo {
+    pub cursor_opens: u64,
+    pub read_calls: u64,
+    pub bytes: u64,
+    pub max_request: usize,
+}
 pub struct Source {
+    cell_io: std::cell::RefCell<CellIo>,
+    active_cell: std::cell::RefCell<Option<RetainedCell>>,
     manifest: Manifest,
     fingerprint: [u8; 32],
     manifest_bytes: Vec<u8>,
@@ -308,11 +341,17 @@ impl Source {
             let mut h = Sha256::new();
             let mut buf = vec![0u8; admission.read_chunk_bytes as usize];
             let mut file_read = 0u64;
+            let mut header = [0u8; 20];
+            ensure!(file.byte_length >= 100, "UnsupportedSchema: truncated SQLite header");
             while file_read < file.byte_length {
                 ensure!(!cancel.load(Ordering::Relaxed), "Cancelled: initial source verification");
                 let nread = (file.byte_length - file_read).min(buf.len() as u64) as usize;
                 let n = input.read(&mut buf[..nread])?;
                 ensure!(n > 0, "SourceMismatch: truncated checkpoint file");
+                if file_read < 20 {
+                    let take = n.min(20 - file_read as usize);
+                    header[file_read as usize..file_read as usize + take].copy_from_slice(&buf[..take]);
+                }
                 h.update(&buf[..n]);
                 file_read += n as u64;
                 verified_bytes = verified_bytes.checked_add(n as u64).context("source byte overflow")?;
@@ -326,12 +365,20 @@ impl Source {
                 }
             }
             ensure!(<[u8; 32]>::from(h.finalize()) == file.digest, "SourceMismatch: file content digest");
+            ensure!(
+                &header[..16] == b"SQLite format 3\0" && header[18] == 1 && header[19] == 1,
+                "UnsupportedSchema: consolidate the checkpoint in rollback-journal mode before opening"
+            );
             let conn = Connection::open_with_flags(
                 &file.path,
                 OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
             )?;
             conn.execute_batch("pragma query_only=on; begin")?;
             ensure!(schema_digest(&conn)? == file.schema_digest, "SourceMismatch: schema fingerprint");
+            ensure!(
+                file.kind == SourceKind::Main || file.catalog_counts.is_some(),
+                "SourceMismatch: selected catalog counts missing from content manifest"
+            );
             let columns = match file.kind {
                 SourceKind::Main => {
                     mains += 1;
@@ -393,9 +440,20 @@ impl Source {
         let manifest_bytes = serde_json::to_vec(&identity)?;
         ensure!(manifest_bytes.len() <= 8 * 1024 * 1024, "InsufficientBudget: source manifest admission");
         let fingerprint = Sha256::digest(&manifest_bytes).into();
-        let source = Self { manifest, fingerprint, manifest_bytes, files, verified_bytes };
+        let source = Self {
+            manifest,
+            fingerprint,
+            manifest_bytes,
+            files,
+            verified_bytes,
+            cell_io: Default::default(),
+            active_cell: Default::default(),
+        };
         source.check_unchanged()?;
         Ok(source)
+    }
+    pub fn cell_io(&self) -> CellIo {
+        *self.cell_io.borrow()
     }
     pub fn manifest_bytes(&self) -> &[u8] {
         &self.manifest_bytes
@@ -431,6 +489,12 @@ impl Source {
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt;
         for f in self.files.values() {
+            for suffix in ["-wal", "-shm", "-journal"] {
+                ensure!(
+                    !PathBuf::from(format!("{}{suffix}", f.manifest.path.display())).exists(),
+                    "SourceMismatch: captured checkpoint acquired a sidecar"
+                );
+            }
             let now = std::fs::metadata(&f.manifest.path)?;
             #[cfg(unix)]
             ensure!(
@@ -522,6 +586,7 @@ impl Source {
                         let blob = f.conn.blob_open("main", table, col.name(), rowid, true)?;
                         bytes += 8;
                         Scalar::Cell(CellRef {
+                            fingerprint: self.fingerprint,
                             source_id: cursor.source_id,
                             relation: cursor.relation,
                             rowid,
@@ -563,8 +628,46 @@ impl Source {
             allowed.contains(&cell.column) && cell.relation != Relation::Collections,
             "UnsupportedSchema: unallowlisted cell handle"
         );
-        let blob = f.conn.blob_open("main", table, cell.column.name(), cell.rowid, true)?;
-        ensure!(blob.len() as u64 == cell.bytes && offset <= cell.bytes, "SourceMismatch: changed cell handle");
+        ensure!(cell.fingerprint == self.fingerprint, "SourceMismatch: cell belongs to another checkpoint");
+        {
+            let mut active = self.active_cell.borrow_mut();
+            if active.as_ref().is_none_or(|open| open.reference != *cell) {
+                active.take();
+                let table_name = std::ffi::CString::new(table)?;
+                let column_name = std::ffi::CString::new(cell.column.name())?;
+                let mut handle = std::ptr::null_mut();
+                // SAFETY: Source privately owns the stable SQLite connection
+                // and this handle. Fixed allowlisted C strings remain live for
+                // the call; flag zero opens read-only. active_cell is declared
+                // before files, so the handle closes before its connection.
+                let code = unsafe {
+                    rusqlite::ffi::sqlite3_blob_open(
+                        f.conn.handle(),
+                        c"main".as_ptr(),
+                        table_name.as_ptr(),
+                        column_name.as_ptr(),
+                        cell.rowid,
+                        0,
+                        &mut handle,
+                    )
+                };
+                ensure!(
+                    code == rusqlite::ffi::SQLITE_OK,
+                    "SourceMismatch: incremental cell open failed (SQLite {code})"
+                );
+                let handle = std::ptr::NonNull::new(handle).context("SourceMismatch: null incremental cell handle")?;
+                *active = Some(RetainedCell { handle, reference: cell.clone(), indexed_until: 0 });
+                self.cell_io.borrow_mut().cursor_opens += 1;
+            }
+            let handle = active.as_ref().expect("active read-only cell").handle;
+            // SAFETY: this owned cursor is live on the owning connection and
+            // no mutation/connection escape is available through Source.
+            let length = unsafe { rusqlite::ffi::sqlite3_blob_bytes(handle.as_ptr()) };
+            ensure!(
+                length >= 0 && length as u64 == cell.bytes && offset <= cell.bytes,
+                "SourceMismatch: changed cell handle"
+            );
+        }
         // Recheck the original type using metadata only; no whole-cell Value.
         let ty: String = f.conn.query_row(
             &format!("select typeof({}) from {table} where rowid=?1", cell.column.name()),
@@ -576,12 +679,44 @@ impl Source {
             "SourceMismatch: cell type"
         );
         let metadata_bytes = 8 + ty.len() as u64;
-        let n = (cell.bytes - offset).min(budget.bytes - metadata_bytes).min(u64::from(budget.chunk_bytes)) as usize;
+        let indexed = self.active_cell.borrow().as_ref().expect("active cell").indexed_until;
+        let preparing = offset < cell.bytes && indexed < offset;
+        let read_offset = if preparing { indexed } else { offset };
+        let remaining = if preparing { offset - indexed } else { cell.bytes - offset };
+        let n = remaining.min(budget.bytes - metadata_bytes).min(u64::from(budget.chunk_bytes)) as usize;
         if n == 0 {
             return Ok(CellProgress { next: offset, bytes: metadata_bytes });
         }
         let mut bytes = vec![0; n];
-        blob.read_at_exact(&mut bytes, offset as usize)?;
+        {
+            let active = self.active_cell.borrow();
+            let handle = active.as_ref().expect("active read-only cell").handle;
+            // SAFETY: the live read-only cursor, buffer length and checked
+            // SQLite-sized offset stay valid for this synchronous call.
+            let code = unsafe {
+                rusqlite::ffi::sqlite3_blob_read(
+                    handle.as_ptr(),
+                    bytes.as_mut_ptr().cast(),
+                    n as i32,
+                    i32::try_from(read_offset)?,
+                )
+            };
+            ensure!(code == rusqlite::ffi::SQLITE_OK, "SourceMismatch: incremental cell read failed (SQLite {code})");
+        }
+        {
+            let mut io = self.cell_io.borrow_mut();
+            io.read_calls += 1;
+            io.bytes += n as u64;
+            io.max_request = io.max_request.max(n);
+        }
+        {
+            let mut active = self.active_cell.borrow_mut();
+            let cell = active.as_mut().expect("active cell");
+            cell.indexed_until = cell.indexed_until.max(read_offset + n as u64);
+        }
+        if preparing {
+            return Ok(CellProgress { next: offset, bytes: metadata_bytes + n as u64 });
+        }
         sink(&bytes)?;
         Ok(CellProgress { next: offset + n as u64, bytes: metadata_bytes + n as u64 })
     }
@@ -624,6 +759,7 @@ pub(crate) mod tests {
                 byte_length: bytes.len() as u64,
                 digest: Sha256::digest(&bytes).into(),
                 schema_digest: [0; 32],
+                catalog_counts: Some(CatalogCounts { releases: 0, collections: 0 }),
             }],
         };
         let c = Connection::open(&m.files[0].path).unwrap();
@@ -647,6 +783,7 @@ pub(crate) mod tests {
             byte_length: data.len() as u64,
             digest: Sha256::digest(&data).into(),
             schema_digest: schema,
+            catalog_counts: None,
         });
         let frozen = dir.path().join("frozen.db");
         let c = Connection::open(&frozen).unwrap();
@@ -663,6 +800,7 @@ pub(crate) mod tests {
             byte_length: data.len() as u64,
             digest: Sha256::digest(&data).into(),
             schema_digest: schema,
+            catalog_counts: Some(CatalogCounts { releases: 0, collections: 0 }),
         });
         // Verification of explicitly declared synthetic sources must succeed;
         // later cases exercise paired files and all bounded cursor operations.
@@ -686,6 +824,18 @@ pub(crate) mod tests {
         for file in &mut manifest.files {
             let c = Connection::open(&file.path).unwrap();
             file.schema_digest = schema_digest(&c).unwrap();
+            if file.kind != SourceKind::Main {
+                let release = if file.kind == SourceKind::Current { "releases" } else { "frozen_releases" };
+                let aliases = if file.kind == SourceKind::Current { "collections" } else { "frozen_collections" };
+                file.catalog_counts = Some(CatalogCounts {
+                    releases: c
+                        .query_row(&format!("select count(*) from {release}"), [], |r| r.get::<_, i64>(0))
+                        .unwrap() as u64,
+                    collections: c
+                        .query_row(&format!("select count(*) from {aliases}"), [], |r| r.get::<_, i64>(0))
+                        .unwrap() as u64,
+                });
+            }
             drop(c);
             let bytes = std::fs::read(&file.path).unwrap();
             file.byte_length = bytes.len() as u64;
@@ -803,5 +953,117 @@ pub(crate) mod tests {
         c.execute_batch("insert into frozen_collections values(-9,899),(0,41),(7,3)").unwrap();
         drop(c);
         refresh(manifest);
+    }
+    #[test]
+    fn one_cell_retains_its_read_cursor_across_forward_pages() {
+        let (_dir, mut manifest) = fixture();
+        seed_current(&mut manifest, 1);
+        let source = Source::open(manifest, 1 << 20).unwrap();
+        let cursor = RowCursor { source_id: 1, relation: Relation::Releases, after: None };
+        let mut cell = None;
+        source
+            .scan(&cursor, ReadBudget { rows: 1, bytes: 512, chunk_bytes: 1 }, |row| {
+                cell = match row.fields.iter().find(|(c, _)| *c == Column::Name).unwrap().1.clone() {
+                    Scalar::Cell(cell) => Some(cell),
+                    _ => None,
+                };
+                Ok(true)
+            })
+            .unwrap();
+        let cell = cell.unwrap();
+        let mut next = 0;
+        while next < cell.bytes {
+            next = source
+                .read_cell(&cell, next, ReadBudget { rows: 1, bytes: 32, chunk_bytes: 1 }, |_| Ok(()))
+                .unwrap()
+                .next;
+        }
+        let io = source.cell_io();
+        assert_eq!(io.bytes, cell.bytes);
+        assert_eq!(io.max_request, 1);
+        assert_eq!(io.cursor_opens, 1, "ordinary cell pages must retain their overflow-page cursor");
+    }
+    #[test]
+    fn wal_header_is_rejected_before_sqlite_can_create_sidecars() {
+        let (_dir, mut manifest) = fixture();
+        let file = &mut manifest.files[0];
+        let mut bytes = std::fs::read(&file.path).unwrap();
+        bytes[18] = 2;
+        bytes[19] = 2;
+        std::fs::write(&file.path, &bytes).unwrap();
+        file.digest = Sha256::digest(&bytes).into();
+        let result = Source::open(manifest.clone(), 1 << 20);
+        assert!(result.is_err(), "WAL-mode checkpoints must be consolidated before conversion");
+        for suffix in ["-wal", "-shm", "-journal"] {
+            assert!(
+                !PathBuf::from(format!("{}{suffix}", manifest.files[0].path.display())).exists(),
+                "read-only verification may not create source sidecars"
+            );
+        }
+    }
+    #[test]
+    fn cell_handles_cannot_cross_checkpoint_fingerprints() {
+        let (_a, mut first) = fixture();
+        seed_current(&mut first, 1);
+        let source = Source::open(first, 1 << 20).unwrap();
+        let mut cell = None;
+        source
+            .scan(
+                &RowCursor { source_id: 1, relation: Relation::Releases, after: None },
+                ReadBudget { rows: 1, bytes: 512, chunk_bytes: 32 },
+                |row| {
+                    cell = match row.fields.iter().find(|(c, _)| *c == Column::Name).unwrap().1.clone() {
+                        Scalar::Cell(c) => Some(c),
+                        _ => None,
+                    };
+                    Ok(true)
+                },
+            )
+            .unwrap();
+        let (_b, mut second) = fixture();
+        seed_current(&mut second, 1);
+        let path = second.files[0].path.clone();
+        let c = Connection::open(path).unwrap();
+        c.execute("update releases set name=replace(name,'posted','POSTED')", []).unwrap();
+        drop(c);
+        refresh(&mut second);
+        let other = Source::open(second, 1 << 20).unwrap();
+        assert_ne!(source.fingerprint(), other.fingerprint());
+        assert!(
+            other.read_cell(&cell.unwrap(), 0, ReadBudget { rows: 1, bytes: 64, chunk_bytes: 32 }, |_| Ok(())).is_err(),
+            "cell reference must be scoped to its original fingerprint"
+        );
+    }
+    #[test]
+    fn resumed_cell_seek_warms_its_prefix_within_the_read_budget() {
+        let (_dir, mut manifest) = fixture();
+        seed_current(&mut manifest, 1);
+        let source = Source::open(manifest, 1 << 20).unwrap();
+        let mut cell = None;
+        source
+            .scan(
+                &RowCursor { source_id: 1, relation: Relation::Releases, after: None },
+                ReadBudget { rows: 1, bytes: 512, chunk_bytes: 1 },
+                |row| {
+                    cell = match row.fields.iter().find(|(c, _)| *c == Column::Name).unwrap().1.clone() {
+                        Scalar::Cell(c) => Some(c),
+                        _ => None,
+                    };
+                    Ok(true)
+                },
+            )
+            .unwrap();
+        let cell = cell.unwrap();
+        let mut chunks = 0;
+        let end = source
+            .read_cell(&cell, 8, ReadBudget { rows: 1, bytes: 32, chunk_bytes: 1 }, |_| {
+                chunks += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(end.next, 8, "a fresh cursor must admit its seek-prefix work first");
+        assert_eq!(chunks, 0);
+        assert!(end.bytes <= 32);
+        assert_eq!(source.cell_io().bytes, 1);
     }
 }

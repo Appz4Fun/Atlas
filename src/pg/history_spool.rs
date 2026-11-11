@@ -196,6 +196,36 @@ impl Spool {
         file.read_exact(&mut bytes)?;
         Ok(bytes)
     }
+    pub fn cleanup(root: &Path, fingerprint: [u8; 32], source: i64, key: i64) -> Result<()> {
+        let mut identity = fingerprint.to_vec();
+        identity.extend_from_slice(&source.to_le_bytes());
+        identity.extend_from_slice(&key.to_le_bytes());
+        let name = Sha256::digest(&identity).iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let directory = root.join(format!("frame-{name}"));
+        if !directory.exists() {
+            return Ok(());
+        }
+        ensure!(std::fs::symlink_metadata(&directory)?.is_dir(), "CorruptObject: unknown cleanup path");
+        let mut stored = Vec::new();
+        open_file(&directory.join("identity"), false, false)?.take(49).read_to_end(&mut stored)?;
+        ensure!(stored == identity, "CorruptObject: cleanup ownership receipt");
+        let allowed = ["input.part", "input.ready", "projection.part", "projection.ready", "identity"];
+        let entries = std::fs::read_dir(&directory)?.take(6).collect::<std::io::Result<Vec<_>>>()?;
+        ensure!(
+            entries.len() <= 5
+                && entries.iter().all(|e| e.file_name().to_str().is_some_and(|name| allowed.contains(&name))),
+            "CorruptObject: unknown spool contents"
+        );
+        for name in allowed {
+            let path = directory.join(name);
+            if path.exists() {
+                std::fs::remove_file(path)?;
+            }
+        }
+        std::fs::remove_dir(&directory)?;
+        sync_directory(root)?;
+        Ok(())
+    }
     pub fn remove(&mut self) {
         self.input.take();
         self.projection.take();

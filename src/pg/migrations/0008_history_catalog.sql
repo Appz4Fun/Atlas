@@ -70,6 +70,16 @@ create table history_catalog (
     primary key(import_id,public_id),
     foreign key(import_id,selected_source_id,public_id) references history_release_variants(import_id,source_id,public_id)
 );
+create table history_frozen_resolutions (
+    import_id bytea not null,source_id bigint not null,public_id bigint not null,
+    header_object_id bigint not null,metadata_object_id bigint not null,
+    differing_columns bytea not null check(octet_length(differing_columns)<=2048),
+    oracle_code text not null check(oracle_code='embedded_release_thaw_v1'),
+    primary key(import_id,source_id,public_id),
+    foreign key(import_id,source_id,public_id) references history_release_variants,
+    foreign key(import_id,header_object_id) references history_objects,
+    foreign key(import_id,metadata_object_id) references history_objects
+);
 create table history_collection_aliases (
     import_id bytea not null,source_id bigint not null,original_signed_hash bigint not null,target_public_id bigint not null,
     primary key(import_id,source_id,original_signed_hash),
@@ -100,7 +110,7 @@ create table history_receipts (
 -- owner is the conversion authority; runtime access uses guarded Rust handles.
 revoke all on history_imports,history_sources,history_objects,history_object_chunks,
     history_release_variants,history_catalog,history_collection_aliases,
-    history_checkpoints,history_receipts from public;
+    history_checkpoints,history_receipts,history_frozen_resolutions from public;
 
 -- Statement triggers supplement explicit Rust transaction entry guards. They
 -- also cover direct Sql cursor/metadata entrypoints. Volatile function queries

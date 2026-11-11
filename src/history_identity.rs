@@ -1,5 +1,6 @@
 //! SQLite-free preservation types and bounded metadata handles.
 use serde::{Deserialize, Serialize};
+pub type ImportId = [u8; 32];
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Column {
     Id,
