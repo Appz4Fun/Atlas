@@ -6,8 +6,9 @@
 
 mod common;
 
-use std::sync::Arc;
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use common::{GROUP, Server, post_at, spawn_server};
@@ -39,23 +40,53 @@ fn a_split_group_is_shared_by_both_servers() {
         std::env::set_var("ATLAS_SAB_DIR", home.path().join("no-sabnzbd"));
     }
 
-    // a little delay per request soo a chunk takes long enough for the other
-    // server's idle worker to wake up and take some
-    let slow = |mut s: Arc<Server>| {
-        Arc::get_mut(&mut s).unwrap().xover_delay = Duration::from_millis(10);
-        s
+    // One worker per provider leaves one frontier day for each. The first chunk
+    // response waits until both have claimed work, independently of wall-clock speed.
+    let gate = Arc::new(ClaimGate::default());
+    let keys = [Arc::new(Mutex::new(String::new())), Arc::new(Mutex::new(String::new()))];
+    let server = |offset, key: Arc<Mutex<String>>| {
+        let mut state = Server::new(posts(offset));
+        let (main, gate) = (home.path().join("atlas.db"), gate.clone());
+        Arc::get_mut(&mut state).unwrap().before_xover = Some(Arc::new(move || {
+            if gate.ready.load(Ordering::Acquire) {
+                return;
+            }
+            let key = key.lock().unwrap().clone();
+            let connection =
+                rusqlite::Connection::open_with_flags(&main, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+            connection.busy_timeout(Duration::from_secs(5)).unwrap();
+            let exists: bool = connection
+                .query_row("select exists(select 1 from sqlite_master where name='backfill_chunks')", [], |r| r.get(0))
+                .unwrap();
+            if !exists {
+                return;
+            }
+            let claimed: bool = connection
+                .query_row("select exists(select 1 from backfill_chunks where state=1 and server=?1)", [&key], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            drop(connection);
+            if claimed {
+                gate.wait(key);
+            }
+        }));
+        state
     };
-    let a = slow(Server::new(posts(1)));
-    let b = slow(Server::new(posts(500_001)));
-    let (pa, pb) = (spawn_server(a.clone()), spawn_server(b.clone()));
+    let a = server(1, keys[0].clone());
+    let b = server(500_001, keys[1].clone());
+    let (pa, pb) = (spawn_server(a), spawn_server(b));
+    *keys[0].lock().unwrap() = format!("127.0.0.1:{pa}");
+    *keys[1].lock().unwrap() = format!("localhost:{pb}");
     let config = serde_json::json!({
         "usenet_servers": [
-            {"host": "127.0.0.1", "username": "bob", "password": "secret", "port": pa, "ssl": false, "connections": 4, "priority": 1},
-            {"host": "localhost", "username": "bob", "password": "secret", "port": pb, "ssl": false, "connections": 4, "priority": 1}
+            {"host": "127.0.0.1", "username": "bob", "password": "secret", "port": pa, "ssl": false, "connections": 1, "priority": 1},
+            {"host": "localhost", "username": "bob", "password": "secret", "port": pb, "ssl": false, "connections": 1, "priority": 1}
         ],
         "groups": [GROUP],
         "index_mode": "backfill",
         "batch_size": 100,
+        "parallel_groups": 1,
         "request_size": 50,
         "split_min_backlog": 500
     });
@@ -85,9 +116,42 @@ fn a_split_group_is_shared_by_both_servers() {
     stop.store(true, Ordering::Relaxed);
     assert_eq!(runner.join().unwrap(), 0);
 
+    assert!(!gate.timed_out.load(Ordering::Relaxed), "both providers must claim work before the response gate opens");
+    assert_eq!(gate.seen.lock().unwrap().len(), 2);
     let conn = atlas::db::open_with_shards(&main).unwrap();
     assert_eq!(atlas::store::totals(&conn).unwrap().1, 1200, "every post once, overlaps deduplicated");
     let servers: i64 =
         conn.query_row("select count(distinct server) from backfill_chunks where state = 2", [], |r| r.get(0)).unwrap();
     assert_eq!(servers, 2, "both servers indexed day chunks");
+}
+
+#[derive(Default)]
+struct ClaimGate {
+    seen: Mutex<BTreeSet<String>>,
+    changed: Condvar,
+    ready: AtomicBool,
+    timed_out: AtomicBool,
+}
+
+impl ClaimGate {
+    fn wait(&self, key: String) {
+        let mut seen = self.seen.lock().unwrap();
+        seen.insert(key);
+        if seen.len() == 2 {
+            self.ready.store(true, Ordering::Release);
+            self.changed.notify_all();
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !self.ready.load(Ordering::Acquire) {
+            let (held, waited) =
+                self.changed.wait_timeout(seen, deadline.saturating_duration_since(Instant::now())).unwrap();
+            seen = held;
+            if waited.timed_out() && !self.ready.load(Ordering::Acquire) {
+                self.timed_out.store(true, Ordering::Relaxed);
+                self.ready.store(true, Ordering::Release);
+                self.changed.notify_all();
+            }
+        }
+    }
 }

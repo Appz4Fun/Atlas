@@ -40,6 +40,8 @@ pub struct Server {
     /// BODY answers "430 Failed forwarding.", like a reseller whose backend didnt answer
     pub forwarding_fails: bool,
     pub xover_delay: Duration,
+    /// Optional fixture coordination before an overview response; no posts lock is held.
+    pub before_xover: Option<Arc<dyn Fn() + Send + Sync>>,
     /// an XOVER over more than this many numbers waits this long before answering, like a server that scans the
     /// whole range first
     pub slow_over: Option<(u64, Duration)>,
@@ -117,6 +119,7 @@ impl Server {
             body_troubles_left: AtomicUsize::new(0),
             forwarding_fails: false,
             xover_delay: Duration::ZERO,
+            before_xover: None,
             slow_over: None,
             compress: false,
             compress_broken: false,
@@ -304,6 +307,9 @@ pub fn serve(stream: TcpStream, state: &Server, over_limit: bool) {
                 state.xover_peak.fetch_max(now, Ordering::SeqCst);
                 state.xovers.fetch_add(1, Ordering::SeqCst);
                 state.groups_seen.lock().unwrap().insert(selected.clone().unwrap_or_default());
+                if let Some(before) = &state.before_xover {
+                    before();
+                }
                 thread::sleep(state.xover_delay);
                 if state.stalls_left.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
                     state.stalled.fetch_add(1, Ordering::SeqCst);
