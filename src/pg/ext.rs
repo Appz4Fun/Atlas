@@ -225,8 +225,8 @@ fn top_up(tx: &mut postgres::Transaction<'_>, ext: &str, keep: &str, cols: &[Col
                                  where x.log_id = p.id and x.page = e.page and x.fetched_at = e.fetched_at)",
             &[],
         )?
-    } else if let Some((id, same)) = renumbered(tx, ext)? {
-        // a row is the same by what it holds, whatever id it had: one already there (`same`) is left out, and one
+    } else if let Some((id, there)) = renumbered(tx, ext, keep)? {
+        // a row is the same by what it holds, whatever id it had: one already there (`there`) is left out, and one
         // whose id SQLite handed out again since the snapshot (a file made again, or the highest rows pruned) gets
         // the next free id instead of being dropped
         let picked = both
@@ -244,7 +244,7 @@ fn top_up(tx: &mut postgres::Transaction<'_>, ext: &str, keep: &str, cols: &[Col
             &format!(
                 "with missing as (
                      select k.* from keep.{keep_q} k
-                      where not exists (select 1 from {ext} t where {same})
+                      where not {there}
                  ),
                  n as (
                      select m.{id} as old_id,
@@ -300,20 +300,59 @@ fn advance_counters(tx: &mut postgres::Transaction<'_>) -> Result<()> {
 
 /// The tables whose keep rows are matched by content rather than id, and how: (id column, the condition that a row
 /// `t` of the ext table is keep row `k`).
-/// A title is the importer's identity (`predb::import`): equal when lowercased, whichever feed brought it, soo one
-/// that SQLite has again under other casing or from another feed since the snapshot isn't added twice. Lowercased
-/// under ICU's root collation when the server has it (full Unicode, as Rust's `to_lowercase`), else the database's.
-fn renumbered(tx: &mut postgres::Transaction<'_>, ext: &str) -> Result<Option<(&'static str, String)>> {
+/// How a keep row `k` of the tables matched by content is found already there, and the id column it renumbers.
+///
+/// A title is the importer's identity (`predb::import`): equal under Rust's `str::to_lowercase`, whichever feed brought
+/// it, soo one that SQLite has again under other casing or from another feed since the snapshot isn't added twice.
+/// The keys are made here in Rust, not with SQL's `lower()`, whose answer depends on the server's locale and ICU (a
+/// Turkish locale lowercases `I` to `ı`) and could call two titles the same that the importer keeps apart.
+fn renumbered(tx: &mut postgres::Transaction<'_>, ext: &str, keep: &str) -> Result<Option<(&'static str, String)>> {
     Ok(match ext {
         "ext_predb_titles" => {
-            let icu: bool =
-                tx.query_one("select exists (select 1 from pg_collation where collname = 'und-x-icu')", &[])?.get(0);
-            let c = if icu { "\"und-x-icu\"" } else { "\"default\"" };
-            Some(("id", format!("lower(t.title collate {c}) = lower(k.title collate {c})")))
+            for (table, from) in [("ext_title_keys", ext.to_string()), ("keep_title_keys", format!("keep.{}", keep_export::quoted(keep)))] {
+                tx.batch_execute(&format!(
+                    "drop table if exists pg_temp.{table};
+                     create temp table {table} (id bigint not null, key text collate \"C\" not null) on commit drop"
+                ))?;
+                title_keys(tx, &format!("select id, title from {from}"), table)?;
+                tx.batch_execute(&format!("create index on pg_temp.{table} (key); create index on pg_temp.{table} (id); analyze pg_temp.{table}"))?;
+            }
+            Some((
+                "id",
+                "exists (select 1 from pg_temp.keep_title_keys kk join pg_temp.ext_title_keys e on e.key = kk.key \
+                  where kk.id = k.id)"
+                    .into(),
+            ))
         }
-        "ext_predb_pages" => Some(("id", "t.source_id = k.source_id and t.body_sha256 = k.body_sha256".into())),
+        "ext_predb_pages" => Some((
+            "id",
+            "exists (select 1 from ext_predb_pages t where t.source_id = k.source_id and t.body_sha256 = k.body_sha256)"
+                .into(),
+        )),
         _ => None,
     })
+}
+
+/// `(id, title)` rows of `select` into the temp table `into` as `(id, title.to_lowercase())`, read through a cursor
+/// a chunk at a time (one connection can't read and COPY at once).
+fn title_keys(tx: &mut postgres::Transaction<'_>, select: &str, into: &str) -> Result<()> {
+    use postgres::types::Type;
+    tx.batch_execute(&format!("declare title_keys_cur no scroll cursor for {select}"))?;
+    loop {
+        let rows = tx.query("fetch 50000 from title_keys_cur", &[])?;
+        if rows.is_empty() {
+            break;
+        }
+        let sink = tx.copy_in(&format!("copy pg_temp.{into} (id, key) from stdin (format binary)"))?;
+        let mut w = postgres::binary_copy::BinaryCopyInWriter::new(sink, &[Type::INT8, Type::TEXT]);
+        for r in &rows {
+            let (id, title): (i64, String) = (r.get(0), r.get(1));
+            w.write(&[&id, &title.to_lowercase()])?;
+        }
+        w.finish()?;
+    }
+    tx.batch_execute("close title_keys_cur")?;
+    Ok(())
 }
 
 /// Hand thaws from every shard, by the release's name and group (the id doesn't survive indexing again). A thaw
@@ -638,11 +677,10 @@ fn shrank(kept: &[Manifest], now: &Manifest) -> Option<String> {
         }
     }
     for (table, &rows) in &most {
-        if CHURNS.contains(table) {
-            continue;
-        }
         match now.tables.iter().find(|t| t.table == *table) {
+            // gone is refused for a churning table too: only its row count may go down
             None => return Some(format!("{table} was in an earlier dump and is gone")),
+            Some(_) if CHURNS.contains(table) => {}
             Some(t) if rows > 0 && (t.rows == 0 || t.rows * 10 < rows * 9) => {
                 return Some(format!("{table} has {} rows, an earlier dump had {rows}", t.rows));
             }
@@ -856,6 +894,7 @@ pub fn run_cli(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keep_export::PgKind;
 
     #[test]
     fn dump_names_and_next_time() {
@@ -907,6 +946,10 @@ mod tests {
         assert_eq!(shrank(&kept, &m(vec![cache(41, 41)])), None);
         assert!(shrank(&kept, &m(vec![cache(5000, 40)])).is_some(), "one pinned row lost");
         assert!(shrank(&kept, &m(vec![t("ext_http_cache", 5000)])).is_some(), "pinned rows not counted");
+        // a churning table with no pinned rows may empty, but not disappear
+        let kept = [m(vec![cache(30, 0), t("ext_a", 5)])];
+        assert_eq!(shrank(&kept, &m(vec![cache(0, 0), t("ext_a", 5)])), None);
+        assert!(shrank(&kept, &m(vec![t("ext_a", 5)])).is_some(), "the HTTP cache table gone");
     }
 
     /// With the session's default off (a role or database set that way), the move and the restore still commit
@@ -934,6 +977,43 @@ mod tests {
         let refused =
             c.execute("insert into ext_predb_titles (title, source, added_at) values ('Async.Row-GRP', 3, 1)", &[]);
         assert!(refused.is_err());
+    }
+
+    /// Keep titles are matched by Rust's lowercasing, as the importer matches them, not by the server's `lower()`:
+    /// other casing (ASCII or not) is the same title, a dotless `ı` is another one. The keep schema is made and
+    /// dropped inside a transaction that's rolled back, soo no other test sees it.
+    #[test]
+    fn keep_titles_match_the_importers_identity() {
+        let Some(s) = super::super::testing::Schema::new() else { return };
+        let mut c = s.pool.get().unwrap();
+        let mut tx = c.transaction().unwrap();
+        tx.batch_execute(
+            "create schema keep;
+             create table keep.predb_titles (id bigint, title text, source bigint, added_at bigint);
+             insert into ext_predb_titles (id, title, source, added_at)
+                 values (1, 'Some.FILE.Title-GRP', 3, 1), (2, 'école.Title-GRP', 3, 1);
+             insert into keep.predb_titles values
+                 (1, 'some.file.title-grp', 5, 1),
+                 (2, 'ÉCOLE.TITLE-GRP', 3, 1),
+                 (3, 'Some.fıle.Title-GRP', 3, 1)",
+        )
+        .unwrap();
+        let col = |name: &str, pg| Column { name: name.into(), decl: String::new(), pg };
+        let cols = [
+            col("id", PgKind::Int),
+            col("title", PgKind::Text),
+            col("source", PgKind::Int),
+            col("added_at", PgKind::Int),
+        ];
+        assert_eq!(top_up(&mut tx, "ext_predb_titles", "predb_titles", &cols).unwrap(), 1);
+        let added: Vec<(i64, String)> = tx
+            .query("select id, title from ext_predb_titles where id > 2", &[])
+            .unwrap()
+            .iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect();
+        assert_eq!(added, [(3, "Some.fıle.Title-GRP".to_string())]);
+        tx.rollback().unwrap();
     }
 
     #[test]
