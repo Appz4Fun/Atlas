@@ -24,8 +24,8 @@ impl Drop for Guard {
     }
 }
 
-/// One bounded client step. SQL may externally sort arbitrarily large input;
-/// only scalar IDs and the configured row/byte page reach this process.
+/// One bounded reducer step. Input rows, merge heads and metadata effects
+/// advance durable indexed cursors; no transaction owns a whole epoch/upload.
 pub(crate) async fn step(
     db: &Db,
     store: &Arc<Store>,
@@ -40,33 +40,31 @@ pub(crate) async fn step(
     match phase.as_str() {
         "stage" => {
             if super::linker_source::step(db, store, epoch, budget, cache).await? {
-                on_native_db(db, move |c| super::linker_epoch::scope(c, epoch)).await?;
+                on_native_db(db, move |c| super::linker_epoch::scope_step(c, epoch, budget.rows)).await?;
             }
         }
-        "select" => on_native_db(db, move |c| super::linker_select::select(c, epoch)).await?,
+        "select" => {
+            on_native_db(db, move |c| super::linker_select::select_step(c, epoch, budget.rows).map(|_| ())).await?
+        }
         "files" => {
             on_native_db(db, move |c| {
-                super::linker_plan::prepare(c, epoch)?;
-                super::linker_files::infer(c, epoch)
+                if !super::linker_plan::prepare_step(c, epoch, budget.rows)? {
+                    return Ok(());
+                }
+                super::linker_files::infer_step(c, epoch, budget.rows).map(|_| ())
             })
             .await?
         }
         "chain" => {
-            on_native_db(db, move |c| super::linker::plan_files(c, epoch, 32)).await?;
+            on_native_db(db, move |c| super::linker::plan_files(c, epoch, budget.rows)).await?;
         }
         "plan" => {
-            on_native_db(db, move |c| {
-                if !super::linker_plan::late_one(c, epoch)? {
-                    super::linker_plan::chain_one(c, epoch)?;
-                }
-                Ok(())
-            })
-            .await?;
+            on_native_db(db, move |c| super::linker_output::step(c, epoch, budget.rows)).await?;
         }
         "emit" => {
             super::linker_emit::emit_page(db, epoch, budget).await?;
         }
-        "ack" => on_native_db(db, move |c| super::linker_plan::ack(c, epoch)).await?,
+        "ack" => on_native_db(db, move |c| super::linker_plan::ack_step(c, epoch, budget.rows).map(|_| ())).await?,
         "done" => return Ok(true),
         _ => bail!("unknown native linker phase"),
     }
@@ -99,9 +97,13 @@ pub(crate) async fn run(db: Db, store: Arc<Store>, stopping: impl Fn() -> bool) 
         let result: Result<bool> = async {
             if !imported {
                 let dir = store.root().join("_state");
-                on_native_db(&db, move |c| super::linker_bootstrap::import(c, &dir, chrono::Utc::now().timestamp()))
-                    .await?;
-                imported = true;
+                imported = on_native_db(&db, move |c| {
+                    super::linker_bootstrap::step(c, &dir, chrono::Utc::now().timestamp(), Budget::default())
+                })
+                .await?;
+                if !imported {
+                    return Ok(false);
+                }
             }
             if current.is_none()
                 && on_native_db(&db, |c| super::linker_gc::step(c, chrono::Utc::now().timestamp(), 256)).await?
@@ -199,6 +201,15 @@ mod tests {
         for file in 0..32 {
             let poster = if file == 0 {
                 "MÃ¼ller@example.invalid".to_owned()
+            } else if file == 2 {
+                // Valid, incompressible author text must stay a payload, never a B-tree key.
+                use sha2::{Digest, Sha256};
+                format!(
+                    "zz-{}",
+                    (0..160)
+                        .map(|n| format!("{:x}", Sha256::digest(format!("generic-poster-{n}"))))
+                        .collect::<String>()
+                )
             } else {
                 format!("file{file:02}@example.invalid")
             };
@@ -266,9 +277,26 @@ mod tests {
         assert_eq!(golden.iter().map(|r| r.articles.len()).sum::<usize>(), 299);
         assert!(!golden.iter().flat_map(|r| &r.articles).any(|a| a.message_id.starts_with("<file1part")));
         assert!(golden.iter().flat_map(|r| &r.articles).any(|a| a.message_id.contains('�')));
+        drop(store);
+        let (store, _) = Store::open(
+            StoreConfig { bounded_maps: true, sealers: 1, ..StoreConfig::new(dir.path()) },
+            KeepSet { live_from: i64::MIN / 2, ..KeepSet::default() },
+        )
+        .unwrap();
         let mut c = schema.pool.get().unwrap();
-        super::super::linker_bootstrap::import(&mut c, &state, 250000).unwrap();
         c.execute("insert into linker_linked_hours select generate_series(-14,100)", &[]).unwrap();
+        c.batch_execute("create table mutation_audit(tx bigint primary key,phase text not null,mutations bigint not null);
+            create function audit_linker_mutation() returns trigger language plpgsql as $$ declare p text; begin
+              if current_setting('synchronous_commit')<>'on' then raise exception 'non-durable native mutation'; end if;
+              select phase into p from linker_epochs where phase<>'done' order by id limit 1;
+              insert into mutation_audit values(txid_current(),coalesce(p,'done'),1)
+                on conflict(tx) do update set mutations=mutation_audit.mutations+1;
+              return null; end $$;
+            do $$ declare tab record; begin for tab in select tablename from pg_tables where schemaname=current_schema() and tablename like 'linker_%' loop
+              execute format('create trigger audit_mutations after insert or update or delete on %I for each row execute function audit_linker_mutation()',tab.tablename);
+            end loop;end $$").unwrap();
+        c.batch_execute("set synchronous_commit=off").unwrap();
+        super::super::linker_bootstrap::import(&mut c, &state, 250000).unwrap();
         let database: String = c.query_one("select current_database()", &[]).unwrap().get(0);
         drop(c);
         let db = crate::indexer::shared_postgres_db(
@@ -280,7 +308,24 @@ mod tests {
                 ..Default::default()
             },
             &database,
-            crate::indexer::PgWriteLimits { max_pending_bytes: 4096, max_job_bytes: 4096, concurrent_saves: 1 },
+            crate::indexer::PgWriteLimits { max_pending_bytes: 65536, max_job_bytes: 32768, concurrent_saves: 1 },
+        )
+        .unwrap();
+        let mut owner_client = postgres::Client::connect(&schema.url, postgres::NoTls).unwrap();
+        owner_client
+            .batch_execute(&format!("set search_path to \"{}\"; set synchronous_commit=off", schema.name))
+            .unwrap();
+        assert!(
+            owner_client
+                .query_one("select pg_try_advisory_lock(hashtext('atlas.indexer'),hashtext($1))", &[&schema.name])
+                .unwrap()
+                .get::<_, bool>(0)
+        );
+        let owner = Arc::new(crate::pg::indexer_runtime::Owner::new(owner_client));
+        let db = crate::indexer::owned_postgres_db(
+            db,
+            owner,
+            crate::indexer::PgWriteLimits { max_pending_bytes: 65536, max_job_bytes: 32768, concurrent_saves: 1 },
         )
         .unwrap();
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -310,6 +355,34 @@ mod tests {
             }
             assert_eq!(cache.verifications, 2);
         });
+        let mut audit = schema.pool.get().unwrap();
+        let phases =
+            audit.query("select phase,max(mutations) from mutation_audit group by phase order by phase", &[]).unwrap();
+        for phase in ["stage", "select", "files", "chain", "plan", "emit", "ack"] {
+            let row = phases.iter().find(|r| r.get::<_, String>(0) == phase).expect("every phase was exercised");
+            let limit = match phase {
+                "stage" => 66,
+                // File merge: one output insert + consumed-input delete per unit, plus checkpoint.
+                "chain" => 2 * 3 + 1,
+                "ack" => 4,
+                "emit" => 10,
+                _ => 13,
+            };
+            assert!(
+                row.get::<_, i64>(1) <= limit,
+                "{phase} exceeded mutation bound: {} > {limit}",
+                row.get::<_, i64>(1)
+            );
+        }
+        assert_eq!(
+            audit
+                .query_one("select count(*) from linker_places where octet_length(poster)>5000", &[])
+                .unwrap()
+                .get::<_, i64>(0),
+            1,
+            "long poster must reach acknowledged live metadata, not merely pending selection"
+        );
+        drop(audit);
         let flatten = |releases: Vec<crate::parser::Release>| {
             let mut rows: Vec<_> = releases
                 .into_iter()
@@ -364,7 +437,7 @@ mod tests {
             store.tick().unwrap();
             ticket.wait(Duration::from_secs(5)).unwrap();
             store.close().unwrap();
-            assert_eq!(store.segment_snapshot("a.example", 1).unwrap().count, blocks);
+            assert_eq!(store.segment_snapshot("a.example", 1).unwrap().unwrap().count, blocks);
             let state = dir.path().join("_state");
             std::fs::create_dir_all(&state).unwrap();
             std::fs::write(state.join("linker.rec"), "L\t-14\t100\nC\t1\t1\ta.example\nE\n").unwrap();
@@ -607,7 +680,7 @@ mod tests {
                     for _ in 0..3 {
                         store.housekeeping();
                     }
-                    assert!(store.segment_snapshot("group.example", 1).is_none());
+                    assert!(store.segment_snapshot("group.example", 1).unwrap().is_none());
                     store.set_linker_coverage(None);
                     for turn in 0..2000 {
                         assert!(turn < 1999, "completed epoch cleanup did not progress");

@@ -23,7 +23,7 @@ create table linker_files (
     planned boolean not null default false,
     primary key (epoch,id)
 );
-create index linker_file_order on linker_files (epoch,first_posted,(articles <> 1),last_posted,poster,id) where not planned;
+-- Lexical poster file ties are ordered by bounded external merge runs.
 create table linker_file_groups (
     epoch bigint not null,
     file_id bigint not null,
@@ -222,14 +222,16 @@ create table linker_epoch_pending_sources (
     primary key(epoch,source)
 );
 create table linker_places (
-    poster bytea primary key,
+    poster bytea not null,
     release_name text not null,
     group_name text not null,
     file_number bigint not null,
     file_total bigint not null,
     parts bigint not null,
     oldest bigint not null,
-    added bigint not null
+    added bigint not null,
+    poster_key bytea generated always as (sha256(poster)) stored,
+    primary key(poster_key)
 );
 create table linker_uploads (
     release_name text primary key,
@@ -247,16 +249,20 @@ create table linker_upload_groups (
     primary key(release_name,group_id)
 );
 create table linker_place_firsts (
-    poster bytea not null references linker_places(poster) on delete cascade,
+    poster bytea not null,
     group_id bigint not null,
     article_number bigint not null,
-    primary key(poster,group_id)
+    primary key(poster_key,group_id),
+    poster_key bytea generated always as (sha256(poster)) stored,
+    foreign key(poster_key) references linker_places(poster_key) on delete cascade
 );
 create table linker_place_leads (
-    poster bytea not null references linker_places(poster) on delete cascade,
+    poster bytea not null,
     ordinal bigint not null,
     part bigint not null,
-    primary key(poster,ordinal)
+    primary key(poster_key,ordinal),
+    poster_key bytea generated always as (sha256(poster)) stored,
+    foreign key(poster_key) references linker_places(poster_key) on delete cascade
 );
 create table linker_candidates (
     epoch bigint not null references linker_epochs(id) on delete cascade,
@@ -332,7 +338,8 @@ create table linker_late_files (
     encounter_rank bigint not null,
     articles bigint not null,
     planned boolean not null default false,
-    primary key(epoch,poster)
+    primary key(epoch,poster_key),
+    poster_key bytea generated always as (sha256(poster)) stored
 );
 create table linker_planned_places (
     epoch bigint not null references linker_epochs(id) on delete cascade,
@@ -345,23 +352,26 @@ create table linker_planned_places (
     parts bigint not null,
     oldest bigint not null,
     added bigint not null,
-    primary key(epoch,poster)
+    primary key(epoch,poster_key),
+    poster_key bytea generated always as (sha256(poster)) stored
 );
 create table linker_planned_firsts (
     epoch bigint not null,
     poster bytea not null,
     group_id bigint not null,
     article_number bigint not null,
-    primary key(epoch,poster,group_id),
-    foreign key(epoch,poster) references linker_planned_places(epoch,poster) on delete cascade
+    primary key(epoch,poster_key,group_id),
+    foreign key(epoch,poster_key) references linker_planned_places(epoch,poster_key) on delete cascade,
+    poster_key bytea generated always as (sha256(poster)) stored
 );
 create table linker_planned_leads (
     epoch bigint not null,
     poster bytea not null,
     ordinal bigint not null,
     part bigint not null,
-    primary key(epoch,poster,ordinal),
-    foreign key(epoch,poster) references linker_planned_places(epoch,poster) on delete cascade
+    primary key(epoch,poster_key,ordinal),
+    foreign key(epoch,poster_key) references linker_planned_places(epoch,poster_key) on delete cascade,
+    poster_key bytea generated always as (sha256(poster)) stored
 );
 create table linker_planned_uploads (
     epoch bigint not null references linker_epochs(id) on delete cascade,
@@ -415,7 +425,7 @@ create index linker_complete_manifest on linker_source_blocks(group_name,day,gen
 -- A source-ID high-watermark snapshots the immutable pending inbox without
 -- copying its entire historical source set into every idle epoch.
 alter table linker_epochs add column pending_source_through bigint not null default 0;
-create index linker_places_expiry on linker_places(added,poster);
+create index linker_places_expiry on linker_places(added,poster_key);
 create index linker_uploads_expiry on linker_uploads(added,release_name);
 -- Publication receipts enqueue only proven full identities. Cleanup seeks
 -- those keys rather than repeatedly scanning all unresolved source rows.
@@ -423,3 +433,223 @@ create table linker_duplicate_work (
     message_key bytea primary key,
     message_id bytea not null
 );
+
+-- Native flush barrier identity changes on Store reopen; the high-watermark
+-- bounds all pre-call uncommitted rows without a whole-group discovery scan.
+alter table linker_epochs add column flush_identity bytea;
+alter table linker_epochs add column flush_through bigint not null default 0;
+
+-- Fixed-size reducer state and indexed external ordering; no complete phase
+-- is recomputed after an interrupted transaction.
+create table linker_work (
+ epoch bigint not null references linker_epochs(id) on delete cascade,
+ kind text not null,
+ state text not null,
+ primary key(epoch,kind)
+);
+create table linker_file_input (
+ epoch bigint not null references linker_epochs(id) on delete cascade,
+ poster_rank bigint not null,
+ posted bigint not null,
+ source_rank bigint not null,
+ source bigint not null,
+ source_ordinal bigint not null,
+ poster bytea not null,
+ again boolean not null,
+ is_new boolean not null,
+ group_id bigint not null,
+ primary key(epoch,poster_rank,posted,source_rank)
+);
+
+create table linker_file_posters (
+ epoch bigint not null references linker_epochs(id) on delete cascade,
+ poster bytea not null,
+ first_rank bigint not null,
+ primary key(epoch,poster_key),
+    poster_key bytea generated always as (sha256(poster)) stored
+);
+
+create table linker_selection_sources (
+ epoch bigint not null references linker_epochs(id) on delete cascade,
+ source bigint not null,
+ priority smallint not null,
+ new_block boolean not null,
+ group_name text not null,
+ day bigint not null,
+ seq bigint not null,
+ consumed boolean not null default false,
+ primary key(epoch,source)
+);
+create index linker_selection_encounter on linker_selection_sources(epoch,priority,group_name collate "C",day,seq,source) where not consumed;
+create table linker_selection_winners (
+ epoch bigint not null references linker_epochs(id) on delete cascade,
+ message_key bytea not null,
+ message_id bytea not null,
+ primary key(epoch,message_key)
+);
+create table linker_poster_order (
+ epoch bigint not null references linker_epochs(id) on delete cascade,
+ poster bytea not null,
+ first_rank bigint not null,
+ primary key(epoch,poster_key),
+    poster_key bytea generated always as (sha256(poster)) stored
+);
+create index linker_legacy_hash_lookup on linker_legacy_ids(hash,added);
+
+create table linker_scope_sources (
+ epoch bigint not null references linker_epochs(id) on delete cascade,
+ source bigint not null,
+ day bigint not null,
+ old_block boolean not null,
+ new_block boolean not null,
+ primary key(epoch,source)
+);
+create table linker_scope_days (
+ epoch bigint not null references linker_epochs(id) on delete cascade,
+ day bigint not null,
+ has_new boolean not null,
+ primary key(epoch,day)
+);
+create table linker_scope_hours (
+ epoch bigint not null references linker_epochs(id) on delete cascade,
+ hour bigint not null,
+ primary key(epoch,hour)
+);
+create index linker_pending_backfill_day on backfill_chunks(day) where state<>2;
+
+create index linker_upload_seed_order on linker_uploads(first_posted,release_name collate "C");
+create index linker_late_encounter on linker_late_rows(epoch,source_rank);
+
+
+create index linker_active_encounter on linker_chains(epoch,active_order) where active_order is not null and not expired;
+
+alter table linker_chains add column articles bigint not null default 0;
+alter table linker_chains add column new_material boolean not null default false;
+alter table linker_chains add column fresh_first bigint;
+alter table linker_chains add column fresh_last bigint;
+
+alter table linker_file_input add column article_number bigint not null;
+alter table linker_file_input add column message_id bytea not null;
+
+create table linker_plan_groups (
+ epoch bigint not null references linker_epochs(id) on delete cascade,
+ chain_id bigint not null,
+ group_id bigint not null,
+ articles bigint not null,
+ group_name text not null,
+ primary key(epoch,chain_id,group_id)
+);
+create index linker_plan_home on linker_plan_groups(epoch,chain_id,articles desc,group_id);
+
+create table linker_import_scans (
+ name text primary key,
+ source_identity bytea not null,
+ state text not null,
+ complete boolean not null default false,
+ ended boolean not null default false
+);
+create table linker_import_lines (
+ name text not null,
+ ordinal bigint not null,
+ start_bytes bigint not null,
+ end_bytes bigint not null,
+ primary key(name,ordinal)
+);
+create table linker_import_ranges (
+ name text not null,
+ first_ordinal bigint not null,
+ last_ordinal bigint not null,
+ primary key(name,last_ordinal)
+);
+
+create table linker_import_jobs (
+ name text primary key,
+ source_identity bytea not null,
+ state text not null,
+ complete boolean not null default false
+);
+create table linker_import_members (
+ kind smallint not null,
+ key bigint not null,
+ value bigint not null,
+ primary key(kind,key)
+);
+
+alter table linker_bootstrap add column import_phase smallint not null default 0;
+create table linker_import_state_records (
+ ordinal bigint primary key,
+ tag smallint not null,
+ a bigint not null,
+ b bigint not null,
+ group_name text not null
+);
+
+create table linker_sort_rows (
+ epoch bigint not null references linker_epochs(id) on delete cascade,
+ kind smallint not null,
+ level bigint not null,
+ position bigint not null,
+ file_id bigint not null,
+ group_id bigint not null,
+ article_number bigint not null,
+ message_id bytea not null,
+ source bigint not null,
+ source_ordinal bigint not null,
+ posted bigint not null,
+ primary key(epoch,kind,level,position)
+);
+create index linker_sorted_file on linker_sort_rows(epoch,kind,level,file_id,position);
+create table linker_sort_state (
+ epoch bigint not null references linker_epochs(id) on delete cascade,
+ kind smallint not null,
+ state text not null,
+ complete boolean not null,
+ level bigint not null,
+ primary key(epoch,kind)
+);
+
+create table linker_coverage (
+ group_name text not null,
+ day bigint not null,
+ generation bytea not null,
+ through bigint not null,
+ primary key(group_name,day,generation)
+);
+
+-- Hash handles are never identity evidence: each conflicting payload is checked
+-- before INSERT/UPSERT can suppress or overwrite an exact poster. Membership
+-- rows additionally check their parent payload. Every lookup is an indexed
+-- fixed-width prefix and returns at most one row.
+create function linker_check_poster() returns trigger language plpgsql as $$
+declare prior bytea; parent text;
+begin
+    if TG_ARGV[0]='epoch' then
+        execute format('select poster from %I.%I where epoch=$1 and poster_key=sha256($2) limit 1',TG_TABLE_SCHEMA,TG_TABLE_NAME)
+            into prior using NEW.epoch,NEW.poster;
+    else
+        execute format('select poster from %I.%I where poster_key=sha256($1) limit 1',TG_TABLE_SCHEMA,TG_TABLE_NAME)
+            into prior using NEW.poster;
+    end if;
+    if prior is not null and prior<>NEW.poster then raise exception 'native poster digest collision'; end if;
+    if TG_NARGS>1 then
+        parent:=TG_ARGV[1];
+        if TG_ARGV[0]='epoch' then
+            execute format('select poster from %I.%I where epoch=$1 and poster_key=sha256($2)',TG_TABLE_SCHEMA,parent)
+                into prior using NEW.epoch,NEW.poster;
+        else
+            execute format('select poster from %I.%I where poster_key=sha256($1)',TG_TABLE_SCHEMA,parent)
+                into prior using NEW.poster;
+        end if;
+        if prior is not null and prior<>NEW.poster then raise exception 'native poster parent digest collision'; end if;
+    end if;
+    return NEW;
+end $$;
+create trigger linker_places_exact before insert or update on linker_places for each row execute function linker_check_poster('live');
+create trigger linker_place_firsts_exact before insert or update on linker_place_firsts for each row execute function linker_check_poster('live','linker_places');
+create trigger linker_place_leads_exact before insert or update on linker_place_leads for each row execute function linker_check_poster('live','linker_places');
+create trigger linker_late_files_exact before insert or update on linker_late_files for each row execute function linker_check_poster('epoch');
+create trigger linker_planned_places_exact before insert or update on linker_planned_places for each row execute function linker_check_poster('epoch');
+create trigger linker_planned_firsts_exact before insert or update on linker_planned_firsts for each row execute function linker_check_poster('epoch','linker_planned_places');
+create trigger linker_planned_leads_exact before insert or update on linker_planned_leads for each row execute function linker_check_poster('epoch','linker_planned_places');
+create trigger linker_file_posters_exact before insert or update on linker_file_posters for each row execute function linker_check_poster('epoch');
+create trigger linker_poster_order_exact before insert or update on linker_poster_order for each row execute function linker_check_poster('epoch');

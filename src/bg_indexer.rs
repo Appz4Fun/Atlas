@@ -1913,7 +1913,7 @@ fn run_native(config: Config, storage: crate::pg::StorageConfig) -> i32 {
         let _ = signal_hook::flag::register(signal_hook::consts::SIGTERM, stop.clone());
         let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, stop.clone());
     }
-    if crate::nxv_store::live::spawn(&headers).is_err() {
+    if crate::nxv_store::live::spawn_bounded(&headers).is_err() {
         ui::error("could not start the durable NXV header store");
         return 1;
     }

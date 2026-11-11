@@ -6,6 +6,18 @@ use postgres::Client;
 // Children precede parents so deleting one parent cannot cascade through a
 // huge file/upload. Each step removes at most `budget` rows from ONE table.
 const LEAVES: &[&str] = &[
+    "linker_sort_rows",
+    "linker_sort_state",
+    "linker_plan_groups",
+    "linker_scope_sources",
+    "linker_scope_days",
+    "linker_scope_hours",
+    "linker_selection_sources",
+    "linker_selection_winners",
+    "linker_poster_order",
+    "linker_file_input",
+    "linker_file_posters",
+    "linker_work",
     "linker_emission_rows",
     "linker_planned_firsts",
     "linker_planned_leads",
@@ -129,13 +141,13 @@ pub(crate) fn expire_metadata(client: &mut Client, session_now: i64, budget: i64
     }
     let before = session_now.saturating_sub(8 * crate::xref::KEEP_SECS);
     if let Some(row) = tx.query_opt(
-        "select poster from linker_places where added<$1 order by added,poster limit 1 for update",
+        "select poster from linker_places where added<$1 order by added,poster_key limit 1 for update",
         &[&before],
     )? {
         let poster: Vec<u8> = row.get(0);
         for table in ["linker_place_leads", "linker_place_firsts"] {
             let n = tx.execute(
-                &format!("delete from {table} where ctid in(select ctid from {table} where poster=$1 limit $2)"),
+                &format!("delete from {table} where ctid in(select ctid from {table} where poster_key=sha256($1) and poster=$1 limit $2)"),
                 &[&poster, &budget],
             )?;
             if n > 0 {
@@ -143,7 +155,7 @@ pub(crate) fn expire_metadata(client: &mut Client, session_now: i64, budget: i64
                 return Ok(MetadataExpiry::Progress);
             }
         }
-        tx.execute("delete from linker_places where poster=$1", &[&poster])?;
+        tx.execute("delete from linker_places where poster_key=sha256($1) and poster=$1", &[&poster])?;
         tx.commit()?;
         return Ok(MetadataExpiry::Progress);
     }

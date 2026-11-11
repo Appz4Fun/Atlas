@@ -1,132 +1,264 @@
-//! One-time state migration before native epoch work can start. The original
-//! files remain unchanged; all import clocks and receipts live on the fenced
-//! PostgreSQL session. No legacy Linker/Links/LinkedIds object is constructed.
-
-use anyhow::{Context, Result, ensure};
+//! One-time bounded import driver. No epoch can observe partial imported
+//! records, metadata replacement, expiry, or historical-hour expansion.
+use super::linker_metadata::Number;
+use super::linker_stage::Budget;
+use anyhow::{Result, ensure};
 use postgres::Client;
-use sha2::{Digest, Sha256};
+use serde::{Deserialize, Serialize};
 use std::fs::File;
-use std::io::{BufRead, BufReader};
-use std::os::unix::fs::MetadataExt;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
-/// Finish any interrupted bootstrap and return its immutable migration clock.
-pub(crate) fn import(client: &mut Client, dir: &Path, now: i64) -> Result<i64> {
+pub(crate) fn step(client: &mut Client, dir: &Path, now: i64, budget: Budget) -> Result<bool> {
     super::linker::durable_execute(
         client,
         "insert into linker_bootstrap(singleton,logical_now) values(true,$1) on conflict do nothing",
         &[&now],
     )?;
-    let state = client.query_one("select logical_now,complete from linker_bootstrap where singleton", &[])?;
-    let now: i64 = state.get(0);
-    if state.get::<_, bool>(1) {
-        return Ok(now);
+    let row =
+        client.query_one("select logical_now,complete,import_phase from linker_bootstrap where singleton", &[])?;
+    if row.get::<_, bool>(1) {
+        return Ok(true);
     }
-    super::linker_ids::import(client, dir, now)?;
-    super::linker_metadata::import(client, dir, now)?;
-    import_state(client, &dir.join("linker.rec"))?;
-    super::linker::durable_execute(client, "update linker_bootstrap set complete=true where singleton", &[])?;
-    Ok(now)
-}
-
-fn checked(line: &str) -> Result<()> {
-    let f: Vec<_> = line.splitn(4, '\t').collect();
-    match f.as_slice() {
-        ["L", a, b] | ["S", a, b] => {
-            a.parse::<i64>()?;
-            b.parse::<i64>()?;
-        }
-        ["C", day, count, _] => {
-            day.parse::<i64>()?;
-            count.parse::<u32>()?;
-        }
-        ["W", at] => {
-            at.parse::<i64>()?;
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn import_state(client: &mut Client, path: &Path) -> Result<()> {
-    const NAME: &str = "linker.rec:state";
-    let file = match File::open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let pending: bool = client
-                .query_one("select exists(select 1 from linker_id_imports where name=$1 and not complete)", &[&NAME])?
-                .get(0);
-            ensure!(!pending, "legacy linker state disappeared during migration");
-            return Ok(());
-        }
-        Err(e) => return Err(e.into()),
+    let now: i64 = row.get(0);
+    let phase: i16 = row.get(2);
+    let finished = match phase {
+        0 => super::linker_ids::step(client, dir, now, budget)?,
+        1 => super::linker_metadata::step(client, dir, now, budget)?,
+        2 => state_step(client, &dir.join("linker.rec"), budget)?,
+        _ => true,
     };
-    let metadata = file.metadata()?;
-    let mut digest = Sha256::new();
-    digest.update(metadata.dev().to_le_bytes());
-    digest.update(metadata.ino().to_le_bytes());
-    digest.update(metadata.len().to_le_bytes());
-    digest.update(metadata.mtime().to_le_bytes());
-    digest.update(metadata.mtime_nsec().to_le_bytes());
-    let identity: [u8; 32] = digest.finalize().into();
-    // Validate first: a truncated/invalid state must not partially acknowledge
-    // historical hours. This scan retains only one compact scalar record.
-    let mut ended = false;
-    for line in BufReader::new(file).lines() {
-        let line = line?;
-        checked(&line).context("invalid legacy linker state")?;
-        if line == "E" {
-            ended = true;
-        }
+    if finished {
+        super::linker::durable_execute(
+            client,
+            "update linker_bootstrap set import_phase=import_phase+1,complete=$1 where singleton",
+            &[&(phase >= 2)],
+        )?;
     }
-    ensure!(ended, "legacy linker state is cut short");
-    super::linker::durable_execute(
-        client,
-        "insert into linker_id_imports(name,source_identity) values($1,$2) on conflict do nothing",
-        &[&NAME, &&identity[..]],
+    Ok(finished && phase >= 2)
+}
+
+#[cfg(test)]
+pub(crate) fn import(client: &mut Client, dir: &Path, now: i64) -> Result<i64> {
+    while !step(client, dir, now, Budget::default())? {}
+    Ok(client.query_one("select logical_now from linker_bootstrap where singleton", &[])?.get(0))
+}
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
+struct State {
+    phase: u8,
+    ordinal: i64,
+    offset: u64,
+    end: u64,
+    tag: u8,
+    field: u8,
+    number: Number,
+    text: Vec<u8>,
+    a: i64,
+    b: i64,
+    invalid_numeric: bool,
+    applied: i64,
+    range: Option<(i64, i64)>,
+}
+impl State {
+    fn delimiter(&mut self, b: u8) -> Result<()> {
+        if !(self.tag == b'C' && self.field == 3) {
+            match self.number.take() {
+                Some(value) => {
+                    if self.field == 1 {
+                        self.a = value;
+                    } else if self.field == 2 {
+                        self.b = value;
+                    }
+                }
+                None => self.invalid_numeric = true,
+            }
+        }
+        let last = if self.tag == b'W' {
+            1
+        } else if self.tag == b'C' {
+            3
+        } else {
+            2
+        };
+        if b == b'\n' {
+            // Legacy splitn parsing ignores wrong-shaped records altogether;
+            // numeric errors are fatal only for a recognized complete shape.
+            if self.field != last {
+                self.phase = 0;
+                return Ok(());
+            }
+            ensure!(!self.invalid_numeric, "invalid legacy numeric state");
+            if self.tag == b'C' {
+                ensure!((0..=u32::MAX as i64).contains(&self.b), "invalid legacy block count");
+            }
+            self.phase = 2;
+        } else {
+            self.field = self.field.saturating_add(1);
+        }
+        Ok(())
+    }
+}
+
+fn state_step(client: &mut Client, path: &Path, budget: Budget) -> Result<bool> {
+    const NAME: &str = "linker.rec:state";
+    if !super::linker_import_scan::step(client, path, "linker.rec", budget)? {
+        return Ok(false);
+    }
+    if !path.exists() {
+        return Ok(true);
+    }
+    ensure!(
+        client.query_one("select ended from linker_import_scans where name='linker.rec'", &[])?.get::<_, bool>(0),
+        "legacy linker state is cut short"
+    );
+    let mut file = File::open(path)?;
+    let identity = super::linker_import_scan::identity(&file)?;
+    let mut tx = super::linker::durable_transaction(client)?;
+    let saved = tx.query_opt(
+        "select source_identity,state,complete from linker_import_jobs where name=$1 for update",
+        &[&NAME],
     )?;
-    let saved = client
-        .query_one("select source_identity,offset_bytes,complete from linker_id_imports where name=$1", &[&NAME])?;
-    ensure!(saved.get::<_, Vec<u8>>(0) == identity, "legacy linker state changed during migration");
-    if saved.get::<_, bool>(2) {
-        return Ok(());
-    }
-    // offset_bytes here is the ordinal of a state record, never expanded hours.
-    let done: i64 = saved.get(1);
-    for (index, line) in BufReader::new(File::open(path)?).lines().enumerate() {
-        let index = i64::try_from(index)? + 1;
-        let line = line?;
-        if index <= done {
-            continue;
+    let mut s: State = if let Some(row) = saved {
+        ensure!(row.get::<_, Vec<u8>>(0) == identity, "legacy state changed during import");
+        if row.get::<_, bool>(2) {
+            return Ok(true);
         }
-        let f: Vec<_> = line.splitn(4, '\t').collect();
-        let mut tx = super::linker::durable_transaction(client)?;
-        tx.batch_execute("set local work_mem='4MB'")?;
-        match f.as_slice() {
-            ["L", a, b] => {
-                tx.execute("insert into linker_linked_hours select generate_series($1::bigint,$2::bigint) on conflict do nothing",&[&a.parse::<i64>()?,&b.parse::<i64>()?])?;
+        serde_json::from_str(&row.get::<_, String>(1))?
+    } else {
+        State::default()
+    };
+    let mut done = false;
+    match s.phase {
+        0 => {
+            if let Some((ordinal, start, end)) = super::linker_import_scan::next(&mut tx, "linker.rec", s.ordinal)? {
+                s = State { ordinal, offset: start, end, ..Default::default() };
+                file.seek(SeekFrom::Start(start))?;
+                let mut tag = [0; 2];
+                if end - start >= 2 {
+                    file.read_exact(&mut tag)?;
+                }
+                if matches!(tag[0], b'L' | b'S' | b'C' | b'W') && tag[1] == b'\t' {
+                    s.tag = tag[0];
+                    s.field = 1;
+                    s.offset += 2;
+                    s.phase = 1;
+                }
+            } else {
+                s.phase = 3;
             }
-            ["S", day, at] => {
-                tx.execute("insert into linker_day_seen values($1,$2) on conflict(day) do update set first_seen=excluded.first_seen",&[&day.parse::<i64>()?,&at.parse::<i64>()?])?;
-            }
-            ["C", day, count, group] => {
-                tx.execute("insert into linker_legacy_counts values($1,$2,$3) on conflict(group_name,day) do update set blocks=excluded.blocks",&[group,&day.parse::<i64>()?,&(count.parse::<u32>()? as i64)])?;
-            }
-            ["W", at] => {
-                tx.execute("update linker_bootstrap set waiting_from=$1 where singleton", &[&at.parse::<i64>()?])?;
-            }
-            _ => {}
         }
-        tx.execute("update linker_id_imports set offset_bytes=$2 where name=$1", &[&NAME, &index])?;
-        tx.commit()?;
+        1 => {
+            file.seek(SeekFrom::Start(s.offset))?;
+            let length = (s.end - s.offset).min(budget.bytes as u64) as usize;
+            let mut bytes = vec![0; length];
+            file.read_exact(&mut bytes)?;
+            for b in bytes {
+                s.offset += 1;
+                if b == b'\n' || b == b'\t' && !(s.tag == b'C' && s.field == 3) {
+                    s.delimiter(b)?;
+                } else if s.tag == b'C' && s.field == 3 {
+                    s.text.push(b);
+                } else {
+                    s.number.byte(b);
+                }
+            }
+            // BufRead::lines historically accepts a final scalar record with
+            // no newline. The durable index preserves that state-file case.
+            if s.offset == s.end && s.phase == 1 {
+                s.delimiter(b'\n')?;
+            }
+        }
+        2 => {
+            tx.execute(
+                "insert into linker_import_state_records values($1,$2,$3,$4,$5)",
+                &[&s.ordinal, &i16::from(s.tag), &s.a, &s.b, &String::from_utf8_lossy(&s.text).as_ref()],
+            )?;
+            s = State { ordinal: s.ordinal, ..Default::default() };
+        }
+        3 => {
+            // Every accepted scalar record has validated before ANY historical
+            // hour becomes visible; an enormous L interval is then paged.
+            if let Some((next,last))=s.range {
+                let end=last.min(next.saturating_add(i64::try_from(budget.rows)?-1));
+                tx.execute("insert into linker_linked_hours select generate_series($1::bigint,$2::bigint) on conflict do nothing", &[&next,&end])?;
+                s.range=if end==last {None}else{Some((end+1,last))};
+            }else if let Some(row)=tx.query_opt("select ordinal,tag,a,b,group_name from linker_import_state_records where ordinal>$1 order by ordinal limit 1", &[&s.applied])? {
+                s.applied=row.get(0);let a:i64=row.get(2);let b:i64=row.get(3);
+                match u8::try_from(row.get::<_,i16>(1))? {
+                    b'L'=>{if a<=b {s.range=Some((a,b));}}
+                    b'S'=>{tx.execute("insert into linker_day_seen values($1,$2) on conflict(day) do update set first_seen=excluded.first_seen", &[&a,&b])?;}
+                    b'C'=>{tx.execute("insert into linker_legacy_counts values($1,$2,$3) on conflict(group_name,day) do update set blocks=excluded.blocks", &[&row.get::<_,String>(4),&a,&b])?;}
+                    b'W'=>{tx.execute("update linker_bootstrap set waiting_from=$1 where singleton", &[&a])?;}
+                    _=>unreachable!(),
+                }
+            }else{done=true;}
+        }
+        _ => unreachable!(),
     }
-    super::linker::durable_execute(client, "update linker_id_imports set complete=true where name=$1", &[&NAME])?;
-    Ok(())
+    tx.execute("insert into linker_import_jobs values($1,$2,$3,$4) on conflict(name) do update set state=excluded.state,complete=excluded.complete", &[&NAME,&identity,&serde_json::to_string(&s)?,&done])?;
+    tx.commit()?;
+    Ok(done)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn historical_range_pages_survive_failure_without_replaying_completed_hours() {
+        let Some(schema) = crate::pg::testing::Schema::new() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let text = "L\t1\t137\nL\tbad\t2\textra\nS\t2\t50\nC\t2\t7\tgroup.example\nW\t100\nE";
+        std::fs::write(dir.path().join("linker.rec"), text).unwrap();
+        let mut c = schema.pool.get().unwrap();
+        c.batch_execute("create table bootstrap_audit(tx bigint primary key, mutations bigint not null);
+            create function audit_bootstrap() returns trigger language plpgsql as $$ begin
+              insert into bootstrap_audit values(txid_current(),1) on conflict(tx) do update set mutations=bootstrap_audit.mutations+1;
+              return null; end $$;
+            create function fail_hour() returns trigger language plpgsql as $$ begin
+              if new.hour=42 then raise exception 'synthetic range storage exhaustion' using errcode='53100'; end if;return new;end $$;
+            create trigger fail before insert on linker_linked_hours for each row execute function fail_hour()").unwrap();
+        for table in [
+            "linker_bootstrap",
+            "linker_import_scans",
+            "linker_import_lines",
+            "linker_import_ranges",
+            "linker_import_jobs",
+            "linker_import_state_records",
+            "linker_linked_hours",
+            "linker_day_seen",
+            "linker_legacy_counts",
+        ] {
+            c.batch_execute(&format!("create trigger audit after insert or update or delete on {table} for each row execute function audit_bootstrap()" )).unwrap();
+        }
+        let budget = Budget { rows: 1, bytes: 7 };
+        for turn in 0..500 {
+            assert!(turn < 499, "range did not reach injected failure");
+            match step(&mut c, dir.path(), 1000, budget) {
+                Ok(false) => {}
+                Ok(true) => panic!("range skipped injected hour"),
+                Err(_) => break,
+            }
+        }
+        assert_eq!(c.query_one("select count(*) from linker_linked_hours", &[]).unwrap().get::<_, i64>(0), 41);
+        let state: State = serde_json::from_str(
+            &c.query_one("select state from linker_import_jobs where name='linker.rec:state'", &[])
+                .unwrap()
+                .get::<_, String>(0),
+        )
+        .unwrap();
+        assert_eq!(state.range, Some((42, 137)));
+        drop(c);
+        let mut c = schema.pool.get().unwrap();
+        c.batch_execute("drop trigger fail on linker_linked_hours").unwrap();
+        while !step(&mut c, dir.path(), 9000, budget).unwrap() {}
+        assert_eq!(c.query_one("select count(*) from linker_linked_hours", &[]).unwrap().get::<_, i64>(0), 137);
+        assert_eq!(c.query_one("select logical_now from linker_bootstrap", &[]).unwrap().get::<_, i64>(0), 1000);
+        assert!(c.query_one("select max(mutations) from bootstrap_audit", &[]).unwrap().get::<_, i64>(0) <= 3);
+        assert_eq!(std::fs::read_to_string(dir.path().join("linker.rec")).unwrap(), text);
+    }
+
     #[test]
     fn bootstrap_preserves_legacy_ranges_counts_and_frozen_clock() {
         let Some(schema) = crate::pg::testing::Schema::new() else { return };

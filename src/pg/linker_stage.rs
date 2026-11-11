@@ -8,7 +8,7 @@ use nntp_xover_engine::streamer::FieldCursor;
 use postgres::Client;
 use sha2::{Digest, Sha256};
 
-use crate::nxv_store::segment::{Entry, Snapshot};
+use crate::nxv_store::segment::{BlockMap, Entry, Snapshot};
 
 #[derive(Clone, Copy)]
 pub(crate) struct Budget {
@@ -34,16 +34,14 @@ pub(crate) struct Progress {
 pub(crate) struct VerifiedBlock {
     pub(crate) identity: [u8; 32],
     pub(crate) entry: Entry,
-    map: std::sync::Arc<memmap2::Mmap>,
+    map: BlockMap,
     digest: [u8; 32],
 }
 impl VerifiedBlock {
     pub(crate) fn new(snapshot: &Snapshot, entry: Entry) -> Result<Self> {
         ensure!((entry.seq as usize) < snapshot.count, "block is outside native linker snapshot");
-        let map = snapshot.map.as_ref().context("native linker snapshot has no mapping")?.clone();
-        let start = usize::try_from(entry.offset)?;
-        let end = start.checked_add(entry.len as usize).context("native linker block extent overflow")?;
-        let bytes = map.get(start..end).context("native linker source block is truncated")?;
+        let map = snapshot.map_block(entry)?;
+        let bytes = &map[..];
         let digest = Sha256::digest(bytes).into();
         let view = NxvBlockView::from_mmap_slice(bytes).context("reading native linker source block")?;
         ensure!(view.verify_body(), "native linker source block checksum failed");
@@ -74,9 +72,7 @@ pub(crate) fn stage_verified(
 ) -> Result<Progress> {
     ensure!(budget.rows > 0 && budget.bytes > 0, "native linker staging budget must be positive");
     let entry = &block.entry;
-    let start = usize::try_from(entry.offset)?;
-    let end = start.checked_add(entry.len as usize).context("native linker block extent overflow")?;
-    let view = NxvBlockView::from_mmap_slice(&block.map[start..end]).context("reading verified native source block")?;
+    let view = NxvBlockView::from_mmap_slice(&block.map).context("reading verified native source block")?;
     let mut tx = super::linker::durable_transaction(client)?;
     let source = tx.query_one(
         "insert into linker_source_blocks(group_name,day,generation,seq,digest,rows,manifest)
@@ -179,18 +175,52 @@ pub(crate) fn stage_verified(
     Ok(Progress { source: id, scanned, complete: ended })
 }
 
-/// Scalar complete-coverage query for expiry. Missing records, incomplete
-/// pages or a new generation return false. The store rechecks the captured
-/// prefix under its writer lock before deleting any source files.
+/// A durable contiguous prefix avoids COUNT/DISTINCT over an arbitrary day.
+/// Normal sequential staging advances it with two fixed-key mutations.
+pub(crate) fn record_coverage(
+    tx: &mut postgres::Transaction<'_>,
+    group: &str,
+    day: i64,
+    identity: [u8; 32],
+    seq: i64,
+) -> Result<()> {
+    tx.execute(
+        "insert into linker_coverage values($1,$2,$3,0) on conflict do nothing",
+        &[&group, &day, &&identity[..]],
+    )?;
+    tx.execute(
+        "update linker_coverage set through=$4+1 where group_name=$1 and day=$2 and generation=$3 and through=$4",
+        &[&group, &day, &&identity[..], &seq],
+    )?;
+    Ok(())
+}
+
+/// Missing/out-of-order coverage repairs at most 32 sequence keys per callback.
+/// Until that cursor catches up, expiry fails closed and the next sweep resumes.
 pub(crate) fn covered(client: &mut Client, group: &str, day: i64, identity: [u8; 32], count: usize) -> Result<bool> {
     let count = i64::try_from(count)?;
-    Ok(client
-        .query_one(
-            "select count(distinct seq)=$4 from linker_source_blocks
-        where group_name=$1 and day=$2 and generation=$3 and seq>=0 and seq<$4 and complete",
-            &[&group, &day, &&identity[..], &count],
-        )?
-        .get(0))
+    let prior = client.query_opt(
+        "select through from linker_coverage where group_name=$1 and day=$2 and generation=$3",
+        &[&group, &day, &&identity[..]],
+    )?;
+    let mut through = prior.map_or(0, |row| row.get::<_, i64>(0));
+    if through >= count {
+        return Ok(true);
+    }
+    let mut tx = super::linker::durable_transaction(client)?;
+    for _ in 0..32 {
+        if through >= count {
+            break;
+        }
+        let complete:bool=tx.query_one("select exists(select 1 from linker_source_blocks where group_name=$1 and day=$2 and generation=$3 and seq=$4 and complete)", &[&group,&day,&&identity[..],&through])?.get(0);
+        if !complete {
+            break;
+        }
+        through += 1;
+    }
+    tx.execute("insert into linker_coverage values($1,$2,$3,$4) on conflict(group_name,day,generation) do update set through=greatest(linker_coverage.through,excluded.through)", &[&group,&day,&&identity[..],&through])?;
+    tx.commit()?;
+    Ok(through >= count)
 }
 
 #[cfg(test)]
@@ -199,6 +229,46 @@ mod tests {
     use crate::nxv_store::segment::{ENTRY_LEN, Segment, parse_day_name};
     use nntp_xover_engine::container::{BlockMeta, NxvBlockBuilder};
     use std::os::unix::fs::FileExt;
+
+    #[test]
+    fn coverage_repairs_only_a_fixed_prefix_and_keeps_gaps_and_new_generations() {
+        let Some(schema) = crate::pg::testing::Schema::new() else { return };
+        let mut c = schema.pool.get().unwrap();
+        let identity = [7u8; 32];
+        c.execute("insert into linker_source_blocks(group_name,day,generation,seq,digest,rows,scanned,complete) select 'group.example',1,$1,n,decode(md5(n::text),'hex'),1,1,true from generate_series(0,999) n where n<>70", &[&&identity[..]]).unwrap();
+        c.batch_execute("set synchronous_commit=off").unwrap();
+        assert!(!covered(&mut c, "group.example", 1, identity, 1000).unwrap());
+        assert_eq!(c.query_one("select through from linker_coverage", &[]).unwrap().get::<_, i64>(0), 32);
+        drop(c);
+        let mut c = schema.pool.get().unwrap();
+        assert!(!covered(&mut c, "group.example", 1, identity, 1000).unwrap());
+        assert_eq!(c.query_one("select through from linker_coverage", &[]).unwrap().get::<_, i64>(0), 64);
+        assert!(!covered(&mut c, "group.example", 1, identity, 1000).unwrap());
+        assert_eq!(c.query_one("select through from linker_coverage", &[]).unwrap().get::<_, i64>(0), 70);
+        assert!(!covered(&mut c, "group.example", 1, [8; 32], 1000).unwrap());
+        c.execute("insert into linker_source_blocks(group_name,day,generation,seq,digest,rows,scanned,complete) values('group.example',1,$1,70,$1,1,1,true)", &[&&identity[..]]).unwrap();
+        let mut previous = 70;
+        loop {
+            let done = covered(&mut c, "group.example", 1, identity, 1000).unwrap();
+            let through: i64 = c
+                .query_one("select through from linker_coverage where generation=$1", &[&&identity[..]])
+                .unwrap()
+                .get(0);
+            assert!(through > previous && through - previous <= 32);
+            previous = through;
+            if done {
+                break;
+            }
+        }
+        assert_eq!(previous, 1000);
+        assert!(!covered(&mut c, "group.example", 1, identity, 1001).unwrap());
+        assert!(covered(&mut c, "group.example", 1, identity, 1000).unwrap());
+        c.batch_execute("analyze linker_source_blocks").unwrap();
+        let plans=c.query("explain (analyze,format text) select exists(select 1 from linker_source_blocks where group_name=$1 and day=$2 and generation=$3 and seq=$4 and complete)", &[&"group.example",&1i64,&&identity[..],&998i64]).unwrap();
+        let text = plans.iter().map(|r| r.get::<_, String>(0)).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("Index"), "{text}");
+        assert!(!text.contains("Seq Scan"), "{text}");
+    }
 
     #[test]
     fn staged_block_resumes_small_pages_without_dropping_filtered_rows() {
@@ -217,7 +287,7 @@ mod tests {
         reserved.arena.write_all_at(&bytes, reserved.entry.offset).unwrap();
         reserved.index.write_all_at(&reserved.entry.to_bytes(), reserved.entry.seq as u64 * ENTRY_LEN as u64).unwrap();
         seg.publish(&reserved).unwrap();
-        let snap = seg.bounded_snapshot();
+        let snap = seg.bounded_snapshot().unwrap();
         let budget = Budget { rows: 2, bytes: 1024 };
         let mut client = schema.pool.get().unwrap();
         let first = stage_block(&mut client, &snap, "group.example", day, &reserved.entry, budget).unwrap();

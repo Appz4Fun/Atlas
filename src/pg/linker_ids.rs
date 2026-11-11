@@ -3,19 +3,15 @@
 //! semantics until expiry, rather than pretending a hash identifies one string.
 
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
-use std::os::unix::fs::MetadataExt;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use postgres::Client;
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 
-use super::linker_legacy::Committed;
-
-const BATCH: usize = 256;
-
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 struct Hex {
     value: u64,
     valid: bool,
@@ -51,6 +47,7 @@ impl Hex {
 /// Constant-state I-line decoder. Numeric fields can contain arbitrarily many
 /// leading zeroes without allocating a token. Byte positions are checkpointed
 /// only at hash/line boundaries, where `time` suffices to resume decoding.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Decoder {
     state: u8,
     time: i64,
@@ -118,135 +115,140 @@ impl Decoder {
     }
 }
 
-fn checkpoint(
-    client: &mut Client,
-    name: &str,
+#[derive(serde::Serialize, serde::Deserialize)]
+struct IdState {
+    ordinal: i64,
     offset: u64,
-    time: Option<i64>,
-    ids: &mut Vec<(i64, i64)>,
-) -> Result<()> {
-    let mut tx = super::linker::durable_transaction(client)?;
-    // At most BATCH identities are held. Expired entries can be pruned later in
-    // bounded pages without ever loading native membership into a HashSet.
-    for &(hash, added) in ids.iter() {
-        tx.execute(
-            "insert into linker_legacy_ids values($1,$2,$3) on conflict(origin,hash)
-            do update set added=case when excluded.origin='links.rec' then excluded.added
-                else greatest(linker_legacy_ids.added,excluded.added) end",
-            &[&name, &hash, &added],
-        )?;
+    end: u64,
+    decoder: Decoder,
+}
+impl Default for IdState {
+    fn default() -> Self {
+        Self { ordinal: 0, offset: 0, end: 0, decoder: Decoder::new(None) }
     }
-    tx.execute(
-        "update linker_id_imports set offset_bytes=$2,id_time=$3 where name=$1",
-        &[&name, &i64::try_from(offset)?, &time],
-    )?;
-    tx.commit()?;
-    ids.clear();
-    Ok(())
 }
 
-/// Import both historical formats without modifying them. The native ownership
-/// lock must already be held, so no legacy linker can append concurrently.
-/// `now` is the immutable migration logical time, not a fresh clock per retry.
-pub(crate) fn import(client: &mut Client, dir: &Path, now: i64) -> Result<()> {
+/// Each call commits one byte/identity page, including the decoder state inside
+/// an arbitrarily long token. Source range discovery is independently paged.
+pub(crate) fn step(client: &mut Client, dir: &Path, now: i64, budget: super::linker_stage::Budget) -> Result<bool> {
     for (name, binary) in [("links.rec", false), ("linked-ids.rec", true)] {
         let path = dir.join(name);
-        let file = match File::open(&path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let pending: bool = client
+        if !binary && !super::linker_import_scan::step(client, &path, name, budget)? {
+            return Ok(false);
+        }
+        if !step_file(client, &path, name, binary, now, budget)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+fn step_file(
+    client: &mut Client,
+    path: &Path,
+    name: &str,
+    binary: bool,
+    now: i64,
+    budget: super::linker_stage::Budget,
+) -> Result<bool> {
+    ensure!(budget.rows > 0 && budget.bytes > 0, "ID import budget must be positive");
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            ensure!(
+                !client
                     .query_one(
                         "select exists(select 1 from linker_id_imports where name=$1 and not complete)",
-                        &[&name],
+                        &[&name]
                     )?
-                    .get(0);
-                ensure!(!pending, "legacy linker source disappeared before migration completed");
-                continue;
-            }
-            Err(e) => return Err(e.into()),
-        };
-        let metadata = file.metadata()?;
-        let mut identity = Sha256::new();
-        identity.update(metadata.dev().to_le_bytes());
-        identity.update(metadata.ino().to_le_bytes());
-        identity.update(metadata.len().to_le_bytes());
-        identity.update(metadata.mtime().to_le_bytes());
-        identity.update(metadata.mtime_nsec().to_le_bytes());
-        let identity: [u8; 32] = identity.finalize().into();
-        super::linker::durable_execute(
-            client,
-            "insert into linker_id_imports(name,source_identity) values($1,$2) on conflict do nothing",
-            &[&name, &&identity[..]],
-        )?;
-        let state = client.query_one(
-            "select source_identity,offset_bytes,id_time,complete from linker_id_imports where name=$1",
-            &[&name],
-        )?;
-        ensure!(state.get::<_, Vec<u8>>(0) == identity, "legacy linker source changed during migration");
-        if state.get::<_, bool>(3) {
-            continue;
+                    .get::<_, bool>(0),
+                "legacy ID source disappeared during import"
+            );
+            return Ok(true);
         }
-        let mut offset = u64::try_from(state.get::<_, i64>(1))?;
-        let resume: Option<i64> = state.get(2);
-        let before = now.saturating_sub(8 * crate::xref::KEEP_SECS);
-        let mut ids = Vec::with_capacity(BATCH);
-        if binary {
-            let mut reader = BufReader::new(file);
-            ensure!(offset % 16 == 0, "invalid legacy binary checkpoint");
-            reader.seek(SeekFrom::Start(offset))?;
-            let mut record = [0u8; 16];
-            let mut scanned = 0;
-            loop {
-                match reader.read_exact(&mut record) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                    Err(e) => return Err(e.into()),
+        Err(e) => return Err(e.into()),
+    };
+    let identity = super::linker_import_scan::identity(&file)?;
+    let job = format!("{name}:ids");
+    let mut tx = super::linker::durable_transaction(client)?;
+    let saved = tx
+        .query_opt("select source_identity,state,complete from linker_import_jobs where name=$1 for update", &[&job])?;
+    let mut s: IdState = if let Some(row) = saved {
+        ensure!(row.get::<_, Vec<u8>>(0) == identity, "legacy ID source changed during import");
+        if row.get::<_, bool>(2) {
+            return Ok(true);
+        }
+        serde_json::from_str(&row.get::<_, String>(1))?
+    } else {
+        IdState::default()
+    };
+    let mut ids = Vec::with_capacity(budget.rows);
+    let mut done = false;
+    if binary {
+        file.seek(SeekFrom::Start(s.offset))?;
+        for _ in 0..budget.rows.min((budget.bytes / 16).max(1)) {
+            let mut bytes = [0; 16];
+            match file.read_exact(&mut bytes) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    done = true;
+                    break;
                 }
-                let hash = i64::from_le_bytes(record[..8].try_into().expect("8 bytes"));
-                let at = i64::from_le_bytes(record[8..].try_into().expect("8 bytes"));
-                if at >= before {
-                    ids.push((hash, at));
-                }
-                offset += 16;
-                scanned += 1;
-                if scanned == BATCH {
-                    checkpoint(client, name, offset, None, &mut ids)?;
-                    scanned = 0;
-                }
+                Err(e) => return Err(e.into()),
+            }
+            s.offset += 16;
+            let hash = i64::from_le_bytes(bytes[..8].try_into().unwrap());
+            let added = i64::from_le_bytes(bytes[8..].try_into().unwrap());
+            if added >= now.saturating_sub(8 * crate::xref::KEEP_SECS) {
+                ids.push((hash, added));
+            }
+        }
+    } else if s.offset >= s.end {
+        if let Some((ordinal, start, end)) = super::linker_import_scan::next(&mut tx, name, s.ordinal)? {
+            s.ordinal = ordinal;
+            s.offset = start;
+            s.end = end;
+            s.decoder = Decoder::new(None);
+            file.seek(SeekFrom::Start(start))?;
+            let mut tag = [0; 2];
+            if end - start >= 2 {
+                file.read_exact(&mut tag)?;
+            }
+            if tag != *b"I\t" {
+                s.offset = end;
             }
         } else {
-            let mut ranges = Committed::new(file)?;
-            let mut reader = BufReader::new(File::open(&path)?);
-            let mut decoder = Decoder::new(resume);
-            let mut scanned = 0;
-            while let Some(range) = ranges.next_range()? {
-                if range.end <= offset {
-                    continue;
-                }
-                if offset < range.start {
-                    offset = range.start;
-                    decoder = Decoder::new(None);
-                }
-                reader.seek(SeekFrom::Start(offset))?;
-                let mut byte = [0u8; 1];
-                while offset < range.end {
-                    reader.read_exact(&mut byte).context("reading committed legacy range")?;
-                    offset += 1;
-                    if let Some((hash, at)) = decoder.byte(byte[0]) {
-                        ids.push((hash as i64, at));
-                        scanned += 1;
-                        if scanned == BATCH {
-                            checkpoint(client, name, offset, decoder.resume_time(), &mut ids)?;
-                            scanned = 0;
-                        }
-                    }
-                }
-                checkpoint(client, name, offset, None, &mut ids)?;
+            done = true;
+        }
+    } else {
+        file.seek(SeekFrom::Start(s.offset))?;
+        let mut bytes = vec![0; (s.end - s.offset).min(budget.bytes as u64) as usize];
+        file.read_exact(&mut bytes)?;
+        for byte in bytes {
+            s.offset += 1;
+            if let Some((hash, added)) = s.decoder.byte(byte) {
+                ids.push((hash as i64, added));
+            }
+            if ids.len() == budget.rows {
+                break;
             }
         }
-        checkpoint(client, name, offset, None, &mut ids)?;
-        super::linker::durable_execute(client, "update linker_id_imports set complete=true where name=$1", &[&name])?;
     }
+    for (hash, added) in ids {
+        tx.execute("insert into linker_legacy_ids values($1,$2,$3) on conflict(origin,hash) do update set
+            added=case when excluded.origin='links.rec' then excluded.added else greatest(linker_legacy_ids.added,excluded.added) end", &[&name,&hash,&added])?;
+    }
+    tx.execute("insert into linker_id_imports(name,source_identity,offset_bytes,id_time,complete) values($1,$2,$3,$4,$5)
+        on conflict(name) do update set offset_bytes=excluded.offset_bytes,id_time=excluded.id_time,complete=excluded.complete",
+        &[&name,&identity,&i64::try_from(s.offset)?,&s.decoder.resume_time(),&done])?;
+    tx.execute("insert into linker_import_jobs values($1,$2,$3,$4) on conflict(name) do update set state=excluded.state,complete=excluded.complete",
+        &[&job,&identity,&serde_json::to_string(&s)?,&done])?;
+    tx.commit()?;
+    Ok(done)
+}
+
+#[cfg(test)]
+pub(crate) fn import(client: &mut Client, dir: &Path, now: i64) -> Result<()> {
+    while !step(client, dir, now, super::linker_stage::Budget::default())? {}
     Ok(())
 }
 
