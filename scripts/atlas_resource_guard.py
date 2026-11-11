@@ -151,30 +151,58 @@ class Sampler:
         return Observation(memory, swap, free, reads)
 
 
-def stop_child(child, grace_seconds=10):
-    """Only call for a child started with start_new_session=True."""
+def group_has_no_live_members(child):
+    # Darwin can report EPERM for a zombie-only group. Require a reaped
+    # leader and a readable process inventory before treating it as gone.
+    if sys.platform != "darwin" or child.poll() is None:
+        return False
     try:
-        os.killpg(child.pid, signal.SIGTERM)
+        result = subprocess.run(
+            ["/bin/ps", "-axo", "pgid=,stat="], capture_output=True,
+            text=True, check=True, timeout=2)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    rows = result.stdout.splitlines()
+    if not rows:
+        return False
+    for row in rows:
+        fields = row.split()
+        if len(fields) != 2 or not fields[0].isdigit():
+            return False
+        if int(fields[0]) == child.pid and not fields[1].startswith("Z"):
+            return False
+    return True
+
+
+def signal_owned_group(child, signum):
+    try:
+        os.killpg(child.pid, signum)
     except ProcessLookupError:
         child.wait()
+        return False
+    except PermissionError:
+        if not group_has_no_live_members(child):
+            raise
+        child.wait()
+        return False
+    return True
+
+
+def stop_child(child, grace_seconds=10):
+    """Only call for a child started with start_new_session=True."""
+    if not signal_owned_group(child, signal.SIGTERM):
         return
     deadline = time.monotonic() + grace_seconds
     while True:
         # Reap an exited leader, but descendants still belong to the owned group.
         child.poll()
-        try:
-            os.killpg(child.pid, 0)
-        except ProcessLookupError:
-            child.wait()
+        if not signal_owned_group(child, 0):
             return
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
         time.sleep(min(remaining, 0.02))
-    try:
-        os.killpg(child.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
+    signal_owned_group(child, signal.SIGKILL)
     child.wait()
 
 
