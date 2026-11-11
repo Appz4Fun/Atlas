@@ -1,5 +1,7 @@
 //! Native storage through the actual background-indexer entry point.
 mod common;
+#[path = "common/pg_outage.rs"]
+mod pg_outage;
 
 use std::fs::File;
 use std::io::Read;
@@ -129,10 +131,27 @@ fn background_entrypoint_persists_postgres_and_nxv_without_sqlite() {
     let owner: i32 = owners[0].get(0);
     let terminated: bool = schema.client.query_one("select pg_terminate_backend($1)", &[&owner]).unwrap().get(0);
     assert!(terminated);
-    assert!(
-        !wait_for_exit(&mut runner, Duration::from_secs(10)).success(),
-        "loss of ownership must stop the indexer with failure"
-    );
+    let deadline = Instant::now() + Duration::from_secs(12);
+    loop {
+        assert!(runner.0.try_wait().unwrap().is_none(), "owner loss must pause the same process");
+        let fresh: bool = schema
+            .client
+            .query_one(
+                "select exists(select 1 from pg_locks where locktype='advisory' and granted and objsubid=2
+             and database=(select oid from pg_database where datname=current_database())
+             and classid::bigint=(hashtext('atlas.indexer')::bigint & 4294967295)
+             and objid::bigint=(hashtext($1)::bigint & 4294967295) and pid<>$2)",
+                &[&schema.name, &owner],
+            )
+            .unwrap()
+            .get(0);
+        if fresh {
+            break;
+        }
+        assert!(Instant::now() < deadline, "a fresh owner was not acquired after outage");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(runner.stop().success());
 
     let mut restarted = start(home.path(), "restarted.log");
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -187,6 +206,31 @@ fn background_entrypoint_persists_postgres_and_nxv_without_sqlite() {
     }
     assert!(rows >= 50, "native background lost durable NXV input");
     assert_no_sqlite(home.path());
+}
+
+#[test]
+fn native_startup_offline_pauses_without_provider_or_sqlite_and_stops_promptly() {
+    let home = tempfile::tempdir().unwrap();
+    let server = Server::new(vec![]);
+    let port = spawn_server(Arc::clone(&server));
+    let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let unused = socket.local_addr().unwrap().port();
+    drop(socket);
+    let url = format!("host=127.0.0.1 port={unused} dbname=example user=example connect_timeout=1");
+    let config = configuration(&url, "example", port);
+    std::fs::write(home.path().join("config.json"), config.to_string()).unwrap();
+    let mut runner = start(home.path(), "offline.log");
+    std::thread::sleep(Duration::from_secs(4));
+    assert!(runner.0.try_wait().unwrap().is_none(), "startup outage must keep the process alive");
+    assert_eq!(server.accepted.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(!home.path().join("header-store").exists());
+    assert_no_sqlite(home.path());
+    let status: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(home.path().join("status.json")).unwrap()).unwrap();
+    assert_eq!(status["status"], "postgres_paused");
+    let began = Instant::now();
+    assert!(runner.stop().success());
+    assert!(began.elapsed() < Duration::from_secs(3));
 }
 
 #[test]
@@ -288,9 +332,9 @@ fn configuration(url: &str, schema: &str, port: u16) -> serde_json::Value {
 
 fn assert_no_sqlite(home: &std::path::Path) {
     for path in walk_files(home) {
-        let mut magic = [0; 16];
-        File::open(path).unwrap().read(&mut magic).unwrap();
-        assert_ne!(&magic, b"SQLite format 3\0", "native background opened a SQLite store");
+        let mut magic = Vec::with_capacity(16);
+        File::open(path).unwrap().take(16).read_to_end(&mut magic).unwrap();
+        assert_ne!(magic.as_slice(), b"SQLite format 3\0", "native background opened a SQLite store");
     }
 }
 
@@ -353,4 +397,330 @@ fn walk_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
         }
     }
     files
+}
+
+fn wait_until(runner: &mut Runner, home: &std::path::Path, seconds: u64, mut condition: impl FnMut() -> bool) {
+    let until = Instant::now() + Duration::from_secs(seconds);
+    while !condition() {
+        assert!(
+            runner.0.try_wait().unwrap().is_none(),
+            "outage runner exited: {}",
+            std::fs::read_to_string(home.join("outage.log")).unwrap()
+        );
+        assert!(
+            Instant::now() < until,
+            "owned outage condition timed out: {}",
+            std::fs::read_to_string(home.join("outage.log")).unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn paused(home: &std::path::Path) -> bool {
+    std::fs::read_to_string(home.join("status.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .is_some_and(|status| status["status"] == "postgres_paused")
+}
+
+fn owned_backend(schema: &mut Schema) -> Option<i32> {
+    let rows = schema
+        .client
+        .query(
+            "select pid from pg_locks where locktype='advisory' and granted and objsubid=2
+        and database=(select oid from pg_database where datname=current_database())
+        and classid::bigint=(hashtext('atlas.indexer')::bigint & 4294967295)
+        and objid::bigint=(hashtext($1)::bigint & 4294967295)",
+            &[&schema.name],
+        )
+        .unwrap();
+    assert!(rows.len() <= 1, "concurrent advisory owners");
+    rows.first().map(|row| row.get(0))
+}
+
+fn identities(schema: &mut Schema) -> Vec<String> {
+    [
+        "select id,group_name,encode(identity_key,'hex') identity_key,name from releases order by id",
+        "select id,release_id,encode(filename_key,'hex') filename_key,filename from files order by id",
+        "select release_id,file_id,encode(message_id,'hex') message_id,part,bytes from segments order by release_id,message_key",
+        "select release_id,generation from pp_queue order by release_id",
+    ].iter().map(|query| {
+        let query = query.replace("from releases", &format!("from {}.releases",schema.name))
+            .replace("from files", &format!("from {}.files",schema.name))
+            .replace("from segments", &format!("from {}.segments",schema.name))
+            .replace("from pp_queue", &format!("from {}.pp_queue",schema.name));
+        schema.client.query_one(&format!("select coalesce(json_agg(row_to_json(t)),'[]')::text from ({query}) t"), &[]).unwrap().get(0)
+    }).collect()
+}
+
+fn fifty_posts() -> Vec<common::Post> {
+    (1..=50)
+        .map(|n| {
+            post(n, &format!(r#""Example.Release.{}.part{}.rar" yEnc (1/1)"#, (n - 1) / 10, (n - 1) % 10), 100, vec![])
+        })
+        .collect()
+}
+
+#[test]
+fn owned_proxy_repeated_outages_and_lost_commit_ack_resume_exact_data() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let Ok(url) = std::env::var("ATLAS_PG_TEST_URL") else { return };
+    if url.is_empty() {
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let name = format!("t_outage_{}", std::process::id());
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    atlas::pg::migrate::run(&mut client, &name).unwrap();
+    let mut schema = Schema { client, name };
+    let proxy = pg_outage::Proxy::new(&url);
+    let server = Server::new(fifty_posts());
+    let port = spawn_server(server.clone());
+    let config = configuration(&proxy.url(&url), &schema.name, port);
+    std::fs::write(home.path().join("config.json"), config.to_string()).unwrap();
+    let mut runner = start(home.path(), "outage.log");
+    wait_until(&mut runner, home.path(), 5, || paused(home.path()));
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(server.accepted.load(SeqCst), 0);
+    assert!(!home.path().join("header-store").exists());
+    assert_no_sqlite(home.path());
+    proxy.suppress_commit.store(true, SeqCst);
+    proxy.online.store(true, SeqCst);
+    wait_until(&mut runner, home.path(), 35, || {
+        schema
+            .client
+            .query_one(&format!("select count(*) from {}.segments", schema.name), &[])
+            .unwrap()
+            .get::<_, i64>(0)
+            == 50
+            && proxy.ambiguous.load(SeqCst) == 1
+            && !paused(home.path())
+    });
+    // Let durable cursor acknowledgment catch up with the final release save.
+    std::thread::sleep(Duration::from_secs(2));
+    let expected = identities(&mut schema);
+    let generation = schema
+        .client
+        .query_one(&format!("select count(*),min(generation),max(generation) from {}.pp_queue", schema.name), &[])
+        .unwrap();
+    assert_eq!(
+        (generation.get::<_, i64>(0), generation.get::<_, i64>(1), generation.get::<_, i64>(2)),
+        (5, 1, 1),
+        "ambiguous replay incremented semantic queue generations"
+    );
+    let mut owner = owned_backend(&mut schema).unwrap();
+    let mut seen = std::collections::HashSet::from([owner]);
+    let baseline_resources = child_resources(runner.0.id());
+    let mut prior_cursor: Option<i64> = None;
+    for _ in 0..3 {
+        proxy.drop_connections();
+        wait_until(&mut runner, home.path(), 6, || paused(home.path()));
+        let fetched = server.xovers.load(SeqCst);
+        std::thread::sleep(Duration::from_millis(1200));
+        assert_eq!(server.xovers.load(SeqCst), fetched, "provider ingest continued while paused");
+        assert_no_sqlite(home.path());
+        proxy.online.store(true, SeqCst);
+        wait_until(&mut runner, home.path(), 15, || {
+            owned_backend(&mut schema).is_some_and(|pid| pid != owner) && !paused(home.path())
+        });
+        owner = owned_backend(&mut schema).unwrap();
+        assert!(seen.insert(owner), "reused a dead ownership session");
+        assert_eq!(identities(&mut schema), expected, "replay changed persisted identities or queue generations");
+        let cursor: Option<i64> = schema
+            .client
+            .query_one(&format!("select min(backfill_cursor) from {}.groups", schema.name), &[])
+            .unwrap()
+            .get(0);
+        if let (Some(old), Some(new)) = (prior_cursor, cursor) {
+            assert!(new <= old, "backfill cursor moved backward in progress");
+        }
+        prior_cursor = cursor;
+        let resources = child_resources(runner.0.id());
+        assert!(
+            resources.0 <= baseline_resources.0 + 4,
+            "file descriptors accumulated: {baseline_resources:?} -> {resources:?}"
+        );
+        assert!(
+            resources.1 <= baseline_resources.1 + 4,
+            "threads accumulated: {baseline_resources:?} -> {resources:?}"
+        );
+        eprintln!("recovered child resources: fds={} threads={}", resources.0, resources.1);
+    }
+    assert_eq!(proxy.ambiguous.load(SeqCst), 1);
+    assert!(runner.stop().success());
+    assert_no_sqlite(home.path());
+}
+
+#[test]
+fn silent_owned_forward_quarantines_until_return_then_uses_fresh_owner() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let Ok(url) = std::env::var("ATLAS_PG_TEST_URL") else { return };
+    if url.is_empty() {
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let name = format!("t_blackhole_{}", std::process::id());
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    atlas::pg::migrate::run(&mut client, &name).unwrap();
+    let mut schema = Schema { client, name };
+    let proxy = pg_outage::Proxy::new(&url);
+    proxy.online.store(true, SeqCst);
+    let server = Server::new(fifty_posts());
+    let port = spawn_server(server.clone());
+    let config = configuration(&proxy.url(&url), &schema.name, port);
+    std::fs::write(home.path().join("config.json"), config.to_string()).unwrap();
+    let mut runner = start(home.path(), "outage.log");
+    wait_until(&mut runner, home.path(), 25, || {
+        schema
+            .client
+            .query_one(&format!("select count(*) from {}.segments", schema.name), &[])
+            .unwrap()
+            .get::<_, i64>(0)
+            == 50
+    });
+    std::thread::sleep(Duration::from_secs(2));
+    let expected = identities(&mut schema);
+    let owner = owned_backend(&mut schema).unwrap();
+    proxy.blackhole.store(true, SeqCst);
+    wait_until(&mut runner, home.path(), 35, || paused(home.path()));
+    assert_eq!(owned_backend(&mut schema), Some(owner), "replaced an unresolved old writer");
+    let fetched = server.xovers.load(SeqCst);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(server.xovers.load(SeqCst), fetched);
+    proxy.blackhole.store(false, SeqCst);
+    wait_until(&mut runner, home.path(), 15, || {
+        owned_backend(&mut schema).is_some_and(|pid| pid != owner) && !paused(home.path())
+    });
+    assert_eq!(identities(&mut schema), expected);
+    // Operator stop remains monotonic while an old callback is quarantined.
+    proxy.blackhole.store(true, SeqCst);
+    std::thread::sleep(Duration::from_millis(1300));
+    unsafe {
+        libc::kill(runner.0.id() as libc::pid_t, libc::SIGTERM);
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    proxy.blackhole.store(false, SeqCst);
+    assert!(wait_for_exit(&mut runner, Duration::from_secs(6)).success());
+    assert!(owned_backend(&mut schema).is_none());
+    assert_no_sqlite(home.path());
+}
+
+#[test]
+fn native_changed_catalog_identity_after_outage_is_fatal_before_ingest() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let Ok(url) = std::env::var("ATLAS_PG_TEST_URL") else { return };
+    if url.is_empty() {
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let name = format!("t_identity_{}", std::process::id());
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    atlas::pg::migrate::run(&mut client, &name).unwrap();
+    let mut schema = Schema { client, name };
+    let proxy = pg_outage::Proxy::new(&url);
+    proxy.online.store(true, SeqCst);
+    let server = Server::new(vec![]);
+    let port = spawn_server(server.clone());
+    let config = configuration(&proxy.url(&url), &schema.name, port);
+    std::fs::write(home.path().join("config.json"), config.to_string()).unwrap();
+    let mut runner = start(home.path(), "outage.log");
+    wait_until(&mut runner, home.path(), 10, || owned_backend(&mut schema).is_some() && !paused(home.path()));
+    proxy.drop_connections();
+    wait_until(&mut runner, home.path(), 6, || paused(home.path()));
+    // This is the unique test-owned schema only.
+    schema.client.batch_execute(&format!("drop schema {} cascade", schema.name)).unwrap();
+    atlas::pg::migrate::run(&mut schema.client, &schema.name).unwrap();
+    let accepted = server.accepted.load(SeqCst);
+    let before: i64 =
+        schema.client.query_one(&format!("select count(*) from {}.meta", schema.name), &[]).unwrap().get(0);
+    proxy.online.store(true, SeqCst);
+    assert!(!wait_for_exit(&mut runner, Duration::from_secs(12)).success());
+    assert_eq!(server.accepted.load(SeqCst), accepted);
+    let rows: i64 = schema.client.query_one(&format!("select count(*) from {}.meta", schema.name), &[]).unwrap().get(0);
+    assert_eq!(rows, before, "identity refusal mutated the replacement catalog");
+}
+
+#[cfg(target_os = "macos")]
+fn child_resources(pid: u32) -> (usize, usize) {
+    let mut info = std::mem::MaybeUninit::<libc::proc_taskinfo>::zeroed();
+    // SAFETY: this exact test-owned live child PID is read only; buffers have
+    // the sizes expected by proc_pidinfo and are initialized only on success.
+    let count = unsafe {
+        libc::proc_pidinfo(
+            pid as i32,
+            libc::PROC_PIDTASKINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            std::mem::size_of::<libc::proc_taskinfo>() as i32,
+        )
+    };
+    assert_eq!(count as usize, std::mem::size_of::<libc::proc_taskinfo>());
+    let info = unsafe { info.assume_init() };
+    let bytes = unsafe { libc::proc_pidinfo(pid as i32, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+    assert!(bytes > 0);
+    let unit = std::mem::size_of::<libc::proc_fdinfo>();
+    let mut descriptors = vec![std::mem::MaybeUninit::<libc::proc_fdinfo>::zeroed(); bytes as usize / unit + 32];
+    let actual = unsafe {
+        libc::proc_pidinfo(
+            pid as i32,
+            libc::PROC_PIDLISTFDS,
+            0,
+            descriptors.as_mut_ptr().cast(),
+            (descriptors.len() * unit) as i32,
+        )
+    };
+    assert!(actual > 0);
+    (actual as usize / unit, info.pti_threadnum as usize)
+}
+#[cfg(target_os = "linux")]
+fn child_resources(pid: u32) -> (usize, usize) {
+    let fds = std::fs::read_dir(format!("/proc/{pid}/fd")).unwrap().count();
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+    let threads = status.lines().find_map(|line| line.strip_prefix("Threads:")).unwrap().trim().parse().unwrap();
+    (fds, threads)
+}
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn child_resources(_: u32) -> (usize, usize) {
+    (0, 0)
+}
+
+#[test]
+fn unsupported_reload_while_postgres_paused_is_fatal() {
+    let home = tempfile::tempdir().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let unused = listener.local_addr().unwrap().port();
+    drop(listener);
+    let config = configuration(
+        &format!("host=127.0.0.1 port={unused} dbname=example user=example connect_timeout=1"),
+        "example",
+        1,
+    );
+    std::fs::write(home.path().join("config.json"), config.to_string()).unwrap();
+    let mut runner = start(home.path(), "outage.log");
+    wait_until(&mut runner, home.path(), 5, || paused(home.path()) && home.path().join("config.toml").exists());
+    edit_config(home.path(), |document| document["postprocess"]["enabled"] = toml_edit::value(true));
+    assert!(!wait_for_exit(&mut runner, Duration::from_secs(4)).success());
+    assert!(!home.path().join("header-store").exists());
+    assert_no_sqlite(home.path());
+}
+
+#[test]
+fn authentication_failure_is_fatal_before_provider_or_nxv_startup() {
+    let Ok(url) = std::env::var("ATLAS_PG_TEST_URL") else { return };
+    if url.is_empty() {
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let proxy = pg_outage::Proxy::new(&url);
+    proxy.online.store(true, std::sync::atomic::Ordering::Release);
+    let server = Server::new(vec![]);
+    let port = spawn_server(server.clone());
+    let url = format!("{} user=outage_missing_role_{}", proxy.url(&url), std::process::id());
+    let config = configuration(&url, "example", port);
+    std::fs::write(home.path().join("config.json"), config.to_string()).unwrap();
+    let mut runner = start(home.path(), "outage.log");
+    assert!(!wait_for_exit(&mut runner, Duration::from_secs(5)).success());
+    assert_eq!(server.accepted.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(!home.path().join("header-store").exists());
+    assert_no_sqlite(home.path());
 }

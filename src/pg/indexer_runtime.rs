@@ -1,7 +1,11 @@
 //! Startup fencing for the native ingestion profile while auxiliary services are ported.
 
+use super::outage::{Failure, SessionUnavailable, classify};
 use anyhow::{Context, Result, ensure};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicU8, Ordering},
+};
 
 use crate::config::{Config, HeaderStoreConfig};
 use crate::indexer::{Db, PgWriteLimits, shared_postgres_db};
@@ -13,7 +17,7 @@ pub(crate) struct Profile {
 }
 
 impl Profile {
-    fn check(config: &Config, headers: &HeaderStoreConfig) -> Result<()> {
+    pub(crate) fn check(config: &Config, headers: &HeaderStoreConfig) -> Result<()> {
         ensure!(headers.enabled, "native ingestion requires the NXV header store");
         ensure!(!config.postprocess.enabled, "native ingestion requires postprocessing to be disabled");
         ensure!(!config.predb.enabled, "native ingestion requires the PreDB worker to be disabled");
@@ -54,6 +58,8 @@ impl Profile {
 pub(crate) struct Runtime {
     pub(crate) db: Db,
     pub(crate) profile: Profile,
+    pub(crate) owner: Arc<Owner>,
+    pub(crate) identity: DestinationIdentity,
     // Held outside Tokio for the full indexing run. Claims are reclaimed only
     // after this connection has acquired sole indexer ownership of the schema.
 }
@@ -62,19 +68,101 @@ pub(crate) struct Runtime {
 /// A lost session cannot continue writing through a different pooled client.
 pub(crate) struct Owner {
     client: Mutex<Option<postgres::Client>>,
+    pub(crate) stop: Arc<AtomicBool>,
+    accepting: AtomicBool,
+    failure: AtomicU8,
+    busy_since: Mutex<Option<std::time::Instant>>,
 }
 
 impl Owner {
     pub(crate) fn new(client: postgres::Client) -> Self {
-        Self { client: Mutex::new(Some(client)) }
+        Self {
+            client: Mutex::new(Some(client)),
+            stop: Arc::new(AtomicBool::new(false)),
+            accepting: AtomicBool::new(true),
+            failure: AtomicU8::new(0),
+            busy_since: Mutex::new(None),
+        }
     }
 
     pub(crate) fn with<T>(&self, work: impl FnOnce(&mut postgres::Client) -> Result<T>) -> Result<T> {
-        let mut held = self.client.lock().map_err(|_| anyhow::anyhow!("native owner connection is poisoned"))?;
-        let client = held.as_mut().context("native owner connection has closed")?;
-        ensure!(!client.is_closed(), "native indexer lost its ownership session");
-        work(client)
+        let mut held = self.client.lock().map_err(|_| {
+            self.fail(Failure::Fatal);
+            anyhow::anyhow!("native owner connection is poisoned")
+        })?;
+        if !self.accepting.load(Ordering::Acquire) || self.stop.load(Ordering::Acquire) {
+            anyhow::bail!("native attempt has ended");
+        }
+        *self.busy_since.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::time::Instant::now());
+        let result = match held.as_mut() {
+            Some(client) if !client.is_closed() => work(client),
+            _ => Err(SessionUnavailable.into()),
+        };
+        *self.busy_since.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        if let Err(error) = &result {
+            self.fail(classify(error));
+        }
+        result
     }
+
+    pub(crate) fn fail(&self, failure: Failure) {
+        self.failure.fetch_max(if failure == Failure::Fatal { 2 } else { 1 }, Ordering::AcqRel);
+        self.stop.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn failure(&self) -> Option<Failure> {
+        match self.failure.load(Ordering::Acquire) {
+            0 => None,
+            1 => Some(Failure::Unavailable),
+            _ => Some(Failure::Fatal),
+        }
+    }
+
+    /// A silent local forward can ACK TCP while withholding PG replies. Mark
+    /// quarantine independently of the client mutex; never abandon that work
+    /// or acquire a replacement owner until it actually drains.
+    pub(crate) fn overdue(&self) -> bool {
+        self.busy_since
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some_and(|since| since.elapsed() >= std::time::Duration::from_secs(30))
+    }
+
+    /// Run outside Tokio after worker drain. Queued blocking callbacks may
+    /// retain this Owner, but can never access a replacement session.
+    pub(crate) fn close(&self) {
+        self.accepting.store(false, Ordering::Release);
+        self.stop.store(true, Ordering::Release);
+        let mut held = self.client.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(held.take());
+    }
+}
+
+/// Catalog pins supplement the fixed configured destination without requiring
+/// cluster-control privileges. They are not cryptographic cluster identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DestinationIdentity {
+    database: String,
+    role: String,
+    session_role: String,
+    ids: Vec<u32>,
+}
+
+fn destination_identity(client: &mut postgres::Client, schema: &str) -> Result<DestinationIdentity> {
+    let row = client.query_one(
+        "select current_database(),current_user,session_user,d.oid,r.oid,s.oid,n.oid,n.nspowner,c.oid
+         from pg_database d join pg_roles r on r.rolname=current_user
+         join pg_roles s on s.rolname=session_user join pg_namespace n on n.nspname=$1
+         join pg_class c on c.relnamespace=n.oid and c.relname='schema_migrations'
+         where d.datname=current_database()",
+        &[&schema],
+    )?;
+    Ok(DestinationIdentity {
+        database: row.get(0),
+        role: row.get(1),
+        session_role: row.get(2),
+        ids: (3..9).map(|i| row.get(i)).collect(),
+    })
 }
 
 impl Drop for Owner {
@@ -94,6 +182,7 @@ impl Runtime {
         storage: super::StorageConfig,
         headers: HeaderStoreConfig,
         hosts: &[String],
+        expected_identity: &mut Option<DestinationIdentity>,
     ) -> Result<Self> {
         storage.check().context("invalid native storage configuration")?;
         ensure!(storage.is_postgres(), "native ingestion requires PostgreSQL storage");
@@ -104,6 +193,18 @@ impl Runtime {
         let db = shared_postgres_db(&storage, expected, PgWriteLimits::default())
             .context("validating the native catalog destination")?;
         let mut owner = connection.connect(postgres::NoTls).context("opening the native owner session")?;
+        let identity = destination_identity(&mut owner, &storage.schema)?;
+        ensure!(
+            expected_identity.as_ref().is_none_or(|expected| *expected == identity),
+            "native PostgreSQL destination identity changed"
+        );
+        let version = super::migrate::version(&mut owner, &storage.schema)?;
+        ensure!(
+            version == super::migrate::MIGRATIONS.last().expect("storage migrations").0,
+            "native PostgreSQL schema version changed"
+        );
+        // Pin even when an initialization COMMIT later loses its response.
+        *expected_identity = Some(identity.clone());
         let locked: bool = owner
             .query_one("select pg_try_advisory_lock(hashtext('atlas.indexer'), hashtext($1))", &[&storage.schema])?
             .get(0);
@@ -125,7 +226,7 @@ impl Runtime {
         }
         let owner = Arc::new(Owner::new(owner));
         let db = crate::indexer::owned_postgres_db(db, owner.clone(), PgWriteLimits::default())?;
-        Ok(Self { db, profile: Profile { storage, headers } })
+        Ok(Self { db, profile: Profile { storage, headers }, owner, identity })
     }
 }
 
@@ -138,6 +239,43 @@ fn owner_connection_config(storage: &super::StorageConfig) -> Result<postgres::C
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn close_waits_for_current_work_and_rejects_queued_stale_callbacks() {
+        let Some(schema) = super::super::testing::Schema::new() else { return };
+        let owner = Arc::new(Owner::new(postgres::Client::connect(&schema.url, postgres::NoTls).unwrap()));
+        let (entered, ready) = std::sync::mpsc::channel();
+        let (release, proceed) = std::sync::mpsc::channel();
+        let current = owner.clone();
+        let work = std::thread::spawn(move || {
+            current.with(|_| {
+                entered.send(()).unwrap();
+                proceed.recv().unwrap();
+                Ok(())
+            })
+        });
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        let close_owner = owner.clone();
+        let (closed, done) = std::sync::mpsc::channel();
+        let close = std::thread::spawn(move || {
+            close_owner.close();
+            closed.send(()).unwrap();
+        });
+        let until = std::time::Instant::now() + Duration::from_secs(2);
+        while !owner.stop.load(Ordering::Acquire) {
+            assert!(std::time::Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(done.try_recv().is_err(), "close abandoned active work");
+        let queued_owner = owner.clone();
+        let queued = std::thread::spawn(move || queued_owner.with(|_| panic!("stale callback ran")) as Result<()>);
+        release.send(()).unwrap();
+        work.join().unwrap().unwrap();
+        close.join().unwrap();
+        done.recv().unwrap();
+        assert!(queued.join().unwrap().is_err());
+        assert!(owner.with(|_| Ok(())).is_err());
+    }
 
     #[test]
     fn owner_connection_uses_bounded_transport_defaults_and_url_overrides() {

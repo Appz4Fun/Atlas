@@ -13,6 +13,7 @@
 pub mod ext;
 pub mod header_blocks;
 pub(crate) mod indexer_runtime;
+pub(crate) mod outage;
 pub mod ingest;
 pub(crate) mod linker;
 mod linker_bootstrap;

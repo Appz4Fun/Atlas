@@ -38,6 +38,8 @@ pub const COMPACT_EVERY: Duration = Duration::from_secs(24 * 3600);
 /// a compaction that couldnt take the lock (a `--compact` or a menu write
 /// holds it) is tried again after this long
 const COMPACT_RETRY: Duration = Duration::from_secs(10 * 60);
+static NATIVE_PAUSED: AtomicBool = AtomicBool::new(false);
+static STATUS_WRITE: Mutex<()> = Mutex::new(());
 
 /// servers with a host and password, in priority order
 fn usable_servers(config: &crate::config::Config) -> Vec<UsenetServer> {
@@ -49,6 +51,12 @@ fn now() -> f64 {
 }
 
 fn write_status(running: bool, group: &str, mode: &str, idle: bool, status: &str, error: bool, errors: u32) {
+    let _write = STATUS_WRITE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (group, idle, status, error, errors) = if running && NATIVE_PAUSED.load(Ordering::Acquire) {
+        ("PostgreSQL unavailable", true, "postgres_paused", false, 0)
+    } else {
+        (group, idle, status, error, errors)
+    };
     let data = json!({
         "running": running,
         "group": group,
@@ -1224,7 +1232,15 @@ async fn watch_config(sched: Arc<Scheduler>, servers: Vec<UsenetServer>) {
             return;
         }
 
-        let Some(config) = load_config() else { continue };
+        let Some(config) = load_config() else {
+            if sched.native.is_some() {
+                ui::error("native indexing configuration unavailable");
+                sched.fatal.store(true, Ordering::Relaxed);
+                sched.ctx.stop.store(true, Ordering::Release);
+                return;
+            }
+            continue;
+        };
         if let Some(profile) = &sched.native
             && let Err(error) = profile.check_reload(&config)
         {
@@ -1334,6 +1350,7 @@ async fn run_servers(
     compact_after: Option<SystemTime>,
     native: Option<&NativeRuntime>,
 ) -> anyhow::Result<bool> {
+    let stop = native.map_or(stop, |runtime| runtime.owner.stop.clone());
     let servers = usable_servers(config);
     let groups = config.tracked_groups();
     say_blocked(&config.blocked_groups());
@@ -1542,26 +1559,26 @@ async fn run_servers(
     }
     tasks.spawn(named!("the config watcher".into(), watch_config(sched.clone(), servers)));
     tasks.spawn(named!("the status report".into(), report(sched.clone())));
-    if native.is_none() {
-        tasks.spawn(named!("the compaction timer".into(), compact_timer(sched.clone())));
-    } else {
-        let (db, s) = (db.clone(), sched.clone());
+    if let Some(runtime) = native {
+        let (db, s, owner) = (db.clone(), sched.clone(), runtime.owner.clone());
         tasks.spawn(named!("native storage health".into(), async move {
             while !s.stopping() {
-                if crate::indexer::on_db(&db, |sql| {
+                if let Err(error) = crate::indexer::on_db(&db, |sql| {
                     let _: i64 = sql.one("select 1", &[])?;
                     Ok(())
                 })
                 .await
-                .is_err()
                 {
-                    s.fatal.store(true, Ordering::Relaxed);
-                    s.ctx.stop.store(true, Ordering::Relaxed);
+                    if !s.ctx.stop.load(Ordering::Acquire) {
+                        owner.fail(crate::pg::outage::classify(&error));
+                    }
                     return;
                 }
                 nap(Duration::from_secs(1), || s.stopping()).await;
             }
         }));
+    } else {
+        tasks.spawn(named!("the compaction timer".into(), compact_timer(sched.clone())));
     }
 
     // the workers and the config watcher all stop on `stopping()`
@@ -1592,6 +1609,12 @@ async fn run_servers(
         let _ = tokio::task::spawn_blocking(move || checkpointer.join()).await;
     }
     stop_log("checkpointer done");
+    if let Some(runtime) = native {
+        if sched.fatal.load(Ordering::Relaxed) {
+            runtime.owner.fail(crate::pg::outage::Failure::Fatal);
+        }
+        anyhow::ensure!(runtime.owner.failure().is_none(), "native PostgreSQL attempt ended");
+    }
     anyhow::ensure!(!sched.fatal.load(Ordering::Relaxed), "indexer task or storage ownership failed");
     Ok(sched.compact_due.load(Ordering::Relaxed))
 }
@@ -1680,6 +1703,9 @@ async fn supervise(
         let Some(config) = load_config() else {
             let why = crate::config::file_problem().unwrap_or_else(|| "config.toml not found".into());
             ui::error(&format!("error with config, stopped: {why}"));
+            if native.is_some() {
+                return 1;
+            }
             break;
         };
 
@@ -1689,9 +1715,25 @@ async fn supervise(
             ui::error(&format!("native indexing configuration refused: {error}"));
             return 1;
         }
+        if let Some(native) = native {
+            let owner = native.owner.clone();
+            if !matches!(
+                tokio::task::spawn_blocking(move || owner.with(|client| {
+                    client.simple_query("select 1")?;
+                    Ok(())
+                }))
+                .await,
+                Ok(Ok(()))
+            ) {
+                return 1;
+            }
+        }
         let servers = usable_servers(&config);
         if servers.is_empty() {
             ui::error("config missing required fields");
+            if native.is_some() {
+                return 1;
+            }
             break;
         }
 
@@ -1750,7 +1792,9 @@ async fn supervise(
             Ok(compact_due) => compact_due,
             Err(error) => {
                 ui::error(&format!("indexing stopped: {error}"));
-                stop.store(true, Ordering::Relaxed);
+                if native.is_none() {
+                    stop.store(true, Ordering::Relaxed);
+                }
                 return 1;
             }
         };
@@ -1792,16 +1836,6 @@ pub fn run() -> i32 {
         return 1;
     }
     if storage.is_postgres() {
-        // the external data (`ext_*`) is dumped nightly once Postgres holds it: it can't be fetched again
-        match crate::pg::Pool::new(&storage) {
-            Ok(pool) => crate::pg::ext::spawn_nightly(
-                std::sync::Arc::new(pool),
-                crate::pg::ext::dump_dir(),
-                crate::pg::ext::DUMP_HOUR,
-                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            ),
-            Err(e) => ui::warn(&format!("no nightly dump of the external data: {e:#}")),
-        }
         return run_native(config, storage);
     }
     if let Err(e) = write_atomic(&paths::pid_file(), std::process::id().to_string()) {
@@ -1903,16 +1937,12 @@ pub fn run() -> i32 {
 
 /// Start the explicitly limited native ingestion profile without opening SQLite.
 fn run_native(config: Config, storage: crate::pg::StorageConfig) -> i32 {
+    use crate::pg::outage::{AttemptOutcome, Backoff, Failure, classify};
     let headers = crate::config::header_store_config();
-    let hosts = crate::nntp::server_keys(&usable_servers(&config));
-    let native = match NativeRuntime::open(&config, storage, headers.clone(), &hosts) {
-        Ok(native) => native,
-        Err(error) => {
-            // Configuration URLs and driver diagnostics can contain credentials.
-            ui::error(&format!("native PostgreSQL startup refused: {error}"));
-            return 1;
-        }
-    };
+    if NativeProfile::check(&config, &headers).is_err() || crate::pg::Pool::new(&storage).is_err() {
+        ui::error("native PostgreSQL configuration refused");
+        return 1;
+    }
     if write_atomic(&paths::pid_file(), std::process::id().to_string()).is_err() {
         ui::error("could not write the indexer PID");
         return 1;
@@ -1923,14 +1953,135 @@ fn run_native(config: Config, storage: crate::pg::StorageConfig) -> i32 {
         let _ = signal_hook::flag::register(signal_hook::consts::SIGTERM, stop.clone());
         let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, stop.clone());
     }
-    if crate::nxv_store::live::spawn_bounded(&headers).is_err() {
-        ui::error("could not start the durable NXV header store");
-        return 1;
-    }
-    crate::metrics::start(&config, crate::metrics::Role::Indexer);
-    let code = index(config, stop, None, Some(native));
+    let final_stop = Arc::new(AtomicBool::new(false));
+    let mut identity = None;
+    let mut initialized = false;
+    let mut backoff = Backoff::default();
+    let mut paused = false;
+    let code = loop {
+        if stop.load(Ordering::Acquire) {
+            break 0;
+        }
+        let Some(current) = load_config() else {
+            ui::error("native PostgreSQL configuration unavailable");
+            break 1;
+        };
+        if crate::config::storage_config() != storage
+            || crate::config::header_store_config() != headers
+            || NativeProfile::check(&current, &headers).is_err()
+        {
+            ui::error("native PostgreSQL configuration changed or refused");
+            break 1;
+        }
+        let hosts = crate::nntp::server_keys(&usable_servers(&current));
+        NATIVE_PAUSED.store(true, Ordering::Release);
+        write_status(true, "Validating PostgreSQL", &current.index_mode, true, "postgres_paused", false, 0);
+        let native = match NativeRuntime::open(&current, storage.clone(), headers.clone(), &hosts, &mut identity) {
+            Ok(native) => native,
+            Err(error) if classify(&error) == Failure::Unavailable => {
+                native_pause(&current, &stop, &mut backoff, &mut paused);
+                continue;
+            }
+            Err(_) => {
+                ui::error("native PostgreSQL destination refused");
+                break 1;
+            }
+        };
+        if stop.load(Ordering::Acquire) {
+            native.owner.close();
+            break 0;
+        }
+        identity = Some(native.identity.clone());
+        if !initialized {
+            if crate::nxv_store::live::spawn_bounded(&headers).is_err() {
+                ui::error("could not start the durable NXV header store");
+                native.owner.close();
+                break 1;
+            }
+            crate::metrics::start(&current, crate::metrics::Role::Indexer);
+            if let Ok(pool) = crate::pg::Pool::new(&storage) {
+                crate::pg::ext::spawn_nightly(
+                    Arc::new(pool),
+                    crate::pg::ext::dump_dir(),
+                    crate::pg::ext::DUMP_HOUR,
+                    final_stop.clone(),
+                );
+            }
+            initialized = true;
+        }
+        if paused {
+            ui::success("native PostgreSQL recovered; resuming with a fresh owner");
+        }
+        paused = false;
+        NATIVE_PAUSED.store(false, Ordering::Release);
+        backoff = Backoff::default();
+        let owner = native.owner.clone();
+        let monitor_done = Arc::new(AtomicBool::new(false));
+        let (finished, watched, operator, mode) =
+            (monitor_done.clone(), owner.clone(), stop.clone(), current.index_mode.clone());
+        // Outside the attempt runtime: this also watches run-local cursor
+        // claims and pre-provider health work before run_servers starts.
+        let monitor = thread::spawn(move || {
+            while !finished.load(Ordering::Acquire) {
+                if operator.load(Ordering::Acquire) {
+                    watched.stop.store(true, Ordering::Release);
+                }
+                if watched.overdue() && watched.failure().is_none() {
+                    watched.fail(Failure::Unavailable);
+                    NATIVE_PAUSED.store(true, Ordering::Release);
+                    ui::warn("native PostgreSQL reply overdue; indexing paused until the old session drains");
+                    write_status(true, "PostgreSQL reply overdue", &mode, true, "postgres_paused", false, 0);
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        });
+        // index owns and drops its Tokio runtime, joining detached blocking work
+        // before returning. No old runtime or session is reused by the next run.
+        let result = index(current.clone(), stop.clone(), None, Some(native));
+        monitor_done.store(true, Ordering::Release);
+        if monitor.join().is_err() {
+            owner.fail(Failure::Fatal);
+        }
+        owner.close();
+        match AttemptOutcome::from_exit(result, owner.failure()) {
+            AttemptOutcome::Stopped => break result,
+            AttemptOutcome::Fatal => {
+                ui::error("native PostgreSQL indexing failed");
+                break 1;
+            }
+            AttemptOutcome::Unavailable => native_pause(&current, &stop, &mut backoff, &mut paused),
+        }
+    };
+    final_stop.store(true, Ordering::Release);
     crate::nxv_store::live::finish();
+    write_status(false, "", &config.index_mode, false, "stopped", code != 0, u32::from(code != 0));
+    NATIVE_PAUSED.store(false, Ordering::Release);
     code
+}
+
+fn native_pause(config: &Config, stop: &AtomicBool, backoff: &mut crate::pg::outage::Backoff, paused: &mut bool) {
+    if !*paused {
+        ui::warn("native PostgreSQL unavailable; indexing paused");
+    }
+    *paused = true;
+    NATIVE_PAUSED.store(true, Ordering::Release);
+    write_status(true, "PostgreSQL unavailable", &config.index_mode, true, "postgres_paused", false, 0);
+    let until = Instant::now() + backoff.next();
+    let destination = crate::config::storage_config();
+    let headers = crate::config::header_store_config();
+    let mut checked = Instant::now();
+    while Instant::now() < until && !stop.load(Ordering::Acquire) {
+        thread::sleep(Duration::from_millis(50));
+        if checked.elapsed() >= Duration::from_secs(1) {
+            checked = Instant::now();
+            if load_config().is_none_or(|current| NativeProfile::check(&current, &headers).is_err())
+                || crate::config::storage_config() != destination
+                || crate::config::header_store_config() != headers
+            {
+                break;
+            }
+        }
+    }
 }
 
 /// The one time move into the shards at start, if `main` needs it, with

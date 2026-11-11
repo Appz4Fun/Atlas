@@ -19,7 +19,9 @@ impl Drop for Guard {
     fn drop(&mut self) {
         // Clear the closure too: it owns a Db clone and must not retain the
         // advisory-lock session after the background owner stops.
-        self.0.set_linker_coverage(None);
+        // Replace atomically, with no age-retention fallback window during a
+        // database outage. This callback holds no Db or ownership session.
+        self.0.set_linker_coverage(Some(Arc::new(|_, _, _, _| Ok(false))));
         ACTIVE.store(false, Ordering::Release);
     }
 }
@@ -155,15 +157,21 @@ pub(crate) async fn run(db: Db, store: Arc<Store>, stopping: impl Fn() -> bool) 
                     Ok(true) => tokio::task::yield_now().await,
                     Ok(false) => pause(&stopping).await,
                     Err(error) => {
-                        eprintln!("native header linker: could not read completed progress: {error:#}");
-                        pause(&stopping).await;
+                        if !stopping() {
+                            db.fail_native(super::outage::classify(&error));
+                        }
+                        eprintln!("native header linker: progress failed; durable phase retained");
+                        return;
                     }
                 }
             }
             Ok(false) => tokio::task::yield_now().await,
             Err(error) => {
-                eprintln!("native header linker: {error:#}; durable phase retained for retry");
-                pause(&stopping).await;
+                if !stopping() {
+                    db.fail_native(super::outage::classify(&error));
+                }
+                eprintln!("native header linker: attempt failed; durable phase retained");
+                return;
             }
         }
     }
@@ -173,6 +181,55 @@ pub(crate) async fn run(db: Db, store: Arc<Store>, stopping: impl Fn() -> bool) 
 mod tests {
     use super::*;
     use crate::nxv_store::store::{Clamp, KeepSet, StoreConfig};
+
+    #[test]
+    fn outage_coverage_replacement_retains_aged_input_without_a_healthy_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = Store::open(
+            StoreConfig { sealers: 1, ..StoreConfig::new(dir.path()) },
+            KeepSet { live_from: i64::MIN, ..Default::default() },
+        )
+        .unwrap();
+        let row = b"1\tpart\tposter@example.invalid\tFri, 02 Jan 1970 03:30:00 +0000\t<part@example.invalid>\t\t100\t1"
+            .to_vec();
+        store.record("server.example", "group.example", &[row], Clamp::Unknown { now: 100000 }).unwrap();
+        store.close().unwrap();
+        let (entered, ready) = std::sync::mpsc::channel();
+        let (release, proceed) = std::sync::mpsc::channel();
+        let proceed = std::sync::Mutex::new(proceed);
+        let captured = Arc::new(());
+        let token = captured.clone();
+        store.set_linker_coverage(Some(Arc::new(move |_, _, _, _| {
+            let _ = &token;
+            entered.send(()).unwrap();
+            proceed.lock().unwrap().recv().unwrap();
+            Ok(false)
+        })));
+        store.set_keep(KeepSet { live_from: 100, ..Default::default() });
+        store.arm_expiry();
+        let housekeeping = store.clone();
+        let worker = std::thread::spawn(move || housekeeping.housekeeping());
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        drop(Guard(store.clone()));
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        assert_eq!(Arc::strong_count(&captured), 1, "old callback retained session references");
+        for _ in 0..100 {
+            store.housekeeping();
+        }
+        assert!(
+            store.segment_snapshot("group.example", 1).unwrap().is_some(),
+            "aged durable input expired during pause"
+        );
+        store.set_linker_coverage(Some(Arc::new(|_, _, _, _| Ok(true))));
+        for _ in 0..3 {
+            store.housekeeping();
+        }
+        assert!(
+            store.segment_snapshot("group.example", 1).unwrap().is_none(),
+            "healthy coverage was pinned indefinitely"
+        );
+    }
 
     #[test]
     fn multi_file_golden_matches_indexes_group_ties_lossy_ids_and_repeated_posters() {
