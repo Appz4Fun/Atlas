@@ -56,22 +56,22 @@ fn kept() -> Vec<Kept> {
 }
 
 /// Releases thawed by hand, from every shard file there is.
-const FREEZE_EXEMPT: &str = "freeze_exempt";
+pub(crate) const FREEZE_EXEMPT: &str = "freeze_exempt";
 
-fn shard_files(main: &Path) -> Vec<PathBuf> {
+pub(crate) fn shard_files(main: &Path) -> Vec<PathBuf> {
     crate::store::shard_paths(main).into_iter().filter(|p| p.exists()).collect()
 }
 
 /// A column as SQLite declares it, and the Postgres type it's copied as.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Column {
-    name: String,
-    decl: String,
-    pg: PgKind,
+pub(crate) struct Column {
+    pub(crate) name: String,
+    pub(crate) decl: String,
+    pub(crate) pg: PgKind,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PgKind {
+pub(crate) enum PgKind {
     Int,
     Real,
     Text,
@@ -105,7 +105,7 @@ impl PgKind {
     }
 }
 
-fn columns(conn: &Connection, schema: &str, table: &str) -> Result<Vec<Column>> {
+pub(crate) fn columns(conn: &Connection, schema: &str, table: &str) -> Result<Vec<Column>> {
     let mut stmt = conn.prepare("select name, type from pragma_table_info(?1, ?2) order by cid")?;
     let cols = stmt
         .query_map([table, schema], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
@@ -156,14 +156,14 @@ impl Tally {
         self.digest = self.digest.wrapping_add(u128::from_le_bytes(h[..16].try_into().expect("16 bytes")));
     }
 
-    fn hex(self) -> String {
+    pub(crate) fn hex(self) -> String {
         format!("{:032x}", self.digest)
     }
 }
 
 /// The tally of `sql`'s rows, each value checked to be of its column's kind (as Postgres will take it), soo a dry
 /// run finds what `--apply` would refuse.
-fn tally_sql(conn: &Connection, sql: &str, cols: &[Column]) -> Result<Tally> {
+pub(crate) fn tally_sql(conn: &Connection, sql: &str, cols: &[Column]) -> Result<Tally> {
     let mut t = Tally::default();
     let mut buf = Vec::new();
     let mut stmt = conn.prepare(sql)?;
@@ -196,11 +196,11 @@ fn tally_sql(conn: &Connection, sql: &str, cols: &[Column]) -> Result<Tally> {
     Ok(t)
 }
 
-fn quoted(name: &str) -> String {
+pub(crate) fn quoted(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-fn select_list(cols: &[Column]) -> String {
+pub(crate) fn select_list(cols: &[Column]) -> String {
     cols.iter().map(|c| quoted(&c.name)).collect::<Vec<_>>().join(", ")
 }
 
@@ -213,7 +213,7 @@ fn freeze_exempt_columns() -> Vec<Column> {
         .collect()
 }
 
-fn attach_ro(conn: &Connection, path: &Path, alias: &str) -> Result<()> {
+pub(crate) fn attach_ro(conn: &Connection, path: &Path, alias: &str) -> Result<()> {
     let uri = format!(
         "file:{}?mode=ro",
         path.display().to_string().replace('%', "%25").replace('?', "%3f").replace('#', "%23")
@@ -352,8 +352,32 @@ pub fn to_postgres(pg: &mut postgres::Client, file: &Path, copied: &[Copied], st
 fn copy_checked(conn: &Connection, tx: &mut postgres::Transaction<'_>, table: &str, c: &Copied) -> Result<Tally> {
     let defs = c.columns.iter().map(|col| format!("{} {}", quoted(&col.name), col.pg.sql())).collect::<Vec<_>>();
     tx.batch_execute(&format!("create table {table} ({});", defs.join(", ")))?;
-    let types: Vec<postgres::types::Type> = c
-        .columns
+    copy_rows(
+        tx,
+        table,
+        &c.columns,
+        conn,
+        &format!("select {} from {}", select_list(&c.columns), quoted(&c.name)),
+        &c.name,
+    )?;
+    let back = pg_tally(tx, table, &c.columns)?;
+    if back != c.tally {
+        bail!("{table}: Postgres holds something else ({back:?} vs {:?})", c.tally);
+    }
+    Ok(back)
+}
+
+/// The rows `select` reads from `conn` (its columns `cols`, in order) into the Postgres `table` by binary COPY, each
+/// value checked to be of its column's kind. `what` names the source in errors.
+pub(crate) fn copy_rows(
+    tx: &mut postgres::Transaction<'_>,
+    table: &str,
+    cols: &[Column],
+    conn: &Connection,
+    select: &str,
+    what: &str,
+) -> Result<()> {
+    let types: Vec<postgres::types::Type> = cols
         .iter()
         .map(|col| match col.pg {
             PgKind::Int => postgres::types::Type::INT8,
@@ -362,45 +386,37 @@ fn copy_checked(conn: &Connection, tx: &mut postgres::Transaction<'_>, table: &s
             PgKind::Blob => postgres::types::Type::BYTEA,
         })
         .collect();
-    {
-        let sink = tx.copy_in(&format!("copy {table} ({}) from stdin binary", select_list(&c.columns)))?;
-        let mut writer = postgres::binary_copy::BinaryCopyInWriter::new(sink, &types);
-        let mut stmt = conn.prepare(&format!("select {} from {}", select_list(&c.columns), quoted(&c.name)))?;
-        let mut rows = stmt.query([])?;
-        while let Some(r) = rows.next()? {
-            let mut vals: Vec<Box<dyn postgres::types::ToSql + Sync>> = Vec::with_capacity(c.columns.len());
-            for (i, col) in c.columns.iter().enumerate() {
-                let v: Value = r.get(i)?;
-                vals.push(match (col.pg, v) {
-                    (_, Value::Null) => match col.pg {
-                        PgKind::Int => Box::new(None::<i64>),
-                        PgKind::Real => Box::new(None::<f64>),
-                        PgKind::Text => Box::new(None::<String>),
-                        PgKind::Blob => Box::new(None::<Vec<u8>>),
-                    },
-                    (PgKind::Int, Value::Integer(i)) => Box::new(i),
-                    (PgKind::Real, Value::Real(f)) => Box::new(f),
-                    (PgKind::Text, Value::Text(t)) => Box::new(t),
-                    (PgKind::Blob, Value::Blob(b)) => Box::new(b),
-                    (kind, v) => {
-                        bail!("{}.{}: a {v:?} in a {kind:?} column can't go over as it is", c.name, col.name)
-                    }
-                });
-            }
-            let refs: Vec<&(dyn postgres::types::ToSql + Sync)> = vals.iter().map(|b| b.as_ref()).collect();
-            writer.write(&refs)?;
+    let sink = tx.copy_in(&format!("copy {table} ({}) from stdin binary", select_list(cols)))?;
+    let mut writer = postgres::binary_copy::BinaryCopyInWriter::new(sink, &types);
+    let mut stmt = conn.prepare(select)?;
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        let mut vals: Vec<Box<dyn postgres::types::ToSql + Sync>> = Vec::with_capacity(cols.len());
+        for (i, col) in cols.iter().enumerate() {
+            let v: Value = r.get(i)?;
+            vals.push(match (col.pg, v) {
+                (_, Value::Null) => match col.pg {
+                    PgKind::Int => Box::new(None::<i64>),
+                    PgKind::Real => Box::new(None::<f64>),
+                    PgKind::Text => Box::new(None::<String>),
+                    PgKind::Blob => Box::new(None::<Vec<u8>>),
+                },
+                (PgKind::Int, Value::Integer(i)) => Box::new(i),
+                (PgKind::Real, Value::Real(f)) => Box::new(f),
+                (PgKind::Text, Value::Text(t)) => Box::new(t),
+                (PgKind::Blob, Value::Blob(b)) => Box::new(b),
+                (kind, v) => bail!("{what}.{}: a {v:?} in a {kind:?} column can't go over as it is", col.name),
+            });
         }
-        writer.finish()?;
+        let refs: Vec<&(dyn postgres::types::ToSql + Sync)> = vals.iter().map(|b| b.as_ref()).collect();
+        writer.write(&refs)?;
     }
-    let back = pg_tally(tx, table, &c.columns)?;
-    if back != c.tally {
-        bail!("{table}: Postgres holds something else ({back:?} vs {:?})", c.tally);
-    }
-    Ok(back)
+    writer.finish()?;
+    Ok(())
 }
 
 /// The tally of a Postgres table, its rows streamed.
-fn pg_tally(tx: &mut postgres::Transaction<'_>, table: &str, cols: &[Column]) -> Result<Tally> {
+pub(crate) fn pg_tally(tx: &mut postgres::Transaction<'_>, table: &str, cols: &[Column]) -> Result<Tally> {
     use postgres::fallible_iterator::FallibleIterator;
     let mut t = Tally::default();
     let mut buf = Vec::new();

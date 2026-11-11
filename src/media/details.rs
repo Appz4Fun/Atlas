@@ -40,7 +40,7 @@ const BACKFILL_REST: Duration = Duration::from_secs(6 * 3600);
 /// Past a start, soo it doesn't add to what starting up does.
 const BACKFILL_DELAY: Duration = Duration::from_secs(30);
 
-const SCHEMA: &str = "
+pub(crate) const SCHEMA: &str = "
 create table if not exists details (
     kind       INTEGER NOT NULL,
     tmdb_id    INTEGER NOT NULL,
