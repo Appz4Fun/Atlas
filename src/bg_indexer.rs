@@ -1679,6 +1679,18 @@ async fn compact(config: &Config, stats: &Arc<Mutex<Stats>>, stop: &Arc<AtomicBo
     Compacted::Ran
 }
 
+/// Only typed rejection before work may turn a preflight error into operator stop.
+fn native_preflight_exit(
+    result: Result<anyhow::Result<()>, tokio::task::JoinError>,
+    operator_stopped: bool,
+) -> Option<i32> {
+    match result {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) if operator_stopped && crate::pg::outage::is_attempt_ended(&error) => Some(0),
+        _ => Some(1),
+    }
+}
+
 /// Index until stopping. Returns the exit code: not 0 when a compaction held
 /// the database at the start. `writing` is the hold on compaction taken
 /// before setting up the database, if there was one.
@@ -1721,16 +1733,20 @@ async fn supervise(
         }
         if let Some(native) = native {
             let owner = native.owner.clone();
-            if !matches!(
-                tokio::task::spawn_blocking(move || owner.with(|client| {
+            let result = tokio::task::spawn_blocking(move || {
+                owner.with(|client| {
                     client.simple_query("select 1")?;
                     Ok(())
-                }))
-                .await,
-                Ok(Ok(()))
-            ) || stopping()
-            {
-                return 1;
+                })
+            })
+            .await;
+            if let Some(code) = native_preflight_exit(result, stop.load(Ordering::Acquire)) {
+                return code;
+            }
+            if stopping() {
+                // Only a successful reply may end cleanly on operator stop.
+                // Recorded owner failures still take precedence after drain.
+                return i32::from(!stop.load(Ordering::Acquire));
             }
         }
         let servers = usable_servers(&config);
@@ -1777,7 +1793,7 @@ async fn supervise(
                 Some(result) => result,
                 None => {
                     pool.close().await;
-                    return 1;
+                    return i32::from(!stop.load(Ordering::Acquire));
                 }
             }
         } else {
@@ -2170,6 +2186,72 @@ fn index(config: Config, stop: Arc<AtomicBool>, writing: Option<WriteGuard>, nat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_preflight_queued_operator_cancellation_is_clean() {
+        use crate::pg::{
+            indexer_runtime::Owner,
+            outage::{AttemptOutcome, Failure, is_attempt_ended},
+        };
+        let Some(schema) = crate::pg::testing::Schema::new() else { return };
+        let owner = Arc::new(Owner::new(postgres::Client::connect(&schema.url, postgres::NoTls).unwrap()));
+        let (entered, ready) = std::sync::mpsc::channel();
+        let (release, proceed) = std::sync::mpsc::channel();
+        let current = owner.clone();
+        let work = thread::spawn(move || {
+            current.with(|_| {
+                entered.send(()).unwrap();
+                proceed.recv().unwrap();
+                Ok(())
+            })
+        });
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (queued, waiting) = std::sync::mpsc::channel();
+        let stale = owner.clone();
+        let preflight = thread::spawn(move || {
+            queued.send(()).unwrap();
+            stale.with::<()>(|_| panic!("canceled preflight executed"))
+        });
+        waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+        // The callback was admitted before TERM, but cannot enter its work
+        // until the current callback drains and observes operator cancellation.
+        owner.stop.store(true, Ordering::Release);
+        release.send(()).unwrap();
+        work.join().unwrap().unwrap();
+        let error = preflight.join().unwrap().unwrap_err().context("queued native preflight");
+        assert!(is_attempt_ended(&error));
+        assert_eq!(owner.failure(), None);
+        let code = native_preflight_exit(Ok(Err(error)), true).unwrap();
+        assert_eq!(code, 0, "typed operator rejection must stop cleanly");
+        assert!(matches!(AttemptOutcome::from_exit(code, owner.failure()), AttemptOutcome::Stopped));
+        owner.fail(Failure::Unavailable);
+        assert!(matches!(AttemptOutcome::from_exit(code, owner.failure()), AttemptOutcome::Unavailable));
+        owner.fail(Failure::Fatal);
+        assert!(matches!(AttemptOutcome::from_exit(code, owner.failure()), AttemptOutcome::Fatal));
+        owner.close();
+    }
+
+    #[test]
+    fn native_preflight_independent_errors_and_join_failures_remain_failed() {
+        use crate::pg::outage::AttemptEnded;
+        assert_eq!(native_preflight_exit(Ok(Ok(())), true), None);
+        assert_eq!(native_preflight_exit(Ok(Err(AttemptEnded.into())), false), Some(1));
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        for operator_stopped in [false, true] {
+            for message in ["native attempt has ended", "native configuration invariant"] {
+                assert_eq!(native_preflight_exit(Ok(Err(anyhow::anyhow!(message))), operator_stopped), Some(1));
+            }
+            let panic = runtime.spawn(async { panic!("owned preflight panic fixture") });
+            let result = runtime.block_on(panic);
+            assert!(result.as_ref().unwrap_err().is_panic());
+            assert_eq!(native_preflight_exit(result, operator_stopped), Some(1));
+            let canceled = runtime.spawn(std::future::pending::<anyhow::Result<()>>());
+            canceled.abort();
+            let result = runtime.block_on(canceled);
+            assert!(result.as_ref().unwrap_err().is_cancelled());
+            assert_eq!(native_preflight_exit(result, operator_stopped), Some(1));
+        }
+    }
 
     #[test]
     fn skipped_articles_are_counted_per_group_and_in_all() {

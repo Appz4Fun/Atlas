@@ -778,3 +778,90 @@ fn quarantined_pre_provider_reply_never_admits_the_old_attempt() {
     assert!(runner.stop().success());
     assert_no_sqlite(home.path());
 }
+
+fn operator_term_at_admission(held_preflight: bool) {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+    let Ok(url) = std::env::var("ATLAS_PG_TEST_URL") else { return };
+    if url.is_empty() {
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let phase = if held_preflight { "preflight" } else { "greeting" };
+    let name = format!("t_operator_admission_{}_{phase}", std::process::id());
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    atlas::pg::migrate::run(&mut client, &name).unwrap();
+    let mut schema = Schema { client, name };
+    let proxy = pg_outage::Proxy::new(&url);
+    proxy.online.store(true, SeqCst);
+    proxy.hold_preflight.store(held_preflight, SeqCst);
+    let connections = Arc::new(AtomicUsize::new(0));
+    let release_greeting = Arc::new(AtomicBool::new(false));
+    struct Release(Arc<AtomicBool>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.store(true, SeqCst);
+        }
+    }
+    let _release_on_exit = Release(release_greeting.clone());
+    let (accepted, released) = (connections.clone(), release_greeting.clone());
+    let mut server = Server::new(vec![]);
+    Arc::get_mut(&mut server).unwrap().before_connection = Some(Arc::new(move || {
+        accepted.fetch_add(1, SeqCst);
+        if !held_preflight {
+            let until = Instant::now() + Duration::from_secs(10);
+            while !released.load(SeqCst) && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }));
+    let port = spawn_server(server.clone());
+    let config = configuration(&proxy.url(&url), &schema.name, port);
+    std::fs::write(home.path().join("config.json"), config.to_string()).unwrap();
+    let mut runner = start(home.path(), "outage.log");
+    wait_until(&mut runner, home.path(), 10, || {
+        if held_preflight {
+            proxy.preflight_held.load(SeqCst) && !paused(home.path())
+        } else {
+            connections.load(SeqCst) == 1
+        }
+    });
+    assert!(owned_backend(&mut schema).is_some());
+    let began = Instant::now();
+    // Signal only this fixture's Atlas PID. A pending successful reply remains
+    // held until after TERM, so cancellation and its drain are exercised.
+    assert_eq!(unsafe { libc::kill(runner.0.id() as libc::pid_t, libc::SIGTERM) }, 0);
+    if held_preflight {
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(runner.0.try_wait().unwrap().is_none(), "held synchronous work was abandoned");
+        proxy.release_preflight.store(true, SeqCst);
+    }
+    let status = wait_for_exit(&mut runner, Duration::from_secs(3));
+    assert!(
+        status.success(),
+        "ordinary TERM during {phase} must exit successfully, got {status}: {}",
+        std::fs::read_to_string(home.path().join("outage.log")).unwrap()
+    );
+    assert!(began.elapsed() < Duration::from_secs(3));
+    assert!(owned_backend(&mut schema).is_none(), "operator stop retained its owner");
+    assert_eq!(connections.load(SeqCst), usize::from(!held_preflight), "operator stop re-admitted provider work");
+    let status: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(home.path().join("status.json")).unwrap()).unwrap();
+    assert_eq!(status["status"], "stopped");
+    assert_eq!(status["running"], false);
+    assert_eq!(status["error"], false);
+    assert_eq!(status["error_count"], 0);
+    let log = std::fs::read_to_string(home.path().join("outage.log")).unwrap();
+    assert!(!log.contains("native PostgreSQL indexing failed"), "operator stop reported a fatal failure");
+    assert!(!log.contains("native PostgreSQL recovered"), "operator stop entered recovery");
+    assert_no_sqlite(home.path());
+}
+
+#[test]
+fn native_operator_term_during_pending_greeting_exits_cleanly() {
+    operator_term_at_admission(false);
+}
+
+#[test]
+fn native_operator_term_after_held_preflight_exits_cleanly() {
+    operator_term_at_admission(true);
+}
