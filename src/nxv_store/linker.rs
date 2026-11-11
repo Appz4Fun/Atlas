@@ -1199,7 +1199,7 @@ fn not_done_days(main: &dyn crate::pg::sql::Sql) -> Result<HashSet<i64>> {
     use crate::pg::sql::vals;
     let start: i64 = main.opt("select value from meta where key = 'backfill_forward_start'", &[])?.unwrap_or(i64::MIN);
     Ok(main
-        .column("select distinct day from backfill_chunks where state != 2 and day >= ?1", &vals![start])?
+        .column("select distinct day from backfill_chunks where state != 2 and day >= $1", &vals![start])?
         .into_iter()
         .collect())
 }

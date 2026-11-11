@@ -467,6 +467,15 @@ mod postgres_backend_tests {
 
     #[test]
     fn cancelled_postgres_day_claim_is_released_off_the_async_worker() {
+        cancelled_postgres_claim(false);
+    }
+
+    #[test]
+    fn cancelled_owned_postgres_day_claim_is_released_off_the_async_worker() {
+        cancelled_postgres_claim(true);
+    }
+
+    fn cancelled_postgres_claim(owned: bool) {
         let Some(schema) = crate::pg::testing::Schema::new() else { return };
         let mut admin = schema.pool.get().unwrap();
         let database: String = admin.query_one("select current_database()", &[]).unwrap().get(0);
@@ -483,6 +492,14 @@ mod postgres_backend_tests {
             PgWriteLimits::default(),
         )
         .unwrap();
+        let db = if owned {
+            let mut client = postgres::Client::connect(&schema.url, postgres::NoTls).unwrap();
+            client.batch_execute(&format!("set search_path to {}", schema.name)).unwrap();
+            owned_postgres_db(db, Arc::new(crate::pg::indexer_runtime::Owner::new(client)), PgWriteLimits::default())
+                .unwrap()
+        } else {
+            db
+        };
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
         rt.block_on(async {
             let (ready, started) = tokio::sync::oneshot::channel();
@@ -1946,7 +1963,7 @@ impl Drop for GiveBackOnDrop<'_> {
             return;
         }
         let conn = self.db.conn.clone();
-        let postgres = matches!(&*conn, MainConnection::Postgres(_));
+        let postgres = !matches!(&*conn, MainConnection::Sqlite(_));
         let claim = self.chunk.clone();
         let release = move || {
             if let Err(e) = conn.with_sql(|conn| Ok(crate::chunks::release(conn, &claim)?)) {

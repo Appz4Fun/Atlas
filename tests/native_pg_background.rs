@@ -70,23 +70,7 @@ fn background_entrypoint_persists_postgres_and_nxv_without_sqlite() {
         .collect();
     let server = Server::new(posts);
     let port = spawn_server(Arc::clone(&server));
-    let config = serde_json::json!({
-        "usenet_servers": [{
-            "host": "127.0.0.1", "username": "bob", "password": "secret",
-            "port": port, "ssl": false, "connections": 1, "priority": 1
-        }],
-        "groups": [GROUP], "index_mode": "backfill", "batch_size": 50,
-        "request_size": 10, "parallel_groups": 1, "auto_run_compact": false,
-        "inferred_parts": false, "postprocess": {"enabled": false},
-        "predb": {"enabled": false}, "spots": {"enabled": false},
-        "archive": {"enabled": false}, "header_store": {"enabled": true},
-        "media": {"tvmaze": {"enabled": false}, "allocine": {"enabled": false}, "details_per_minute": 0},
-        "metrics": {"enabled": false},
-        "storage": {
-            "backend": "postgres", "url": url, "schema": schema.name,
-            "max_connections": 4, "allow_plaintext": true
-        }
-    });
+    let config = configuration(&url, &schema.name, port);
     for case in ["headers_disabled", "postprocessing_enabled", "missing_schema"] {
         let invalid_home = tempfile::tempdir().unwrap();
         let mut invalid = config.clone();
@@ -203,6 +187,103 @@ fn background_entrypoint_persists_postgres_and_nxv_without_sqlite() {
     }
     assert!(rows >= 50, "native background lost durable NXV input");
     assert_no_sqlite(home.path());
+}
+
+#[test]
+fn background_linker_publishes_an_obfuscated_upload_on_postgres() {
+    let Ok(url) = std::env::var("ATLAS_PG_TEST_URL") else { return };
+    if url.is_empty() {
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let name = format!("t_native_linker_{}", std::process::id());
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    atlas::pg::migrate::run(&mut client, &name).unwrap();
+    let mut schema = Schema { client, name };
+    let root = home.path().join("header-store");
+    let keep = atlas::nxv_store::KeepSet { live_from: i64::MIN, ..Default::default() };
+    let (store, _) =
+        atlas::nxv_store::store::Store::open(atlas::nxv_store::store::StoreConfig::new(&root), keep).unwrap();
+    let first = chrono::Utc::now().timestamp() - 8 * 3600;
+    let mut lines = Vec::new();
+    for file in 0..=5 {
+        for part in 0..if file == 0 { 1 } else { 4 } {
+            let number = lines.len() + 1;
+            let subject = format!("aa{file:03}p{part:03}g0");
+            let date = chrono::DateTime::from_timestamp(first + number as i64, 0)
+                .unwrap()
+                .format("%a, %d %b %Y %H:%M:%S +0000");
+            lines.push(
+                format!("{number}\t{subject}\taa{file:03}@x.y\t{date}\t<{subject}@ngPost>\t\t740000\t5692")
+                    .into_bytes(),
+            );
+        }
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let (_, ticket) = runtime
+        .block_on(store.record_live(
+            "fixture",
+            GROUP,
+            lines,
+            atlas::nxv_store::store::Clamp::Unknown { now: first + 100 },
+            None,
+        ))
+        .unwrap();
+    drop(runtime);
+    let days: Vec<_> = (first..first + 100).map(|t| t.div_euclid(86400)).collect();
+    store.flush_days(&days, Duration::from_secs(5)).unwrap();
+    ticket.wait(Duration::from_secs(5)).unwrap();
+    store.close().unwrap();
+    drop(store);
+    let server = Server::new(vec![]);
+    let port = spawn_server(server);
+    let config = configuration(&url, &schema.name, port);
+    std::fs::write(home.path().join("config.json"), config.to_string()).unwrap();
+    let mut runner = start(home.path(), "linker.log");
+    let deadline = Instant::now() + Duration::from_secs(12);
+    loop {
+        let count: i64 =
+            schema.client.query_one(&format!("select count(*) from {}.segments", schema.name), &[]).unwrap().get(0);
+        if count == 21 {
+            break;
+        }
+        assert!(
+            runner.0.try_wait().unwrap().is_none(),
+            "indexer exited: {}",
+            std::fs::read_to_string(home.path().join("linker.log")).unwrap()
+        );
+        assert!(
+            Instant::now() < deadline,
+            "linker did not publish its durable input: {}",
+            std::fs::read_to_string(home.path().join("linker.log")).unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    assert!(runner.stop().success());
+    let releases: i64 =
+        schema.client.query_one(&format!("select count(*) from {}.releases", schema.name), &[]).unwrap().get(0);
+    assert_eq!(releases, 1);
+    assert_no_sqlite(home.path());
+}
+
+fn configuration(url: &str, schema: &str, port: u16) -> serde_json::Value {
+    serde_json::json!({
+        "usenet_servers": [{
+            "host": "127.0.0.1", "username": "bob", "password": "secret",
+            "port": port, "ssl": false, "connections": 1, "priority": 1
+        }],
+        "groups": [GROUP], "index_mode": "backfill", "batch_size": 50,
+        "request_size": 10, "parallel_groups": 1, "auto_run_compact": false,
+        "inferred_parts": false, "postprocess": {"enabled": false},
+        "predb": {"enabled": false}, "spots": {"enabled": false},
+        "archive": {"enabled": false}, "header_store": {"enabled": true},
+        "media": {"tvmaze": {"enabled": false}, "allocine": {"enabled": false}, "details_per_minute": 0},
+        "metrics": {"enabled": false},
+        "storage": {
+            "backend": "postgres", "url": url, "schema": schema,
+            "max_connections": 4, "allow_plaintext": true
+        }
+    })
 }
 
 fn assert_no_sqlite(home: &std::path::Path) {
