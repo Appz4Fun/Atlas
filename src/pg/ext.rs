@@ -112,15 +112,149 @@ pub struct Moved {
     pub from_keep: u64,
 }
 
+/// Which preservation snapshot supplies facts absent from SQLite.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KeepSource<'a> {
+    /// Use the conventional `keep` schema if it exists.
+    #[default]
+    Optional,
+    /// Require a compatible, readable snapshot in this schema.
+    Named(&'a str),
+    /// Import only SQLite, without consulting a snapshot.
+    Disabled,
+}
+
+fn selected_keep<'a>(source: KeepSource<'a>) -> Option<(&'a str, bool)> {
+    match source {
+        KeepSource::Optional => Some(("keep", false)),
+        KeepSource::Named(name) => Some((name, true)),
+        KeepSource::Disabled => None,
+    }
+}
+
+/// Resolve the source without creating or changing it. All source reads use this validated name.
+fn resolve_keep<'a>(
+    tx: &mut postgres::Transaction<'_>,
+    destination: &str,
+    source: KeepSource<'a>,
+) -> Result<Option<&'a str>> {
+    let Some((name, required)) = selected_keep(source) else { return Ok(None) };
+    if !super::valid_schema(name) {
+        bail!("keep source must be a plain lowercase schema name");
+    }
+    if name == destination {
+        bail!("keep source must differ from the destination schema");
+    }
+    let exists: bool = tx.query_one("select exists (select 1 from pg_namespace where nspname = $1)", &[&name])?.get(0);
+    if !exists {
+        if required {
+            bail!("keep source schema {name} does not exist");
+        }
+        return Ok(None);
+    }
+    let readable: bool = tx.query_one("select has_schema_privilege($1, 'USAGE')", &[&name])?.get(0);
+    if !readable {
+        bail!("keep source schema {name} is not readable");
+    }
+    Ok(Some(name))
+}
+
+/// Explicit snapshots may omit entire tables and optional columns, but must not silently lose unsupported data.
+/// Compare with the migrated destination, including the renamed release id of hand thaws.
+fn validate_keep(tx: &mut postgres::Transaction<'_>, name: &str) -> Result<()> {
+    let mut compatible = 0;
+    let pairs = sources()
+        .into_iter()
+        .map(|s| (s.ext, keep_name(s.ext).unwrap()))
+        .chain(std::iter::once(("ext_freeze_exempt", "freeze_exempt")));
+    for (ext, keep) in pairs {
+        let relation = tx.query_opt(
+            "select c.relkind::text, has_table_privilege(c.oid, 'SELECT')
+               from pg_class c join pg_namespace n on n.oid=c.relnamespace
+              where n.nspname=$1 and c.relname=$2",
+            &[&name, &keep],
+        )?;
+        let Some(relation) = relation else { continue };
+        let kind: String = relation.get(0);
+        if kind != "r" && kind != "p" {
+            bail!("keep source {name}.{keep}: incompatible table kind");
+        }
+        if !relation.get::<_, bool>(1) {
+            bail!("keep source {name}.{keep} is not readable");
+        }
+        let cols = tx.query(
+            "select column_name::text, udt_name::text from information_schema.columns
+              where table_schema=$1 and table_name=$2",
+            &[&name, &keep],
+        )?;
+        let theirs: Vec<(String, String)> = cols.iter().map(|r| (r.get(0), r.get(1))).collect();
+        let ours = tx.query(
+            "select column_name::text, udt_name::text,
+                    (is_nullable='NO' and column_default is null) or is_identity='YES'
+               from information_schema.columns where table_schema=current_schema() and table_name=$1",
+            &[&ext],
+        )?;
+        for r in &ours {
+            let column: String = r.get(0);
+            let source_column =
+                if ext == "ext_freeze_exempt" && column == "old_release_id" { "release_id" } else { &column };
+            let ty: String = r.get(1);
+            let required = r.get::<_, bool>(2)
+                || ext == "ext_freeze_exempt"
+                || (ext == "ext_predb_page_events" && column == "page");
+            match theirs.iter().find(|(n, _)| n == source_column) {
+                Some((_, source_ty)) if source_ty != &ty => {
+                    bail!("keep source {name}.{keep}: incompatible column {source_column}")
+                }
+                None if required => bail!("keep source {name}.{keep}: incompatible shape, missing {source_column}"),
+                _ => {}
+            }
+        }
+        for (column, _) in &theirs {
+            let dest_column =
+                if ext == "ext_freeze_exempt" && column == "release_id" { "old_release_id" } else { column };
+            if !ours.iter().any(|r| r.get::<_, String>(0) == dest_column) {
+                bail!("keep source {name}.{keep}: incompatible column {column}");
+            }
+        }
+        // A zero-row SELECT checks privileges on every column even when the table is empty.
+        tx.batch_execute(&format!(
+            "select * from {}.{} limit 0",
+            keep_export::quoted(name),
+            keep_export::quoted(keep)
+        ))?;
+        compatible += 1;
+    }
+    if compatible == 0 {
+        bail!("keep source schema {name} has no compatible keep tables");
+    }
+    Ok(())
+}
+
 /// Every `ext_*` table filled from the SQLite files beside `main` (and the shards' hand thaws), then topped up from
 /// `keep.*` when the database has it, in one transaction. A dry run (`apply` false) reads and checks the SQLite side
 /// only. Refused if any `ext_*` table already has rows: the move happens once.
 /// `schema` is migrated first, in the same transaction, so a dry run (rolled back) leaves Postgres as it was.
 pub fn copy_from_sqlite(c: &mut Client, main: &Path, schema: &str, apply: bool) -> Result<Vec<Moved>> {
+    copy_from_sqlite_with_keep(c, main, schema, apply, KeepSource::Optional)
+}
+
+/// As `copy_from_sqlite`, with an explicit read-only preservation source policy.
+pub fn copy_from_sqlite_with_keep(
+    c: &mut Client,
+    main: &Path,
+    schema: &str,
+    apply: bool,
+    source: KeepSource<'_>,
+) -> Result<Vec<Moved>> {
     let lite = Connection::open_in_memory()?;
     let mut tx = c.transaction()?;
     durable(&mut tx)?;
+    let keep_schema = resolve_keep(&mut tx, schema, source)?;
     super::migrate::run_in_transaction(&mut tx, schema)?;
+    if let (KeepSource::Named(_), Some(name)) = (source, keep_schema) {
+        validate_keep(&mut tx, name)?;
+    }
     for t in tables_of(&mut tx)? {
         let any: bool =
             tx.query_one(&format!("select exists (select 1 from {})", keep_export::quoted(&t)), &[])?.get(0);
@@ -128,7 +262,6 @@ pub fn copy_from_sqlite(c: &mut Client, main: &Path, schema: &str, apply: bool) 
             bail!("{t} has rows already: the external data was moved before (refusing to copy over it)");
         }
     }
-    let has_keep: bool = tx.query_one("select exists (select 1 from pg_namespace where nspname = 'keep')", &[])?.get(0);
     let mut moved = Vec::new();
     for s in sources() {
         let path = (s.db)(main);
@@ -153,15 +286,17 @@ pub fn copy_from_sqlite(c: &mut Client, main: &Path, schema: &str, apply: bool) 
             if back != tally {
                 bail!("{}: Postgres holds something else than {} ({back:?} vs {tally:?})", s.ext, path.display());
             }
-            if has_keep && let Some(k) = keep_name(s.ext) {
-                from_keep = top_up(&mut tx, s.ext, k, &cols)?;
+            if let Some(name) = keep_schema
+                && let Some(k) = keep_name(s.ext)
+            {
+                from_keep = top_up(&mut tx, name, s.ext, k, &cols)?;
             }
         }
         lite.execute("detach database src", [])?;
         println!("  {}: {} rows, digest {}{}", s.ext, tally.rows, tally.hex(), added(from_keep));
         moved.push(Moved { table: s.ext.into(), tally, from_keep });
     }
-    moved.push(freeze_exempt(&mut tx, &lite, main, apply, has_keep)?);
+    moved.push(freeze_exempt(&mut tx, &lite, main, apply, keep_schema)?);
     if apply {
         advance_counters(&mut tx)?;
         tx.commit()?;
@@ -185,12 +320,12 @@ fn tables_of(tx: &mut postgres::Transaction<'_>) -> Result<Vec<String>> {
         .collect())
 }
 
-/// The rows of `keep.<keep>` that `ext` hasn't got (by any of its keys), added. Only the columns both have.
-fn top_up(tx: &mut postgres::Transaction<'_>, ext: &str, keep: &str, cols: &[Column]) -> Result<u64> {
+/// The rows of the selected snapshot table that `ext` hasn't got (by any of its keys), added. Only the columns both have.
+fn top_up(tx: &mut postgres::Transaction<'_>, schema: &str, ext: &str, keep: &str, cols: &[Column]) -> Result<u64> {
     let there: Vec<String> = tx
         .query(
-            "select column_name::text from information_schema.columns where table_schema = 'keep' and table_name = $1",
-            &[&keep],
+            "select column_name::text from information_schema.columns where table_schema = $2 and table_name = $1",
+            &[&keep, &schema],
         )?
         .iter()
         .map(|r| r.get(0))
@@ -200,11 +335,13 @@ fn top_up(tx: &mut postgres::Transaction<'_>, ext: &str, keep: &str, cols: &[Col
     }
     let both: Vec<&Column> = cols.iter().filter(|c| there.contains(&c.name)).collect();
     let list = both.iter().map(|c| keep_export::quoted(&c.name)).collect::<Vec<_>>().join(", ");
-    let total: i64 = tx.query_one(&format!("select count(*) from keep.{}", keep_export::quoted(keep)), &[])?.get(0);
+    let namespace = keep_export::quoted(schema);
+    let total: i64 =
+        tx.query_one(&format!("select count(*) from {namespace}.{}", keep_export::quoted(keep)), &[])?.get(0);
     let keep_pages: bool = tx
         .query_one(
-            "select exists (select 1 from information_schema.tables where table_schema = 'keep' and table_name = 'predb_pages')",
-            &[],
+            "select exists (select 1 from information_schema.tables where table_schema = $1 and table_name = 'predb_pages')",
+            &[&schema],
         )?
         .get(0);
     let n = if ext == "ext_predb_page_events" && !keep_pages {
@@ -215,17 +352,19 @@ fn top_up(tx: &mut postgres::Transaction<'_>, ext: &str, keep: &str, cols: &[Col
         // same body, so the event goes to that page; an event already there (same page, page number and time) isn't
         // added twice, and one whose seq SQLite reused gets the next free one
         tx.execute(
-            "insert into ext_predb_page_events (seq, log_id, page, fetched_at)
+            &format!(
+                "insert into ext_predb_page_events (seq, log_id, page, fetched_at)
              select (select coalesce(max(seq), 0) from ext_predb_page_events) + row_number() over (order by e.seq),
                     p.id, e.page, e.fetched_at
-               from keep.predb_page_events e
-               join keep.predb_pages k on k.id = e.log_id
+               from {namespace}.predb_page_events e
+               join {namespace}.predb_pages k on k.id = e.log_id
                join ext_predb_pages p on p.source_id = k.source_id and p.body_sha256 = k.body_sha256
               where not exists (select 1 from ext_predb_page_events x
-                                 where x.log_id = p.id and x.page = e.page and x.fetched_at = e.fetched_at)",
+                                 where x.log_id = p.id and x.page = e.page and x.fetched_at = e.fetched_at)"
+            ),
             &[],
         )?
-    } else if let Some((id, there)) = renumbered(tx, ext, keep)? {
+    } else if let Some((id, there)) = renumbered(tx, schema, ext, keep)? {
         // a row is the same by what it holds, whatever id it had: one already there (`there`) is left out, and one
         // whose id SQLite handed out again since the snapshot (a file made again, or the highest rows pruned) gets
         // the next free id instead of being dropped
@@ -243,7 +382,7 @@ fn top_up(tx: &mut postgres::Transaction<'_>, ext: &str, keep: &str, cols: &[Col
         tx.execute(
             &format!(
                 "with missing as (
-                     select k.* from keep.{keep_q} k
+                     select k.* from {namespace}.{keep_q} k
                       where not {there}
                  ),
                  n as (
@@ -261,7 +400,7 @@ fn top_up(tx: &mut postgres::Transaction<'_>, ext: &str, keep: &str, cols: &[Col
     } else {
         tx.execute(
             &format!(
-                "insert into {ext} ({list}) select {list} from keep.{} on conflict do nothing",
+                "insert into {ext} ({list}) select {list} from {namespace}.{} on conflict do nothing",
                 keep_export::quoted(keep)
             ),
             &[],
@@ -269,7 +408,7 @@ fn top_up(tx: &mut postgres::Transaction<'_>, ext: &str, keep: &str, cols: &[Col
     };
     let skipped = (total as u64).saturating_sub(n);
     if skipped > 0 {
-        println!("  {ext}: {skipped} rows of keep.{keep} are there already (by a key) and were left as they are");
+        println!("  {ext}: {skipped} rows of {schema}.{keep} are there already (by a key) and were left as they are");
     }
     Ok(n)
 }
@@ -306,10 +445,15 @@ fn advance_counters(tx: &mut postgres::Transaction<'_>) -> Result<()> {
 /// it, soo one that SQLite has again under other casing or from another feed since the snapshot isn't added twice.
 /// The keys are made here in Rust, not with SQL's `lower()`, whose answer depends on the server's locale and ICU (a
 /// Turkish locale lowercases `I` to `ı`) and could call two titles the same that the importer keeps apart.
-fn renumbered(tx: &mut postgres::Transaction<'_>, ext: &str, keep: &str) -> Result<Option<(&'static str, String)>> {
+fn renumbered(
+    tx: &mut postgres::Transaction<'_>,
+    schema: &str,
+    ext: &str,
+    keep: &str,
+) -> Result<Option<(&'static str, String)>> {
     Ok(match ext {
         "ext_predb_titles" => {
-            for (table, from) in [("ext_title_keys", ext.to_string()), ("keep_title_keys", format!("keep.{}", keep_export::quoted(keep)))] {
+            for (table, from) in [("ext_title_keys", ext.to_string()), ("keep_title_keys", format!("{}.{}", keep_export::quoted(schema), keep_export::quoted(keep)))] {
                 tx.batch_execute(&format!(
                     "drop table if exists pg_temp.{table};
                      create temp table {table} (id bigint not null, key text collate \"C\" not null) on commit drop"
@@ -363,7 +507,7 @@ fn freeze_exempt(
     lite: &Connection,
     main: &Path,
     apply: bool,
-    has_keep: bool,
+    keep_schema: Option<&str>,
 ) -> Result<Moved> {
     let table = "ext_freeze_exempt";
     let (mut rows, mut lost) = (Vec::<(String, String, i64, i64)>::new(), 0u64);
@@ -397,22 +541,21 @@ fn freeze_exempt(
                 &[n, g, at, id],
             )?;
         }
-        let keep_has: bool = has_keep
-            && tx
-                .query_one(
-                    "select exists (select 1 from information_schema.tables
-                      where table_schema = 'keep' and table_name = 'freeze_exempt')",
+        if let Some(schema) = keep_schema {
+            let keep_has: bool = tx.query_one(
+                "select exists (select 1 from information_schema.tables where table_schema = $1 and table_name = 'freeze_exempt')", &[&schema])?.get(0);
+            if keep_has {
+                from_keep = tx.execute(
+                    &format!(
+                        "insert into ext_freeze_exempt (name, group_name, at, old_release_id)
+                     select name, group_name, at, release_id from {}.freeze_exempt
+                      where name is not null and group_name is not null and at is not null
+                     on conflict do nothing",
+                        keep_export::quoted(schema)
+                    ),
                     &[],
-                )?
-                .get(0);
-        if keep_has {
-            from_keep = tx.execute(
-                "insert into ext_freeze_exempt (name, group_name, at, old_release_id)
-                 select name, group_name, at, release_id from keep.freeze_exempt
-                  where name is not null and group_name is not null and at is not null
-                 on conflict do nothing",
-                &[],
-            )?;
+                )?;
+            }
         }
     }
     let lost_note = if lost > 0 { format!(" ({lost} whose release row is gone left out)") } else { String::new() };
@@ -420,11 +563,22 @@ fn freeze_exempt(
     Ok(Moved { table: table.into(), tally: Tally { rows: rows.len() as u64, digest: 0 }, from_keep })
 }
 
-/// `atlas --move-ext [--apply]`: `copy_from_sqlite` into the `[storage]` Postgres (migrated first, and only
+/// `atlas --move-ext [--apply] [--keep-schema NAME]`: `copy_from_sqlite` into the `[storage]` Postgres (migrated first, and only
 /// committed with `--apply`).
 pub fn run_move(args: &[String]) -> i32 {
     let apply = args.iter().any(|a| a == "--apply");
     let go = || -> Result<()> {
+        let mut source = KeepSource::Optional;
+        for (i, arg) in args.iter().enumerate() {
+            if arg == "--keep-schema" {
+                let name =
+                    args.get(i + 1).filter(|v| !v.starts_with("--")).context("--keep-schema requires a value")?;
+                if !super::valid_schema(name) {
+                    bail!("keep source must be a plain lowercase schema name");
+                }
+                source = KeepSource::Named(name);
+            }
+        }
         let storage = crate::config::storage_config();
         storage.check()?;
         if storage.url.is_empty() {
@@ -438,7 +592,7 @@ pub fn run_move(args: &[String]) -> i32 {
             if apply { "moving" } else { "checking (dry run)" },
             main.display()
         );
-        copy_from_sqlite(&mut c, &main, pool.schema(), apply)?;
+        copy_from_sqlite_with_keep(&mut c, &main, pool.schema(), apply, source)?;
         if !apply {
             println!("dry run: nothing written (--apply to move it)");
         }
@@ -952,6 +1106,44 @@ mod tests {
         assert!(shrank(&kept, &m(vec![t("ext_a", 5)])).is_some(), "the HTTP cache table gone");
     }
 
+    #[test]
+    fn keep_selection_retains_the_optional_default() {
+        assert_eq!(selected_keep(KeepSource::default()), Some(("keep", false)));
+        assert_eq!(selected_keep(KeepSource::Named("snapshot")), Some(("snapshot", true)));
+        assert_eq!(selected_keep(KeepSource::Disabled), None);
+    }
+
+    #[test]
+    fn named_keep_dry_run_checks_source_without_leaving_tables() {
+        let Some(source) = super::super::testing::Schema::empty() else { return };
+        let Some(destination) = super::super::testing::Schema::empty() else { return };
+        let mut source_conn = source.pool.get().unwrap();
+        source_conn
+            .batch_execute(
+                "create table predb_titles (id bigint, title text, source bigint, added_at bigint);
+            insert into predb_titles values (1, 'Preserved.Title', 3, 5)",
+            )
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let main = sqlite_files(dir.path());
+        let mut c = destination.pool.get().unwrap();
+        let moved =
+            copy_from_sqlite_with_keep(&mut c, &main, &destination.name, false, KeepSource::Named(&source.name))
+                .unwrap();
+        assert!(moved.iter().all(|m| m.from_keep == 0));
+        assert!(tables(&mut c).unwrap().is_empty());
+        assert_eq!(
+            source_conn.query_one("select title from predb_titles", &[]).unwrap().get::<_, String>(0),
+            "Preserved.Title"
+        );
+        source_conn.batch_execute("alter table predb_titles drop column title").unwrap();
+        assert!(
+            copy_from_sqlite_with_keep(&mut c, &main, &destination.name, false, KeepSource::Named(&source.name))
+                .is_err()
+        );
+        assert!(tables(&mut c).unwrap().is_empty());
+    }
+
     /// With the session's default off (a role or database set that way), the move and the restore still commit
     /// durably: a trigger refuses any row written by a transaction that isn't.
     #[test]
@@ -968,7 +1160,7 @@ mod tests {
              set synchronous_commit = off",
         )
         .unwrap();
-        copy_from_sqlite(&mut c, &main, &s.name, true).unwrap();
+        copy_from_sqlite_with_keep(&mut c, &main, &s.name, true, KeepSource::Disabled).unwrap();
         let d = dump(&mut c, &dir.path().join("ext-dumps"), 3, false).unwrap();
         restore(&mut c, &d, true).unwrap();
         let after: String = c.query_one("show synchronous_commit", &[]).unwrap().get(0);
@@ -980,23 +1172,23 @@ mod tests {
     }
 
     /// Keep titles are matched by Rust's lowercasing, as the importer matches them, not by the server's `lower()`:
-    /// other casing (ASCII or not) is the same title, a dotless `ı` is another one. The keep schema is made and
-    /// dropped inside a transaction that's rolled back, soo no other test sees it.
+    /// other casing (ASCII or not) is the same title, a dotless `ı` is another one. The source is isolated.
     #[test]
     fn keep_titles_match_the_importers_identity() {
+        let Some(source) = super::super::testing::Schema::empty() else { return };
         let Some(s) = super::super::testing::Schema::new() else { return };
         let mut c = s.pool.get().unwrap();
         let mut tx = c.transaction().unwrap();
-        tx.batch_execute(
-            "create schema keep;
-             create table keep.predb_titles (id bigint, title text, source bigint, added_at bigint);
+        let namespace = keep_export::quoted(&source.name);
+        tx.batch_execute(&format!(
+            "create table {namespace}.predb_titles (id bigint, title text, source bigint, added_at bigint);
              insert into ext_predb_titles (id, title, source, added_at)
                  values (1, 'Some.FILE.Title-GRP', 3, 1), (2, 'école.Title-GRP', 3, 1);
-             insert into keep.predb_titles values
+             insert into {namespace}.predb_titles values
                  (1, 'some.file.title-grp', 5, 1),
                  (2, 'ÉCOLE.TITLE-GRP', 3, 1),
-                 (3, 'Some.fıle.Title-GRP', 3, 1)",
-        )
+                 (3, 'Some.fıle.Title-GRP', 3, 1)"
+        ))
         .unwrap();
         let col = |name: &str, pg| Column { name: name.into(), decl: String::new(), pg };
         let cols = [
@@ -1005,7 +1197,7 @@ mod tests {
             col("source", PgKind::Int),
             col("added_at", PgKind::Int),
         ];
-        assert_eq!(top_up(&mut tx, "ext_predb_titles", "predb_titles", &cols).unwrap(), 1);
+        assert_eq!(top_up(&mut tx, &source.name, "ext_predb_titles", "predb_titles", &cols).unwrap(), 1);
         let added: Vec<(i64, String)> = tx
             .query("select id, title from ext_predb_titles where id > 2", &[])
             .unwrap()
@@ -1069,17 +1261,20 @@ mod tests {
         let main = sqlite_files(dir.path());
         let mut c = s.pool.get().unwrap();
         // a dry run writes nothing, not even the migrations it needed
-        copy_from_sqlite(&mut c, &main, &s.name, false).unwrap();
+        copy_from_sqlite_with_keep(&mut c, &main, &s.name, false, KeepSource::Disabled).unwrap();
         let migrated: bool = c
             .query_one("select exists (select 1 from information_schema.tables where table_schema = $1)", &[&s.name])
             .unwrap()
             .get(0);
         assert!(!migrated, "a dry run left tables behind");
-        let moved = copy_from_sqlite(&mut c, &main, &s.name, true).unwrap();
+        let moved = copy_from_sqlite_with_keep(&mut c, &main, &s.name, true, KeepSource::Disabled).unwrap();
         let rows = |t: &str| moved.iter().find(|m| m.table == t).unwrap().tally.rows;
         assert_eq!(rows("ext_predb_titles"), 1);
         assert_eq!(rows("ext_http_cache"), 1);
-        assert!(copy_from_sqlite(&mut c, &main, &s.name, true).is_err(), "a second move is refused");
+        assert!(
+            copy_from_sqlite_with_keep(&mut c, &main, &s.name, true, KeepSource::Disabled).is_err(),
+            "a second move is refused"
+        );
         // a new title is numbered past the moved ones, as SQLite would
         let id: i64 = c
             .query_one(
