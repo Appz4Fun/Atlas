@@ -152,11 +152,18 @@ fn resolve_keep<'a>(
         }
         return Ok(None);
     }
-    let readable: bool = tx.query_one("select has_schema_privilege($1, 'USAGE')", &[&name])?.get(0);
-    if !readable {
+    check_keep_access(name, required, || {
+        Ok(tx.query_one("select has_schema_privilege($1, 'USAGE')", &[&name])?.get(0))
+    })?;
+    Ok(Some(name))
+}
+
+/// Optional snapshots defer permission checks to their visible tables; named snapshots require schema access.
+fn check_keep_access(name: &str, required: bool, readable: impl FnOnce() -> Result<bool>) -> Result<()> {
+    if required && !readable()? {
         bail!("keep source schema {name} is not readable");
     }
-    Ok(Some(name))
+    Ok(())
 }
 
 /// Explicit snapshots may omit entire tables and optional columns, but must not silently lose unsupported data.
@@ -1111,6 +1118,18 @@ mod tests {
         assert_eq!(selected_keep(KeepSource::default()), Some(("keep", false)));
         assert_eq!(selected_keep(KeepSource::Named("snapshot")), Some(("snapshot", true)));
         assert_eq!(selected_keep(KeepSource::Disabled), None);
+    }
+
+    #[test]
+    fn optional_keep_defers_readability_checks_while_named_requires_them() {
+        let (_, required) = selected_keep(KeepSource::Optional).unwrap();
+        let optional = check_keep_access("keep", required, || bail!("permission lookup must stay lazy"));
+        assert!(optional.is_ok(), "optional source resolution must not query schema readability");
+
+        let (_, required) = selected_keep(KeepSource::Named("snapshot")).unwrap();
+        let named = check_keep_access("snapshot", required, || Ok(false));
+        assert!(named.unwrap_err().to_string().contains("not readable"));
+        assert!(check_keep_access("snapshot", required, || Ok(true)).is_ok());
     }
 
     #[test]
