@@ -13,6 +13,8 @@
 pub mod header_blocks;
 pub(crate) mod indexer_runtime;
 pub mod ingest;
+pub(crate) mod linker;
+mod linker_legacy;
 pub mod main_import;
 pub mod migrate;
 pub mod release_queue;
