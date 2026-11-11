@@ -29,6 +29,8 @@ pub struct Post {
 }
 
 pub struct Server {
+    /// Optional deterministic audit before greeting an accepted test connection.
+    pub before_connection: Option<Arc<dyn Fn() + Send + Sync>>,
     pub posts: Mutex<Vec<Post>>,
     pub password: &'static str,
     /// false = BODY always 430s, like a provider missing the article
@@ -112,6 +114,7 @@ pub struct Server {
 impl Server {
     pub fn new(posts: Vec<Post>) -> Arc<Server> {
         Arc::new(Server {
+            before_connection: None,
             posts: Mutex::new(posts),
             password: "secret",
             bodies: true,
@@ -228,6 +231,9 @@ pub fn post_at(number: u64, subject: &str, date: &str) -> Post {
 }
 
 pub fn handle(stream: TcpStream, state: Arc<Server>) {
+    if let Some(before) = &state.before_connection {
+        before();
+    }
     state.accepted.fetch_add(1, Ordering::SeqCst);
     let now_open = state.open.fetch_add(1, Ordering::SeqCst) + 1;
     state.peak.fetch_max(now_open, Ordering::SeqCst);
