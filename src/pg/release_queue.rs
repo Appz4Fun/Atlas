@@ -37,7 +37,9 @@ fn deadline(now: i64, limit: usize, lease_seconds: i64) -> Result<i64> {
 pub fn claim(client: &mut Client, now: i64, limit: usize, lease_seconds: i64) -> Result<Vec<Claim>> {
     let lease_until = deadline(now, limit, lease_seconds)?;
     let limit = limit as i64;
-    let rows = client.query(
+    let mut tx = client.transaction()?;
+    super::history_gate::native(&mut tx)?;
+    let rows = tx.query(
         "with due as (
              select release_id from pp_queue
              where due_at <= $1 and (lease_until is null or lease_until <= $1)
@@ -49,6 +51,7 @@ pub fn claim(client: &mut Client, now: i64, limit: usize, lease_seconds: i64) ->
          ) select release_id, due_at, lease_until, generation, lease_token from leased order by due_at, release_id",
         &[&now, &limit, &lease_until],
     )?;
+    tx.commit()?;
     Ok(rows
         .into_iter()
         .map(|row| Claim {
@@ -75,6 +78,7 @@ pub fn requeue(tx: &mut Transaction<'_>, claim: &Claim, now: i64, due_at: i64) -
 }
 
 fn settle(tx: &mut Transaction<'_>, claim: &Claim, now: i64, retry_at: Option<i64>) -> Result<Outcome> {
+    super::history_gate::native(tx)?;
     let Some(row) = tx.query_opt(
         "select generation from pp_queue where release_id = $1 and lease_token = $2 and lease_until > $3 for update",
         &[&claim.release_id, &claim.token, &now],

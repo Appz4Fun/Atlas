@@ -12,6 +12,12 @@
 
 pub mod ext;
 pub mod header_blocks;
+mod history_gate;
+mod history_digest;
+mod history_validator;
+pub mod history_import;
+mod history_stage;
+mod history_spool;
 pub(crate) mod indexer_runtime;
 pub mod ingest;
 pub(crate) mod linker;

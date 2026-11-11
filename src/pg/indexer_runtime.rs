@@ -110,6 +110,9 @@ impl Runtime {
         ensure!(locked, "another native indexer owns this PostgreSQL schema");
         owner.batch_execute(&format!("set search_path to \"{}\"", storage.schema))?;
         {
+            let mut tx = owner.transaction()?;
+            super::history_gate::native(&mut tx).context("historical readiness before native cursor initialization")?;
+            tx.commit()?;
             let pg = super::sql::Pg::new(&mut owner);
             let sql: &dyn super::sql::Sql = &pg;
             sql.tx(|connection| {

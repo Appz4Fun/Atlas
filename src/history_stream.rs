@@ -225,6 +225,29 @@ pub fn sealed<R: Read, V: FnMut(Event<'_>) -> io::Result<()>>(
     p.finish()
 }
 
+/// I/O class for an explicitly admitted streaming consumer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadClass {
+    Compressed,
+    Expanded,
+}
+/// Optional backpressure at both actual read boundaries. An allowance may
+/// block, but must return 1..=requested or an error. Completion charges exactly
+/// the bytes actually returned, including decoder read-ahead and EOF probes.
+pub trait Admission: Send + Sync {
+    fn allowance(&self, class: ReadClass, requested: usize) -> io::Result<usize>;
+    fn completed(&self, class: ReadClass, bytes: usize) -> io::Result<()>;
+}
+/// The ordinary codec contract with caller-owned I/O backpressure.
+pub fn frozen_admitted<R: Read, V: FnMut(Event<'_>) -> io::Result<()>>(
+    reader: R,
+    config: Config,
+    admission: std::sync::Arc<dyn Admission>,
+    visitor: V,
+) -> io::Result<Stats> {
+    frozen_with_admission(reader, config, Some(admission), visitor)
+}
+
 /// Stream a complete v1 frozen frame, without SQLite or table/row materialization.
 /// Counts use the legacy minimum-encoded-size checks, deferred to final validation
 /// when the frame's expanded length is known. Empty-column rows therefore remain
@@ -232,9 +255,18 @@ pub fn sealed<R: Read, V: FnMut(Event<'_>) -> io::Result<()>>(
 pub fn frozen<R: Read, V: FnMut(Event<'_>) -> io::Result<()>>(
     reader: R,
     config: Config,
+    visitor: V,
+) -> io::Result<Stats> {
+    frozen_with_admission(reader, config, None, visitor)
+}
+
+fn frozen_with_admission<R: Read, V: FnMut(Event<'_>) -> io::Result<()>>(
+    reader: R,
+    config: Config,
+    admission: Option<std::sync::Arc<dyn Admission>>,
     mut visitor: V,
 ) -> io::Result<Stats> {
-    let mut p = Parser::new(reader, config, true)?;
+    let mut p = Parser::new_admitted(reader, config, true, admission)?;
     p.version()?;
     let domains = p.count(2)?;
     visitor(Event::Domains(domains))?;
@@ -296,16 +328,32 @@ fn unzigzag(value: u64) -> i64 {
     ((value >> 1) as i64) ^ -((value & 1) as i64)
 }
 
+fn admit(admission: &Option<std::sync::Arc<dyn Admission>>, class: ReadClass, requested: usize) -> io::Result<usize> {
+    if requested == 0 {
+        return Ok(0);
+    }
+    let n = if let Some(a) = admission { a.allowance(class, requested)? } else { requested };
+    if n == 0 || n > requested {
+        return Err(bad("invalid history read allowance"));
+    }
+    Ok(n)
+}
+
 struct Input<R> {
     reader: R,
     stats: Stats,
     magic_seen: usize,
+    admission: Option<std::sync::Arc<dyn Admission>>,
 }
 impl<R: Read> Read for Input<R> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         self.stats.read_calls = checked_add(self.stats.read_calls, 1)?;
         self.stats.max_read_request = self.stats.max_read_request.max(out.len());
-        let n = self.reader.read(out)?;
+        let allowed = admit(&self.admission, ReadClass::Compressed, out.len())?;
+        let n = self.reader.read(&mut out[..allowed])?;
+        if let Some(a) = &self.admission {
+            a.completed(ReadClass::Compressed, n)?;
+        }
         self.stats.compressed_bytes = checked_add(self.stats.compressed_bytes, n as u64)?;
         for &byte in &out[..n.min(4 - self.magic_seen)] {
             if byte != MAGIC[self.magic_seen] {
@@ -322,6 +370,7 @@ struct Expanded<R> {
     reader: R,
     total: u64,
     limit: u64,
+    admission: Option<std::sync::Arc<dyn Admission>>,
 }
 impl<R: Read> Read for Expanded<R> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
@@ -329,7 +378,11 @@ impl<R: Read> Read for Expanded<R> {
         // One extra byte proves a limit violation; even at the limit we must
         // still ask Zstd to validate its trailer and detect expanded garbage.
         let size = out.len().min(usize::try_from(remaining.saturating_add(1)).unwrap_or(usize::MAX));
+        let size = admit(&self.admission, ReadClass::Expanded, size)?;
         let n = self.reader.read(&mut out[..size])?;
+        if let Some(a) = &self.admission {
+            a.completed(ReadClass::Expanded, n)?;
+        }
         if n as u64 > remaining {
             return Err(bad("expanded history exceeds configured limit"));
         }
@@ -348,6 +401,14 @@ struct Parser<R: Read> {
 }
 impl<R: Read> Parser<R> {
     fn new(reader: R, config: Config, is_frozen: bool) -> io::Result<Self> {
+        Self::new_admitted(reader, config, is_frozen, None)
+    }
+    fn new_admitted(
+        reader: R,
+        config: Config,
+        is_frozen: bool,
+        admission: Option<std::sync::Arc<dyn Admission>>,
+    ) -> io::Result<Self> {
         if !(1..=MAX_BUFFER).contains(&config.read_buffer_bytes)
             || !(1..=MAX_BUFFER).contains(&config.chunk_bytes)
             || !(10..=31).contains(&config.window_log_max)
@@ -355,11 +416,11 @@ impl<R: Read> Parser<R> {
         {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid history reader limits"));
         }
-        let input = Input { reader, stats: Stats::default(), magic_seen: 0 };
+        let input = Input { reader, stats: Stats::default(), magic_seen: 0, admission: admission.clone() };
         let input = BufReader::with_capacity(config.read_buffer_bytes, input);
         let mut decoder = zstd::stream::read::Decoder::with_buffer(input)?.single_frame();
         decoder.window_log_max(config.window_log_max)?;
-        let expanded = Expanded { reader: decoder, total: 0, limit: config.max_expanded_bytes };
+        let expanded = Expanded { reader: decoder, total: 0, limit: config.max_expanded_bytes, admission };
         Ok(Self {
             reader: BufReader::with_capacity(config.read_buffer_bytes, expanded),
             chunk: vec![0; config.chunk_bytes],
@@ -490,5 +551,34 @@ impl Utf8 {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    struct DenyExpanded;
+    impl Admission for DenyExpanded {
+        fn allowance(&self, class: ReadClass, requested: usize) -> io::Result<usize> {
+            if class == ReadClass::Expanded {
+                Err(io::Error::other("expanded admission denied"))
+            } else {
+                Ok(requested)
+            }
+        }
+        fn completed(&self, _: ReadClass, _: usize) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    #[test]
+    fn admitted_frozen_charges_expansion_before_callback() {
+        let packed = zstd::bulk::compress(&[1, 0, 0], 1).unwrap();
+        let mut callbacks = 0;
+        let result = frozen_admitted(packed.as_slice(), Config::default(), std::sync::Arc::new(DenyExpanded), |_| {
+            callbacks += 1;
+            Ok(())
+        });
+        assert!(result.is_err(), "expanded input must obey admission");
+        assert_eq!(callbacks, 0, "no provisional callback may bypass expansion admission");
     }
 }

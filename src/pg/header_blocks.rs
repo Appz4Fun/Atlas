@@ -41,6 +41,7 @@ pub fn append(conn: &mut Client, source: &str, blocks: &[Block<'_>]) -> Result<u
     }
     // The conflict check needs a fresh snapshot if an overlapping append committed while we waited.
     let mut tx = conn.build_transaction().isolation_level(IsolationLevel::ReadCommitted).start()?;
+    super::history_gate::native(&mut tx)?;
     tx.batch_execute(
         "set local synchronous_commit = on;
          create temporary table if not exists atlas_header_batch (like header_blocks) on commit delete rows;",
