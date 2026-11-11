@@ -21,11 +21,12 @@ pub(crate) fn plan_files(client: &mut Client, epoch: i64, budget: usize) -> Resu
 
 fn plan_one(client: &mut Client, epoch: i64) -> Result<bool> {
     let mut tx = client.transaction()?;
+    tx.batch_execute("set local work_mem='4MB'")?;
     let state = tx
         .query_one("select phase,active_serial,next_chain from linker_epochs where id=$1 for update", &[&epoch])
         .context("opening native linker epoch")?;
     let phase: String = state.get(0);
-    if phase == "emit" || phase == "ack" || phase == "done" {
+    if phase == "plan" || phase == "emit" || phase == "ack" || phase == "done" {
         return Ok(true);
     }
     ensure!(phase == "chain", "linker file planning requires a sealed file snapshot");
@@ -38,7 +39,7 @@ fn plan_one(client: &mut Client, epoch: i64) -> Result<bool> {
         &[&epoch],
     )?;
     let Some(file) = file else {
-        tx.execute("update linker_epochs set phase='emit' where id=$1", &[&epoch])?;
+        tx.execute("update linker_epochs set phase='plan' where id=$1", &[&epoch])?;
         tx.commit()?;
         return Ok(true);
     };
@@ -182,7 +183,7 @@ mod tests {
                 .execute(
                     "insert into linker_files(epoch,id,poster,articles,first_posted,last_posted)
                 values($1,$2,$3,$4,$5,$6)",
-                    &[&epoch, &(i as i64), &f.poster, &f.n, &f.first, &f.last],
+                    &[&epoch, &(i as i64), &f.poster.as_bytes(), &f.n, &f.first, &f.last],
                 )
                 .unwrap();
             for g in &f.groups {
@@ -240,6 +241,16 @@ mod tests {
         )
         .unwrap();
         assert!(db.is_native());
+        let mut owner_client = postgres::Client::connect(&schema.url, postgres::NoTls).unwrap();
+        owner_client.batch_execute(&format!("set search_path to \"{}\"", schema.name)).unwrap();
+        let locked: bool = owner_client
+            .query_one("select pg_try_advisory_lock(hashtext('atlas.indexer'),hashtext($1))", &[&schema.name])
+            .unwrap()
+            .get(0);
+        assert!(locked);
+        let owner_pid: i32 = owner_client.query_one("select pg_backend_pid()", &[]).unwrap().get(0);
+        let owner = std::sync::Arc::new(crate::pg::indexer_runtime::Owner::new(owner_client));
+        let db = crate::indexer::owned_postgres_db(db, owner, crate::indexer::PgWriteLimits::default()).unwrap();
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
             let borrowed = String::from("generic callback fixture");
@@ -250,6 +261,14 @@ mod tests {
             let answer: i64 =
                 crate::indexer::on_native_db(&db, |c| Ok(c.query_one("select 42::bigint", &[])?.get(0))).await.unwrap();
             assert_eq!(answer, 42);
+            let sync_pid: i32 =
+                crate::indexer::on_native_db_sync(&db, |c| Ok(c.query_one("select pg_backend_pid()", &[])?.get(0)))
+                    .unwrap();
+            let async_pid: i32 =
+                crate::indexer::on_native_db(&db, |c| Ok(c.query_one("select pg_backend_pid()", &[])?.get(0)))
+                    .await
+                    .unwrap();
+            assert_eq!((sync_pid, async_pid), (owner_pid, owner_pid));
         });
     }
 

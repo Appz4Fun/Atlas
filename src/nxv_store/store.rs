@@ -1044,10 +1044,14 @@ impl Store {
             let gone: Vec<i64> = segs
                 .iter()
                 .filter(|(day, seg)| {
-                    armed && !keep.keeps(**day) && !open_days.contains(day) && !inflight_days.contains(day) && {
-                        let _gate = self.retention_gate.lock().unwrap_or_else(|e| e.into_inner());
-                        self.linker_pins.load(Ordering::Acquire) == 0 && seg.expire()
-                    }
+                    armed
+                        && !keep.keeps(**day)
+                        && !open_days.contains(day)
+                        && !inflight_days.contains(day)
+                        && self.linker_pins.load(Ordering::Acquire) == 0
+                        && self.expiry_armed.load(Ordering::Acquire)
+                        && self.linker_coverage.read().unwrap_or_else(|e| e.into_inner()).is_none()
+                        && seg.expire()
                 })
                 .map(|(d, _)| *d)
                 .collect();

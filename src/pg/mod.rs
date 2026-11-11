@@ -16,6 +16,8 @@ pub mod ingest;
 pub(crate) mod linker;
 mod linker_legacy;
 mod linker_ids;
+mod linker_emit;
+mod linker_files;
 mod linker_stage;
 pub mod main_import;
 pub mod migrate;
