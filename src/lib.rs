@@ -27,6 +27,7 @@ pub mod frozen;
 pub mod gemini;
 pub mod gf2;
 pub mod groups_menu;
+pub mod history_stream;
 pub mod indexer;
 pub mod inferred;
 pub mod junk;
