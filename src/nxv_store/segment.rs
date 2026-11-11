@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -142,8 +142,33 @@ pub struct Segment {
     pub day: i64,
     pub arena_path: PathBuf,
     pub index_path: PathBuf,
+    identity: [u8; 32],
     writer: Mutex<Writer>,
     view: RwLock<View>,
+}
+
+/// A fixed published prefix, keeping its mapping alive without copying the
+/// segment index. Appends cannot widen this snapshot; expiry/recreation cannot
+/// replace its backing segment. Persist `identity` and each block's content
+/// digest when resuming after process restart (inode identity alone is not a
+/// content integrity check).
+pub struct Snapshot {
+    segment: Arc<Segment>,
+    pub map: Option<Arc<Mmap>>,
+    pub count: usize,
+    pub identity: [u8; 32],
+}
+
+impl Snapshot {
+    /// At most `limit` entries from the immutable published prefix.
+    pub fn entries(&self, start: usize, limit: usize) -> Vec<Entry> {
+        let v = self.segment.view.read().unwrap_or_else(|e| e.into_inner());
+        let end = start.saturating_add(limit).min(self.count);
+        if start >= end {
+            return Vec::new();
+        }
+        v.entries[start..end].to_vec()
+    }
 }
 
 /// Space a commit reserved in a segment, with its own handles on the files.
@@ -191,6 +216,17 @@ impl Segment {
         let rw = |p: &Path| OpenOptions::new().create(true).read(true).write(true).truncate(false).open(p);
         let arena = rw(&arena_path).with_context(|| format!("opening {}", arena_path.display()))?;
         let index = rw(&index_path).with_context(|| format!("opening {}", index_path.display()))?;
+        let metadata = arena.metadata()?;
+        use sha2::{Digest, Sha256};
+        let mut identity = Sha256::new();
+        identity.update(metadata.dev().to_le_bytes());
+        identity.update(metadata.ino().to_le_bytes());
+        if let Ok(created) = metadata.created() {
+            let birth = created.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+            identity.update(birth.as_secs().to_le_bytes());
+            identity.update(birth.subsec_nanos().to_le_bytes());
+        }
+        let identity = identity.finalize().into();
         let (entries, arena_len, healed) = heal(&arena, &index, day)?;
         let map = map_arena(&arena, arena_len)?;
         let committed = entries.iter().map(|e| (e.server, e.slab_gen)).collect();
@@ -198,6 +234,7 @@ impl Segment {
             day,
             arena_path,
             index_path,
+            identity,
             writer: Mutex::new(Writer {
                 files: None,
                 arena_tail: arena_len,
@@ -216,6 +253,11 @@ impl Segment {
     pub fn snapshot(&self) -> (Option<Arc<Mmap>>, Vec<Entry>) {
         let v = self.view.read().unwrap_or_else(|e| e.into_inner());
         (v.map.clone(), v.entries.clone())
+    }
+
+    pub fn bounded_snapshot(self: &Arc<Self>) -> Snapshot {
+        let v = self.view.read().unwrap_or_else(|e| e.into_inner());
+        Snapshot { segment: Arc::clone(self), map: v.map.clone(), count: v.entries.len(), identity: self.identity }
     }
 
     pub fn block_count(&self) -> usize {
@@ -420,6 +462,28 @@ mod tests {
         r.index.write_all_at(&r.entry.to_bytes(), r.entry.seq as u64 * ENTRY_LEN as u64).unwrap();
         seg.publish(&r).unwrap();
         r.entry
+    }
+
+    #[test]
+    fn bounded_snapshot_pins_prefix_across_append_and_recreation() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = parse_day_name("2026-11-08").unwrap();
+        let (seg, _) = Segment::open(dir.path(), day).unwrap();
+        commit(&seg, &block(1, 2, 1));
+        let old = seg.bounded_snapshot();
+        commit(&seg, &block(10, 2, 2));
+        assert_eq!(old.count, 1);
+        assert_eq!(old.entries(0, 100).len(), 1);
+        assert!(old.entries(1, 1).is_empty());
+        assert_eq!(seg.bounded_snapshot().entries(0, 1).len(), 1);
+        let identity = old.identity;
+        std::fs::remove_file(&seg.arena_path).unwrap();
+        std::fs::remove_file(&seg.index_path).unwrap();
+        let (replacement, _) = Segment::open(dir.path(), day).unwrap();
+        commit(&replacement, &block(20, 2, 1));
+        assert_ne!(replacement.bounded_snapshot().identity, identity);
+        assert_eq!(old.entries(0, 1)[0].min_art, 1);
+        assert!(NxvBlockView::from_mmap_slice(old.map.as_ref().unwrap()).is_ok());
     }
 
     #[test]

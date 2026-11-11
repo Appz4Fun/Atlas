@@ -15,6 +15,7 @@ pub(crate) mod indexer_runtime;
 pub mod ingest;
 pub(crate) mod linker;
 mod linker_legacy;
+mod linker_stage;
 pub mod main_import;
 pub mod migrate;
 pub mod release_queue;

@@ -57,3 +57,42 @@ create table linker_chain_files (
     foreign key (epoch,chain_id) references linker_chains(epoch,id) on delete cascade,
     foreign key (epoch,file_id) references linker_files(epoch,id) on delete cascade
 );
+
+-- Scanned source progress is independent of release publication. Rows outside
+-- the ready window survive here, so acknowledging a fully staged mixed block
+-- cannot lose a future hour or a delayed chain.
+create table linker_source_blocks (
+    id bigint generated always as identity primary key,
+    group_name text not null,
+    day bigint not null,
+    generation bytea not null,
+    seq bigint not null,
+    digest bytea not null,
+    rows bigint not null,
+    scanned bigint not null default 0,
+    complete boolean not null default false,
+    unique(group_name,day,generation,seq,digest),
+    check(scanned between 0 and rows)
+);
+create table linker_epoch_sources (
+    epoch bigint not null references linker_epochs(id) on delete cascade,
+    source bigint not null references linker_source_blocks(id),
+    old_block boolean not null,
+    primary key(epoch,source)
+);
+create table linker_staged_rows (
+    source bigint not null references linker_source_blocks(id) on delete cascade,
+    ordinal bigint not null,
+    message_key bytea not null,
+    legacy_hash bigint not null,
+    message_id bytea not null,
+    poster bytea not null,
+    posted bigint not null,
+    group_id bigint not null,
+    article_number bigint not null,
+    bytes bigint not null,
+    lines bigint not null,
+    primary key(source,ordinal)
+);
+create index linker_staged_message on linker_staged_rows(message_key);
+create index linker_staged_posted on linker_staged_rows(posted);

@@ -811,6 +811,40 @@ impl Store {
         out
     }
 
+    /// A keyset page of the segment inventory. Unlike `segments`, the extra
+    /// memory is proportional to `limit`, regardless of historical day count.
+    /// An epoch must pin retention while inventory and source staging run.
+    pub fn segment_page(&self, after: Option<(&str, i64)>, limit: usize) -> Vec<(String, i64, usize)> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut page: BTreeMap<(String, i64), usize> = BTreeMap::new();
+        for (name, g) in self.groups.read().unwrap_or_else(|e| e.into_inner()).iter() {
+            for (day, seg) in g.segments.read().unwrap_or_else(|e| e.into_inner()).iter() {
+                if after.is_some_and(|a| (name.as_str(), *day) <= a) {
+                    continue;
+                }
+                if page.len() == limit
+                    && page.last_key_value().is_some_and(|(k, _)| (name.as_str(), *day) >= (k.0.as_str(), k.1))
+                {
+                    continue;
+                }
+                page.insert((name.clone(), *day), seg.block_count());
+                if page.len() > limit {
+                    page.pop_last();
+                }
+            }
+        }
+        page.into_iter().map(|((g, d), n)| (g, d, n)).collect()
+    }
+
+    /// Pin one segment's published prefix without copying its manifest.
+    pub fn segment_snapshot(&self, group: &str, day: i64) -> Option<super::segment::Snapshot> {
+        let g = self.groups.read().unwrap_or_else(|e| e.into_inner()).get(group).cloned()?;
+        let seg = g.segments.read().unwrap_or_else(|e| e.into_inner()).get(&day).cloned()?;
+        Some(seg.bounded_snapshot())
+    }
+
     /// Days some slab still holds rows of (not yet sealed and committed).
     pub fn open_days(&self) -> BTreeSet<i64> {
         let mut out = BTreeSet::new();
@@ -1522,6 +1556,30 @@ mod tests {
         drop(store);
         let (again, _) = Store::open(cfg(dir.path()), keep_all()).unwrap();
         again.close().unwrap();
+    }
+
+    #[test]
+    fn bounded_segment_inventory_pages_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = Store::open(cfg(dir.path()), keep_all()).unwrap();
+        for group in ["third.example", "first.example", "second.example"] {
+            store
+                .record("server.example", group, &[line(1, "poster@example.invalid", NOV8)], Clamp::Live { now: NOW })
+                .unwrap();
+        }
+        store.close().unwrap();
+        let expected = store.segments();
+        let mut actual = Vec::new();
+        let mut after: Option<(String, i64)> = None;
+        loop {
+            let page = store.segment_page(after.as_ref().map(|(g, d)| (g.as_str(), *d)), 1);
+            assert!(page.len() <= 1);
+            let Some((g, d, _)) = page.first() else { break };
+            after = Some((g.clone(), *d));
+            actual.extend(page);
+        }
+        assert_eq!(actual, expected);
+        assert!(store.segment_page(None, 0).is_empty());
     }
 
     #[test]
