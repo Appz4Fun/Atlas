@@ -501,8 +501,24 @@ mod tests {
             )
             .unwrap();
         let plan = explain.iter().map(|r| r.get::<_, String>(0)).collect::<Vec<_>>().join("\n");
-        assert!(plan.contains("linker_active_encounter"), "matching did not use bounded frontier: {plan}");
-        assert!(!plan.contains("Seq Scan on linker_chains"), "matching scanned expired history: {plan}");
+        let assert_bounded = |plan: &str| {
+            assert!(!plan.contains("Seq Scan on linker_chains"), "matching scanned history: {plan}");
+            // Planner statistics may choose either partial active index when
+            // only one active row remains. A one-row sort is bounded too;
+            // the contract is executor work, not one particular index name.
+            for line in plan.lines().filter(|line| line.contains("actual time=")) {
+                let actual = line.split("actual time=").nth(1).unwrap();
+                let rows: f64 =
+                    actual.split("rows=").nth(1).unwrap().split_whitespace().next().unwrap().parse().unwrap();
+                let loops: f64 = actual.split("loops=").nth(1).unwrap().split(')').next().unwrap().parse().unwrap();
+                assert!(rows * loops <= 2.0, "matching visited too many rows: {plan}");
+            }
+            for line in plan.lines().filter(|line| line.contains("Rows Removed")) {
+                let removed: f64 = line.rsplit(':').next().unwrap().trim().parse().unwrap();
+                assert!(removed <= 1.0, "matching filtered completed history: {plan}");
+            }
+        };
+        assert_bounded(&plan);
         while !plan_files(&mut c, epoch, 1).unwrap() {}
         assert_eq!(
             c.query_one("select active_serial from linker_epochs where id=$1", &[&epoch]).unwrap().get::<_, i64>(0),
@@ -517,6 +533,14 @@ mod tests {
             .get::<_, i64>(0),
             1
         );
+        // Also exercise a continuation after a large *active* prefix. This
+        // prevents an index that scans/filter-sorts the entire active set from
+        // satisfying the assertion merely because the expired fixture is tiny.
+        c.execute("insert into linker_chains(epoch,id,first_posted,last_posted,index_only,active_order) select $1,20000+n,1000000,1000000,false,20000+n from generate_series(1,10000) n", &[&epoch]).unwrap();
+        c.batch_execute("analyze linker_chains").unwrap();
+        let explain=c.query("explain (analyze,buffers,format text) select id from linker_chains where epoch=$1 and active_order>29999 and not expired order by active_order limit 1", &[&epoch]).unwrap();
+        let plan = explain.iter().map(|r| r.get::<_, String>(0)).collect::<Vec<_>>().join("\n");
+        assert_bounded(&plan);
     }
 
     #[test]

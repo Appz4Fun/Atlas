@@ -167,6 +167,11 @@ pub(crate) async fn emit_page(db: &Db, epoch: i64, budget: Budget) -> Result<boo
 }
 
 #[cfg(test)]
+pub(super) fn test_page(client: &mut Client, epoch: i64, budget: Budget) -> Result<Vec<Release>> {
+    Ok(page(client, epoch, budget)?.releases)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
@@ -263,9 +268,4 @@ mod tests {
         let phase: String = c.query_one("select phase from linker_epochs where id=$1", &[&epoch]).unwrap().get(0);
         assert_eq!(phase, "done");
     }
-}
-
-#[cfg(test)]
-pub(super) fn test_page(client: &mut Client, epoch: i64, budget: Budget) -> Result<Vec<Release>> {
-    Ok(page(client, epoch, budget)?.releases)
 }

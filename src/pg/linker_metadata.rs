@@ -412,25 +412,24 @@ mod tests {
             if step(&mut c, dir.path(), 1000, budget).unwrap() {
                 break;
             }
-            if !interrupted {
-                if let Some(row) =
+            if !interrupted
+                && let Some(row) =
                     c.query_opt("select state from linker_import_jobs where name='links.rec:metadata'", &[]).unwrap()
-                {
-                    let state: Meta = serde_json::from_str(&row.get::<_, String>(0)).unwrap();
-                    if state.stage == 1 && state.tag == b'U' && state.offset > 100 {
-                        let offset = state.offset;
-                        drop(c);
-                        c = schema.pool.get().unwrap();
-                        step(&mut c, dir.path(), 1000, budget).unwrap();
-                        let state: Meta = serde_json::from_str(
-                            &c.query_one("select state from linker_import_jobs where name='links.rec:metadata'", &[])
-                                .unwrap()
-                                .get::<_, String>(0),
-                        )
-                        .unwrap();
-                        assert!(state.offset > offset && state.offset - offset <= 17);
-                        interrupted = true;
-                    }
+            {
+                let state: Meta = serde_json::from_str(&row.get::<_, String>(0)).unwrap();
+                if state.stage == 1 && state.tag == b'U' && state.offset > 100 {
+                    let offset = state.offset;
+                    drop(c);
+                    c = schema.pool.get().unwrap();
+                    step(&mut c, dir.path(), 1000, budget).unwrap();
+                    let state: Meta = serde_json::from_str(
+                        &c.query_one("select state from linker_import_jobs where name='links.rec:metadata'", &[])
+                            .unwrap()
+                            .get::<_, String>(0),
+                    )
+                    .unwrap();
+                    assert!(state.offset > offset && state.offset - offset <= 17);
+                    interrupted = true;
                 }
             }
         }
