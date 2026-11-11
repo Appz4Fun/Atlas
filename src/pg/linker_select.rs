@@ -1,5 +1,11 @@
 //! Immutable row selection and old-before-late deduplication. Poster placement
 //! is classified before file inference, without holding any poster's articles.
+//!
+//! One-time legacy reconciliation: historical counts lack generation identity.
+//! Preserve their old-before-late priority, but never interpret them as proof
+//! every ID was published. Unknown-generation prefix rows are staged and their
+//! unpublished eligible IDs remain new material. That decision is persisted in
+//! the first captured generation; restart never reclassifies the same source.
 
 use anyhow::{Result, ensure};
 use postgres::Client;
@@ -48,11 +54,11 @@ pub(crate) fn select(client: &mut Client, epoch: i64) -> Result<()> {
 const CANDIDATES:&str="
 with eligible as (
  select s.source,s.ordinal,s.poster,s.message_key,s.message_id,b.group_name,b.day,b.seq,e.old_block,
-    (not e.old_block or exists(select 1 from linker_epoch_hours h where h.epoch=$1 and h.hour=floor(s.posted::numeric/3600)::bigint)) as is_new
+    (e.new_block or exists(select 1 from linker_epoch_hours h where h.epoch=$1 and h.hour=floor(s.posted::numeric/3600)::bigint)) as is_new
  from linker_epoch_sources e join linker_source_blocks b on b.id=e.source join linker_staged_rows s on s.source=b.id
  where e.epoch=$1 and not s.published and (
     (e.old_block and s.posted between $2::bigint and $3::bigint) or
-    (not e.old_block and (exists(select 1 from linker_linked_hours h where h.hour=floor(s.posted::numeric/3600)::bigint)
+    (e.new_block and (exists(select 1 from linker_linked_hours h where h.hour=floor(s.posted::numeric/3600)::bigint)
       or exists(select 1 from linker_epoch_hours h where h.epoch=$1 and h.hour=floor(s.posted::numeric/3600)::bigint))))
  and not exists(select 1 from linker_linked_ids i where i.message_key=s.message_key and i.message_id=s.message_id and i.added>=$4)
  and not exists(select 1 from linker_legacy_ids i where i.hash=s.legacy_hash and i.added>=$4)
@@ -86,7 +92,11 @@ mod tests {
         for (group, old) in [("first.example", true), ("second.example", false)] {
             let source:i64=c.query_one("insert into linker_source_blocks(group_name,day,generation,seq,digest,rows,scanned,complete,was_read)
                 values($1,0,$2,0,$2,3,3,true,$3) returning id",&[&group,&&[1u8][..],&old]).unwrap().get(0);
-            c.execute("insert into linker_epoch_sources values($1,$2,$3)", &[&epoch, &source, &old]).unwrap();
+            c.execute(
+                "insert into linker_epoch_sources(epoch,source,old_block,new_block) values($1,$2,$3,not $3)",
+                &[&epoch, &source, &old],
+            )
+            .unwrap();
             sources.push(source);
         }
         for (source, ordinal, message, poster, posted) in [

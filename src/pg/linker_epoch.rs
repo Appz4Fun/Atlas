@@ -113,7 +113,8 @@ pub(crate) fn scope(client: &mut Client, epoch: i64) -> Result<bool> {
     }
     let waiting: Option<i64> = tx
         .query_opt(
-            "select waiting_from from linker_epochs where id<$1 and phase='done' order by id desc limit 1",
+            "select coalesce((select waiting_from from linker_epochs where id<$1 and phase='done' order by id desc limit 1),
+                 (select waiting_from from linker_bootstrap where singleton))",
             &[&epoch],
         )?
         .and_then(|r| r.get(0));
@@ -133,8 +134,8 @@ pub(crate) fn scope(client: &mut Client, epoch: i64) -> Result<bool> {
     tx.execute("with captured as (
           select source from linker_inventory_blocks where epoch=$1 union
           select source from linker_epoch_pending_sources where epoch=$1
-        ) insert into linker_epoch_sources(epoch,source,old_block)
-        select $1,b.id,b.was_read from captured join linker_source_blocks b on b.id=captured.source
+        ) insert into linker_epoch_sources(epoch,source,old_block,new_block)
+        select $1,b.id,(b.was_read or b.legacy_priority),not b.was_read from captured join linker_source_blocks b on b.id=captured.source
         where (
         ($2::bigint is not null and b.day between floor(($2-$4)::numeric/86400)::bigint and floor(($3+$4)::numeric/86400)::bigint)
           or (not exists(select 1 from generate_series(b.day*24-14,b.day*24+37) h
@@ -171,7 +172,7 @@ mod tests {
         let epoch = open(&mut c, now).unwrap();
         assert_eq!(open(&mut c, now + 1000).unwrap(), epoch);
         c.execute(
-            "insert into linker_epoch_inventory values($1,'group.example',$2,$3,1,1)",
+            "insert into linker_epoch_inventory(epoch,group_name,day,generation,blocks,scanned_blocks) values($1,'group.example',$2,$3,1,1)",
             &[&epoch, &day, &&[1u8][..]],
         )
         .unwrap();

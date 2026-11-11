@@ -279,3 +279,22 @@ create table linker_late_rows (
     primary key(epoch,source,source_ordinal),
     foreign key(source,source_ordinal) references linker_staged_rows(source,ordinal)
 );
+-- A legacy count is a source-order hint, not a publication receipt. The first
+-- generation-aware snapshot persists reconciliation priority separately from
+-- whether a source has been read by the native planner.
+alter table linker_source_blocks add column legacy_priority boolean not null default false;
+alter table linker_epoch_sources add column new_block boolean not null default false;
+create table linker_legacy_counts (
+    group_name text not null,
+    day bigint not null,
+    blocks bigint not null,
+    primary key(group_name,day)
+);
+alter table linker_epoch_inventory add column legacy_prefix bigint not null default 0;
+create table linker_bootstrap (
+    singleton boolean primary key default true check(singleton),
+    logical_now bigint not null,
+    complete boolean not null default false,
+    counts_reconciled boolean not null default false,
+    waiting_from bigint
+);
