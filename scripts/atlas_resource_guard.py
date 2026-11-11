@@ -153,23 +153,32 @@ class Sampler:
 
 def stop_child(child, grace_seconds=10):
     """Only call for a child started with start_new_session=True."""
-    if child.poll() is not None:
-        return
     try:
         os.killpg(child.pid, signal.SIGTERM)
     except ProcessLookupError:
-        return
-    try:
-        child.wait(timeout=grace_seconds)
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(child.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
         child.wait()
+        return
+    deadline = time.monotonic() + grace_seconds
+    while True:
+        # Reap an exited leader, but descendants still belong to the owned group.
+        child.poll()
+        try:
+            os.killpg(child.pid, 0)
+        except ProcessLookupError:
+            child.wait()
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(remaining, 0.02))
+    try:
+        os.killpg(child.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    child.wait()
 
 
-def write_stop_receipt(path, reason, pid, observation):
+def write_stop_receipt(path, reason, pid, observation, *, exclusive=False):
     receipt = {"reason": reason, "pid": pid, "time": time.time(),
                "observation": asdict(observation) if observation is not None else None}
     fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
@@ -179,7 +188,11 @@ def write_stop_receipt(path, reason, pid, observation):
             output.write("\n")
             output.flush()
             os.fsync(output.fileno())
-        os.replace(temporary, path)
+        if exclusive:
+            # Publish only if no other supervisor already claimed this stop path.
+            os.link(temporary, path)
+        else:
+            os.replace(temporary, path)
         directory = os.open(path.parent, os.O_RDONLY)
         try:
             os.fsync(directory)
@@ -201,6 +214,15 @@ def supervise(command, limits, storage_paths, stop_file, interval=0.5):
         print("Atlas resource guard: insufficient free storage to launch.", file=sys.stderr)
         return 0
 
+    # Establish durable fencing before creating a child. It survives a later
+    # ENOSPC, interrupted supervisor, or failed update of the final diagnostic.
+    try:
+        write_stop_receipt(
+            stop_file, "supervising", None, Observation(0, initial_swap, free, 0),
+            exclusive=True)
+    except FileExistsError:
+        print("Atlas resource guard: another launch already holds the stop fence.", file=sys.stderr)
+        return 0
     stop = threading.Event()
     previous_signals = {}
     for signum in (signal.SIGTERM, signal.SIGINT):
@@ -231,8 +253,13 @@ def supervise(command, limits, storage_paths, stop_file, interval=0.5):
         for signum, previous in previous_signals.items():
             signal.signal(signum, previous)
     if reason:
-        write_stop_receipt(stop_file, reason, child.pid, observation)
+        try:
+            write_stop_receipt(stop_file, reason, child.pid, observation)
+        except OSError:
+            print("Atlas resource guard: diagnostic update failed; startup fence retained.", file=sys.stderr)
         print(f"Atlas resource guard: stopped child after {reason}; operator review required.", file=sys.stderr)
+    else:
+        stop_file.unlink()
     # A successful supervisor exit prevents launchd KeepAlive.SuccessfulExit=false
     # from immediately restarting a process that just crossed its resource budget.
     return 0

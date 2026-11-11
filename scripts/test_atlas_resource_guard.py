@@ -1,11 +1,13 @@
 """Regression checks for the indexer's external resource supervisor."""
 import importlib.util
+import errno
 import json
 import os
 import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 from pathlib import Path
@@ -101,6 +103,84 @@ class ResourceGuardTests(unittest.TestCase):
             self.assertEqual(again.returncode, 0, again.stderr)
             self.assertFalse(started.exists(), "a stop receipt must prevent relaunch")
             self.assertEqual(saved, json.loads(receipt.read_text()))
+
+    def test_stop_kills_descendants_with_exited_or_running_leader(self):
+        for leader_exits in (False, True):
+            with self.subTest(leader_exits=leader_exits):
+                self.assert_stops_descendant(leader_exits)
+
+    def assert_stops_descendant(self, leader_exits):
+        grandchild = (
+            "import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+            "print('ready',flush=True); time.sleep(60)")
+        parent = (
+            "import subprocess,sys,time; "
+            f"p=subprocess.Popen([sys.executable,'-c',{grandchild!r}],stdout=subprocess.PIPE,text=True); "
+            "p.stdout.readline(); print(p.pid,flush=True); " +
+            ("sys.exit(0)" if leader_exits else "time.sleep(60)"))
+        child = subprocess.Popen(
+            [sys.executable, "-c", parent], start_new_session=True,
+            stdout=subprocess.PIPE, text=True)
+        descendant = int(child.stdout.readline())
+        if leader_exits:
+            child.wait(timeout=5)
+        try:
+            guard.stop_child(child, grace_seconds=0.05)
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(descendant, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("a descendant survived its supervised process group")
+        finally:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            child.wait()
+            child.stdout.close()
+
+    def test_failed_startup_fence_prevents_any_child_launch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fake_sampler = unittest.mock.Mock()
+            fake_sampler.system_usage.return_value = (100, 1000)
+            fake_sampler.sample.return_value = self.observation(memory_bytes=101)
+            with patch.object(guard, "Sampler", return_value=fake_sampler), \
+                    patch.object(guard, "write_stop_receipt", side_effect=OSError(errno.ENOSPC, "full")), \
+                    patch.object(guard.subprocess, "Popen", wraps=subprocess.Popen) as launch:
+                for _ in range(2):
+                    try:
+                        guard.supervise([sys.executable, "-c", "import time;time.sleep(60)"],
+                                        self.limits(), [Path(directory)], Path(directory) / "stop.json")
+                    except OSError:
+                        pass
+                self.assertEqual(launch.call_count, 0, "a child needs a durable fence before starting")
+
+    def test_failed_receipt_update_retains_durable_startup_fence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "stop.json"
+            fake_sampler = unittest.mock.Mock()
+            fake_sampler.system_usage.return_value = (100, 1000)
+            fake_sampler.sample.return_value = self.observation(memory_bytes=101)
+            write = guard.write_stop_receipt
+            calls = 0
+            def fail_update(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    return write(*args, **kwargs)
+                raise OSError(errno.ENOSPC, "full")
+            with patch.object(guard, "Sampler", return_value=fake_sampler), \
+                    patch.object(guard, "write_stop_receipt", side_effect=fail_update), \
+                    patch.object(guard.subprocess, "Popen", wraps=subprocess.Popen) as launch:
+                for _ in range(2):
+                    guard.supervise([sys.executable, "-c", "import time;time.sleep(60)"],
+                                    self.limits(), [Path(directory)], marker)
+                self.assertEqual(launch.call_count, 1)
+                self.assertEqual(json.loads(marker.read_text())["reason"], "supervising")
 
     def test_stop_receipt_has_no_command_line_or_environment(self):
         with tempfile.TemporaryDirectory() as directory:
