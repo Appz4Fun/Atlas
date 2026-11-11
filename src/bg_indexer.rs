@@ -17,6 +17,7 @@ use crate::db;
 use crate::indexer::{Db, NotCarried, PassContext, PassSettings, Progress, RunStates, TooOld, run_pass_on, shared_db};
 use crate::nntp::{Pool, RankView, unless_stopped};
 use crate::paths;
+use crate::pg::indexer_runtime::{Profile as NativeProfile, Runtime as NativeRuntime};
 use crate::postprocess::{Stage, StageParams};
 use crate::sab;
 use crate::ui;
@@ -292,6 +293,8 @@ fn say_blocked(blocked: &[String]) {
 
 /// State shared by the scheduler's workers for one set of servers.
 struct Scheduler {
+    native: Option<NativeProfile>,
+    fatal: AtomicBool,
     ctx: PassContext,
     settings: RwLock<PassSettings>,
     groups: RwLock<Vec<String>>,
@@ -1222,13 +1225,25 @@ async fn watch_config(sched: Arc<Scheduler>, servers: Vec<UsenetServer>) {
         }
 
         let Some(config) = load_config() else { continue };
+        if let Some(profile) = &sched.native
+            && let Err(error) = profile.check_reload(&config)
+        {
+            ui::error(&format!("native indexing configuration refused: {error}"));
+            sched.fatal.store(true, Ordering::Relaxed);
+            sched.ctx.stop.store(true, Ordering::Relaxed);
+            return;
+        }
 
         if needs_rebuild(&sched, &config, &servers) {
             println!("config changed, restarting the indexer");
             sched.wind_down.store(true, Ordering::Relaxed);
             return;
         }
-        crate::archive::sync_inline_lookups(&config);
+        if sched.native.is_some() {
+            crate::archive::set_inline_lookups(false);
+        } else {
+            crate::archive::sync_inline_lookups(&config);
+        }
         if let Some(stage) = sched.stage.get() {
             let (stage, config) = (stage.clone(), config.clone());
             let _ = tokio::task::spawn_blocking(move || stage.set_config(&config)).await;
@@ -1317,7 +1332,8 @@ async fn run_servers(
     stats: Arc<Mutex<Stats>>,
     stop: Arc<AtomicBool>,
     compact_after: Option<SystemTime>,
-) -> bool {
+    native: Option<&NativeRuntime>,
+) -> anyhow::Result<bool> {
     let servers = usable_servers(config);
     let groups = config.tracked_groups();
     say_blocked(&config.blocked_groups());
@@ -1332,6 +1348,8 @@ async fn run_servers(
     states.set_tracked(&groups);
 
     let sched = Arc::new(Scheduler {
+        native: native.map(|runtime| runtime.profile.clone()),
+        fatal: AtomicBool::new(false),
         ctx: PassContext { pool, states, stop, verbose: false },
         settings: RwLock::new(settings_of(config)),
         groups: RwLock::new(groups),
@@ -1364,29 +1382,44 @@ async fn run_servers(
 
     // a rebuild or a compaction stopped the last run: these writers freeze again
     crate::frozen::STOPPING.store(false, Ordering::Relaxed);
-    let db = match db::open().and_then(|conn| db::tune_for_writing(&conn).map(|_| conn)) {
-        Ok(conn) => {
-            // before any pass: what is there so far was saved by file name
-            if let Err(e) = crate::store::start_grouping(&paths::database()) {
-                ui::warn(&format!("couldnt note where collections start: {e:#}"));
+    let db = if let Some(runtime) = native {
+        let db = runtime.db.clone();
+        let pool = sched.ctx.pool.clone();
+        crate::indexer::on_db(&db, move |sql| {
+            crate::indexer::claim_plain_cursors(sql, &pool)?;
+            Ok(())
+        })
+        .await?;
+        db
+    } else {
+        match db::open().and_then(|conn| db::tune_for_writing(&conn).map(|_| conn)) {
+            Ok(conn) => {
+                // before any pass: what is there so far was saved by file name
+                if let Err(e) = crate::store::start_grouping(&paths::database()) {
+                    ui::warn(&format!("couldnt note where collections start: {e:#}"));
+                }
+                // before any pass: whose the plain cursors are (see claim_plain_cursors)
+                if let Err(e) = crate::indexer::claim_plain_cursors(&conn, &sched.ctx.pool) {
+                    ui::warn(&format!("couldnt record whose the group cursors are: {e:#}"));
+                }
+                shared_db(conn)
             }
-            // before any pass: whose the plain cursors are (see claim_plain_cursors)
-            if let Err(e) = crate::indexer::claim_plain_cursors(&conn, &sched.ctx.pool) {
-                ui::warn(&format!("couldnt record whose the group cursors are: {e:#}"));
+            Err(e) => {
+                ui::error(&format!("couldnt open database: {e}"));
+                return Err(e.into());
             }
-            shared_db(conn)
-        }
-        Err(e) => {
-            ui::error(&format!("couldnt open database: {e}"));
-            return false;
         }
     };
 
     // checkpoints off the writer's path, see db::checkpointer
     let checkpoint_stop = Arc::new(AtomicBool::new(false));
-    let checkpointer = db::checkpointer(checkpoint_stop.clone());
+    let checkpointer = native.is_none().then(|| db::checkpointer(checkpoint_stop.clone()));
 
-    crate::archive::sync_inline_lookups(config);
+    if native.is_some() {
+        crate::archive::set_inline_lookups(false);
+    } else {
+        crate::archive::sync_inline_lookups(config);
+    }
     let mut tasks = tokio::task::JoinSet::new();
     // when the stop was asked for: each task that ends past it says when (`named`)
     let stopping_since: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
@@ -1447,7 +1480,7 @@ async fn run_servers(
     // set once stopping: the long scans of every shard (`repair::reading_until`) give up instead of holding the stop
     let scans_stop = Arc::new(AtomicBool::new(false));
     // which groups the big releases come from, for the backfill to take first, and the live passes
-    {
+    if native.is_none() {
         let s = sched.clone();
         tasks.spawn(named!(
             "the count of big releases".into(),
@@ -1471,7 +1504,7 @@ async fn run_servers(
         }
     }
     // parts one server's listing left out, read again from another (see `repair`)
-    if sched.ctx.pool.indexing_servers().len() > 1 {
+    if native.is_none() && sched.ctx.pool.indexing_servers().len() > 1 {
         let s = sched.clone();
         let settings = settings_of(config);
         tasks.spawn(named!(
@@ -1509,10 +1542,35 @@ async fn run_servers(
     }
     tasks.spawn(named!("the config watcher".into(), watch_config(sched.clone(), servers)));
     tasks.spawn(named!("the status report".into(), report(sched.clone())));
-    tasks.spawn(named!("the compaction timer".into(), compact_timer(sched.clone())));
+    if native.is_none() {
+        tasks.spawn(named!("the compaction timer".into(), compact_timer(sched.clone())));
+    } else {
+        let (db, s) = (db.clone(), sched.clone());
+        tasks.spawn(named!("native storage health".into(), async move {
+            while !s.stopping() {
+                if crate::indexer::on_db(&db, |sql| {
+                    let _: i64 = sql.one("select 1", &[])?;
+                    Ok(())
+                })
+                .await
+                .is_err()
+                {
+                    s.fatal.store(true, Ordering::Relaxed);
+                    s.ctx.stop.store(true, Ordering::Relaxed);
+                    return;
+                }
+                nap(Duration::from_secs(1), || s.stopping()).await;
+            }
+        }));
+    }
 
     // the workers and the config watcher all stop on `stopping()`
-    while tasks.join_next().await.is_some() {
+    while let Some(result) = tasks.join_next().await {
+        if result.is_err() || !sched.stopping() {
+            ui::error("an indexer task ended unexpectedly; draining and stopping");
+            sched.fatal.store(true, Ordering::Relaxed);
+            sched.ctx.stop.store(true, Ordering::Relaxed);
+        }
         if sched.stopping() {
             sched.wind_down.store(true, Ordering::Relaxed);
         }
@@ -1530,9 +1588,12 @@ async fn run_servers(
     stop_log("writers drained");
     // its last checkpoints after the writers: with them still writing, each waited out its busy timeout
     checkpoint_stop.store(true, Ordering::Relaxed);
-    let _ = tokio::task::spawn_blocking(move || checkpointer.join()).await;
+    if let Some(checkpointer) = checkpointer {
+        let _ = tokio::task::spawn_blocking(move || checkpointer.join()).await;
+    }
     stop_log("checkpointer done");
-    sched.compact_due.load(Ordering::Relaxed)
+    anyhow::ensure!(!sched.fatal.load(Ordering::Relaxed), "indexer task or storage ownership failed");
+    Ok(sched.compact_due.load(Ordering::Relaxed))
 }
 
 /// How an auto compaction went, for what the indexer does next.
@@ -1598,7 +1659,12 @@ async fn compact(config: &Config, stats: &Arc<Mutex<Stats>>, stop: &Arc<AtomicBo
 /// Index until stopping. Returns the exit code: not 0 when a compaction held
 /// the database at the start. `writing` is the hold on compaction taken
 /// before setting up the database, if there was one.
-async fn supervise(stop: Arc<AtomicBool>, stats: Arc<Mutex<Stats>>, writing: Option<WriteGuard>) -> i32 {
+async fn supervise(
+    stop: Arc<AtomicBool>,
+    stats: Arc<Mutex<Stats>>,
+    writing: Option<WriteGuard>,
+    native: Option<&NativeRuntime>,
+) -> i32 {
     let states = RunStates::default();
     let stopping = || stop.load(Ordering::Relaxed);
     let main = paths::database();
@@ -1617,13 +1683,19 @@ async fn supervise(stop: Arc<AtomicBool>, stats: Arc<Mutex<Stats>>, writing: Opt
             break;
         };
 
+        if let Some(native) = native
+            && let Err(error) = native.profile.check_reload(&config)
+        {
+            ui::error(&format!("native indexing configuration refused: {error}"));
+            return 1;
+        }
         let servers = usable_servers(&config);
         if servers.is_empty() {
             ui::error("config missing required fields");
             break;
         }
 
-        if writing.is_none() {
+        if native.is_none() && writing.is_none() {
             match crate::compact::hold_off_compaction(&main) {
                 Ok(guard) => writing = Some(guard),
                 Err(e) if !started => {
@@ -1668,11 +1740,20 @@ async fn supervise(stop: Arc<AtomicBool>, stats: Arc<Mutex<Stats>>, writing: Opt
             continue;
         }
 
-        let compact_due =
-            run_servers(&config, pool.clone(), states.clone(), stats.clone(), stop.clone(), compact_after).await;
+        let result =
+            run_servers(&config, pool.clone(), states.clone(), stats.clone(), stop.clone(), compact_after, native)
+                .await;
         pool.close().await;
         // its last totals, and no connections while there's no pool
         crate::metrics::report_servers(&pool.server_stats());
+        let compact_due = match result {
+            Ok(compact_due) => compact_due,
+            Err(error) => {
+                ui::error(&format!("indexing stopped: {error}"));
+                stop.store(true, Ordering::Relaxed);
+                return 1;
+            }
+        };
 
         if compact_due && !stopping() {
             writing = None;
@@ -1705,6 +1786,14 @@ pub fn run() -> i32 {
         return 1;
     }
 
+    let storage = crate::config::storage_config();
+    if storage.check().is_err() {
+        ui::error("invalid storage configuration");
+        return 1;
+    }
+    if storage.is_postgres() {
+        return run_native(config, storage);
+    }
     if let Err(e) = write_atomic(&paths::pid_file(), std::process::id().to_string()) {
         ui::error(&format!("couldnt write pid file: {e}"));
         return 1;
@@ -1794,10 +1883,42 @@ pub fn run() -> i32 {
         crate::metrics::catalog::spawn(Duration::from_secs(config.metrics.catalog_every_secs), stop.clone());
     }
 
-    let code = index(config, stop, Some(writing));
+    let code = index(config, stop, Some(writing), None);
     // the batches still queued for the overview archive
     crate::overview_archive::finish(Duration::from_secs(30));
     // the header store's open slabs sealed and committed
+    crate::nxv_store::live::finish();
+    code
+}
+
+/// Start the explicitly limited native ingestion profile without opening SQLite.
+fn run_native(config: Config, storage: crate::pg::StorageConfig) -> i32 {
+    let headers = crate::config::header_store_config();
+    let hosts = crate::nntp::server_keys(&usable_servers(&config));
+    let native = match NativeRuntime::open(&config, storage, headers.clone(), &hosts) {
+        Ok(native) => native,
+        Err(error) => {
+            // Configuration URLs and driver diagnostics can contain credentials.
+            ui::error(&format!("native PostgreSQL startup refused: {error}"));
+            return 1;
+        }
+    };
+    if write_atomic(&paths::pid_file(), std::process::id().to_string()).is_err() {
+        ui::error("could not write the indexer PID");
+        return 1;
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    #[cfg(unix)]
+    {
+        let _ = signal_hook::flag::register(signal_hook::consts::SIGTERM, stop.clone());
+        let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, stop.clone());
+    }
+    if crate::nxv_store::live::spawn(&headers).is_err() {
+        ui::error("could not start the durable NXV header store");
+        return 1;
+    }
+    crate::metrics::start(&config, crate::metrics::Role::Indexer);
+    let code = index(config, stop, None, Some(native));
     crate::nxv_store::live::finish();
     code
 }
@@ -1825,13 +1946,13 @@ pub fn convert_at_start(
 /// The indexing loop from `run`, stopping once `stop` is set (tests set it
 /// directly, `run` wires it to SIGTERM / SIGINT).
 pub fn run_until(config: Config, stop: Arc<AtomicBool>) -> i32 {
-    index(config, stop, None)
+    index(config, stop, None, None)
 }
 
-fn index(config: Config, stop: Arc<AtomicBool>, writing: Option<WriteGuard>) -> i32 {
+fn index(config: Config, stop: Arc<AtomicBool>, writing: Option<WriteGuard>, native: Option<NativeRuntime>) -> i32 {
     // start sabnzbd soo its ready when you wanna download. on its own thread
     // soo indexing doesnt sit around for up to 90s waiting on it
-    if sab::available() && !sab::is_running() {
+    if native.is_none() && sab::available() && !sab::is_running() {
         thread::spawn(|| {
             if sab::start() {
                 sab::wait_ready(Duration::from_secs(90));
@@ -1853,23 +1974,20 @@ fn index(config: Config, stop: Arc<AtomicBool>, writing: Option<WriteGuard>) -> 
         }
     };
 
-    crate::media::details::start_backfill(stop.clone());
-
-    if let Ok(conn) = crate::db::open() {
-        crate::duplicates::forget_old_twins(&conn);
+    if native.is_none() {
+        crate::media::details::start_backfill(stop.clone());
+        if let Ok(conn) = crate::db::open() {
+            crate::duplicates::forget_old_twins(&conn);
+        }
     }
 
     let stats = Arc::new(Mutex::new(Stats::new()));
     write_status(true, &groups_label(&config.tracked_groups(), 0), &config.index_mode, false, "running", false, 0);
 
-    let code = runtime.block_on(supervise(stop, stats.clone(), writing));
-    if code != 0 {
-        return code;
-    }
-
-    write_status(false, "", &config.index_mode, false, "stopped", false, 0);
+    let code = runtime.block_on(supervise(stop, stats.clone(), writing, native.as_ref()));
+    write_status(false, "", &config.index_mode, false, "stopped", code != 0, u32::from(code != 0));
     stats.lock().unwrap().write("", "", false, false);
-    0
+    code
 }
 
 #[cfg(test)]
@@ -1897,6 +2015,8 @@ mod tests {
 
     fn scheduler(pool: Pool, groups: Vec<String>) -> Scheduler {
         Scheduler {
+            native: None,
+            fatal: AtomicBool::new(false),
             ctx: PassContext {
                 pool: Arc::new(pool),
                 states: RunStates::default(),

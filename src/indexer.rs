@@ -364,6 +364,7 @@ pub use crate::pg::ingest::PgWriteLimits;
 enum MainConnection {
     Sqlite(Mutex<Connection>),
     Postgres(Arc<crate::pg::Pool>),
+    OwnedPostgres(Arc<crate::pg::indexer_runtime::Owner>),
 }
 
 impl MainConnection {
@@ -380,8 +381,22 @@ impl MainConnection {
                 crate::profile::DB_WAIT.add_since(t);
                 f(&crate::pg::sql::Pg::new(conn))
             }
+            Self::OwnedPostgres(owner) => owner.with(|conn| {
+                crate::profile::DB_WAIT.add_since(t);
+                f(&crate::pg::sql::Pg::new(conn))
+            }),
         }
     }
+}
+
+pub(crate) fn owned_postgres_db(
+    mut db: Db,
+    owner: Arc<crate::pg::indexer_runtime::Owner>,
+    limits: PgWriteLimits,
+) -> Result<Db> {
+    db.conn = Arc::new(MainConnection::OwnedPostgres(owner.clone()));
+    db.native = Some(crate::pg::ingest::Native::with_owner(owner, limits)?);
+    Ok(db)
 }
 
 /// Opt-in native indexer storage. The destination must already exist and be migrated; this never opens SQLite
@@ -1043,7 +1058,7 @@ pub(crate) async fn on_sqlite_db(db: &Db, f: impl FnOnce(&Connection) -> Result<
             let conn = conn.lock().map_err(|_| anyhow!("the database connection is poisoned"))?;
             f(&conn)
         }
-        MainConnection::Postgres(_) => Ok(()),
+        MainConnection::Postgres(_) | MainConnection::OwnedPostgres(_) => Ok(()),
     })
     .await
     .map_err(|e| anyhow!("db task failed: {e}"))?

@@ -1,6 +1,6 @@
-//! Postgres as the primary store, step 1 of the move off SQLite: the connection pool, the schema's migrations, and
-//! what a caller does while Postgres can't be reached. Nothing is stored here yet: `[storage] backend` stays
-//! `sqlite` until the tables move over, one area at a time.
+//! PostgreSQL storage, schema migrations, native ingestion, and isolated migration tooling.
+//! The background indexer has an explicit native ingestion profile that validates its destination and refuses
+//! auxiliary services that still require their own storage port.
 //!
 //! Everything lives in one schema (`atlas` unless `[storage] schema` says otherwise). Each connection sets its
 //! `search_path` to it, so the migrations and every query name tables without a schema, and a test can run the
@@ -11,6 +11,7 @@
 //! run again even when the first try's commit landed and only its answer was lost (see `with_retry`).
 
 pub mod header_blocks;
+pub(crate) mod indexer_runtime;
 pub mod ingest;
 pub mod main_import;
 pub mod migrate;

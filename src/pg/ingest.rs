@@ -34,17 +34,43 @@ impl PgWriteLimits {
 
 #[derive(Clone)]
 pub(crate) struct Native {
-    pool: Arc<super::Pool>,
+    source: Source,
     memory: Arc<Semaphore>,
     slots: Arc<Semaphore>,
     limits: PgWriteLimits,
 }
 
+#[derive(Clone)]
+enum Source {
+    Pool(Arc<super::Pool>),
+    Owner(Arc<super::indexer_runtime::Owner>),
+}
+
+impl Source {
+    fn with<T>(&self, work: impl FnOnce(&mut super::Client) -> Result<T>) -> Result<T> {
+        match self {
+            Self::Pool(pool) => {
+                let mut client = pool.get()?;
+                work(&mut client)
+            }
+            Self::Owner(owner) => owner.with(work),
+        }
+    }
+}
+
 impl Native {
     pub fn new(pool: Arc<super::Pool>, limits: PgWriteLimits) -> Result<Self> {
+        Self::from_source(Source::Pool(pool), limits)
+    }
+
+    pub(crate) fn with_owner(owner: Arc<super::indexer_runtime::Owner>, limits: PgWriteLimits) -> Result<Self> {
+        Self::from_source(Source::Owner(owner), limits)
+    }
+
+    fn from_source(source: Source, limits: PgWriteLimits) -> Result<Self> {
         limits.check()?;
         Ok(Self {
-            pool,
+            source,
             memory: Arc::new(Semaphore::new(limits.max_pending_bytes as usize)),
             slots: Arc::new(Semaphore::new(usize::from(limits.concurrent_saves))),
             limits,
@@ -147,14 +173,15 @@ impl Native {
         ensure!(bytes <= self.limits.max_job_bytes as usize, "native job exceeds max_job_bytes");
         let memory = self.memory.clone().acquire_many_owned(bytes as u32).await?;
         let slot = self.slots.clone().acquire_owned().await?;
-        let pool = self.pool.clone();
+        let source = self.source.clone();
         // The blocking save owns admission, including while queued in Tokio. Cancelling its caller cannot free
         // memory/worker capacity while the payload or a transaction is still in flight.
         tokio::task::spawn_blocking(move || {
             let (_memory, _slot) = (memory, slot);
-            let mut conn = pool.get()?;
-            super::release_writer::save(&mut conn, &releases, chrono::Utc::now().timestamp())?;
-            Ok::<_, anyhow::Error>(())
+            source.with(|conn| {
+                super::release_writer::save(conn, &releases, chrono::Utc::now().timestamp())?;
+                Ok(())
+            })
         })
         .await
         .context("native PostgreSQL save task failed")?
