@@ -96,3 +96,27 @@ create table linker_staged_rows (
 );
 create index linker_staged_message on linker_staged_rows(message_key);
 create index linker_staged_posted on linker_staged_rows(posted);
+
+-- Legacy logs only contain 64-bit hashes. Keep them separately: they cannot be
+-- upgraded into exact IDs. A legacy collision conservatively suppresses both
+-- IDs until expiry; newly linked IDs use their full canonical identity.
+create table linker_legacy_ids (
+    origin text not null,
+    hash bigint not null,
+    added bigint not null,
+    primary key(origin,hash)
+);
+create index linker_legacy_ids_expiry on linker_legacy_ids(added);
+create table linker_id_imports (
+    name text primary key,
+    source_identity bytea not null,
+    offset_bytes bigint not null default 0,
+    id_time bigint,
+    complete boolean not null default false
+);
+create table linker_linked_ids (
+    message_key bytea primary key,
+    message_id bytea not null,
+    added bigint not null
+);
+create index linker_linked_ids_expiry on linker_linked_ids(added);

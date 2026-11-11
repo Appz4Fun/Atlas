@@ -160,6 +160,9 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    pub fn close_if_idle(&self, idle: Duration) {
+        self.segment.close_if_idle(idle);
+    }
     /// At most `limit` entries from the immutable published prefix.
     pub fn entries(&self, start: usize, limit: usize) -> Vec<Entry> {
         let v = self.segment.view.read().unwrap_or_else(|e| e.into_inner());
@@ -333,8 +336,19 @@ impl Segment {
 
     /// Marks the segment expired and deletes its files, unless a commit holds it (then false: try again later).
     pub fn expire(&self) -> bool {
+        self.expire_checked(None)
+    }
+
+    /// Coverage of an earlier prefix never authorizes deleting a new suffix.
+    pub fn expire_covered(&self, identity: [u8; 32], count: usize) -> bool {
+        self.expire_checked(Some((identity, count)))
+    }
+
+    fn expire_checked(&self, covered: Option<([u8; 32], usize)>) -> bool {
         let mut w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
-        if w.in_flight > 0 {
+        if w.in_flight > 0
+            || covered.is_some_and(|(identity, count)| identity != self.identity || self.block_count() != count)
+        {
             return false;
         }
         w.expired = true;
@@ -473,6 +487,7 @@ mod tests {
         let old = seg.bounded_snapshot();
         commit(&seg, &block(10, 2, 2));
         assert_eq!(old.count, 1);
+        assert!(!seg.expire_covered(old.identity, old.count), "staged prefix cannot expire appended suffix");
         assert_eq!(old.entries(0, 100).len(), 1);
         assert!(old.entries(1, 1).is_empty());
         assert_eq!(seg.bounded_snapshot().entries(0, 1).len(), 1);

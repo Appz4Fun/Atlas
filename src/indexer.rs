@@ -1071,7 +1071,10 @@ pub(crate) async fn on_sqlite_db(db: &Db, f: impl FnOnce(&Connection) -> Result<
 /// Native database work shares the already-validated indexer session.
 fn native_db_work<T>(db: &Db, work: impl FnOnce(&mut postgres::Client) -> Result<T>) -> Result<T> {
     match &*db.conn {
-        MainConnection::Postgres(pool) => work(&mut pool.get()?),
+        MainConnection::Postgres(pool) => {
+            let mut conn = pool.get()?;
+            work(&mut conn)
+        }
         MainConnection::OwnedPostgres(owner) => owner.with(work),
         MainConnection::Sqlite(_) => anyhow::bail!("native database work requires PostgreSQL"),
     }

@@ -86,14 +86,14 @@ fn plan_one(client: &mut Client, epoch: i64) -> Result<bool> {
          select f.epoch,c.id,0,f.group_id from linker_file_groups f
          join linker_chains c on c.epoch=f.epoch and c.id=$3
          where f.epoch=$1 and f.file_id=$2 and
-           (c.index_only and $4>1 or c.seed is not null or c.file_count=0 and not c.index_only)
+           (c.index_only and $4::bigint>1 or c.seed is not null or c.file_count=0 and not c.index_only)
          on conflict do nothing",
         &[&epoch, &id, &chain, &articles],
     )?;
     let ordinal: i64 = tx
         .query_one(
             "update linker_chains set first_posted=least(first_posted,$3),last_posted=greatest(last_posted,$4),
-         index_only=index_only and $5=1,file_count=file_count+1
+         index_only=index_only and $5::bigint=1,file_count=file_count+1
          where epoch=$1 and id=$2 returning file_count",
             &[&epoch, &chain, &first, &last, &articles],
         )?
@@ -221,6 +221,36 @@ mod tests {
             actual.push((seed.map(|v| v as usize), members));
         }
         assert_eq!(actual, crate::xref::chain(files, seeds));
+    }
+
+    #[test]
+    fn raw_callbacks_work_on_current_thread_runtime_with_borrowed_input() {
+        let Some(schema) = crate::pg::testing::Schema::new() else { return };
+        let database: String = schema.pool.get().unwrap().query_one("select current_database()", &[]).unwrap().get(0);
+        let db = crate::indexer::shared_postgres_db(
+            &crate::pg::StorageConfig {
+                backend: crate::pg::Backend::Postgres,
+                url: schema.url.clone(),
+                schema: schema.name.clone(),
+                allow_plaintext: true,
+                ..Default::default()
+            },
+            &database,
+            crate::indexer::PgWriteLimits::default(),
+        )
+        .unwrap();
+        assert!(db.is_native());
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let borrowed = String::from("generic callback fixture");
+            let answer: String =
+                crate::indexer::on_native_db_sync(&db, |c| Ok(c.query_one("select $1::text", &[&borrowed])?.get(0)))
+                    .unwrap();
+            assert_eq!(answer, borrowed);
+            let answer: i64 =
+                crate::indexer::on_native_db(&db, |c| Ok(c.query_one("select 42::bigint", &[])?.get(0))).await.unwrap();
+            assert_eq!(answer, 42);
+        });
     }
 
     #[test]

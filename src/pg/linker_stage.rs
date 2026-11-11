@@ -145,6 +145,20 @@ pub(crate) fn stage_block(
     Ok(Progress { source: id, scanned, complete: ended })
 }
 
+/// Scalar complete-coverage query for expiry. Missing records, incomplete
+/// pages or a new generation return false. The store rechecks the captured
+/// prefix under its writer lock before deleting any source files.
+pub(crate) fn covered(client: &mut Client, group: &str, day: i64, identity: [u8; 32], count: usize) -> Result<bool> {
+    let count = i64::try_from(count)?;
+    Ok(client
+        .query_one(
+            "select count(distinct seq)=$4 from linker_source_blocks
+        where group_name=$1 and day=$2 and generation=$3 and seq>=0 and seq<$4 and complete",
+            &[&group, &day, &&identity[..], &count],
+        )?
+        .get(0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

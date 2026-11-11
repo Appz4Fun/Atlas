@@ -283,6 +283,21 @@ fn parse_row(line: &[u8]) -> Option<(u64, Option<i64>)> {
     Some((slab::art_of(line)?, line.split(|&b| b == b'\t').nth(3).and_then(parse_rfc2822_to_epoch)))
 }
 
+/// PostgreSQL's durable complete-coverage check. Unknown/error means retain.
+/// Called outside store locks and never with an unbounded segment inventory.
+pub type LinkerCoverage = Arc<dyn Fn(&str, i64, [u8; 32], usize) -> Result<bool> + Send + Sync>;
+
+/// Blocks expiry during the source snapshot/staging boundary. The guard is
+/// independent of day count and must be held before enumerating inventory.
+pub struct LinkerRetentionPin {
+    store: Arc<Store>,
+}
+impl Drop for LinkerRetentionPin {
+    fn drop(&mut self) {
+        self.store.linker_pins.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 pub struct Store {
     cfg: StoreConfig,
     groups: RwLock<HashMap<String, Arc<Group>>>,
@@ -292,6 +307,10 @@ pub struct Store {
     seal_tx: Mutex<Option<Sender<SealJob>>>,
     /// expiry waits until the linker has finished a pass, soo days it hasn't linked aren't let go after a start
     expiry_armed: AtomicBool,
+    linker_pins: AtomicUsize,
+    retention_gate: Mutex<()>,
+    linker_coverage: RwLock<Option<LinkerCoverage>>,
+    coverage_cursor: Mutex<Option<(String, i64)>>,
     /// where a fresh keep set comes from (`live::keep_now`): housekeeping and a refused row ask it, soo a keep set set
     /// earlier never wins over a newer one
     keep_source: Mutex<Option<KeepSource>>,
@@ -427,6 +446,10 @@ impl Store {
             tick_lock: Mutex::new(()),
             recording: RwLock::new(()),
             expiry_armed: AtomicBool::new(false),
+            linker_pins: AtomicUsize::new(0),
+            retention_gate: Mutex::new(()),
+            linker_coverage: RwLock::new(None),
+            coverage_cursor: Mutex::new(None),
             keep_source: Mutex::new(None),
             recent_claims: Mutex::new(BTreeMap::new()),
             _lock: lock,
@@ -999,6 +1022,11 @@ impl Store {
     /// Idle writer files closed, and segments of days the keep set no longer holds (and no slab still fills)
     /// expired.
     pub fn housekeeping(&self) {
+        let coverage = self.linker_coverage.read().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(coverage) = coverage {
+            self.covered_housekeeping(&coverage);
+            return;
+        }
         // armed first, then the keep set: arming comes after the keep set took the linker's unlinked days
         let armed = self.expiry_armed.load(Ordering::Acquire);
         let keep = self.current_keep();
@@ -1011,15 +1039,15 @@ impl Store {
             };
             let inflight_days: BTreeSet<i64> =
                 self.shared.inflight.lock().unwrap_or_else(|e| e.into_inner()).values().copied().collect();
+            let _gate = self.retention_gate.lock().unwrap_or_else(|e| e.into_inner());
             let mut segs = g.segments.write().unwrap_or_else(|e| e.into_inner());
             let gone: Vec<i64> = segs
                 .iter()
                 .filter(|(day, seg)| {
-                    armed
-                        && !keep.keeps(**day)
-                        && !open_days.contains(day)
-                        && !inflight_days.contains(day)
-                        && seg.expire()
+                    armed && !keep.keeps(**day) && !open_days.contains(day) && !inflight_days.contains(day) && {
+                        let _gate = self.retention_gate.lock().unwrap_or_else(|e| e.into_inner());
+                        self.linker_pins.load(Ordering::Acquire) == 0 && seg.expire()
+                    }
                 })
                 .map(|(d, _)| *d)
                 .collect();
@@ -1028,6 +1056,67 @@ impl Store {
             }
             for seg in segs.values() {
                 seg.close_if_idle(self.cfg.writer_idle);
+            }
+        }
+    }
+
+    pub fn pin_linker_retention(self: &Arc<Self>) -> LinkerRetentionPin {
+        let _gate = self.retention_gate.lock().unwrap_or_else(|e| e.into_inner());
+        self.linker_pins.fetch_add(1, Ordering::AcqRel);
+        LinkerRetentionPin { store: Arc::clone(self) }
+    }
+
+    /// Clearing the callback also disarms expiry; shutdown/failure must not
+    /// fall back to day-only expiry while native work remains unpublished.
+    pub fn set_linker_coverage(&self, coverage: Option<LinkerCoverage>) {
+        let _gate = self.retention_gate.lock().unwrap_or_else(|e| e.into_inner());
+        if coverage.is_none() {
+            self.expiry_armed.store(false, Ordering::Release);
+        }
+        *self.linker_coverage.write().unwrap_or_else(|e| e.into_inner()) = coverage;
+    }
+
+    fn covered_housekeeping(&self, coverage: &LinkerCoverage) {
+        let after = self.coverage_cursor.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let page = self.segment_page(after.as_ref().map(|(g, d)| (g.as_str(), *d)), 64);
+        *self.coverage_cursor.lock().unwrap_or_else(|e| e.into_inner()) = page.last().map(|(g, d, _)| (g.clone(), *d));
+        for (name, day, _) in page {
+            let Some(snapshot) = self.segment_snapshot(&name, day) else { continue };
+            snapshot.close_if_idle(self.cfg.writer_idle);
+            if !self.expiry_armed.load(Ordering::Acquire)
+                || self.linker_pins.load(Ordering::Acquire) > 0
+                || self.current_keep().keeps(day)
+            {
+                continue;
+            }
+            // No locks are held across PostgreSQL: the owner may be staging a
+            // source page. A stale positive answer is rechecked at deletion.
+            if !coverage(&name, day, snapshot.identity, snapshot.count).unwrap_or(false)
+                || self.current_keep().keeps(day)
+            {
+                continue;
+            }
+            let Some(group) = self.groups.read().unwrap_or_else(|e| e.into_inner()).get(&name).cloned() else {
+                continue;
+            };
+            let slabs = group.slabs.lock().unwrap_or_else(|e| e.into_inner());
+            if slabs.open.values().chain(slabs.full.iter()).any(|s| s.day == day) {
+                continue;
+            }
+            let inflight = self.shared.inflight.lock().unwrap_or_else(|e| e.into_inner());
+            if inflight.values().any(|&d| d == day) {
+                continue;
+            }
+            let _gate = self.retention_gate.lock().unwrap_or_else(|e| e.into_inner());
+            if self.linker_pins.load(Ordering::Acquire) > 0 || !self.expiry_armed.load(Ordering::Acquire) {
+                continue;
+            }
+            let mut segments = group.segments.write().unwrap_or_else(|e| e.into_inner());
+            if let Some(seg) = segments.get(&day) {
+                seg.close_if_idle(self.cfg.writer_idle);
+                if seg.expire_covered(snapshot.identity, snapshot.count) {
+                    segments.remove(&day);
+                }
             }
         }
     }
@@ -1556,6 +1645,50 @@ mod tests {
         drop(store);
         let (again, _) = Store::open(cfg(dir.path()), keep_all()).unwrap();
         again.close().unwrap();
+    }
+
+    #[test]
+    fn native_expiry_requires_coverage_and_respects_inventory_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = Store::open(cfg(dir.path()), keep_all()).unwrap();
+        store
+            .record(
+                "server.example",
+                "group.example",
+                &[line(1, "poster@example.invalid", NOV8)],
+                Clamp::Live { now: NOW },
+            )
+            .unwrap();
+        store.close().unwrap();
+        let day = day_of("2026-11-08");
+        let status = Arc::new(AtomicUsize::new(0));
+        let shared = Arc::clone(&status);
+        store.set_linker_coverage(Some(Arc::new(move |_, _, _, _| match shared.load(Ordering::Acquire) {
+            0 => Err(anyhow!("synthetic coverage outage")),
+            1 => Ok(false),
+            _ => Ok(true),
+        })));
+        store.set_keep(KeepSet { live_from: day + 10, ..KeepSet::default() });
+        store.arm_expiry();
+        let sweep = || {
+            for _ in 0..3 {
+                store.housekeeping();
+            }
+        };
+        sweep();
+        assert!(store.segment_snapshot("group.example", day).is_some());
+        status.store(1, Ordering::Release);
+        sweep();
+        assert!(store.segment_snapshot("group.example", day).is_some());
+        let pin = store.pin_linker_retention();
+        status.store(2, Ordering::Release);
+        sweep();
+        assert!(store.segment_snapshot("group.example", day).is_some());
+        drop(pin);
+        sweep();
+        assert!(store.segment_snapshot("group.example", day).is_none());
+        store.set_linker_coverage(None);
+        assert!(!store.expiry_armed.load(Ordering::Acquire));
     }
 
     #[test]
