@@ -55,53 +55,58 @@ pub(crate) fn claim_root(root: &Path, scope: [u8; 32]) -> Result<File> {
     }
     Ok(file)
 }
-pub(crate) fn inventory(root: &Path, id: [u8; 32], quota: u64) -> Result<Vec<Existing>> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CleanupAuthority {
+    Identity,
+    /// Locator authenticated by the committed import checkpoint. This may
+    /// reconcile its empty directory after the final identity unlink.
+    CommittedCheckpoint,
+}
+const FRAME_FILES: [&str;5] = ["input.part","input.ready","projection.part","projection.ready","identity"];
+fn frame_identity(fingerprint:[u8;32],source:i64,key:i64)->Vec<u8> {
+    let mut identity=fingerprint.to_vec();identity.extend_from_slice(&source.to_le_bytes());identity.extend_from_slice(&key.to_le_bytes());identity
+}
+fn frame_name(identity:&[u8])->String {
+    format!("frame-{}",Sha256::digest(identity).iter().map(|b|format!("{b:02x}")).collect::<String>())
+}
+fn frame_contents(directory:&Path)->Result<Vec<std::fs::DirEntry>> {
+    let files=std::fs::read_dir(directory)?.take(FRAME_FILES.len()+1).collect::<std::io::Result<Vec<_>>>()?;
+    ensure!(files.len()<=FRAME_FILES.len(),HistoryError::new(ErrorCode::CorruptObject,"unknown spool contents"));
+    for file in &files {
+        ensure!(file.file_type()?.is_file() && FRAME_FILES.iter().any(|name|file.file_name()==*name),HistoryError::new(ErrorCode::CorruptObject,"unknown spool contents"));
+    }
+    Ok(files)
+}
+pub(crate) fn inventory(root: &Path, id: [u8; 32], quota: u64, checkpoint_cleanups:&[(i64,i64)]) -> Result<Vec<Existing>> {
+    ensure!(checkpoint_cleanups.len()<=MAX_COMPLETED+1,HistoryError::new(ErrorCode::CorruptObject,"cleanup receipt admission"));
+    let authenticated:std::collections::BTreeMap<_,_>=checkpoint_cleanups.iter().map(|&(source,key)|(std::ffi::OsString::from(frame_name(&frame_identity(id,source,key))),(source,key))).collect();
     let entries = std::fs::read_dir(root)?.take(MAX_COMPLETED + 3).collect::<std::io::Result<Vec<_>>>()?;
-    ensure!(
-        entries.len() <= MAX_COMPLETED + 2,
-        HistoryError::new(ErrorCode::InsufficientBudget, "spool recovery inventory admission")
-    );
-    let mut total = 0u64;
-    let mut result = Vec::new();
+    ensure!(entries.len()<=MAX_COMPLETED+2,HistoryError::new(ErrorCode::InsufficientBudget,"spool recovery inventory admission"));
+    let mut total=0u64;let mut result=Vec::new();
     for entry in entries {
-        if entry.file_name() == "owner.lock" {
-            continue;
-        }
-        let path = entry.path();
-        ensure!(entry.file_type()?.is_dir(), HistoryError::new(ErrorCode::CorruptObject, "unknown spool root entry"));
-        let mut identity = Vec::new();
-        open_file(&path.join("identity"), false, false)?.take(49).read_to_end(&mut identity)?;
-        ensure!(
-            identity.len() == 48 && identity[..32] == id,
-            HistoryError::new(ErrorCode::SourceMismatch, "spool recovery capture identity")
-        );
-        let expected =
-            format!("frame-{}", Sha256::digest(&identity).iter().map(|b| format!("{b:02x}")).collect::<String>());
-        ensure!(
-            entry.file_name() == std::ffi::OsStr::new(&expected),
-            HistoryError::new(ErrorCode::CorruptObject, "spool recovery locator")
-        );
-        let source = i64::from_le_bytes(identity[32..40].try_into()?);
-        let key = i64::from_le_bytes(identity[40..48].try_into()?);
-        let contents = std::fs::read_dir(&path)?.take(6).collect::<std::io::Result<Vec<_>>>()?;
-        ensure!(contents.len() <= 5, HistoryError::new(ErrorCode::CorruptObject, "unknown spool recovery files"));
-        let mut bytes = FRAME_OVERHEAD;
-        for file in contents {
-            let name = file.file_name();
-            ensure!(
-                ["input.part", "input.ready", "projection.part", "projection.ready", "identity"]
-                    .iter()
-                    .any(|allowed| name == *allowed)
-                    && file.file_type()?.is_file(),
-                HistoryError::new(ErrorCode::CorruptObject, "unknown spool recovery file")
-            );
-            if name != "identity" {
-                bytes = bytes.checked_add(file.metadata()?.len()).context("spool inventory overflow")?;
+        if entry.file_name()=="owner.lock" {continue;}
+        let path=entry.path();
+        ensure!(entry.file_type()?.is_dir(),HistoryError::new(ErrorCode::CorruptObject,"unknown spool root entry"));
+        let contents=frame_contents(&path)?;
+        let mut identity=Vec::new();
+        let locator=match open_file(&path.join("identity"),false,false) {
+            Ok(file)=>{
+                file.take(49).read_to_end(&mut identity)?;
+                ensure!(identity.len()==48 && identity[..32]==id,HistoryError::new(ErrorCode::SourceMismatch,"spool recovery capture identity"));
+                ensure!(entry.file_name()==std::ffi::OsStr::new(&frame_name(&identity)),HistoryError::new(ErrorCode::CorruptObject,"spool recovery locator"));
+                (i64::from_le_bytes(identity[32..40].try_into()?),i64::from_le_bytes(identity[40..48].try_into()?))
             }
-        }
-        total = total.checked_add(bytes).context("spool inventory overflow")?;
-        ensure!(total <= quota, HistoryError::new(ErrorCode::InsufficientBudget, "retained spool bytes exceed quota"));
-        result.push(Existing { source, key, charged_bytes: bytes });
+            Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound)=>{
+                ensure!(contents.is_empty(),HistoryError::new(ErrorCode::CorruptObject,"identity-free spool is not empty"));
+                *authenticated.get(&entry.file_name()).context(HistoryError::new(ErrorCode::CorruptObject,"identity-free spool lacks committed cleanup ownership"))?
+            }
+            Err(error)=>return Err(error),
+        };
+        let mut bytes=FRAME_OVERHEAD;
+        for file in contents {if file.file_name()!="identity" {bytes=bytes.checked_add(file.metadata()?.len()).context("spool inventory overflow")?;}}
+        total=total.checked_add(bytes).context("spool inventory overflow")?;
+        ensure!(total<=quota,HistoryError::new(ErrorCode::InsufficientBudget,"retained spool bytes exceed quota"));
+        result.push(Existing{source:locator.0,key:locator.1,charged_bytes:bytes});
     }
     Ok(result)
 }
@@ -339,38 +344,38 @@ impl Spool {
         self.keep = true;
         Ok(bytes)
     }
-    pub fn cleanup(root: &Path, fingerprint: [u8; 32], source: i64, key: i64) -> Result<()> {
-        let mut identity = fingerprint.to_vec();
-        identity.extend_from_slice(&source.to_le_bytes());
-        identity.extend_from_slice(&key.to_le_bytes());
-        let name = Sha256::digest(&identity).iter().map(|b| format!("{b:02x}")).collect::<String>();
-        let directory = root.join(format!("frame-{name}"));
-        if !directory.exists() {
-            return Ok(());
+    pub fn cleanup(root: &Path, fingerprint: [u8; 32], source: i64, key: i64, authority:CleanupAuthority) -> Result<()> {
+        let identity=frame_identity(fingerprint,source,key);
+        let directory=root.join(frame_name(&identity));
+        if !directory.exists() {return Ok(());}
+        ensure!(std::fs::symlink_metadata(&directory)?.is_dir(),HistoryError::new(ErrorCode::CorruptObject,"unknown cleanup path"));
+        // Inspect every name before any unlink, even when a checkpoint proves
+        // ownership of an empty directory whose identity was already removed.
+        let contents=frame_contents(&directory)?;
+        let mut stored=Vec::new();
+        match open_file(&directory.join("identity"),false,false) {
+            Ok(file)=>{file.take(49).read_to_end(&mut stored)?;ensure!(stored==identity,HistoryError::new(ErrorCode::CorruptObject,"cleanup ownership receipt"));}
+            Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound)=>{
+                ensure!(authority==CleanupAuthority::CommittedCheckpoint && contents.is_empty(),HistoryError::new(ErrorCode::CorruptObject,"identity-free cleanup lacks committed ownership or is not empty"));
+            }
+            Err(error)=>return Err(error),
         }
-        ensure!(
-            std::fs::symlink_metadata(&directory)?.is_dir(),
-            HistoryError::new(ErrorCode::CorruptObject, "unknown cleanup path")
-        );
-        let mut stored = Vec::new();
-        open_file(&directory.join("identity"), false, false)?.take(49).read_to_end(&mut stored)?;
-        ensure!(stored == identity, HistoryError::new(ErrorCode::CorruptObject, "cleanup ownership receipt"));
-        let allowed = ["input.part", "input.ready", "projection.part", "projection.ready", "identity"];
-        let entries = std::fs::read_dir(&directory)?.take(6).collect::<std::io::Result<Vec<_>>>()?;
-        ensure!(
-            entries.len() <= 5
-                && entries.iter().all(|e| e.file_name().to_str().is_some_and(|name| allowed.contains(&name))),
-            HistoryError::new(ErrorCode::CorruptObject, "unknown spool contents")
-        );
-        for name in allowed {
-            let path = directory.join(name);
+        for name in FRAME_FILES {
+            // Persist payload removals before relinquishing the identity. A
+            // crash thereafter can leave only an authenticated empty directory.
+            if name=="identity" {sync_directory(&directory)?;}
+            let path=directory.join(name);
             if path.exists() {
                 std::fs::remove_file(path)?;
+                #[cfg(test)]
+                testing::boundary(name)?;
             }
         }
+        sync_directory(&directory)?;
+        #[cfg(test)]
+        testing::boundary("before_remove_dir")?;
         std::fs::remove_dir(&directory)?;
-        sync_directory(root)?;
-        Ok(())
+        sync_directory(root)?;Ok(())
     }
     pub fn remove(&mut self) {
         self.input.take();
@@ -386,6 +391,22 @@ impl Drop for Spool {
         if !self.keep {
             self.remove();
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::cell::Cell;
+    thread_local! { static INTERRUPT: Cell<Option<&'static str>> = const { Cell::new(None) }; }
+    pub(crate) struct Fault;
+    impl Drop for Fault { fn drop(&mut self) { INTERRUPT.with(|point|point.set(None)); } }
+    pub(crate) fn interrupt_at(point:&'static str)->Fault {
+        INTERRUPT.with(|old|{assert!(old.get().is_none());old.set(Some(point));});Fault
+    }
+    pub(super) fn boundary(point:&'static str)->std::io::Result<()> {
+        if INTERRUPT.with(|old|{if old.get()==Some(point){old.set(None);true}else{false}}) {
+            Err(std::io::Error::other(format!("injected cleanup interruption: {point}")))
+        } else {Ok(())}
     }
 }
 
@@ -427,20 +448,61 @@ mod tests {
         spool.read_projection(0, projection.len() as u64, projection.len()).unwrap();
         let charged = spool.retire().unwrap();
         assert_eq!(charged, FRAME_OVERHEAD + (original.len() + projection.len()) as u64);
-        let entries = inventory(root.path(), [3; 32], charged).unwrap();
+        let entries = inventory(root.path(), [3; 32], charged, &[]).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].charged_bytes, charged);
-        assert!(inventory(root.path(), [3; 32], charged - 1).is_err());
-        Spool::cleanup(root.path(), [3; 32], 1, 7).unwrap();
+        assert!(inventory(root.path(), [3; 32], charged - 1, &[]).is_err());
+        Spool::cleanup(root.path(), [3; 32], 1, 7, CleanupAuthority::Identity).unwrap();
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
     }
+    #[test]
+    fn cleanup_interruption_after_every_unlink_can_reclaim_the_same_owned_frame() {
+        for point in ["input.part","input.ready","projection.part","projection.ready","identity","before_remove_dir"] {
+            let root=root();let owner=claim_root(root.path(),[1;32]).unwrap();
+            let mut spool=Spool::open(root.path(),[3;32],1,7,1024*1024,0,1,false).unwrap();
+            spool.append(0,b"x").unwrap();spool.finish_input(1,Sha256::digest(b"x").into()).unwrap();
+            let mut projection=spool.projection_writer().unwrap();projection.write_all(b"y").unwrap();projection.sync_all().unwrap();drop(projection);spool.finish_projection().unwrap();
+            let directory=spool.directory.clone();spool.retire().unwrap();
+            // Exercise all fixed unlink names, including stale part files.
+            std::fs::write(directory.join("input.part"),b"part").unwrap();
+            std::fs::write(directory.join("projection.part"),b"part").unwrap();
+            #[cfg(unix)] {use std::os::unix::fs::PermissionsExt;for name in ["input.part","projection.part"] {std::fs::set_permissions(directory.join(name),std::fs::Permissions::from_mode(0o600)).unwrap();}}
+            let fault=testing::interrupt_at(point);
+            let error=Spool::cleanup(root.path(),[3;32],1,7,CleanupAuthority::Identity).unwrap_err();
+            assert!(error.to_string().contains("injected cleanup interruption"),"{point}: {error}");
+            drop(fault);drop(owner);let _resumed=claim_root(root.path(),[1;32]).unwrap();
+            let pending=inventory(root.path(),[3;32],1024*1024,&[(1,7)]).expect("owned interrupted cleanup must remain recoverable");
+            assert_eq!(pending.len(),1);assert_eq!((pending[0].source,pending[0].key),(1,7));
+            Spool::cleanup(root.path(),[3;32],1,7,CleanupAuthority::CommittedCheckpoint).unwrap();
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(),1,"only root ownership lock remains");
+        }
+    }
+
+    #[test]
+    fn missing_identity_needs_exact_checkpoint_and_unknown_content_stays_untouched() {
+        let root=root();let _owner=claim_root(root.path(),[1;32]).unwrap();
+        let mut spool=Spool::open(root.path(),[3;32],1,7,1024*1024,0,1,false).unwrap();
+        spool.append(0,b"x").unwrap();spool.finish_input(1,Sha256::digest(b"x").into()).unwrap();
+        let mut projection=spool.projection_writer().unwrap();projection.write_all(b"y").unwrap();projection.sync_all().unwrap();drop(projection);spool.finish_projection().unwrap();
+        let directory=spool.directory.clone();spool.retire().unwrap();
+        let fault=testing::interrupt_at("identity");
+        assert!(Spool::cleanup(root.path(),[3;32],1,7,CleanupAuthority::Identity).is_err());drop(fault);
+        assert!(inventory(root.path(),[3;32],1024*1024,&[]).is_err());
+        assert!(inventory(root.path(),[3;32],1024*1024,&[(1,8)]).is_err());
+        assert_eq!(inventory(root.path(),[3;32],1024*1024,&[(1,7)]).unwrap().len(),1);
+        let unknown=directory.join("unowned");std::fs::write(&unknown,b"retain").unwrap();
+        assert!(inventory(root.path(),[3;32],1024*1024,&[(1,7)]).is_err());
+        assert!(Spool::cleanup(root.path(),[3;32],1,7,CleanupAuthority::CommittedCheckpoint).is_err());
+        assert_eq!(std::fs::read(unknown).unwrap(),b"retain");
+    }
+
     #[test]
     fn cleanup_never_removes_unknown_frame_contents() {
         let root = root();
         let mut spool = Spool::open(root.path(), [3; 32], 1, 7, 1024 * 1024, 0, 1, false).unwrap();
         let unknown = spool.directory.join("unowned");
         std::fs::write(&unknown, b"retain").unwrap();
-        assert!(Spool::cleanup(root.path(), [3; 32], 1, 7).is_err());
+        assert!(Spool::cleanup(root.path(), [3; 32], 1, 7, CleanupAuthority::Identity).is_err());
         assert!(unknown.exists());
         spool.keep = true;
     }

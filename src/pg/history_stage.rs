@@ -3,6 +3,7 @@ use crate::history_identity::{ErrorCode, HistoryError};
 use anyhow::{Result, ensure};
 use postgres::{Transaction, binary_copy::BinaryCopyInWriter, types::Type};
 
+pub(crate) const ROW_OVERHEAD: u64 = 256;
 #[derive(Default)]
 pub(crate) struct Row {
     pub tag: i16,
@@ -22,7 +23,7 @@ pub(crate) struct Row {
 }
 impl Row {
     pub fn bytes(&self) -> u64 {
-        256 + (self.text.len() + self.x.len() + self.y.len() + self.z.len() + self.extra.len()) as u64
+        ROW_OVERHEAD + (self.text.len() + self.x.len() + self.y.len() + self.z.len() + self.extra.len()) as u64
     }
     pub fn mutations(&self) -> u32 {
         if self.tag == 4 { 4 } else { 3 }
