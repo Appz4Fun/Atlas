@@ -82,6 +82,12 @@ async fn pause(stopping: &impl Fn() -> bool) {
     }
 }
 
+fn record_failure(db: &Db, error: &anyhow::Error) {
+    if !super::outage::is_attempt_ended(error) {
+        db.fail_native(super::outage::classify(error));
+    }
+}
+
 pub(crate) async fn run(db: Db, store: Arc<Store>, stopping: impl Fn() -> bool) {
     let mut pin: Option<LinkerRetentionPin> = Some(store.pin_linker_retention());
     ACTIVE.store(true, Ordering::Release);
@@ -157,9 +163,7 @@ pub(crate) async fn run(db: Db, store: Arc<Store>, stopping: impl Fn() -> bool) 
                     Ok(true) => tokio::task::yield_now().await,
                     Ok(false) => pause(&stopping).await,
                     Err(error) => {
-                        if !stopping() {
-                            db.fail_native(super::outage::classify(&error));
-                        }
+                        record_failure(&db, &error);
                         eprintln!("native header linker: progress failed; durable phase retained");
                         return;
                     }
@@ -167,9 +171,7 @@ pub(crate) async fn run(db: Db, store: Arc<Store>, stopping: impl Fn() -> bool) 
             }
             Ok(false) => tokio::task::yield_now().await,
             Err(error) => {
-                if !stopping() {
-                    db.fail_native(super::outage::classify(&error));
-                }
+                record_failure(&db, &error);
                 eprintln!("native header linker: attempt failed; durable phase retained");
                 return;
             }
@@ -181,6 +183,102 @@ pub(crate) async fn run(db: Db, store: Arc<Store>, stopping: impl Fn() -> bool) 
 mod tests {
     use super::*;
     use crate::nxv_store::store::{Clamp, KeepSet, StoreConfig};
+
+    fn fatal_during_drain(inner: bool) {
+        use super::super::{
+            Backend, StorageConfig,
+            indexer_runtime::Owner,
+            outage::{AttemptOutcome, Failure},
+        };
+        let Some(schema) = crate::pg::testing::Schema::new() else { return };
+        let mut client = postgres::Client::connect(&schema.url, postgres::NoTls).unwrap();
+        let database: String = client.query_one("select current_database()", &[]).unwrap().get(0);
+        let db = crate::indexer::shared_postgres_db(
+            &StorageConfig {
+                backend: Backend::Postgres,
+                url: schema.url.clone(),
+                schema: schema.name.clone(),
+                allow_plaintext: true,
+                ..Default::default()
+            },
+            &database,
+            Default::default(),
+        )
+        .unwrap();
+        let owner = Arc::new(Owner::new(client));
+        let db = crate::indexer::owned_postgres_db(db, owner.clone(), Default::default()).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let error = if inner {
+            let active = owner.clone();
+            runtime
+                .block_on(on_native_db(&db, move |_| {
+                    active.fail(Failure::Unavailable);
+                    Ok(Err::<(), _>(anyhow::anyhow!("native source cursor exceeds manifest rows")))
+                }))
+                .unwrap()
+                .unwrap_err()
+        } else {
+            owner.fail(Failure::Unavailable);
+            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound))
+                .context("reading a durable NXV segment")
+        };
+        assert!(owner.stop.load(Ordering::Acquire));
+        record_failure(&db, &error);
+        assert_eq!(owner.failure(), Some(Failure::Fatal), "independent fatal error was lost during drain");
+        assert!(
+            matches!(AttemptOutcome::from_exit(1, owner.failure()), AttemptOutcome::Fatal),
+            "fatal drain entered recovery"
+        );
+        drop(runtime);
+        owner.close();
+    }
+
+    #[test]
+    fn independent_nxv_error_during_drain_is_fatal() {
+        fatal_during_drain(false);
+    }
+
+    #[test]
+    fn inner_result_invariant_during_drain_is_fatal() {
+        fatal_during_drain(true);
+    }
+
+    #[test]
+    fn ended_callback_during_drain_preserves_transient_outcome() {
+        use super::super::{
+            Backend, StorageConfig,
+            indexer_runtime::Owner,
+            outage::{AttemptOutcome, Failure, classify, is_attempt_ended},
+        };
+        let Some(schema) = crate::pg::testing::Schema::new() else { return };
+        let mut client = postgres::Client::connect(&schema.url, postgres::NoTls).unwrap();
+        let database: String = client.query_one("select current_database()", &[]).unwrap().get(0);
+        let db = crate::indexer::shared_postgres_db(
+            &StorageConfig {
+                backend: Backend::Postgres,
+                url: schema.url.clone(),
+                schema: schema.name.clone(),
+                allow_plaintext: true,
+                ..Default::default()
+            },
+            &database,
+            Default::default(),
+        )
+        .unwrap();
+        let owner = Arc::new(Owner::new(client));
+        let db = crate::indexer::owned_postgres_db(db, owner.clone(), Default::default()).unwrap();
+        owner.fail(Failure::Unavailable);
+        let error = owner
+            .with::<()>(|_| panic!("canceled callback executed"))
+            .unwrap_err()
+            .context("queued native linker callback");
+        assert!(is_attempt_ended(&error));
+        assert_eq!(classify(&error), Failure::Unavailable);
+        record_failure(&db, &error);
+        assert_eq!(owner.failure(), Some(Failure::Unavailable));
+        assert!(matches!(AttemptOutcome::from_exit(1, owner.failure()), AttemptOutcome::Unavailable));
+        owner.close();
+    }
 
     #[test]
     fn outage_coverage_replacement_retains_aged_input_without_a_healthy_pin() {

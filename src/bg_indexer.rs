@@ -1689,7 +1689,11 @@ async fn supervise(
     native: Option<&NativeRuntime>,
 ) -> i32 {
     let states = RunStates::default();
-    let stopping = || stop.load(Ordering::Relaxed);
+    let stopping = || {
+        stop.load(Ordering::Acquire)
+            || native
+                .is_some_and(|runtime| runtime.owner.stop.load(Ordering::Acquire) || runtime.owner.failure().is_some())
+    };
     let main = paths::database();
     // a compaction that couldnt take the lock waits till then
     let mut compact_after = None;
@@ -1724,7 +1728,8 @@ async fn supervise(
                 }))
                 .await,
                 Ok(Ok(()))
-            ) {
+            ) || stopping()
+            {
                 return 1;
             }
         }
@@ -1767,7 +1772,18 @@ async fn supervise(
         );
 
         // at least one server has to answer before spinning everything up
-        if let Err(e) = pool.connect().await {
+        let connected = if let Some(native) = native {
+            match unless_stopped(&native.owner.stop, pool.connect()).await {
+                Some(result) => result,
+                None => {
+                    pool.close().await;
+                    return 1;
+                }
+            }
+        } else {
+            pool.connect().await
+        };
+        if let Err(e) = connected {
             ui::error(&format!("couldnt reach any usenet server: {e}"));
             let errors = {
                 let mut stats = stats.lock().unwrap();

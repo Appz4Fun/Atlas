@@ -32,11 +32,26 @@ impl std::fmt::Display for SessionUnavailable {
 }
 impl std::error::Error for SessionUnavailable {}
 
+/// A queued callback rejected by an already-canceled/closed owner did no work.
+/// It must not hide a separate storage/invariant failure produced while draining.
+#[derive(Debug)]
+pub(crate) struct AttemptEnded;
+impl std::fmt::Display for AttemptEnded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("native attempt has ended")
+    }
+}
+impl std::error::Error for AttemptEnded {}
+
+pub(crate) fn is_attempt_ended(error: &anyhow::Error) -> bool {
+    error.chain().any(|source| source.is::<AttemptEnded>())
+}
+
 /// Only a PostgreSQL driver's I/O provenance permits a transport retry. An NXV
 /// file error with the same OS kind must remain fatal.
 pub(crate) fn classify(error: &anyhow::Error) -> Failure {
     for source in error.chain() {
-        if source.is::<SessionUnavailable>() {
+        if source.is::<SessionUnavailable>() || source.is::<AttemptEnded>() {
             return Failure::Unavailable;
         }
         if let Some(pg) = source.downcast_ref::<postgres::Error>() {
@@ -97,6 +112,15 @@ impl Backoff {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn attempt_end_provenance_is_typed_not_a_matching_message() {
+        let canceled = anyhow::Error::new(AttemptEnded).context("queued owner callback");
+        assert!(is_attempt_ended(&canceled));
+        assert_eq!(classify(&canceled), Failure::Unavailable);
+        let independent = anyhow::anyhow!("native attempt has ended");
+        assert!(!is_attempt_ended(&independent));
+        assert_eq!(classify(&independent), Failure::Fatal);
+    }
     #[test]
     fn filesystem_errors_are_fatal_even_with_nested_context() {
         for kind in [std::io::ErrorKind::NotFound, std::io::ErrorKind::TimedOut, std::io::ErrorKind::ConnectionReset] {

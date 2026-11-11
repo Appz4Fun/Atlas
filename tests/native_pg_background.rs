@@ -724,3 +724,57 @@ fn authentication_failure_is_fatal_before_provider_or_nxv_startup() {
     assert!(!home.path().join("header-store").exists());
     assert_no_sqlite(home.path());
 }
+
+#[test]
+fn quarantined_pre_provider_reply_never_admits_the_old_attempt() {
+    use std::sync::{Mutex, atomic::Ordering::SeqCst};
+    let Ok(url) = std::env::var("ATLAS_PG_TEST_URL") else { return };
+    if url.is_empty() {
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let name = format!("t_preflight_{}", std::process::id());
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    atlas::pg::migrate::run(&mut client, &name).unwrap();
+    let mut schema = Schema { client, name };
+    let proxy = pg_outage::Proxy::new(&url);
+    proxy.online.store(true, SeqCst);
+    proxy.hold_preflight.store(true, SeqCst);
+    let observed = Arc::new(Mutex::new(Vec::<i32>::new()));
+    let captured = observed.clone();
+    let audit_name = schema.name.clone();
+    let audit = Mutex::new(postgres::Client::connect(&url, postgres::NoTls).unwrap());
+    let mut server = Server::new(vec![]);
+    Arc::get_mut(&mut server).unwrap().before_connection = Some(Arc::new(move || {
+        let mut client = audit.lock().unwrap();
+        let owner: i32 = client
+            .query_one(
+                "select pid from pg_locks where locktype='advisory' and granted and objsubid=2
+             and database=(select oid from pg_database where datname=current_database())
+             and classid::bigint=(hashtext('atlas.indexer')::bigint & 4294967295)
+             and objid::bigint=(hashtext($1)::bigint & 4294967295)",
+                &[&audit_name],
+            )
+            .unwrap()
+            .get(0);
+        captured.lock().unwrap().push(owner);
+    }));
+    let port = spawn_server(server.clone());
+    let config = configuration(&proxy.url(&url), &schema.name, port);
+    std::fs::write(home.path().join("config.json"), config.to_string()).unwrap();
+    let mut runner = start(home.path(), "outage.log");
+    wait_until(&mut runner, home.path(), 10, || proxy.preflight_held.load(SeqCst) && !paused(home.path()));
+    let old = owned_backend(&mut schema).unwrap();
+    wait_until(&mut runner, home.path(), 35, || paused(home.path()));
+    assert_eq!(server.accepted.load(SeqCst), 0);
+    proxy.release_preflight.store(true, SeqCst);
+    wait_until(&mut runner, home.path(), 15, || !observed.lock().unwrap().is_empty());
+    let owners = observed.lock().unwrap().clone();
+    assert!(
+        owners.iter().all(|&owner| owner != old),
+        "quarantined old owner contacted a provider: {owners:?}, old={old}"
+    );
+    assert!(owned_backend(&mut schema).is_some_and(|owner| owner != old));
+    assert!(runner.stop().success());
+    assert_no_sqlite(home.path());
+}

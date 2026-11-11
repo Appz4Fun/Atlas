@@ -1,6 +1,6 @@
 //! Startup fencing for the native ingestion profile while auxiliary services are ported.
 
-use super::outage::{Failure, SessionUnavailable, classify};
+use super::outage::{AttemptEnded, Failure, SessionUnavailable, classify};
 use anyhow::{Context, Result, ensure};
 use std::sync::{
     Arc, Mutex,
@@ -91,7 +91,7 @@ impl Owner {
             anyhow::anyhow!("native owner connection is poisoned")
         })?;
         if !self.accepting.load(Ordering::Acquire) || self.stop.load(Ordering::Acquire) {
-            anyhow::bail!("native attempt has ended");
+            return Err(AttemptEnded.into());
         }
         *self.busy_since.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::time::Instant::now());
         let result = match held.as_mut() {

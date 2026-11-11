@@ -14,6 +14,9 @@ pub struct Proxy {
     pub blackhole: Arc<AtomicBool>,
     pub suppress_commit: Arc<AtomicBool>,
     pub ambiguous: Arc<AtomicUsize>,
+    pub hold_preflight: Arc<AtomicBool>,
+    pub preflight_held: Arc<AtomicBool>,
+    pub release_preflight: Arc<AtomicBool>,
     generation: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -75,6 +78,9 @@ impl Proxy {
         let blackhole = Arc::new(AtomicBool::new(false));
         let suppress_commit = Arc::new(AtomicBool::new(false));
         let ambiguous = Arc::new(AtomicUsize::new(0));
+        let hold_preflight = Arc::new(AtomicBool::new(false));
+        let preflight_held = Arc::new(AtomicBool::new(false));
+        let release_preflight = Arc::new(AtomicBool::new(false));
         let generation = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let (on, hole, suppress, lost, epoch, stopping) = (
@@ -85,6 +91,7 @@ impl Proxy {
             generation.clone(),
             stop.clone(),
         );
+        let (hold, held, release) = (hold_preflight.clone(), preflight_held.clone(), release_preflight.clone());
         let thread = std::thread::spawn(move || {
             let mut workers: Vec<JoinHandle<()>> = Vec::new();
             while !stopping.load(Ordering::Acquire) {
@@ -103,12 +110,14 @@ impl Proxy {
                         let (on, hole, suppress, lost, epoch, stopping) =
                             (on.clone(), hole.clone(), suppress.clone(), lost.clone(), epoch.clone(), stopping.clone());
                         let initial = epoch.load(Ordering::Acquire);
+                        let (hold, held, release) = (hold.clone(), held.clone(), release.clone());
                         workers.push(std::thread::spawn(move || {
                             let mut request = std::collections::VecDeque::new();
                             let mut response = std::collections::VecDeque::new();
                             let mut frontend_tail = Vec::new();
                             let mut backend_tail = Vec::new();
                             let mut release_transaction = false;
+                            let mut preflight_response = false;
                             while !stopping.load(Ordering::Acquire)
                                 && on.load(Ordering::Acquire)
                                 && epoch.load(Ordering::Acquire) == initial
@@ -123,6 +132,12 @@ impl Proxy {
                                         Ok(0) => break,
                                         Ok(n) => {
                                             frontend_tail.extend_from_slice(&buffer[..n]);
+                                            if frontend_tail.windows(9).any(|w| w == b"select 1\0")
+                                                && hold.swap(false, Ordering::AcqRel)
+                                            {
+                                                preflight_response = true;
+                                                held.store(true, Ordering::Release);
+                                            }
                                             release_transaction |=
                                                 frontend_tail.windows(20).any(|w| w == b"insert into segments");
                                             if frontend_tail.len() > 128 {
@@ -169,7 +184,7 @@ impl Proxy {
                                         Err(_) => break,
                                     }
                                 }
-                                if !response.is_empty() {
+                                if !response.is_empty() && (!preflight_response || release.load(Ordering::Acquire)) {
                                     match downstream.write(response.make_contiguous()) {
                                         Ok(n) => {
                                             response.drain(..n);
@@ -196,7 +211,19 @@ impl Proxy {
                 worker.join().unwrap();
             }
         });
-        Self { port, online, blackhole, suppress_commit, ambiguous, generation, stop, thread: Some(thread) }
+        Self {
+            port,
+            online,
+            blackhole,
+            suppress_commit,
+            ambiguous,
+            hold_preflight,
+            preflight_held,
+            release_preflight,
+            generation,
+            stop,
+            thread: Some(thread),
+        }
     }
     pub fn drop_connections(&self) {
         self.online.store(false, Ordering::Release);
