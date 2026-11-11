@@ -1195,24 +1195,13 @@ pub fn unlinked_days() -> BTreeSet<i64> {
 const PASS_EVERY: Duration = Duration::from_secs(60);
 
 /// The backfill days still to read, from the main database (read only).
-fn not_done_days() -> Result<HashSet<i64>> {
-    use rusqlite::OptionalExtension;
-    let main = rusqlite::Connection::open_with_flags(
-        crate::paths::database(),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
-    main.busy_timeout(Duration::from_secs(30))?;
-    // in forward mode the days before its start aren't read (their chunks stay undone for good): they don't hold an
-    // hour back
-    let start: i64 = main
-        .query_row("select value from meta where key = 'backfill_forward_start'", [], |r| r.get(0))
-        .optional()?
-        .unwrap_or(i64::MIN);
-    let days = main
-        .prepare("select distinct day from backfill_chunks where state != 2 and day >= ?1")?
-        .query_map([start], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    Ok(days)
+fn not_done_days(main: &dyn crate::pg::sql::Sql) -> Result<HashSet<i64>> {
+    use crate::pg::sql::vals;
+    let start: i64 = main.opt("select value from meta where key = 'backfill_forward_start'", &[])?.unwrap_or(i64::MIN);
+    Ok(main
+        .column("select distinct day from backfill_chunks where state != 2 and day >= $1", vals![start])?
+        .into_iter()
+        .collect())
 }
 
 /// Runs the linker in the indexer until `stopping`: a pass, its releases saved, then noted; again at once while
@@ -1233,6 +1222,14 @@ pub async fn run(db: crate::indexer::Db, store: Arc<Store>, stopping: impl Fn() 
     }
     let linker = Arc::new(Mutex::new(linker));
     while !stopping() {
+        let not_done = match crate::indexer::on_db(&db, not_done_days).await {
+            Ok(days) => days,
+            Err(_) => {
+                eprintln!("header store linker: could not read pending backfill days");
+                sleep_unless(PASS_EVERY, &stopping).await;
+                continue;
+            }
+        };
         let (l, s) = (Arc::clone(&linker), Arc::clone(&store));
         let found = tokio::task::spawn_blocking(move || -> Result<Option<Found>> {
             let mut lk = l.lock().unwrap_or_else(|e| e.into_inner());
@@ -1240,7 +1237,6 @@ pub async fn run(db: crate::indexer::Db, store: Arc<Store>, stopping: impl Fn() 
             if let Ok(mut u) = UNLINKED.lock() {
                 *u = lk.unlinked_in(&s);
             }
-            let not_done = not_done_days()?;
             let stop = || crate::frozen::STOPPING.load(std::sync::atomic::Ordering::Relaxed);
             let found = lk.pass(&s, chrono::Utc::now().timestamp(), &not_done, &stop)?;
             if let Ok(mut u) = UNLINKED.lock() {

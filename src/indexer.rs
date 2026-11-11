@@ -364,6 +364,7 @@ pub use crate::pg::ingest::PgWriteLimits;
 enum MainConnection {
     Sqlite(Mutex<Connection>),
     Postgres(Arc<crate::pg::Pool>),
+    OwnedPostgres(Arc<crate::pg::indexer_runtime::Owner>),
 }
 
 impl MainConnection {
@@ -380,8 +381,22 @@ impl MainConnection {
                 crate::profile::DB_WAIT.add_since(t);
                 f(&crate::pg::sql::Pg::new(conn))
             }
+            Self::OwnedPostgres(owner) => owner.with(|conn| {
+                crate::profile::DB_WAIT.add_since(t);
+                f(&crate::pg::sql::Pg::new(conn))
+            }),
         }
     }
+}
+
+pub(crate) fn owned_postgres_db(
+    mut db: Db,
+    owner: Arc<crate::pg::indexer_runtime::Owner>,
+    limits: PgWriteLimits,
+) -> Result<Db> {
+    db.conn = Arc::new(MainConnection::OwnedPostgres(owner.clone()));
+    db.native = Some(crate::pg::ingest::Native::with_owner(owner, limits)?);
+    Ok(db)
 }
 
 /// Opt-in native indexer storage. The destination must already exist and be migrated; this never opens SQLite
@@ -452,6 +467,15 @@ mod postgres_backend_tests {
 
     #[test]
     fn cancelled_postgres_day_claim_is_released_off_the_async_worker() {
+        cancelled_postgres_claim(false);
+    }
+
+    #[test]
+    fn cancelled_owned_postgres_day_claim_is_released_off_the_async_worker() {
+        cancelled_postgres_claim(true);
+    }
+
+    fn cancelled_postgres_claim(owned: bool) {
         let Some(schema) = crate::pg::testing::Schema::new() else { return };
         let mut admin = schema.pool.get().unwrap();
         let database: String = admin.query_one("select current_database()", &[]).unwrap().get(0);
@@ -468,6 +492,14 @@ mod postgres_backend_tests {
             PgWriteLimits::default(),
         )
         .unwrap();
+        let db = if owned {
+            let mut client = postgres::Client::connect(&schema.url, postgres::NoTls).unwrap();
+            client.batch_execute(&format!("set search_path to {}", schema.name)).unwrap();
+            owned_postgres_db(db, Arc::new(crate::pg::indexer_runtime::Owner::new(client)), PgWriteLimits::default())
+                .unwrap()
+        } else {
+            db
+        };
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
         rt.block_on(async {
             let (ready, started) = tokio::sync::oneshot::channel();
@@ -1043,7 +1075,7 @@ pub(crate) async fn on_sqlite_db(db: &Db, f: impl FnOnce(&Connection) -> Result<
             let conn = conn.lock().map_err(|_| anyhow!("the database connection is poisoned"))?;
             f(&conn)
         }
-        MainConnection::Postgres(_) => Ok(()),
+        MainConnection::Postgres(_) | MainConnection::OwnedPostgres(_) => Ok(()),
     })
     .await
     .map_err(|e| anyhow!("db task failed: {e}"))?
@@ -1931,7 +1963,7 @@ impl Drop for GiveBackOnDrop<'_> {
             return;
         }
         let conn = self.db.conn.clone();
-        let postgres = matches!(&*conn, MainConnection::Postgres(_));
+        let postgres = !matches!(&*conn, MainConnection::Sqlite(_));
         let claim = self.chunk.clone();
         let release = move || {
             if let Err(e) = conn.with_sql(|conn| Ok(crate::chunks::release(conn, &claim)?)) {
