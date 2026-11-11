@@ -16,6 +16,7 @@ mod history_gate;
 mod history_digest;
 mod history_validator;
 pub mod history_import;
+pub mod history_cli;
 mod history_stage;
 mod history_spool;
 pub mod history_catalog;

@@ -1,4 +1,5 @@
 //! Bounded binary COPY staging and set-based identity admission.
+use crate::history_identity::{ErrorCode, HistoryError};
 use anyhow::{Result, ensure};
 use postgres::{Transaction, binary_copy::BinaryCopyInWriter, types::Type};
 
@@ -101,11 +102,11 @@ pub(crate) fn apply(tx: &mut Transaction<'_>, id: &[u8; 32], rows: &[Row], cache
         select 1 from atlas_history_stage s left join history_sources h on h.import_id=$1 and h.source_id=s.a where s.tag=7 and (h.source_id is null or (h.kind,h.shard_number,h.paired_current_source,h.file_manifest_digest,h.schema_digest) is distinct from (s.t,nullif(s.b,-1)::integer,nullif(s.c,-1),s.x,s.y))
         union all select 1 from atlas_history_stage s left join history_objects h on h.import_id=$1 and h.object_id=s.a where s.tag=1 and (h.object_id is null or (h.source_id,h.scope_release_id,h.object_kind,h.source_bookmark,h.locator_digest,h.byte_length) is distinct from(s.b,s.c,s.t,s.x,s.y,s.d))
         union all select 1 from atlas_history_stage s left join history_object_chunks h on h.import_id=$1 and h.object_id=s.a and h.ordinal=s.b where s.tag=2 and (h.object_id is null or (h.byte_offset,h.bytes,h.digest) is distinct from(s.c,s.x,s.y))
-        union all select 1 from atlas_history_stage s left join history_objects h on h.import_id=$1 and h.object_id=s.a where s.tag=3 and (h.object_id is null or h.byte_length<>s.d or (h.digest is not null and h.digest<>s.x) or (h.validated and (not s.flag or (h.logical_rows,h.logical_values) is distinct from(nullif(s.b,-1),nullif(s.c,-1))))))",id)?.get(0);
-    ensure!(!conflict, "SourceMismatch: resumed object/source/chunk identity differs");
+        union all select 1 from (select distinct on(a) * from atlas_history_stage where tag=3 order by a,flag desc) s left join history_objects h on h.import_id=$1 and h.object_id=s.a where (h.object_id is null or h.byte_length<>s.d or (h.digest is not null and h.digest<>s.x) or (h.validated and (not s.flag or (h.logical_rows,h.logical_values) is distinct from(nullif(s.b,-1),nullif(s.c,-1))))) union all select 1 from atlas_history_stage s join atlas_history_stage t on s.tag=3 and t.tag=3 and s.a=t.a where (s.d,s.x) is distinct from(t.d,t.x) or (s.flag and t.flag and (s.b,s.c) is distinct from(t.b,t.c)))",id)?.get(0);
+    ensure!(!conflict, HistoryError::new(ErrorCode::SourceMismatch, "resumed object/source/chunk identity differs"));
     mutations += execute(
         tx,
-        "update history_objects h set digest=s.x,validated=s.flag,logical_rows=nullif(s.b,-1),logical_values=nullif(s.c,-1) from atlas_history_stage s where s.tag=3 and h.import_id=$1 and h.object_id=s.a",
+        "update history_objects h set digest=s.x,validated=s.flag,logical_rows=nullif(s.b,-1),logical_values=nullif(s.c,-1) from (select distinct on(a) * from atlas_history_stage where tag=3 order by a,flag desc) s where h.import_id=$1 and h.object_id=s.a",
         id,
     )?;
     mutations += execute(
@@ -120,14 +121,14 @@ pub(crate) fn apply(tx: &mut Transaction<'_>, id: &[u8; 32], rows: &[Row], cache
     )?;
     // Detect unapproved current/current and cross-lineage frozen ownership.
     let conflict:bool=query(tx,"select exists(select 1 from atlas_history_stage s join history_release_variants v on v.import_id=$1 and v.public_id=s.b and v.source_id<>s.a join history_sources old on old.import_id=v.import_id and old.source_id=v.source_id join history_sources new on new.import_id=$1 and new.source_id=s.a where s.tag=4 and not ((old.kind='current' and new.kind='frozen' and new.paired_current_source=old.source_id) or (old.kind='frozen' and new.kind='current' and old.paired_current_source=new.source_id)))",id)?.get(0);
-    ensure!(!conflict, "SourceMismatch: conflicting public-ID source lineages");
+    ensure!(!conflict, HistoryError::new(ErrorCode::SourceMismatch, "conflicting public-ID source lineages"));
     mutations += execute(
         tx,
         "insert into history_collection_aliases(import_id,source_id,original_signed_hash,target_public_id) select $1,a,b,c from atlas_history_stage where tag=5 on conflict do nothing",
         id,
     )?;
     let conflict:bool=query(tx,"select exists(select 1 from atlas_history_stage s join history_release_variants v on v.import_id=$1 and v.source_id=s.a and v.public_id=s.b where s.tag=4 and (v.metadata_object_id,v.frozen_header_object_id,v.frozen_payload_object_id) is distinct from(s.c,nullif(s.d,-1),nullif(s.e,-1)) union all select 1 from atlas_history_stage s join history_collection_aliases h on h.import_id=$1 and h.source_id=s.a and h.original_signed_hash=s.b where s.tag=5 and h.target_public_id<>s.c)",id)?.get(0);
-    ensure!(!conflict, "SourceMismatch: resumed variant/alias content differs");
+    ensure!(!conflict, HistoryError::new(ErrorCode::SourceMismatch, "resumed variant/alias content differs"));
     mutations += execute(
         tx,
         "insert into history_catalog(import_id,public_id,selected_source_id) select distinct on(s.b) $1,s.b,s.a from atlas_history_stage s join history_sources src on src.import_id=$1 and src.source_id=s.a where s.tag=4 order by s.b,(src.kind='current') desc,s.a on conflict(import_id,public_id) do update set selected_source_id=excluded.selected_source_id where (select kind from history_sources where import_id=$1 and source_id=excluded.selected_source_id)='current' and (select kind from history_sources where import_id=$1 and source_id=history_catalog.selected_source_id)='frozen'",
@@ -144,7 +145,7 @@ pub(crate) fn apply(tx: &mut Transaction<'_>, id: &[u8; 32], rows: &[Row], cache
         id,
     )?;
     let conflict:bool=query(tx,"select exists(select 1 from atlas_history_stage s left join history_frozen_resolutions h on h.import_id=$1 and h.source_id=s.a and h.public_id=s.b where s.tag=12 and (h.source_id is null or (h.header_object_id,h.metadata_object_id,h.differing_columns,h.oracle_code) is distinct from(s.c,s.d,s.x,s.t)) union all select 1 from atlas_history_stage s left join history_sources h on h.import_id=$1 and h.source_id=s.a where s.tag=9 and (h.source_id is null or h.facts_object_id is distinct from s.b) union all select 1 from atlas_history_stage s left join history_receipts h on h.import_id=$1 and h.source_id=s.a and h.relation_code=s.b where s.tag=8 and (h.source_id is null or (h.relation_name,h.owner_code) is distinct from(s.x,s.extra) or (s.flag and (h.state,h.logical_rows,h.digest) is distinct from(s.t,s.c,s.y))))",id)?.get(0);
-    ensure!(!conflict, "SourceMismatch: frozen resolution receipt differs");
+    ensure!(!conflict, HistoryError::new(ErrorCode::SourceMismatch, "frozen resolution receipt differs"));
     // Fixed count regardless of ordinary row/cell count; COPY protocol writes
     // are separately byte bounded. No destination round trip per source row.
     Ok(Applied { round_trips, mutations, copy_bytes: 21 + rows.iter().map(|r| r.bytes() - 139).sum::<u64>() })

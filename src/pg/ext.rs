@@ -633,6 +633,9 @@ pub fn run_move(args: &[String]) -> i32 {
             main.display()
         );
         copy_from_sqlite_with_keep(&mut c, &main, pool.schema(), apply, source)?;
+        if apply && let Some(receipt)=super::history_companion::digest(&mut c,pool.schema(),"ext")? {
+            println!("External source-pairing receipt: {}",receipt.iter().map(|byte|format!("{byte:02x}")).collect::<String>());
+        }
         if !apply {
             println!("dry run: nothing written (--apply to move it)");
         }

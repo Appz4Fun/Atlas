@@ -2,6 +2,7 @@
 //! Decoder state survives ordinary pages. Dropping the owner cancels and joins
 //! this worker; only a subsequent process/session recovery restarts a frame.
 use crate::history_identity::{CellType, Column};
+use crate::history_identity::{ErrorCode, HistoryError};
 use crate::history_stream::{self, Admission, BytesKind, Event, ReadClass};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -106,7 +107,7 @@ impl Validator {
         quota: u64,
         config: history_stream::Config,
     ) -> Result<Self> {
-        ensure!(length <= quota, "InsufficientBudget: frozen spool quota");
+        ensure!(length <= quota, HistoryError::new(ErrorCode::InsufficientBudget, "frozen spool quota"));
         let meter = Arc::new(Meter {
             state: Mutex::new(State {
                 remaining: [0; 3],
@@ -129,10 +130,13 @@ impl Validator {
     pub(crate) fn advance(&mut self, bytes: u64, events: u32) -> Result<Progress> {
         ensure!(
             bytes >= 512 && events > 0,
-            "InsufficientBudget: validator needs 512 byte admission and positive callback work"
+            HistoryError::new(
+                ErrorCode::InsufficientBudget,
+                "validator needs 512 byte admission and positive callback work"
+            )
         );
         let mut s = self.meter.state.lock().map_err(|_| anyhow::anyhow!("validator meter poisoned"))?;
-        ensure!(!s.cancelled, "LostOwner: validator has been cancelled");
+        ensure!(!s.cancelled, HistoryError::new(ErrorCode::LostOwner, "validator has been cancelled"));
         s.remaining = [bytes / 2, bytes - bytes / 2, u64::from(events)];
         s.usage = Usage::default();
         s.paused = false;
@@ -193,8 +197,8 @@ impl Matcher {
         Self { mask: if table { 1 } else { (1 << COLUMNS.len()) - 1 }, offset: 0, length, table }
     }
     fn feed(&mut self, bytes: &[u8]) {
-        for i in 0..if self.table { 1 } else { COLUMNS.len() } {
-            let expected = if self.table { b"releases".as_slice() } else { COLUMNS[i].name().as_bytes() };
+        for (i, column) in COLUMNS.iter().enumerate().take(if self.table { 1 } else { COLUMNS.len() }) {
+            let expected = if self.table { b"releases".as_slice() } else { column.name().as_bytes() };
             if self.length != expected.len() as u64
                 || self.offset as usize > expected.len()
                 || bytes.len() > expected.len().saturating_sub(self.offset as usize)
@@ -308,13 +312,13 @@ impl Extractor {
                     }
                 }
                 Active::Name(m) => {
-                    if self.in_release {
-                        if let Some(c) = m.column() {
-                            if self.columns.iter().any(|(_, old)| *old == c) {
-                                return Err(io::Error::other("duplicate frozen release column"));
-                            }
-                            self.columns.push((self.column_name, c));
+                    if self.in_release
+                        && let Some(c) = m.column()
+                    {
+                        if self.columns.iter().any(|(_, old)| *old == c) {
+                            return Err(io::Error::other("duplicate frozen release column"));
                         }
+                        self.columns.push((self.column_name, c));
                     }
                 }
                 Active::Value(col, kind, offset, length, hash) => {
@@ -330,6 +334,10 @@ impl Extractor {
         Ok(())
     }
 }
+#[allow(
+    clippy::too_many_arguments,
+    reason = "source, projection, identity and resource admissions stay explicit at the worker boundary"
+)]
 fn validate(
     input: File,
     projection: File,
@@ -361,14 +369,14 @@ fn validate(
     })?;
     ensure!(
         input.bytes == length && <[u8; 32]>::from(input.hash.finalize()) == digest,
-        "CorruptObject: exact frozen envelope digest/length"
+        HistoryError::new(ErrorCode::CorruptObject, "exact frozen envelope digest/length")
     );
     ensure!(
         extract.release_tables == 1
             && [Column::Id, Column::Name, Column::Group]
                 .iter()
                 .all(|c| extract.fields.iter().any(|(found, _)| found == c)),
-        "UnsupportedSchema: frozen release metadata missing"
+        HistoryError::new(ErrorCode::UnsupportedSchema, "frozen release metadata missing")
     );
     extract.file.sync_all().context("fsync frozen metadata projection")?;
     Ok(Validated {

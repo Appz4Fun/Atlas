@@ -690,7 +690,10 @@ impl<C: PgClient> Sql for Pg<C> {
         // a savepoint when this is a transaction already
         let mut transaction = c.pg_transaction()?;
         // Fence before the callback can acquire application/group row locks.
-        super::history_gate::native(&mut transaction).map_err(|e| Error::Value(e.to_string()))?;
+        super::history_gate::native(&mut transaction).map_err(|error| match error.downcast::<postgres::Error>() {
+            Ok(error) => Error::Postgres(error),
+            Err(error) => Error::Value(error.to_string()),
+        })?;
         let tx = Pg::new(transaction);
         f(&tx)?;
         Ok(tx.into_inner().commit()?)

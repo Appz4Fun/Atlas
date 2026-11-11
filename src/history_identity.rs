@@ -1,5 +1,34 @@
 //! SQLite-free preservation types and bounded metadata handles.
 use serde::{Deserialize, Serialize};
+/// Stable validation categories; storage errors retain their original causes.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ErrorCode {
+    SourceMismatch,
+    UnsupportedSchema,
+    IncompleteImport,
+    CorruptObject,
+    MissingArchive,
+    InsufficientBudget,
+    DestinationMismatch,
+    LostOwner,
+    Cancelled,
+}
+#[derive(Debug)]
+pub struct HistoryError {
+    pub code: ErrorCode,
+    detail: String,
+}
+impl HistoryError {
+    pub fn new(code: ErrorCode, detail: impl Into<String>) -> Self {
+        Self { code, detail: detail.into() }
+    }
+}
+impl std::fmt::Display for HistoryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}: {}", self.code, self.detail)
+    }
+}
+impl std::error::Error for HistoryError {}
 pub type ImportId = [u8; 32];
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Column {

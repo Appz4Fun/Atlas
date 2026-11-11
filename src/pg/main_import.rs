@@ -303,6 +303,9 @@ fn run(args: &[String]) -> Result<()> {
         println!("  {table}: {rows} rows verified");
     }
     println!("Imported and verified {} tables in {database}.{schema}", restored.len());
+    if let Some(receipt)=super::history_companion::digest(&mut client,schema,"main_import")? {
+        println!("Main source-pairing receipt: {}",receipt.iter().map(|byte|format!("{byte:02x}")).collect::<String>());
+    }
     Ok(())
 }
 

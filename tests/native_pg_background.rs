@@ -354,3 +354,51 @@ fn walk_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     }
     files
 }
+
+#[test]
+fn historical_readiness_rejects_actual_startup_before_cursor_or_provider_work() {
+    let Ok(url) = std::env::var("ATLAS_PG_TEST_URL") else { return };
+    if url.is_empty() {
+        return;
+    }
+    for (index, state) in ["loading", "identity_ready"].iter().enumerate() {
+        let home = tempfile::tempdir().unwrap();
+        let name = format!("t_native_history_{}_{}", std::process::id(), index);
+        let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        atlas::pg::migrate::run(&mut client, &name).unwrap();
+        let mut schema = Schema { client, name };
+        let snapshot = |client: &mut postgres::Client, name: &str| -> Vec<(String, Option<i64>, Option<String>)> {
+            client
+                .query(&format!("select key,value,text_value from {name}.meta order by key"), &[])
+                .unwrap()
+                .iter()
+                .map(|r| (r.get(0), r.get(1), r.get(2)))
+                .collect()
+        };
+        let before = snapshot(&mut schema.client, &schema.name);
+        let id = [1u8; 32];
+        schema.client.execute(&format!("insert into {}.history_imports(import_id,source_fingerprint,contract_version,state,expected_database,expected_schema,expected_role,expected_owner,reserved_next_seq,checkpoint,identity_digest) values($1,$1,1,$2,current_database(),$3,current_user,current_user,900,'',case when $2='identity_ready' then $1::bytea else null::bytea end)",schema.name),&[&&id[..],state,&schema.name]).unwrap();
+        let server = Server::new(vec![]);
+        let port = spawn_server(Arc::clone(&server));
+        let config = configuration(&url, &schema.name, port);
+        std::fs::write(home.path().join("config.json"), config.to_string()).unwrap();
+        let mut rejected = start(home.path(), "historical-rejected.log");
+        assert!(!wait_for_exit(&mut rejected, Duration::from_secs(5)).success());
+        let log = std::fs::read_to_string(home.path().join("historical-rejected.log")).unwrap();
+        assert!(
+            log.contains("historical readiness before native cursor initialization"),
+            "startup must reach the persistent readiness guard: {log}"
+        );
+        assert_eq!(
+            snapshot(&mut schema.client, &schema.name),
+            before,
+            "readiness must precede main cursor initialization"
+        );
+        assert_eq!(
+            server.accepted.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "readiness must precede provider connections"
+        );
+        assert_no_sqlite(home.path());
+    }
+}

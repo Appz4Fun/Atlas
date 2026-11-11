@@ -1,18 +1,26 @@
 //! Native mutation gate tests and transaction entrypoint.
 
+use crate::history_identity::{ErrorCode, HistoryError};
 use anyhow::{Result, ensure};
 use postgres::GenericClient;
 
 /// The owner fence precedes the persistent gate and all group/row locks.
 /// No history state currently permits native mutation, including identity_ready.
 pub(crate) fn native(tx: &mut impl GenericClient) -> Result<()> {
-    let row=tx.query_one("select current_schema()::text,exists(select 1 from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid=p.pronamespace where n.nspname=current_schema() and p.proname='atlas_native_write_guard')",&[])?;
+    let row=tx.query_typed_one("select current_schema()::text,exists(select 1 from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid=p.pronamespace where n.nspname=current_schema() and p.proname='atlas_native_write_guard'),to_regclass(format('%I.history_imports',current_schema())) is not null",&[])?;
     let schema: String = row.get(0);
     ensure!(super::valid_schema(&schema), "native mutation schema is not supported");
     if row.get::<_, bool>(1) {
-        tx.query_one(&format!("select \"{schema}\".atlas_native_write_guard($1)"), &[&schema])?;
+        tx.query_typed_one(
+            &format!("select \"{schema}\".atlas_native_write_guard($1)"),
+            &[(&schema, postgres::types::Type::TEXT)],
+        )?;
     } else {
-        tx.query_one("select pg_catalog.pg_advisory_xact_lock_shared(pg_catalog.hashtext('atlas.indexer'),pg_catalog.hashtext($1))",&[&schema])?;
+        ensure!(
+            !row.get::<_, bool>(2),
+            HistoryError::new(ErrorCode::IncompleteImport, "history schema is missing its native guard")
+        );
+        tx.query_typed_one("select pg_catalog.pg_advisory_xact_lock_shared(pg_catalog.hashtext('atlas.indexer'),pg_catalog.hashtext($1))",&[(&schema,postgres::types::Type::TEXT)])?;
     }
     Ok(())
 }
@@ -20,6 +28,18 @@ pub(crate) fn native(tx: &mut impl GenericClient) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use crate::parser::{Article, Release};
+
+    #[test]
+    fn a_missing_gate_function_is_never_native_only_fallback() {
+        let Some(s) = crate::pg::testing::Schema::new() else { return };
+        let mut c = s.pool.get().unwrap();
+        c.batch_execute("drop function atlas_native_write_guard(text)").unwrap();
+        let mut tx = c.transaction().unwrap();
+        assert!(
+            super::native(&mut tx).is_err(),
+            "a history schema missing its gate must fail before callers lock rows"
+        );
+    }
 
     #[test]
     fn sql_transaction_checks_readiness_before_callers_can_lock_rows() {

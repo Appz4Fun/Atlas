@@ -1,4 +1,5 @@
 //! Serializable SHA-256 checkpoint state. Compression remains in sha2.
+use crate::history_identity::{ErrorCode, HistoryError};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 #[derive(Clone, Serialize, Deserialize)]
@@ -20,7 +21,7 @@ impl DigestState {
     fn check(&self) -> Result<()> {
         ensure!(
             self.pending.len() < 64 && self.bytes % 64 == self.pending.len() as u64 && self.bytes <= u64::MAX / 8,
-            "invalid history digest continuation"
+            HistoryError::new(ErrorCode::CorruptObject, "invalid history digest continuation")
         );
         Ok(())
     }
@@ -30,7 +31,7 @@ impl DigestState {
             .bytes
             .checked_add(bytes.len() as u64)
             .filter(|n| *n <= u64::MAX / 8)
-            .context("history digest length overflow")?;
+            .context(HistoryError::new(ErrorCode::CorruptObject, "history digest length overflow"))?;
         if !self.pending.is_empty() {
             let n = bytes.len().min(64 - self.pending.len());
             self.pending.extend_from_slice(&bytes[..n]);
@@ -58,7 +59,7 @@ impl DigestState {
             tail.push(0);
         }
         tail.extend_from_slice(&(self.bytes * 8).to_be_bytes());
-        for bytes in tail.chunks_exact(64) {
+        for bytes in tail.as_chunks::<64>().0 {
             let block = sha2::digest::generic_array::GenericArray::clone_from_slice(bytes);
             sha2::compress256(&mut words, std::slice::from_ref(&block));
         }

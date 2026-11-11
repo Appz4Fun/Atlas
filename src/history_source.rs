@@ -2,8 +2,9 @@
 //! This module is removable with the SQLite conversion tools; runtime catalog
 //! inspection depends only on PostgreSQL object handles.
 
+use crate::history_identity::{ErrorCode, HistoryError};
 use anyhow::{Context, Result, bail, ensure};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -17,11 +18,13 @@ pub enum SourceKind {
     Frozen,
 }
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CatalogCounts {
     pub releases: u64,
     pub collections: u64,
 }
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FileManifest {
     pub source_id: i64,
     pub kind: SourceKind,
@@ -34,6 +37,7 @@ pub struct FileManifest {
     pub catalog_counts: Option<CatalogCounts>,
 }
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub version: u32,
     pub checkpoint_id: String,
@@ -137,10 +141,20 @@ pub struct VerificationAdmission {
     pub max_total_bytes: u64,
     pub bytes_per_second: u64,
     pub read_chunk_bytes: u32,
+    pub max_open_files: u32,
+    pub sqlite_cache_bytes: u64,
+    pub max_schema_bytes: u64,
 }
 impl VerificationAdmission {
     pub fn new(max_total_bytes: u64) -> Self {
-        Self { max_total_bytes, bytes_per_second: 32 * 1024 * 1024, read_chunk_bytes: 65536 }
+        Self {
+            max_total_bytes,
+            bytes_per_second: 32 * 1024 * 1024,
+            read_chunk_bytes: 65536,
+            max_open_files: 33,
+            sqlite_cache_bytes: 16 * 1024 * 1024,
+            max_schema_bytes: 16 * 1024 * 1024,
+        }
     }
 }
 #[derive(Clone, Copy, Debug, Default)]
@@ -207,31 +221,41 @@ fn table(kind: SourceKind, relation: Relation) -> Result<&'static str> {
         (SourceKind::Current, Relation::Collections) => Ok("collections"),
         (SourceKind::Frozen, Relation::Releases) => Ok("frozen_releases"),
         (SourceKind::Frozen, Relation::Collections) => Ok("frozen_collections"),
-        _ => bail!("UnsupportedSchema: relation is not available for this source"),
+        _ => bail!(HistoryError::new(ErrorCode::UnsupportedSchema, "relation is not available for this source")),
     }
 }
 
 /// Initial schema hashing is separately admitted; no payload cell is read.
 pub fn schema_digest(conn: &Connection) -> Result<[u8; 32]> {
+    Ok(schema_digest_admitted(conn, 4 * 1024 * 1024)?.0)
+}
+fn schema_digest_admitted(conn: &Connection, limit: u64) -> Result<([u8; 32], u64)> {
     let excessive: bool =
         conn.query_row("select exists(select 1 from sqlite_schema where length(cast(sql as blob))>65536)", [], |r| {
             r.get(0)
         })?;
-    ensure!(!excessive, "UnsupportedSchema: schema object exceeds verification admission");
+    ensure!(
+        !excessive,
+        HistoryError::new(ErrorCode::UnsupportedSchema, "schema object exceeds verification admission")
+    );
     let mut q = conn.prepare("select type,name,tbl_name,sql from sqlite_schema order by type,name")?;
     let mut rows = q.query([])?;
     let mut hash = Sha256::new();
-    let mut bytes = 0usize;
+    let mut bytes = 0u64;
     let mut count = 0usize;
     while let Some(row) = rows.next()? {
         count += 1;
-        ensure!(count <= 4096, "UnsupportedSchema: too many schema objects");
+        ensure!(count <= 4096, HistoryError::new(ErrorCode::UnsupportedSchema, "too many schema objects"));
         for i in 0..4 {
             let v: Option<String> = row.get(i)?;
+            bytes =
+                bytes.checked_add(8 + v.as_ref().map_or(0, |v| v.len() as u64)).context("schema length overflow")?;
+            ensure!(
+                bytes <= limit,
+                HistoryError::new(ErrorCode::InsufficientBudget, "aggregate schema verification byte admission")
+            );
             match v {
                 Some(v) => {
-                    bytes = bytes.checked_add(v.len()).context("schema length overflow")?;
-                    ensure!(bytes <= 4 * 1024 * 1024, "UnsupportedSchema: schema verification byte admission");
                     hash.update((v.len() as u64).to_le_bytes());
                     hash.update(v.as_bytes());
                 }
@@ -239,7 +263,7 @@ pub fn schema_digest(conn: &Connection) -> Result<[u8; 32]> {
             }
         }
     }
-    Ok(hash.finalize().into())
+    Ok((hash.finalize().into(), bytes))
 }
 fn check_columns(conn: &Connection, table: &str, allowed: &[Column], optional: &[Column]) -> Result<Vec<Column>> {
     let mut q = conn.prepare(&format!("pragma table_xinfo('{table}')"))?;
@@ -248,37 +272,49 @@ fn check_columns(conn: &Connection, table: &str, allowed: &[Column], optional: &
             Ok((r.get::<_, String>(1)?, r.get::<_, i64>(5)?, r.get::<_, i64>(6)?, r.get::<_, String>(2)?))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    ensure!(!found.is_empty() && found.len() <= allowed.len(), "UnsupportedSchema: missing/extra catalog columns");
+    ensure!(
+        !found.is_empty() && found.len() <= allowed.len(),
+        HistoryError::new(ErrorCode::UnsupportedSchema, "missing/extra catalog columns")
+    );
     let (kind, without_rowid): (String, i64) =
         conn.query_row("select type,wr from pragma_table_list where schema='main' and name=?1", [table], |r| {
             Ok((r.get(0)?, r.get(1)?))
         })?;
     ensure!(
         kind == "table" && found.iter().filter(|(_, pk, _, _)| *pk > 0).count() == 1,
-        "UnsupportedSchema: catalog requires one original primary key"
+        HistoryError::new(ErrorCode::UnsupportedSchema, "catalog requires one original primary key")
     );
     if table == "releases" || table == "frozen_releases" {
         let indexed_pk: bool =
             conn.query_row("select exists(select 1 from pragma_index_list(?1) where origin='pk')", [table], |r| {
                 r.get(0)
             })?;
-        ensure!(without_rowid == 0 && !indexed_pk, "UnsupportedSchema: release cells require an integer rowid alias");
+        ensure!(
+            without_rowid == 0 && !indexed_pk,
+            HistoryError::new(ErrorCode::UnsupportedSchema, "release cells require an integer rowid alias")
+        );
     }
 
     let mut cols = Vec::new();
     for (name, pk, hidden, declared) in &found {
-        ensure!(*hidden == 0, "UnsupportedSchema: generated catalog column");
-        let col = allowed.iter().find(|c| c.name() == name).context("UnsupportedSchema: unknown catalog column")?;
+        ensure!(*hidden == 0, HistoryError::new(ErrorCode::UnsupportedSchema, "generated catalog column"));
+        let col = allowed
+            .iter()
+            .find(|c| c.name() == name)
+            .context(HistoryError::new(ErrorCode::UnsupportedSchema, "unknown catalog column"))?;
         if matches!(col, Column::Id | Column::Alias) {
             ensure!(
                 *pk == 1 && declared.eq_ignore_ascii_case("INTEGER"),
-                "UnsupportedSchema: catalog key is not the integer primary key"
+                HistoryError::new(ErrorCode::UnsupportedSchema, "catalog key is not the integer primary key")
             );
         }
         cols.push(*col);
     }
     for col in allowed {
-        ensure!(cols.contains(col) || optional.contains(col), "UnsupportedSchema: required catalog column missing");
+        ensure!(
+            cols.contains(col) || optional.contains(col),
+            HistoryError::new(ErrorCode::UnsupportedSchema, "required catalog column missing")
+        );
     }
     Ok(cols)
 }
@@ -296,25 +332,35 @@ impl Source {
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<Self> {
         use std::sync::atomic::Ordering;
-        ensure!(!cancel.load(Ordering::Relaxed), "Cancelled: initial source verification");
+        ensure!(
+            !cancel.load(Ordering::Relaxed),
+            HistoryError::new(ErrorCode::Cancelled, "initial source verification")
+        );
         ensure!(
             admission.max_total_bytes > 0
                 && admission.bytes_per_second > 0
-                && (1..=65536).contains(&admission.read_chunk_bytes),
-            "InsufficientBudget: positive initial verification limits required"
+                && (1..=65536).contains(&admission.read_chunk_bytes)
+                && admission.max_open_files > 0
+                && admission.sqlite_cache_bytes >= 1024
+                && admission.max_schema_bytes > 0,
+            HistoryError::new(ErrorCode::InsufficientBudget, "positive initial verification limits required")
+        );
+        ensure!(
+            manifest.archive_manifest != [0; 32],
+            HistoryError::new(ErrorCode::MissingArchive, "captured archive manifest identity is required")
         );
         let hash_budget = admission.max_total_bytes;
         let verification_started = std::time::Instant::now();
         ensure!(
             manifest.version == 1 && manifest.immutable_checkpoint,
-            "SourceMismatch: an immutable independent checkpoint is required"
+            HistoryError::new(ErrorCode::SourceMismatch, "an immutable independent checkpoint is required")
         );
         ensure!(
             !manifest.checkpoint_id.is_empty()
                 && manifest.checkpoint_id.len() <= 256
                 && !manifest.source_uuid.is_empty()
                 && manifest.source_uuid.len() <= 256,
-            "SourceMismatch: invalid capture identity"
+            HistoryError::new(ErrorCode::SourceMismatch, "invalid capture identity")
         );
         ensure!(
             manifest.shard_count > 0
@@ -322,48 +368,77 @@ impl Source {
                 && manifest.reserved_next_id > 0
                 && !manifest.grouping_facts.is_empty()
                 && manifest.grouping_facts.len() <= 4 * 1024 * 1024,
-            "SourceMismatch: required allocator/grouping facts missing"
+            HistoryError::new(ErrorCode::SourceMismatch, "required allocator/grouping facts missing")
         );
         ensure!(
             manifest.files.len() == 1 + 2 * manifest.shard_count as usize,
-            "SourceMismatch: explicit main/current/frozen pairs required"
+            HistoryError::new(ErrorCode::SourceMismatch, "explicit main/current/frozen pairs required")
         );
+        ensure!(
+            manifest.files.len() <= admission.max_open_files as usize
+                && admission.sqlite_cache_bytes / manifest.files.len() as u64 >= 1024,
+            HistoryError::new(ErrorCode::InsufficientBudget, "source connection/cache admission")
+        );
+        let cache_kib = admission.sqlite_cache_bytes / manifest.files.len() as u64 / 1024;
         let total = manifest
             .files
             .iter()
             .try_fold(0u64, |n, f| n.checked_add(f.byte_length).context("source length overflow"))?;
-        ensure!(hash_budget > 0 && total <= hash_budget, "InsufficientBudget: initial file hashing admission");
+        ensure!(
+            hash_budget > 0 && total <= hash_budget,
+            HistoryError::new(ErrorCode::InsufficientBudget, "initial file hashing admission")
+        );
         let mut files = BTreeMap::new();
+        let mut schema_left = admission.max_schema_bytes;
         let mut verified_bytes = 0u64;
         let mut mains = 0;
         for file in &manifest.files {
             ensure!(
                 file.source_id > 0 && !files.contains_key(&file.source_id),
-                "SourceMismatch: duplicate source identity"
+                HistoryError::new(ErrorCode::SourceMismatch, "duplicate source identity")
             );
             ensure!(
                 file.path.is_absolute() && !std::fs::symlink_metadata(&file.path)?.file_type().is_symlink(),
-                "SourceMismatch: source must be an explicit regular file"
+                HistoryError::new(ErrorCode::SourceMismatch, "source must be an explicit regular file")
             );
             for suffix in ["-wal", "-shm", "-journal"] {
                 ensure!(
                     !PathBuf::from(format!("{}{suffix}", file.path.display())).exists(),
-                    "SourceMismatch: source is not a consolidated independent checkpoint"
+                    HistoryError::new(ErrorCode::SourceMismatch, "source is not a consolidated independent checkpoint")
                 );
             }
             let mut input = std::fs::File::open(&file.path)?;
+            #[cfg(target_os = "macos")]
+            {
+                use std::os::fd::AsRawFd;
+                // SAFETY: the owned file descriptor is live. F_NOCACHE changes
+                // only this verification descriptor's caching policy.
+                ensure!(
+                    unsafe { libc::fcntl(input.as_raw_fd(), libc::F_NOCACHE, 1) } == 0,
+                    HistoryError::new(ErrorCode::InsufficientBudget, "cannot admit uncached initial verification")
+                );
+            }
             let before = input.metadata()?;
-            ensure!(before.is_file() && before.len() == file.byte_length, "SourceMismatch: source file length");
+            ensure!(
+                before.is_file() && before.len() == file.byte_length,
+                HistoryError::new(ErrorCode::SourceMismatch, "source file length")
+            );
             let mut h = Sha256::new();
             let mut buf = vec![0u8; admission.read_chunk_bytes as usize];
             let mut file_read = 0u64;
             let mut header = [0u8; 20];
-            ensure!(file.byte_length >= 100, "UnsupportedSchema: truncated SQLite header");
+            ensure!(
+                file.byte_length >= 100,
+                HistoryError::new(ErrorCode::UnsupportedSchema, "truncated SQLite header")
+            );
             while file_read < file.byte_length {
-                ensure!(!cancel.load(Ordering::Relaxed), "Cancelled: initial source verification");
+                ensure!(
+                    !cancel.load(Ordering::Relaxed),
+                    HistoryError::new(ErrorCode::Cancelled, "initial source verification")
+                );
                 let nread = (file.byte_length - file_read).min(buf.len() as u64) as usize;
                 let n = input.read(&mut buf[..nread])?;
-                ensure!(n > 0, "SourceMismatch: truncated checkpoint file");
+                ensure!(n > 0, HistoryError::new(ErrorCode::SourceMismatch, "truncated checkpoint file"));
                 if file_read < 20 {
                     let take = n.min(20 - file_read as usize);
                     header[file_read as usize..file_read as usize + take].copy_from_slice(&buf[..take]);
@@ -374,26 +449,45 @@ impl Source {
                 let target =
                     std::time::Duration::from_secs_f64(verified_bytes as f64 / admission.bytes_per_second as f64);
                 while verification_started.elapsed() < target {
-                    ensure!(!cancel.load(Ordering::Relaxed), "Cancelled: initial source verification throttle");
+                    ensure!(
+                        !cancel.load(Ordering::Relaxed),
+                        HistoryError::new(ErrorCode::Cancelled, "initial source verification throttle")
+                    );
                     std::thread::sleep(
                         target.saturating_sub(verification_started.elapsed()).min(std::time::Duration::from_millis(20)),
                     );
                 }
             }
-            ensure!(<[u8; 32]>::from(h.finalize()) == file.digest, "SourceMismatch: file content digest");
+            ensure!(
+                <[u8; 32]>::from(h.finalize()) == file.digest,
+                HistoryError::new(ErrorCode::SourceMismatch, "file content digest")
+            );
             ensure!(
                 &header[..16] == b"SQLite format 3\0" && header[18] == 1 && header[19] == 1,
-                "UnsupportedSchema: consolidate the checkpoint in rollback-journal mode before opening"
+                HistoryError::new(
+                    ErrorCode::UnsupportedSchema,
+                    "consolidate the checkpoint in rollback-journal mode before opening"
+                )
             );
             let conn = Connection::open_with_flags(
                 &file.path,
                 OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
             )?;
-            conn.execute_batch("pragma query_only=on; begin")?;
-            ensure!(schema_digest(&conn)? == file.schema_digest, "SourceMismatch: schema fingerprint");
+            // SAFETY: this connection owns the live SQLite handle. Bound SQL
+            // text before schema parsing; retained payload cells keep SQLite's
+            // independent data-length limit and incremental reads.
+            unsafe {
+                rusqlite::ffi::sqlite3_limit(conn.handle(), rusqlite::ffi::SQLITE_LIMIT_SQL_LENGTH, 65536);
+            }
+            conn.execute_batch(&format!(
+                "pragma query_only=on;pragma mmap_size=0;pragma cache_size=-{cache_kib};begin"
+            ))?;
+            let (schema, bytes) = schema_digest_admitted(&conn, schema_left.min(4 * 1024 * 1024))?;
+            schema_left -= bytes;
+            ensure!(schema == file.schema_digest, HistoryError::new(ErrorCode::SourceMismatch, "schema fingerprint"));
             ensure!(
                 file.kind == SourceKind::Main || file.catalog_counts.is_some(),
-                "SourceMismatch: selected catalog counts missing from content manifest"
+                HistoryError::new(ErrorCode::SourceMismatch, "selected catalog counts missing from content manifest")
             );
             let columns = match file.kind {
                 SourceKind::Main => {
@@ -409,16 +503,29 @@ impl Source {
                     check_columns(&conn, "frozen_releases", FROZEN, &[Column::Articles])?
                 }
             };
+            if file.kind != SourceKind::Main {
+                let relation = if file.kind == SourceKind::Current { "releases" } else { "frozen_releases" };
+                let greatest: Option<i64> = conn
+                    .query_row(&format!("select id from {relation} order by id desc limit 1"), [], |r| r.get(0))
+                    .optional()?;
+                ensure!(
+                    greatest.is_none_or(|id| id < manifest.reserved_next_id),
+                    HistoryError::new(
+                        ErrorCode::SourceMismatch,
+                        "allocator reservation does not exceed retained public IDs"
+                    )
+                );
+            }
             for key in fact_names(file.kind) {
                 let v: i64 = conn
                     .query_row("select value from meta where key=?1", [key], |r| r.get(0))
-                    .context("SourceMismatch: required integer source fact missing")?;
+                    .context(HistoryError::new(ErrorCode::SourceMismatch, "required integer source fact missing"))?;
                 if *key == "next_seq" {
                     ensure!(
                         v > 0
                             && v.checked_mul(i64::from(manifest.shard_count))
                                 .is_some_and(|n| n <= manifest.reserved_next_id),
-                        "SourceMismatch: allocator reservation below original next_seq"
+                        HistoryError::new(ErrorCode::SourceMismatch, "allocator reservation below original next_seq")
                     );
                 }
             }
@@ -430,11 +537,11 @@ impl Source {
             };
             ensure!(
                 tables.len() <= 4096 && tables.iter().all(|name| name.len() <= 256),
-                "UnsupportedSchema: table inventory admission"
+                HistoryError::new(ErrorCode::UnsupportedSchema, "table inventory admission")
             );
             files.insert(file.source_id, FileSource { manifest: file.clone(), conn, stamp: before, columns, tables });
         }
-        ensure!(mains == 1, "SourceMismatch: exactly one main allocator source required");
+        ensure!(mains == 1, HistoryError::new(ErrorCode::SourceMismatch, "exactly one main allocator source required"));
         for shard in 0..manifest.shard_count {
             let current: Vec<_> =
                 manifest.files.iter().filter(|f| f.kind == SourceKind::Current && f.shard == Some(shard)).collect();
@@ -445,7 +552,7 @@ impl Source {
                     && frozen.len() == 1
                     && current[0].paired_current.is_none()
                     && frozen[0].paired_current == Some(current[0].source_id),
-                "SourceMismatch: conflicting source lineage"
+                HistoryError::new(ErrorCode::SourceMismatch, "conflicting source lineage")
             );
         }
         let mut identity = manifest.clone();
@@ -454,7 +561,10 @@ impl Source {
         }
         identity.files.sort_by_key(|f| f.source_id);
         let manifest_bytes = serde_json::to_vec(&identity)?;
-        ensure!(manifest_bytes.len() <= 8 * 1024 * 1024, "InsufficientBudget: source manifest admission");
+        ensure!(
+            manifest_bytes.len() <= 8 * 1024 * 1024,
+            HistoryError::new(ErrorCode::InsufficientBudget, "source manifest admission")
+        );
         let fingerprint = Sha256::digest(&manifest_bytes).into();
         let source = Self {
             manifest,
@@ -485,7 +595,7 @@ impl Source {
         let names = q.query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
         ensure!(
             names.len() <= 4096 && names.iter().all(|s| s.len() <= 256),
-            "UnsupportedSchema: table inventory admission"
+            HistoryError::new(ErrorCode::UnsupportedSchema, "table inventory admission")
         );
         Ok(names)
     }
@@ -499,7 +609,7 @@ impl Source {
         Ok(self.file(id)?.manifest.kind)
     }
     fn file(&self, id: i64) -> Result<&FileSource> {
-        self.files.get(&id).context("SourceMismatch: unregistered source")
+        self.files.get(&id).context(HistoryError::new(ErrorCode::SourceMismatch, "unregistered source"))
     }
     pub fn check_unchanged(&self) -> Result<()> {
         #[cfg(unix)]
@@ -508,7 +618,7 @@ impl Source {
             for suffix in ["-wal", "-shm", "-journal"] {
                 ensure!(
                     !PathBuf::from(format!("{}{suffix}", f.manifest.path.display())).exists(),
-                    "SourceMismatch: captured checkpoint acquired a sidecar"
+                    HistoryError::new(ErrorCode::SourceMismatch, "captured checkpoint acquired a sidecar")
                 );
             }
             let now = std::fs::metadata(&f.manifest.path)?;
@@ -521,12 +631,12 @@ impl Source {
                     && now.mtime_nsec() == f.stamp.mtime_nsec()
                     && now.ctime() == f.stamp.ctime()
                     && now.ctime_nsec() == f.stamp.ctime_nsec(),
-                "SourceMismatch: captured source changed"
+                HistoryError::new(ErrorCode::SourceMismatch, "captured source changed")
             );
             #[cfg(not(unix))]
             ensure!(
                 now.len() == f.stamp.len() && now.modified()? == f.stamp.modified()?,
-                "SourceMismatch: captured source changed"
+                HistoryError::new(ErrorCode::SourceMismatch, "captured source changed")
             );
         }
         Ok(())
@@ -539,11 +649,16 @@ impl Source {
     ) -> Result<PageEnd> {
         self.check_unchanged()?;
         ensure!(
-            budget.rows > 0 && budget.bytes >= DESCRIPTOR_ADMISSION && budget.chunk_bytes > 0,
-            "InsufficientBudget: source descriptor admission"
+            budget.rows > 0 && budget.bytes >= DESCRIPTOR_ADMISSION && (1..=MAX_CHUNK).contains(&budget.chunk_bytes),
+            HistoryError::new(ErrorCode::InsufficientBudget, "source descriptor admission")
         );
         let f = self.file(cursor.source_id)?;
         let table = table(f.manifest.kind, cursor.relation)?;
+        ensure!(
+            cursor.relation != Relation::Facts
+                || cursor.after.is_none_or(|n| n >= 0 && n < (fact_names(f.manifest.kind).len() as i64)),
+            HistoryError::new(ErrorCode::SourceMismatch, "invalid source fact bookmark")
+        );
         let cols = match cursor.relation {
             Relation::Releases => f.columns.as_slice(),
             Relation::Collections => ALIASES,
@@ -551,17 +666,21 @@ impl Source {
         };
         let mut end = PageEnd { cursor: cursor.clone(), complete: false, rows: 0, bytes: 0 };
         while end.rows < u64::from(budget.rows) && budget.bytes - end.bytes >= DESCRIPTOR_ADMISSION {
-            let (key, rowid, query) = if cursor.relation == Relation::Facts {
+            let (key, rowid, query, parameter) = if cursor.relation == Relation::Facts {
                 let index = end.cursor.after.map_or(0, |i| i + 1);
                 let Some(name) = fact_names(f.manifest.kind).get(index as usize) else {
                     end.complete = true;
                     break;
                 };
-                let rowid: i64 = f.conn.query_row("select rowid from meta where key=?1", [name], |r| r.get(0))?;
-                (index, rowid, format!("select {} from meta where rowid={rowid}", descriptor_sql(cols)))
+                (
+                    index,
+                    0,
+                    format!("select {} from meta where key=?1", descriptor_sql(cols)),
+                    rusqlite::types::Value::Text((*name).into()),
+                )
             } else {
                 let keycol = if cursor.relation == Relation::Collections { "key" } else { "id" };
-                let mut q = f.conn.prepare(&format!(
+                let mut q = f.conn.prepare_cached(&format!(
                     "select {keycol} from {table} {} order by {keycol} limit 1",
                     if end.cursor.after.is_some() { "where ".to_owned() + keycol + ">?1" } else { String::new() }
                 ))?;
@@ -571,7 +690,12 @@ impl Source {
                     q.query_row([], |r| r.get::<_, i64>(0))
                 };
                 match key {
-                    Ok(k) => (k, k, format!("select {} from {table} where {keycol}={k}", descriptor_sql(cols))),
+                    Ok(k) => (
+                        k,
+                        k,
+                        format!("select {} from {table} where {keycol}=?1", descriptor_sql(cols)),
+                        rusqlite::types::Value::Integer(k),
+                    ),
                     Err(rusqlite::Error::QueryReturnedNoRows) => {
                         end.complete = true;
                         break;
@@ -579,9 +703,9 @@ impl Source {
                     Err(e) => return Err(e.into()),
                 }
             };
-            let mut q = f.conn.prepare(&query)?;
-            let mut rows = q.query([])?;
-            let row = rows.next()?.context("SourceMismatch: row disappeared")?;
+            let mut q = f.conn.prepare_cached(&query)?;
+            let mut rows = q.query([parameter])?;
+            let row = rows.next()?.context(HistoryError::new(ErrorCode::SourceMismatch, "row disappeared"))?;
             let mut desc = Descriptor { key, fields: Vec::with_capacity(cols.len()) };
             let mut bytes = 8u64;
             for (i, col) in cols.iter().enumerate() {
@@ -598,7 +722,10 @@ impl Source {
                         Scalar::RealBits(row.get::<_, f64>(i * 2 + 1)?.to_bits())
                     }
                     "text" | "blob" => {
-                        ensure!(cursor.relation != Relation::Collections, "UnsupportedSchema: noninteger alias");
+                        ensure!(
+                            cursor.relation != Relation::Collections,
+                            HistoryError::new(ErrorCode::UnsupportedSchema, "noninteger alias")
+                        );
                         let blob = f.conn.blob_open("main", table, col.name(), rowid, true)?;
                         bytes += 8;
                         Scalar::Cell(CellRef {
@@ -611,11 +738,14 @@ impl Source {
                             bytes: blob.len() as u64,
                         })
                     }
-                    _ => bail!("UnsupportedSchema: SQLite value type"),
+                    _ => bail!(HistoryError::new(ErrorCode::UnsupportedSchema, "SQLite value type")),
                 };
                 desc.fields.push((*col, scalar));
             }
-            ensure!(bytes <= DESCRIPTOR_ADMISSION, "UnsupportedSchema: descriptor exceeds fixed schema admission");
+            ensure!(
+                bytes <= DESCRIPTOR_ADMISSION,
+                HistoryError::new(ErrorCode::UnsupportedSchema, "descriptor exceeds fixed schema admission")
+            );
             end.rows += 1;
             end.bytes += bytes;
             if !sink(&desc)? {
@@ -634,17 +764,20 @@ impl Source {
     ) -> Result<CellProgress> {
         self.check_unchanged()?;
         ensure!(
-            budget.bytes >= 32 && budget.chunk_bytes > 0 && budget.chunk_bytes <= MAX_CHUNK,
-            "InsufficientBudget: cell chunk admission"
+            budget.rows > 0 && budget.bytes >= 32 && budget.chunk_bytes > 0 && budget.chunk_bytes <= MAX_CHUNK,
+            HistoryError::new(ErrorCode::InsufficientBudget, "cell chunk admission")
         );
         let f = self.file(cell.source_id)?;
         let table = table(f.manifest.kind, cell.relation)?;
         let allowed = if cell.relation == Relation::Facts { FACTS } else { f.columns.as_slice() };
         ensure!(
             allowed.contains(&cell.column) && cell.relation != Relation::Collections,
-            "UnsupportedSchema: unallowlisted cell handle"
+            HistoryError::new(ErrorCode::UnsupportedSchema, "unallowlisted cell handle")
         );
-        ensure!(cell.fingerprint == self.fingerprint, "SourceMismatch: cell belongs to another checkpoint");
+        ensure!(
+            cell.fingerprint == self.fingerprint,
+            HistoryError::new(ErrorCode::SourceMismatch, "cell belongs to another checkpoint")
+        );
         {
             let mut active = self.active_cell.borrow_mut();
             if active.as_ref().is_none_or(|open| open.reference != *cell) {
@@ -669,9 +802,13 @@ impl Source {
                 };
                 ensure!(
                     code == rusqlite::ffi::SQLITE_OK,
-                    "SourceMismatch: incremental cell open failed (SQLite {code})"
+                    HistoryError::new(
+                        ErrorCode::SourceMismatch,
+                        format!("incremental cell open failed (SQLite {code})")
+                    )
                 );
-                let handle = std::ptr::NonNull::new(handle).context("SourceMismatch: null incremental cell handle")?;
+                let handle = std::ptr::NonNull::new(handle)
+                    .context(HistoryError::new(ErrorCode::SourceMismatch, "null incremental cell handle"))?;
                 *active = Some(RetainedCell { handle, reference: cell.clone(), indexed_until: 0 });
                 self.cell_io.borrow_mut().cursor_opens += 1;
             }
@@ -681,18 +818,17 @@ impl Source {
             let length = unsafe { rusqlite::ffi::sqlite3_blob_bytes(handle.as_ptr()) };
             ensure!(
                 length >= 0 && length as u64 == cell.bytes && offset <= cell.bytes,
-                "SourceMismatch: changed cell handle"
+                HistoryError::new(ErrorCode::SourceMismatch, "changed cell handle")
             );
         }
         // Recheck the original type using metadata only; no whole-cell Value.
-        let ty: String = f.conn.query_row(
-            &format!("select typeof({}) from {table} where rowid=?1", cell.column.name()),
-            [cell.rowid],
-            |r| r.get(0),
-        )?;
+        let ty: String = f
+            .conn
+            .prepare_cached(&format!("select typeof({}) from {table} where rowid=?1", cell.column.name()))?
+            .query_row([cell.rowid], |r| r.get(0))?;
         ensure!(
             (ty == "text" && cell.kind == CellType::Text) || (ty == "blob" && cell.kind == CellType::Blob),
-            "SourceMismatch: cell type"
+            HistoryError::new(ErrorCode::SourceMismatch, "cell type")
         );
         let metadata_bytes = 8 + ty.len() as u64;
         let indexed = self.active_cell.borrow().as_ref().expect("active cell").indexed_until;
@@ -717,7 +853,10 @@ impl Source {
                     i32::try_from(read_offset)?,
                 )
             };
-            ensure!(code == rusqlite::ffi::SQLITE_OK, "SourceMismatch: incremental cell read failed (SQLite {code})");
+            ensure!(
+                code == rusqlite::ffi::SQLITE_OK,
+                HistoryError::new(ErrorCode::SourceMismatch, format!("incremental cell read failed (SQLite {code})"))
+            );
         }
         {
             let mut io = self.cell_io.borrow_mut();
@@ -840,6 +979,113 @@ pub(crate) mod tests {
         assert!(Source::open(m, 1 << 20).is_ok());
     }
     #[test]
+    fn admission_errors_have_stable_structured_codes() {
+        let (_dir, m) = fixture();
+        let error = Source::open(m, 0).err().unwrap();
+        assert_eq!(
+            error.downcast_ref::<crate::history_identity::HistoryError>().map(|e| e.code),
+            Some(crate::history_identity::ErrorCode::InsufficientBudget)
+        );
+    }
+    #[test]
+    fn a_missing_archive_identity_is_explicitly_rejected() {
+        let (_dir, mut m) = fixture();
+        m.archive_manifest = [0; 32];
+        let error = Source::open(m, 1 << 20).err();
+        assert!(error.is_some(), "an empty archive identity is not preservation evidence");
+        assert_eq!(
+            error.unwrap().downcast_ref::<crate::history_identity::HistoryError>().map(|e| e.code),
+            Some(crate::history_identity::ErrorCode::MissingArchive)
+        );
+    }
+    #[test]
+    fn schema_verification_has_an_aggregate_byte_admission() {
+        let (_dir, m) = fixture();
+        let mut admission = VerificationAdmission::new(1 << 20);
+        admission.max_schema_bytes = 1;
+        assert!(
+            Source::open_with_admission(m, admission, &std::sync::atomic::AtomicBool::new(false)).is_err(),
+            "schema validation must share a total capture budget"
+        );
+    }
+    #[test]
+    fn allocator_admission_rejects_a_release_at_the_reserved_floor() {
+        let (_dir, mut m) = fixture();
+        let current = m.files.iter().find(|f| f.kind == SourceKind::Current).unwrap();
+        let c = Connection::open(&current.path).unwrap();
+        c.execute("insert into releases(id) values(900)", []).unwrap();
+        drop(c);
+        refresh(&mut m);
+        assert!(Source::open(m, 1 << 20).is_err(), "native reservation must exceed every retained public ID");
+    }
+    #[test]
+    fn integer_source_facts_do_not_require_a_meta_rowid() {
+        let (_dir, mut manifest) = fixture();
+        for file in &manifest.files {
+            if file.kind == SourceKind::Frozen {
+                continue;
+            }
+            let c = Connection::open(&file.path).unwrap();
+            c.execute_batch("alter table meta rename to old_meta;create table meta(key text primary key,value integer) without rowid;insert into meta select * from old_meta;drop table old_meta").unwrap();
+        }
+        refresh(&mut manifest);
+        let source = Source::open(manifest, 1 << 20).unwrap();
+        let mut values = Vec::new();
+        let end = source
+            .scan(
+                &RowCursor { source_id: 1, relation: Relation::Facts, after: None },
+                ReadBudget { rows: 8, bytes: 4096, chunk_bytes: 64 },
+                |row| {
+                    values.push(row.key);
+                    Ok(true)
+                },
+            )
+            .unwrap();
+        assert!(end.complete);
+        assert_eq!(values.len(), fact_names(SourceKind::Current).len());
+    }
+    #[test]
+    fn request_admission_rejects_zero_rows_for_cells() {
+        let (_dir, mut manifest) = fixture();
+        seed_current(&mut manifest, 1);
+        let source = Source::open(manifest, 1 << 20).unwrap();
+        let mut cell = None;
+        source
+            .scan(
+                &RowCursor { source_id: 1, relation: Relation::Releases, after: None },
+                ReadBudget { rows: 1, bytes: 512, chunk_bytes: 64 },
+                |row| {
+                    if let Scalar::Cell(value) = row.fields.iter().find(|(c, _)| *c == Column::Name).unwrap().1.clone()
+                    {
+                        cell = Some(value);
+                    }
+                    Ok(true)
+                },
+            )
+            .unwrap();
+        assert!(
+            source.read_cell(&cell.unwrap(), 0, ReadBudget { rows: 0, bytes: 64, chunk_bytes: 1 }, |_| Ok(())).is_err(),
+            "cell reads require positive explicit row admission"
+        );
+    }
+    #[test]
+    fn request_admission_rejects_invalid_fact_bookmarks() {
+        let (_dir, manifest) = fixture();
+        let source = Source::open(manifest, 1 << 20).unwrap();
+        for after in [-1, i64::MAX] {
+            assert!(
+                source
+                    .scan(
+                        &RowCursor { source_id: 1, relation: Relation::Facts, after: Some(after) },
+                        ReadBudget { rows: 1, bytes: 512, chunk_bytes: 64 },
+                        |_| Ok(true)
+                    )
+                    .is_err(),
+                "invalid fact bookmark must fail without skipping or overflowing"
+            );
+        }
+    }
+    #[test]
     fn cancelled_initial_verification_reads_nothing() {
         let (_dir, m) = fixture();
         let cancel = std::sync::atomic::AtomicBool::new(true);
@@ -865,9 +1111,18 @@ pub(crate) mod tests {
                 });
             }
             drop(c);
-            let bytes = std::fs::read(&file.path).unwrap();
-            file.byte_length = bytes.len() as u64;
-            file.digest = Sha256::digest(&bytes).into();
+            let mut input = std::fs::File::open(&file.path).unwrap();
+            file.byte_length = input.metadata().unwrap().len();
+            let mut hash = Sha256::new();
+            let mut bytes = [0u8; 65536];
+            loop {
+                let n = input.read(&mut bytes).unwrap();
+                if n == 0 {
+                    break;
+                }
+                hash.update(&bytes[..n]);
+            }
+            file.digest = hash.finalize().into();
         }
     }
     pub(crate) fn seed_current(manifest: &mut Manifest, rows: usize) {
@@ -942,11 +1197,19 @@ pub(crate) mod tests {
         assert_eq!(before, m.files.iter().map(|f| f.digest).collect::<Vec<_>>());
     }
     pub(crate) fn seed_frozen(manifest: &mut Manifest, corrupt: bool) {
+        seed_frozen_count(manifest, corrupt, 2, 0)
+    }
+    pub(crate) fn seed_frozen_count(manifest: &mut Manifest, corrupt: bool, count: usize, name_bytes: usize) {
         use crate::frozen::payload::{Payload, Table};
         use rusqlite::types::Value;
         let path = manifest.files.iter().find(|f| f.kind == SourceKind::Frozen).unwrap().path.clone();
         let c = Connection::open(path).unwrap();
-        for id in [3, 41] {
+        for index in 0..count {
+            let id = match index {
+                0 => 3,
+                1 => 41,
+                _ => 100 + index as i64,
+            };
             let payload = Payload {
                 domains: vec![(1, "example.test".into())],
                 tables: vec![
@@ -963,7 +1226,7 @@ pub(crate) mod tests {
                         ],
                         rows: vec![vec![
                             Value::Integer(id),
-                            Value::Text(format!("embedded-{id}")),
+                            Value::Text(format!("embedded-{id}{}", "x".repeat(name_bytes))),
                             Value::Text("test.group".into()),
                             Value::Text(String::new()),
                             Value::Integer(40),

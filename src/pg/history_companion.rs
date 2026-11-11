@@ -1,5 +1,6 @@
 //! Receipts issued by the existing main/ext conversion owners, never a second
 //! importer. They pair a captured main file and already verified owner results.
+use crate::history_identity::{ErrorCode, HistoryError};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -54,7 +55,7 @@ impl Witness {
         let mut buffer = [0u8; 65536];
         while bytes < stamp.len() {
             let n = file.read(&mut buffer[..((stamp.len() - bytes).min(65536) as usize)])?;
-            ensure!(n > 0, "SourceMismatch: truncated companion source");
+            ensure!(n > 0, HistoryError::new(ErrorCode::SourceMismatch, "truncated companion source"));
             hash.update(&buffer[..n]);
             bytes += n as u64;
             let target = std::time::Duration::from_secs_f64(bytes as f64 / (32 * 1024 * 1024) as f64);
@@ -79,14 +80,14 @@ impl Witness {
                     && now.mtime_nsec() == self.stamp.mtime_nsec()
                     && now.ctime() == self.stamp.ctime()
                     && now.ctime_nsec() == self.stamp.ctime_nsec(),
-                "SourceMismatch: companion snapshot changed"
+                HistoryError::new(ErrorCode::SourceMismatch, "companion snapshot changed")
             );
         }
         #[cfg(not(unix))]
         {
             ensure!(
                 now.len() == self.stamp.len() && now.modified()? == self.stamp.modified()?,
-                "SourceMismatch: companion snapshot changed"
+                HistoryError::new(ErrorCode::SourceMismatch, "companion snapshot changed")
             );
         }
         Ok(())
@@ -100,9 +101,12 @@ pub(crate) fn relation(table: &str, rows: u64, digest: u128) -> RelationReceipt 
     RelationReceipt { table: table.into(), rows, digest: h.finalize().into() }
 }
 pub(crate) fn store(tx: &mut postgres::Transaction<'_>, receipt: Receipt) -> Result<()> {
-    ensure!(receipt.relations.len() <= 64, "InsufficientBudget: companion receipt relation admission");
+    ensure!(
+        receipt.relations.len() <= 64,
+        HistoryError::new(ErrorCode::InsufficientBudget, "companion receipt relation admission")
+    );
     let manifest = serde_json::to_vec(&receipt)?;
-    ensure!(manifest.len() <= 65536, "InsufficientBudget: companion receipt bytes");
+    ensure!(manifest.len() <= 65536, HistoryError::new(ErrorCode::InsufficientBudget, "companion receipt bytes"));
     let digest = Sha256::digest(&manifest).to_vec();
     tx.execute("insert into history_companion_receipts(owner_code,source_digest,receipt_digest,manifest,dirty) values($1,$2,$3,$4,false) on conflict(owner_code) do update set receipt_digest=excluded.receipt_digest,manifest=excluded.manifest,dirty=false where history_companion_receipts.source_digest=excluded.source_digest",&[&receipt.owner,&&receipt.main_source_digest[..],&digest,&manifest])?;
     let row = tx.query_one(
@@ -114,12 +118,12 @@ pub(crate) fn store(tx: &mut postgres::Transaction<'_>, receipt: Receipt) -> Res
             && row.get::<_, Vec<u8>>(1) == digest
             && row.get::<_, Vec<u8>>(2) == manifest
             && !row.get::<_, bool>(3),
-        "SourceMismatch: companion receipt conflict"
+        HistoryError::new(ErrorCode::SourceMismatch, "companion receipt conflict")
     );
     Ok(())
 }
 pub(crate) fn digest(client: &mut postgres::Client, schema: &str, owner: &str) -> Result<Option<[u8; 32]>> {
-    ensure!(super::valid_schema(schema), "DestinationMismatch: receipt schema");
+    ensure!(super::valid_schema(schema), HistoryError::new(ErrorCode::DestinationMismatch, "receipt schema"));
     let row = client.query_opt(
         &format!(
             "select receipt_digest from \"{schema}\".history_companion_receipts where owner_code=$1 and not dirty"
@@ -127,7 +131,9 @@ pub(crate) fn digest(client: &mut postgres::Client, schema: &str, owner: &str) -
         &[&owner],
     )?;
     row.map(|r| {
-        r.get::<_, Vec<u8>>(0).try_into().map_err(|_| anyhow::anyhow!("CorruptObject: companion digest length"))
+        r.get::<_, Vec<u8>>(0)
+            .try_into()
+            .map_err(|_| anyhow::anyhow!(HistoryError::new(ErrorCode::CorruptObject, "companion digest length")))
     })
     .transpose()
 }
@@ -145,21 +151,22 @@ pub(crate) fn paired(
         return Ok(None);
     };
     let bytes: Vec<u8> = row.get(2);
-    ensure!(bytes.len() <= 65536, "CorruptObject: companion receipt size");
+    ensure!(bytes.len() <= 65536, HistoryError::new(ErrorCode::CorruptObject, "companion receipt size"));
     ensure!(
         !row.get::<_, bool>(3)
             && row.get::<_, Vec<u8>>(0) == main
             && row.get::<_, Vec<u8>>(1) == expected
             && Sha256::digest(&bytes).as_slice() == expected,
-        "SourceMismatch: companion receipt no longer pairs with captured source"
+        HistoryError::new(ErrorCode::SourceMismatch, "companion receipt no longer pairs with captured source")
     );
-    let receipt: Receipt = serde_json::from_slice(&bytes).context("CorruptObject: companion receipt encoding")?;
+    let receipt: Receipt = serde_json::from_slice(&bytes)
+        .context(HistoryError::new(ErrorCode::CorruptObject, "companion receipt encoding"))?;
     ensure!(
         receipt.version == 1
             && receipt.owner == owner
             && receipt.main_source_digest == main
             && receipt.relations.len() <= 64,
-        "SourceMismatch: companion receipt identity"
+        HistoryError::new(ErrorCode::SourceMismatch, "companion receipt identity")
     );
     Ok(Some(receipt))
 }

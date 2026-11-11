@@ -6,8 +6,10 @@ use super::{
     history_stage::{self, Row},
 };
 use crate::history_identity::{Column, Metadata, Value};
+use crate::history_identity::{ErrorCode, HistoryError};
 use crate::history_source::{CellRef, Descriptor, ReadBudget, Relation, RowCursor, Scalar, Source, SourceKind};
 use anyhow::{Context, Result, bail, ensure};
+use postgres::types::Type;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
@@ -16,13 +18,32 @@ pub use crate::history_identity::ImportId;
 const FIXED_COPY: u64 = 131072;
 const INLINE: u64 = 512;
 const MAX_METADATA: usize = 49152;
-#[derive(Clone)]
+const MAX_RECORD: usize = 2 * MAX_METADATA + 4096;
+// SQL CASE bounds payloads before PostgreSQL sends bytea to the client. Keep
+// these literal ceilings in sync with MAX_METADATA and MAX_RECORD.
+const CHECKPOINT_SQL: &str = "case when octet_length(checkpoint)<=49152 then checkpoint end";
+const RECORD_SQL: &str = "case when octet_length(bookmark)<=102400 then bookmark end";
+fn checkpoint_payload(row: &postgres::Row, column: usize) -> Result<Vec<u8>> {
+    row.get::<_, Option<Vec<u8>>>(column)
+        .context(HistoryError::new(ErrorCode::CorruptObject, "checkpoint payload admission"))
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExpectedTransport {
+    PlaintextTcp,
+    UnixSocket,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExpectedDestination {
     pub database: String,
     pub schema: String,
     pub role: String,
     pub owner: String,
     pub server_version: i32,
+    pub server_address: Option<String>,
+    pub server_port: Option<i32>,
+    pub transport: ExpectedTransport,
     pub staging_prefix: String,
 }
 #[derive(Clone, Copy)]
@@ -45,19 +66,22 @@ impl Default for ImportBudget {
     }
 }
 impl ImportBudget {
-    fn check(self) -> Result<()> {
+    pub(crate) fn check(self) -> Result<()> {
         ensure!(
             self.source_rows > 0
                 && self.source_bytes >= 512
                 && self.mutations >= 16
                 && self.copy_bytes >= FIXED_COPY + MAX_METADATA as u64 + 8192
                 && (1..=65536).contains(&self.chunk_bytes),
-            "InsufficientBudget: positive page limits and fixed protocol admission required"
+            HistoryError::new(
+                ErrorCode::InsufficientBudget,
+                "positive page limits and fixed protocol admission required"
+            )
         );
         Ok(())
     }
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StepReceipt {
     pub sequence: i64,
     pub source_rows: u64,
@@ -95,6 +119,8 @@ struct State {
     validate_chunk_offset: u64,
     validate_digest: DigestState,
     cleanup: Option<(i64, i64)>,
+    #[serde(default)]
+    cleanups: Vec<(i64, i64)>,
     catalog_after: Option<i64>,
     identity_digest: DigestState,
     validate_part: u8,
@@ -106,6 +132,12 @@ struct State {
     receipt_after: Option<(i64, i32)>,
     canonical_rows: u64,
     variant_rows: u64,
+    #[serde(default)]
+    validated_objects: u64,
+    #[serde(default)]
+    validated_variant_rows: u64,
+    #[serde(default)]
+    variant_after: Option<(i64, i64)>,
     dangling_aliases: u64,
     facts_ending: Option<Artifact>,
 }
@@ -129,12 +161,22 @@ struct Frozen {
     rows: u64,
     values: u64,
 }
+struct CompletedFrame {
+    source: i64,
+    key: i64,
+    fingerprint: [u8; 32],
+    bytes: u64,
+}
 struct Runtime {
+    _root_lock: std::fs::File,
     root: PathBuf,
     quota: u64,
+    decoder: crate::history_stream::Config,
     spool: Option<super::history_spool::Spool>,
     validator: Option<super::history_validator::Validator>,
-    completed: bool,
+    completed: Vec<CompletedFrame>,
+    scanned: bool,
+    abandoned: Vec<(i64, i64)>,
 }
 impl Runtime {
     fn ensure_spool(&mut self, source: &Source, cell: &Cell, key: i64, validated: bool) -> Result<()> {
@@ -144,7 +186,7 @@ impl Runtime {
                 source.fingerprint(),
                 cell.reference.source_id,
                 key,
-                self.quota,
+                self.quota - self.completed.iter().map(|f| f.bytes).sum::<u64>(),
                 cell.offset,
                 cell.reference.bytes,
                 validated,
@@ -174,7 +216,7 @@ impl Runtime {
         }
         ensure!(
             spool.prefix_digest.finish()? == cell.digest.finish()?,
-            "CorruptObject: recovered source prefix differs"
+            HistoryError::new(ErrorCode::CorruptObject, "recovered source prefix differs")
         );
         if cell.offset == cell.reference.bytes {
             spool.finish_input(cell.offset, cell.digest.finish()?)?;
@@ -187,14 +229,39 @@ impl Runtime {
         }
         Ok(())
     }
-    fn committed(&mut self) {
-        if self.completed {
-            if let Some(mut spool) = self.spool.take() {
-                spool.keep = false;
-                spool.remove();
-            }
-            self.completed = false;
+    fn scan_recovery(&mut self, source: &Source, state: &State) -> Result<()> {
+        if self.scanned {
+            return Ok(());
         }
+        let active = state.pending.as_ref().and_then(|p| {
+            p.cells.iter().find(|c| c.reference.column == Column::Payload).map(|c| (c.reference.source_id, p.row.key))
+        });
+        let entries = super::history_spool::inventory(&self.root, source.fingerprint(), self.quota)?;
+        for entry in entries {
+            ensure!(
+                entry.charged_bytes <= self.quota,
+                HistoryError::new(ErrorCode::InsufficientBudget, "recovery frame quota")
+            );
+            if Some((entry.source, entry.key)) != active
+                && !state.cleanups.contains(&(entry.source, entry.key))
+                && state.cleanup != Some((entry.source, entry.key))
+            {
+                self.abandoned.push((entry.source, entry.key));
+            }
+        }
+        self.scanned = true;
+        Ok(())
+    }
+    fn complete(&mut self, source: &Source, key: i64, source_id: i64) -> Result<()> {
+        let bytes = self.spool.take().context("missing completed frame spool")?.retire()?;
+        self.completed.push(CompletedFrame { source: source_id, key, fingerprint: source.fingerprint(), bytes });
+        Ok(())
+    }
+    fn committed(&mut self) -> Result<()> {
+        for frame in self.completed.drain(..) {
+            super::history_spool::Spool::cleanup(&self.root, frame.fingerprint, frame.source, frame.key)?;
+        }
+        Ok(())
     }
 }
 impl Drop for Runtime {
@@ -247,7 +314,10 @@ impl Batch {
         self.mutations + mutations <= self.budget.mutations && self.copy_bytes + bytes <= self.budget.copy_bytes
     }
     fn push(&mut self, row: Row) -> Result<()> {
-        ensure!(self.room(row.mutations(), row.bytes()), "InsufficientBudget: mutation/COPY admission");
+        ensure!(
+            self.room(row.mutations(), row.bytes()),
+            HistoryError::new(ErrorCode::InsufficientBudget, "mutation/COPY admission")
+        );
         self.mutations += row.mutations();
         self.copy_bytes += row.bytes();
         self.rows.push(row);
@@ -267,16 +337,20 @@ pub struct ImportOwner {
 impl ImportOwner {
     pub fn connect(storage: StorageConfig, expected: ExpectedDestination, spool: PathBuf, quota: u64) -> Result<Self> {
         storage.check()?;
-        ensure!(storage.is_postgres() && storage.schema == expected.schema, "DestinationMismatch: PostgreSQL schema");
+        ensure!(
+            storage.is_postgres() && storage.schema == expected.schema,
+            HistoryError::new(ErrorCode::DestinationMismatch, "PostgreSQL schema")
+        );
         ensure!(
             super::valid_schema(&expected.schema)
                 && !expected.staging_prefix.is_empty()
-                && expected.schema.starts_with(&expected.staging_prefix),
-            "DestinationMismatch: explicit staging prefix"
+                && expected.schema.starts_with(&expected.staging_prefix)
+                && expected.schema.len() > expected.staging_prefix.len(),
+            HistoryError::new(ErrorCode::DestinationMismatch, "explicit staging prefix")
         );
         ensure!(
             quota > 0 && spool.is_absolute() && spool.is_dir(),
-            "InsufficientBudget: explicit private spool directory and quota"
+            HistoryError::new(ErrorCode::InsufficientBudget, "explicit private spool directory and quota")
         );
         #[cfg(unix)]
         {
@@ -284,27 +358,87 @@ impl ImportOwner {
             ensure!(
                 std::fs::symlink_metadata(&spool)?.is_dir()
                     && std::fs::metadata(&spool)?.permissions().mode() & 0o077 == 0,
-                "DestinationMismatch: spool directory must be private"
+                HistoryError::new(ErrorCode::DestinationMismatch, "spool directory must be private")
             );
         }
         let config = super::Pool::new(&storage)?.config.clone();
-        ensure!(config.get_dbname() == Some(expected.database.as_str()), "DestinationMismatch: explicit database name");
+        ensure!(
+            config.get_dbname() == Some(expected.database.as_str()),
+            HistoryError::new(ErrorCode::DestinationMismatch, "explicit database name")
+        );
         let mut client = config.connect(postgres::NoTls)?;
         verify_destination(&mut client, &expected)?;
         // The same session remains the only importer connection until dropped.
-        client.query_one("select pg_advisory_lock(hashtext('atlas.indexer'),hashtext($1))", &[&expected.schema])?;
+        ensure!(
+            client
+                .query_one("select pg_try_advisory_lock(hashtext('atlas.indexer'),hashtext($1))", &[&expected.schema])?
+                .get::<_, bool>(0),
+            HistoryError::new(ErrorCode::LostOwner, "another owner holds the destination")
+        );
         client.batch_execute(&format!("set search_path to \"{}\"", expected.schema))?;
         verify_destination(&mut client, &expected)?;
+        ensure!(
+            quota >= super::history_spool::FRAME_OVERHEAD,
+            HistoryError::new(ErrorCode::InsufficientBudget, "fixed spool metadata admission")
+        );
+        let scope = Sha256::digest(serde_json::to_vec(&(
+            &expected.database,
+            &expected.schema,
+            &expected.role,
+            &expected.owner,
+            &expected.server_address,
+            &expected.server_port,
+            &expected.transport,
+        ))?)
+        .into();
+        let root_lock = super::history_spool::claim_root(&spool, scope)?;
         Ok(Self {
             client,
             expected,
             terminal: false,
-            runtime: Runtime { root: spool, quota, spool: None, validator: None, completed: false },
+            runtime: Runtime {
+                _root_lock: root_lock,
+                root: spool,
+                quota,
+                decoder: Default::default(),
+                spool: None,
+                validator: None,
+                completed: Vec::new(),
+                scanned: false,
+                abandoned: Vec::new(),
+            },
             stage_cache: Default::default(),
         })
     }
+    /// Admit the decoder window independently of per-page byte grants. Caller
+    /// process admission must additionally cover source caches and COPY buffers.
+    pub fn configure_decoder(&mut self, config: crate::history_stream::Config, max_window_bytes: u64) -> Result<()> {
+        self.live()?;
+        ensure!(
+            self.runtime.validator.is_none()
+                && (10..=31).contains(&config.window_log_max)
+                && (1..=1048576).contains(&config.read_buffer_bytes)
+                && (1..=1048576).contains(&config.chunk_bytes)
+                && config.max_expanded_bytes > 0
+                && max_window_bytes > 0
+                && (1u64 << config.window_log_max) <= max_window_bytes,
+            HistoryError::new(ErrorCode::InsufficientBudget, "explicit decoder window and buffers admission")
+        );
+        self.runtime.decoder = config;
+        Ok(())
+    }
+    pub fn status(&mut self, id: ImportId) -> Result<(String, i64)> {
+        self.live()?;
+        let row = self
+            .client
+            .query_one("select state,checkpoint_sequence from history_imports where import_id=$1", &[&&id[..]])?;
+        Ok((row.get(0), row.get(1)))
+    }
     fn live(&self) -> Result<()> {
-        ensure!(!self.terminal && !self.client.is_closed(), "LostOwner: historical import ownership session ended");
+        ensure!(
+            !self.terminal && !self.client.is_closed(),
+            HistoryError::new(ErrorCode::LostOwner, "historical import ownership session ended")
+        );
         Ok(())
     }
     pub fn begin(&mut self, source: &Source) -> Result<ImportId> {
@@ -315,12 +449,10 @@ impl ImportOwner {
         let mut tx = self.client.transaction()?;
         tx.batch_execute("set local synchronous_commit=on")?;
         let has_history: bool = tx.query_one("select to_regclass('history_imports') is not null", &[])?.get(0);
-        if has_history {
-            if let Some(row)=tx.query_opt("select import_id,source_fingerprint,expected_database,expected_schema,expected_role,expected_owner,reserved_next_seq from history_imports for update",&[])? {
-                ensure!(row.get::<_,Vec<u8>>(0)==id&&row.get::<_,Vec<u8>>(1)==id&&row.get::<_,String>(2)==self.expected.database&&row.get::<_,String>(3)==self.expected.schema&&row.get::<_,String>(4)==self.expected.role&&row.get::<_,String>(5)==self.expected.owner&&row.get::<_,i64>(6)==source.manifest().reserved_next_id,"SourceMismatch: destination belongs to a different import");
+        if has_history && let Some(row)=tx.query_opt("select import_id,source_fingerprint,expected_database,expected_schema,expected_role,expected_owner,reserved_next_seq from history_imports for update",&[])? {
+                ensure!(row.get::<_,Vec<u8>>(0)==id&&row.get::<_,Vec<u8>>(1)==id&&row.get::<_,String>(2)==self.expected.database&&row.get::<_,String>(3)==self.expected.schema&&row.get::<_,String>(4)==self.expected.role&&row.get::<_,String>(5)==self.expected.owner&&row.get::<_,i64>(6)==source.manifest().reserved_next_id,HistoryError::new(ErrorCode::SourceMismatch, "destination belongs to a different import"));
                 reserve(&mut tx,&self.expected.schema,source.manifest().reserved_next_id,false)?;
                 tx.commit()?;return Ok(id);
-            }
         }
         // Existing owner receipts are issued in the original main/ext copy
         // transaction. Statement guards invalidate them on later native DML;
@@ -330,7 +462,7 @@ impl ImportOwner {
             .files
             .iter()
             .find(|f| f.kind == SourceKind::Main)
-            .context("SourceMismatch: main source")?;
+            .context(HistoryError::new(ErrorCode::SourceMismatch, "main source"))?;
         let main_receipt = if has_history {
             super::history_companion::paired(&mut tx, "main_import", source.manifest().main_receipt, main.digest)?
         } else {
@@ -354,7 +486,7 @@ impl ImportOwner {
                             .enumerate()
                             .all(|(i, r)| owns(&r.table)
                                 && !receipt.relations[..i].iter().any(|old| old.table == r.table)),
-                    "SourceMismatch: companion receipt relation inventory"
+                    HistoryError::new(ErrorCode::SourceMismatch, "companion receipt relation inventory")
                 );
             }
         }
@@ -362,7 +494,7 @@ impl ImportOwner {
             "select tablename::text from pg_tables where schemaname=$1 order by tablename",
             &[&self.expected.schema],
         )?;
-        ensure!(tables.len() <= 256, "DestinationMismatch: unexpected staging schema");
+        ensure!(tables.len() <= 256, HistoryError::new(ErrorCode::DestinationMismatch, "unexpected staging schema"));
         for row in &tables {
             let table: String = row.get(0);
             if table == "schema_migrations" || table == "history_companion_receipts" {
@@ -375,11 +507,20 @@ impl ImportOwner {
             {
                 continue;
             }
-            ensure!(super::valid_schema(&table), "DestinationMismatch: unexpected relation name");
+            ensure!(
+                super::valid_schema(&table),
+                HistoryError::new(ErrorCode::DestinationMismatch, "unexpected relation name")
+            );
             let predicate = if table == "meta" { " where key<>'next_seq' or value<>1" } else { "" };
             let nonempty: bool =
                 tx.query_one(&format!("select exists(select 1 from \"{table}\"{predicate})"), &[])?.get(0);
-            ensure!(!nonempty, "DestinationMismatch: populated target requires an exact paired import receipt");
+            ensure!(
+                !nonempty,
+                HistoryError::new(
+                    ErrorCode::DestinationMismatch,
+                    "populated target requires an exact paired import receipt"
+                )
+            );
         }
         let versions =
             tx.query("select to_regclass('schema_migrations') is not null", &[])?.remove(0).get::<_, bool>(0);
@@ -390,7 +531,10 @@ impl ImportOwner {
                 .map(|r| (r.get(0), r.get(1)))
                 .collect();
             let expected: Vec<_> = super::migrate::MIGRATIONS.iter().map(|(v, n, _)| (*v, n.to_string())).collect();
-            ensure!(done == expected, "DestinationMismatch: exact migration history required");
+            ensure!(
+                done == expected,
+                HistoryError::new(ErrorCode::DestinationMismatch, "exact migration history required")
+            );
         } else {
             super::migrate::run_in_transaction(&mut tx, &self.expected.schema)?;
         }
@@ -403,7 +547,7 @@ impl ImportOwner {
             // Only this deliberate allocator derivation may clear the dirty
             // flag set by the meta trigger. The receipt was clean and paired
             // above while the exclusive owner fence excluded native writers.
-            ensure!(tx.execute("update history_companion_receipts set dirty=false,derived_allocator=$1 where owner_code='main_import' and receipt_digest=$2", &[&source.manifest().reserved_next_id, &&source.manifest().main_receipt[..]])? == 1, "SourceMismatch: companion allocator derivation");
+            ensure!(tx.execute("update history_companion_receipts set dirty=false,derived_allocator=$1 where owner_code='main_import' and receipt_digest=$2", &[&source.manifest().reserved_next_id, &&source.manifest().main_receipt[..]])? == 1, HistoryError::new(ErrorCode::SourceMismatch, "companion allocator derivation"));
         }
         let mut state = State {
             next_object: 2,
@@ -457,47 +601,77 @@ impl ImportOwner {
         self.live()?;
         budget.check()?;
         source.check_unchanged()?;
-        ensure!(source.fingerprint() == id, "SourceMismatch: import fingerprint");
+        ensure!(source.fingerprint() == id, HistoryError::new(ErrorCode::SourceMismatch, "import fingerprint"));
         let mut tx = self.client.transaction()?;
         tx.batch_execute("set local synchronous_commit=on")?;
-        let row=tx.query_one("select source_fingerprint,state,checkpoint_sequence,checkpoint from history_imports where import_id=$1 for update",&[&&id[..]])?;
+        let row=tx.query_typed_one(&format!("select source_fingerprint,state,checkpoint_sequence,{CHECKPOINT_SQL} from history_imports where import_id=$1 for update"),&[(&&id[..],Type::BYTEA)])?;
         ensure!(
             row.get::<_, Vec<u8>>(0) == id && row.get::<_, String>(1) == "loading",
-            "IncompleteImport: import is not loading"
+            HistoryError::new(ErrorCode::IncompleteImport, "import is not loading")
         );
         let sequence: i64 = row.get(2);
-        let checkpoint: Vec<u8> = row.get(3);
+        let checkpoint = checkpoint_payload(&row, 3)?;
         if sequence == previous_sequence + 1 {
-            let old = tx.query_one(
-                "select bookmark from history_checkpoints where import_id=$1 and sequence=$2",
-                &[&&id[..], &sequence],
+            let old = tx.query_typed_one(
+                &format!("select {RECORD_SQL},digest from history_checkpoints where import_id=$1 and sequence=$2"),
+                &[(&&id[..], Type::BYTEA), (&sequence, Type::INT8)],
             )?;
-            let record: Checkpoint = serde_json::from_slice(&old.get::<_, Vec<u8>>(0))?;
-            ensure!(record.state.as_bytes() == checkpoint, "SourceMismatch: ambiguous checkpoint content");
+            let bytes = checkpoint_payload(&old, 0)?;
+            let digest: Vec<u8> = old.get(1);
+            ensure!(
+                Sha256::digest(&bytes).as_slice() == digest,
+                HistoryError::new(ErrorCode::CorruptObject, "ambiguous checkpoint digest")
+            );
+            let record: Checkpoint = serde_json::from_slice(&bytes)?;
+            ensure!(
+                record.receipt.sequence == sequence && record.state.as_bytes() == checkpoint,
+                HistoryError::new(ErrorCode::SourceMismatch, "ambiguous checkpoint content")
+            );
             tx.commit()?;
             return Ok(record.receipt);
         }
-        ensure!(sequence == previous_sequence, "SourceMismatch: checkpoint sequence conflict");
+        ensure!(
+            sequence == previous_sequence,
+            HistoryError::new(ErrorCode::SourceMismatch, "checkpoint sequence conflict")
+        );
         if sequence > 0 {
-            let old = tx.query_one(
-                "select bookmark,digest from history_checkpoints where import_id=$1 and sequence=$2",
-                &[&&id[..], &sequence],
+            let old = tx.query_typed_one(
+                &format!("select {RECORD_SQL},digest from history_checkpoints where import_id=$1 and sequence=$2"),
+                &[(&&id[..], Type::BYTEA), (&sequence, Type::INT8)],
             )?;
-            let bytes: Vec<u8> = old.get(0);
+            let bytes = checkpoint_payload(&old, 0)?;
             let digest: Vec<u8> = old.get(1);
-            ensure!(Sha256::digest(&bytes).as_slice() == digest, "CorruptObject: durable checkpoint digest");
+            ensure!(
+                Sha256::digest(&bytes).as_slice() == digest,
+                HistoryError::new(ErrorCode::CorruptObject, "durable checkpoint digest")
+            );
             let old: Checkpoint = serde_json::from_slice(&bytes)?;
-            ensure!(old.state.as_bytes() == checkpoint, "CorruptObject: durable bookmark mismatch");
+            ensure!(
+                old.state.as_bytes() == checkpoint,
+                HistoryError::new(ErrorCode::CorruptObject, "durable bookmark mismatch")
+            );
         }
         let mut state: State = serde_json::from_slice(&checkpoint)?;
         let mut batch = Batch::new(budget);
+        self.runtime.scan_recovery(source, &state)?;
         consume(source, &mut state, &mut batch, &mut self.runtime)?;
-        let validation_trips = if state.phase == 3 { validate_page(&mut tx, &id, &mut state, &mut batch)? } else { 0 };
+        // Validate only previously committed capture pages. Starting against
+        // this transaction's not-yet-COPYed final capture batch would skip its
+        // chunks when the validator reaches the current database EOF.
+        let validation_trips =
+            if state.phase == 3 && batch.rows.is_empty() && batch.source_rows == 0 && batch.source_bytes == 0 {
+                validate_page(&mut tx, &id, &mut state, &mut batch)?
+            } else {
+                0
+            };
         self.runtime.sync_page()?;
         let applied = history_stage::apply(&mut tx, &id, &batch.rows, &mut self.stage_cache)?;
         let next = sequence.checked_add(1).context("checkpoint sequence overflow")?;
         let checkpoint = serde_json::to_vec(&state)?;
-        ensure!(checkpoint.len() <= MAX_METADATA, "InsufficientBudget: fixed checkpoint admission");
+        ensure!(
+            checkpoint.len() <= MAX_METADATA,
+            HistoryError::new(ErrorCode::InsufficientBudget, "fixed checkpoint admission")
+        );
         let mut receipt = StepReceipt {
             sequence: next,
             source_rows: batch.source_rows,
@@ -512,7 +686,7 @@ impl ImportOwner {
         };
         ensure!(
             receipt.mutations <= u64::from(batch.mutations),
-            "CorruptObject: mutation accounting exceeded reservation"
+            HistoryError::new(ErrorCode::CorruptObject, "mutation accounting exceeded reservation")
         );
         let checkpoint_text = String::from_utf8(checkpoint.clone())?;
         let mut record;
@@ -522,44 +696,70 @@ impl ImportOwner {
         }
         record = serde_json::to_vec(&Checkpoint { state: checkpoint_text, receipt: receipt.clone() })?;
         ensure!(
-            receipt.copy_bytes <= batch.copy_bytes && receipt.copy_bytes <= budget.copy_bytes,
-            "InsufficientBudget: exact COPY/checkpoint bytes"
+            record.len() <= MAX_RECORD
+                && receipt.copy_bytes <= batch.copy_bytes
+                && receipt.copy_bytes <= budget.copy_bytes,
+            HistoryError::new(ErrorCode::InsufficientBudget, "exact COPY/checkpoint bytes")
         );
         let digest = Sha256::digest(&record).to_vec();
-        tx.execute("insert into history_checkpoints(import_id,sequence,bookmark,source_rows,source_bytes,decoded_bytes,callback_events,mutations,copy_bytes,digest) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",&[&&id[..],&next,&record,&to_i64(receipt.source_rows)?,&to_i64(receipt.source_bytes)?,&to_i64(receipt.decoded_bytes)?,&to_i64(receipt.callback_events)?,&to_i64(receipt.mutations)?,&to_i64(receipt.copy_bytes)?,&digest])?;
-        tx.execute(
+        tx.execute_typed("insert into history_checkpoints(import_id,sequence,bookmark,source_rows,source_bytes,decoded_bytes,callback_events,mutations,copy_bytes,digest) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",&[(&&id[..],Type::BYTEA),(&next,Type::INT8),(&record,Type::BYTEA),(&to_i64(receipt.source_rows)?,Type::INT8),(&to_i64(receipt.source_bytes)?,Type::INT8),(&to_i64(receipt.decoded_bytes)?,Type::INT8),(&to_i64(receipt.callback_events)?,Type::INT8),(&to_i64(receipt.mutations)?,Type::INT8),(&to_i64(receipt.copy_bytes)?,Type::INT8),(&digest,Type::BYTEA)])?;
+        tx.execute_typed(
             "update history_imports set checkpoint_sequence=$2,checkpoint=$3 where import_id=$1",
-            &[&&id[..], &next, &checkpoint],
+            &[(&&id[..], Type::BYTEA), (&next, Type::INT8), (&checkpoint, Type::BYTEA)],
         )?;
         if let Err(error) = tx.commit() {
             self.terminal = true;
-            return Err(error)
-                .context("LostOwner: commit outcome requires a new fenced owner and durable checkpoint inspection");
+            return Err(error).context(HistoryError::new(
+                ErrorCode::LostOwner,
+                "commit outcome requires a new fenced owner and durable checkpoint inspection",
+            ));
         }
-        self.runtime.committed();
+        self.runtime.committed()?;
         Ok(receipt)
     }
     pub fn finish_identity(&mut self, source: &Source, id: ImportId) -> Result<()> {
         self.live()?;
         source.check_unchanged()?;
-        ensure!(source.fingerprint() == id, "SourceMismatch: import fingerprint");
+        ensure!(source.fingerprint() == id, HistoryError::new(ErrorCode::SourceMismatch, "import fingerprint"));
         let mut tx = self.client.transaction()?;
         tx.batch_execute("set local synchronous_commit=on")?;
-        let row =
-            tx.query_one("select state,checkpoint from history_imports where import_id=$1 for update", &[&&id[..]])?;
+        let row = tx.query_one(
+            &format!(
+                "select state,{CHECKPOINT_SQL},checkpoint_sequence from history_imports where import_id=$1 for update"
+            ),
+            &[&&id[..]],
+        )?;
+        let sequence: i64 = row.get(2);
+        let checkpoint = checkpoint_payload(&row, 1)?;
+        ensure!(sequence > 0, HistoryError::new(ErrorCode::IncompleteImport, "no completed validation checkpoint"));
+        let final_row = tx.query_one(
+            &format!("select {RECORD_SQL},digest from history_checkpoints where import_id=$1 and sequence=$2"),
+            &[&&id[..], &sequence],
+        )?;
+        let bytes = checkpoint_payload(&final_row, 0)?;
+        let digest: Vec<u8> = final_row.get(1);
+        ensure!(
+            Sha256::digest(&bytes).as_slice() == digest,
+            HistoryError::new(ErrorCode::CorruptObject, "final checkpoint digest")
+        );
+        let record: Checkpoint = serde_json::from_slice(&bytes)?;
+        ensure!(
+            record.state.as_bytes() == checkpoint && record.receipt.sequence == sequence && record.receipt.complete,
+            HistoryError::new(ErrorCode::CorruptObject, "final checkpoint receipt")
+        );
         if row.get::<_, String>(0) == "identity_ready" {
             tx.commit()?;
             return Ok(());
         }
-        let state: State = serde_json::from_slice(&row.get::<_, Vec<u8>>(1))?;
-        ensure!(state.phase == 4, "IncompleteImport: paged validation is incomplete");
+        let state: State = serde_json::from_slice(&checkpoint)?;
+        ensure!(state.phase == 4, HistoryError::new(ErrorCode::IncompleteImport, "paged validation is incomplete"));
         let provisional: bool = tx
             .query_one(
                 "select exists(select 1 from history_objects where import_id=$1 and not validated)",
                 &[&&id[..]],
             )?
             .get(0);
-        ensure!(!provisional, "IncompleteImport: provisional objects remain");
+        ensure!(!provisional, HistoryError::new(ErrorCode::IncompleteImport, "provisional objects remain"));
         reserve(&mut tx, &self.expected.schema, source.manifest().reserved_next_id, false)?;
         let digest = state.identity_digest.finish()?.to_vec();
         tx.execute(
@@ -579,13 +779,24 @@ fn to_i64(n: u64) -> Result<i64> {
     i64::try_from(n).context("history count exceeds signed storage")
 }
 fn verify_destination(client: &mut postgres::Client, e: &ExpectedDestination) -> Result<()> {
-    let row=client.query_one("select current_database(),current_user,current_setting('server_version_num')::integer,(select pg_get_userbyid(nspowner)::text from pg_namespace where nspname=$1)",&[&e.schema])?;
+    let row=client.query_one("select current_database(),current_user,current_setting('server_version_num')::integer,(select pg_get_userbyid(nspowner)::text from pg_namespace where nspname=$1),host(inet_server_addr()),inet_server_port(),coalesce((select ssl from pg_stat_ssl where pid=pg_backend_pid()),false)",&[&e.schema])?;
+    let owner: Option<String> = row.get(3);
+    let address: Option<String> = row.get(4);
+    let port: Option<i32> = row.get(5);
+    let transport = match e.transport {
+        ExpectedTransport::PlaintextTcp => address.is_some() && port.is_some(),
+        ExpectedTransport::UnixSocket => address.is_none() && port.is_none(),
+    };
     ensure!(
         row.get::<_, String>(0) == e.database
             && row.get::<_, String>(1) == e.role
             && row.get::<_, i32>(2) == e.server_version
-            && row.get::<_, Option<String>>(3).as_deref() == Some(e.owner.as_str()),
-        "DestinationMismatch: database/role/owner/server identity"
+            && owner.as_deref().map_or(e.owner == e.role, |owner| owner == e.owner)
+            && address == e.server_address
+            && port == e.server_port
+            && transport
+            && !row.get::<_, bool>(6),
+        HistoryError::new(ErrorCode::DestinationMismatch, "database/role/owner/server endpoint/transport identity")
     );
     Ok(())
 }
@@ -601,16 +812,19 @@ fn reserve(tx: &mut postgres::Transaction<'_>, schema: &str, floor: i64, fresh: 
             && row.get::<_, i64>(2) == 1
             && row.get::<_, i64>(3) == 1
             && !row.get::<_, bool>(4),
-        "DestinationMismatch: unexpected release identity sequence"
+        HistoryError::new(ErrorCode::DestinationMismatch, "unexpected release identity sequence")
     );
     let current = tx.query_one(&format!("select last_value,is_called from \"{schema}\".\"{name}\""), &[])?;
     let value: i64 = current.get(0);
     let called: bool = current.get(1);
     let next = if called { value.checked_add(1).context("allocator overflow")? } else { value };
     if fresh {
-        ensure!(next == 1 && !called, "DestinationMismatch: unexpected existing native allocations");
+        ensure!(
+            next == 1 && !called,
+            HistoryError::new(ErrorCode::DestinationMismatch, "unexpected existing native allocations")
+        );
     }
-    ensure!(floor > 0, "SourceMismatch: invalid allocator reservation");
+    ensure!(floor > 0, HistoryError::new(ErrorCode::SourceMismatch, "invalid allocator reservation"));
     // ALTER SEQUENCE RESTART takes a transactional sequence lock and rolls
     // back with this transaction. Never use nontransactional setval here.
     tx.batch_execute(&format!("alter sequence \"{schema}\".\"{name}\" restart with {}", next.max(floor)))?;
@@ -703,7 +917,7 @@ fn emit_artifact(
     bookmark: &[u8],
     body: &[u8],
 ) -> Result<bool> {
-    ensure!(body.len() <= MAX_METADATA, "InsufficientBudget: bounded metadata index");
+    ensure!(body.len() <= MAX_METADATA, HistoryError::new(ErrorCode::InsufficientBudget, "bounded metadata index"));
     if !cursor.started {
         batch.push(object(cursor.id, source, key, kind, bookmark, body.len() as u64))?;
         cursor.started = true;
@@ -724,10 +938,43 @@ fn emit_artifact(
     batch.push(seal(cursor.id, body.len() as u64, cursor.digest.finish()?, true))?;
     Ok(true)
 }
+fn pending_progress(state: &State, batch: &Batch) -> (usize, u64, u64, u8, u64, u64, u64, u64, u64, usize) {
+    let p = state.pending.as_ref();
+    let frozen = p.and_then(|p| p.frozen.as_ref());
+    (
+        p.map_or(0, |p| p.cell),
+        p.and_then(|p| p.cells.get(p.cell)).map_or(0, |c| c.offset),
+        p.map_or(0, |p| p.output.offset),
+        frozen.map_or(0, |f| f.phase),
+        frozen.map_or(0, |f| f.projection_data.offset),
+        frozen.map_or(0, |f| f.index.offset),
+        batch.source_bytes,
+        batch.decoded_bytes,
+        batch.events,
+        batch.rows.len(),
+    )
+}
 fn consume(source: &Source, state: &mut State, batch: &mut Batch, runtime: &mut Runtime) -> Result<()> {
     let files = ordered(source);
-    if let Some((source_id, key)) = state.cleanup.take() {
+    if let Some(old) = state.cleanup.take() {
+        state.cleanups.push(old);
+    }
+    ensure!(
+        state.cleanups.len() <= super::history_spool::MAX_COMPLETED,
+        HistoryError::new(ErrorCode::InsufficientBudget, "checkpoint cleanup admission")
+    );
+    while !state.cleanups.is_empty() || !runtime.abandoned.is_empty() {
+        if batch.source_left() < 128 || batch.source_rows >= u64::from(batch.budget.source_rows) {
+            return Ok(());
+        }
+        let (source_id, key) = if let Some(key) = state.cleanups.pop() {
+            key
+        } else {
+            runtime.abandoned.pop().expect("abandoned cleanup")
+        };
         super::history_spool::Spool::cleanup(&runtime.root, source.fingerprint(), source_id, key)?;
+        batch.source_rows += 1;
+        batch.source_bytes += 128;
     }
     loop {
         if !batch.room(12, MAX_METADATA as u64 + 4096)
@@ -847,11 +1094,9 @@ fn consume(source: &Source, state: &mut State, batch: &mut Batch, runtime: &mut 
                     continue;
                 }
                 if state.pending.is_some() {
+                    let before = pending_progress(state, batch);
                     capture_pending(source, state, batch, file.source_id, file.kind, runtime)?;
-                    if runtime.completed {
-                        break;
-                    }
-                    if state.pending.is_some() {
+                    if state.pending.is_some() && before == pending_progress(state, batch) {
                         break;
                     }
                     continue;
@@ -860,6 +1105,9 @@ fn consume(source: &Source, state: &mut State, batch: &mut Batch, runtime: &mut 
                     state.file += 1;
                     state.relation = 0;
                     continue;
+                }
+                if file.kind == SourceKind::Frozen && runtime.completed.len() >= super::history_spool::MAX_COMPLETED {
+                    break;
                 }
                 let cursor =
                     RowCursor { source_id: file.source_id, relation: relation(state.relation), after: state.after };
@@ -880,19 +1128,41 @@ fn consume(source: &Source, state: &mut State, batch: &mut Batch, runtime: &mut 
                             match row.fields.iter().find(|(c, _)| *c == column).map(|(_, s)| s) {
                                 Some(Scalar::Integer(i)) => Ok(*i),
                                 _ => {
-                                    bail!("UnsupportedSchema: alias keys and targets must be original signed integers")
+                                    bail!(HistoryError::new(
+                                        ErrorCode::UnsupportedSchema,
+                                        "alias keys and targets must be original signed integers"
+                                    ))
                                 }
                             }
                         };
                         let hash = get(Column::Alias)?;
                         let target = get(Column::Target)?;
-                        ensure!(hash == row.key, "SourceMismatch: alias bookmark");
+                        ensure!(hash == row.key, HistoryError::new(ErrorCode::SourceMismatch, "alias bookmark"));
                         batch.push(Row { tag: 5, a: file.source_id, b: hash, c: target, ..Default::default() })?;
                         state.relation_digest.update(&hash.to_le_bytes())?;
                         state.relation_digest.update(&target.to_le_bytes())?;
                         state.relation_rows += 1;
                         state.after = Some(row.key);
                     } else {
+                        if file.kind == SourceKind::Frozen
+                            && let Some(Scalar::Cell(payload)) =
+                                row.fields.iter().find(|(c, _)| *c == Column::Payload).map(|(_, v)| v)
+                        {
+                            let required = payload
+                                .bytes
+                                .checked_add(super::history_spool::FRAME_OVERHEAD)
+                                .context("spool admission overflow")?;
+                            ensure!(
+                                required <= runtime.quota,
+                                HistoryError::new(
+                                    ErrorCode::InsufficientBudget,
+                                    "frozen frame exceeds total spool quota"
+                                )
+                            );
+                            if required > runtime.quota - runtime.completed.iter().map(|f| f.bytes).sum::<u64>() {
+                                break;
+                            }
+                        }
                         let metadata = allocate(state)?;
                         let mut fields = Vec::new();
                         let mut cells = Vec::new();
@@ -943,12 +1213,17 @@ fn consume(source: &Source, state: &mut State, batch: &mut Batch, runtime: &mut 
                     }
                 } else if end.complete {
                     if state.relation > 0 {
-                        let expected =
-                            file.catalog_counts.as_ref().context("SourceMismatch: catalog count receipt missing")?;
+                        let expected = file
+                            .catalog_counts
+                            .as_ref()
+                            .context(HistoryError::new(ErrorCode::SourceMismatch, "catalog count receipt missing"))?;
                         ensure!(
                             state.relation_rows
                                 == if state.relation == 1 { expected.releases } else { expected.collections },
-                            "SourceMismatch: captured catalog count differs from content manifest"
+                            HistoryError::new(
+                                ErrorCode::SourceMismatch,
+                                "captured catalog count differs from content manifest"
+                            )
                         );
                     }
                     if state.relation == 0 {
@@ -978,7 +1253,7 @@ fn consume(source: &Source, state: &mut State, batch: &mut Batch, runtime: &mut 
                 break;
             }
             4 => break,
-            _ => bail!("CorruptObject: unsupported checkpoint phase"),
+            _ => bail!(HistoryError::new(ErrorCode::CorruptObject, "unsupported checkpoint phase")),
         }
     }
     Ok(())
@@ -1079,7 +1354,7 @@ fn capture_pending(
     }
     let metadata = Metadata { version: 1, source_id, source_key: pending.row.key, fields: pending.fields.clone() };
     let body = serde_json::to_vec(&metadata)?;
-    ensure!(body.len() <= MAX_METADATA, "InsufficientBudget: metadata index");
+    ensure!(body.len() <= MAX_METADATA, HistoryError::new(ErrorCode::InsufficientBudget, "metadata index"));
     if !emit_artifact(
         batch,
         &mut pending.output,
@@ -1096,7 +1371,7 @@ fn capture_pending(
         state.variant_rows = state.variant_rows.checked_add(1).context("variant count overflow")?;
         ensure!(
             pending.row.key < source.manifest().reserved_next_id,
-            "SourceMismatch: public ID exceeds imported allocator reservation"
+            HistoryError::new(ErrorCode::SourceMismatch, "public ID exceeds imported allocator reservation")
         );
         batch.push(Row {
             tag: 4,
@@ -1178,10 +1453,14 @@ fn finish_frozen(
         .cells
         .iter()
         .find(|c| c.reference.column == Column::Payload)
-        .context("UnsupportedSchema: frozen payload is not a byte cell")?
+        .context(HistoryError::new(ErrorCode::UnsupportedSchema, "frozen payload is not a byte cell"))?
         .clone();
-    ensure!(payload.offset == payload.reference.bytes, "IncompleteImport: frozen envelope capture is incomplete");
-    let payload_id = payload.object.context("CorruptObject: frozen payload object missing")?;
+    ensure!(
+        payload.offset == payload.reference.bytes,
+        HistoryError::new(ErrorCode::IncompleteImport, "frozen envelope capture is incomplete")
+    );
+    let payload_id =
+        payload.object.context(HistoryError::new(ErrorCode::CorruptObject, "frozen payload object missing"))?;
     let source_id = payload.reference.source_id;
     let key = pending.row.key;
     if pending.frozen.is_none() {
@@ -1213,9 +1492,11 @@ fn finish_frozen(
         return Ok(false);
     }
     if frozen.phase == 1 {
-        // A fresh grant owns the whole page, so compressed + expanded reads
-        // and every provisional callback have exact per-page counters.
-        if batch.source_bytes != 0 || batch.decoded_bytes != 0 || batch.source_rows != 0 || !batch.rows.is_empty() {
+        // The worker gets only this page's unconsumed permits. A small frame
+        // can complete alongside other admitted frames; a large one stays live.
+        let events = (u64::from(batch.budget.source_rows) - batch.events)
+            .min(u64::from(batch.budget.mutations - batch.mutations));
+        if batch.source_left() < 512 || events == 0 {
             return Ok(false);
         }
         if runtime.validator.is_none() {
@@ -1228,20 +1509,21 @@ fn finish_frozen(
                 payload.reference.bytes,
                 payload.digest.finish()?,
                 key,
-                runtime.quota,
-                crate::history_stream::Config::default(),
+                spool.quota,
+                runtime.decoder,
             )?);
         }
         let progress = runtime
             .validator
             .as_mut()
             .expect("owned validator")
-            .advance(batch.budget.source_bytes, batch.budget.source_rows.min(batch.budget.mutations - 2))?;
+            .advance(batch.source_left(), u32::try_from(events)?)?;
         batch.source_bytes += progress.usage.compressed;
         batch.decoded_bytes += progress.usage.expanded;
         batch.events += progress.usage.events;
         if let Some(result) = progress.result {
-            let validated = result?;
+            let validated =
+                result.context(HistoryError::new(ErrorCode::CorruptObject, "frozen envelope codec validation"))?;
             runtime.validator.take();
             runtime.spool.as_mut().expect("owned spool").finish_projection()?;
             frozen.rows = validated.stats.rows;
@@ -1258,7 +1540,10 @@ fn finish_frozen(
         return Ok(false);
     }
     if frozen.phase == 2 {
-        let projection = frozen.projection.as_ref().context("CorruptObject: validated projection receipt missing")?;
+        let projection = frozen
+            .projection
+            .as_ref()
+            .context(HistoryError::new(ErrorCode::CorruptObject, "validated projection receipt missing"))?;
         let cursor = &mut frozen.projection_data;
         if !cursor.started {
             batch.push(object(
@@ -1295,13 +1580,19 @@ fn finish_frozen(
         if cursor.offset != projection.byte_length {
             return Ok(false);
         }
-        ensure!(cursor.digest.finish()? == projection.digest, "CorruptObject: validated projection digest differs");
+        ensure!(
+            cursor.digest.finish()? == projection.digest,
+            HistoryError::new(ErrorCode::CorruptObject, "validated projection digest differs")
+        );
         batch.push(seal(cursor.id, projection.byte_length, projection.digest, true))?;
         frozen.phase = 3;
         return Ok(false);
     }
     if frozen.phase == 3 {
-        let projection = frozen.projection.as_ref().context("CorruptObject: projection metadata missing")?;
+        let projection = frozen
+            .projection
+            .as_ref()
+            .context(HistoryError::new(ErrorCode::CorruptObject, "projection metadata missing"))?;
         let metadata = projected_metadata(source_id, key, frozen.projection_data.id, projection);
         let body = serde_json::to_vec(&metadata)?;
         if !emit_artifact(
@@ -1317,7 +1608,7 @@ fn finish_frozen(
         }
         ensure!(
             key < source.manifest().reserved_next_id,
-            "SourceMismatch: frozen public ID exceeds allocator reservation"
+            HistoryError::new(ErrorCode::SourceMismatch, "frozen public ID exceeds allocator reservation")
         );
         batch.push(Row {
             tag: 4,
@@ -1359,11 +1650,15 @@ fn finish_frozen(
         state.relation_rows = state.relation_rows.checked_add(1).context("frozen source row count overflow")?;
         state.variant_rows = state.variant_rows.checked_add(1).context("variant count overflow")?;
         state.after = Some(key);
-        state.cleanup = Some((source_id, key));
-        runtime.completed = true;
+        ensure!(
+            state.cleanups.len() < super::history_spool::MAX_COMPLETED,
+            HistoryError::new(ErrorCode::InsufficientBudget, "completed frame cleanup count")
+        );
+        state.cleanups.push((source_id, key));
+        runtime.complete(source, key, source_id)?;
         return Ok(true);
     }
-    bail!("CorruptObject: frozen continuation phase")
+    bail!(HistoryError::new(ErrorCode::CorruptObject, "frozen continuation phase"))
 }
 
 fn finish_validated_object(state: &mut State) -> Result<()> {
@@ -1371,7 +1666,7 @@ fn finish_validated_object(state: &mut State) -> Result<()> {
         ensure!(
             state.validate_offset == state.validate_length
                 && state.validate_digest.finish()?.as_slice() == state.validate_expected,
-            "CorruptObject: exact object length/digest"
+            HistoryError::new(ErrorCode::CorruptObject, "exact object length/digest")
         );
         state.identity_digest.update(&state.validate_object.to_le_bytes())?;
         state.identity_digest.update(&state.validate_expected)?;
@@ -1395,7 +1690,7 @@ fn validate_page(
     }
     match state.validate_part {
         0 => {
-            let rows=tx.query("select c.object_id,c.ordinal,c.byte_offset,octet_length(c.bytes)::bigint,c.digest,o.byte_length,o.digest,o.validated from history_object_chunks c join history_objects o using(import_id,object_id) where c.import_id=$1 and (c.object_id,c.ordinal)>=($2,$3) order by c.object_id,c.ordinal limit $4",&[&&id[..],&state.validate_object,&state.validate_ordinal,&limit])?;
+            let rows=tx.query_typed("select c.object_id,c.ordinal,c.byte_offset,octet_length(c.bytes)::bigint,c.digest,o.byte_length,o.digest,o.validated from history_object_chunks c join history_objects o using(import_id,object_id) where c.import_id=$1 and (c.object_id,c.ordinal)>=($2,$3) order by c.object_id,c.ordinal limit $4",&[(&&id[..],Type::BYTEA),(&state.validate_object,Type::INT8),(&state.validate_ordinal,Type::INT8),(&limit,Type::INT8)])?;
             if rows.is_empty() {
                 finish_validated_object(state)?;
                 state.validate_part = 1;
@@ -1418,8 +1713,11 @@ fn validate_page(
                 } else {
                     0
                 };
-                ensure!(full > 0 && offset < full as u64, "CorruptObject: chunk continuation");
-                let n = (full as u64 - offset).min(left - 128) as i32;
+                ensure!(
+                    full > 0 && offset < full as u64,
+                    HistoryError::new(ErrorCode::CorruptObject, "chunk continuation")
+                );
+                let n = (full as u64 - offset).min(left - 128).min(u64::from(batch.budget.chunk_bytes)) as i32;
                 objects.push(oid);
                 ordinals.push(ordinal);
                 offsets.push(offset as i32);
@@ -1433,15 +1731,18 @@ fn validate_page(
             if chosen.is_empty() {
                 return Ok(1);
             }
-            let data=tx.query("select r.object_id,r.ordinal,substring(c.bytes from r.start_byte+1 for r.byte_count) from unnest($2::bigint[],$3::bigint[],$4::integer[],$5::integer[]) as r(object_id,ordinal,start_byte,byte_count) join history_object_chunks c on c.import_id=$1 and c.object_id=r.object_id and c.ordinal=r.ordinal order by r.object_id,r.ordinal",&[&&id[..],&objects,&ordinals,&offsets,&lengths])?;
-            ensure!(data.len() == chosen.len(), "CorruptObject: missing captured chunks");
+            let data=tx.query_typed("select r.object_id,r.ordinal,substring(c.bytes from r.start_byte+1 for r.byte_count) from unnest($2::bigint[],$3::bigint[],$4::integer[],$5::integer[]) as r(object_id,ordinal,start_byte,byte_count) join history_object_chunks c on c.import_id=$1 and c.object_id=r.object_id and c.ordinal=r.ordinal order by r.object_id,r.ordinal",&[(&&id[..],Type::BYTEA),(&objects,Type::INT8_ARRAY),(&ordinals,Type::INT8_ARRAY),(&offsets,Type::INT4_ARRAY),(&lengths,Type::INT4_ARRAY)])?;
+            ensure!(data.len() == chosen.len(), HistoryError::new(ErrorCode::CorruptObject, "missing captured chunks"));
             for (index, (meta, data)) in chosen.iter().zip(&data).enumerate() {
                 let oid: i64 = meta.get(0);
                 let ordinal: i64 = meta.get(1);
                 let byte_offset: i64 = meta.get(2);
                 let full: i64 = meta.get(3);
                 let digest: Vec<u8> = meta.get(4);
-                ensure!(meta.get::<_, bool>(7), "IncompleteImport: provisional object during validation");
+                ensure!(
+                    meta.get::<_, bool>(7),
+                    HistoryError::new(ErrorCode::IncompleteImport, "provisional object during validation")
+                );
                 if !state.validate_active || oid != state.validate_object {
                     finish_validated_object(state)?;
                     state.validate_object = oid;
@@ -1458,10 +1759,13 @@ fn validate_page(
                     ordinal == state.validate_ordinal
                         && byte_offset >= 0
                         && byte_offset as u64 + state.validate_chunk_offset == state.validate_offset,
-                    "CorruptObject: noncontiguous object chunks"
+                    HistoryError::new(ErrorCode::CorruptObject, "noncontiguous object chunks")
                 );
                 let bytes: Vec<u8> = data.get(2);
-                ensure!(bytes.len() == lengths[index] as usize, "CorruptObject: short object chunk");
+                ensure!(
+                    bytes.len() == lengths[index] as usize,
+                    HistoryError::new(ErrorCode::CorruptObject, "short object chunk")
+                );
                 state.validate_digest.update(&bytes)?;
                 state.validate_chunk_digest.update(&bytes)?;
                 state.validate_offset += bytes.len() as u64;
@@ -1469,7 +1773,10 @@ fn validate_page(
                 batch.source_bytes += 128 + bytes.len() as u64;
                 batch.source_rows += 1;
                 if state.validate_chunk_offset == full as u64 {
-                    ensure!(state.validate_chunk_digest.finish()?.as_slice() == digest, "CorruptObject: chunk digest");
+                    ensure!(
+                        state.validate_chunk_digest.finish()?.as_slice() == digest,
+                        HistoryError::new(ErrorCode::CorruptObject, "chunk digest")
+                    );
                     state.validate_chunk_offset = 0;
                     state.validate_chunk_digest = DigestState::default();
                     state.validate_ordinal += 1;
@@ -1478,20 +1785,29 @@ fn validate_page(
             Ok(2)
         }
         1 => {
-            let rows=tx.query("select object_id,byte_length,digest,validated,exists(select 1 from history_object_chunks c where c.import_id=o.import_id and c.object_id=o.object_id) from history_objects o where import_id=$1 and object_id>$2 order by object_id limit $3",&[&&id[..],&state.validate_object,&limit])?;
+            let rows=tx.query_typed("select object_id,byte_length,digest,validated,exists(select 1 from history_object_chunks c where c.import_id=o.import_id and c.object_id=o.object_id) from history_objects o where import_id=$1 and object_id>$2 order by object_id limit $3",&[(&&id[..],Type::BYTEA),(&state.validate_object,Type::INT8),(&limit,Type::INT8)])?;
             if rows.is_empty() {
+                ensure!(
+                    state.validated_objects + 1 == state.next_object as u64,
+                    HistoryError::new(ErrorCode::CorruptObject, "missing admitted object identities")
+                );
                 state.validate_part = 2;
                 return Ok(1);
             }
             for row in rows {
                 let oid: i64 = row.get(0);
+                ensure!(
+                    oid > 0 && oid < state.next_object && oid as u64 == state.validated_objects + 1,
+                    HistoryError::new(ErrorCode::CorruptObject, "unregistered object identity")
+                );
+                state.validated_objects += 1;
                 let len: i64 = row.get(1);
                 let digest: Vec<u8> = row.get(2);
-                ensure!(row.get::<_, bool>(3), "IncompleteImport: provisional object");
+                ensure!(row.get::<_, bool>(3), HistoryError::new(ErrorCode::IncompleteImport, "provisional object"));
                 ensure!(
                     (len == 0 && !row.get::<_, bool>(4) && Sha256::digest([]).as_slice() == digest)
                         || (len > 0 && row.get::<_, bool>(4)),
-                    "CorruptObject: missing/extra object chunks"
+                    HistoryError::new(ErrorCode::CorruptObject, "missing/extra object chunks")
                 );
                 if len == 0 {
                     state.identity_digest.update(&oid.to_le_bytes())?;
@@ -1505,9 +1821,9 @@ fn validate_page(
         }
         2 => {
             let rows = if let Some(after) = state.catalog_after {
-                tx.query("select public_id,selected_source_id from history_catalog where import_id=$1 and public_id>$2 order by public_id limit $3",&[&&id[..],&after,&limit])?
+                tx.query_typed("select public_id,selected_source_id from history_catalog where import_id=$1 and public_id>$2 order by public_id limit $3",&[(&&id[..],Type::BYTEA),(&after,Type::INT8),(&limit,Type::INT8)])?
             } else {
-                tx.query("select public_id,selected_source_id from history_catalog where import_id=$1 order by public_id limit $2",&[&&id[..],&limit])?
+                tx.query_typed("select public_id,selected_source_id from history_catalog where import_id=$1 order by public_id limit $2",&[(&&id[..],Type::BYTEA),(&limit,Type::INT8)])?
             };
             if rows.is_empty() {
                 state.validate_part = 3;
@@ -1529,9 +1845,12 @@ fn validate_page(
             let params = state.alias_after;
             let query = "select a.source_id,a.original_signed_hash,a.target_public_id,(v.public_id is null) from history_collection_aliases a left join history_release_variants v on v.import_id=a.import_id and v.source_id=a.source_id and v.public_id=a.target_public_id where a.import_id=$1";
             let rows = if let Some((source, key)) = params {
-                tx.query(&format!("{query} and (a.source_id,a.original_signed_hash)>($2,$3) order by a.source_id,a.original_signed_hash limit $4"),&[&&id[..],&source,&key,&limit])?
+                tx.query_typed(&format!("{query} and (a.source_id,a.original_signed_hash)>($2,$3) order by a.source_id,a.original_signed_hash limit $4"),&[(&&id[..],Type::BYTEA),(&source,Type::INT8),(&key,Type::INT8),(&limit,Type::INT8)])?
             } else {
-                tx.query(&format!("{query} order by a.source_id,a.original_signed_hash limit $2"), &[&&id[..], &limit])?
+                tx.query_typed(
+                    &format!("{query} order by a.source_id,a.original_signed_hash limit $2"),
+                    &[(&&id[..], Type::BYTEA), (&limit, Type::INT8)],
+                )?
             };
             if rows.is_empty() {
                 state.validate_part = 4;
@@ -1557,14 +1876,67 @@ fn validate_page(
             let query =
                 "select source_id,relation_code,logical_rows,digest,state from history_receipts where import_id=$1";
             let rows = if let Some((source, code)) = state.receipt_after {
-                tx.query(
+                tx.query_typed(
                     &format!("{query} and (source_id,relation_code)>($2,$3) order by source_id,relation_code limit $4"),
-                    &[&&id[..], &source, &code, &limit],
+                    &[(&&id[..], Type::BYTEA), (&source, Type::INT8), (&code, Type::INT4), (&limit, Type::INT8)],
                 )?
             } else {
-                tx.query(&format!("{query} order by source_id,relation_code limit $2"), &[&&id[..], &limit])?
+                tx.query_typed(
+                    &format!("{query} order by source_id,relation_code limit $2"),
+                    &[(&&id[..], Type::BYTEA), (&limit, Type::INT8)],
+                )?
             };
             if rows.is_empty() {
+                state.validate_part = 5;
+                return Ok(1);
+            }
+            for row in rows {
+                let source: i64 = row.get(0);
+                let code: i32 = row.get(1);
+                if code <= 3 {
+                    ensure!(
+                        row.get::<_, String>(4) == "complete",
+                        HistoryError::new(ErrorCode::IncompleteImport, "selected relation receipt is pending")
+                    );
+                }
+                state.receipt_after = Some((source, code));
+                batch.source_rows += 1;
+                batch.source_bytes += 128;
+            }
+            Ok(1)
+        }
+        5 => {
+            let query="select v.source_id,v.public_id,v.metadata_object_id,v.frozen_header_object_id,v.frozen_payload_object_id,
+                coalesce(m.source_id=v.source_id and m.scope_release_id=v.public_id and m.validated and m.byte_length<=49152
+                and ((s.kind='current' and m.object_kind='metadata' and v.frozen_header_object_id is null and v.frozen_payload_object_id is null)
+                    or (s.kind='frozen' and m.object_kind='frozen_metadata' and h.source_id=v.source_id and h.scope_release_id=v.public_id and h.object_kind='frozen_header' and h.validated and h.byte_length<=49152
+                        and p.source_id=v.source_id and p.scope_release_id=v.public_id and p.object_kind='frozen_payload' and p.validated and p.logical_rows is not null and p.logical_values is not null
+                        and r.header_object_id=h.object_id and r.metadata_object_id=m.object_id))
+                and c.public_id is not null and c.selected_source_id=coalesce((select w.source_id from history_release_variants w join history_sources ws on ws.import_id=w.import_id and ws.source_id=w.source_id where w.import_id=v.import_id and w.public_id=v.public_id and ws.kind='current' limit 1),v.source_id)
+                and not exists(select 1 from history_release_variants ov join history_sources os on os.import_id=ov.import_id and os.source_id=ov.source_id where ov.import_id=v.import_id and ov.public_id=v.public_id and ov.source_id<>v.source_id
+                    and not ((s.kind='current' and os.kind='frozen' and os.paired_current_source=s.source_id) or (s.kind='frozen' and os.kind='current' and s.paired_current_source=os.source_id))),false)
+                from history_release_variants v join history_sources s on s.import_id=v.import_id and s.source_id=v.source_id
+                left join history_objects m on m.import_id=v.import_id and m.object_id=v.metadata_object_id
+                left join history_objects h on h.import_id=v.import_id and h.object_id=v.frozen_header_object_id
+                left join history_objects p on p.import_id=v.import_id and p.object_id=v.frozen_payload_object_id
+                left join history_frozen_resolutions r on r.import_id=v.import_id and r.source_id=v.source_id and r.public_id=v.public_id
+                left join history_catalog c on c.import_id=v.import_id and c.public_id=v.public_id where v.import_id=$1";
+            let rows = if let Some((source, key)) = state.variant_after {
+                tx.query_typed(
+                    &format!("{query} and (v.source_id,v.public_id)>($2,$3) order by v.source_id,v.public_id limit $4"),
+                    &[(&&id[..], Type::BYTEA), (&source, Type::INT8), (&key, Type::INT8), (&limit, Type::INT8)],
+                )?
+            } else {
+                tx.query_typed(
+                    &format!("{query} order by v.source_id,v.public_id limit $2"),
+                    &[(&&id[..], Type::BYTEA), (&limit, Type::INT8)],
+                )?
+            };
+            if rows.is_empty() {
+                ensure!(
+                    state.validated_variant_rows == state.variant_rows,
+                    HistoryError::new(ErrorCode::CorruptObject, "variant count differs from admitted source rows")
+                );
                 let overlap =
                     state.variant_rows.checked_sub(state.canonical_rows).context("canonical count exceeds variants")?;
                 for (code, name, count) in [
@@ -1578,21 +1950,29 @@ fn validate_page(
                 return Ok(1);
             }
             for row in rows {
+                ensure!(
+                    row.get::<_, bool>(5),
+                    HistoryError::new(ErrorCode::CorruptObject, "variant source/object/winner references")
+                );
                 let source: i64 = row.get(0);
-                let code: i32 = row.get(1);
-                if code <= 3 {
-                    ensure!(
-                        row.get::<_, String>(4) == "complete",
-                        "IncompleteImport: selected relation receipt is pending"
-                    );
+                let key: i64 = row.get(1);
+                for value in [
+                    source,
+                    key,
+                    row.get(2),
+                    row.get::<_, Option<i64>>(3).unwrap_or(-1),
+                    row.get::<_, Option<i64>>(4).unwrap_or(-1),
+                ] {
+                    state.identity_digest.update(&value.to_le_bytes())?;
                 }
-                state.receipt_after = Some((source, code));
+                state.variant_after = Some((source, key));
+                state.validated_variant_rows += 1;
                 batch.source_rows += 1;
                 batch.source_bytes += 128;
             }
             Ok(1)
         }
-        _ => bail!("CorruptObject: validation checkpoint phase"),
+        _ => bail!(HistoryError::new(ErrorCode::CorruptObject, "validation checkpoint phase")),
     }
 }
 
@@ -1604,7 +1984,7 @@ mod tests {
         let Some(test) = crate::pg::testing::Schema::empty() else { return };
         let mut c = test.pool.get().unwrap();
         let row = c
-            .query_one("select current_database(),current_user,current_setting('server_version_num')::integer", &[])
+            .query_one("select current_database(),current_user,current_setting('server_version_num')::integer,host(inet_server_addr()),inet_server_port()", &[])
             .unwrap();
         let expected = ExpectedDestination {
             database: row.get(0),
@@ -1612,6 +1992,13 @@ mod tests {
             role: row.get(1),
             owner: row.get(1),
             server_version: row.get(2),
+            server_address: row.get(3),
+            server_port: row.get(4),
+            transport: if row.get::<_, Option<String>>(3).is_some() {
+                ExpectedTransport::PlaintextTcp
+            } else {
+                ExpectedTransport::UnixSocket
+            },
             staging_prefix: "t_".into(),
         };
         let spool = tempfile::tempdir().unwrap();
@@ -1690,7 +2077,7 @@ mod tests {
         let Some(test) = crate::pg::testing::Schema::empty() else { return };
         let mut c = test.pool.get().unwrap();
         let row = c
-            .query_one("select current_database(),current_user,current_setting('server_version_num')::integer", &[])
+            .query_one("select current_database(),current_user,current_setting('server_version_num')::integer,host(inet_server_addr()),inet_server_port()", &[])
             .unwrap();
         let expected = ExpectedDestination {
             database: row.get(0),
@@ -1698,6 +2085,13 @@ mod tests {
             role: row.get(1),
             owner: row.get(1),
             server_version: row.get(2),
+            server_address: row.get(3),
+            server_port: row.get(4),
+            transport: if row.get::<_, Option<String>>(3).is_some() {
+                ExpectedTransport::PlaintextTcp
+            } else {
+                ExpectedTransport::UnixSocket
+            },
             staging_prefix: "t_".into(),
         };
         let spool = tempfile::tempdir().unwrap();
@@ -1808,7 +2202,7 @@ mod tests {
         let main = super::super::main_import::tests::sqlite_snapshot(files.path());
         let mut c = base.pool.get().unwrap();
         let row = c
-            .query_one("select current_database(),current_user,current_setting('server_version_num')::integer", &[])
+            .query_one("select current_database(),current_user,current_setting('server_version_num')::integer,host(inet_server_addr()),inet_server_port()", &[])
             .unwrap();
         let database: String = row.get(0);
         super::super::main_import::import_snapshot(&main, &mut c, &database, &stage).unwrap();
@@ -1839,6 +2233,13 @@ mod tests {
             role: row.get(1),
             owner: row.get(1),
             server_version: row.get(2),
+            server_address: row.get(3),
+            server_port: row.get(4),
+            transport: if row.get::<_, Option<String>>(3).is_some() {
+                ExpectedTransport::PlaintextTcp
+            } else {
+                ExpectedTransport::UnixSocket
+            },
             staging_prefix: "atlas_stage_".into(),
         };
         let mut owner = ImportOwner::connect(config, expected, spool.path().into(), 4 * 1024 * 1024).unwrap();
@@ -1889,7 +2290,7 @@ mod tests {
         let Some(test) = crate::pg::testing::Schema::empty() else { return };
         let mut c = test.pool.get().unwrap();
         let row = c
-            .query_one("select current_database(),current_user,current_setting('server_version_num')::integer", &[])
+            .query_one("select current_database(),current_user,current_setting('server_version_num')::integer,host(inet_server_addr()),inet_server_port()", &[])
             .unwrap();
         let expected = ExpectedDestination {
             database: row.get(0),
@@ -1897,6 +2298,13 @@ mod tests {
             role: row.get(1),
             owner: row.get(1),
             server_version: row.get(2),
+            server_address: row.get(3),
+            server_port: row.get(4),
+            transport: if row.get::<_, Option<String>>(3).is_some() {
+                ExpectedTransport::PlaintextTcp
+            } else {
+                ExpectedTransport::UnixSocket
+            },
             staging_prefix: "t_".into(),
         };
         let config = StorageConfig {
@@ -1966,6 +2374,346 @@ mod tests {
                 "group policy may not receive a fresh full metadata budget"
             );
             assert!(snapshot.stats().payload_bytes <= budget.bytes);
+        });
+    }
+    struct Fixture {
+        target: crate::pg::testing::Schema,
+        _files: tempfile::TempDir,
+        source: Source,
+        spool: tempfile::TempDir,
+        config: StorageConfig,
+        expected: ExpectedDestination,
+    }
+    impl Fixture {
+        fn new() -> Option<Self> {
+            Self::with_frozen(false)
+        }
+        fn with_frozen(frozen: bool) -> Option<Self> {
+            Self::with_frame_count(if frozen { 2 } else { 0 })
+        }
+        fn with_frame_count(frames: usize) -> Option<Self> {
+            let target = crate::pg::testing::Schema::empty()?;
+            let mut c = target.pool.get().unwrap();
+            let row=c.query_one("select current_database(),current_user,current_setting('server_version_num')::integer,host(inet_server_addr()),inet_server_port()",&[]).unwrap();
+            let expected = ExpectedDestination {
+                database: row.get(0),
+                schema: target.name.clone(),
+                role: row.get(1),
+                owner: row.get(1),
+                server_version: row.get(2),
+                server_address: row.get(3),
+                server_port: row.get(4),
+                transport: if row.get::<_, Option<String>>(3).is_some() {
+                    ExpectedTransport::PlaintextTcp
+                } else {
+                    ExpectedTransport::UnixSocket
+                },
+                staging_prefix: "t_".into(),
+            };
+            let config = StorageConfig {
+                backend: super::super::Backend::Postgres,
+                url: target.url.clone(),
+                schema: target.name.clone(),
+                allow_plaintext: true,
+                ..Default::default()
+            };
+            let (files, mut manifest) = crate::history_source::tests::fixture();
+            crate::history_source::tests::seed_current(&mut manifest, 2);
+            if frames > 0 {
+                crate::history_source::tests::seed_frozen_count(&mut manifest, false, frames, 2048);
+            }
+            let source = Source::open(manifest, 1 << 20).unwrap();
+            let spool = tempfile::tempdir().unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(spool.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            drop(c);
+            Some(Self { target, _files: files, source, spool, config, expected })
+        }
+        fn owner(&self) -> ImportOwner {
+            ImportOwner::connect(self.config.clone(), self.expected.clone(), self.spool.path().into(), 4 * 1024 * 1024)
+                .unwrap()
+        }
+    }
+    fn finish_pages(owner: &mut ImportOwner, source: &Source, id: ImportId, mut seq: i64) -> Result<()> {
+        for _ in 0..10000 {
+            let r = owner.step(source, id, seq, ImportBudget::default())?;
+            seq = r.sequence;
+            if r.complete {
+                return owner.finish_identity(source, id);
+            }
+        }
+        bail!("test exceeded bounded fixture pages")
+    }
+    fn capture_fixture(f: &Fixture, owner: &mut ImportOwner, id: ImportId) -> i64 {
+        let mut seq = 0;
+        loop {
+            let r = owner.step(&f.source, id, seq, ImportBudget::default()).unwrap();
+            seq = r.sequence;
+            let data: Vec<u8> = owner.client.query_one("select checkpoint from history_imports", &[]).unwrap().get(0);
+            let state: State = serde_json::from_slice(&data).unwrap();
+            if state.phase == 3 {
+                return seq;
+            }
+            assert!(!r.complete, "fixture must expose validation boundary");
+        }
+    }
+    #[test]
+    fn oversized_durable_checkpoint_payloads_are_rejected_before_materialization() {
+        for mode in ["checkpoint", "replay", "continue", "finish"] {
+            let Some(f) = Fixture::new() else { return };
+            let mut owner = f.owner();
+            let id = owner.begin(&f.source).unwrap();
+            let mut sequence = 0;
+            if mode != "checkpoint" {
+                loop {
+                    let receipt = owner.step(&f.source, id, sequence, ImportBudget::default()).unwrap();
+                    sequence = receipt.sequence;
+                    if mode != "finish" || receipt.complete {
+                        break;
+                    }
+                }
+            }
+            let mut c = f.target.pool.get().unwrap();
+            let sql = if mode == "checkpoint" {
+                "select checkpoint from history_imports"
+            } else {
+                "select bookmark from history_checkpoints where sequence=$1"
+            };
+            let row = if mode == "checkpoint" {
+                c.query_one(sql, &[]).unwrap()
+            } else {
+                c.query_one(sql, &[&sequence]).unwrap()
+            };
+            let mut bytes: Vec<u8> = row.get(0);
+            bytes.resize(1024 * 1024, b' '); // Valid JSON padding must not bypass payload admission.
+            if mode == "checkpoint" {
+                c.execute("update history_imports set checkpoint=$1", &[&bytes]).unwrap();
+            } else {
+                let digest = Sha256::digest(&bytes).to_vec();
+                c.execute(
+                    "update history_checkpoints set bookmark=$1,digest=$2 where sequence=$3",
+                    &[&bytes, &digest, &sequence],
+                )
+                .unwrap();
+            }
+            let result = if mode == "finish" {
+                owner.finish_identity(&f.source, id)
+            } else {
+                owner
+                    .step(
+                        &f.source,
+                        id,
+                        if mode == "replay" { sequence - 1 } else { sequence },
+                        ImportBudget::default(),
+                    )
+                    .map(|_| ())
+            };
+            let error = result.expect_err("oversized valid checkpoint JSON was admitted");
+            let error = error.downcast_ref::<HistoryError>().expect("structured checkpoint admission error");
+            assert_eq!(error.code, ErrorCode::CorruptObject);
+            assert!(error.to_string().contains("checkpoint payload admission"), "{mode}: {error}");
+        }
+    }
+    #[test]
+    fn import_validation_rejects_corrupt_final_checkpoint() {
+        let Some(f) = Fixture::new() else { return };
+        let mut owner = f.owner();
+        let id = owner.begin(&f.source).unwrap();
+        let mut seq = 0;
+        loop {
+            let r = owner.step(&f.source, id, seq, ImportBudget::default()).unwrap();
+            seq = r.sequence;
+            if r.complete {
+                break;
+            }
+        }
+        let mut c = f.target.pool.get().unwrap();
+        c.execute("update history_checkpoints set digest=decode(repeat('00',32),'hex') where sequence=$1", &[&seq])
+            .unwrap();
+        assert!(
+            owner.finish_identity(&f.source, id).is_err(),
+            "publication must authenticate the final durable bookmark"
+        );
+    }
+    #[test]
+    fn import_validation_rejects_corrupt_ambiguous_checkpoint_receipt() {
+        let Some(f) = Fixture::new() else { return };
+        let mut owner = f.owner();
+        let id = owner.begin(&f.source).unwrap();
+        let r = owner.step(&f.source, id, 0, ImportBudget::default()).unwrap();
+        assert_eq!(r.sequence, 1);
+        let mut c = f.target.pool.get().unwrap();
+        c.batch_execute("update history_checkpoints set digest=decode(repeat('00',32),'hex')").unwrap();
+        assert!(
+            owner.step(&f.source, id, 0, ImportBudget::default()).is_err(),
+            "ambiguous replay must authenticate the stored receipt"
+        );
+    }
+    #[test]
+    fn import_validation_rejects_cross_release_metadata_reference() {
+        let Some(f) = Fixture::new() else { return };
+        let mut owner = f.owner();
+        let id = owner.begin(&f.source).unwrap();
+        let seq = capture_fixture(&f, &mut owner, id);
+        let mut c = f.target.pool.get().unwrap();
+        c.batch_execute("update history_release_variants set metadata_object_id=(select metadata_object_id from history_release_variants where public_id=5) where public_id=3").unwrap();
+        assert!(
+            finish_pages(&mut owner, &f.source, id, seq).is_err(),
+            "a valid object from a different release is not valid metadata for this variant"
+        );
+    }
+    #[test]
+    fn import_validation_rejects_unregistered_extra_object() {
+        let Some(f) = Fixture::new() else { return };
+        let mut owner = f.owner();
+        let id = owner.begin(&f.source).unwrap();
+        let seq = capture_fixture(&f, &mut owner, id);
+        let mut c = f.target.pool.get().unwrap();
+        c.execute("insert into history_objects(import_id,object_id,source_id,scope_release_id,object_kind,source_bookmark,locator_digest,byte_length,digest,validated) select $1,max(object_id)+1,0,0,'metadata','extra',$2,0,$3,true from history_objects",&[&&id[..],&Sha256::digest(b"extra").to_vec(),&Sha256::digest([]).to_vec()]).unwrap();
+        assert!(
+            finish_pages(&mut owner, &f.source, id, seq).is_err(),
+            "extra durable objects are not part of the admitted checkpoint"
+        );
+    }
+
+    #[test]
+    fn import_validation_rejects_last_capture_page_chunk_corruption() {
+        let Some(f) = Fixture::new() else { return };
+        let mut owner = f.owner();
+        let id = owner.begin(&f.source).unwrap();
+        let seq = capture_fixture(&f, &mut owner, id);
+        let mut c = f.target.pool.get().unwrap();
+        c.batch_execute("update history_object_chunks set bytes=set_byte(bytes,0,get_byte(bytes,0)#1) where object_id=(select metadata_object_id from history_release_variants where public_id=5)").unwrap();
+        assert!(
+            finish_pages(&mut owner, &f.source, id, seq).is_err(),
+            "newly captured chunks must be validated after their capture commit"
+        );
+    }
+
+    #[test]
+    fn owner_loss_is_terminal_and_recovery_replays_exact_committed_receipt() {
+        let Some(f) = Fixture::new() else { return };
+        let mut owner = f.owner();
+        let id = owner.begin(&f.source).unwrap();
+        assert!(
+            ImportOwner::connect(f.config.clone(), f.expected.clone(), f.spool.path().into(), 4 * 1024 * 1024).is_err(),
+            "a second importer cannot share ownership"
+        );
+        let receipt = owner.step(&f.source, id, 0, ImportBudget::default()).unwrap();
+        assert_eq!(
+            owner.step(&f.source, id, 0, ImportBudget::default()).unwrap(),
+            receipt,
+            "same-session ambiguous acknowledgment is exact"
+        );
+        let pid: i32 = owner.client.query_one("select pg_backend_pid()", &[]).unwrap().get(0);
+        let mut c = f.target.pool.get().unwrap();
+        assert!(c.query_one("select pg_terminate_backend($1)", &[&pid]).unwrap().get::<_, bool>(0));
+        assert!(owner.step(&f.source, id, receipt.sequence, ImportBudget::default()).is_err());
+        assert!(owner.terminal);
+        assert!(owner.begin(&f.source).is_err(), "lost owners never reconnect");
+        drop(owner);
+        let mut recovered = f.owner();
+        assert_eq!(recovered.begin(&f.source).unwrap(), id);
+        assert_eq!(
+            recovered.step(&f.source, id, 0, ImportBudget::default()).unwrap(),
+            receipt,
+            "new-owner ambiguous replay is exact"
+        );
+        finish_pages(&mut recovered, &f.source, id, receipt.sequence).unwrap();
+        let next: i64 = c.query_one("select nextval(pg_get_serial_sequence('releases','id'))", &[]).unwrap().get(0);
+        assert_eq!(next, 900);
+        recovered.begin(&f.source).unwrap();
+        let next: i64 = c.query_one("select nextval(pg_get_serial_sequence('releases','id'))", &[]).unwrap().get(0);
+        assert_eq!(next, 901, "resume may not regress consumed allocator reservation");
+    }
+    #[test]
+    fn frozen_owner_recovery_resumes_capture_validation_projection_and_index() {
+        let budget =
+            ImportBudget { source_rows: 8, source_bytes: 512, mutations: 64, copy_bytes: 262144, chunk_bytes: 7 };
+        for desired in [0u8, 1, 2, 3] {
+            let Some(f) = Fixture::with_frozen(true) else { return };
+            let mut owner = f.owner();
+            let id = owner.begin(&f.source).unwrap();
+            let mut seq = 0;
+            let mut reached = false;
+            for _ in 0..10000 {
+                let r = owner.step(&f.source, id, seq, budget).unwrap();
+                seq = r.sequence;
+                let bytes: Vec<u8> =
+                    owner.client.query_one("select checkpoint from history_imports", &[]).unwrap().get(0);
+                let state: State = serde_json::from_slice(&bytes).unwrap();
+                if state
+                    .pending
+                    .as_ref()
+                    .is_some_and(|p| p.row.key == 3 && p.frozen.as_ref().is_some_and(|v| v.phase == desired))
+                {
+                    reached = true;
+                    break;
+                }
+                assert!(!r.complete, "requested recovery phase must be observable");
+            }
+            assert!(reached, "phase {desired}");
+            let started = std::time::Instant::now();
+            drop(owner);
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(2),
+                "paused decoder cancellation must join promptly"
+            );
+            let mut owner = f.owner();
+            owner.begin(&f.source).unwrap();
+            finish_pages(&mut owner, &f.source, id, seq).unwrap();
+            let mut c = f.target.pool.get().unwrap();
+            let ids: Vec<i64> = c
+                .query("select public_id from history_catalog order by public_id", &[])
+                .unwrap()
+                .iter()
+                .map(|r| r.get(0))
+                .collect();
+            assert_eq!(ids, [3, 5, 41]);
+            assert_eq!(
+                std::fs::read_dir(f.spool.path()).unwrap().count(),
+                1,
+                "owned frame spools cleaned after publication"
+            );
+        }
+    }
+
+    #[test]
+    fn small_frozen_frames_share_admitted_pages_instead_of_one_phase_commit_each() {
+        let count = 32;
+        let Some(f) = Fixture::with_frame_count(count) else { return };
+        let mut owner = f.owner();
+        let id = owner.begin(&f.source).unwrap();
+        let sequence = capture_fixture(&f, &mut owner, id);
+        assert!(sequence < count as i64, "{count} small fully admitted frames used {sequence} capture commits");
+        println!("{}", serde_json::json!({"case":"packed_small_frames","frames":count,"capture_pages":sequence}));
+        finish_pages(&mut owner, &f.source, id, sequence).unwrap();
+        let mut c = f.target.pool.get().unwrap();
+        assert_eq!(
+            c.query_one("select count(*) from history_release_variants where source_id=3", &[])
+                .unwrap()
+                .get::<_, i64>(0),
+            count as i64
+        );
+    }
+
+    #[test]
+    fn request_admission_rejects_nonprogressing_value_byte_budget() {
+        inspect_fixture(0, |client, id| {
+            use super::super::history_catalog::{ReadBudget, Snapshot};
+            let mut snapshot = Snapshot::open(client, id).unwrap();
+            let mut cursor = snapshot
+                .value_cursor(&Value::Inline { kind: crate::history_identity::CellType::Blob, bytes: vec![1] })
+                .unwrap();
+            assert!(
+                snapshot
+                    .read_value(&mut cursor, ReadBudget { rows: 1, bytes: 128, chunk_bytes: 1 }, |_| Ok(()))
+                    .is_err(),
+                "a nonempty value cannot accept a page with no payload admission"
+            );
         });
     }
 }
