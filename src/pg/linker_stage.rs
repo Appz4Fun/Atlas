@@ -79,10 +79,18 @@ pub(crate) fn stage_verified(
     let view = NxvBlockView::from_mmap_slice(&block.map[start..end]).context("reading verified native source block")?;
     let mut tx = super::linker::durable_transaction(client)?;
     let source = tx.query_one(
-        "insert into linker_source_blocks(group_name,day,generation,seq,digest,rows)
-         values($1,$2,$3,$4,$5,$6) on conflict(group_name,day,generation,seq,digest)
-         do update set rows=linker_source_blocks.rows returning id,scanned,complete,rows",
-        &[&group, &day, &&block.identity[..], &(entry.seq as i64), &&block.digest[..], &(entry.rows as i64)],
+        "insert into linker_source_blocks(group_name,day,generation,seq,digest,rows,manifest)
+         values($1,$2,$3,$4,$5,$6,$7) on conflict(group_name,day,generation,seq,digest)
+         do update set rows=linker_source_blocks.rows,manifest=excluded.manifest returning id,scanned,complete,rows",
+        &[
+            &group,
+            &day,
+            &&block.identity[..],
+            &(entry.seq as i64),
+            &&block.digest[..],
+            &(entry.rows as i64),
+            &&entry.to_bytes()[..],
+        ],
     )?;
     let id: i64 = source.get(0);
     let before: i64 = source.get(1);
@@ -143,7 +151,7 @@ pub(crate) fn stage_verified(
         // hash-only records use the same representation in PostgreSQL bigint.
         let legacy_hash = nntp_xover_engine::msgid_index::msgid_hash(message.as_bytes()) as i64;
         tx.execute(
-            "insert into linker_staged_rows(source,ordinal,message_key,legacy_hash,message_id,poster,posted,group_id,article_number,bytes,lines) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+            "insert into linker_staged_rows(source,ordinal,message_key,legacy_hash,message_id,poster,posted,group_id,article_number,bytes,lines,published) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,exists(select 1 from linker_linked_ids where message_key=$3 and message_id=$5))",
             &[
                 &id,
                 &scanned,

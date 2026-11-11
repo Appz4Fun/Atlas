@@ -407,3 +407,19 @@ create index linker_unstaged_inventory on linker_epoch_inventory(epoch,group_nam
     where scanned_blocks<blocks;
 create index linker_emission_header on linker_emission_files(epoch,release_name,group_name,id);
 create index linker_emission_file_rows on linker_emission_rows(epoch,file_id,part);
+
+-- Exact append-only manifest identity permits already durable source reuse
+-- without touching/re-hashing the raw block on each historical scope.
+alter table linker_source_blocks add column manifest bytea;
+create index linker_complete_manifest on linker_source_blocks(group_name,day,generation,seq,manifest) where complete;
+-- A source-ID high-watermark snapshots the immutable pending inbox without
+-- copying its entire historical source set into every idle epoch.
+alter table linker_epochs add column pending_source_through bigint not null default 0;
+create index linker_places_expiry on linker_places(added,poster);
+create index linker_uploads_expiry on linker_uploads(added,release_name);
+-- Publication receipts enqueue only proven full identities. Cleanup seeks
+-- those keys rather than repeatedly scanning all unresolved source rows.
+create table linker_duplicate_work (
+    message_key bytea primary key,
+    message_id bytea not null
+);

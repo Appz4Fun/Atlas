@@ -19,12 +19,7 @@ pub(crate) fn open(client: &mut Client, now: i64) -> Result<i64> {
         return Ok(row.get(0));
     }
     let epoch: i64 = tx.query_one("insert into linker_epochs(logical_now) values($1) returning id", &[&now])?.get(0);
-    tx.execute(
-        "insert into linker_epoch_pending_sources(epoch,source)
-        select $1,b.id from linker_source_blocks b where complete and exists
-        (select 1 from linker_staged_rows s where s.source=b.id and not published)",
-        &[&epoch],
-    )?;
+    tx.execute("update linker_epochs set pending_source_through=(select coalesce(max(id),0) from linker_source_blocks) where id=$1",&[&epoch])?;
     tx.commit()?;
     Ok(epoch)
 }
@@ -81,7 +76,8 @@ pub(crate) fn scope(client: &mut Client, epoch: i64) -> Result<bool> {
     let first:Option<i64>=tx.query_one("with hours as (
         select distinct generate_series(day*24-14,day*24+37) as h from (
           select day from linker_epoch_inventory where epoch=$1 and blocks>0 union
-          select b.day from linker_epoch_pending_sources p join linker_source_blocks b on b.id=p.source where p.epoch=$1) days)
+          select b.day from linker_source_blocks b where b.id<=(select pending_source_through from linker_epochs where id=$1) and b.complete
+            and exists(select 1 from linker_staged_rows r where r.source=b.id and not r.published)) days)
         select min(h) from hours where not exists(select 1 from linker_linked_hours l where l.hour=h)
         and (h+1)*3600+$4<=$2 and (
           not exists(select 1 from backfill_chunks where state<>2
@@ -99,8 +95,9 @@ pub(crate) fn scope(client: &mut Client, epoch: i64) -> Result<bool> {
                 .query_one(
                     "select (exists(select 1 from linker_epoch_inventory where epoch=$1 and blocks>0
                 and $2 between day*24-14 and day*24+37) or exists(
-                  select 1 from linker_epoch_pending_sources p join linker_source_blocks b on b.id=p.source
-                  where p.epoch=$1 and $2 between b.day*24-14 and b.day*24+37))
+                  select 1 from linker_source_blocks b where b.id<=(select pending_source_through from linker_epochs where id=$1) and b.complete
+                  and exists(select 1 from linker_staged_rows r where r.source=b.id and not r.published)
+                  and $2 between b.day*24-14 and b.day*24+37))
                 and not exists(select 1 from linker_linked_hours where hour=$2)",
                     &[&epoch, &hour],
                 )?
@@ -135,7 +132,8 @@ pub(crate) fn scope(client: &mut Client, epoch: i64) -> Result<bool> {
     tx.execute("delete from linker_epoch_sources where epoch=$1", &[&epoch])?;
     tx.execute("with captured as (
           select source from linker_inventory_blocks where epoch=$1 union
-          select source from linker_epoch_pending_sources where epoch=$1
+          select b.id from linker_source_blocks b where b.id<=(select pending_source_through from linker_epochs where id=$1) and b.complete
+            and exists(select 1 from linker_staged_rows r where r.source=b.id and not r.published)
         ) insert into linker_epoch_sources(epoch,source,old_block,new_block)
         select $1,b.id,(b.was_read or b.legacy_priority),not b.was_read from captured join linker_source_blocks b on b.id=captured.source
         where (

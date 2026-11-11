@@ -122,6 +122,14 @@ fn receipt(client: &mut Client, epoch: i64, before: i64, through: i64, finished:
         &[&epoch, &before, &through, &now],
     )?;
     tx.execute(
+        "insert into linker_duplicate_work(message_key,message_id)
+        select distinct on(s.message_key) s.message_key,s.message_id from linker_emission_rows e
+        join linker_staged_rows s on s.source=e.source and s.ordinal=e.source_ordinal
+        where e.epoch=$1 and e.ordinal>$2 and e.ordinal<=$3 order by s.message_key,e.ordinal
+        on conflict(message_key) do nothing",
+        &[&epoch, &before, &through],
+    )?;
+    tx.execute(
         "update linker_staged_rows s set published=true from linker_emission_rows e
         where e.epoch=$1 and e.ordinal>$2 and e.ordinal<=$3 and s.source=e.source and s.ordinal=e.source_ordinal",
         &[&epoch, &before, &through],

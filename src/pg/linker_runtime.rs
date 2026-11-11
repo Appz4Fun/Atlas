@@ -90,6 +90,8 @@ pub(crate) async fn run(db: Db, store: Arc<Store>, stopping: impl Fn() -> bool) 
     store.set_linker_coverage(Some(Arc::new(move |group, day, generation, count| {
         on_native_db_sync(&coverage_db, |c| super::linker_stage::covered(c, group, day, generation, count))
     })));
+    let session_now = chrono::Utc::now().timestamp();
+    let mut metadata_expired = false;
     let mut imported = false;
     let mut current = None;
     let mut source_cache = super::linker_source::Cache::default();
@@ -105,6 +107,13 @@ pub(crate) async fn run(db: Db, store: Arc<Store>, stopping: impl Fn() -> bool) 
                 && on_native_db(&db, |c| super::linker_gc::step(c, chrono::Utc::now().timestamp(), 256)).await?
             {
                 return Ok(false);
+            }
+            if current.is_none() && !metadata_expired {
+                match on_native_db(&db, move |c| super::linker_gc::expire_metadata(c, session_now, 256)).await? {
+                    super::linker_gc::MetadataExpiry::Deferred => {}
+                    super::linker_gc::MetadataExpiry::Progress => return Ok(false),
+                    super::linker_gc::MetadataExpiry::Complete => metadata_expired = true,
+                }
             }
             let epoch = match current {
                 Some(epoch) => epoch,
@@ -248,6 +257,11 @@ mod tests {
                         }
                     }
                 }
+                assert_eq!(
+                    source_cache.verifications,
+                    blocks as u64 + 1,
+                    "completed blocks were rehashed in the next epoch"
+                );
             });
             let mut c = schema.pool.get().unwrap();
             assert_eq!(c.query_one("select count(*) from segments", &[]).unwrap().get::<_, i64>(0), 12);
@@ -278,8 +292,40 @@ mod tests {
         store.tick().unwrap();
         ticket.wait(Duration::from_secs(5)).unwrap();
         store.close().unwrap();
+        let old_time = 120000 - 9 * crate::xref::KEEP_SECS;
+        let old_place = crate::nxv_store::linker::PlaceRec {
+            place: crate::xref::Place {
+                release: "xref-upload-stale".into(),
+                group: "group.example".into(),
+                file: 1,
+                files: 1,
+                parts: 12,
+                leads: "1".into(),
+                oldest: old_time,
+            },
+            firsts: Default::default(),
+            added: old_time,
+        };
+        let old_upload = crate::nxv_store::linker::UploadRec {
+            group: "group.example".into(),
+            seed: crate::xref::Seed { groups: Default::default(), first: 99000, last: 99000 },
+            files: 1,
+            generation: 3,
+            probed: 1,
+            added: old_time,
+        };
+        let legacy_records = format!(
+            "{}{}",
+            crate::nxv_store::linker::Links::place_line("current@example.invalid", &old_place),
+            crate::nxv_store::linker::Links::upload_line("xref-upload-stale", &old_upload)
+        );
+        let state_dir = dir.path().join("_state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(state_dir.join("links.rec"), &legacy_records).unwrap();
         let legacy_dir = tempfile::tempdir().unwrap();
+        std::fs::write(legacy_dir.path().join("links.rec"), &legacy_records).unwrap();
         let mut legacy = crate::nxv_store::linker::Linker::open_in(legacy_dir.path(), 120000).unwrap();
+        assert!(legacy.links.lock().unwrap().places.is_empty());
         legacy.state.linked.extend((-14..=100).filter(|h| ![27, 40].contains(h)));
         let mut golden = Vec::new();
         for now in [120000, 250000] {
@@ -302,7 +348,8 @@ mod tests {
         )
         .unwrap();
         let mut c = schema.pool.get().unwrap();
-        super::super::linker_bootstrap::import(&mut c, &dir.path().join("_state"), 120000).unwrap();
+        super::super::linker_bootstrap::import(&mut c, &state_dir, old_time).unwrap();
+        assert_eq!(c.query_one("select count(*) from linker_places", &[]).unwrap().get::<_, i64>(0), 1);
         c.execute(
             "insert into linker_linked_hours select h from generate_series(-14,100) h where h not in(27,40)",
             &[],
@@ -334,6 +381,23 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
             let mut source_cache = super::super::linker_source::Cache::default();
+            let restart_dir = state_dir.clone();
+            on_native_db(&db, move |c| super::super::linker_bootstrap::import(c, &restart_dir, 120000)).await.unwrap();
+            assert_eq!(
+                on_native_db(&db, |c| Ok(c.query_one("select count(*) from linker_places", &[])?.get::<_, i64>(0)))
+                    .await
+                    .unwrap(),
+                1
+            );
+            for turn in 0..100 {
+                assert!(turn < 99);
+                if matches!(
+                    on_native_db(&db, |c| super::super::linker_gc::expire_metadata(c, 120000, 2)).await.unwrap(),
+                    super::super::linker_gc::MetadataExpiry::Complete
+                ) {
+                    break;
+                }
+            }
             for (now, expected) in [(120000i64, 12i64), (250000, 24)] {
                 let epoch = on_native_db(&db, move |c| super::super::linker_epoch::open(c, now)).await.unwrap();
                 let pin = store.pin_linker_retention();
@@ -420,6 +484,6 @@ mod tests {
             c.query_one("select count(*) from linker_staged_rows where published", &[]).unwrap().get::<_, i64>(0),
             12
         );
-        assert!(!dir.path().join("_state/links.rec").exists());
+        assert_eq!(std::fs::read_to_string(state_dir.join("links.rec")).unwrap(), legacy_records);
     }
 }

@@ -157,12 +157,20 @@ pub(crate) async fn step(db: &Db, store: &Arc<Store>, epoch: i64, budget: Budget
     ensure!(entry.seq as i64 == index, "native source manifest sequence changed");
     let prior = cache.block.take();
     let (verified,fresh,result)=on_native_db(db,move|c| {
-        let (verified,fresh)=match prior {
-            Some(block) if block.identity==snapshot.identity && block.entry==entry => (block,false),
-            _=>(super::linker_stage::VerifiedBlock::new(&snapshot,entry)?,true),
+        let known=c.query_opt("select id,scanned from linker_source_blocks where group_name=$1 and day=$2 and generation=$3 and seq=$4 and manifest=$5 and complete order by id limit 1",
+            &[&group,&day,&&snapshot.identity[..],&index,&&entry.to_bytes()[..]])?;
+        let (verified,fresh,progress)=if let Some(row)=known {
+            (prior,false,Ok(super::linker_stage::Progress{source:row.get(0),scanned:row.get(1),complete:true}))
+        }else{
+            let (verified,fresh)=match prior {
+                Some(block) if block.identity==snapshot.identity && block.entry==entry => (block,false),
+                _=>(super::linker_stage::VerifiedBlock::new(&snapshot,entry)?,true),
+            };
+            let progress=super::linker_stage::stage_verified(c,&verified,&group,day,budget);
+            (Some(verified),fresh,progress)
         };
         let result=(||->Result<()> {
-            let progress=super::linker_stage::stage_verified(c,&verified,&group,day,budget)?;
+            let progress=progress?;
             ensure!(progress.scanned<=i64::from(entry.rows),"native source cursor exceeds manifest rows");
             if progress.complete {
                 ensure!(progress.scanned==i64::from(entry.rows),"native completed source cursor differs from manifest rows");
@@ -177,7 +185,7 @@ pub(crate) async fn step(db: &Db, store: &Arc<Store>, epoch: i64, budget: Budget
         })();
         Ok((verified,fresh,result))
     }).await?;
-    cache.block = Some(verified);
+    cache.block = verified;
     cache.verifications += u64::from(fresh);
     result?;
     Ok(false)

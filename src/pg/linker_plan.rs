@@ -455,6 +455,17 @@ mod tests {
         while !super::super::linker::plan_files(&mut c, epoch, 1).unwrap() {}
         assert!(late_one(&mut c, epoch).unwrap());
         assert!(!late_one(&mut c, epoch).unwrap());
+        c.batch_execute("create function fail_fresh_plan() returns trigger language plpgsql as $$ begin
+            if new.poster=convert_to('fresh@example.invalid','UTF8') then raise exception 'synthetic plan storage exhaustion' using errcode='53100'; end if; return new; end $$;
+            create trigger fail_fresh_plan before insert or update on linker_planned_places for each row execute function fail_fresh_plan()").unwrap();
+        assert!(chain_one(&mut c, epoch).is_err());
+        assert_eq!(
+            c.query_one("select count(*) from linker_emission_rows where epoch=$1", &[&epoch])
+                .unwrap()
+                .get::<_, i64>(0),
+            2
+        );
+        c.batch_execute("drop trigger fail_fresh_plan on linker_planned_places").unwrap();
         while !chain_one(&mut c, epoch).unwrap() {}
         c.execute("update linker_epochs set phase='ack',emitted=planned_rows where id=$1", &[&epoch]).unwrap();
         ack(&mut c, epoch).unwrap();
@@ -508,6 +519,15 @@ mod tests {
         assert_eq!((r.get::<_, i64>(0), r.get::<_, i64>(1), r.get::<_, i64>(2)), (12, 1, 12));
         assert!(ack(&mut c, epoch).is_err());
         c.execute("update linker_epochs set phase='ack',emitted=12 where id=$1", &[&epoch]).unwrap();
+        c.batch_execute("create function fail_ack() returns trigger language plpgsql as $$ begin raise exception 'synthetic acknowledgement storage exhaustion' using errcode='53100'; end $$;
+            create trigger fail_ack before insert or update on linker_uploads for each row execute function fail_ack()").unwrap();
+        assert!(ack(&mut c, epoch).is_err());
+        assert_eq!(c.query_one("select count(*) from linker_places", &[]).unwrap().get::<_, i64>(0), 0);
+        assert_eq!(
+            c.query_one("select phase from linker_epochs where id=$1", &[&epoch]).unwrap().get::<_, String>(0),
+            "ack"
+        );
+        c.batch_execute("drop trigger fail_ack on linker_uploads").unwrap();
         ack(&mut c, epoch).unwrap();
         ack(&mut c, epoch).unwrap();
         let r = c.query_one("select parts,file_number,file_total from linker_places", &[]).unwrap();
