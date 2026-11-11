@@ -117,7 +117,7 @@ pub(crate) fn stage_block(
         // hash-only records use the same representation in PostgreSQL bigint.
         let legacy_hash = nntp_xover_engine::msgid_index::msgid_hash(message.as_bytes()) as i64;
         tx.execute(
-            "insert into linker_staged_rows values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+            "insert into linker_staged_rows(source,ordinal,message_key,legacy_hash,message_id,poster,posted,group_id,article_number,bytes,lines) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
             &[
                 &id,
                 &scanned,
@@ -174,7 +174,8 @@ mod tests {
         let (seg, _) = Segment::open(dir.path(), day).unwrap();
         let rows: Vec<_> = (1..=5).map(|n| {
             let id=format!("{:032x}",n);
-            format!("{n}\t{id}\tposter@example.invalid\tSun, 08 Nov 2026 10:00:00 +0000\t<{id}@example.invalid>\t\t700000\t5000").into_bytes()
+            let subject=if n==3 {"[1/1] - \"file.part01.rar\" yEnc (1/3)".to_string()}else{id.clone()};
+            format!("{n}\t{subject}\tposter@example.invalid\tSun, 08 Nov 2026 10:00:00 +0000\t<{id}@example.invalid>\t\t700000\t5000").into_bytes()
         }).collect();
         let refs: Vec<&[u8]> = rows.iter().map(Vec::as_slice).collect();
         let bytes = NxvBlockBuilder::build_hot_block_meta(&refs, BlockMeta { server_id: 1, slab_gen: 1 }).unwrap();
@@ -217,6 +218,6 @@ mod tests {
             .query_one("select count(*) from linker_staged_rows where source=$1", &[&first.source])
             .unwrap()
             .get(0);
-        assert_eq!(count, 5);
+        assert_eq!(count, 4);
     }
 }

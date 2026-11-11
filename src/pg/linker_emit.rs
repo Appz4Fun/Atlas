@@ -117,6 +117,11 @@ fn receipt(client: &mut Client, epoch: i64, before: i64, through: i64, finished:
         &[&epoch, &before, &through, &now],
     )?;
     tx.execute(
+        "update linker_staged_rows s set published=true from linker_emission_rows e
+        where e.epoch=$1 and e.ordinal>$2 and e.ordinal<=$3 and s.source=e.source and s.ordinal=e.source_ordinal",
+        &[&epoch, &before, &through],
+    )?;
+    tx.execute(
         "update linker_epochs set emitted=$2,phase=case when $3 then 'ack' else 'emit' end where id=$1",
         &[&epoch, &through, &finished],
     )?;
@@ -181,7 +186,7 @@ mod tests {
             let message = format!("<part{n}@example.invalid>");
             let key: [u8; 32] = Sha256::digest(message.as_bytes()).into();
             c.execute(
-                "insert into linker_staged_rows values($1,$2,$3,0,$4,$5,$6,1,$2,100,1)",
+                "insert into linker_staged_rows(source,ordinal,message_key,legacy_hash,message_id,poster,posted,group_id,article_number,bytes,lines) values($1,$2,$3,0,$4,$5,$6,1,$2,100,1)",
                 &[&source, &n, &&key[..], &message.as_bytes(), &b"poster@example.invalid".as_slice(), &now],
             )
             .unwrap();

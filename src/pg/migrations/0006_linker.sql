@@ -3,7 +3,7 @@
 create table linker_epochs (
     id bigint generated always as identity primary key,
     logical_now bigint not null,
-    phase text not null default 'stage' check (phase in ('stage','files','chain','plan','emit','ack','done')),
+    phase text not null default 'stage' check (phase in ('stage','select','files','chain','plan','emit','ack','done')),
     active_serial bigint not null default 0,
     next_chain bigint not null default 0,
     emitted bigint not null default 0
@@ -178,3 +178,104 @@ create table linker_file_rows (
     foreign key(source,source_ordinal) references linker_staged_rows(source,ordinal)
 );
 create index linker_file_rows_order on linker_file_rows(epoch,file_id,source_rank);
+
+alter table linker_epochs add column lo bigint;
+alter table linker_epochs add column hi bigint;
+alter table linker_epochs add column waiting_from bigint;
+alter table linker_source_blocks add column was_read boolean not null default false;
+create table linker_linked_hours (hour bigint primary key);
+create table linker_day_seen (day bigint primary key,first_seen bigint not null);
+create table linker_epoch_hours (
+    epoch bigint not null references linker_epochs(id) on delete cascade,
+    hour bigint not null,
+    primary key(epoch,hour)
+);
+create table linker_epoch_inventory (
+    epoch bigint not null references linker_epochs(id) on delete cascade,
+    group_name text collate "C" not null,
+    day bigint not null,
+    generation bytea not null,
+    blocks bigint not null,
+    scanned_blocks bigint not null default 0,
+    primary key(epoch,group_name,day),
+    check(scanned_blocks between 0 and blocks)
+);
+-- A sealed inventory is a durable segment high-watermark. It is separate from
+-- the scanned block receipts and from the eventual publication acknowledgements.
+alter table linker_epochs add column inventory_sealed boolean not null default false;
+create table linker_inventory_blocks (
+    epoch bigint not null,
+    group_name text not null,
+    day bigint not null,
+    seq bigint not null,
+    source bigint not null references linker_source_blocks(id),
+    primary key(epoch,group_name,day,seq),
+    foreign key(epoch,group_name,day) references linker_epoch_inventory(epoch,group_name,day) on delete cascade
+);
+-- Pending inference rows outlive their NXV segment. Every epoch snapshots this
+-- inbox as well as current raw segments, before complete staged segments expire.
+alter table linker_staged_rows add column published boolean not null default false;
+create index linker_pending_source on linker_staged_rows(source) where not published;
+create table linker_epoch_pending_sources (
+    epoch bigint not null references linker_epochs(id) on delete cascade,
+    source bigint not null references linker_source_blocks(id),
+    primary key(epoch,source)
+);
+create table linker_places (
+    poster bytea primary key,
+    release_name text not null,
+    group_name text not null,
+    file_number bigint not null,
+    file_total bigint not null,
+    parts bigint not null,
+    oldest bigint not null,
+    added bigint not null
+);
+create table linker_uploads (
+    release_name text primary key,
+    group_name text not null,
+    first_posted bigint not null,
+    last_posted bigint not null,
+    files bigint not null,
+    generation bigint not null,
+    probed bigint not null,
+    added bigint not null
+);
+create table linker_upload_groups (
+    release_name text not null references linker_uploads(release_name) on delete cascade,
+    group_id bigint not null,
+    primary key(release_name,group_id)
+);
+create table linker_place_firsts (
+    poster bytea not null references linker_places(poster) on delete cascade,
+    group_id bigint not null,
+    article_number bigint not null,
+    primary key(poster,group_id)
+);
+create table linker_place_leads (
+    poster bytea not null references linker_places(poster) on delete cascade,
+    ordinal bigint not null,
+    part bigint not null,
+    primary key(poster,ordinal)
+);
+create table linker_candidates (
+    epoch bigint not null references linker_epochs(id) on delete cascade,
+    source bigint not null,
+    source_ordinal bigint not null,
+    source_rank bigint not null,
+    poster_rank bigint not null,
+    is_new boolean not null,
+    primary key(epoch,source,source_ordinal),
+    unique(epoch,source_rank),
+    foreign key(source,source_ordinal) references linker_staged_rows(source,ordinal)
+);
+alter table linker_selected_rows add column poster_rank bigint not null default 0;
+create table linker_late_rows (
+    epoch bigint not null references linker_epochs(id) on delete cascade,
+    source bigint not null,
+    source_ordinal bigint not null,
+    source_rank bigint not null,
+    poster_rank bigint not null,
+    primary key(epoch,source,source_ordinal),
+    foreign key(source,source_ordinal) references linker_staged_rows(source,ordinal)
+);

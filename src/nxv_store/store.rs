@@ -842,11 +842,19 @@ impl Store {
             return Vec::new();
         }
         let mut page: BTreeMap<(String, i64), usize> = BTreeMap::new();
+        use std::ops::Bound::{Excluded, Unbounded};
         for (name, g) in self.groups.read().unwrap_or_else(|e| e.into_inner()).iter() {
-            for (day, seg) in g.segments.read().unwrap_or_else(|e| e.into_inner()).iter() {
-                if after.is_some_and(|a| (name.as_str(), *day) <= a) {
-                    continue;
-                }
+            if after.is_some_and(|(group, _)| name.as_str() < group) {
+                continue;
+            }
+            let lower = match after {
+                Some((group, day)) if group == name.as_str() => Excluded(day),
+                _ => Unbounded,
+            };
+            let segments = g.segments.read().unwrap_or_else(|e| e.into_inner());
+            // At most one page from each group's ordered manifest. A long
+            // history does not rescan all earlier days for every next page.
+            for (day, seg) in segments.range((lower, Unbounded)).take(limit) {
                 if page.len() == limit
                     && page.last_key_value().is_some_and(|(k, _)| (name.as_str(), *day) >= (k.0.as_str(), k.1))
                 {

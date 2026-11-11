@@ -153,7 +153,16 @@ pub(crate) fn import(client: &mut Client, dir: &Path, now: i64) -> Result<()> {
         let path = dir.join(name);
         let file = match File::open(&path) {
             Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let pending: bool = client
+                    .query_one(
+                        "select exists(select 1 from linker_id_imports where name=$1 and not complete)",
+                        &[&name],
+                    )?
+                    .get(0);
+                ensure!(!pending, "legacy linker source disappeared before migration completed");
+                continue;
+            }
             Err(e) => return Err(e.into()),
         };
         let metadata = file.metadata()?;

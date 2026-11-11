@@ -42,18 +42,18 @@ pub(crate) fn infer(client: &mut Client, epoch: i64) -> Result<()> {
 const INFER_FILES:&str="
 with previous as (
  select r.*,s.poster,s.posted,lag(s.posted) over(partition by s.poster order by s.posted,r.source_rank) as previous,
-   min(r.source_rank) over(partition by s.poster) as poster_rank
+   coalesce(nullif(r.poster_rank,0),min(r.source_rank) over(partition by s.poster)) as encounter_rank
  from linker_selected_rows r join linker_staged_rows s on s.source=r.source and s.ordinal=r.source_ordinal where r.epoch=$1
 ), runs as (
  select *,sum(case when again and posted-previous>$2 then 1 else 0 end)
     over(partition by poster order by posted,source_rank rows unbounded preceding) as run
  from previous
 ), summaries as (
- select poster,run,poster_rank,count(*) as articles,min(posted) as first_posted,max(posted) as last_posted,
+ select poster,run,encounter_rank,count(*) as articles,min(posted) as first_posted,max(posted) as last_posted,
     bool_or(is_new) as new_material,bool_or(again) as again
- from runs group by poster,run,poster_rank
+ from runs group by poster,run,encounter_rank
 ) insert into linker_files(epoch,id,poster,run_no,first_rank,new_material,again,articles,first_posted,last_posted)
- select $1,row_number() over(order by poster_rank,run)-1,poster,run,poster_rank,new_material,again,articles,first_posted,last_posted
+ select $1,row_number() over(order by encounter_rank,run)-1,poster,run,encounter_rank,new_material,again,articles,first_posted,last_posted
  from summaries";
 
 const INFER_MEMBERS:&str="
@@ -99,12 +99,12 @@ mod tests {
             let message = format!("<part{n}@example.invalid>");
             let key: [u8; 32] = Sha256::digest(message.as_bytes()).into();
             c.execute(
-                "insert into linker_staged_rows values($1,$2,$3,0,$4,$5,$6,$7,$2,100,1)",
+                "insert into linker_staged_rows(source,ordinal,message_key,legacy_hash,message_id,poster,posted,group_id,article_number,bytes,lines) values($1,$2,$3,0,$4,$5,$6,$7,$2,100,1)",
                 &[&source, &n, &&key[..], &message.as_bytes(), &poster, &posted, &(n % 2)],
             )
             .unwrap();
             c.execute(
-                "insert into linker_selected_rows values($1,$2,$3,$3,$4,true)",
+                "insert into linker_selected_rows(epoch,source,source_ordinal,source_rank,again,is_new) values($1,$2,$3,$3,$4,true)",
                 &[&epoch, &source, &n, &(n % 2 == 0)],
             )
             .unwrap();
