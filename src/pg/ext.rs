@@ -22,6 +22,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use postgres::Client;
 use rusqlite::Connection;
+use sha2::{Digest, Sha256};
 
 use crate::keep_export::{self, Column, Tally};
 
@@ -106,9 +107,11 @@ pub struct Moved {
 /// Every `ext_*` table filled from the SQLite files beside `main` (and the shards' hand thaws), then topped up from
 /// `keep.*` when the database has it, in one transaction. A dry run (`apply` false) reads and checks the SQLite side
 /// only. Refused if any `ext_*` table already has rows: the move happens once.
-pub fn copy_from_sqlite(c: &mut Client, main: &Path, apply: bool) -> Result<Vec<Moved>> {
+/// `schema` is migrated first, in the same transaction, so a dry run (rolled back) leaves Postgres as it was.
+pub fn copy_from_sqlite(c: &mut Client, main: &Path, schema: &str, apply: bool) -> Result<Vec<Moved>> {
     let lite = Connection::open_in_memory()?;
     let mut tx = c.transaction()?;
+    super::migrate::run_in_transaction(&mut tx, schema)?;
     for t in tables_of(&mut tx)? {
         let any: bool =
             tx.query_one(&format!("select exists (select 1 from {})", keep_export::quoted(&t)), &[])?.get(0);
@@ -213,7 +216,7 @@ fn top_up(tx: &mut postgres::Transaction<'_>, ext: &str, keep: &str, cols: &[Col
                                  where x.log_id = p.id and x.page = e.page and x.fetched_at = e.fetched_at)",
             &[],
         )?
-    } else if let Some((id, same)) = renumbered(ext) {
+    } else if let Some((id, same)) = renumbered(tx, ext)? {
         // a row is the same by what it holds, whatever id it had: one already there (`same`) is left out, and one
         // whose id SQLite handed out again since the snapshot (a file made again, or the highest rows pruned) gets
         // the next free id instead of being dropped
@@ -288,12 +291,20 @@ fn advance_counters(tx: &mut postgres::Transaction<'_>) -> Result<()> {
 
 /// The tables whose keep rows are matched by content rather than id, and how: (id column, the condition that a row
 /// `t` of the ext table is keep row `k`).
-fn renumbered(ext: &str) -> Option<(&'static str, &'static str)> {
-    match ext {
-        "ext_predb_titles" => Some(("id", "t.title = k.title and t.source = k.source")),
-        "ext_predb_pages" => Some(("id", "t.source_id = k.source_id and t.body_sha256 = k.body_sha256")),
+/// A title is the importer's identity (`predb::import`): equal when lowercased, whichever feed brought it, soo one
+/// that SQLite has again under other casing or from another feed since the snapshot isn't added twice. Lowercased
+/// under ICU's root collation when the server has it (full Unicode, as Rust's `to_lowercase`), else the database's.
+fn renumbered(tx: &mut postgres::Transaction<'_>, ext: &str) -> Result<Option<(&'static str, String)>> {
+    Ok(match ext {
+        "ext_predb_titles" => {
+            let icu: bool =
+                tx.query_one("select exists (select 1 from pg_collation where collname = 'und-x-icu')", &[])?.get(0);
+            let c = if icu { "\"und-x-icu\"" } else { "\"default\"" };
+            Some(("id", format!("lower(t.title collate {c}) = lower(k.title collate {c})")))
+        }
+        "ext_predb_pages" => Some(("id", "t.source_id = k.source_id and t.body_sha256 = k.body_sha256".into())),
         _ => None,
-    }
+    })
 }
 
 /// Hand thaws from every shard, by the release's name and group (the id doesn't survive indexing again). A thaw
@@ -361,7 +372,8 @@ fn freeze_exempt(
     Ok(Moved { table: table.into(), tally: Tally { rows: rows.len() as u64, digest: 0 }, from_keep })
 }
 
-/// `atlas --move-ext [--apply]`: `copy_from_sqlite` into the `[storage]` Postgres (migrated first).
+/// `atlas --move-ext [--apply]`: `copy_from_sqlite` into the `[storage]` Postgres (migrated first, and only
+/// committed with `--apply`).
 pub fn run_move(args: &[String]) -> i32 {
     let apply = args.iter().any(|a| a == "--apply");
     let go = || -> Result<()> {
@@ -372,14 +384,13 @@ pub fn run_move(args: &[String]) -> i32 {
         }
         let pool = super::Pool::new(&storage)?;
         let mut c = pool.get()?;
-        super::migrate::run(&mut c, pool.schema())?;
         let main = crate::paths::database();
         println!(
             "{} external data from beside {}",
             if apply { "moving" } else { "checking (dry run)" },
             main.display()
         );
-        copy_from_sqlite(&mut c, &main, apply)?;
+        copy_from_sqlite(&mut c, &main, pool.schema(), apply)?;
         if !apply {
             println!("dry run: nothing written (--apply to move it)");
         }
@@ -415,6 +426,48 @@ pub struct Dumped {
     pub rows: i64,
     pub file: String,
     pub bytes: u64,
+    /// SHA-256 of the table's COPY stream as Postgres sent it (before compression), checked when the dump is
+    /// written and again before a restore commits: a damaged file, or another dump's, is refused
+    #[serde(default)]
+    pub sha256: Option<String>,
+    /// for a table whose rows come and go (`CHURNS`), how many of them never expire (`PINNED`): guarded by `shrank`
+    /// as other tables' rows are, with no loss allowed
+    #[serde(default)]
+    pub pinned: Option<i64>,
+}
+
+/// The rows of a `CHURNS` table that are kept forever: the HTTP cache's static historical PreDB archive snapshots
+/// (`raw_store::is_immutable_predb_page`).
+const PINNED: &[(&str, &str)] = &[("ext_http_cache", "source in ('nzedb_archive', 'dats_pciso_1998')")];
+
+/// A writer that hashes what goes through it.
+struct Hashed<W> {
+    inner: W,
+    sha: Sha256,
+}
+
+impl<W: Write> Write for Hashed<W> {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(b)?;
+        self.sha.update(&b[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// `file` decompressed, its SHA-256 compared with `want`.
+fn check_file(file: &Path, want: &str) -> Result<()> {
+    let mut dec = zstd::Decoder::new(BufReader::new(std::fs::File::open(file)?))?;
+    let mut h = Hashed { inner: std::io::sink(), sha: Sha256::new() };
+    std::io::copy(&mut dec, &mut h).with_context(|| format!("reading {}", file.display()))?;
+    let got = format!("{:x}", h.sha.finalize());
+    if got != want {
+        bail!("{}: SHA-256 {got}, the manifest says {want}", file.display());
+    }
+    Ok(())
 }
 
 const MANIFEST: &str = "manifest.json";
@@ -446,19 +499,31 @@ pub fn dump(c: &mut Client, dir: &Path, keep: usize, allow_shrink: bool) -> Resu
             let columns = pg_columns(&mut tx, &t)?;
             let list = columns.iter().map(|c| keep_export::quoted(c)).collect::<Vec<_>>().join(", ");
             let rows: i64 = tx.query_one(&format!("select count(*) from {}", keep_export::quoted(&t)), &[])?.get(0);
+            let pinned = match PINNED.iter().find(|(p, _)| *p == t) {
+                Some((_, kept)) => Some(
+                    tx.query_one(&format!("select count(*) from {} where {kept}", keep_export::quoted(&t)), &[])?
+                        .get::<_, i64>(0),
+                ),
+                None => None,
+            };
             let file = format!("{t}.copy.zst");
             let path = partial.join(&file);
             let out = std::fs::File::create(&path)?;
-            let mut enc = zstd::Encoder::new(BufWriter::new(out), 6)?;
+            let enc = zstd::Encoder::new(BufWriter::new(out), 6)?;
+            let mut hashed = Hashed { inner: enc, sha: Sha256::new() };
             let mut reader =
                 tx.copy_out(&format!("copy {} ({list}) to stdout (format binary)", keep_export::quoted(&t)))?;
-            std::io::copy(&mut reader, &mut enc)?;
+            std::io::copy(&mut reader, &mut hashed)?;
             drop(reader);
-            let w = enc.finish()?;
+            let sha = format!("{:x}", hashed.sha.finalize());
+            let w = hashed.inner.finish()?;
             let f = w.into_inner().map_err(|e| e.into_error())?;
             f.sync_all()?;
+            drop(f);
+            // read back: what's on disk is what Postgres sent
+            check_file(&path, &sha)?;
             let bytes = std::fs::metadata(&path)?.len();
-            tables.push(Dumped { table: t, columns, rows, file, bytes });
+            tables.push(Dumped { table: t, columns, rows, file, bytes, sha256: Some(sha), pinned });
         }
         tx.commit()?;
         let m = Manifest { taken_at: stamp.clone(), schema_version: version, tables, baseline: allow_shrink };
@@ -484,11 +549,18 @@ pub fn dump(c: &mut Client, dir: &Path, keep: usize, allow_shrink: bool) -> Resu
     }
     std::fs::File::open(&partial)?.sync_all()?;
     std::fs::rename(&partial, &done)?;
-    if let Ok(d) = std::fs::File::open(dir) {
-        let _ = d.sync_all();
-    }
-    if let Err(e) = prune(dir, keep) {
-        crate::ui::warn(&format!("ext dump: couldnt remove old dumps ({e:#})"));
+    // the rename is only durable once the directory holding it is synced: until then a crash could lose the new
+    // dump, soo the old ones stay
+    match std::fs::File::open(dir).and_then(|d| d.sync_all()) {
+        Ok(()) => {
+            if let Err(e) = prune(dir, keep) {
+                crate::ui::warn(&format!("ext dump: couldnt remove old dumps ({e:#})"));
+            }
+        }
+        Err(e) => crate::ui::warn(&format!(
+            "ext dump: couldnt sync {} after the rename ({e}), so no old dump was removed",
+            dir.display()
+        )),
     }
     Ok(done)
 }
@@ -527,7 +599,8 @@ fn since_baseline(mut kept: Vec<Manifest>) -> Vec<Manifest> {
     kept
 }
 
-/// A table whose rows come and go by design (the HTTP cache's entries expire after 12 hours): left out of `shrank`.
+/// A table whose rows come and go by design (the HTTP cache's entries expire after 12 hours): left out of `shrank`,
+/// all but its `PINNED` rows.
 const CHURNS: &[&str] = &["ext_http_cache"];
 
 /// Why `now` looks like a database that lost data since the dumps kept: a table they had is gone, or one is below
@@ -537,10 +610,22 @@ const CHURNS: &[&str] = &["ext_http_cache"];
 /// caught too.
 fn shrank(kept: &[Manifest], now: &Manifest) -> Option<String> {
     let mut most: std::collections::BTreeMap<&str, i64> = std::collections::BTreeMap::new();
+    let mut most_pinned: std::collections::BTreeMap<&str, i64> = std::collections::BTreeMap::new();
     for m in kept {
         for t in &m.tables {
             let e = most.entry(t.table.as_str()).or_insert(0);
             *e = (*e).max(t.rows);
+            if let Some(p) = t.pinned {
+                let e = most_pinned.entry(t.table.as_str()).or_insert(0);
+                *e = (*e).max(p);
+            }
+        }
+    }
+    // the rows of a churning table that never expire may not go down at all: they're static snapshots
+    for (table, &pinned) in &most_pinned {
+        let now_pinned = now.tables.iter().find(|t| t.table == *table).map_or(0, |t| t.pinned.unwrap_or(0));
+        if now_pinned < pinned {
+            return Some(format!("{table} has {now_pinned} rows kept forever, an earlier dump had {pinned}"));
         }
     }
     for (table, &rows) in &most {
@@ -594,8 +679,8 @@ fn prune(dir: &Path, keep: usize) -> Result<()> {
     Ok(())
 }
 
-/// A dump put back: each of its tables COPYed into the connection's schema in one transaction, and its row count
-/// checked. Tables that have rows are refused unless `replace`, which empties them first.
+/// A dump put back: each of its tables COPYed into the connection's schema in one transaction, its SHA-256 and row
+/// count checked before anything commits. Tables that have rows are refused unless `replace`, which empties them first.
 pub fn restore(c: &mut Client, from: &Path, replace: bool) -> Result<Manifest> {
     let m: Manifest = serde_json::from_slice(&std::fs::read(from.join(MANIFEST)).context("reading the manifest")?)?;
     let mut tx = c.transaction()?;
@@ -631,19 +716,29 @@ pub fn restore(c: &mut Client, from: &Path, replace: bool) -> Result<Manifest> {
             }
             tx.batch_execute(&format!("truncate {q}"))?;
         }
+        let Some(want) = &t.sha256 else {
+            bail!("{}: the dump has no checksum (made before they were recorded), so it can't be verified", t.table);
+        };
         let list = t.columns.iter().map(|c| keep_export::quoted(c)).collect::<Vec<_>>().join(", ");
         let file = std::fs::File::open(from.join(&t.file))?;
         let mut dec = zstd::Decoder::new(BufReader::new(file))?;
         let mut w = tx.copy_in(&format!("copy {q} ({list}) from stdin (format binary)"))?;
         let mut buf = vec![0u8; 1 << 20];
+        let mut sha = Sha256::new();
         loop {
             let n = dec.read(&mut buf)?;
             if n == 0 {
                 break;
             }
+            sha.update(&buf[..n]);
             w.write_all(&buf[..n])?;
         }
         w.finish()?;
+        // before anything commits: a file that decodes and COPYs fine can still be the wrong one
+        let got = format!("{:x}", sha.finalize());
+        if &got != want {
+            bail!("{}: the file's SHA-256 is {got}, the manifest says {want}: not restored", t.table);
+        }
         let rows: i64 = tx.query_one(&format!("select count(*) from {q}"), &[])?.get(0);
         if rows != t.rows {
             bail!("{}: {rows} rows back, the dump says {}", t.table, t.rows);
@@ -770,6 +865,8 @@ mod tests {
             rows,
             file: format!("{name}.copy.zst"),
             bytes: 0,
+            sha256: None,
+            pinned: None,
         };
         let m = |tables| Manifest { taken_at: String::new(), schema_version: 2, tables, baseline: false };
         let kept = [
@@ -794,6 +891,20 @@ mod tests {
         let since = since_baseline(old);
         assert_eq!(since.len(), 1);
         assert_eq!(shrank(&since, &m(vec![t("ext_a", 101), t("ext_b", 3)])), None);
+        // the HTTP cache's pinned snapshots may not go down at all, however its other rows come and go
+        let cache = |rows, pinned| Dumped { pinned: Some(pinned), ..t("ext_http_cache", rows) };
+        let kept = [m(vec![cache(900, 40)]), m(vec![cache(50, 41)]), m(vec![t("ext_http_cache", 7)])];
+        assert_eq!(shrank(&kept, &m(vec![cache(41, 41)])), None);
+        assert!(shrank(&kept, &m(vec![cache(5000, 40)])).is_some(), "one pinned row lost");
+        assert!(shrank(&kept, &m(vec![t("ext_http_cache", 5000)])).is_some(), "pinned rows not counted");
+    }
+
+    #[test]
+    fn pinned_rows_are_the_raw_stores_forever_ones() {
+        for key in ["nzedb_archive", "dats_pciso_1998"] {
+            assert!(crate::raw_store::is_immutable_predb_page(key, 0));
+            assert!(PINNED[0].1.contains(&format!("'{key}'")));
+        }
     }
 
     #[test]
@@ -812,7 +923,7 @@ mod tests {
     /// SQLite files made with the providers' own schemas, a row or two each, moved, dumped, emptied and restored.
     #[test]
     fn move_dump_restore_round_trip() {
-        let Some(s) = super::super::testing::Schema::new() else { return };
+        let Some(s) = super::super::testing::Schema::empty() else { return };
         let dir = tempfile::tempdir().unwrap();
         let main = dir.path().join("atlas.db");
         crate::db::create_at(&main).unwrap();
@@ -836,15 +947,18 @@ mod tests {
             d.execute_batch("alter table details add column backdrop TEXT").unwrap();
         }
         let mut c = s.pool.get().unwrap();
-        // a dry run writes nothing
-        copy_from_sqlite(&mut c, &main, false).unwrap();
-        let n: i64 = c.query_one("select count(*) from ext_predb_titles", &[]).unwrap().get(0);
-        assert_eq!(n, 0);
-        let moved = copy_from_sqlite(&mut c, &main, true).unwrap();
+        // a dry run writes nothing, not even the migrations it needed
+        copy_from_sqlite(&mut c, &main, &s.name, false).unwrap();
+        let migrated: bool = c
+            .query_one("select exists (select 1 from information_schema.tables where table_schema = $1)", &[&s.name])
+            .unwrap()
+            .get(0);
+        assert!(!migrated, "a dry run left tables behind");
+        let moved = copy_from_sqlite(&mut c, &main, &s.name, true).unwrap();
         let rows = |t: &str| moved.iter().find(|m| m.table == t).unwrap().tally.rows;
         assert_eq!(rows("ext_predb_titles"), 1);
         assert_eq!(rows("ext_http_cache"), 1);
-        assert!(copy_from_sqlite(&mut c, &main, true).is_err(), "a second move is refused");
+        assert!(copy_from_sqlite(&mut c, &main, &s.name, true).is_err(), "a second move is refused");
         // a new title is numbered past the moved ones, as SQLite would
         let id: i64 = c
             .query_one(
@@ -866,6 +980,24 @@ mod tests {
         let body: Vec<u8> = c.query_one("select body_zst from ext_http_cache", &[]).unwrap().get(0);
         assert_eq!(body, [0x00, 0xff]);
         assert!(restore(&mut c, &d, false).is_err(), "tables with rows are refused without --replace");
+        let pinned = m.tables.iter().find(|t| t.table == "ext_http_cache").unwrap().pinned;
+        assert_eq!(pinned, Some(1), "the nzedb archive page is counted as kept forever");
+        // a file that isn't the one dumped (here: another table's, decodable and the same size of rows) is
+        // refused before anything commits, even with --replace
+        let swapped = dir.path().join("swapped");
+        std::fs::create_dir(&swapped).unwrap();
+        for e in std::fs::read_dir(&d).unwrap() {
+            let e = e.unwrap();
+            std::fs::copy(e.path(), swapped.join(e.file_name())).unwrap();
+        }
+        let mut sm: Manifest = serde_json::from_slice(&std::fs::read(swapped.join(MANIFEST)).unwrap()).unwrap();
+        let t = sm.tables.iter_mut().find(|t| t.table == "ext_predb_titles").unwrap();
+        t.sha256 = Some("0".repeat(64));
+        std::fs::write(swapped.join(MANIFEST), serde_json::to_vec(&sm).unwrap()).unwrap();
+        let err = restore(&mut c, &swapped, true).unwrap_err().to_string();
+        assert!(err.contains("SHA-256"), "{err}");
+        let n: i64 = c.query_one("select count(*) from ext_predb_titles", &[]).unwrap().get(0);
+        assert_eq!(n, 2, "the refused restore left the tables as they were");
         restore(&mut c, &d, true).unwrap();
         let id: i64 = c
             .query_one(
