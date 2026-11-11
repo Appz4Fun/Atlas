@@ -267,45 +267,93 @@ struct ValidationWire {
     payload_bytes: AtomicUsize,
 }
 impl ValidationWire {
-    fn snapshot(&self) -> (usize,usize,usize) {
-        (self.extent_rows.load(Ordering::SeqCst), self.payload_rows.load(Ordering::SeqCst),
-         self.extent_bytes.load(Ordering::SeqCst)+self.payload_bytes.load(Ordering::SeqCst))
+    fn snapshot(&self) -> (usize, usize, usize) {
+        (
+            self.extent_rows.load(Ordering::SeqCst),
+            self.payload_rows.load(Ordering::SeqCst),
+            self.extent_bytes.load(Ordering::SeqCst) + self.payload_bytes.load(Ordering::SeqCst),
+        )
     }
 }
 // Parse server framing and lengths, never retain/log any field payload. Count
 // whole DataRow envelopes independently of importer counters, including every
 // unchosen extent and both identifiers accompanying each payload substring.
-fn relay_backend(from:&mut impl Read,to:&mut impl Write,meter:&ValidationWire)->std::io::Result<()> {
-    let mut class=0;
+fn relay_backend(from: &mut impl Read, to: &mut impl Write, meter: &ValidationWire) -> std::io::Result<()> {
+    let mut class = 0;
     loop {
-        let mut header=[0;5];
-        match from.read_exact(&mut header) {Ok(())=>{},Err(e) if e.kind()==std::io::ErrorKind::UnexpectedEof=>return Ok(()),Err(e)=>return Err(e)}
-        let length=u32::from_be_bytes(header[1..].try_into().unwrap()) as usize;
-        assert!((4..=64*1024*1024).contains(&length));to.write_all(&header)?;
-        if header[0]==b'T' {
-            let mut n=[0;2];from.read_exact(&mut n)?;to.write_all(&n)?;
-            let count=u16::from_be_bytes(n) as usize;let mut names=Vec::new();let mut used=2;
+        let mut header = [0; 5];
+        match from.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(e) => return Err(e),
+        }
+        let length = u32::from_be_bytes(header[1..].try_into().unwrap()) as usize;
+        assert!((4..=64 * 1024 * 1024).contains(&length));
+        to.write_all(&header)?;
+        if header[0] == b'T' {
+            let mut n = [0; 2];
+            from.read_exact(&mut n)?;
+            to.write_all(&n)?;
+            let count = u16::from_be_bytes(n) as usize;
+            let mut names = Vec::new();
+            let mut used = 2;
             for _ in 0..count {
-                let mut name=Vec::new();loop {let mut b=[0];from.read_exact(&mut b)?;to.write_all(&b)?;used+=1;if b[0]==0{break;}name.push(b[0]);assert!(name.len()<=256);}
-                names.push(name);relay_payload(from,to,18)?;used+=18;
+                let mut name = Vec::new();
+                loop {
+                    let mut b = [0];
+                    from.read_exact(&mut b)?;
+                    to.write_all(&b)?;
+                    used += 1;
+                    if b[0] == 0 {
+                        break;
+                    }
+                    name.push(b[0]);
+                    assert!(name.len() <= 256);
+                }
+                names.push(name);
+                relay_payload(from, to, 18)?;
+                used += 18;
             }
-            assert_eq!(used,length-4);
-            let names:Vec<&[u8]>=names.iter().map(Vec::as_slice).collect();
-            class=if names==[b"object_id".as_slice(),b"ordinal",b"byte_offset",b"octet_length",b"digest",b"byte_length",b"digest",b"validated"] {1}
-                else if names==[b"object_id".as_slice(),b"ordinal",b"substring"] {2} else {0};
+            assert_eq!(used, length - 4);
+            let names: Vec<&[u8]> = names.iter().map(Vec::as_slice).collect();
+            class = if names
+                == [
+                    b"object_id".as_slice(),
+                    b"ordinal",
+                    b"byte_offset",
+                    b"octet_length",
+                    b"digest",
+                    b"byte_length",
+                    b"digest",
+                    b"validated",
+                ] {
+                1
+            } else if names == [b"object_id".as_slice(), b"ordinal", b"substring"] {
+                2
+            } else {
+                0
+            };
         } else {
-            relay_payload(from,to,length-4)?;
-            if header[0]==b'D' {
-                let (rows,bytes)=match class {1=>(&meter.extent_rows,&meter.extent_bytes),2=>(&meter.payload_rows,&meter.payload_bytes),_=>continue};
-                rows.fetch_add(1,Ordering::SeqCst);bytes.fetch_add(length+1,Ordering::SeqCst);
+            relay_payload(from, to, length - 4)?;
+            if header[0] == b'D' {
+                let (rows, bytes) = match class {
+                    1 => (&meter.extent_rows, &meter.extent_bytes),
+                    2 => (&meter.payload_rows, &meter.payload_bytes),
+                    _ => continue,
+                };
+                rows.fetch_add(1, Ordering::SeqCst);
+                bytes.fetch_add(length + 1, Ordering::SeqCst);
             }
         }
     }
 }
 fn protocol_proxy(url: &str) -> Option<(String, std::sync::Arc<AtomicUsize>, std::thread::JoinHandle<()>)> {
-    let (url,counter,_,thread)=protocol_proxy_with_reads(url)?;Some((url,counter,thread))
+    let (url, counter, _, thread) = protocol_proxy_with_reads(url)?;
+    Some((url, counter, thread))
 }
-fn protocol_proxy_with_reads(url: &str) -> Option<(String, std::sync::Arc<AtomicUsize>,std::sync::Arc<ValidationWire>,std::thread::JoinHandle<()>)> {
+fn protocol_proxy_with_reads(
+    url: &str,
+) -> Option<(String, std::sync::Arc<AtomicUsize>, std::sync::Arc<ValidationWire>, std::thread::JoinHandle<()>)> {
     use std::net::{Shutdown, TcpListener, TcpStream};
     let config: postgres::Config = url.parse().unwrap();
     let host = if let Some(address) = config.get_hostaddrs().first() {
@@ -321,7 +369,8 @@ fn protocol_proxy_with_reads(url: &str) -> Option<(String, std::sync::Arc<Atomic
     let port = listener.local_addr().unwrap().port();
     let count = std::sync::Arc::new(AtomicUsize::new(0));
     let counter = count.clone();
-    let reads=std::sync::Arc::new(ValidationWire::default());let observed=reads.clone();
+    let reads = std::sync::Arc::new(ValidationWire::default());
+    let observed = reads.clone();
     let thread = std::thread::spawn(move || {
         let (mut client, _) = listener.accept().unwrap();
         let mut backend = TcpStream::connect((host.as_str(), backend_port)).unwrap();
@@ -330,7 +379,7 @@ fn protocol_proxy_with_reads(url: &str) -> Option<(String, std::sync::Arc<Atomic
         let mut upstream = backend.try_clone().unwrap();
         let mut downstream = client.try_clone().unwrap();
         let returning = std::thread::spawn(move || {
-            relay_backend(&mut upstream,&mut downstream,&observed).unwrap();
+            relay_backend(&mut upstream, &mut downstream, &observed).unwrap();
             let _ = downstream.shutdown(Shutdown::Write);
         });
         let result = (|| -> std::io::Result<()> {
@@ -459,7 +508,6 @@ fn multi_row_pages_have_exact_constant_protocol_cost_and_indexed_keysets() {
     );
 }
 
-
 #[test]
 fn selected_frozen_metadata_survives_copy_limited_pages_and_owner_resume() {
     use atlas::pg::history_catalog::{Lookup, LookupPurpose, ReadBudget, Snapshot};
@@ -471,85 +519,194 @@ fn selected_frozen_metadata_survives_copy_limited_pages_and_owner_resume() {
             let mut manifest: Manifest = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
             let packed = files.path().join("selected.zst");
             let mut encoder = zstd::stream::write::Encoder::new(std::fs::File::create(&packed).unwrap(), 1).unwrap();
-            encoder.write_all(&[1]).unwrap(); varint(&mut encoder,0); varint(&mut encoder,1);
-            bytes(&mut encoder,b"releases"); varint(&mut encoder,4);
-            for name in [b"id".as_slice(),b"name",b"group_name",b"poster"] { bytes(&mut encoder,name); }
-            varint(&mut encoder,1); encoder.write_all(&[1]).unwrap(); varint(&mut encoder,82);
+            encoder.write_all(&[1]).unwrap();
+            varint(&mut encoder, 0);
+            varint(&mut encoder, 1);
+            bytes(&mut encoder, b"releases");
+            varint(&mut encoder, 4);
+            for name in [b"id".as_slice(), b"name", b"group_name", b"poster"] {
+                bytes(&mut encoder, name);
+            }
+            varint(&mut encoder, 1);
+            encoder.write_all(&[1]).unwrap();
+            varint(&mut encoder, 82);
             let mut expected = Sha256::new();
             for field in [Column::Name, Column::Group, Column::Poster] {
                 encoder.write_all(&[3]).unwrap();
                 if field == column {
-                    varint(&mut encoder,LENGTH as u64);
-                    let chunk=[b'x';65536];
-                    for _ in 0..LENGTH/chunk.len() { encoder.write_all(&chunk).unwrap();expected.update(chunk); }
-                } else { bytes(&mut encoder,if field == Column::Group {b"test.group"} else {b"small"}); }
+                    varint(&mut encoder, LENGTH as u64);
+                    let chunk = [b'x'; 65536];
+                    for _ in 0..LENGTH / chunk.len() {
+                        encoder.write_all(&chunk).unwrap();
+                        expected.update(chunk);
+                    }
+                } else {
+                    bytes(&mut encoder, if field == Column::Group { b"test.group" } else { b"small" });
+                }
             }
             encoder.finish().unwrap().sync_all().unwrap();
-            let expected:[u8;32]=expected.finalize().into();
-            let frozen=manifest.files.iter().find(|f|f.kind==SourceKind::Frozen).unwrap();
-            let c=rusqlite::Connection::open(&frozen.path).unwrap();
-            c.execute("insert into frozen_releases(id,name,group_name,reason,frozen_at,payload) values(41,'Header.Title','test.group','synthetic',1,?1)",[std::fs::read(&packed).unwrap()]).unwrap();drop(c);
+            let expected: [u8; 32] = expected.finalize().into();
+            let frozen = manifest.files.iter().find(|f| f.kind == SourceKind::Frozen).unwrap();
+            let c = rusqlite::Connection::open(&frozen.path).unwrap();
+            c.execute("insert into frozen_releases(id,name,group_name,reason,frozen_at,payload) values(41,'Header.Title','test.group','synthetic',1,?1)",[std::fs::read(&packed).unwrap()]).unwrap();
+            drop(c);
             history_catalog_support::refresh(&mut manifest);
-            let source=Source::open(manifest,4*1024*1024).unwrap();
-            let target_files=tempfile::tempdir().unwrap();
-            let Some((mut target,_))=history_catalog_support::destination(target_files.path()) else{return};
-            let spool=tempfile::tempdir().unwrap();
-            #[cfg(unix)] {use std::os::unix::fs::PermissionsExt;std::fs::set_permissions(spool.path(),std::fs::Permissions::from_mode(0o700)).unwrap();}
-            let mut owner=target.owner(spool.path(),32*1024*1024);
-            let id=owner.begin(&source).unwrap();let budget=ImportBudget{copy_bytes,..Default::default()};
-            let mut sequence=0;let mut resumed=false;
-            loop {
-                let receipt=owner.step(&source,id,sequence,budget).unwrap();sequence=receipt.sequence;
-                assert!(receipt.copy_bytes<=copy_bytes);assert!(receipt.source_bytes+receipt.decoded_bytes<=budget.source_bytes);
-                let checkpoint:Vec<u8>=target.client.query_one(&format!("select checkpoint from {}.history_imports",target.name),&[]).unwrap().get(0);
-                let state:serde_json::Value=serde_json::from_slice(&checkpoint).unwrap();
-                let projection=&state["pending"]["frozen"];
-                if !resumed && projection["phase"]==2 && projection["projection_data"]["offset"].as_u64().is_some_and(|n|n>0 && n<LENGTH as u64) {
-                    drop(owner);owner=target.owner(spool.path(),32*1024*1024);assert_eq!(owner.begin(&source).unwrap(),id);resumed=true;
-                }
-                if receipt.complete {break;}assert!(sequence<3000);
+            let source = Source::open(manifest, 4 * 1024 * 1024).unwrap();
+            let target_files = tempfile::tempdir().unwrap();
+            let Some((mut target, _)) = history_catalog_support::destination(target_files.path()) else { return };
+            let spool = tempfile::tempdir().unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(spool.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
             }
-            assert!(resumed,"must resume a committed partial selected-field upload");
-            owner.finish_identity(&source,id).unwrap();
-            target.client.batch_execute(&format!("set search_path to {}",target.name)).unwrap();
-            let mut catalog=Snapshot::open(&mut target.client,id).unwrap();
-            let Lookup::Found(found)=catalog.lookup(41,LookupPurpose::Raw,ReadBudget::default()).unwrap() else{panic!("frozen lookup")};
-            let mut cursor=catalog.value_cursor(found.metadata.field(column).unwrap()).unwrap();let mut actual=Sha256::new();let mut length=0;
-            loop {let receipt=catalog.read_value(&mut cursor,ReadBudget::default(),|part|{actual.update(part);length+=part.len();Ok(())}).unwrap();if receipt.complete{break;}}
-            assert_eq!(length,LENGTH);assert_eq!(<[u8;32]>::from(actual.finalize()),expected);
-            println!("{}",serde_json::json!({"case":"selected_frozen_copy_resume","column":column.name(),"copy_bytes":copy_bytes,"pages":sequence,"readback_bytes":length}));
+            let mut owner = target.owner(spool.path(), 32 * 1024 * 1024);
+            let id = owner.begin(&source).unwrap();
+            let budget = ImportBudget { copy_bytes, ..Default::default() };
+            let mut sequence = 0;
+            let mut resumed = false;
+            loop {
+                let receipt = owner.step(&source, id, sequence, budget).unwrap();
+                sequence = receipt.sequence;
+                assert!(receipt.copy_bytes <= copy_bytes);
+                assert!(receipt.source_bytes + receipt.decoded_bytes <= budget.source_bytes);
+                let checkpoint: Vec<u8> = target
+                    .client
+                    .query_one(&format!("select checkpoint from {}.history_imports", target.name), &[])
+                    .unwrap()
+                    .get(0);
+                let state: serde_json::Value = serde_json::from_slice(&checkpoint).unwrap();
+                let projection = &state["pending"]["frozen"];
+                if !resumed
+                    && projection["phase"] == 2
+                    && projection["projection_data"]["offset"].as_u64().is_some_and(|n| n > 0 && n < LENGTH as u64)
+                {
+                    drop(owner);
+                    owner = target.owner(spool.path(), 32 * 1024 * 1024);
+                    assert_eq!(owner.begin(&source).unwrap(), id);
+                    resumed = true;
+                }
+                if receipt.complete {
+                    break;
+                }
+                assert!(sequence < 3000);
+            }
+            assert!(resumed, "must resume a committed partial selected-field upload");
+            owner.finish_identity(&source, id).unwrap();
+            target.client.batch_execute(&format!("set search_path to {}", target.name)).unwrap();
+            let mut catalog = Snapshot::open(&mut target.client, id).unwrap();
+            let Lookup::Found(found) = catalog.lookup(41, LookupPurpose::Raw, ReadBudget::default()).unwrap() else {
+                panic!("frozen lookup")
+            };
+            let mut cursor = catalog.value_cursor(found.metadata.field(column).unwrap()).unwrap();
+            let mut actual = Sha256::new();
+            let mut length = 0;
+            loop {
+                let receipt = catalog
+                    .read_value(&mut cursor, ReadBudget::default(), |part| {
+                        actual.update(part);
+                        length += part.len();
+                        Ok(())
+                    })
+                    .unwrap();
+                if receipt.complete {
+                    break;
+                }
+            }
+            assert_eq!(length, LENGTH);
+            assert_eq!(<[u8; 32]>::from(actual.finalize()), expected);
+            println!(
+                "{}",
+                serde_json::json!({"case":"selected_frozen_copy_resume","column":column.name(),"copy_bytes":copy_bytes,"pages":sequence,"readback_bytes":length})
+            );
         }
     }
 }
 
 #[test]
 fn validation_transfer_admits_all_extent_rows_and_payload_identifiers() {
-    let files=tempfile::tempdir().unwrap();let path=history_catalog_support::manifest(files.path());
-    let mut manifest:Manifest=serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-    let current=manifest.files.iter().find(|f|f.kind==SourceKind::Current).unwrap();
-    let c=rusqlite::Connection::open(&current.path).unwrap();c.execute("update releases set poster=zeroblob(?1) where id=3",[40*1024*1024]).unwrap();drop(c);
-    history_catalog_support::refresh(&mut manifest);let source=Source::open(manifest,48*1024*1024).unwrap();
-    let target_files=tempfile::tempdir().unwrap();let Some((mut target,_))=history_catalog_support::destination(target_files.path()) else{return};
-    let Some((url,counter,wire,proxy))=protocol_proxy_with_reads(&target.url) else{panic!("validation transfer measurement requires the TCP fixture endpoint")};
-    let spool=tempfile::tempdir().unwrap();
-    #[cfg(unix)] {use std::os::unix::fs::PermissionsExt;std::fs::set_permissions(spool.path(),std::fs::Permissions::from_mode(0o700)).unwrap();}
-    let mut owner=atlas::pg::history_import::ImportOwner::connect(atlas::pg::StorageConfig{backend:atlas::pg::Backend::Postgres,url,schema:target.name.clone(),max_connections:1,allow_plaintext:true},target.expected.clone(),spool.path().into(),64*1024*1024).unwrap();
-    let id=owner.begin(&source).unwrap();let mut sequence=0;let mut measured=0;let mut maximum=0;let mut validation_pages=0;
-    loop {
-        let before=wire.snapshot();let before_trips=counter.load(Ordering::SeqCst);
-        let budget=ImportBudget{source_bytes:if measured>0 && validation_pages%2==1 {16384} else {4*1024*1024},..Default::default()};
-        let receipt=owner.step(&source,id,sequence,budget).unwrap();sequence=receipt.sequence;
-        let after=wire.snapshot();let rows=after.0-before.0;let payload_rows=after.1-before.1;let bytes=after.2-before.2;
-        assert_eq!((counter.load(Ordering::SeqCst)-before_trips) as u64,receipt.sql_round_trips);
-        assert!(bytes as u64<=budget.source_bytes,"independent validation transfer {bytes} exceeds {} at page {sequence}",budget.source_bytes);
-        assert!(rows<=budget.source_rows as usize,"all fetched extent rows must be admitted");
-        assert!(payload_rows<=rows,"payload lookup must reuse admitted extent identities");
-        assert!(bytes as u64<=receipt.source_bytes+receipt.decoded_bytes,"receipt omitted independently observed validation bytes");
-        if rows>0 {validation_pages+=1;measured+=bytes;maximum=maximum.max(bytes);}
-        if receipt.complete{break;}assert!(sequence<10000);
+    let files = tempfile::tempdir().unwrap();
+    let path = history_catalog_support::manifest(files.path());
+    let mut manifest: Manifest = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let current = manifest.files.iter().find(|f| f.kind == SourceKind::Current).unwrap();
+    let c = rusqlite::Connection::open(&current.path).unwrap();
+    c.execute("update releases set poster=zeroblob(?1) where id=3", [40 * 1024 * 1024]).unwrap();
+    drop(c);
+    history_catalog_support::refresh(&mut manifest);
+    let source = Source::open(manifest, 48 * 1024 * 1024).unwrap();
+    let target_files = tempfile::tempdir().unwrap();
+    let Some((mut target, _)) = history_catalog_support::destination(target_files.path()) else { return };
+    let Some((url, counter, wire, proxy)) = protocol_proxy_with_reads(&target.url) else {
+        panic!("validation transfer measurement requires the TCP fixture endpoint")
+    };
+    let spool = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(spool.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     }
-    owner.finish_identity(&source,id).unwrap();drop(owner);proxy.join().unwrap();
-    assert!(wire.extent_rows.load(Ordering::SeqCst)>512);assert!(wire.payload_rows.load(Ordering::SeqCst)>512);
-    assert!(validation_pages>1);println!("{}",serde_json::json!({"case":"validation_wire_admission","data_row_bytes":measured,"maximum_step_bytes":maximum,"extent_rows":wire.extent_rows.load(Ordering::SeqCst),"payload_rows":wire.payload_rows.load(Ordering::SeqCst),"pages":sequence,"validation_pages":validation_pages}));
-    target.client.batch_execute(&format!("set search_path to {}",target.name)).unwrap();
+    let mut owner = atlas::pg::history_import::ImportOwner::connect(
+        atlas::pg::StorageConfig {
+            backend: atlas::pg::Backend::Postgres,
+            url,
+            schema: target.name.clone(),
+            max_connections: 1,
+            allow_plaintext: true,
+        },
+        target.expected.clone(),
+        spool.path().into(),
+        64 * 1024 * 1024,
+    )
+    .unwrap();
+    let id = owner.begin(&source).unwrap();
+    let mut sequence = 0;
+    let mut measured = 0;
+    let mut maximum = 0;
+    let mut validation_pages = 0;
+    loop {
+        let before = wire.snapshot();
+        let before_trips = counter.load(Ordering::SeqCst);
+        let budget = ImportBudget {
+            source_bytes: if measured > 0 && validation_pages % 2 == 1 { 16384 } else { 4 * 1024 * 1024 },
+            ..Default::default()
+        };
+        let receipt = owner.step(&source, id, sequence, budget).unwrap();
+        sequence = receipt.sequence;
+        let after = wire.snapshot();
+        let rows = after.0 - before.0;
+        let payload_rows = after.1 - before.1;
+        let bytes = after.2 - before.2;
+        assert_eq!((counter.load(Ordering::SeqCst) - before_trips) as u64, receipt.sql_round_trips);
+        assert!(
+            bytes as u64 <= budget.source_bytes,
+            "independent validation transfer {bytes} exceeds {} at page {sequence}",
+            budget.source_bytes
+        );
+        assert!(rows <= budget.source_rows as usize, "all fetched extent rows must be admitted");
+        assert!(payload_rows <= rows, "payload lookup must reuse admitted extent identities");
+        assert!(
+            bytes as u64 <= receipt.source_bytes + receipt.decoded_bytes,
+            "receipt omitted independently observed validation bytes"
+        );
+        if rows > 0 {
+            validation_pages += 1;
+            measured += bytes;
+            maximum = maximum.max(bytes);
+        }
+        if receipt.complete {
+            break;
+        }
+        assert!(sequence < 10000);
+    }
+    owner.finish_identity(&source, id).unwrap();
+    drop(owner);
+    proxy.join().unwrap();
+    assert!(wire.extent_rows.load(Ordering::SeqCst) > 512);
+    assert!(wire.payload_rows.load(Ordering::SeqCst) > 512);
+    assert!(validation_pages > 1);
+    println!(
+        "{}",
+        serde_json::json!({"case":"validation_wire_admission","data_row_bytes":measured,"maximum_step_bytes":maximum,"extent_rows":wire.extent_rows.load(Ordering::SeqCst),"payload_rows":wire.payload_rows.load(Ordering::SeqCst),"pages":sequence,"validation_pages":validation_pages})
+    );
+    target.client.batch_execute(&format!("set search_path to {}", target.name)).unwrap();
 }

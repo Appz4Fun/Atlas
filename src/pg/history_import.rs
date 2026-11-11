@@ -243,8 +243,10 @@ impl Runtime {
         // State was authenticated against the durable checkpoint before this
         // inventory. Only its completed cleanup locators authorize a missing
         // identity in an empty deterministic frame directory.
-        let mut authenticated=state.cleanups.clone();
-        if let Some(old)=state.cleanup {authenticated.push(old);}
+        let mut authenticated = state.cleanups.clone();
+        if let Some(old) = state.cleanup {
+            authenticated.push(old);
+        }
         let entries = super::history_spool::inventory(&self.root, source.fingerprint(), self.quota, &authenticated)?;
         for entry in entries {
             ensure!(
@@ -268,7 +270,13 @@ impl Runtime {
     }
     fn committed(&mut self) -> Result<()> {
         for frame in self.completed.drain(..) {
-            super::history_spool::Spool::cleanup(&self.root, frame.fingerprint, frame.source, frame.key, super::history_spool::CleanupAuthority::CommittedCheckpoint)?;
+            super::history_spool::Spool::cleanup(
+                &self.root,
+                frame.fingerprint,
+                frame.source,
+                frame.key,
+                super::history_spool::CleanupAuthority::CommittedCheckpoint,
+            )?;
         }
         Ok(())
     }
@@ -326,11 +334,16 @@ impl Batch {
     // its row/digest overhead. Exhaustion ends this page without subtraction
     // underflow or relying on a later push failure.
     fn chunk_payload_limit(&self, reserve: u64) -> usize {
-        if self.mutations.saturating_add(13) > self.budget.mutations { return 0; }
-        self.budget.copy_bytes.checked_sub(self.copy_bytes)
+        if self.mutations.saturating_add(13) > self.budget.mutations {
+            return 0;
+        }
+        self.budget
+            .copy_bytes
+            .checked_sub(self.copy_bytes)
             .and_then(|left| left.checked_sub(reserve))
             .and_then(|left| left.checked_sub(history_stage::ROW_OVERHEAD + 32))
-            .unwrap_or(0).min(u64::from(self.budget.chunk_bytes)) as usize
+            .unwrap_or(0)
+            .min(u64::from(self.budget.chunk_bytes)) as usize
     }
     fn push(&mut self, row: Row) -> Result<()> {
         ensure!(
@@ -943,7 +956,9 @@ fn emit_artifact(
     }
     while cursor.offset < body.len() as u64 && batch.room(13, 1024) {
         let n = (body.len() as u64 - cursor.offset).min(batch.chunk_payload_limit(4096) as u64) as usize;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         let part = &body[cursor.offset as usize..cursor.offset as usize + n];
         batch.push(chunk(cursor.id, cursor.ordinal, cursor.offset, part))?;
         cursor.digest.update(part)?;
@@ -986,9 +1001,9 @@ fn consume(source: &Source, state: &mut State, batch: &mut Batch, runtime: &mut 
             return Ok(());
         }
         let ((source_id, key), authority) = if let Some(key) = state.cleanups.pop() {
-            (key,super::history_spool::CleanupAuthority::CommittedCheckpoint)
+            (key, super::history_spool::CleanupAuthority::CommittedCheckpoint)
         } else {
-            (runtime.abandoned.pop().expect("abandoned cleanup"),super::history_spool::CleanupAuthority::Identity)
+            (runtime.abandoned.pop().expect("abandoned cleanup"), super::history_spool::CleanupAuthority::Identity)
         };
         super::history_spool::Spool::cleanup(&runtime.root, source.fingerprint(), source_id, key, authority)?;
         batch.source_rows += 1;
@@ -1310,16 +1325,15 @@ fn capture_pending(
             cell.started = true;
         }
         let chunk_limit = batch.chunk_payload_limit(MAX_METADATA as u64 + 4096);
-        if chunk_limit == 0 { state.pending = Some(pending); return Ok(()); }
+        if chunk_limit == 0 {
+            state.pending = Some(pending);
+            return Ok(());
+        }
         let mut bytes = Vec::new();
         let end = source.read_cell(
             &cell.reference,
             cell.offset,
-            ReadBudget {
-                rows: 1,
-                bytes: batch.source_left(),
-                chunk_bytes: chunk_limit as u32,
-            },
+            ReadBudget { rows: 1, bytes: batch.source_left(), chunk_bytes: chunk_limit as u32 },
             |part| {
                 bytes.extend_from_slice(part);
                 Ok(())
@@ -1580,7 +1594,9 @@ fn finish_frozen(
             let count = (projection.byte_length - cursor.offset)
                 .min(batch.source_left())
                 .min(batch.chunk_payload_limit(4096) as u64) as usize;
-            if count == 0 { break; }
+            if count == 0 {
+                break;
+            }
             let bytes = runtime.spool.as_mut().expect("validated spool").read_projection(
                 cursor.offset,
                 projection.byte_length,
@@ -1711,7 +1727,9 @@ fn validate_page(
             let extent_limit = (u64::from(batch.budget.source_rows) - batch.source_rows)
                 .min(batch.source_left() / (VALIDATION_EXTENT_BYTES + VALIDATION_PAYLOAD_OVERHEAD + 1))
                 .min(512) as i64;
-            if extent_limit == 0 { return Ok(0); }
+            if extent_limit == 0 {
+                return Ok(0);
+            }
             let rows=tx.query_typed("select c.object_id,c.ordinal,c.byte_offset,octet_length(c.bytes)::bigint,c.digest,o.byte_length,o.digest,o.validated from history_object_chunks c join history_objects o using(import_id,object_id) where c.import_id=$1 and (c.object_id,c.ordinal)>=($2,$3) order by c.object_id,c.ordinal limit $4",&[(&&id[..],Type::BYTEA),(&state.validate_object,Type::INT8),(&state.validate_ordinal,Type::INT8),(&extent_limit,Type::INT8)])?;
             if rows.is_empty() {
                 finish_validated_object(state)?;
@@ -1743,7 +1761,9 @@ fn validate_page(
                     full > 0 && offset < full as u64,
                     HistoryError::new(ErrorCode::CorruptObject, "chunk continuation")
                 );
-                let n = (full as u64 - offset).min(left - VALIDATION_PAYLOAD_OVERHEAD).min(u64::from(batch.budget.chunk_bytes)) as i32;
+                let n = (full as u64 - offset)
+                    .min(left - VALIDATION_PAYLOAD_OVERHEAD)
+                    .min(u64::from(batch.budget.chunk_bytes)) as i32;
                 objects.push(oid);
                 ordinals.push(ordinal);
                 offsets.push(offset as i32);
@@ -2403,15 +2423,24 @@ mod tests {
     }
     #[test]
     fn emit_artifact_copy_limited_page_preserves_reserve_and_exact_continuation() {
-        let budget=ImportBudget::default();let mut batch=Batch::new(budget);
-        batch.copy_bytes=budget.copy_bytes-5000;
-        let body=vec![b'q';8192];let mut cursor=Artifact{id:7,..Default::default()};
-        assert!(!emit_artifact(&mut batch,&mut cursor,1,3,"metadata",b"key",&body).unwrap());
-        assert!(batch.copy_bytes<=budget.copy_bytes-4096,"chunk row overhead must not consume the final reserve");
-        let mut stored=Vec::new();for row in batch.rows.iter().filter(|r|r.tag==2){stored.extend_from_slice(&row.x);}
-        let mut next=Batch::new(budget);assert!(emit_artifact(&mut next,&mut cursor,1,3,"metadata",b"key",&body).unwrap());
-        for row in next.rows.iter().filter(|r|r.tag==2){stored.extend_from_slice(&row.x);}
-        assert_eq!(stored,body);assert_eq!(cursor.digest.finish().unwrap(),<[u8;32]>::from(Sha256::digest(&body)));
+        let budget = ImportBudget::default();
+        let mut batch = Batch::new(budget);
+        batch.copy_bytes = budget.copy_bytes - 5000;
+        let body = vec![b'q'; 8192];
+        let mut cursor = Artifact { id: 7, ..Default::default() };
+        assert!(!emit_artifact(&mut batch, &mut cursor, 1, 3, "metadata", b"key", &body).unwrap());
+        assert!(batch.copy_bytes <= budget.copy_bytes - 4096, "chunk row overhead must not consume the final reserve");
+        let mut stored = Vec::new();
+        for row in batch.rows.iter().filter(|r| r.tag == 2) {
+            stored.extend_from_slice(&row.x);
+        }
+        let mut next = Batch::new(budget);
+        assert!(emit_artifact(&mut next, &mut cursor, 1, 3, "metadata", b"key", &body).unwrap());
+        for row in next.rows.iter().filter(|r| r.tag == 2) {
+            stored.extend_from_slice(&row.x);
+        }
+        assert_eq!(stored, body);
+        assert_eq!(cursor.digest.finish().unwrap(), <[u8; 32]>::from(Sha256::digest(&body)));
     }
     struct Fixture {
         target: crate::pg::testing::Schema,
@@ -2668,27 +2697,41 @@ mod tests {
     }
     #[test]
     fn frozen_cleanup_interruption_resumes_its_authenticated_committed_checkpoint() {
-        for point in ["input.ready","projection.ready","identity","before_remove_dir"] {
-            let Some(f)=Fixture::with_frame_count(1) else{return};let mut owner=f.owner();
-            let id=owner.begin(&f.source).unwrap();let fault=super::super::history_spool::testing::interrupt_at(point);
-            let mut sequence=0;
+        for point in ["input.ready", "projection.ready", "identity", "before_remove_dir"] {
+            let Some(f) = Fixture::with_frame_count(1) else { return };
+            let mut owner = f.owner();
+            let id = owner.begin(&f.source).unwrap();
+            let fault = super::super::history_spool::testing::interrupt_at(point);
+            let mut sequence = 0;
             loop {
-                match owner.step(&f.source,id,sequence,ImportBudget::default()) {
-                    Ok(receipt)=>{sequence=receipt.sequence;assert!(!receipt.complete,"cleanup interruption did not fire");},
-                    Err(error)=>{assert!(error.to_string().contains("injected cleanup interruption"),"{point}: {error:#}");break;}
+                match owner.step(&f.source, id, sequence, ImportBudget::default()) {
+                    Ok(receipt) => {
+                        sequence = receipt.sequence;
+                        assert!(!receipt.complete, "cleanup interruption did not fire");
+                    }
+                    Err(error) => {
+                        assert!(error.to_string().contains("injected cleanup interruption"), "{point}: {error:#}");
+                        break;
+                    }
                 }
-                assert!(sequence<1000);
+                assert!(sequence < 1000);
             }
-            drop(fault);drop(owner);
-            let read_before=f.source.cell_io().bytes;let mut client=f.target.pool.get().unwrap();
-            let row=client.query_one("select checkpoint_sequence,checkpoint from history_imports where import_id=$1",&[&&id[..]]).unwrap();
-            let committed:i64=row.get(0);assert!(committed>sequence,"cleanup must follow server commit");
-            let state:State=serde_json::from_slice(&row.get::<_,Vec<u8>>(1)).unwrap();
-            assert!(!state.cleanups.is_empty(),"durable checkpoint must authenticate cleanup locators");
-            let mut resumed=f.owner();assert_eq!(resumed.begin(&f.source).unwrap(),id);
-            finish_pages(&mut resumed,&f.source,id,committed).unwrap();
-            assert_eq!(f.source.cell_io().bytes,read_before,"completed envelope must not be reimported");
-            assert_eq!(std::fs::read_dir(f.spool.path()).unwrap().count(),1);
+            drop(fault);
+            drop(owner);
+            let read_before = f.source.cell_io().bytes;
+            let mut client = f.target.pool.get().unwrap();
+            let row = client
+                .query_one("select checkpoint_sequence,checkpoint from history_imports where import_id=$1", &[&&id[..]])
+                .unwrap();
+            let committed: i64 = row.get(0);
+            assert!(committed > sequence, "cleanup must follow server commit");
+            let state: State = serde_json::from_slice(&row.get::<_, Vec<u8>>(1)).unwrap();
+            assert!(!state.cleanups.is_empty(), "durable checkpoint must authenticate cleanup locators");
+            let mut resumed = f.owner();
+            assert_eq!(resumed.begin(&f.source).unwrap(), id);
+            finish_pages(&mut resumed, &f.source, id, committed).unwrap();
+            assert_eq!(f.source.cell_io().bytes, read_before, "completed envelope must not be reimported");
+            assert_eq!(std::fs::read_dir(f.spool.path()).unwrap().count(), 1);
         }
     }
 
