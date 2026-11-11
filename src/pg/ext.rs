@@ -4,8 +4,9 @@
 //!
 //! - `copy_from_sqlite` moves them over once, at the cutover (indexing stopped, and in the same release as the
 //!   providers' writes move to these tables, so nothing written after the copy is left behind in SQLite): each table copied from its SQLite file and checked
-//!   against it by row count and an order-free digest of every row, then topped up from the frozen `keep.*`
-//!   snapshot of 2026-11-08 (rows the SQLite raw store's caps pruned since come back; nothing there is overwritten);
+//!   against it by row count and an order-free digest of every row, then topped up from the `keep` schema when the
+//!   database has one (an `--export-keep` snapshot, whenever it was taken: rows the SQLite raw store's caps pruned
+//!   since come back, and nothing already there is overwritten; tables or columns the snapshot hasn't got are skipped);
 //! - `dump` writes every `ext_*` table to a directory, from one snapshot, one zstd file per table and a manifest;
 //!   `spawn_nightly` does it once a day and keeps the last few, away from the server's disk;
 //! - `restore` puts a dump back into empty tables.
@@ -94,6 +95,13 @@ fn pg_columns(c: &mut impl postgres::GenericClient, table: &str) -> Result<Vec<S
     .collect())
 }
 
+/// The transaction's commit waits for its WAL to be flushed, whatever the session or role defaults to: a move or
+/// restore that says it's done must survive a crash right after, as the SQLite copy it replaces may be gone by then.
+fn durable(tx: &mut postgres::Transaction<'_>) -> Result<()> {
+    tx.batch_execute("set local synchronous_commit = on")?;
+    Ok(())
+}
+
 /// What `copy_from_sqlite` did to one table.
 #[derive(Debug)]
 pub struct Moved {
@@ -111,6 +119,7 @@ pub struct Moved {
 pub fn copy_from_sqlite(c: &mut Client, main: &Path, schema: &str, apply: bool) -> Result<Vec<Moved>> {
     let lite = Connection::open_in_memory()?;
     let mut tx = c.transaction()?;
+    durable(&mut tx)?;
     super::migrate::run_in_transaction(&mut tx, schema)?;
     for t in tables_of(&mut tx)? {
         let any: bool =
@@ -684,6 +693,7 @@ fn prune(dir: &Path, keep: usize) -> Result<()> {
 pub fn restore(c: &mut Client, from: &Path, replace: bool) -> Result<Manifest> {
     let m: Manifest = serde_json::from_slice(&std::fs::read(from.join(MANIFEST)).context("reading the manifest")?)?;
     let mut tx = c.transaction()?;
+    durable(&mut tx)?;
     let version: i32 = tx.query_one("select coalesce(max(version), 0) from schema_migrations", &[])?.get(0);
     if version < m.schema_version {
         bail!("the dump is of schema version {}, this database is at {version}: migrate it first", m.schema_version);
@@ -899,6 +909,33 @@ mod tests {
         assert!(shrank(&kept, &m(vec![t("ext_http_cache", 5000)])).is_some(), "pinned rows not counted");
     }
 
+    /// With the session's default off (a role or database set that way), the move and the restore still commit
+    /// durably: a trigger refuses any row written by a transaction that isn't.
+    #[test]
+    fn move_and_restore_commit_durably_when_the_default_is_off() {
+        let Some(s) = super::super::testing::Schema::new() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let main = sqlite_files(dir.path());
+        let mut c = s.pool.get().unwrap();
+        c.batch_execute(
+            "create function durable_only() returns trigger language plpgsql as $$ begin
+               if current_setting('synchronous_commit') <> 'on' then raise exception 'not durable'; end if;
+               return new; end $$;
+             create trigger durable_only before insert on ext_predb_titles for each row execute function durable_only();
+             set synchronous_commit = off",
+        )
+        .unwrap();
+        copy_from_sqlite(&mut c, &main, &s.name, true).unwrap();
+        let d = dump(&mut c, &dir.path().join("ext-dumps"), 3, false).unwrap();
+        restore(&mut c, &d, true).unwrap();
+        let after: String = c.query_one("show synchronous_commit", &[]).unwrap().get(0);
+        assert_eq!(after, "off", "only the transactions' own setting changed");
+        // and without it the trigger does refuse
+        let refused =
+            c.execute("insert into ext_predb_titles (title, source, added_at) values ('Async.Row-GRP', 3, 1)", &[]);
+        assert!(refused.is_err());
+    }
+
     #[test]
     fn pinned_rows_are_the_raw_stores_forever_ones() {
         for key in ["nzedb_archive", "dats_pciso_1998"] {
@@ -920,32 +957,36 @@ mod tests {
         assert_eq!(left, ["20261102T040000Z", "20261103T040000Z", "other"]);
     }
 
+    /// SQLite files made with the providers' own schemas beside `dir/atlas.db`, a row or two each.
+    fn sqlite_files(dir: &Path) -> PathBuf {
+        let main = dir.join("atlas.db");
+        crate::db::create_at(&main).unwrap();
+        let p = crate::predb::db::create(&crate::predb::db::path_for(&main)).unwrap();
+        p.execute(
+            "insert into titles (id, title, source, added_at) values (1, 'Some.Movie.2020.1080p.BluRay-GRP', 3, 10)",
+            [],
+        )
+        .unwrap();
+        let r = crate::raw_store::create(&crate::raw_store::path_for(&main)).unwrap();
+        r.execute(
+            "insert into raw_http_cache (cache_key, source, url, status, body_zst, fetched_at)
+             values ('k', 'nzedb_archive', 'https://example.invalid/a', 200, x'00ff', 5)",
+            [],
+        )
+        .unwrap();
+        crate::media::store::open(&crate::media::store::path_for(&main)).unwrap();
+        let d = crate::db::create_at(&crate::media::details::path_for(&main)).unwrap();
+        d.execute_batch(crate::media::details::SCHEMA).unwrap();
+        d.execute_batch("alter table details add column backdrop TEXT").unwrap();
+        main
+    }
+
     /// SQLite files made with the providers' own schemas, a row or two each, moved, dumped, emptied and restored.
     #[test]
     fn move_dump_restore_round_trip() {
         let Some(s) = super::super::testing::Schema::empty() else { return };
         let dir = tempfile::tempdir().unwrap();
-        let main = dir.path().join("atlas.db");
-        crate::db::create_at(&main).unwrap();
-        {
-            let p = crate::predb::db::create(&crate::predb::db::path_for(&main)).unwrap();
-            p.execute(
-                "insert into titles (id, title, source, added_at) values (1, 'Some.Movie.2020.1080p.BluRay-GRP', 3, 10)",
-                [],
-            )
-            .unwrap();
-            let r = crate::raw_store::create(&crate::raw_store::path_for(&main)).unwrap();
-            r.execute(
-                "insert into raw_http_cache (cache_key, source, url, status, body_zst, fetched_at)
-                 values ('k', 'nzedb_archive', 'https://example.invalid/a', 200, x'00ff', 5)",
-                [],
-            )
-            .unwrap();
-            crate::media::store::open(&crate::media::store::path_for(&main)).unwrap();
-            let d = crate::db::create_at(&crate::media::details::path_for(&main)).unwrap();
-            d.execute_batch(crate::media::details::SCHEMA).unwrap();
-            d.execute_batch("alter table details add column backdrop TEXT").unwrap();
-        }
+        let main = sqlite_files(dir.path());
         let mut c = s.pool.get().unwrap();
         // a dry run writes nothing, not even the migrations it needed
         copy_from_sqlite(&mut c, &main, &s.name, false).unwrap();
