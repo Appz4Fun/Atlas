@@ -173,6 +173,159 @@ mod tests {
     use crate::nxv_store::store::{Clamp, KeepSet, StoreConfig};
 
     #[test]
+    fn multi_file_golden_matches_indexes_group_ties_lossy_ids_and_repeated_posters() {
+        let Some(schema) = crate::pg::testing::Schema::new() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = Store::open(
+            StoreConfig { sealers: 1, ..StoreConfig::new(dir.path()) },
+            KeepSet { live_from: i64::MIN / 2, ..KeepSet::default() },
+        )
+        .unwrap();
+        let mut groups = std::collections::BTreeMap::<String, Vec<Vec<u8>>>::new();
+        let mut number = 0;
+        let mut add = |group: &str, poster: &str, posted: i64, local: Vec<u8>| {
+            number += 1;
+            let date = chrono::DateTime::from_timestamp(posted, 0).unwrap().format("%a, %d %b %Y %H:%M:%S +0000");
+            let mut row = format!("{number}\t").into_bytes();
+            row.extend_from_slice(&local);
+            row.extend_from_slice(format!("\t{poster}\t{date}\t<").as_bytes());
+            row.extend_from_slice(&local);
+            row.extend_from_slice(b"@ngPost>\t\t700000\t5000");
+            groups.entry(group.to_owned()).or_default().push(row);
+        };
+        add("a.example", "00-index@example.invalid", 99000, b"index0".to_vec());
+        add("b.example", "01-index@example.invalid", 99000, b"index1".to_vec());
+        let mut full = 0;
+        for file in 0..32 {
+            let poster = if file == 0 {
+                "MÃ¼ller@example.invalid".to_owned()
+            } else {
+                format!("file{file:02}@example.invalid")
+            };
+            for part in 0..if file == 0 { 64 } else { 7 } {
+                let mut local = format!("file{file}part{part}").into_bytes();
+                if file == 0 && part == 0 {
+                    local.push(0xff);
+                }
+                add(if full % 2 == 0 { "a.example" } else { "b.example" }, &poster, 99000, local);
+                full += 1;
+            }
+        }
+        for (run, posted) in [(0, 150000), (1, 170000)] {
+            for part in 0..12 {
+                add(
+                    if part % 2 == 0 { "a.example" } else { "b.example" },
+                    "repeated@example.invalid",
+                    posted,
+                    format!("repeat{run}part{part}").into_bytes(),
+                );
+            }
+        }
+        for (group, rows) in groups {
+            let ticket = store.record("server.example", &group, &rows, Clamp::Unknown { now: 250000 }).unwrap();
+            store.tick().unwrap();
+            ticket.wait(Duration::from_secs(5)).unwrap();
+        }
+        store.close().unwrap();
+        let place = crate::nxv_store::linker::PlaceRec {
+            place: crate::xref::Place {
+                release: "xref-upload-prior".into(),
+                group: "a.example".into(),
+                file: 1,
+                files: 1,
+                parts: 12,
+                leads: "1".into(),
+                oldest: 250000,
+            },
+            firsts: Default::default(),
+            added: 250000,
+        };
+        let upload = crate::nxv_store::linker::UploadRec {
+            group: "a.example".into(),
+            seed: crate::xref::Seed { groups: Default::default(), first: 0, last: 0 },
+            files: 1,
+            generation: 4,
+            probed: 0,
+            added: 250000,
+        };
+        let records = format!(
+            "{}{}",
+            crate::nxv_store::linker::Links::place_line("repeated@example.invalid", &place),
+            crate::nxv_store::linker::Links::upload_line("xref-upload-prior", &upload)
+        );
+        let state = dir.path().join("_state");
+        std::fs::write(state.join("links.rec"), &records).unwrap();
+        let legacy_dir = tempfile::tempdir().unwrap();
+        std::fs::write(legacy_dir.path().join("links.rec"), &records).unwrap();
+        let mut legacy = crate::nxv_store::linker::Linker::open_in(legacy_dir.path(), 250000).unwrap();
+        legacy.state.linked.extend(-14..=100);
+        let golden = legacy.pass(&store, 250000, &Default::default(), &|| false).unwrap().unwrap().releases;
+        // Each singleton index takes one full file before an established
+        // chain wins ties. The second index plus its seven-part file stays
+        // below MIN_UPLOAD_ARTICLES, so that eight-row chain remains pending.
+        assert_eq!(golden.iter().map(|r| r.articles.len()).sum::<usize>(), 299);
+        assert!(!golden.iter().flat_map(|r| &r.articles).any(|a| a.message_id.starts_with("<file1part")));
+        assert!(golden.iter().flat_map(|r| &r.articles).any(|a| a.message_id.contains('�')));
+        let mut c = schema.pool.get().unwrap();
+        super::super::linker_bootstrap::import(&mut c, &state, 250000).unwrap();
+        c.execute("insert into linker_linked_hours select generate_series(-14,100)", &[]).unwrap();
+        let database: String = c.query_one("select current_database()", &[]).unwrap().get(0);
+        drop(c);
+        let db = crate::indexer::shared_postgres_db(
+            &crate::pg::StorageConfig {
+                backend: crate::pg::Backend::Postgres,
+                url: schema.url.clone(),
+                schema: schema.name.clone(),
+                allow_plaintext: true,
+                ..Default::default()
+            },
+            &database,
+            crate::indexer::PgWriteLimits { max_pending_bytes: 4096, max_job_bytes: 4096, concurrent_saves: 1 },
+        )
+        .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let mut actual = Vec::new();
+        rt.block_on(async {
+            let epoch = on_native_db(&db, |c| super::super::linker_epoch::open(c, 250000)).await.unwrap();
+            let _pin = store.pin_linker_retention();
+            let mut cache = super::super::linker_source::Cache::default();
+            for turn in 0..3000 {
+                assert!(turn < 2999, "golden fixture stopped making progress");
+                let page = on_native_db(&db, move |c| {
+                    if c.query_one("select phase from linker_epochs where id=$1", &[&epoch])?.get::<_, String>(0)
+                        == "emit"
+                    {
+                        super::super::linker_emit::test_page(c, epoch, Budget { rows: 3, bytes: 1024 })
+                    } else {
+                        Ok(Vec::new())
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(page.len() <= 3);
+                actual.extend(page);
+                if step(&db, &store, epoch, Budget { rows: 3, bytes: 1024 }, &mut cache).await.unwrap() {
+                    break;
+                }
+            }
+            assert_eq!(cache.verifications, 2);
+        });
+        let flatten = |releases: Vec<crate::parser::Release>| {
+            let mut rows: Vec<_> = releases
+                .into_iter()
+                .flat_map(|r| {
+                    r.articles
+                        .into_iter()
+                        .map(move |a| ((r.name.clone(), r.group.clone(), r.poster.clone(), r.date.clone()), a))
+                })
+                .collect();
+            rows.sort_by(|a, b| a.1.message_id.cmp(&b.1.message_id));
+            rows
+        };
+        assert_eq!(flatten(actual), flatten(golden));
+    }
+
+    #[test]
     fn unknown_generation_same_and_larger_counts_reconcile_unpublished_ids_once() {
         for blocks in [1, 2] {
             let Some(schema) = crate::pg::testing::Schema::new() else { return };
