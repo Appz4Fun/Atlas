@@ -18,6 +18,21 @@ sys.modules[spec.name] = guard
 spec.loader.exec_module(guard)
 
 
+def process_is_running(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    if sys.platform.startswith("linux"):
+        try:
+            state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+        except FileNotFoundError:
+            return False
+        # A killed orphan may await reaping by a container's PID 1.
+        return state != "Z"
+    return True
+
+
 class ResourceGuardTests(unittest.TestCase):
     def limits(self):
         return guard.Limits(memory_bytes=100, swap_growth_bytes=20, minimum_free_bytes=50,
@@ -49,6 +64,13 @@ class ResourceGuardTests(unittest.TestCase):
         for now, count in [(0, 0), (1, 100), (4, 100), (6, 100)]:
             monitor.check(self.observation(read_bytes=count), now=now)
         self.assertIsNone(monitor.check(self.observation(read_bytes=100), now=11))
+
+    def test_linux_zombie_is_distinguished_from_running_descendant(self):
+        with patch.object(sys, "platform", "linux"), patch.object(os, "kill"):
+            with patch.object(Path, "read_text", return_value="123 (worker name) Z 1 123"):
+                self.assertFalse(process_is_running(123))
+            with patch.object(Path, "read_text", return_value="123 (worker name) S 1 123"):
+                self.assertTrue(process_is_running(123))
 
     def test_nonpositive_limits_are_rejected(self):
         with self.assertRaises(ValueError):
@@ -128,9 +150,7 @@ class ResourceGuardTests(unittest.TestCase):
             guard.stop_child(child, grace_seconds=0.05)
             deadline = time.monotonic() + 2
             while time.monotonic() < deadline:
-                try:
-                    os.kill(descendant, 0)
-                except ProcessLookupError:
+                if not process_is_running(descendant):
                     break
                 time.sleep(0.01)
             else:
