@@ -11,6 +11,7 @@
 //! run again even when the first try's commit landed and only its answer was lost (see `with_retry`).
 
 pub mod header_blocks;
+pub mod ingest;
 pub mod main_import;
 pub mod migrate;
 pub mod release_queue;
@@ -147,6 +148,23 @@ struct PoolState {
     idle: Vec<Client>,
     /// connections open, idle or handed out
     open: usize,
+}
+
+impl Drop for Pool {
+    fn drop(&mut self) {
+        let state = self.state.get_mut().unwrap_or_else(|e| e.into_inner());
+        let clients = std::mem::take(&mut state.idle);
+        if clients.is_empty() {
+            return;
+        }
+        // postgres::Client owns a synchronous runtime, including during Drop. The final Arc may be released
+        // by an async indexer task; use a plain thread so cleanup is safe even while Tokio is shutting down.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            std::thread::spawn(move || drop(clients));
+        } else {
+            drop(clients);
+        }
+    }
 }
 
 impl Pool {

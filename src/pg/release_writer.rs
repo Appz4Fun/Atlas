@@ -32,7 +32,7 @@ struct Incoming<'a> {
     article: Option<&'a Article>,
 }
 
-fn identity(release: &Release) -> (bool, [u8; 32]) {
+pub(crate) fn identity(release: &Release) -> (bool, [u8; 32]) {
     let key = Sha256::digest(release.collection.as_deref().unwrap_or(&release.name)).into();
     (release.collection.is_some(), key)
 }
