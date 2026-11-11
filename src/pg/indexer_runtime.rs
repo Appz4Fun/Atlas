@@ -65,6 +65,10 @@ pub(crate) struct Owner {
 }
 
 impl Owner {
+    pub(crate) fn new(client: postgres::Client) -> Self {
+        Self { client: Mutex::new(Some(client)) }
+    }
+
     pub(crate) fn with<T>(&self, work: impl FnOnce(&mut postgres::Client) -> Result<T>) -> Result<T> {
         let mut held = self.client.lock().map_err(|_| anyhow::anyhow!("native owner connection is poisoned"))?;
         let client = held.as_mut().context("native owner connection has closed")?;
@@ -94,7 +98,7 @@ impl Runtime {
         storage.check().context("invalid native storage configuration")?;
         ensure!(storage.is_postgres(), "native ingestion requires PostgreSQL storage");
         Profile::check(config, &headers)?;
-        let connection: postgres::Config = storage.url.parse().context("invalid native storage configuration")?;
+        let connection = owner_connection_config(&storage)?;
         let expected = connection.get_dbname().context("native storage requires an explicit database name")?;
         // Validate schema/version and transport policy before taking ownership or changing rows.
         let db = shared_postgres_db(&storage, expected, PgWriteLimits::default())
@@ -119,8 +123,44 @@ impl Runtime {
             })
             .context("initializing native indexer cursors")?;
         }
-        let owner = Arc::new(Owner { client: Mutex::new(Some(owner)) });
+        let owner = Arc::new(Owner::new(owner));
         let db = crate::indexer::owned_postgres_db(db, owner.clone(), PgWriteLimits::default())?;
         Ok(Self { db, profile: Profile { storage, headers } })
+    }
+}
+
+fn owner_connection_config(storage: &super::StorageConfig) -> Result<postgres::Config> {
+    // Keep ownership sessions under the same transport policy as pooled sessions.
+    Ok(super::Pool::new(storage)?.config.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn owner_connection_uses_bounded_transport_defaults_and_url_overrides() {
+        let mut storage = super::super::StorageConfig {
+            backend: super::super::Backend::Postgres,
+            url: "host=127.0.0.1 dbname=example".into(),
+            schema: "example".into(),
+            ..Default::default()
+        };
+        let connection = owner_connection_config(&storage).unwrap();
+        assert_eq!(connection.get_connect_timeout(), Some(&Duration::from_secs(5)));
+        assert_eq!(connection.get_keepalives_idle(), Duration::from_secs(30));
+        assert_eq!(connection.get_keepalives_interval(), Some(Duration::from_secs(10)));
+        assert_eq!(connection.get_keepalives_retries(), Some(3));
+        assert_eq!(connection.get_tcp_user_timeout(), Some(&Duration::from_secs(30)));
+        storage.url.push_str(
+            " connect_timeout=7 keepalives_idle=9 keepalives_interval=2 keepalives_retries=4 tcp_user_timeout=11",
+        );
+        let connection = owner_connection_config(&storage).unwrap();
+        assert_eq!(connection.get_connect_timeout(), Some(&Duration::from_secs(7)));
+        assert_eq!(connection.get_keepalives_idle(), Duration::from_secs(9));
+        assert_eq!(connection.get_keepalives_interval(), Some(Duration::from_secs(2)));
+        assert_eq!(connection.get_keepalives_retries(), Some(4));
+        assert_eq!(connection.get_tcp_user_timeout(), Some(&Duration::from_secs(11)));
     }
 }
