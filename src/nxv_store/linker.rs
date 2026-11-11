@@ -1207,6 +1207,10 @@ fn not_done_days(main: &dyn crate::pg::sql::Sql) -> Result<HashSet<i64>> {
 /// Runs the linker in the indexer until `stopping`: a pass, its releases saved, then noted; again at once while
 /// passes find work, else every `PASS_EVERY`.
 pub async fn run(db: crate::indexer::Db, store: Arc<Store>, stopping: impl Fn() -> bool) {
+    if db.is_native() {
+        crate::pg::linker_runtime::run(db, store, stopping).await;
+        return;
+    }
     let now = chrono::Utc::now().timestamp();
     let linker = match Linker::open(&store, now) {
         Ok(l) => l,

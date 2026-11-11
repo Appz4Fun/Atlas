@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -142,8 +142,73 @@ pub struct Segment {
     pub day: i64,
     pub arena_path: PathBuf,
     pub index_path: PathBuf,
+    identity: [u8; 32],
+    bounded_maps: bool,
     writer: Mutex<Writer>,
     view: RwLock<View>,
+}
+
+/// A fixed published prefix with one pinned descriptor. It never clones a
+/// retained whole-arena mapping; each current block is mapped independently.
+pub struct Snapshot {
+    segment: Arc<Segment>,
+    arena: Arc<File>,
+    pub count: usize,
+    pub identity: [u8; 32],
+}
+
+impl Snapshot {
+    /// Map exactly one manifest block from the original descriptor. Expiry may
+    /// unlink/recreate the path, but cannot redirect this snapshot's reads.
+    pub fn map_block(&self, entry: Entry) -> Result<BlockMap> {
+        anyhow::ensure!((entry.seq as usize) < self.count, "block outside snapshot");
+        anyhow::ensure!(self.entries(entry.seq as usize, 1).first() == Some(&entry), "snapshot manifest mismatch");
+        anyhow::ensure!(file_identity(&self.arena)? == self.identity, "snapshot arena identity changed");
+        let end = entry.offset.checked_add(u64::from(entry.len)).context("block extent overflow")?;
+        anyhow::ensure!(end <= self.arena.metadata()?.len(), "snapshot block truncated");
+        // SAFETY: committed prefix is immutable; the pinned file cannot be
+        // replaced by reopening its path. memmap2 aligns the actual OS mapping
+        // and exposes the requested 64-byte-aligned block boundary.
+        let map = unsafe { MmapOptions::new().offset(entry.offset).len(entry.len as usize).map(self.arena.as_ref())? };
+        Ok(BlockMap { map, _arena: Arc::clone(&self.arena) })
+    }
+    pub fn close_if_idle(&self, idle: Duration) {
+        self.segment.close_if_idle(idle);
+    }
+    /// At most `limit` entries from the immutable published prefix.
+    pub fn entries(&self, start: usize, limit: usize) -> Vec<Entry> {
+        let v = self.segment.view.read().unwrap_or_else(|e| e.into_inner());
+        let end = start.saturating_add(limit).min(self.count);
+        if start >= end {
+            return Vec::new();
+        }
+        v.entries[start..end].to_vec()
+    }
+}
+
+pub struct BlockMap {
+    map: Mmap,
+    _arena: Arc<File>,
+}
+impl std::ops::Deref for BlockMap {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.map
+    }
+}
+
+fn file_identity(file: &File) -> Result<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    let metadata = file.metadata()?;
+    let mut identity = Sha256::new();
+    identity.update(metadata.dev().to_le_bytes());
+    identity.update(metadata.ino().to_le_bytes());
+    if let Ok(created) = metadata.created() {
+        let birth = created.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        identity.update(birth.as_secs().to_le_bytes());
+        identity.update(birth.subsec_nanos().to_le_bytes());
+    }
+    Ok(identity.finalize().into())
 }
 
 /// Space a commit reserved in a segment, with its own handles on the files.
@@ -184,6 +249,9 @@ impl Segment {
     /// Opens (making if need be) the segment of `day` in `dir`, healing what a crash left: a torn manifest tail, entries
     /// past the last intact block, intact blocks the manifest never got, and a torn arena tail.
     pub fn open(dir: &Path, day: i64) -> Result<(Arc<Segment>, Healed)> {
+        Self::open_with_mapping(dir, day, false)
+    }
+    pub(crate) fn open_with_mapping(dir: &Path, day: i64, bounded_maps: bool) -> Result<(Arc<Segment>, Healed)> {
         std::fs::create_dir_all(dir).with_context(|| format!("making {}", dir.display()))?;
         let name = day_name(day);
         let arena_path = dir.join(format!("{name}.nxv"));
@@ -191,13 +259,16 @@ impl Segment {
         let rw = |p: &Path| OpenOptions::new().create(true).read(true).write(true).truncate(false).open(p);
         let arena = rw(&arena_path).with_context(|| format!("opening {}", arena_path.display()))?;
         let index = rw(&index_path).with_context(|| format!("opening {}", index_path.display()))?;
+        let identity = file_identity(&arena)?;
         let (entries, arena_len, healed) = heal(&arena, &index, day)?;
-        let map = map_arena(&arena, arena_len)?;
+        let map = if bounded_maps { None } else { map_arena(&arena, arena_len)? };
         let committed = entries.iter().map(|e| (e.server, e.slab_gen)).collect();
         let seg = Segment {
             day,
             arena_path,
             index_path,
+            identity,
+            bounded_maps,
             writer: Mutex::new(Writer {
                 files: None,
                 arena_tail: arena_len,
@@ -216,6 +287,16 @@ impl Segment {
     pub fn snapshot(&self) -> (Option<Arc<Mmap>>, Vec<Entry>) {
         let v = self.view.read().unwrap_or_else(|e| e.into_inner());
         (v.map.clone(), v.entries.clone())
+    }
+
+    pub fn bounded_snapshot(self: &Arc<Self>) -> Result<Snapshot> {
+        // Same lock order as expiry: writer before view. Open once per current
+        // snapshot, not one permanently retained FD per historical segment.
+        let _writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let arena = Arc::new(File::open(&self.arena_path)?);
+        anyhow::ensure!(file_identity(&arena)? == self.identity, "segment was recreated before snapshot capture");
+        let count = self.view.read().unwrap_or_else(|e| e.into_inner()).entries.len();
+        Ok(Snapshot { segment: Arc::clone(self), arena, count, identity: self.identity })
     }
 
     pub fn block_count(&self) -> usize {
@@ -260,7 +341,7 @@ impl Segment {
     /// them).
     pub fn publish(&self, r: &Reserved) -> Result<()> {
         let end = r.entry.offset + r.entry.len as u64;
-        let map = map_arena(&r.arena, end)?;
+        let map = if self.bounded_maps { None } else { map_arena(&r.arena, end)? };
         {
             let mut v = self.view.write().unwrap_or_else(|e| e.into_inner());
             anyhow::ensure!(
@@ -291,8 +372,19 @@ impl Segment {
 
     /// Marks the segment expired and deletes its files, unless a commit holds it (then false: try again later).
     pub fn expire(&self) -> bool {
+        self.expire_checked(None)
+    }
+
+    /// Coverage of an earlier prefix never authorizes deleting a new suffix.
+    pub fn expire_covered(&self, identity: [u8; 32], count: usize) -> bool {
+        self.expire_checked(Some((identity, count)))
+    }
+
+    fn expire_checked(&self, covered: Option<([u8; 32], usize)>) -> bool {
         let mut w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
-        if w.in_flight > 0 {
+        if w.in_flight > 0
+            || covered.is_some_and(|(identity, count)| identity != self.identity || self.block_count() != count)
+        {
             return false;
         }
         w.expired = true;
@@ -311,6 +403,28 @@ fn map_arena(arena: &File, len: u64) -> Result<Option<Arc<Mmap>>> {
     // it before mapping, and expiry deletes rather than truncates
     let map = unsafe { MmapOptions::new().len(len as usize).map(arena)? };
     Ok(Some(Arc::new(map)))
+}
+
+fn recovery_entry(arena: &File, arena_len: u64, offset: u64, seq: u32, day: i64) -> Result<Option<Entry>> {
+    if arena_len.saturating_sub(offset) < 64 {
+        return Ok(None);
+    }
+    let mut header = [0; 64];
+    arena.read_exact_at(&mut header, offset)?;
+    let len = u32::from_le_bytes(header[48..52].try_into().expect("fixed header field")) as usize;
+    if len < nntp_xover_engine::container::DATA_START
+        || !len.is_multiple_of(64)
+        || offset.checked_add(len as u64).is_none_or(|end| end > arena_len)
+    {
+        return Ok(None);
+    }
+    // SAFETY: recovery is exclusive, and no truncation happens until this
+    // single-block mapping has been dropped by returning from this helper.
+    let map = unsafe { MmapOptions::new().offset(offset).len(len).map(arena)? };
+    Ok(Entry::of_block(&map, 0, seq, day).map(|mut entry| {
+        entry.offset = offset;
+        entry
+    }))
 }
 
 /// Recovery at open: the entries to keep, the arena's good length, and what was done.
@@ -343,30 +457,27 @@ fn heal(arena: &File, index: &File, day: i64) -> Result<(Vec<Entry>, u64, Healed
         healed.dropped_entries = count - entries.len();
         dirty = true;
     }
-    let map = map_arena(arena, arena_len)?;
-    let bytes: &[u8] = map.as_deref().map_or(&[], |m| &m[..]);
-    // the last kept block whole and intact, or dropped
+    // Recovery faults in at most one block, then unmaps it before inspecting
+    // the next tail block. A large roll-forward cannot retain arena-wide RSS.
     if let Some(last) = entries.last().copied()
-        && Entry::of_block(bytes, last.offset, last.seq, day).is_none()
+        && recovery_entry(arena, arena_len, last.offset, last.seq, day)?.is_none()
     {
         entries.pop();
         healed.dropped_entries += 1;
         dirty = true;
         end = last.offset;
     }
-    // blocks written whole that the manifest never got
     while end < arena_len {
-        match Entry::of_block(bytes, end, entries.len() as u32, day) {
-            Some(e) => {
-                end += e.len as u64;
-                entries.push(e);
+        match recovery_entry(arena, arena_len, end, entries.len() as u32, day)? {
+            Some(entry) => {
+                end += u64::from(entry.len);
+                entries.push(entry);
                 healed.rolled_forward += 1;
                 dirty = true;
             }
             None => break,
         }
     }
-    drop(map);
     if end < arena_len {
         healed.cut_arena_bytes = arena_len - end;
         arena.set_len(end)?;
@@ -420,6 +531,60 @@ mod tests {
         r.index.write_all_at(&r.entry.to_bytes(), r.entry.seq as u64 * ENTRY_LEN as u64).unwrap();
         seg.publish(&r).unwrap();
         r.entry
+    }
+
+    #[test]
+    fn bounded_snapshot_pins_prefix_across_append_and_recreation() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = parse_day_name("2026-11-08").unwrap();
+        let (seg, _) = Segment::open(dir.path(), day).unwrap();
+        commit(&seg, &block(1, 2, 1));
+        let old = seg.bounded_snapshot().unwrap();
+        commit(&seg, &block(10, 2, 2));
+        assert_eq!(old.count, 1);
+        assert!(!seg.expire_covered(old.identity, old.count), "staged prefix cannot expire appended suffix");
+        assert_eq!(old.entries(0, 100).len(), 1);
+        assert!(old.entries(1, 1).is_empty());
+        assert_eq!(seg.bounded_snapshot().unwrap().entries(0, 1).len(), 1);
+        let identity = old.identity;
+        std::fs::remove_file(&seg.arena_path).unwrap();
+        std::fs::remove_file(&seg.index_path).unwrap();
+        let (replacement, _) = Segment::open(dir.path(), day).unwrap();
+        commit(&replacement, &block(20, 2, 1));
+        assert_ne!(replacement.bounded_snapshot().unwrap().identity, identity);
+        assert_eq!(old.entries(0, 1)[0].min_art, 1);
+        assert!(NxvBlockView::from_mmap_slice(&old.map_block(old.entries(0, 1)[0]).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn bounded_maps_are_block_sized_and_never_retained_in_segment_views() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = parse_day_name("2026-11-08").unwrap();
+        let (seg, _) = Segment::open_with_mapping(dir.path(), day, true).unwrap();
+        for n in 0..19 {
+            commit(&seg, &block(n * 100 + 1, 70, (n + 1) as u32));
+            assert!(seg.snapshot().0.is_none());
+        }
+        let snapshot = seg.bounded_snapshot().unwrap();
+        for offset in 0..snapshot.count {
+            let entry = snapshot.entries(offset, 1)[0];
+            let mapped = snapshot.map_block(entry).unwrap();
+            assert_eq!(mapped.len(), entry.len as usize);
+            assert!(NxvBlockView::from_mmap_slice(&mapped).is_ok());
+        }
+        drop(snapshot);
+        drop(seg);
+        let (seg, healed) = Segment::open_with_mapping(dir.path(), day, true).unwrap();
+        assert_eq!(healed.blocks, 19);
+        assert!(seg.snapshot().0.is_none());
+        let old = seg.bounded_snapshot().unwrap();
+        std::fs::remove_file(&seg.arena_path).unwrap();
+        std::fs::remove_file(&seg.index_path).unwrap();
+        let (replacement, _) = Segment::open_with_mapping(dir.path(), day, true).unwrap();
+        commit(&replacement, &block(9999, 2, 1));
+        assert!(seg.bounded_snapshot().is_err());
+        assert_eq!(old.map_block(old.entries(0, 1)[0]).unwrap().len(), old.entries(0, 1)[0].len as usize);
+        assert!(replacement.snapshot().0.is_none());
     }
 
     #[test]

@@ -97,7 +97,9 @@ fn every_shard_compacts_with_the_late_thread_busy() {
             .ok()
             .and_then(|t| serde_json::from_str(&t).ok())
             .unwrap_or(serde_json::Value::Null);
-        if stats["predb"]["titles"].as_i64().unwrap_or(0) >= 1 && stats["predb"]["sources"].is_array() {
+        // The snapshot may contain an empty sources array before the feed
+        // thread registers its state. Wait for the data asserted below.
+        if stats["predb"]["titles"].as_i64().unwrap_or(0) >= 1 && stats["predb"]["sources"][0]["key"] == "predb_club" {
             break stats;
         }
         assert!(Instant::now() < deadline, "no predb in stats.json");

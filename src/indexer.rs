@@ -999,6 +999,10 @@ fn housekeeping(
 }
 
 impl Db {
+    pub(crate) fn is_native(&self) -> bool {
+        self.native.is_some()
+    }
+
     /// Run `work` in one transaction on `shard`'s writer, between saves. The
     /// answer comes when it has committed; jobs queued when the writer stops still run.
     /// `kind` (`db.stage.*`) times it apart from the other kinds: one job can hold the writer for minutes.
@@ -1032,6 +1036,11 @@ impl Db {
         // a writer waiting for work wakes; a full queue means it's busy, and looks at the lane between saves anyway
         let _ = self.saves[shard].try_send(WriterJob::Wake);
         Ok(answer)
+    }
+
+    pub(crate) async fn save_native_at(&self, releases: Vec<Release>, logical_now: i64) -> Result<()> {
+        let native = self.native.as_ref().ok_or_else(|| anyhow!("replay saves require native PostgreSQL storage"))?;
+        native.save_at(releases, logical_now).await
     }
 
     /// Save one slice's releases. Returns once they are committed. Dropping
@@ -1079,6 +1088,46 @@ pub(crate) async fn on_sqlite_db(db: &Db, f: impl FnOnce(&Connection) -> Result<
     })
     .await
     .map_err(|e| anyhow!("db task failed: {e}"))?
+}
+
+/// Native database work shares the already-validated indexer session.
+fn native_db_work<T>(db: &Db, work: impl FnOnce(&mut postgres::Client) -> Result<T>) -> Result<T> {
+    match &*db.conn {
+        MainConnection::Postgres(pool) => {
+            let mut conn = pool.get()?;
+            work(&mut conn)
+        }
+        MainConnection::OwnedPostgres(owner) => owner.with(work),
+        MainConnection::Sqlite(_) => anyhow::bail!("native database work requires PostgreSQL"),
+    }
+}
+
+pub(crate) async fn on_native_db<T: Send + 'static>(
+    db: &Db,
+    work: impl FnOnce(&mut postgres::Client) -> Result<T> + Send + 'static,
+) -> Result<T> {
+    let db = db.clone();
+    tokio::task::spawn_blocking(move || native_db_work(&db, work))
+        .await
+        .map_err(|error| anyhow!("native database task failed: {error}"))?
+}
+
+/// Synchronous callbacks may be invoked from either async workers or plain threads.
+/// A scoped thread keeps borrowed inputs usable without nesting the PostgreSQL runtime.
+pub(crate) fn on_native_db_sync<T: Send>(
+    db: &Db,
+    work: impl FnOnce(&mut postgres::Client) -> Result<T> + Send,
+) -> Result<T> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(move || native_db_work(db, work))
+                .join()
+                .map_err(|_| anyhow!("native database callback panicked"))?
+        })
+    } else {
+        native_db_work(db, work)
+    }
 }
 
 pub(crate) async fn on_db<T: Send + 'static>(

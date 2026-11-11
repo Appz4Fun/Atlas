@@ -77,11 +77,19 @@ impl Native {
         })
     }
 
+    pub(crate) async fn save_at(&self, releases: Vec<Release>, logical_now: i64) -> Result<()> {
+        self.save_with_time(releases, Some(logical_now)).await
+    }
+
     /// Completion covers every bounded commit. On failure or cancellation, callers must replay the input before
     /// acknowledging its cursor/hours; the native writer deduplicates the pieces that already committed.
     pub async fn save(&self, releases: Vec<Release>) -> Result<()> {
+        self.save_with_time(releases, None).await
+    }
+
+    async fn save_with_time(&self, releases: Vec<Release>, logical_now: Option<i64>) -> Result<()> {
         if payload_bytes(&releases, releases.capacity()) <= self.limits.max_job_bytes as usize {
-            return self.save_job(releases).await;
+            return self.save_job(releases, logical_now).await;
         }
         // Keep the writer's whole-input executable rule even when a late fragment is in another commit.
         let mut junk = HashMap::new();
@@ -105,7 +113,7 @@ impl Native {
             if let Some(name) = junk.get(&key) {
                 if submitted_junk.insert(key) {
                     metadata.articles = vec![Article { filename: Some(name.clone()), ..Default::default() }];
-                    self.add_piece(metadata, &mut batch, &mut batch_bytes).await?;
+                    self.add_piece(metadata, &mut batch, &mut batch_bytes, logical_now).await?;
                 }
                 continue;
             }
@@ -122,7 +130,7 @@ impl Native {
                 if projected(capacity, strings.saturating_add(heap)) > self.limits.max_job_bytes as usize
                     && !piece.articles.is_empty()
                 {
-                    self.add_piece(piece, &mut batch, &mut batch_bytes).await?;
+                    self.add_piece(piece, &mut batch, &mut batch_bytes, logical_now).await?;
                     piece = metadata.clone();
                     strings = 0;
                     capacity = 1;
@@ -138,20 +146,26 @@ impl Native {
                 piece.articles.push(article);
             }
             if !piece.articles.is_empty() {
-                self.add_piece(piece, &mut batch, &mut batch_bytes).await?;
+                self.add_piece(piece, &mut batch, &mut batch_bytes, logical_now).await?;
             }
         }
-        self.save_job(batch).await
+        self.save_job(batch, logical_now).await
     }
 
-    async fn add_piece(&self, piece: Release, batch: &mut Vec<Release>, bytes: &mut usize) -> Result<()> {
+    async fn add_piece(
+        &self,
+        piece: Release,
+        batch: &mut Vec<Release>,
+        bytes: &mut usize,
+        logical_now: Option<i64>,
+    ) -> Result<()> {
         let owned = payload_bytes(std::slice::from_ref(&piece), 1) - std::mem::size_of::<Release>();
         let mut capacity = next_capacity(batch.len(), batch.capacity());
         let projected = |bytes: usize, old: usize, new: usize| {
             bytes.saturating_add(owned).saturating_add((new - old).saturating_mul(std::mem::size_of::<Release>()))
         };
         if projected(*bytes, batch.capacity(), capacity) > self.limits.max_job_bytes as usize && !batch.is_empty() {
-            self.save_job(std::mem::take(batch)).await?;
+            self.save_job(std::mem::take(batch), logical_now).await?;
             *bytes = 0;
             capacity = 1;
         }
@@ -165,7 +179,7 @@ impl Native {
         Ok(())
     }
 
-    async fn save_job(&self, releases: Vec<Release>) -> Result<()> {
+    async fn save_job(&self, releases: Vec<Release>, logical_now: Option<i64>) -> Result<()> {
         if releases.is_empty() {
             return Ok(());
         }
@@ -179,7 +193,11 @@ impl Native {
         tokio::task::spawn_blocking(move || {
             let (_memory, _slot) = (memory, slot);
             source.with(|conn| {
-                super::release_writer::save(conn, &releases, chrono::Utc::now().timestamp())?;
+                super::release_writer::save(
+                    conn,
+                    &releases,
+                    logical_now.unwrap_or_else(|| chrono::Utc::now().timestamp()),
+                )?;
                 Ok(())
             })
         })
@@ -258,10 +276,15 @@ mod tests {
             ..Default::default()
         }];
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        rt.block_on(native.save(releases.clone())).unwrap();
+        rt.block_on(native.save_at(releases.clone(), 1234)).unwrap();
         let mut conn = schema.pool.get().unwrap();
+        assert_eq!(
+            conn.query_one("select touched_at from files", &[]).unwrap().get::<_, i64>(0),
+            1234,
+            "bounded pieces must keep their epoch's logical time"
+        );
         let generation: i64 = conn.query_one("select generation from pp_queue", &[]).unwrap().get(0);
-        rt.block_on(native.save(releases)).unwrap();
+        rt.block_on(native.save_at(releases, 1234)).unwrap();
         assert_eq!(conn.query_one("select generation from pp_queue", &[]).unwrap().get::<_, i64>(0), generation);
         assert_eq!(conn.query_one("select count(*) from releases", &[]).unwrap().get::<_, i64>(0), 1);
         assert_eq!(conn.query_one("select count(*) from files", &[]).unwrap().get::<_, i64>(0), 1);

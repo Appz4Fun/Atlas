@@ -13,6 +13,24 @@
 pub mod header_blocks;
 pub(crate) mod indexer_runtime;
 pub mod ingest;
+pub(crate) mod linker;
+mod linker_bootstrap;
+mod linker_emit;
+mod linker_epoch;
+mod linker_files;
+mod linker_gc;
+mod linker_ids;
+mod linker_import_scan;
+#[cfg(test)]
+mod linker_legacy;
+mod linker_metadata;
+mod linker_output;
+mod linker_plan;
+pub(crate) mod linker_runtime;
+mod linker_select;
+mod linker_sort;
+mod linker_source;
+mod linker_stage;
 pub mod main_import;
 pub mod migrate;
 pub mod release_queue;

@@ -60,6 +60,8 @@ pub struct StoreConfig {
     pub sealers: usize,
     /// Shared allocation budget for the live slab pipeline, in estimated bytes.
     pub memory_budget: usize,
+    /// Native reads map only the current format-bounded block.
+    pub bounded_maps: bool,
 }
 
 impl StoreConfig {
@@ -72,6 +74,7 @@ impl StoreConfig {
             writer_idle: Duration::from_secs(600),
             sealers: std::thread::available_parallelism().map_or(2, |n| n.get().clamp(1, 4)),
             memory_budget: LIVE_MEMORY_BUDGET,
+            bounded_maps: false,
         }
     }
 }
@@ -185,6 +188,7 @@ struct Group {
     segments: RwLock<BTreeMap<i64, Arc<Segment>>>,
     next_gen: AtomicU32,
     synced_epoch: AtomicU64,
+    bounded_maps: bool,
 }
 
 impl Group {
@@ -196,9 +200,34 @@ impl Group {
         if let Some(s) = segs.get(&day) {
             return Ok(Arc::clone(s));
         }
-        let (seg, _) = Segment::open(&self.dir, day)?;
+        let (seg, _) = Segment::open_with_mapping(&self.dir, day, self.bounded_maps)?;
         segs.insert(day, Arc::clone(&seg));
         Ok(seg)
+    }
+}
+
+/// Indexed uncommitted slabs. Entries exist from the first recorded row until
+/// durable segment publication, including the open/full/inflight transitions.
+#[derive(Default)]
+struct PendingSlabs {
+    next: u64,
+    by_id: BTreeMap<u64, (String, u32, i64)>,
+    by_slab: HashMap<(String, u32), u64>,
+}
+impl PendingSlabs {
+    fn add(&mut self, group: &str, generation: u32, day: i64) {
+        let key = (group.to_owned(), generation);
+        if self.by_slab.contains_key(&key) {
+            return;
+        }
+        self.next = self.next.checked_add(1).expect("slab barrier sequence exhausted");
+        self.by_id.insert(self.next, (group.to_owned(), generation, day));
+        self.by_slab.insert(key, self.next);
+    }
+    fn remove(&mut self, group: &str, generation: u32) {
+        if let Some(id) = self.by_slab.remove(&(group.to_owned(), generation)) {
+            self.by_id.remove(&id);
+        }
     }
 }
 
@@ -221,11 +250,14 @@ struct Shared {
     blocks_committed: AtomicU64,
     /// slabs handed to the sealers and not yet committed (or let go): (group, generation)
     inflight: Mutex<HashMap<(String, u32), i64>>,
+    pending_slabs: Mutex<PendingSlabs>,
+    barrier_identity: [u8; 16],
 }
 
 impl Shared {
     fn landed(&self, group: &str, slab_gen: u32) {
         self.inflight.lock().unwrap_or_else(|e| e.into_inner()).remove(&(group.to_string(), slab_gen));
+        self.pending_slabs.lock().unwrap_or_else(|e| e.into_inner()).remove(group, slab_gen);
     }
 
     fn failure(&self) -> Option<String> {
@@ -283,15 +315,44 @@ fn parse_row(line: &[u8]) -> Option<(u64, Option<i64>)> {
     Some((slab::art_of(line)?, line.split(|&b| b == b'\t').nth(3).and_then(parse_rfc2822_to_epoch)))
 }
 
+/// PostgreSQL's durable complete-coverage check. Unknown/error means retain.
+/// Called outside store locks and never with an unbounded segment inventory.
+pub type LinkerCoverage = Arc<dyn Fn(&str, i64, [u8; 32], usize) -> Result<bool> + Send + Sync>;
+
+/// Blocks expiry during the source snapshot/staging boundary. The guard is
+/// independent of day count and must be held before enumerating inventory.
+pub struct LinkerRetentionPin {
+    store: Arc<Store>,
+}
+impl Drop for LinkerRetentionPin {
+    fn drop(&mut self) {
+        self.store.linker_pins.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// A bounded metadata scan may return no segments while still advancing past
+/// empty groups. `after` records that progress independently of output rows.
+pub(crate) struct SegmentInventoryPage {
+    pub entries: Vec<(String, i64, usize)>,
+    pub after: Option<(String, i64)>,
+    pub complete: bool,
+    #[cfg(test)]
+    pub visited_groups: usize,
+}
+
 pub struct Store {
     cfg: StoreConfig,
-    groups: RwLock<HashMap<String, Arc<Group>>>,
+    groups: RwLock<BTreeMap<String, Arc<Group>>>,
     servers: Mutex<Vec<String>>,
     keep: RwLock<KeepSet>,
     shared: Arc<Shared>,
     seal_tx: Mutex<Option<Sender<SealJob>>>,
     /// expiry waits until the linker has finished a pass, soo days it hasn't linked aren't let go after a start
     expiry_armed: AtomicBool,
+    linker_pins: AtomicUsize,
+    retention_gate: Mutex<()>,
+    linker_coverage: RwLock<Option<LinkerCoverage>>,
+    coverage_cursor: Mutex<Option<(String, i64)>>,
     /// where a fresh keep set comes from (`live::keep_now`): housekeeping and a refused row ask it, soo a keep set set
     /// earlier never wins over a newer one
     keep_source: Mutex<Option<KeepSource>>,
@@ -380,7 +441,7 @@ impl Store {
         let _ = super::sync::raise_open_files(65_536);
         let servers = read_servers(&cfg.root)?;
         let mut opened = Opened::default();
-        let mut groups = HashMap::new();
+        let mut groups = BTreeMap::new();
         let memory = Arc::new(Semaphore::new(cfg.memory_budget));
         let mut recovery = RecoveryOpen {
             memory: &memory,
@@ -397,9 +458,22 @@ impl Store {
             // nothing is deleted at open: what the keep set no longer holds goes once expiry is armed (after the
             // linker's first pass), soo a day the linker hasn't linked survives a restart
             let everything = KeepSet { live_from: i64::MIN / 2, ..KeepSet::default() };
-            let group = open_group(&dir, &name, &everything, &mut opened, &mut recovery)?;
+            let group = open_group(&dir, &name, &everything, &mut opened, &mut recovery, cfg.bounded_maps)?;
             groups.insert(name, group);
         }
+        let mut pending_slabs = PendingSlabs::default();
+        // Recovery bounds the remaining open logs; sealed recovery has already
+        // committed and needs no barrier entry.
+        for group in groups.values() {
+            let slabs = group.slabs.lock().unwrap_or_else(|e| e.into_inner());
+            for slab in slabs.open.values().chain(slabs.full.iter()) {
+                if !slab.is_empty() {
+                    pending_slabs.add(&group.name, slab.slab_gen, slab.day);
+                }
+            }
+        }
+        let mut barrier_identity = [0; 16];
+        getrandom::fill(&mut barrier_identity).map_err(|e| anyhow!("barrier identity: {e}"))?;
         let shared = Arc::new(Shared {
             failed: Mutex::new(None),
             stopping: AtomicBool::new(false),
@@ -415,6 +489,8 @@ impl Store {
             dropped_repeats: AtomicU64::new(0),
             blocks_committed: AtomicU64::new(0),
             inflight: Mutex::new(HashMap::new()),
+            pending_slabs: Mutex::new(pending_slabs),
+            barrier_identity,
         });
         let store = Arc::new(Store {
             cfg,
@@ -427,6 +503,10 @@ impl Store {
             tick_lock: Mutex::new(()),
             recording: RwLock::new(()),
             expiry_armed: AtomicBool::new(false),
+            linker_pins: AtomicUsize::new(0),
+            retention_gate: Mutex::new(()),
+            linker_coverage: RwLock::new(None),
+            coverage_cursor: Mutex::new(None),
             keep_source: Mutex::new(None),
             recent_claims: Mutex::new(BTreeMap::new()),
             _lock: lock,
@@ -537,7 +617,7 @@ impl Store {
         std::fs::create_dir_all(&dir).with_context(|| format!("making {}", dir.display()))?;
         // the new folder's name durable before any row of it counts as kept
         super::sync::sync_dir(&self.cfg.root)?;
-        let g = Arc::new(new_group(dir, name, 1));
+        let g = Arc::new(new_group(dir, name, 1, self.cfg.bounded_maps));
         gs.insert(name.to_string(), Arc::clone(&g));
         Ok(g)
     }
@@ -719,6 +799,7 @@ impl Store {
             }
             let slab = push_row(&g, &mut s, sid, day, art, ts, line, self.cfg.seal_rows)?;
             slab.charge(permit.split(row_charge(line)).expect("listing was charged before recording"));
+            self.shared.pending_slabs.lock().unwrap_or_else(|e| e.into_inner()).add(&g.name, slab.slab_gen, slab.day);
         }
         let epoch = s.epoch + 1;
         drop(s);
@@ -811,6 +892,73 @@ impl Store {
         out
     }
 
+    /// A keyset page of the segment inventory. Unlike `segments`, the extra
+    /// memory is proportional to `limit`, regardless of historical day count.
+    /// An epoch must pin retention while inventory and source staging run.
+    pub fn segment_page(&self, after: Option<(&str, i64)>, limit: usize) -> Vec<(String, i64, usize)> {
+        // Compatibility reader: callers historically stop at an empty result.
+        // Native staging/expiry use the bounded metadata continuation below.
+        self.segment_page_scan(after, limit, usize::MAX).entries
+    }
+
+    pub(crate) fn segment_inventory_page(&self, after: Option<(&str, i64)>, limit: usize) -> SegmentInventoryPage {
+        self.segment_page_scan(after, limit, limit)
+    }
+
+    fn segment_page_scan(&self, after: Option<(&str, i64)>, limit: usize, group_limit: usize) -> SegmentInventoryPage {
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+        let mut page = SegmentInventoryPage {
+            entries: Vec::with_capacity(limit),
+            after: after.map(|(g, d)| (g.to_owned(), d)),
+            complete: false,
+            #[cfg(test)]
+            visited_groups: 0,
+        };
+        if limit == 0 {
+            return page;
+        }
+        let groups = self.groups.read().unwrap_or_else(|e| e.into_inner());
+        // MAX is a cursor for a fully visited group (including empty groups).
+        let lower = match after {
+            Some((g, i64::MAX)) => Excluded(g),
+            Some((g, _)) => Included(g),
+            None => Unbounded,
+        };
+        let mut groups = groups.range::<str, _>((lower, Unbounded));
+        for _ in 0..group_limit {
+            let Some((name, g)) = groups.next() else {
+                page.complete = true;
+                return page;
+            };
+            #[cfg(test)]
+            {
+                page.visited_groups += 1;
+            }
+            let lower = match after {
+                Some((group, day)) if group == name.as_str() => Excluded(day),
+                _ => Unbounded,
+            };
+            let segments = g.segments.read().unwrap_or_else(|e| e.into_inner());
+            for (day, seg) in segments.range((lower, Unbounded)) {
+                page.entries.push((name.clone(), *day, seg.block_count()));
+                page.after = Some((name.clone(), *day));
+                if page.entries.len() == limit {
+                    return page;
+                }
+            }
+            page.after = Some((name.clone(), i64::MAX));
+        }
+        page
+    }
+
+    /// Pin one segment's published prefix without copying its manifest.
+    pub fn segment_snapshot(&self, group: &str, day: i64) -> Result<Option<super::segment::Snapshot>> {
+        let g = self.groups.read().unwrap_or_else(|e| e.into_inner()).get(group).cloned();
+        let Some(g) = g else { return Ok(None) };
+        let segment = g.segments.read().unwrap_or_else(|e| e.into_inner()).get(&day).cloned();
+        segment.map(|segment| segment.bounded_snapshot()).transpose()
+    }
+
     /// Days some slab still holds rows of (not yet sealed and committed).
     pub fn open_days(&self) -> BTreeSet<i64> {
         let mut out = BTreeSet::new();
@@ -819,6 +967,49 @@ impl Store {
             out.extend(s.open.values().chain(s.full.iter()).filter(|sl| !sl.is_empty()).map(|sl| sl.day));
         }
         out
+    }
+
+    /// Freeze the pre-call row barrier without enumerating groups or slabs.
+    /// A reopened Store has a different identity; its recovered pending slabs
+    /// must be captured anew before inventory can be sealed.
+    pub(crate) fn flush_barrier(&self) -> ([u8; 16], u64) {
+        let _recording = self.recording.write().unwrap_or_else(|e| e.into_inner());
+        let pending = self.shared.pending_slabs.lock().unwrap_or_else(|e| e.into_inner());
+        (self.shared.barrier_identity, pending.next)
+    }
+
+    pub(crate) fn barrier_identity(&self) -> [u8; 16] {
+        self.shared.barrier_identity
+    }
+
+    /// Request at most `limit` indexed pending slabs. Zero means the captured
+    /// prefix is durably committed. No historical group/slab prefix is visited;
+    /// completed jobs disappear from this index only after durable publication.
+    pub(crate) fn flush_barrier_page(&self, through: u64, limit: usize) -> Result<usize> {
+        anyhow::ensure!(limit > 0, "barrier page must be nonzero");
+        if let Some(error) = self.failure() {
+            bail!("header store stopped: {error}");
+        }
+        let jobs: Vec<_> = self
+            .shared
+            .pending_slabs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .by_id
+            .range(..=through)
+            .take(limit)
+            .map(|(_, job)| job.clone())
+            .collect();
+        for (name, _, day) in &jobs {
+            let group = self.groups.read().unwrap_or_else(|e| e.into_inner()).get(name).cloned();
+            if let Some(group) = group {
+                group.slabs.lock().unwrap_or_else(|e| e.into_inner()).seal_days.insert(*day);
+            }
+        }
+        if !jobs.is_empty() {
+            self.request_drain();
+        }
+        Ok(jobs.len())
     }
 
     /// The published blocks of `group`'s segment of `day`, with the map they point into.
@@ -965,6 +1156,11 @@ impl Store {
     /// Idle writer files closed, and segments of days the keep set no longer holds (and no slab still fills)
     /// expired.
     pub fn housekeeping(&self) {
+        let coverage = self.linker_coverage.read().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(coverage) = coverage {
+            self.covered_housekeeping(&coverage);
+            return;
+        }
         // armed first, then the keep set: arming comes after the keep set took the linker's unlinked days
         let armed = self.expiry_armed.load(Ordering::Acquire);
         let keep = self.current_keep();
@@ -977,6 +1173,7 @@ impl Store {
             };
             let inflight_days: BTreeSet<i64> =
                 self.shared.inflight.lock().unwrap_or_else(|e| e.into_inner()).values().copied().collect();
+            let _gate = self.retention_gate.lock().unwrap_or_else(|e| e.into_inner());
             let mut segs = g.segments.write().unwrap_or_else(|e| e.into_inner());
             let gone: Vec<i64> = segs
                 .iter()
@@ -985,6 +1182,9 @@ impl Store {
                         && !keep.keeps(**day)
                         && !open_days.contains(day)
                         && !inflight_days.contains(day)
+                        && self.linker_pins.load(Ordering::Acquire) == 0
+                        && self.expiry_armed.load(Ordering::Acquire)
+                        && self.linker_coverage.read().unwrap_or_else(|e| e.into_inner()).is_none()
                         && seg.expire()
                 })
                 .map(|(d, _)| *d)
@@ -994,6 +1194,67 @@ impl Store {
             }
             for seg in segs.values() {
                 seg.close_if_idle(self.cfg.writer_idle);
+            }
+        }
+    }
+
+    pub fn pin_linker_retention(self: &Arc<Self>) -> LinkerRetentionPin {
+        let _gate = self.retention_gate.lock().unwrap_or_else(|e| e.into_inner());
+        self.linker_pins.fetch_add(1, Ordering::AcqRel);
+        LinkerRetentionPin { store: Arc::clone(self) }
+    }
+
+    /// Clearing the callback also disarms expiry; shutdown/failure must not
+    /// fall back to day-only expiry while native work remains unpublished.
+    pub fn set_linker_coverage(&self, coverage: Option<LinkerCoverage>) {
+        let _gate = self.retention_gate.lock().unwrap_or_else(|e| e.into_inner());
+        if coverage.is_none() {
+            self.expiry_armed.store(false, Ordering::Release);
+        }
+        *self.linker_coverage.write().unwrap_or_else(|e| e.into_inner()) = coverage;
+    }
+
+    fn covered_housekeeping(&self, coverage: &LinkerCoverage) {
+        let after = self.coverage_cursor.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let page = self.segment_inventory_page(after.as_ref().map(|(g, d)| (g.as_str(), *d)), 64);
+        *self.coverage_cursor.lock().unwrap_or_else(|e| e.into_inner()) = if page.complete { None } else { page.after };
+        for (name, day, _) in page.entries {
+            let Ok(Some(snapshot)) = self.segment_snapshot(&name, day) else { continue };
+            snapshot.close_if_idle(self.cfg.writer_idle);
+            if !self.expiry_armed.load(Ordering::Acquire)
+                || self.linker_pins.load(Ordering::Acquire) > 0
+                || self.current_keep().keeps(day)
+            {
+                continue;
+            }
+            // No locks are held across PostgreSQL: the owner may be staging a
+            // source page. A stale positive answer is rechecked at deletion.
+            if !coverage(&name, day, snapshot.identity, snapshot.count).unwrap_or(false)
+                || self.current_keep().keeps(day)
+            {
+                continue;
+            }
+            let Some(group) = self.groups.read().unwrap_or_else(|e| e.into_inner()).get(&name).cloned() else {
+                continue;
+            };
+            let slabs = group.slabs.lock().unwrap_or_else(|e| e.into_inner());
+            if slabs.open.values().chain(slabs.full.iter()).any(|s| s.day == day) {
+                continue;
+            }
+            let inflight = self.shared.inflight.lock().unwrap_or_else(|e| e.into_inner());
+            if inflight.values().any(|&d| d == day) {
+                continue;
+            }
+            let _gate = self.retention_gate.lock().unwrap_or_else(|e| e.into_inner());
+            if self.linker_pins.load(Ordering::Acquire) > 0 || !self.expiry_armed.load(Ordering::Acquire) {
+                continue;
+            }
+            let mut segments = group.segments.write().unwrap_or_else(|e| e.into_inner());
+            if let Some(seg) = segments.get(&day) {
+                seg.close_if_idle(self.cfg.writer_idle);
+                if seg.expire_covered(snapshot.identity, snapshot.count) {
+                    segments.remove(&day);
+                }
             }
         }
     }
@@ -1079,7 +1340,7 @@ impl Drop for Store {
     }
 }
 
-fn new_group(dir: PathBuf, name: &str, next_gen: u32) -> Group {
+fn new_group(dir: PathBuf, name: &str, next_gen: u32, bounded_maps: bool) -> Group {
     Group {
         name: name.to_string(),
         dir,
@@ -1092,6 +1353,7 @@ fn new_group(dir: PathBuf, name: &str, next_gen: u32) -> Group {
         }),
         segments: RwLock::new(BTreeMap::new()),
         next_gen: AtomicU32::new(next_gen),
+        bounded_maps,
         synced_epoch: AtomicU64::new(0),
     }
 }
@@ -1139,6 +1401,7 @@ fn open_group(
     keep: &KeepSet,
     opened: &mut Opened,
     recovery: &mut RecoveryOpen<'_>,
+    bounded_maps: bool,
 ) -> Result<Arc<Group>> {
     let mut segments = BTreeMap::new();
     let mut logs: Vec<(PathBuf, u16, i64, u32)> = Vec::new();
@@ -1150,7 +1413,7 @@ fn open_group(
             && let Some(day) = parse_day_name(stem)
         {
             if keep.keeps(day) {
-                let (seg, healed) = Segment::open(dir, day)?;
+                let (seg, healed) = Segment::open_with_mapping(dir, day, bounded_maps)?;
                 opened.segments += 1;
                 opened.blocks += healed.blocks;
                 max_gen = max_gen.max(seg.highest_slab_gen());
@@ -1166,7 +1429,7 @@ fn open_group(
         }
     }
     let next_gen = max_gen.checked_add(1).context("header store slab generations exhausted")?;
-    let g = Arc::new(new_group(dir.to_path_buf(), name, next_gen));
+    let g = Arc::new(new_group(dir.to_path_buf(), name, next_gen, bounded_maps));
     *g.segments.write().unwrap_or_else(|e| e.into_inner()) = segments;
     logs.sort_by_key(|l| l.3);
     {
@@ -1411,6 +1674,80 @@ mod tests {
     }
 
     #[test]
+    fn native_barrier_visits_only_pending_jobs_and_excludes_later_slabs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = Store::open(cfg(dir.path()), keep_all()).unwrap();
+        for n in 0..100 {
+            store.group(&format!("empty{n:03}.example")).unwrap();
+        }
+        let tick = store.tick_lock.lock().unwrap();
+        for n in 0..17 {
+            store
+                .record(
+                    "s",
+                    &format!("pending{n:03}.example"),
+                    &[line(1, "poster@example.invalid", NOV8)],
+                    Clamp::Live { now: NOW },
+                )
+                .unwrap();
+        }
+        let (_, through) = store.flush_barrier();
+        assert_eq!(through, 17);
+        store
+            .record("s", "later.example", &[line(1, "poster@example.invalid", NOV8)], Clamp::Live { now: NOW })
+            .unwrap();
+        // No empty group or post-watermark job is visited. Each requested page
+        // is exactly the number of entries read from the sequence index.
+        assert_eq!(store.flush_barrier_page(through, 3).unwrap(), 3);
+        assert!(store.group("later.example").unwrap().slabs.lock().unwrap().seal_days.is_empty());
+        drop(tick);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let visited = store.flush_barrier_page(through, 3).unwrap();
+            assert!(visited <= 3);
+            if visited == 0 {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(store.counters().2, 17);
+        let pending = store.shared.pending_slabs.lock().unwrap();
+        assert_eq!(pending.by_id.len(), 1);
+        assert_eq!(pending.by_id.first_key_value().unwrap().1.0, "later.example");
+        drop(pending);
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn native_barrier_reopen_recaptures_unsealed_durable_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_identity;
+        {
+            let (store, _) = Store::open(cfg(dir.path()), keep_all()).unwrap();
+            let ticket = store
+                .record("s", "group.example", &[line(1, "poster@example.invalid", NOV8)], Clamp::Live { now: NOW })
+                .unwrap();
+            store.tick().unwrap();
+            ticket.wait(Duration::from_secs(1)).unwrap();
+            old_identity = store.flush_barrier().0;
+            // Stop the pipeline without sealing, preserving its already-synced
+            // slab log. A reopened Store must not trust the old volatile jobs.
+            store.shared.fail(anyhow!("synthetic stop before seal"));
+            assert!(store.close().is_err());
+        }
+        let (store, opened) = Store::open(cfg(dir.path()), keep_all()).unwrap();
+        assert_eq!(opened.rows_replayed, 1);
+        let (identity, through) = store.flush_barrier();
+        assert_ne!(identity, old_identity);
+        assert_eq!(through, 1);
+        assert_eq!(store.flush_barrier_page(through, 1).unwrap(), 1);
+        wait_blocks(&store, 1);
+        assert_eq!(store.flush_barrier_page(through, 1).unwrap(), 0);
+        store.close().unwrap();
+    }
+
+    #[test]
     fn fetch_waits_for_header_storage_capacity() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = StoreConfig { memory_budget: 8192, ..cfg(dir.path()) };
@@ -1522,6 +1859,115 @@ mod tests {
         drop(store);
         let (again, _) = Store::open(cfg(dir.path()), keep_all()).unwrap();
         again.close().unwrap();
+    }
+
+    #[test]
+    fn bounded_inventory_advances_over_empty_groups_and_sparse_days() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = Store::open(cfg(dir.path()), keep_all()).unwrap();
+        for n in 0..25 {
+            let g = store.group(&format!("group{n:02}.example")).unwrap();
+            if n % 5 == 0 {
+                for day in [1, 1000, 100000] {
+                    let (seg, _) = Segment::open(&g.dir, day).unwrap();
+                    g.segments.write().unwrap().insert(day, seg);
+                }
+            }
+        }
+        let expected = store.segments();
+        let mut after = None;
+        let mut actual = Vec::new();
+        let mut visited = 0;
+        for turn in 0..100 {
+            assert!(turn < 99, "inventory cursor failed to advance");
+            let page = store.segment_inventory_page(after.as_ref().map(|(g, d): &(String, i64)| (g.as_str(), *d)), 3);
+            assert!(page.entries.len() <= 3 && page.visited_groups <= 3);
+            visited += page.visited_groups;
+            actual.extend(page.entries);
+            if page.complete {
+                break;
+            }
+            assert_ne!(page.after, after);
+            after = page.after;
+        }
+        assert_eq!(actual, expected);
+        assert!(visited <= 30, "revisited historical group prefixes: {visited}");
+        let first = store.segment_inventory_page(None, 3);
+        let g = store.group("before.example").unwrap();
+        let (seg, _) = Segment::open(&g.dir, 1).unwrap();
+        g.segments.write().unwrap().insert(1, seg);
+        let next = store.segment_inventory_page(first.after.as_ref().map(|(g, d)| (g.as_str(), *d)), 3);
+        assert!(next.entries.iter().all(|(g, _, _)| g != "before.example"));
+        assert_eq!(store.segment_inventory_page(None, 3).entries[0].0, "before.example");
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn native_expiry_requires_coverage_and_respects_inventory_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = Store::open(cfg(dir.path()), keep_all()).unwrap();
+        store
+            .record(
+                "server.example",
+                "group.example",
+                &[line(1, "poster@example.invalid", NOV8)],
+                Clamp::Live { now: NOW },
+            )
+            .unwrap();
+        store.close().unwrap();
+        let day = day_of("2026-11-08");
+        let status = Arc::new(AtomicUsize::new(0));
+        let shared = Arc::clone(&status);
+        store.set_linker_coverage(Some(Arc::new(move |_, _, _, _| match shared.load(Ordering::Acquire) {
+            0 => Err(anyhow!("synthetic coverage outage")),
+            1 => Ok(false),
+            _ => Ok(true),
+        })));
+        store.set_keep(KeepSet { live_from: day + 10, ..KeepSet::default() });
+        store.arm_expiry();
+        let sweep = || {
+            for _ in 0..3 {
+                store.housekeeping();
+            }
+        };
+        sweep();
+        assert!(store.segment_snapshot("group.example", day).unwrap().is_some());
+        status.store(1, Ordering::Release);
+        sweep();
+        assert!(store.segment_snapshot("group.example", day).unwrap().is_some());
+        let pin = store.pin_linker_retention();
+        status.store(2, Ordering::Release);
+        sweep();
+        assert!(store.segment_snapshot("group.example", day).unwrap().is_some());
+        drop(pin);
+        sweep();
+        assert!(store.segment_snapshot("group.example", day).unwrap().is_none());
+        store.set_linker_coverage(None);
+        assert!(!store.expiry_armed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn bounded_segment_inventory_pages_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = Store::open(cfg(dir.path()), keep_all()).unwrap();
+        for group in ["third.example", "first.example", "second.example"] {
+            store
+                .record("server.example", group, &[line(1, "poster@example.invalid", NOV8)], Clamp::Live { now: NOW })
+                .unwrap();
+        }
+        store.close().unwrap();
+        let expected = store.segments();
+        let mut actual = Vec::new();
+        let mut after: Option<(String, i64)> = None;
+        loop {
+            let page = store.segment_page(after.as_ref().map(|(g, d)| (g.as_str(), *d)), 1);
+            assert!(page.len() <= 1);
+            let Some((g, d, _)) = page.first() else { break };
+            after = Some((g.clone(), *d));
+            actual.extend(page);
+        }
+        assert_eq!(actual, expected);
+        assert!(store.segment_page(None, 0).is_empty());
     }
 
     #[test]
@@ -1647,8 +2093,8 @@ mod tests {
         let memory = Arc::new(Semaphore::new(charge));
         let mut recovery = RecoveryOpen { memory: &memory, bytes: charge, logs: 2 };
         let before_commit = std::fs::read(&logs[1]).unwrap();
-        let g = open_group(&first, "g", &keep_all(), &mut opened, &mut recovery).unwrap();
-        let h = open_group(&second, "h", &keep_all(), &mut opened, &mut recovery).unwrap();
+        let g = open_group(&first, "g", &keep_all(), &mut opened, &mut recovery, false).unwrap();
+        let h = open_group(&second, "h", &keep_all(), &mut opened, &mut recovery, false).unwrap();
         assert!(logs[0].exists());
         assert_eq!(g.slabs.lock().unwrap().open.len(), 1);
         assert!(h.slabs.lock().unwrap().open.is_empty());
@@ -1658,7 +2104,7 @@ mod tests {
         drop(h);
 
         std::fs::write(&logs[1], before_commit).unwrap();
-        let h = open_group(&second, "h", &keep_all(), &mut opened, &mut recovery).unwrap();
+        let h = open_group(&second, "h", &keep_all(), &mut opened, &mut recovery, false).unwrap();
         assert_eq!(opened.logs_already_committed, 1);
         assert_eq!(h.segments.read().unwrap()[&day].block_count(), 1);
         assert!(!logs[1].exists());

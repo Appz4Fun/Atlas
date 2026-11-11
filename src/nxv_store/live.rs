@@ -126,6 +126,14 @@ pub fn keep_now() -> KeepSet {
 
 /// Opens the store when it's on. Call once, from the indexer; it starts the store's linker after.
 pub fn spawn(cfg: &crate::config::HeaderStoreConfig) -> anyhow::Result<()> {
+    spawn_with_mapping(cfg, false)
+}
+
+pub(crate) fn spawn_bounded(cfg: &crate::config::HeaderStoreConfig) -> anyhow::Result<()> {
+    spawn_with_mapping(cfg, true)
+}
+
+fn spawn_with_mapping(cfg: &crate::config::HeaderStoreConfig, bounded_maps: bool) -> anyhow::Result<()> {
     if !cfg.enabled {
         return Ok(());
     }
@@ -134,7 +142,7 @@ pub fn spawn(cfg: &crate::config::HeaderStoreConfig) -> anyhow::Result<()> {
     let state_dir: PathBuf = root.join("_state");
     load_claimed(&state_dir);
     use anyhow::Context;
-    let (store, opened) = Store::open(StoreConfig::new(&root), keep_now())
+    let (store, opened) = Store::open(StoreConfig { bounded_maps, ..StoreConfig::new(&root) }, keep_now())
         .with_context(|| format!("opening header store {}", root.display()))?;
     eprintln!(
         "header store: {} segments, {} blocks; {} logs replayed ({} rows), {} already committed",
@@ -145,7 +153,7 @@ pub fn spawn(cfg: &crate::config::HeaderStoreConfig) -> anyhow::Result<()> {
     store.set_keep_source(Arc::new(keep_now));
     // the store's linker arms expiry after its first pass; with a linker that can't read its state, nothing would, soo
     // expiry follows the keep set from the start
-    if let Err(e) = super::linker::Linker::open(&store, now()) {
+    if !bounded_maps && let Err(e) = super::linker::Linker::open(&store, now()) {
         eprintln!("header store: its linker couldnt read its state ({e:#}); expiry follows the keep set alone");
         store.arm_expiry();
     }
@@ -227,6 +235,53 @@ pub fn finish() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_spawn_never_opens_legacy_linker_metadata() {
+        const CHILD: &str = "ATLAS_TEST_BOUNDED_SPAWN_ROOT";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let cfg = crate::config::HeaderStoreConfig {
+                enabled: true,
+                dir: PathBuf::from(root).to_string_lossy().into_owned(),
+            };
+            spawn_bounded(&cfg).unwrap();
+            handle().unwrap().close().unwrap();
+            return;
+        }
+        // Run the real live startup entrypoint in an isolated process because
+        // production Store ownership is a process singleton. A FIFO makes ANY
+        // eager legacy metadata open observable without allocating a huge map.
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("_state");
+        std::fs::create_dir(&state).unwrap();
+        let fifo = std::ffi::CString::new(state.join("links.rec").as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let old_ids = std::fs::File::create(state.join("linked-ids.rec")).unwrap();
+        old_ids.set_len(16 * 1024 * 1024).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "nxv_store::live::tests::bounded_spawn_never_opens_legacy_linker_metadata",
+                "--nocapture",
+            ])
+            .env(CHILD, dir.path())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("bounded startup attempted an eager legacy metadata read");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(old_ids.metadata().unwrap().len(), 16 * 1024 * 1024);
+    }
 
     #[test]
     fn claimed_days_stay_while_read_and_come_back_from_their_file() {
