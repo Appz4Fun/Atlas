@@ -361,6 +361,14 @@ pub struct Db {
 
 pub use crate::pg::ingest::PgWriteLimits;
 
+impl Db {
+    pub(crate) fn fail_native(&self, failure: crate::pg::outage::Failure) {
+        if let MainConnection::OwnedPostgres(owner) = &*self.conn {
+            owner.fail(failure);
+        }
+    }
+}
+
 enum MainConnection {
     Sqlite(Mutex<Connection>),
     Postgres(Arc<crate::pg::Pool>),
