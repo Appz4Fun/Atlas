@@ -1792,6 +1792,16 @@ pub fn run() -> i32 {
         return 1;
     }
     if storage.is_postgres() {
+        // the external data (`ext_*`) is dumped nightly once Postgres holds it: it can't be fetched again
+        match crate::pg::Pool::new(&storage) {
+            Ok(pool) => crate::pg::ext::spawn_nightly(
+                std::sync::Arc::new(pool),
+                crate::pg::ext::dump_dir(),
+                crate::pg::ext::DUMP_HOUR,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ),
+            Err(e) => ui::warn(&format!("no nightly dump of the external data: {e:#}")),
+        }
         return run_native(config, storage);
     }
     if let Err(e) = write_atomic(&paths::pid_file(), std::process::id().to_string()) {

@@ -12,6 +12,7 @@ pub const MIGRATIONS: &[(i32, &str, &str)] = &[
     (4, "main_compat", include_str!("migrations/0004_main_compat.sql")),
     (5, "queue_claim", include_str!("migrations/0005_queue_claim.sql")),
     (6, "linker", include_str!("migrations/0006_linker.sql")),
+    (7, "ext", include_str!("migrations/0007_ext.sql")),
 ];
 
 /// Bring the schema `schema` up to the last migration. Returns the versions applied now.
