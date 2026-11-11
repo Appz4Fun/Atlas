@@ -314,18 +314,31 @@ pub fn build(main: &Path, out: &Path, allow_missing: bool) -> Result<Vec<Copied>
 /// run or the one before. A table that would shrink (a run after a wipe, or against the wrong directory) is refused
 /// unless `force`.
 pub fn to_postgres(pg: &mut postgres::Client, file: &Path, copied: &[Copied], stamp: &str, force: bool) -> Result<()> {
+    to_postgres_in_schema(pg, file, copied, stamp, force, "keep")
+}
+
+fn to_postgres_in_schema(
+    pg: &mut postgres::Client,
+    file: &Path,
+    copied: &[Copied],
+    stamp: &str,
+    force: bool,
+    schema: &str,
+) -> Result<()> {
+    let namespace = quoted(schema);
     let conn = Connection::open_with_flags(file, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let mut tx = pg.transaction()?;
-    tx.batch_execute(
-        "create schema if not exists keep;
-         create table if not exists keep.runs (stamp text not null, name text not null, rows bigint not null,
-             digest text not null, primary key (stamp, name));",
-    )?;
+    tx.batch_execute("set local synchronous_commit = on")?;
+    tx.batch_execute(&format!(
+        "create schema if not exists {namespace};
+         create table if not exists {namespace}.runs (stamp text not null, name text not null, rows bigint not null,
+             digest text not null, primary key (stamp, name));"
+    ))?;
     for c in copied {
-        let table = format!("keep.{}", quoted(&c.name));
+        let table = format!("{namespace}.{}", quoted(&c.name));
         let there: Option<i64> = tx
             .query_opt(
-                "select coalesce((select rows from keep.runs where name = $1 order by stamp desc limit 1), 0)",
+                &format!("select coalesce((select rows from {namespace}.runs where name = $1 order by stamp desc limit 1), 0)"),
                 &[&c.name],
             )?
             .map(|r| r.get(0));
@@ -339,7 +352,7 @@ pub fn to_postgres(pg: &mut postgres::Client, file: &Path, copied: &[Copied], st
         tx.batch_execute(&format!("drop table if exists {table}"))?;
         let back = copy_checked(&conn, &mut tx, &table, c)?;
         tx.execute(
-            "insert into keep.runs (stamp, name, rows, digest) values ($1, $2, $3, $4)",
+            &format!("insert into {namespace}.runs (stamp, name, rows, digest) values ($1, $2, $3, $4)"),
             &[&stamp, &c.name, &(back.rows as i64), &back.hex()],
         )?;
         println!("  {table}: {} rows, digest {}", back.rows, back.hex());
@@ -476,12 +489,25 @@ fn restore_postgres(
     let mut tx = pg.transaction()?;
     let actual: String = tx.query_one("select current_database()", &[])?.get(0);
     anyhow::ensure!(actual == database, "connected to {actual}, expected {database}");
+    restore_postgres_in_transaction(&mut tx, snapshot, copied, schema)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// The restore's mutation phase, shared with the durability regression so its transaction-local setting can be
+/// observed before commit. The wrapper owns the transaction and checks destination identity first.
+fn restore_postgres_in_transaction(
+    tx: &mut postgres::Transaction<'_>,
+    snapshot: &Connection,
+    copied: &[Copied],
+    schema: &str,
+) -> Result<()> {
+    tx.batch_execute("set local synchronous_commit = on")?;
     tx.batch_execute(&format!("create schema {}", quoted(schema)))?;
     for c in copied {
         let table = format!("{}.{}", quoted(schema), quoted(&c.name));
-        copy_checked(snapshot, &mut tx, &table, c).with_context(|| format!("restoring {table}"))?;
+        copy_checked(snapshot, tx, &table, c).with_context(|| format!("restoring {table}"))?;
     }
-    tx.commit()?;
     Ok(())
 }
 
@@ -713,6 +739,58 @@ mod tests {
     }
 
     #[test]
+    fn keep_conversion_commits_durably_when_the_default_is_off() {
+        let Some(test) = crate::pg::testing::Schema::empty() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let copied = restore_fixture(dir.path());
+        let file = dir.path().join("keep.db");
+        let mut pg = test.pool.get().unwrap();
+        to_postgres_in_schema(&mut pg, &file, &copied, "1", false, &test.name).unwrap();
+        pg.batch_execute(
+            "create function durable_only() returns trigger language plpgsql as $$ begin
+            if current_setting('synchronous_commit') <> 'on' then raise exception 'not durable'; end if;
+            return new; end $$;
+            create trigger durable_only before insert on runs for each row execute function durable_only();
+            set synchronous_commit=off",
+        )
+        .unwrap();
+        assert!(pg.execute("insert into runs values ('control','control',0,'control')", &[]).is_err());
+        assert!(
+            to_postgres_in_schema(&mut pg, &file, &copied, "2", false, &test.name).is_ok(),
+            "conversion must override asynchronous session durability"
+        );
+        assert_eq!(pg.query_one("select count(*) from runs where stamp='2'", &[]).unwrap().get::<_, i64>(0), 11);
+        assert_eq!(pg.query_one("show synchronous_commit", &[]).unwrap().get::<_, String>(0), "off");
+    }
+
+    #[test]
+    fn keep_restore_commits_durably_when_the_default_is_off() {
+        let Some(test) = crate::pg::testing::Schema::empty() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let copied = restore_fixture(dir.path());
+        let snapshot = Connection::open(dir.path().join("keep.db")).unwrap();
+        let schema = format!("keep_restore_{}", test.name);
+        let mut pg = test.pool.get().unwrap();
+        pg.batch_execute("set synchronous_commit=off").unwrap();
+        let mut tx = pg.transaction().unwrap();
+        restore_postgres_in_transaction(&mut tx, &snapshot, &copied, &schema).unwrap();
+        let body: Vec<u8> =
+            tx.query_one(&format!("select extra from {schema}.predb_titles where id=1"), &[]).unwrap().get(0);
+        assert_eq!(body, [1, 2]);
+        assert_eq!(
+            tx.query_one("show synchronous_commit", &[]).unwrap().get::<_, String>(0),
+            "on",
+            "restore must override asynchronous session durability before commit"
+        );
+        tx.commit().unwrap();
+        assert_eq!(pg.query_one("show synchronous_commit", &[]).unwrap().get::<_, String>(0), "off");
+        let label: String =
+            pg.query_one(&format!("select label from {schema}.predb_titles where id=1"), &[]).unwrap().get(0);
+        assert_eq!(label, "original");
+        pg.batch_execute(&format!("drop schema {schema} cascade")).unwrap();
+    }
+
+    #[test]
     fn the_digest_is_the_same_in_any_order_and_tells_kinds_apart() {
         let mut buf = Vec::new();
         let rows = [
@@ -783,11 +861,11 @@ mod tests {
         assert_eq!(PgKind::of(""), PgKind::Text);
     }
 
-    /// Against a real Postgres when `ATLAS_CATALOG_TEST_URL` names a database to use: every table goes over, reads
-    /// back with the same digest, and a second run replaces it whole.
+    /// Against an isolated Postgres schema: every table goes over, reads back with the same digest, and a second
+    /// run replaces it whole.
     #[test]
     fn the_kept_tables_go_into_postgres_and_read_back_the_same() {
-        let Ok(url) = std::env::var("ATLAS_CATALOG_TEST_URL") else { return };
+        let Some(test) = crate::pg::testing::Schema::empty() else { return };
         let dir = tempfile::tempdir().unwrap();
         let main = dir.path().join("atlas.db");
         crate::db::create_db_at(&main).unwrap();
@@ -800,10 +878,9 @@ mod tests {
             .unwrap();
         let out = dir.path().join("keep.db");
         let copied = build(&main, &out, true).unwrap();
-        let mut pg = postgres::Client::connect(&url, postgres::NoTls).unwrap();
-        pg.batch_execute("drop schema if exists keep cascade").unwrap();
-        to_postgres(&mut pg, &out, &copied, "1", false).unwrap();
-        to_postgres(&mut pg, &out, &copied, "2", false).unwrap();
+        let mut pg = test.pool.get().unwrap();
+        to_postgres_in_schema(&mut pg, &out, &copied, "1", false, &test.name).unwrap();
+        to_postgres_in_schema(&mut pg, &out, &copied, "2", false, &test.name).unwrap();
         // fewer rows than the last run: refused, and nothing changed
         let fewer: Vec<Copied> = copied
             .iter()
@@ -820,11 +897,10 @@ mod tests {
             let defs = c.columns.iter().map(|col| format!("{} {}", quoted(&col.name), col.decl)).collect::<Vec<_>>();
             e.execute_batch(&format!("create table {} ({});", quoted(&c.name), defs.join(", "))).unwrap();
         }
-        assert!(to_postgres(&mut pg, &empty, &fewer, "3", false).is_err());
-        let runs: i64 = pg.query_one("select count(distinct stamp) from keep.runs", &[]).unwrap().get(0);
+        assert!(to_postgres_in_schema(&mut pg, &empty, &fewer, "3", false, &test.name).is_err());
+        let runs: i64 = pg.query_one("select count(distinct stamp) from runs", &[]).unwrap().get(0);
         assert_eq!(runs, 2, "the refused run left nothing");
-        let n: i64 = pg.query_one("select count(*) from keep.predb_titles", &[]).unwrap().get(0);
+        let n: i64 = pg.query_one("select count(*) from predb_titles", &[]).unwrap().get(0);
         assert_eq!(n, 3);
-        pg.batch_execute("drop schema keep cascade").unwrap();
     }
 }
