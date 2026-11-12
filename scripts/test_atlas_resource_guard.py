@@ -102,46 +102,54 @@ class ResourceGuardTests(unittest.TestCase):
         finally:
             child.wait()
 
-    def test_zombie_group_probe_after_leader_exit_is_reaped(self):
+    def test_zombie_group_probe_keeps_leader_unreaped_until_cleanup(self):
         from unittest.mock import Mock
-        child = Mock(pid=123)
-        child.poll.side_effect = [None, 0]
-        table = subprocess.CompletedProcess([], 0, stdout="123 Z\n456 S\n")
+        child = Mock(pid=123, returncode=None)
+        child.poll.side_effect = AssertionError("leader cannot be reaped before the last group access")
+        live = subprocess.CompletedProcess([], 0, stdout="123 123 Z\n124 123 S\n456 456 S\n")
+        dead = subprocess.CompletedProcess([], 0, stdout="123 123 Z\n456 456 S\n")
         with patch.object(guard.sys, "platform", "darwin"), \
                 patch.object(os, "killpg", side_effect=[None, PermissionError(errno.EPERM, "denied")]) as send, \
-                patch.object(subprocess, "run", return_value=table):
+                patch.object(subprocess, "run", side_effect=[live, dead]):
             guard.stop_child(child)
             self.assertEqual([call.args[1] for call in send.call_args_list], [signal.SIGTERM, 0])
             child.wait.assert_called_once()
+            child.poll.assert_not_called()
 
     def test_group_permission_failure_with_a_live_leader_is_not_ignored(self):
         from unittest.mock import Mock
-        child = Mock(pid=123)
-        child.poll.return_value = None
-        with patch.object(os, "killpg", side_effect=PermissionError(errno.EPERM, "denied")):
-            with self.assertRaises(PermissionError):
-                guard.stop_child(child)
-
-    def test_group_permission_failure_with_a_live_descendant_is_not_ignored(self):
-        from unittest.mock import Mock
-        child = Mock(pid=123)
-        child.poll.return_value = 0
-        table = subprocess.CompletedProcess([], 0, stdout="123 S\n456 Z\n")
+        child = Mock(pid=123, returncode=None)
+        table = subprocess.CompletedProcess([], 0, stdout="123 123 S\n")
         with patch.object(guard.sys, "platform", "darwin"), \
                 patch.object(os, "killpg", side_effect=PermissionError(errno.EPERM, "denied")), \
                 patch.object(subprocess, "run", return_value=table):
             with self.assertRaises(PermissionError):
                 guard.stop_child(child)
+            child.wait.assert_not_called()
+            child.poll.assert_not_called()
+
+    def test_group_permission_failure_with_a_live_descendant_is_not_ignored(self):
+        from unittest.mock import Mock
+        child = Mock(pid=123, returncode=None)
+        table = subprocess.CompletedProcess([], 0, stdout="123 123 Z\n124 123 S\n456 456 Z\n")
+        with patch.object(guard.sys, "platform", "darwin"), \
+                patch.object(os, "killpg", side_effect=PermissionError(errno.EPERM, "denied")), \
+                patch.object(subprocess, "run", return_value=table):
+            with self.assertRaises(PermissionError):
+                guard.stop_child(child)
+            child.wait.assert_not_called()
+            child.poll.assert_not_called()
 
     def test_group_permission_failure_with_unreadable_inventory_is_not_ignored(self):
         from unittest.mock import Mock
-        child = Mock(pid=123)
-        child.poll.return_value = 0
+        child = Mock(pid=123, returncode=None)
         with patch.object(guard.sys, "platform", "darwin"), \
                 patch.object(os, "killpg", side_effect=PermissionError(errno.EPERM, "denied")), \
                 patch.object(subprocess, "run", side_effect=OSError("unavailable")):
             with self.assertRaises(PermissionError):
                 guard.stop_child(child)
+            child.wait.assert_not_called()
+            child.poll.assert_not_called()
 
     def test_stop_escalates_for_a_child_ignoring_term(self):
         child = subprocess.Popen(
@@ -204,7 +212,10 @@ class ResourceGuardTests(unittest.TestCase):
             stdout=subprocess.PIPE, text=True)
         descendant = int(child.stdout.readline())
         if leader_exits:
-            child.wait(timeout=5)
+            deadline = time.monotonic() + 5
+            while not guard.leader_has_exited(child):
+                self.assertLess(time.monotonic(), deadline, "leader did not exit while held")
+                time.sleep(0.01)
         try:
             guard.stop_child(child, grace_seconds=0.05)
             deadline = time.monotonic() + 2
@@ -215,11 +226,9 @@ class ResourceGuardTests(unittest.TestCase):
             else:
                 self.fail("a descendant survived its supervised process group")
         finally:
-            try:
-                os.killpg(child.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            child.wait()
+            # Never signal the old numeric group after stop_child released its leader.
+            if child.returncode is None:
+                guard.stop_child(child, grace_seconds=0.05)
             child.stdout.close()
 
     def test_failed_startup_fence_prevents_any_child_launch(self):
@@ -229,7 +238,7 @@ class ResourceGuardTests(unittest.TestCase):
             fake_sampler.sample.return_value = self.observation(memory_bytes=101)
             with patch.object(guard, "Sampler", return_value=fake_sampler), \
                     patch.object(guard, "write_stop_receipt", side_effect=OSError(errno.ENOSPC, "full")), \
-                    patch.object(guard.subprocess, "Popen", wraps=subprocess.Popen) as launch:
+                    patch.object(guard.subprocess, "Popen") as launch:
                 for _ in range(2):
                     try:
                         guard.supervise([sys.executable, "-c", "import time;time.sleep(60)"],
@@ -246,6 +255,9 @@ class ResourceGuardTests(unittest.TestCase):
             fake_sampler.sample.return_value = self.observation(memory_bytes=101)
             write = guard.write_stop_receipt
             calls = 0
+            child = unittest.mock.Mock(pid=123, returncode=None)
+            def stopped(owned):
+                owned.returncode = -signal.SIGTERM
             def fail_update(*args, **kwargs):
                 nonlocal calls
                 calls += 1
@@ -254,7 +266,10 @@ class ResourceGuardTests(unittest.TestCase):
                 raise OSError(errno.ENOSPC, "full")
             with patch.object(guard, "Sampler", return_value=fake_sampler), \
                     patch.object(guard, "write_stop_receipt", side_effect=fail_update), \
-                    patch.object(guard.subprocess, "Popen", wraps=subprocess.Popen) as launch:
+                    patch.object(guard.subprocess, "Popen", return_value=child) as launch, \
+                    patch.object(guard, "leader_has_exited", return_value=False), \
+                    patch.object(guard.signal, "signal"), \
+                    patch.object(guard, "stop_child", side_effect=stopped):
                 for _ in range(2):
                     guard.supervise([sys.executable, "-c", "import time;time.sleep(60)"],
                                     self.limits(), [Path(directory)], marker)
@@ -333,6 +348,8 @@ class OwnedGroupLifetimeTests(unittest.TestCase):
                 rows.append("456 S")
             else:
                 rows.append(leader)
+            if "-p" in command:
+                rows = rows[:1]  # A real ps -p query returns only the requested leader.
             return subprocess.CompletedProcess(command, 0, stdout="\n".join(rows) + "\n")
         return read
 
