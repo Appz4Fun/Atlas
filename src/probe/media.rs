@@ -1070,7 +1070,11 @@ fn clock_secs(value: &str) -> Option<f64> {
         return None;
     }
     let (h, m, s) = (h.parse::<u64>().ok()?, m.parse::<u64>().ok()?, s.parse::<f64>().ok()?);
-    (m < 60 && (0.0..60.0).contains(&s)).then(|| (h * 3600 + m * 60) as f64 + s)
+    if m >= 60 || !(0.0..60.0).contains(&s) {
+        return None;
+    }
+    let whole_seconds = h.checked_mul(3600)?.checked_add(m * 60)?;
+    Some(whole_seconds as f64 + s)
 }
 
 // ---- MP4
