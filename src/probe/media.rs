@@ -4157,6 +4157,42 @@ mod tests {
     }
 
     #[test]
+    fn clock_duration_rejects_overflowing_whole_seconds() {
+        for value in [
+            "18446744073709551615:00:00",
+            "5124095576030432:00:00",
+            "5124095576030431:01:00",
+        ] {
+            assert_eq!(clock_secs(value), None, "{value}");
+        }
+    }
+
+    #[test]
+    fn clock_duration_preserves_valid_boundaries() {
+        assert_eq!(clock_secs("00:00:00"), Some(0.0));
+        assert_eq!(clock_secs("00:59:59.5"), Some(3599.5));
+        assert_eq!(clock_secs(" 01:23:45.5 "), Some(5025.5));
+        // The largest safe hour product rounds to 2^64 when converted to f64.
+        assert_eq!(clock_secs("5124095576030431:00:00"), Some(18_446_744_073_709_551_616.0));
+        assert_eq!(clock_secs("00:60:00"), None);
+        assert_eq!(clock_secs("00:00:60"), None);
+    }
+
+    #[test]
+    fn clock_duration_overflow_does_not_discard_other_track_statistics() {
+        let (file, tags_at) = mkvmerge_file(false);
+        let mut info = parse(&file[..tags_at]).unwrap();
+        let tags = el(
+            &[0x12, 0x54, 0xC3, 0x67],
+            &tag(Some(0xAAAA), &[("BPS", "8123456"), ("DURATION", "18446744073709551615:00:00")]),
+        );
+        assert!(tail_tags(&tags, &mut info));
+        let stats = info.video[0].stats.as_ref().unwrap();
+        assert_eq!(stats.bps, Some(8_123_456));
+        assert_eq!(stats.duration_secs, None);
+    }
+
+    #[test]
     fn cut_or_odd_tail_tags_never_give_a_wrong_count() {
         let (file, tags_at) = mkvmerge_file(false);
         let front = &file[..tags_at];
