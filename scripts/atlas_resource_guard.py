@@ -257,6 +257,9 @@ def supervise(command, limits, storage_paths, stop_file, interval=0.5):
     if stop_file.exists():
         print("Atlas resource guard: an earlier stop requires operator review.", file=sys.stderr)
         return 0
+    # Automatic/custom child reaping would defeat the unreaped leader's PID pin.
+    if signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL:
+        raise RuntimeError("default SIGCHLD and exclusive child wait ownership are required")
     sampler = Sampler(storage_paths)
     initial_swap, free = sampler.system_usage(time.monotonic())
     if free < limits.minimum_free_bytes:
