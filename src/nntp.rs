@@ -4681,6 +4681,9 @@ fn inflate_xzver(lines: &[Vec<u8>]) -> Result<Vec<u8>> {
 }
 
 #[cfg(test)]
+mod failure_startup_tests;
+
+#[cfg(test)]
 mod yenc_decode_tests {
     use super::yenc_decode;
 
