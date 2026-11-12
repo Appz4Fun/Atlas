@@ -1,5 +1,7 @@
 """Owned local subprocess checks; these tests never run SSH."""
 import importlib.util
+import argparse
+import json
 import os
 from pathlib import Path
 import socket
@@ -43,6 +45,114 @@ class TunnelTests(unittest.TestCase):
 
 
 class TunnelSafetyTests(unittest.TestCase):
+    def run_configured_exit(self, diagnostic, *, fatal=False):
+        """Model OpenSSH log severity at the real command/supervisor boundary.
+
+        Only the SSH executable is replaced. No SSH connection is made; the
+        configured -o LogLevel controls whether the fixture emits its INFO
+        keepalive diagnostic. Authentication/configuration errors are ERROR.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            key = root / "identity"
+            key.write_text("test fixture")
+            key.chmod(0o600)
+            known = root / "known_hosts"
+            known.write_text("")
+            args = argparse.Namespace(host="ssh.example.invalid", user="example", port=2222,
+                remote_host="127.0.0.1", remote_port=5432, socket=root / "pg.sock",
+                identity_file=key, known_hosts_file=known)
+            command = tunnel.build_command(args)
+            fixture = root / "ssh_fixture.py"
+            fixture.write_text("""import json,os,pathlib,socket,sys,time
+root=pathlib.Path(sys.argv[1])
+diagnostic=json.loads(sys.argv[2]);fatal=sys.argv[3]=='True'
+options=[sys.argv[i+1] for i,value in enumerate(sys.argv[:-1]) if value=='-o']
+levels={'QUIET':0,'FATAL':1,'ERROR':2,'INFO':3,'VERBOSE':4,'DEBUG':5,'DEBUG1':5,'DEBUG2':6,'DEBUG3':7}
+level=next((value.split('=',1)[1].upper() for value in options if value.lower().startswith('loglevel=')),'INFO')
+p=root/'attempts';n=int(p.read_text())+1 if p.exists() else 1
+temporary=root/'attempts.tmp';temporary.write_text(str(n));temporary.replace(p)
+s=socket.socket(socket.AF_UNIX);s.bind(str(root/'pg.sock'));s.listen(1)
+(root/f'ready-{os.getpid()}').write_text('ready')
+release=root/f'release-{os.getpid()}';deadline=time.monotonic()+2
+while not release.exists():
+    if time.monotonic()>=deadline:
+        (root/'handshake_failed').write_text('child was not released after measurement')
+        raise RuntimeError('fixture measurement handshake timed out')
+    time.sleep(.005)
+if fatal or n<3:
+    if levels[level]>=(2 if fatal else 3):
+        sys.stderr.write(diagnostic+'\\n');sys.stderr.flush()
+    sys.exit(255)
+while True: time.sleep(.01)
+""")
+            command[:1] = [sys.executable, str(fixture), str(root), json.dumps(diagnostic), str(fatal)]
+            stop = threading.Event()
+            timer = threading.Timer(5, stop.set)
+            timer.start()
+            real_popen = tunnel.subprocess.Popen
+            def start_ready(*command_args, **command_options):
+                child = real_popen(*command_args, **command_options)
+                try:
+                    deadline = time.monotonic() + 2
+                    ready = root / f"ready-{child.pid}"
+                    while not ready.exists():
+                        if child.poll() is not None or time.monotonic() >= deadline:
+                            raise RuntimeError("fixture child readiness timed out")
+                        time.sleep(.005)
+                    return child
+                except BaseException:
+                    tunnel.stop_child(child, grace=.1)
+                    child.stderr.close()
+                    raise
+            def finish(pid, memory, tail):
+                # supervise calls the observer only after the real sample
+                # succeeds; release only that measured, ready child to exit.
+                (root / f"release-{pid}").write_text("measured")
+                record = root / "attempts"
+                if record.exists() and record.read_text() == "3" and args.socket.exists():
+                    stop.set()
+            try:
+                # These classification fixtures take one real sample per child.
+                # The five-second overall stop precedes a second ten-second
+                # sample, keeping deliberate fixture teardown out of /proc reads.
+                # Wait at the real launch boundary so lease.capture also sees
+                # the ready socket before the observer lets its child exit.
+                with patch.object(tunnel.subprocess, "Popen", start_ready):
+                    result = tunnel.supervise(command, args.socket, root / "stop.json", stop,
+                        initial_backoff=.02, max_backoff=.05, sample_seconds=10, observer=finish)
+                self.assertFalse((root / "handshake_failed").exists(), "fixture measurement handshake failed")
+                receipt = (root / "stop.json").read_text() if (root / "stop.json").exists() else None
+                return result, receipt, int((root / "attempts").read_text()), args.socket.exists()
+            finally:
+                stop.set()
+                timer.cancel()
+                timer.join()
+
+    def test_configured_logging_retries_established_keepalive_timeouts(self):
+        result, receipt, attempts, remaining_socket = self.run_configured_exit(
+            "Timeout, server ssh.example.invalid not responding.")
+        self.assertEqual(result, 0, receipt)
+        self.assertIsNone(receipt)
+        self.assertEqual(attempts, 3, "keepalive loss must retry before recovery")
+        self.assertFalse(remaining_socket)
+
+    def test_configured_logging_preserves_fatal_diagnostic_precedence(self):
+        for diagnostic in ("Permission denied (publickey).", "Host key verification failed.",
+                           "Bad configuration option: invalid", "bind: Address already in use",
+                           "unclassified failure"):
+            with self.subTest(diagnostic=diagnostic):
+                # Recognized transport text must never overrule fatal evidence;
+                # an unclassified 255 remains fatal without that extra text.
+                message = diagnostic
+                if diagnostic != "unclassified failure":
+                    message += "\nTimeout, server ssh.example.invalid not responding."
+                result, receipt, attempts, remaining_socket = self.run_configured_exit(message, fatal=True)
+                self.assertEqual(result, 1)
+                self.assertIn("ssh_failed", receipt)
+                self.assertEqual(attempts, 1)
+                self.assertFalse(remaining_socket)
+
     def test_initial_unknown_socket_and_file_are_preserved(self):
         for kind in ("file", "socket", "symlink"):
             with tempfile.TemporaryDirectory() as directory:
