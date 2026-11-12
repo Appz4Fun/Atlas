@@ -427,7 +427,7 @@ fn owned_backend(schema: &mut Schema) -> Option<i32> {
     let rows = schema
         .client
         .query(
-            "select pid from pg_locks where locktype='advisory' and granted and objsubid=2
+            "select distinct pid from pg_locks where locktype='advisory' and granted and objsubid=2
         and database=(select oid from pg_database where datname=current_database())
         and classid::bigint=(hashtext('atlas.indexer')::bigint & 4294967295)
         and objid::bigint=(hashtext($1)::bigint & 4294967295)",
@@ -436,6 +436,46 @@ fn owned_backend(schema: &mut Schema) -> Option<i32> {
         .unwrap();
     assert!(rows.len() <= 1, "concurrent advisory owners");
     rows.first().map(|row| row.get(0))
+}
+
+#[test]
+fn review_regression_owner_observer_accepts_one_backend_with_both_lock_modes() {
+    let Ok(url) = std::env::var("ATLAS_PG_TEST_URL") else { return };
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let name = format!("t_review_owner_modes_{}", std::process::id());
+    atlas::pg::migrate::run(&mut client, &name).unwrap();
+    let mut schema = Schema { client, name };
+    let mut owner = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    owner.batch_execute(&format!("set search_path to {}", schema.name)).unwrap();
+    let pid: i32 = owner.query_one("select pg_backend_pid()", &[]).unwrap().get(0);
+    owner.query_one("select pg_advisory_lock(hashtext('atlas.indexer'),hashtext($1))", &[&schema.name]).unwrap();
+    let mut tx = owner.transaction().unwrap();
+    tx.query_one("select atlas_native_write_guard($1)", &[&schema.name]).unwrap();
+    let rows = schema.client.query("select pid,mode,granted from pg_locks where locktype='advisory' and objsubid=2 and database=(select oid from pg_database where datname=current_database()) and classid::bigint=(hashtext('atlas.indexer')::bigint & 4294967295) and objid::bigint=(hashtext($1)::bigint & 4294967295) order by pid,mode", &[&schema.name]).unwrap();
+    let observed: Vec<(i32, String, bool)> = rows.iter().map(|row| (row.get(0), row.get(1), row.get(2))).collect();
+    println!("{}", serde_json::json!({"case":"owner_lock_modes","backend":pid,"rows":observed}));
+    assert_eq!(observed, vec![(pid, "ExclusiveLock".into(), true), (pid, "ShareLock".into(), true)]);
+    assert_eq!(owned_backend(&mut schema), Some(pid), "one backend remains one owner across lock modes");
+}
+
+#[test]
+fn review_regression_owner_observer_rejects_two_distinct_backends() {
+    let Ok(url) = std::env::var("ATLAS_PG_TEST_URL") else { return };
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let name = format!("t_review_owner_distinct_{}", std::process::id());
+    atlas::pg::migrate::run(&mut client, &name).unwrap();
+    let mut schema = Schema { client, name };
+    let mut first = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let mut second = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    for client in [&mut first, &mut second] {
+        client
+            .query_one("select pg_advisory_lock_shared(hashtext('atlas.indexer'),hashtext($1))", &[&schema.name])
+            .unwrap();
+    }
+    let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owned_backend(&mut schema)));
+    let panic = rejected.expect_err("two distinct backends must be rejected");
+    let message = panic.downcast_ref::<String>().map(String::as_str).or_else(|| panic.downcast_ref::<&str>().copied());
+    assert_eq!(message, Some("concurrent advisory owners"));
 }
 
 fn identities(schema: &mut Schema) -> Vec<String> {
@@ -893,12 +933,45 @@ fn historical_readiness_rejects_actual_startup_before_cursor_or_provider_work() 
         let port = spawn_server(Arc::clone(&server));
         let config = configuration(&url, &schema.name, port);
         std::fs::write(home.path().join("config.json"), config.to_string()).unwrap();
+        let mut blocker = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        let blocker_pid: i32 = blocker.query_one("select pg_backend_pid()", &[]).unwrap().get(0);
+        let mut hold = blocker.transaction().unwrap();
+        hold.batch_execute(&format!("lock table {}.history_imports in access exclusive mode", schema.name)).unwrap();
         let mut rejected = start(home.path(), "historical-rejected.log");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let guard_pid = loop {
+            let row = schema
+                .client
+                .query_opt(
+                    "select a.pid from pg_stat_activity a join pg_locks l on l.pid=a.pid
+                 where l.locktype='relation' and not l.granted
+                 and l.relation=to_regclass($1) and $2=any(pg_blocking_pids(a.pid))
+                 and a.query like '%atlas_native_write_guard%'
+                 and exists(select 1 from pg_locks o where o.pid=a.pid and o.locktype='advisory'
+                   and o.granted and o.mode='ExclusiveLock' and o.objsubid=2
+                   and o.database=(select oid from pg_database where datname=current_database())
+                   and o.classid::bigint=(hashtext('atlas.indexer')::bigint & 4294967295)
+                   and o.objid::bigint=(hashtext($3)::bigint & 4294967295))",
+                    &[&format!("{}.history_imports", schema.name), &blocker_pid, &schema.name],
+                )
+                .unwrap();
+            if let Some(row) = row {
+                break row.get::<_, i32>(0);
+            }
+            assert!(rejected.0.try_wait().unwrap().is_none(), "startup exited before reaching its history guard");
+            assert!(Instant::now() < deadline, "startup did not reach its owned-schema history guard");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        println!(
+            "{}",
+            serde_json::json!({"case":"startup_history_guard","state":state,"guard_backend":guard_pid,"blocker_backend":blocker_pid})
+        );
+        hold.commit().unwrap();
         assert!(!wait_for_exit(&mut rejected, Duration::from_secs(5)).success());
         let log = std::fs::read_to_string(home.path().join("historical-rejected.log")).unwrap();
         assert!(
-            log.contains("historical readiness before native cursor initialization"),
-            "startup must reach the persistent readiness guard: {log}"
+            log.contains("native PostgreSQL destination refused"),
+            "startup must retain its sanitized destination refusal: {log}"
         );
         assert_eq!(
             snapshot(&mut schema.client, &schema.name),

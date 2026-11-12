@@ -123,12 +123,16 @@ revoke all on history_imports,history_sources,history_objects,history_object_chu
 
 -- Statement triggers supplement explicit Rust transaction entry guards. They
 -- also cover direct Sql cursor/metadata entrypoints. Volatile function queries
--- recheck the gate after the ownership fence; import registration takes the
--- identical fence before inserting its persistent gate.
+-- recheck the gate after the ownership fence at READ COMMITTED; fixed writer
+-- snapshots are rejected before reading readiness. Import registration takes
+-- the identical fence before inserting its persistent gate.
 create function atlas_native_write_guard(p_schema text) returns void language plpgsql volatile
 security definer set search_path=pg_catalog as $$
 declare blocked boolean;
 begin
+    if current_setting('transaction_isolation') <> 'read committed' then
+        raise exception 'native mutation requires READ COMMITTED isolation' using errcode='0A000';
+    end if;
     execute format('select exists(select 1 from %I.history_imports)',p_schema) into blocked;
     if blocked then raise exception 'historical import blocks native mutations' using errcode='55000'; end if;
     perform pg_catalog.pg_advisory_xact_lock_shared(pg_catalog.hashtext('atlas.indexer'),pg_catalog.hashtext(p_schema));

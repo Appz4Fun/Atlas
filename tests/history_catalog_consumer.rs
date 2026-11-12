@@ -93,6 +93,51 @@ fn phase(name: &str) {
 }
 
 #[test]
+fn review_regression_readonly_catalog_retains_its_fixed_snapshot() {
+    use atlas::pg::history_catalog::{Lookup, LookupPurpose, ReadBudget, Snapshot};
+    let files = tempfile::tempdir().unwrap();
+    let path = history_catalog_support::manifest(files.path());
+    let manifest: Manifest = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let source = Source::open(manifest, 4 * 1024 * 1024).unwrap();
+    let destination_files = tempfile::tempdir().unwrap();
+    let Some((mut target, _)) = history_catalog_support::destination(destination_files.path()) else { return };
+    let spool = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(spool.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let mut owner = target.owner(spool.path(), 4 * 1024 * 1024);
+    let id = owner.begin(&source).unwrap();
+    let mut sequence = 0;
+    loop {
+        let receipt = owner.step(&source, id, sequence, ImportBudget::default()).unwrap();
+        sequence = receipt.sequence;
+        if receipt.complete {
+            break;
+        }
+    }
+    owner.finish_identity(&source, id).unwrap();
+    target.client.batch_execute(&format!("set search_path to {}", target.name)).unwrap();
+    let mut catalog = Snapshot::open(&mut target.client, id).unwrap();
+    let mut modifier = postgres::Client::connect(&target.url, postgres::NoTls).unwrap();
+    let removed = modifier
+        .execute(
+            &format!("delete from {}.history_catalog where import_id=$1 and public_id=3", target.name),
+            &[&&id[..]],
+        )
+        .unwrap();
+    assert_eq!(removed, 1);
+    assert!(
+        matches!(catalog.lookup(3, LookupPurpose::Raw, ReadBudget::default()).unwrap(), Lookup::Found(_)),
+        "open read-only snapshot must retain catalog identity across later commits"
+    );
+    drop(catalog);
+    let mut fresh = Snapshot::open(&mut target.client, id).unwrap();
+    assert!(matches!(fresh.lookup(3, LookupPurpose::Raw, ReadBudget::default()).unwrap(), Lookup::Missing));
+}
+
+#[test]
 #[ignore = "run the compiled executable under explicit runtime resource admission"]
 fn giant_current_cell_and_frozen_envelope_remain_bounded() {
     const HUGE: usize = 160 * 1024 * 1024;
