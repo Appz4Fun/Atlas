@@ -1692,6 +1692,9 @@ fn native_preflight_exit(
 }
 
 fn run_servers_error_exit(error: &anyhow::Error, native: Option<&NativeRuntime>, stop: &AtomicBool) -> i32 {
+    if native.is_some() && stop.load(Ordering::Acquire) && crate::pg::outage::is_attempt_ended(error) {
+        return 0;
+    }
     ui::error(&format!("indexing stopped: {error}"));
     if native.is_none() {
         stop.store(true, Ordering::Relaxed);
