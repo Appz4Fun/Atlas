@@ -241,8 +241,8 @@ impl Runtime {
             p.cells.iter().find(|c| c.reference.column == Column::Payload).map(|c| (c.reference.source_id, p.row.key))
         });
         // State was authenticated against the durable checkpoint before this
-        // inventory. Only its completed cleanup locators authorize a missing
-        // identity in an empty deterministic frame directory.
+        // inventory. These locators authorize legacy completed cleanup;
+        // inventory also authenticates its independent frame-intent journal.
         let mut authenticated = state.cleanups.clone();
         if let Some(old) = state.cleanup {
             authenticated.push(old);
@@ -284,6 +284,9 @@ impl Runtime {
 impl Drop for Runtime {
     fn drop(&mut self) {
         self.validator.take();
+        // Complete destructive spool Drop while _root_lock is still held;
+        // automatic field order would otherwise release that fence first.
+        drop(self.spool.take());
     }
 }
 #[derive(Clone, Serialize, Deserialize, Default)]
@@ -684,6 +687,14 @@ impl ImportOwner {
             );
         }
         let mut state: State = serde_json::from_slice(&checkpoint)?;
+        #[cfg(test)]
+        let durable_active = state.pending.as_ref().and_then(|pending| {
+            pending
+                .cells
+                .iter()
+                .find(|cell| cell.reference.column == Column::Payload)
+                .map(|cell| (cell.reference.source_id, pending.row.key))
+        });
         let mut batch = Batch::new(budget);
         self.runtime.scan_recovery(source, &state)?;
         consume(source, &mut state, &mut batch, &mut self.runtime)?;
@@ -739,6 +750,10 @@ impl ImportOwner {
             "update history_imports set checkpoint_sequence=$2,checkpoint=$3 where import_id=$1",
             &[(&&id[..], Type::BYTEA), (&next, Type::INT8), (&checkpoint, Type::BYTEA)],
         )?;
+        #[cfg(test)]
+        if self.runtime.completed.iter().any(|frame| Some((frame.source, frame.key)) != durable_active) {
+            super::history_spool::testing::boundary("before_new_frame_commit")?;
+        }
         if let Err(error) = tx.commit() {
             self.terminal = true;
             return Err(error).context(HistoryError::new(
@@ -2733,6 +2748,158 @@ mod tests {
             assert_eq!(f.source.cell_io().bytes, read_before, "completed envelope must not be reimported");
             assert_eq!(std::fs::read_dir(f.spool.path()).unwrap().count(), 1);
         }
+    }
+
+    fn durable_state(f: &Fixture, id: ImportId) -> (i64, State) {
+        let mut client = f.target.pool.get().unwrap();
+        let row = client
+            .query_one("select checkpoint_sequence,checkpoint from history_imports where import_id=$1", &[&&id[..]])
+            .unwrap();
+        (row.get(0), serde_json::from_slice(&row.get::<_, Vec<u8>>(1)).unwrap())
+    }
+
+    #[test]
+    fn r1_import_creation_resumes_actual_durable_sequence() {
+        let mut failures = Vec::new();
+        for point in [
+            "after_journal_staging_create",
+            "after_journal_partial_write",
+            "after_journal_write",
+            "after_journal_staging_sync",
+            "after_journal_publish",
+            "after_frame_directory_create",
+            "after_frame_identity_create",
+            "after_frame_identity_partial_write",
+        ] {
+            let Some(f) = Fixture::with_frame_count(1) else { return };
+            let mut owner = f.owner();
+            let id = owner.begin(&f.source).unwrap();
+            let fault = super::super::history_spool::testing::interrupt_at(point);
+            let mut sequence = 0;
+            loop {
+                match owner.step(&f.source, id, sequence, ImportBudget::default()) {
+                    Ok(receipt) => {
+                        sequence = receipt.sequence;
+                        assert!(!receipt.complete, "creation interruption must fire");
+                    }
+                    Err(error) => {
+                        assert!(error.to_string().contains("injected cleanup interruption"), "{point}: {error:#}");
+                        break;
+                    }
+                }
+                assert!(sequence < 1000);
+            }
+            drop(fault);
+            drop(owner);
+            let (committed, state) = durable_state(&f, id);
+            assert_eq!(committed, sequence, "creation interruption rolls back its page");
+            assert!(state.cleanups.is_empty(), "no invented completed cleanup receipt");
+            let mut resumed = f.owner();
+            assert_eq!(resumed.begin(&f.source).unwrap(), id);
+            match finish_pages(&mut resumed, &f.source, id, committed) {
+                Ok(()) => assert_eq!(std::fs::read_dir(f.spool.path()).unwrap().count(), 1),
+                Err(error) => failures.push(format!("{point}: {error:#}")),
+            }
+        }
+        assert!(failures.is_empty(), "creation must resume from actual durable state: {failures:?}");
+    }
+
+    #[test]
+    fn r1_import_abandoned_cleanup_resumes_actual_durable_sequence() {
+        let Some(f) = Fixture::with_frame_count(2) else { return };
+        let mut owner = f.owner();
+        let id = owner.begin(&f.source).unwrap();
+        let fault = super::super::history_spool::testing::interrupt_at("before_new_frame_commit");
+        let mut sequence = 0;
+        loop {
+            match owner.step(&f.source, id, sequence, ImportBudget::default()) {
+                Ok(receipt) => {
+                    sequence = receipt.sequence;
+                    assert!(!receipt.complete, "rollback interruption must fire");
+                }
+                Err(error) => {
+                    assert!(error.to_string().contains("injected cleanup interruption"), "{error:#}");
+                    break;
+                }
+            }
+            assert!(sequence < 1000);
+        }
+        drop(fault);
+        let (committed, state) = durable_state(&f, id);
+        assert_eq!(committed, sequence);
+        let active = state.pending.as_ref().and_then(|pending| {
+            pending
+                .cells
+                .iter()
+                .find(|cell| cell.reference.column == Column::Payload)
+                .map(|cell| (cell.reference.source_id, pending.row.key))
+        });
+        let abandoned: Vec<_> = owner
+            .runtime
+            .completed
+            .iter()
+            .map(|frame| (frame.source, frame.key))
+            .filter(|locator| Some(*locator) != active)
+            .collect();
+        assert!(!abandoned.is_empty(), "actual completed page work must have rolled back");
+        assert!(abandoned.iter().all(|locator| !state.cleanups.contains(locator)));
+        drop(owner);
+
+        let mut cleanup_owner = f.owner();
+        assert_eq!(cleanup_owner.begin(&f.source).unwrap(), id);
+        let fault = super::super::history_spool::testing::interrupt_at("identity");
+        let error = cleanup_owner
+            .step(&f.source, id, committed, ImportBudget::default())
+            .err()
+            .expect("actual abandoned cleanup interruption must fire");
+        assert!(error.to_string().contains("injected cleanup interruption"), "{error:#}");
+        drop(fault);
+        drop(cleanup_owner);
+        let (actual_sequence, actual_state) = durable_state(&f, id);
+        assert_eq!(actual_sequence, committed, "cleanup error cannot fabricate database progress");
+        assert!(abandoned.iter().all(|locator| !actual_state.cleanups.contains(locator)));
+        let mut resumed = f.owner();
+        assert_eq!(resumed.begin(&f.source).unwrap(), id);
+        finish_pages(&mut resumed, &f.source, id, actual_sequence).unwrap();
+        assert_eq!(std::fs::read_dir(f.spool.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn r1_import_unvalidated_drop_resumes_actual_durable_sequence() {
+        let Some(f) = Fixture::with_frozen(true) else { return };
+        let mut owner = f.owner();
+        let id = owner.begin(&f.source).unwrap();
+        let budget =
+            ImportBudget { source_rows: 8, source_bytes: 512, mutations: 64, copy_bytes: 262144, chunk_bytes: 7 };
+        let mut sequence = 0;
+        let mut reached = false;
+        for _ in 0..10000 {
+            let receipt = owner.step(&f.source, id, sequence, budget).unwrap();
+            sequence = receipt.sequence;
+            let (_, state) = durable_state(&f, id);
+            if state
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.frozen.as_ref().is_some_and(|frame| frame.phase == 0))
+                && owner.runtime.spool.as_ref().is_some_and(|spool| !spool.keep)
+            {
+                reached = true;
+                assert!(state.cleanups.is_empty());
+                break;
+            }
+            assert!(!receipt.complete, "unvalidated Drop phase must be observable");
+        }
+        assert!(reached, "real committed unvalidated frame required");
+        let fault = super::super::history_spool::testing::interrupt_at("identity");
+        drop(owner);
+        drop(fault);
+        let (actual_sequence, state) = durable_state(&f, id);
+        assert_eq!(actual_sequence, sequence);
+        assert!(state.cleanups.is_empty(), "active pending capture is not completed cleanup");
+        let mut resumed = f.owner();
+        assert_eq!(resumed.begin(&f.source).unwrap(), id);
+        finish_pages(&mut resumed, &f.source, id, actual_sequence).unwrap();
+        assert_eq!(std::fs::read_dir(f.spool.path()).unwrap().count(), 1);
     }
 
     #[test]

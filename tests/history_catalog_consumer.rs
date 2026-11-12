@@ -351,9 +351,9 @@ fn protocol_proxy(url: &str) -> Option<(String, std::sync::Arc<AtomicUsize>, std
     let (url, counter, _, thread) = protocol_proxy_with_reads(url)?;
     Some((url, counter, thread))
 }
-fn protocol_proxy_with_reads(
-    url: &str,
-) -> Option<(String, std::sync::Arc<AtomicUsize>, std::sync::Arc<ValidationWire>, std::thread::JoinHandle<()>)> {
+type ObservedProtocolProxy =
+    (String, std::sync::Arc<AtomicUsize>, std::sync::Arc<ValidationWire>, std::thread::JoinHandle<()>);
+fn protocol_proxy_with_reads(url: &str) -> Option<ObservedProtocolProxy> {
     use std::net::{Shutdown, TcpListener, TcpStream};
     let config: postgres::Config = url.parse().unwrap();
     let host = if let Some(address) = config.get_hostaddrs().first() {

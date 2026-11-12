@@ -4,13 +4,14 @@ use super::history_digest::DigestState;
 use crate::history_identity::{ErrorCode, HistoryError};
 use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 pub(crate) const MAX_COMPLETED: usize = 64;
 // Logical frame bytes and a conservative allowance for its fixed files and
-// directory are charged together, including completed uncommitted frames.
+// directory/journal are charged together, including uncommitted frame intents.
 pub(crate) const FRAME_OVERHEAD: u64 = 65536;
 pub(crate) struct Existing {
     pub source: i64,
@@ -63,6 +64,168 @@ pub(crate) enum CleanupAuthority {
     CommittedCheckpoint,
 }
 const FRAME_FILES: [&str; 5] = ["input.part", "input.ready", "projection.part", "projection.ready", "identity"];
+const JOURNAL: &str = "frames.journal";
+const JOURNAL_NEXT: &str = "frames.journal.next";
+const JOURNAL_MAGIC: &[u8; 8] = b"ATSPJ001";
+const JOURNAL_HEADER: usize = 40;
+const MAX_FRAMES: usize = MAX_COMPLETED + 1;
+const MAX_JOURNAL_BYTES: usize = JOURNAL_HEADER + 2 + MAX_FRAMES * 16 + 32;
+
+/// A complete canonical snapshot, independently durable before mkdir and until
+/// rmdir is durable. An unpublished staging write never authorizes a frame.
+/// Both snapshots together fit within one frame's existing metadata allowance.
+struct Journal<'a> {
+    root: &'a Path,
+    fingerprint: [u8; 32],
+    frames: BTreeSet<(i64, i64)>,
+}
+impl<'a> Journal<'a> {
+    fn header(fingerprint: [u8; 32]) -> Vec<u8> {
+        let mut bytes = JOURNAL_MAGIC.to_vec();
+        bytes.extend_from_slice(&fingerprint);
+        bytes
+    }
+    fn read(root: &Path, name: &str) -> Result<Option<Vec<u8>>> {
+        match open_file(&root.join(name), false, false) {
+            Ok(file) => {
+                let mut bytes = Vec::new();
+                file.take(MAX_JOURNAL_BYTES as u64 + 1).read_to_end(&mut bytes)?;
+                ensure!(
+                    bytes.len() <= MAX_JOURNAL_BYTES,
+                    HistoryError::new(ErrorCode::CorruptObject, "spool journal admission")
+                );
+                Ok(Some(bytes))
+            }
+            Err(error)
+                if error.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+    fn decode(bytes: &[u8], fingerprint: [u8; 32]) -> Result<BTreeSet<(i64, i64)>> {
+        ensure!(
+            bytes.len() >= JOURNAL_HEADER + 2 + 32 && bytes.starts_with(&Self::header(fingerprint)),
+            HistoryError::new(ErrorCode::SourceMismatch, "spool journal capture identity")
+        );
+        let count = u16::from_le_bytes(bytes[JOURNAL_HEADER..JOURNAL_HEADER + 2].try_into()?) as usize;
+        let end = JOURNAL_HEADER + 2 + count * 16;
+        ensure!(
+            count <= MAX_FRAMES && bytes.len() == end + 32,
+            HistoryError::new(ErrorCode::CorruptObject, "spool journal count/length")
+        );
+        ensure!(
+            Sha256::digest(&bytes[..end]).as_slice() == &bytes[end..],
+            HistoryError::new(ErrorCode::CorruptObject, "spool journal digest")
+        );
+        let mut frames = BTreeSet::new();
+        let mut previous = None;
+        for row in bytes[JOURNAL_HEADER + 2..end].as_chunks::<16>().0 {
+            let locator = (i64::from_le_bytes(row[..8].try_into()?), i64::from_le_bytes(row[8..].try_into()?));
+            ensure!(
+                previous.is_none_or(|old| old < locator),
+                HistoryError::new(ErrorCode::CorruptObject, "spool journal locator ordering")
+            );
+            frames.insert(locator);
+            previous = Some(locator);
+        }
+        Ok(frames)
+    }
+    fn load(root: &'a Path, fingerprint: [u8; 32]) -> Result<Self> {
+        let canonical = Self::read(root, JOURNAL)?;
+        let frames = match &canonical {
+            Some(bytes) => Self::decode(bytes, fingerprint)?,
+            None => BTreeSet::new(),
+        };
+        if let Some(bytes) = Self::read(root, JOURNAL_NEXT)? {
+            // Only a known private staging file with this exact header prefix
+            // can be an interrupted write. The canonical snapshot remains the
+            // sole authority; creation cannot precede its fsynced publication.
+            let header = Self::header(fingerprint);
+            ensure!(
+                bytes[..bytes.len().min(JOURNAL_HEADER)] == header[..bytes.len().min(JOURNAL_HEADER)],
+                HistoryError::new(ErrorCode::SourceMismatch, "spool staging journal capture identity")
+            );
+            if bytes.len() >= JOURNAL_HEADER + 2 {
+                let count = u16::from_le_bytes(bytes[JOURNAL_HEADER..JOURNAL_HEADER + 2].try_into()?) as usize;
+                let length = JOURNAL_HEADER + 2 + count * 16 + 32;
+                ensure!(
+                    count <= MAX_FRAMES && bytes.len() <= length,
+                    HistoryError::new(ErrorCode::CorruptObject, "spool staging journal length")
+                );
+                if bytes.len() == length {
+                    Self::decode(&bytes, fingerprint)?;
+                }
+            }
+            std::fs::remove_file(root.join(JOURNAL_NEXT))?;
+            sync_directory(root)?;
+        }
+        if canonical.is_some() && frames.is_empty() {
+            std::fs::remove_file(root.join(JOURNAL))?;
+            sync_directory(root)?;
+        }
+        Ok(Self { root, fingerprint, frames })
+    }
+    fn publish(&mut self, frames: BTreeSet<(i64, i64)>) -> Result<()> {
+        ensure!(
+            frames.len() <= MAX_FRAMES,
+            HistoryError::new(ErrorCode::InsufficientBudget, "spool journal frame admission")
+        );
+        let mut bytes = Self::header(self.fingerprint);
+        bytes.extend_from_slice(&(frames.len() as u16).to_le_bytes());
+        for &(source, key) in &frames {
+            bytes.extend_from_slice(&source.to_le_bytes());
+            bytes.extend_from_slice(&key.to_le_bytes());
+        }
+        let digest = Sha256::digest(&bytes);
+        bytes.extend_from_slice(&digest);
+        let temporary = self.root.join(JOURNAL_NEXT);
+        let mut file = open_file(&temporary, true, true)?;
+        #[cfg(test)]
+        {
+            testing::boundary("after_journal_staging_create")?;
+            let split = bytes.len() / 2;
+            file.write_all(&bytes[..split])?;
+            testing::boundary("after_journal_partial_write")?;
+            file.write_all(&bytes[split..])?;
+            testing::boundary("after_journal_write")?;
+        }
+        #[cfg(not(test))]
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        #[cfg(test)]
+        testing::boundary("after_journal_staging_sync")?;
+        std::fs::rename(&temporary, self.root.join(JOURNAL))?;
+        sync_directory(self.root)?;
+        self.frames = frames;
+        #[cfg(test)]
+        testing::boundary("after_journal_publish")?;
+        if self.frames.is_empty() {
+            std::fs::remove_file(self.root.join(JOURNAL))?;
+            #[cfg(test)]
+            testing::boundary("after_empty_journal_remove")?;
+            sync_directory(self.root)?;
+        }
+        Ok(())
+    }
+    fn register(&mut self, source: i64, key: i64) -> Result<()> {
+        if !self.frames.contains(&(source, key)) {
+            let mut next = self.frames.clone();
+            next.insert((source, key));
+            self.publish(next)?;
+        }
+        Ok(())
+    }
+    fn unregister(&mut self, source: i64, key: i64) -> Result<()> {
+        if self.frames.contains(&(source, key)) {
+            let mut next = self.frames.clone();
+            next.remove(&(source, key));
+            self.publish(next)?;
+        }
+        Ok(())
+    }
+}
 fn frame_identity(fingerprint: [u8; 32], source: i64, key: i64) -> Vec<u8> {
     let mut identity = fingerprint.to_vec();
     identity.extend_from_slice(&source.to_le_bytes());
@@ -83,6 +246,40 @@ fn frame_contents(directory: &Path) -> Result<Vec<std::fs::DirEntry>> {
     }
     Ok(files)
 }
+fn checked_identity(directory: &Path, identity: &[u8], journal: bool, checkpoint: bool) -> Result<bool> {
+    let contents = frame_contents(directory)?;
+    match open_file(&directory.join("identity"), false, false) {
+        Ok(file) => {
+            let mut stored = Vec::new();
+            file.take(49).read_to_end(&mut stored)?;
+            if stored == identity {
+                return Ok(true);
+            }
+            ensure!(
+                journal
+                    && stored.len() < 48
+                    && identity.starts_with(&stored)
+                    && contents.len() == 1
+                    && contents[0].file_name() == "identity",
+                HistoryError::new(ErrorCode::CorruptObject, "spool identity is not an owned interrupted creation")
+            );
+            Ok(false)
+        }
+        Err(error)
+            if error.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            ensure!(
+                (journal || checkpoint) && contents.is_empty(),
+                HistoryError::new(
+                    ErrorCode::CorruptObject,
+                    "identity-free spool lacks independent ownership or is not empty"
+                )
+            );
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
 pub(crate) fn inventory(
     root: &Path,
     id: [u8; 32],
@@ -93,19 +290,22 @@ pub(crate) fn inventory(
         checkpoint_cleanups.len() <= MAX_COMPLETED + 1,
         HistoryError::new(ErrorCode::CorruptObject, "cleanup receipt admission")
     );
-    let authenticated: std::collections::BTreeMap<_, _> = checkpoint_cleanups
+    let journal = Journal::load(root, id)?;
+    let mut authenticated: BTreeMap<_, _> = checkpoint_cleanups
         .iter()
         .map(|&(source, key)| (std::ffi::OsString::from(frame_name(&frame_identity(id, source, key))), (source, key)))
         .collect();
-    let entries = std::fs::read_dir(root)?.take(MAX_COMPLETED + 3).collect::<std::io::Result<Vec<_>>>()?;
+    let mut retained: BTreeMap<_, _> = journal.frames.iter().map(|&locator| (locator, FRAME_OVERHEAD)).collect();
+    for &(source, key) in &journal.frames {
+        authenticated.insert(std::ffi::OsString::from(frame_name(&frame_identity(id, source, key))), (source, key));
+    }
+    let entries = std::fs::read_dir(root)?.take(MAX_FRAMES + 4).collect::<std::io::Result<Vec<_>>>()?;
     ensure!(
-        entries.len() <= MAX_COMPLETED + 2,
+        entries.len() <= MAX_FRAMES + 3,
         HistoryError::new(ErrorCode::InsufficientBudget, "spool recovery inventory admission")
     );
-    let mut total = 0u64;
-    let mut result = Vec::new();
     for entry in entries {
-        if entry.file_name() == "owner.lock" {
+        if ["owner.lock", JOURNAL, JOURNAL_NEXT].iter().any(|name| entry.file_name() == *name) {
             continue;
         }
         let path = entry.path();
@@ -115,15 +315,27 @@ pub(crate) fn inventory(
         let locator = match open_file(&path.join("identity"), false, false) {
             Ok(file) => {
                 file.take(49).read_to_end(&mut identity)?;
-                ensure!(
-                    identity.len() == 48 && identity[..32] == id,
-                    HistoryError::new(ErrorCode::SourceMismatch, "spool recovery capture identity")
-                );
-                ensure!(
-                    entry.file_name() == std::ffi::OsStr::new(&frame_name(&identity)),
-                    HistoryError::new(ErrorCode::CorruptObject, "spool recovery locator")
-                );
-                (i64::from_le_bytes(identity[32..40].try_into()?), i64::from_le_bytes(identity[40..48].try_into()?))
+                if identity.len() == 48 {
+                    ensure!(
+                        identity[..32] == id,
+                        HistoryError::new(ErrorCode::SourceMismatch, "spool recovery capture identity")
+                    );
+                    ensure!(
+                        entry.file_name() == std::ffi::OsStr::new(&frame_name(&identity)),
+                        HistoryError::new(ErrorCode::CorruptObject, "spool recovery locator")
+                    );
+                    (i64::from_le_bytes(identity[32..40].try_into()?), i64::from_le_bytes(identity[40..48].try_into()?))
+                } else {
+                    let &(source, key) = authenticated
+                        .get(&entry.file_name())
+                        .filter(|locator| journal.frames.contains(*locator))
+                        .context(HistoryError::new(
+                            ErrorCode::CorruptObject,
+                            "partial identity lacks journal ownership",
+                        ))?;
+                    checked_identity(&path, &frame_identity(id, source, key), true, false)?;
+                    (source, key)
+                }
             }
             Err(error)
                 if error.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
@@ -134,7 +346,7 @@ pub(crate) fn inventory(
                 );
                 *authenticated.get(&entry.file_name()).context(HistoryError::new(
                     ErrorCode::CorruptObject,
-                    "identity-free spool lacks committed cleanup ownership",
+                    "identity-free spool lacks independent cleanup ownership",
                 ))?
             }
             Err(error) => return Err(error),
@@ -145,15 +357,24 @@ pub(crate) fn inventory(
                 bytes = bytes.checked_add(file.metadata()?.len()).context("spool inventory overflow")?;
             }
         }
-        total = total.checked_add(bytes).context("spool inventory overflow")?;
-        ensure!(total <= quota, HistoryError::new(ErrorCode::InsufficientBudget, "retained spool bytes exceed quota"));
-        result.push(Existing { source: locator.0, key: locator.1, charged_bytes: bytes });
+        retained.insert(locator, bytes);
     }
-    Ok(result)
+    ensure!(
+        retained.len() <= MAX_FRAMES,
+        HistoryError::new(ErrorCode::InsufficientBudget, "retained frame count admission")
+    );
+    let total = retained
+        .values()
+        .try_fold(0u64, |total, bytes| total.checked_add(*bytes).context("spool inventory overflow"))?;
+    ensure!(total <= quota, HistoryError::new(ErrorCode::InsufficientBudget, "retained spool bytes exceed quota"));
+    Ok(retained.into_iter().map(|((source, key), charged_bytes)| Existing { source, key, charged_bytes }).collect())
 }
 
 pub(crate) struct Spool {
     directory: PathBuf,
+    fingerprint: [u8; 32],
+    source: i64,
+    key: i64,
     input: Option<File>,
     projection: Option<File>,
     pub written: u64,
@@ -229,11 +450,20 @@ impl Spool {
             length.checked_add(FRAME_OVERHEAD).is_some_and(|n| n <= quota) && available(root)? >= quota,
             HistoryError::new(ErrorCode::InsufficientBudget, "frozen spool quota/free space")
         );
-        let mut identity = fingerprint.to_vec();
-        identity.extend_from_slice(&source.to_le_bytes());
-        identity.extend_from_slice(&key.to_le_bytes());
-        let name = Sha256::digest(&identity).iter().map(|b| format!("{b:02x}")).collect::<String>();
-        let directory = root.join(format!("frame-{name}"));
+        let identity = frame_identity(fingerprint, source, key);
+        let directory = root.join(frame_name(&identity));
+        let mut journal = Journal::load(root, fingerprint)?;
+        let complete_identity = match std::fs::symlink_metadata(&directory) {
+            Ok(meta) => {
+                ensure!(meta.is_dir(), HistoryError::new(ErrorCode::CorruptObject, "unknown spool path"));
+                checked_identity(&directory, &identity, journal.frames.contains(&(source, key)), false)?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        // The durable intent precedes exposing a directory, including its
+        // initially empty or partially written identity states.
+        journal.register(source, key)?;
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         {
@@ -242,25 +472,43 @@ impl Spool {
         }
         match builder.create(&directory) {
             Ok(()) => {
-                let mut f = open_file(&directory.join("identity"), true, true)?;
-                f.write_all(&identity)?;
-                f.sync_all()?;
-                sync_directory(&directory)?;
-                sync_directory(root)?;
+                #[cfg(test)]
+                testing::boundary("after_frame_directory_create")?;
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 ensure!(
                     std::fs::symlink_metadata(&directory)?.is_dir(),
                     HistoryError::new(ErrorCode::CorruptObject, "unknown spool path")
                 );
-                let mut stored = Vec::new();
-                open_file(&directory.join("identity"), false, false)?.take(49).read_to_end(&mut stored)?;
-                ensure!(
-                    stored == identity,
-                    HistoryError::new(ErrorCode::CorruptObject, "spool belongs to another import/object")
-                );
             }
             Err(e) => return Err(e.into()),
+        }
+        if !complete_identity {
+            let path = directory.join("identity");
+            let mut file = match open_file(&path, true, false) {
+                Ok(file) => file,
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    open_file(&path, true, true)?
+                }
+                Err(error) => return Err(error),
+            };
+            file.set_len(0)?;
+            #[cfg(test)]
+            {
+                testing::boundary("after_frame_identity_create")?;
+                file.write_all(&identity[..24])?;
+                testing::boundary("after_frame_identity_partial_write")?;
+                file.write_all(&identity[24..])?;
+            }
+            #[cfg(not(test))]
+            file.write_all(&identity)?;
+            file.sync_all()?;
+            sync_directory(&directory)?;
+            sync_directory(root)?;
         }
         let ready = directory.join("input.ready");
         let part = directory.join("input.part");
@@ -285,6 +533,9 @@ impl Spool {
         }
         Ok(Self {
             directory,
+            fingerprint,
+            source,
+            key,
             input: Some(input),
             projection: None,
             written: if input_ready { length } else { 0 },
@@ -394,35 +645,27 @@ impl Spool {
     ) -> Result<()> {
         let identity = frame_identity(fingerprint, source, key);
         let directory = root.join(frame_name(&identity));
-        if !directory.exists() {
-            return Ok(());
-        }
-        ensure!(
-            std::fs::symlink_metadata(&directory)?.is_dir(),
-            HistoryError::new(ErrorCode::CorruptObject, "unknown cleanup path")
-        );
+        let mut journal = Journal::load(root, fingerprint)?;
+        let metadata = match std::fs::symlink_metadata(&directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                sync_directory(root)?;
+                return journal.unregister(source, key);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        ensure!(metadata.is_dir(), HistoryError::new(ErrorCode::CorruptObject, "unknown cleanup path"));
         // Inspect every name before any unlink, even when a checkpoint proves
         // ownership of an empty directory whose identity was already removed.
-        let contents = frame_contents(&directory)?;
-        let mut stored = Vec::new();
-        match open_file(&directory.join("identity"), false, false) {
-            Ok(file) => {
-                file.take(49).read_to_end(&mut stored)?;
-                ensure!(stored == identity, HistoryError::new(ErrorCode::CorruptObject, "cleanup ownership receipt"));
-            }
-            Err(error)
-                if error.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
-            {
-                ensure!(
-                    authority == CleanupAuthority::CommittedCheckpoint && contents.is_empty(),
-                    HistoryError::new(
-                        ErrorCode::CorruptObject,
-                        "identity-free cleanup lacks committed ownership or is not empty"
-                    )
-                );
-            }
-            Err(error) => return Err(error),
-        }
+        checked_identity(
+            &directory,
+            &identity,
+            journal.frames.contains(&(source, key)),
+            authority == CleanupAuthority::CommittedCheckpoint,
+        )?;
+        // Identity-backed legacy frames also acquire durable cleanup authority
+        // before any unlink; the receipt outlives the directory's identity file.
+        journal.register(source, key)?;
         for name in FRAME_FILES {
             // Persist payload removals before relinquishing the identity. A
             // crash thereafter can leave only an authenticated empty directory.
@@ -440,16 +683,19 @@ impl Spool {
         #[cfg(test)]
         testing::boundary("before_remove_dir")?;
         std::fs::remove_dir(&directory)?;
+        #[cfg(test)]
+        testing::boundary("after_frame_directory_remove")?;
         sync_directory(root)?;
-        Ok(())
+        journal.unregister(source, key)
     }
     pub fn remove(&mut self) {
         self.input.take();
         self.projection.take();
-        for name in ["input.part", "input.ready", "projection.part", "projection.ready", "identity"] {
-            let _ = std::fs::remove_file(self.directory.join(name));
+        if let Some(root) = self.directory.parent() {
+            // A best-effort Drop failure leaves the same durable journal
+            // authority for the next fenced owner's bounded recovery pass.
+            let _ = Self::cleanup(root, self.fingerprint, self.source, self.key, CleanupAuthority::Identity);
         }
-        let _ = std::fs::remove_dir(&self.directory);
     }
 }
 impl Drop for Spool {
@@ -477,7 +723,7 @@ pub(crate) mod testing {
         });
         Fault
     }
-    pub(super) fn boundary(point: &'static str) -> std::io::Result<()> {
+    pub(crate) fn boundary(point: &'static str) -> std::io::Result<()> {
         if INTERRUPT.with(|old| {
             if old.get() == Some(point) {
                 old.set(None);
@@ -597,6 +843,10 @@ mod tests {
         let fault = testing::interrupt_at("identity");
         assert!(Spool::cleanup(root.path(), [3; 32], 1, 7, CleanupAuthority::Identity).is_err());
         drop(fault);
+        // Model a legacy directory with no independent journal authority.
+        // An actual abandoned cleanup now retains that authority instead.
+        std::fs::remove_file(root.path().join(JOURNAL)).unwrap();
+        sync_directory(root.path()).unwrap();
         assert!(inventory(root.path(), [3; 32], 1024 * 1024, &[]).is_err());
         assert!(inventory(root.path(), [3; 32], 1024 * 1024, &[(1, 8)]).is_err());
         assert_eq!(inventory(root.path(), [3; 32], 1024 * 1024, &[(1, 7)]).unwrap().len(), 1);
@@ -616,5 +866,229 @@ mod tests {
         assert!(Spool::cleanup(root.path(), [3; 32], 1, 7, CleanupAuthority::Identity).is_err());
         assert!(unknown.exists());
         spool.keep = true;
+    }
+
+    #[test]
+    fn r1_frame_creation_recovers_without_checkpoint_cleanup() {
+        let mut failures = Vec::new();
+        for point in
+            ["after_frame_directory_create", "after_frame_identity_create", "after_frame_identity_partial_write"]
+        {
+            let root = root();
+            let owner = claim_root(root.path(), [1; 32]).unwrap();
+            let fault = testing::interrupt_at(point);
+            let error = Spool::open(root.path(), [3; 32], 1, 7, 1024 * 1024, 0, 1, false)
+                .err()
+                .expect("creation interruption must fire");
+            assert!(error.to_string().contains("injected cleanup interruption"), "{point}: {error:#}");
+            drop(fault);
+            drop(owner);
+            let _resumed = claim_root(root.path(), [1; 32]).unwrap();
+            match inventory(root.path(), [3; 32], 1024 * 1024, &[]) {
+                Ok(entries) => {
+                    assert_eq!(entries.len(), 1, "one owned interrupted frame");
+                    assert_eq!((entries[0].source, entries[0].key), (1, 7));
+                    Spool::cleanup(root.path(), [3; 32], 1, 7, CleanupAuthority::Identity).unwrap();
+                    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+                }
+                Err(error) => failures.push(format!("{point}: {error:#}")),
+            }
+        }
+        assert!(failures.is_empty(), "same-source creation must recover without a fabricated checkpoint: {failures:?}");
+    }
+
+    #[test]
+    fn r1_abandoned_cleanup_recovers_without_checkpoint_cleanup() {
+        let mut failures = Vec::new();
+        for point in ["identity", "before_remove_dir"] {
+            let root = root();
+            let owner = claim_root(root.path(), [1; 32]).unwrap();
+            let mut spool = Spool::open(root.path(), [3; 32], 1, 7, 1024 * 1024, 0, 1, false).unwrap();
+            spool.append(0, b"x").unwrap();
+            spool.finish_input(1, Sha256::digest(b"x").into()).unwrap();
+            let mut projection = spool.projection_writer().unwrap();
+            projection.write_all(b"y").unwrap();
+            projection.sync_all().unwrap();
+            drop(projection);
+            spool.finish_projection().unwrap();
+            spool.retire().unwrap();
+            let fault = testing::interrupt_at(point);
+            let error = Spool::cleanup(root.path(), [3; 32], 1, 7, CleanupAuthority::Identity).unwrap_err();
+            assert!(error.to_string().contains("injected cleanup interruption"), "{point}: {error:#}");
+            drop(fault);
+            drop(owner);
+            let _resumed = claim_root(root.path(), [1; 32]).unwrap();
+            match inventory(root.path(), [3; 32], 1024 * 1024, &[]) {
+                Ok(entries) => {
+                    assert_eq!(entries.len(), 1);
+                    assert_eq!((entries[0].source, entries[0].key), (1, 7));
+                    Spool::cleanup(root.path(), [3; 32], 1, 7, CleanupAuthority::Identity).unwrap();
+                    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+                }
+                Err(error) => failures.push(format!("{point}: {error:#}")),
+            }
+        }
+        assert!(failures.is_empty(), "abandoned cleanup must retain independent ownership: {failures:?}");
+    }
+
+    #[test]
+    fn r1_unvalidated_drop_recovers_without_checkpoint_cleanup() {
+        let mut failures = Vec::new();
+        for (ready, point) in [
+            (false, "input.part"),
+            (true, "input.ready"),
+            (true, "projection.part"),
+            (false, "identity"),
+            (false, "before_remove_dir"),
+        ] {
+            let root = root();
+            let owner = claim_root(root.path(), [1; 32]).unwrap();
+            let mut spool = Spool::open(root.path(), [3; 32], 1, 7, 1024 * 1024, 0, 1, false).unwrap();
+            spool.append(0, b"x").unwrap();
+            if ready {
+                spool.finish_input(1, Sha256::digest(b"x").into()).unwrap();
+                let mut projection = spool.projection_writer().unwrap();
+                projection.write_all(b"y").unwrap();
+                projection.sync_all().unwrap();
+            }
+            assert!(!spool.keep, "exercise the actual unvalidated Drop branch");
+            let fault = testing::interrupt_at(point);
+            drop(spool);
+            drop(fault);
+            drop(owner);
+            let _resumed = claim_root(root.path(), [1; 32]).unwrap();
+            match inventory(root.path(), [3; 32], 1024 * 1024, &[]) {
+                Ok(entries) => {
+                    assert_eq!(entries.len(), 1);
+                    assert_eq!((entries[0].source, entries[0].key), (1, 7));
+                    Spool::cleanup(root.path(), [3; 32], 1, 7, CleanupAuthority::Identity).unwrap();
+                    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+                }
+                Err(error) => failures.push(format!("{point}: {error:#}")),
+            }
+        }
+        assert!(failures.is_empty(), "unvalidated Drop must retain recovery ownership: {failures:?}");
+    }
+
+    #[test]
+    fn r1_journal_publication_interruptions_never_expose_unproven_frames() {
+        for (point, owned) in [
+            ("after_journal_staging_create", 0),
+            ("after_journal_partial_write", 0),
+            ("after_journal_write", 0),
+            ("after_journal_staging_sync", 0),
+            ("after_journal_publish", 1),
+        ] {
+            let root = root();
+            let owner = claim_root(root.path(), [1; 32]).unwrap();
+            let fault = testing::interrupt_at(point);
+            let error = Spool::open(root.path(), [3; 32], 1, 7, 1024 * 1024, 0, 1, false)
+                .err()
+                .expect("publication interruption must fire");
+            assert!(error.to_string().contains("injected cleanup interruption"), "{point}: {error:#}");
+            drop(fault);
+            drop(owner);
+            let _resumed = claim_root(root.path(), [1; 32]).unwrap();
+            let entries = inventory(root.path(), [3; 32], 1024 * 1024, &[]).unwrap();
+            assert_eq!(entries.len(), owned, "only canonical publication is authority: {point}");
+            for entry in entries {
+                assert_eq!((entry.source, entry.key), (1, 7));
+                Spool::cleanup(root.path(), [3; 32], 1, 7, CleanupAuthority::Identity).unwrap();
+            }
+            let mut resumed = Spool::open(root.path(), [3; 32], 1, 7, 1024 * 1024, 0, 1, false).unwrap();
+            resumed.append(0, b"x").unwrap();
+            drop(resumed);
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn r1_journal_retirement_survives_partial_replacement_and_directory_removal() {
+        for (point, owned) in [
+            ("after_frame_directory_remove", 1),
+            ("after_journal_partial_write", 1),
+            ("after_journal_publish", 0),
+            ("after_empty_journal_remove", 0),
+        ] {
+            let root = root();
+            let owner = claim_root(root.path(), [1; 32]).unwrap();
+            let mut spool = Spool::open(root.path(), [3; 32], 1, 7, 1024 * 1024, 0, 1, false).unwrap();
+            spool.append(0, b"x").unwrap();
+            spool.keep = true;
+            drop(spool);
+            let fault = testing::interrupt_at(point);
+            let error = Spool::cleanup(root.path(), [3; 32], 1, 7, CleanupAuthority::Identity).unwrap_err();
+            assert!(error.to_string().contains("injected cleanup interruption"), "{point}: {error:#}");
+            drop(fault);
+            drop(owner);
+            let _resumed = claim_root(root.path(), [1; 32]).unwrap();
+            let entries = inventory(root.path(), [3; 32], 1024 * 1024, &[]).unwrap();
+            assert_eq!(entries.len(), owned, "retirement ownership ordering: {point}");
+            Spool::cleanup(root.path(), [3; 32], 1, 7, CleanupAuthority::Identity).unwrap();
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn r1_journal_intents_are_bounded_and_charged_even_without_directories() {
+        let root = root();
+        let _owner = claim_root(root.path(), [1; 32]).unwrap();
+        let mut journal = Journal::load(root.path(), [3; 32]).unwrap();
+        for key in 0..65 {
+            journal.register(1, key).unwrap();
+        }
+        let before = std::fs::read(root.path().join(JOURNAL)).unwrap();
+        assert!(journal.register(1, 65).is_err(), "a66th pending intent is not admitted");
+        assert_eq!(std::fs::read(root.path().join(JOURNAL)).unwrap(), before);
+        let entries = inventory(root.path(), [3; 32], 65 * 65536, &[]).unwrap();
+        assert_eq!(entries.len(), 65);
+        assert!(entries.iter().all(|entry| entry.source == 1 && entry.charged_bytes == 65536));
+        assert!(
+            inventory(root.path(), [3; 32], 64 * 65536, &[]).is_err(),
+            "intent-only ownership still consumes quota"
+        );
+        for key in 0..65 {
+            Spool::cleanup(root.path(), [3; 32], 1, key, CleanupAuthority::Identity).unwrap();
+        }
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn r1_wrong_source_corrupt_or_unknown_journals_leave_frame_bytes_untouched() {
+        let root = root();
+        let _owner = claim_root(root.path(), [1; 32]).unwrap();
+        let mut spool = Spool::open(root.path(), [3; 32], 1, 7, 1024 * 1024, 0, 1, false).unwrap();
+        spool.append(0, b"x").unwrap();
+        let directory = spool.directory.clone();
+        spool.keep = true;
+        drop(spool);
+        let path = root.path().join(JOURNAL);
+        let before = std::fs::read(&path).unwrap();
+        assert!(inventory(root.path(), [9; 32], 1024 * 1024, &[]).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let mut corrupt = before.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        std::fs::write(&path, &corrupt).unwrap();
+        assert!(inventory(root.path(), [3; 32], 1024 * 1024, &[]).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), corrupt);
+        std::fs::write(&path, &before).unwrap();
+        let staging = root.path().join(JOURNAL_NEXT);
+        std::fs::write(&staging, b"unowned control content").unwrap();
+        assert!(inventory(root.path(), [3; 32], 1024 * 1024, &[]).is_err());
+        assert_eq!(std::fs::read(&staging).unwrap(), b"unowned control content");
+        assert_eq!(std::fs::read(directory.join("input.part")).unwrap(), b"x");
+        std::fs::remove_file(&staging).unwrap();
+        #[cfg(unix)]
+        {
+            let outside = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(outside.path(), b"unrelated").unwrap();
+            std::os::unix::fs::symlink(outside.path(), &staging).unwrap();
+            assert!(inventory(root.path(), [3; 32], 1024 * 1024, &[]).is_err());
+            assert!(std::fs::symlink_metadata(&staging).unwrap().file_type().is_symlink());
+            assert_eq!(std::fs::read(outside.path()).unwrap(), b"unrelated");
+            std::fs::remove_file(&staging).unwrap();
+        }
+        Spool::cleanup(root.path(), [3; 32], 1, 7, CleanupAuthority::Identity).unwrap();
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
     }
 }
