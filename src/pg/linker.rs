@@ -11,6 +11,7 @@ use postgres::Client;
 /// flush on commit. Keep this fence local to each transaction.
 pub(crate) fn durable_transaction(client: &mut Client) -> Result<postgres::Transaction<'_>> {
     let mut tx = client.transaction()?;
+    super::history_gate::native(&mut tx)?;
     tx.batch_execute("set local synchronous_commit=on")?;
     Ok(tx)
 }

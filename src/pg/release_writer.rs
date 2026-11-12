@@ -64,6 +64,7 @@ pub fn save(client: &mut Client, releases: &[Release], now: i64) -> Result<SaveS
 
     // A group writer that waited on the advisory lock must see the preceding commit.
     let mut tx = client.build_transaction().isolation_level(IsolationLevel::ReadCommitted).start()?;
+    super::history_gate::native(&mut tx)?;
     tx.batch_execute(CREATE_STAGE)?;
     let mut stats = SaveStats::default();
     for (group, releases) in groups {

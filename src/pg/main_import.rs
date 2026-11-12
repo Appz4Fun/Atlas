@@ -34,6 +34,10 @@ const REQUIRED: &[&str] = &[
 const OPTIONAL: &[&str] = &["inferred_asked", "inferred_ids", "repair_tried", "repair_older"];
 const STAGING_PREFIX: &str = "atlas_stage_";
 
+pub(crate) fn owns_table(table: &str) -> bool {
+    REQUIRED.contains(&table) || OPTIONAL.contains(&table)
+}
+
 fn check_destination(database: &str, schema: &str) -> Result<()> {
     ensure!(!database.is_empty(), "a destination database name is required");
     ensure!(
@@ -179,7 +183,7 @@ impl Tally {
     }
 }
 
-fn copy_table(source: &Connection, target: &mut postgres::Transaction<'_>, schema: &str, table: &str) -> Result<u64> {
+fn copy_table(source: &Connection, target: &mut postgres::Transaction<'_>, schema: &str, table: &str) -> Result<Tally> {
     let qualified = format!("{}.{}", quote(schema), quote(table));
     let columns = target.prepare(&format!("select * from {qualified} limit 0"))?;
     let columns = columns.columns();
@@ -215,7 +219,7 @@ fn copy_table(source: &Connection, target: &mut postgres::Transaction<'_>, schem
         restored.add(&cells);
     }
     ensure!(restored == original, "restored rows did not match the SQLite snapshot");
-    Ok(restored.rows)
+    Ok(restored)
 }
 
 /// Import a read-only snapshot and verify the copied rows before making the new schema visible.
@@ -227,11 +231,14 @@ pub fn import_snapshot(
     schema: &str,
 ) -> Result<Vec<(&'static str, u64)>> {
     check_destination(database, schema)?;
+    let witness = super::history_companion::Witness::capture(snapshot)?;
     let mut source = Connection::open_with_flags(snapshot, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let source = source.transaction()?;
     let tables = source_tables(&source)?;
 
     let mut target = client.transaction()?;
+    target.batch_execute("set local synchronous_commit=on")?;
+    target.query_one("select pg_advisory_xact_lock_shared(hashtext('atlas.indexer'),hashtext($1))", &[&schema])?;
     let actual: String = target.query_one("select current_database()", &[])?.get(0);
     ensure!(actual == database, "connected to database {actual:?}, expected {database:?}");
     // Use the migration lock before creating the schema. CREATE without IF NOT EXISTS protects an existing schema.
@@ -241,9 +248,24 @@ pub fn import_snapshot(
     // The migration inserts a default next_seq for new installs. The snapshot supplies the original allocator state.
     target.batch_execute(&format!("delete from {}.meta", quote(schema)))?;
     let mut restored = Vec::with_capacity(tables.len());
+    let mut relations = Vec::new();
     for table in tables {
-        let count = copy_table(&source, &mut target, schema, table).with_context(|| format!("importing {table}"))?;
-        restored.push((table, count));
+        let tally = copy_table(&source, &mut target, schema, table).with_context(|| format!("importing {table}"))?;
+        restored.push((table, tally.rows));
+        relations.push(super::history_companion::relation(table, tally.rows, tally.digest));
+    }
+    if let Some(witness) = witness {
+        witness.check(snapshot)?;
+        super::history_companion::store(
+            &mut target,
+            super::history_companion::Receipt {
+                version: 1,
+                owner: "main_import".into(),
+                main_source_digest: witness.digest,
+                relations,
+                scope: "main_compat_v1".into(),
+            },
+        )?;
     }
     target.commit()?;
     Ok(restored)
@@ -281,6 +303,9 @@ fn run(args: &[String]) -> Result<()> {
         println!("  {table}: {rows} rows verified");
     }
     println!("Imported and verified {} tables in {database}.{schema}", restored.len());
+    if let Some(receipt)=super::history_companion::digest(&mut client,schema,"main_import")? {
+        println!("Main source-pairing receipt: {}",receipt.iter().map(|byte|format!("{byte:02x}")).collect::<String>());
+    }
     Ok(())
 }
 
@@ -295,7 +320,7 @@ pub fn run_cli(args: &[String]) -> i32 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -343,7 +368,7 @@ mod tests {
         assert!(error.to_string().contains("future_cursor"));
     }
 
-    fn sqlite_snapshot(dir: &Path) -> std::path::PathBuf {
+    pub(crate) fn sqlite_snapshot(dir: &Path) -> std::path::PathBuf {
         let path = dir.join("atlas.db");
         let c = Connection::open(&path).unwrap();
         crate::store::create_main(&c).unwrap();

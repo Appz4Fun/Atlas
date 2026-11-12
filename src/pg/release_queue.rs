@@ -1,7 +1,43 @@
 //! Leases for PostgreSQL release postprocessing work.
 
 use anyhow::{Context, Result, ensure};
-use postgres::{Client, Transaction};
+use postgres::Client;
+
+/// A queue result transaction whose owner fence precedes all release locks.
+/// Obtain it with [`begin`], then acquire release locks, write results and
+/// settle the claim. There is no constructor from an existing transaction.
+pub struct GuardedTransaction<'a> {
+    inner: postgres::Transaction<'a>,
+}
+impl<'a> std::ops::Deref for GuardedTransaction<'a> {
+    type Target = postgres::Transaction<'a>;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+impl std::ops::DerefMut for GuardedTransaction<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+impl GuardedTransaction<'_> {
+    pub fn commit(self) -> Result<()> {
+        self.inner.commit()?;
+        Ok(())
+    }
+    pub fn rollback(self) -> Result<()> {
+        self.inner.rollback()?;
+        Ok(())
+    }
+}
+/// Begin before taking any release or queue row lock. Historical registration
+/// and this transaction share the same owner fence; readiness is rechecked
+/// after a wait before this handle can reach a caller.
+pub fn begin(client: &mut Client) -> Result<GuardedTransaction<'_>> {
+    let mut inner = client.transaction()?;
+    super::history_gate::native(&mut inner)?;
+    Ok(GuardedTransaction { inner })
+}
 
 /// Maximum rows locked by one claim statement.
 pub const MAX_CLAIM: usize = 256;
@@ -37,7 +73,9 @@ fn deadline(now: i64, limit: usize, lease_seconds: i64) -> Result<i64> {
 pub fn claim(client: &mut Client, now: i64, limit: usize, lease_seconds: i64) -> Result<Vec<Claim>> {
     let lease_until = deadline(now, limit, lease_seconds)?;
     let limit = limit as i64;
-    let rows = client.query(
+    let mut tx = client.transaction()?;
+    super::history_gate::native(&mut tx)?;
+    let rows = tx.query(
         "with due as (
              select release_id from pp_queue
              where due_at <= $1 and (lease_until is null or lease_until <= $1)
@@ -49,6 +87,7 @@ pub fn claim(client: &mut Client, now: i64, limit: usize, lease_seconds: i64) ->
          ) select release_id, due_at, lease_until, generation, lease_token from leased order by due_at, release_id",
         &[&now, &limit, &lease_until],
     )?;
+    tx.commit()?;
     Ok(rows
         .into_iter()
         .map(|row| Claim {
@@ -62,19 +101,19 @@ pub fn claim(client: &mut Client, now: i64, limit: usize, lease_seconds: i64) ->
 }
 
 /// Acknowledge a claim. Commit postprocessing results only with `Applied` in the same transaction.
-/// Acquire any release locks before this queue lock, in the writer's order. If a caller already
+/// Start with [`begin`], then acquire release locks before this queue lock. If a caller already
 /// wrote results and receives another outcome, it must roll back those results.
-pub fn ack(tx: &mut Transaction<'_>, claim: &Claim, now: i64) -> Result<Outcome> {
+pub fn ack(tx: &mut GuardedTransaction<'_>, claim: &Claim, now: i64) -> Result<Outcome> {
     settle(tx, claim, now, None)
 }
 
 /// Reschedule the claimed generation at `due_at`. A newer generation keeps its own due time.
 /// The same transaction and lock-order requirements as [`ack`] apply.
-pub fn requeue(tx: &mut Transaction<'_>, claim: &Claim, now: i64, due_at: i64) -> Result<Outcome> {
+pub fn requeue(tx: &mut GuardedTransaction<'_>, claim: &Claim, now: i64, due_at: i64) -> Result<Outcome> {
     settle(tx, claim, now, Some(due_at))
 }
 
-fn settle(tx: &mut Transaction<'_>, claim: &Claim, now: i64, retry_at: Option<i64>) -> Result<Outcome> {
+fn settle(tx: &mut GuardedTransaction<'_>, claim: &Claim, now: i64, retry_at: Option<i64>) -> Result<Outcome> {
     let Some(row) = tx.query_opt(
         "select generation from pp_queue where release_id = $1 and lease_token = $2 and lease_until > $3 for update",
         &[&claim.release_id, &claim.token, &now],
@@ -113,6 +152,71 @@ mod tests {
             )
             .unwrap()
             .get(0)
+    }
+
+    #[test]
+    fn registration_fence_precedes_queue_callers_release_locks() {
+        let Some(s) = crate::pg::testing::Schema::new() else { return };
+        let mut owner = s.pool.get().unwrap();
+        let release = push(&mut owner, 1, 0);
+        owner.query_one("select pg_advisory_lock(hashtext('atlas.indexer'),hashtext($1))", &[&s.name]).unwrap();
+        let (pid_tx, pid_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (url, name) = (s.url.clone(), s.name.clone());
+        let worker = std::thread::spawn(move || {
+            let mut c = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+            c.batch_execute(&format!("set search_path to \"{name}\";set statement_timeout='5s'")).unwrap();
+            pid_tx.send(c.query_one("select pg_backend_pid()", &[]).unwrap().get::<_, i32>(0)).unwrap();
+            let rejected = match begin(&mut c) {
+                Ok(mut tx) => {
+                    tx.query_one("select id from releases where id=$1 for update", &[&release]).unwrap();
+                    false
+                }
+                Err(error) => error
+                    .downcast_ref::<postgres::Error>()
+                    .and_then(|e| e.code())
+                    .is_some_and(|code| code.code() == "55000"),
+            };
+            done_tx.send(rejected).unwrap();
+        });
+        let pid = pid_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let started = std::time::Instant::now();
+        loop {
+            if owner
+                .query_one(
+                    "select exists(select 1 from pg_locks where pid=$1 and locktype='advisory' and not granted)",
+                    &[&pid],
+                )
+                .unwrap()
+                .get::<_, bool>(0)
+            {
+                break;
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(3),
+                "queue caller must first wait on the owner fence"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let mut tx = owner.transaction().unwrap();
+        tx.query_one("select id from releases where id=$1 for update nowait", &[&release])
+            .expect("waiting queue constructor has acquired no release lock");
+        tx.batch_execute("insert into history_imports(import_id,source_fingerprint,contract_version,state,expected_database,expected_schema,expected_role,expected_owner,reserved_next_seq,checkpoint) values(decode(repeat('01',32),'hex'),decode(repeat('01',32),'hex'),1,'loading','test','test','test','test',900,'')").unwrap();
+        tx.commit().unwrap();
+        owner.query_one("select pg_advisory_unlock(hashtext('atlas.indexer'),hashtext($1))", &[&s.name]).unwrap();
+        assert!(
+            done_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+            "queue constructor must reject post-wait history registration"
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn settlement_constructor_checks_history_before_returning_a_lockable_transaction() {
+        let Some(s) = crate::pg::testing::Schema::new() else { return };
+        let mut c = s.pool.get().unwrap();
+        c.batch_execute("insert into history_imports(import_id,source_fingerprint,contract_version,state,expected_database,expected_schema,expected_role,expected_owner,reserved_next_seq,checkpoint) values(decode(repeat('01',32),'hex'),decode(repeat('01',32),'hex'),1,'loading','test','test','test','test',900,'')").unwrap();
+        assert!(begin(&mut c).is_err(), "a caller must not get a transaction capable of locking release rows first");
     }
 
     #[test]
@@ -156,20 +260,20 @@ mod tests {
         assert_eq!(first.lease_until, 110);
         assert!(claim(&mut client, 109, 1, 10).unwrap().is_empty());
 
-        let mut tx = client.transaction().unwrap();
+        let mut tx = begin(&mut client).unwrap();
         assert_eq!(ack(&mut tx, &first, 110).unwrap(), Outcome::LeaseLost);
         tx.commit().unwrap();
 
         let renewed = claim(&mut client, 110, 1, 10).unwrap().pop().unwrap();
         assert_ne!(renewed.token, first.token);
-        let mut tx = client.transaction().unwrap();
+        let mut tx = begin(&mut client).unwrap();
         assert_eq!(ack(&mut tx, &first, 110).unwrap(), Outcome::LeaseLost);
         assert_eq!(requeue(&mut tx, &renewed, 111, 200).unwrap(), Outcome::Applied);
         tx.commit().unwrap();
         assert!(claim(&mut client, 199, 1, 10).unwrap().is_empty());
 
         let retry = claim(&mut client, 200, 1, 10).unwrap().pop().unwrap();
-        let mut tx = client.transaction().unwrap();
+        let mut tx = begin(&mut client).unwrap();
         assert_eq!(ack(&mut tx, &retry, 201).unwrap(), Outcome::Applied);
         tx.commit().unwrap();
         assert!(claim(&mut client, 1_000, 1, 10).unwrap().is_empty());
@@ -183,7 +287,7 @@ mod tests {
             let id = push(&mut client, key, 100);
             let prior = claim(&mut client, 100, 1, 10).unwrap().pop().unwrap();
             client.execute("update pp_queue set generation = generation + 1 where release_id = $1", &[&id]).unwrap();
-            let mut tx = client.transaction().unwrap();
+            let mut tx = begin(&mut client).unwrap();
             let outcome =
                 if retry { requeue(&mut tx, &prior, 101, 200).unwrap() } else { ack(&mut tx, &prior, 101).unwrap() };
             assert_eq!(outcome, Outcome::Superseded);
@@ -193,7 +297,7 @@ mod tests {
             assert_eq!(next.release_id, id);
             assert_eq!(next.due_at, 100);
             assert_eq!(next.generation, prior.generation + 1);
-            let mut tx = client.transaction().unwrap();
+            let mut tx = begin(&mut client).unwrap();
             assert_eq!(ack(&mut tx, &next, 102).unwrap(), Outcome::Applied);
             tx.commit().unwrap();
         }
@@ -205,18 +309,18 @@ mod tests {
         let mut client = test.pool.get().unwrap();
         let id = push(&mut client, 1, 100);
         let first = claim(&mut client, 100, 1, 10).unwrap().pop().unwrap();
-        let mut tx = client.transaction().unwrap();
+        let mut tx = begin(&mut client).unwrap();
         assert_eq!(ack(&mut tx, &first, 101).unwrap(), Outcome::Applied);
         tx.commit().unwrap();
 
         client.execute("insert into pp_queue (release_id, due_at) values ($1, 100)", &[&id]).unwrap();
         let next = claim(&mut client, 101, 1, 10).unwrap().pop().unwrap();
         assert_eq!(next.generation, first.generation);
-        let mut tx = client.transaction().unwrap();
+        let mut tx = begin(&mut client).unwrap();
         assert_eq!(ack(&mut tx, &first, 102).unwrap(), Outcome::LeaseLost);
         assert_eq!(ack(&mut tx, &next, 102).unwrap(), Outcome::Applied);
         tx.rollback().unwrap();
-        let mut tx = client.transaction().unwrap();
+        let mut tx = begin(&mut client).unwrap();
         assert_eq!(ack(&mut tx, &next, 103).unwrap(), Outcome::Applied);
         tx.commit().unwrap();
     }

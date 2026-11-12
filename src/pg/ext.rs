@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use postgres::Client;
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
@@ -51,6 +51,10 @@ fn sources() -> Vec<Source> {
         Source { ext: "ext_predb_page_events", db: raw, table: "raw_predb_events" },
         Source { ext: "ext_http_cache", db: raw, table: "raw_http_cache" },
     ]
+}
+
+pub(crate) fn owns_table(table: &str) -> bool {
+    table == "ext_freeze_exempt" || sources().iter().any(|source| source.ext == table)
 }
 
 /// The `keep.*` snapshot table each `ext_*` table is topped up from (`--export-keep` named them).
@@ -254,8 +258,11 @@ pub fn copy_from_sqlite_with_keep(
     apply: bool,
     source: KeepSource<'_>,
 ) -> Result<Vec<Moved>> {
+    ensure!(super::valid_schema(schema),"invalid external conversion schema");
+    let witness=super::history_companion::Witness::capture(main)?;
     let lite = Connection::open_in_memory()?;
     let mut tx = c.transaction()?;
+    tx.query_one("select pg_advisory_xact_lock_shared(hashtext('atlas.indexer'),hashtext($1))",&[&schema])?;
     durable(&mut tx)?;
     let keep_schema = resolve_keep(&mut tx, schema, source)?;
     super::migrate::run_in_transaction(&mut tx, schema)?;
@@ -306,6 +313,32 @@ pub fn copy_from_sqlite_with_keep(
     moved.push(freeze_exempt(&mut tx, &lite, main, apply, keep_schema)?);
     if apply {
         advance_counters(&mut tx)?;
+        if let Some(witness) = witness {
+            witness.check(main)?;
+            // The existing owner verifies source copies and keep top-ups.
+            // Receipt the final normalized target, including manual-thaw rows;
+            // the source-only digest deliberately excludes retained top-ups.
+            let mut relations = Vec::new();
+            for table in tables_of(&mut tx)? {
+                ensure!(owns_table(&table), "SourceMismatch: external receipt table ownership");
+                let columns = tx.prepare(&format!("select * from {} limit 0",keep_export::quoted(&table)))?;
+                let cols = columns.columns().iter().map(|col| {
+                    use postgres::types::Type;
+                    use keep_export::PgKind;
+                    let pg=match *col.type_() {
+                        Type::INT8=>PgKind::Int,Type::TEXT=>PgKind::Text,Type::FLOAT8=>PgKind::Real,Type::BYTEA=>PgKind::Blob,
+                        _=>bail!("UnsupportedSchema: external receipt column type"),
+                    };
+                    Ok(Column{name:col.name().into(),decl:String::new(),pg})
+                }).collect::<Result<Vec<_>>>()?;
+                let final_tally=keep_export::pg_tally(&mut tx,&keep_export::quoted(&table),&cols)?;
+                relations.push(super::history_companion::relation(&table,final_tally.rows,final_tally.digest));
+            }
+            super::history_companion::store(&mut tx,super::history_companion::Receipt{
+                version:1,owner:"ext".into(),main_source_digest:witness.digest,relations,
+                scope:"ext_normalized_and_keep_v1".into(),
+            })?;
+        }
         tx.commit()?;
     }
     Ok(moved)
@@ -600,6 +633,9 @@ pub fn run_move(args: &[String]) -> i32 {
             main.display()
         );
         copy_from_sqlite_with_keep(&mut c, &main, pool.schema(), apply, source)?;
+        if apply && let Some(receipt)=super::history_companion::digest(&mut c,pool.schema(),"ext")? {
+            println!("External source-pairing receipt: {}",receipt.iter().map(|byte|format!("{byte:02x}")).collect::<String>());
+        }
         if !apply {
             println!("dry run: nothing written (--apply to move it)");
         }
@@ -1246,6 +1282,25 @@ mod tests {
             std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
         left.sort();
         assert_eq!(left, ["20261102T040000Z", "20261103T040000Z", "other"]);
+    }
+
+    #[test]
+    fn owner_receipt_covers_top_ups_and_admitted_manual_thaws() {
+        let Some(keep) = super::super::testing::Schema::empty() else {return};
+        let Some(target) = super::super::testing::Schema::new() else {return};
+        let dir=tempfile::tempdir().unwrap();let main=sqlite_files(dir.path());
+        let lite=Connection::open(&main).unwrap();lite.execute_batch("create table capture_marker(value integer);insert into capture_marker values(1);pragma wal_checkpoint(truncate);pragma journal_mode=delete").unwrap();drop(lite);
+        let mut c=target.pool.get().unwrap();
+        c.batch_execute(&format!("create table \"{}\".predb_titles(id bigint,title text,source bigint,added_at bigint);insert into \"{}\".predb_titles values(19,'Retained.Title-GRP',3,7);create table \"{}\".freeze_exempt(release_id bigint,at bigint,name text,group_name text);insert into \"{}\".freeze_exempt values(29,11,'Manual.Title-GRP','test.group'),(31,12,null,null)",keep.name,keep.name,keep.name,keep.name)).unwrap();
+        copy_from_sqlite_with_keep(&mut c,&main,&target.name,true,KeepSource::Named(&keep.name)).unwrap();
+        let data:Vec<u8>=c.query_one("select manifest from history_companion_receipts where owner_code='ext' and not dirty",&[]).unwrap().get(0);
+        let receipt:super::super::history_companion::Receipt=serde_json::from_slice(&data).unwrap();
+        let title=receipt.relations.iter().find(|r|r.table=="ext_predb_titles").unwrap();assert_eq!(title.rows,2);
+        let cols=keep_export::columns(&Connection::open(&crate::predb::db::path_for(&main)).unwrap(),"main","titles").unwrap();
+        let mut tx=c.transaction().unwrap();let tally=keep_export::pg_tally(&mut tx,"ext_predb_titles",&cols).unwrap();
+        let expected=super::super::history_companion::relation("ext_predb_titles",tally.rows,tally.digest);
+        assert_eq!(title.digest,expected.digest,"receipt digest includes exact post-top-up rows");
+        let manual=receipt.relations.iter().find(|r|r.table=="ext_freeze_exempt").unwrap();assert_eq!(manual.rows,1);
     }
 
     /// SQLite files made with the providers' own schemas beside `dir/atlas.db`, a row or two each.

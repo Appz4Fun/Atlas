@@ -28,6 +28,8 @@ pub mod gemini;
 pub mod gf2;
 pub mod groups_menu;
 pub mod history_stream;
+pub mod history_source;
+pub mod history_identity;
 pub mod indexer;
 pub mod inferred;
 pub mod junk;

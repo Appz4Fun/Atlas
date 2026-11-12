@@ -688,7 +688,13 @@ impl<C: PgClient> Sql for Pg<C> {
     fn transaction(&self, f: &mut dyn FnMut(&dyn Sql) -> Result<()>) -> Result<()> {
         let mut c = self.client()?;
         // a savepoint when this is a transaction already
-        let tx = Pg::new(c.pg_transaction()?);
+        let mut transaction = c.pg_transaction()?;
+        // Fence before the callback can acquire application/group row locks.
+        super::history_gate::native(&mut transaction).map_err(|error| match error.downcast::<postgres::Error>() {
+            Ok(error) => Error::Postgres(error),
+            Err(error) => Error::Value(error.to_string()),
+        })?;
+        let tx = Pg::new(transaction);
         f(&tx)?;
         Ok(tx.into_inner().commit()?)
     }
