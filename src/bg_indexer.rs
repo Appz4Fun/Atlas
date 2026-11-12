@@ -1691,6 +1691,17 @@ fn native_preflight_exit(
     }
 }
 
+fn run_servers_error_exit(error: &anyhow::Error, native: Option<&NativeRuntime>, stop: &AtomicBool) -> i32 {
+    if native.is_some() && stop.load(Ordering::Acquire) && crate::pg::outage::is_attempt_ended(error) {
+        return 0;
+    }
+    ui::error(&format!("indexing stopped: {error}"));
+    if native.is_none() {
+        stop.store(true, Ordering::Relaxed);
+    }
+    1
+}
+
 /// Index until stopping. Returns the exit code: not 0 when a compaction held
 /// the database at the start. `writing` is the hold on compaction taken
 /// before setting up the database, if there was one.
@@ -1823,11 +1834,7 @@ async fn supervise(
         let compact_due = match result {
             Ok(compact_due) => compact_due,
             Err(error) => {
-                ui::error(&format!("indexing stopped: {error}"));
-                if native.is_none() {
-                    stop.store(true, Ordering::Relaxed);
-                }
-                return 1;
+                return run_servers_error_exit(&error, native, &stop);
             }
         };
 
@@ -2186,6 +2193,166 @@ fn index(config: Config, stop: Arc<AtomicBool>, writing: Option<WriteGuard>, nat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn native_cursor_fixture() -> (crate::pg::testing::Schema, Config, NativeRuntime, std::net::TcpListener) {
+        // These focused regressions require an admitted PostgreSQL fixture;
+        // an absent URL must never look like a successful cancellation test.
+        let schema = crate::pg::testing::Schema::new().expect("ATLAS_PG_TEST_URL required for cursor admission test");
+        let provider = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        provider.set_nonblocking(true).unwrap();
+        let mut server = UsenetServer::new("127.0.0.1", "example", "fixture", provider.local_addr().unwrap().port());
+        server.ssl = Some(false);
+        server.connections = Some(1);
+        let mut config = Config {
+            servers: vec![server],
+            groups: vec!["alt.binaries.fixture".into()],
+            inferred_parts: false,
+            ..Config::default()
+        };
+        config.postprocess.enabled = false;
+        config.predb.enabled = false;
+        config.spots.enabled = false;
+        config.media.tvmaze.enabled = false;
+        config.media.allocine.enabled = false;
+        config.media.details_per_minute = 0;
+        let storage = crate::pg::StorageConfig {
+            backend: crate::pg::Backend::Postgres,
+            url: schema.url.clone(),
+            schema: schema.name.clone(),
+            max_connections: 4,
+            allow_plaintext: true,
+        };
+        let headers = crate::config::HeaderStoreConfig { enabled: true, ..Default::default() };
+        let hosts = crate::nntp::server_keys(&config.servers);
+        let native = NativeRuntime::open(&config, storage, headers, &hosts, &mut None).unwrap();
+        (schema, config, native, provider)
+    }
+
+    fn canceled_native_cursor_admission(failure: Option<crate::pg::outage::Failure>, operator_stopped: bool) {
+        use crate::pg::outage::{AttemptOutcome, Failure, is_attempt_ended};
+        use std::future::Future;
+        use std::task::Poll;
+
+        let (_schema, config, native, provider) = native_cursor_fixture();
+        let operator = Arc::new(AtomicBool::new(false));
+        let pool = Arc::new(Pool::new(&config.servers));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (entered, ready) = std::sync::mpsc::channel();
+        let (release, proceed) = std::sync::mpsc::channel();
+        struct Release(Option<std::sync::mpsc::Sender<()>>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                if let Some(release) = self.0.take() {
+                    let _ = release.send(());
+                }
+            }
+        }
+        let release = Release(Some(release));
+        let blocker = runtime.spawn_blocking(move || {
+            entered.send(()).unwrap();
+            proceed.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        let result = runtime.block_on(async {
+            let admission = run_servers(
+                &config,
+                pool,
+                RunStates::default(),
+                Arc::new(Mutex::new(Stats::new())),
+                operator.clone(),
+                None,
+                Some(&native),
+            );
+            let mut admission = std::pin::pin!(admission);
+            // run_servers has reached its first await: the actual on_db
+            // claim_plain_cursors job is queued behind the occupied lane.
+            std::future::poll_fn(|cx| {
+                assert!(matches!(admission.as_mut().poll(cx), Poll::Pending), "cursor job did not queue");
+                Poll::Ready(())
+            })
+            .await;
+            if let Some(failure) = failure {
+                native.owner.fail(failure);
+            }
+            operator.store(operator_stopped, Ordering::Release);
+            native.owner.stop.store(true, Ordering::Release);
+            drop(release);
+            blocker.await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), admission).await.unwrap()
+        });
+        let error = result.unwrap_err();
+        assert!(is_attempt_ended(&error), "expected typed queued rejection: {error:#}");
+        let code = run_servers_error_exit(&error, Some(&native), &operator);
+        assert_eq!(native.owner.failure(), failure, "a rejected callback did no storage work");
+        match failure {
+            Some(Failure::Fatal) => {
+                assert!(matches!(AttemptOutcome::from_exit(code, native.owner.failure()), AttemptOutcome::Fatal));
+            }
+            Some(Failure::Unavailable) => {
+                assert!(matches!(AttemptOutcome::from_exit(code, native.owner.failure()), AttemptOutcome::Unavailable));
+            }
+            None => {
+                assert_eq!(code, 0, "operator cancellation at actual cursor admission must exit cleanly");
+                assert!(matches!(AttemptOutcome::from_exit(code, native.owner.failure()), AttemptOutcome::Stopped));
+            }
+        }
+        assert!(matches!(provider.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "cursor admission contacted the provider");
+        native.owner.close();
+    }
+
+    #[test]
+    #[ignore = "requires an admitted isolated PostgreSQL fixture"]
+    fn native_cursor_admission_queued_operator_cancellation_is_clean() {
+        canceled_native_cursor_admission(None, true);
+    }
+
+    #[test]
+    #[ignore = "requires an admitted isolated PostgreSQL fixture"]
+    fn native_cursor_admission_fatal_before_term_stays_fatal() {
+        canceled_native_cursor_admission(Some(crate::pg::outage::Failure::Fatal), true);
+    }
+
+    #[test]
+    #[ignore = "requires an admitted isolated PostgreSQL fixture"]
+    fn native_cursor_admission_lost_owner_keeps_recovery_outcome() {
+        canceled_native_cursor_admission(Some(crate::pg::outage::Failure::Unavailable), false);
+    }
+
+    #[test]
+    #[ignore = "requires an admitted isolated PostgreSQL fixture"]
+    fn native_cursor_admission_unexpected_sql_error_stays_fatal_after_term() {
+        use crate::pg::outage::{AttemptOutcome, Failure, is_attempt_ended};
+        let (schema, config, native, provider) = native_cursor_fixture();
+        schema.pool.get().unwrap().batch_execute("drop table meta").unwrap();
+        let operator = Arc::new(AtomicBool::new(false));
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let error = runtime
+            .block_on(run_servers(
+                &config,
+                Arc::new(Pool::new(&config.servers)),
+                RunStates::default(),
+                Arc::new(Mutex::new(Stats::new())),
+                operator.clone(),
+                None,
+                Some(&native),
+            ))
+            .unwrap_err();
+        assert!(!is_attempt_ended(&error), "unexpected SQL failure became cancellation");
+        operator.store(true, Ordering::Release);
+        native.owner.stop.store(true, Ordering::Release);
+        assert_eq!(native.owner.failure(), Some(Failure::Fatal));
+        let code = run_servers_error_exit(&error, Some(&native), &operator);
+        assert_eq!(code, 1, "unrelated SQL errors must remain fatal after operator stop");
+        assert!(matches!(AttemptOutcome::from_exit(code, native.owner.failure()), AttemptOutcome::Fatal));
+        assert!(matches!(provider.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "cursor admission contacted the provider");
+        native.owner.close();
+    }
 
     #[test]
     fn native_preflight_queued_operator_cancellation_is_clean() {
