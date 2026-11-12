@@ -516,5 +516,117 @@ class SigchldPolicyTests(unittest.TestCase):
         self.assert_refuses_policy(reaper)
 
 
+class SupervisorMetadataFailureTests(unittest.TestCase):
+    """Metadata errors must retain stop diagnostics; cleanup errors still fail closed."""
+
+    def setUp(self):
+        def forbidden(*args, **kwargs):
+            raise AssertionError("real process/ps/signal/native/receipt effect forbidden")
+        for obj, name in ((guard.ctypes, "CDLL"), (guard.subprocess, "Popen"),
+                          (guard.subprocess, "run"), (guard.os, "kill"),
+                          (guard.os, "killpg"), (guard.os, "waitpid"),
+                          (guard.os, "waitid"), (guard.os, "wait"),
+                          (guard.os, "_exit"), (guard.os, "pipe"),
+                          (guard.signal, "getsignal"), (guard.signal, "signal"),
+                          (guard.signal, "pthread_sigmask"), (guard.signal, "sigpending"),
+                          (guard.signal, "setitimer"), (guard.time, "sleep"),
+                          (guard, "Sampler"), (guard, "write_stop_receipt")):
+            mocker = patch.object(obj, name, side_effect=forbidden)
+            mocker.start()
+            self.addCleanup(mocker.stop)
+
+    def exercise(self, probes, *, memory=False, sampler_error=None, cleanup_error=None):
+        class StopFile:
+            unlinked = False
+            def exists(self):
+                return False
+            def unlink(self):
+                self.unlinked = True
+        marker = StopFile()
+        child = unittest.mock.Mock(pid=123, returncode=None)
+        sampler = unittest.mock.Mock()
+        sampler.system_usage.return_value = (100, 1000)
+        sampler.sample.return_value = guard.Observation(101 if memory else 90, 100, 1000, 0)
+        sampler.sample.side_effect = sampler_error
+        stopped = []
+        def cleanup(owned):
+            self.assertIs(owned, child)
+            stopped.append(owned)
+            if cleanup_error is not None:
+                raise cleanup_error
+            owned.returncode = -signal.SIGTERM if memory or sampler_error is not None or isinstance(probes, BaseException) else 0
+        event = unittest.mock.Mock()
+        event.is_set.return_value = False
+        event.wait.side_effect = AssertionError("finite stop fixtures must not loop or wait")
+        with patch.object(guard.signal, "getsignal", return_value=signal.SIG_DFL), \
+                patch.object(guard.signal, "signal") as handlers, \
+                patch.object(guard, "Sampler", return_value=sampler), \
+                patch.object(guard, "write_stop_receipt") as receipt, \
+                patch.object(guard.subprocess, "Popen", return_value=child) as launch, \
+                patch.object(guard, "leader_has_exited", side_effect=probes), \
+                patch.object(guard, "stop_child", side_effect=cleanup) as stop_child, \
+                patch.object(guard.threading, "Event", return_value=event):
+            raised = None
+            result = None
+            try:
+                result = guard.supervise(["never-executed"], guard.Limits(100, 20, 50, 10, 5), [], marker)
+            except Exception as error:
+                raised = error
+            launch.assert_called_once_with(["never-executed"], start_new_session=True)
+            stop_child.assert_called_once_with(child)
+            self.assertEqual(stopped, [child])
+            self.assertEqual([call.args[0] for call in handlers.call_args_list],
+                             [signal.SIGTERM, signal.SIGINT, signal.SIGTERM, signal.SIGINT])
+            self.assertEqual([call.args[1] for call in handlers.call_args_list[2:]],
+                             [handlers.return_value, handlers.return_value])
+            return result, raised, marker, [call.args[1] for call in receipt.call_args_list]
+
+    def test_first_leader_probe_failure_records_measurement_stop_and_returns_zero(self):
+        for error in (OSError("ps unavailable"), subprocess.TimeoutExpired(["mock-ps"], 2),
+                      RuntimeError("malformed ps snapshot")):
+            with self.subTest(failure=type(error).__name__):
+                result, raised, marker, reasons = self.exercise(error)
+                self.assertIsNone(raised, "post-spawn metadata failure escaped normal guarded-stop handling")
+                self.assertEqual(result, 0)
+                self.assertEqual(reasons, ["supervising", "measurement_failed"])
+                self.assertFalse(marker.unlinked, "measurement failure must retain its stop fence")
+
+    def test_sampler_failure_then_failed_leader_probe_records_measurement_stop(self):
+        for error in (OSError("ps unavailable"), subprocess.TimeoutExpired(["mock-ps"], 2),
+                      RuntimeError("malformed ps snapshot")):
+            with self.subTest(failure=type(error).__name__):
+                result, raised, marker, reasons = self.exercise([False, error],
+                                                              sampler_error=OSError("sampler unavailable"))
+                self.assertIsNone(raised, "leader probe escaped while handling an earlier sampler error")
+                self.assertEqual(result, 0)
+                self.assertEqual(reasons, ["supervising", "measurement_failed"])
+                self.assertFalse(marker.unlinked, "failed measurements must retain the stop fence")
+
+    def test_final_probe_failure_preserves_an_already_recorded_memory_reason(self):
+        for error in (OSError("ps unavailable"), subprocess.TimeoutExpired(["mock-ps"], 2),
+                      RuntimeError("malformed ps snapshot")):
+            with self.subTest(failure=type(error).__name__):
+                result, raised, marker, reasons = self.exercise([False, error], memory=True)
+                self.assertIsNone(raised, "optional final status probe discarded the memory diagnostic")
+                self.assertEqual(result, 0)
+                self.assertEqual(reasons, ["supervising", "memory"])
+                self.assertFalse(marker.unlinked, "resource stop must retain its fence")
+
+    def test_valid_natural_exit_keeps_success_and_fence_removal(self):
+        result, raised, marker, reasons = self.exercise([True, True])
+        self.assertIsNone(raised)
+        self.assertEqual(result, 0)
+        self.assertEqual(reasons, ["supervising"])
+        self.assertTrue(marker.unlinked)
+
+    def test_cleanup_failure_is_not_swallowed_or_turned_into_supervisor_success(self):
+        error = RuntimeError("owned child cleanup failed")
+        result, raised, marker, reasons = self.exercise([True, True], cleanup_error=error)
+        self.assertIs(raised, error)
+        self.assertIsNone(result)
+        self.assertEqual(reasons, ["supervising"])
+        self.assertFalse(marker.unlinked)
+
+
 if __name__ == "__main__":
     unittest.main()
