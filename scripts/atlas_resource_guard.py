@@ -286,20 +286,24 @@ def supervise(command, limits, storage_paths, stop_file, interval=0.5):
     leader_exited = False
     try:
         child = subprocess.Popen(command, start_new_session=True)
-        monitor = Monitor(limits, initial_swap)
-        while not leader_has_exited(child) and not stop.is_set():
-            now = time.monotonic()
-            try:
-                observation = sampler.sample(child.pid, now)
-                reason = monitor.check(observation, now)
-            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
-                if leader_has_exited(child):
+        try:
+            monitor = Monitor(limits, initial_swap)
+            while not leader_has_exited(child) and not stop.is_set():
+                now = time.monotonic()
+                try:
+                    observation = sampler.sample(child.pid, now)
+                    reason = monitor.check(observation, now)
+                except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+                    if leader_has_exited(child):
+                        break
+                    reason = "measurement_failed"
+                if reason:
                     break
-                reason = "measurement_failed"
-            if reason:
-                break
-            stop.wait(interval)
-        leader_exited = leader_has_exited(child)
+                stop.wait(interval)
+            leader_exited = leader_has_exited(child)
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+            # Failed inventory is not exit proof and cannot erase a resource reason.
+            reason = reason or "measurement_failed"
     finally:
         try:
             if child is not None:
