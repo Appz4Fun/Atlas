@@ -476,5 +476,45 @@ class OwnedGroupLifetimeTests(unittest.TestCase):
         self.assertEqual(events[-1], ("unlink",), "natural successful exit should retain existing fence semantics")
 
 
+class SigchldPolicyTests(unittest.TestCase):
+    """Unsafe child-reaping policies must be refused before any child is spawned."""
+
+    def assert_refuses_policy(self, disposition):
+        def forbidden(*args, **kwargs):
+            raise AssertionError("real native/process/signal boundary forbidden")
+        # Nothing changes the real signal disposition; the getter is a pure fake.
+        for obj, name in ((guard.ctypes, "CDLL"), (guard.subprocess, "run"),
+                          (guard.os, "kill"), (guard.os, "killpg"),
+                          (guard.os, "waitpid"), (guard.os, "waitid"),
+                          (guard.os, "wait"), (guard.os, "_exit"), (guard.os, "pipe"),
+                          (guard.signal, "pthread_sigmask"), (guard.signal, "sigpending"),
+                          (guard.signal, "setitimer"), (guard.time, "sleep")):
+            mocker = patch.object(obj, name, side_effect=forbidden)
+            mocker.start()
+            self.addCleanup(mocker.stop)
+        class StopFile:
+            def exists(self):
+                return False
+        sampler = unittest.mock.Mock()
+        sampler.system_usage.return_value = (100, 1000)
+        with patch.object(guard.signal, "getsignal", return_value=disposition) as getter, \
+                patch.object(guard.signal, "signal"), \
+                patch.object(guard, "Sampler", return_value=sampler), \
+                patch.object(guard, "write_stop_receipt"), \
+                patch.object(guard.subprocess, "Popen", side_effect=RuntimeError("mock intercepted unsafe spawn")) as launch:
+            with self.assertRaises(RuntimeError):
+                guard.supervise(["never-executed"], guard.Limits(100, 20, 50, 10, 5), [], StopFile())
+            launch.assert_not_called()
+            getter.assert_called_once_with(signal.SIGCHLD)
+
+    def test_ignored_sigchld_refuses_child_spawn(self):
+        self.assert_refuses_policy(signal.SIG_IGN)
+
+    def test_custom_reaper_refuses_child_spawn(self):
+        def reaper(*args):
+            raise AssertionError("the fake reaping handler must never be invoked")
+        self.assert_refuses_policy(reaper)
+
+
 if __name__ == "__main__":
     unittest.main()
