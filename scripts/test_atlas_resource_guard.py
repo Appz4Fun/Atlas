@@ -272,5 +272,192 @@ class ResourceGuardTests(unittest.TestCase):
             self.assertEqual(marker.stat().st_mode & 0o777, 0o600)
 
 
+class OwnedGroupLifetimeTests(unittest.TestCase):
+    """Mock-only ownership regressions; run separately from the real-process cases."""
+
+    class Child:
+        pid = 123
+
+        def __init__(self, events, *, exited=True, reaped=False):
+            self.events = events
+            self.exited = exited
+            self.exit_status = 0
+            self.returncode = self.exit_status if reaped else None
+
+        def poll(self):
+            self.events.append(("poll",))
+            if self.exited:
+                self.returncode = self.exit_status  # Popen.poll really relinquishes the PID pin.
+            return self.returncode
+
+        def wait(self, *args, **kwargs):
+            self.events.append(("wait",))
+            self.returncode = self.exit_status
+            return self.returncode
+
+    def setUp(self):
+        def forbidden(*args, **kwargs):
+            raise AssertionError("real process, signal, native, sampler or receipt effect forbidden")
+        for obj, name in ((guard.ctypes, "CDLL"), (guard.subprocess, "Popen"),
+                          (guard.subprocess, "run"), (guard.os, "kill"),
+                          (guard.os, "killpg"), (guard.os, "waitpid"),
+                          (guard.os, "waitid"), (guard.os, "wait"), (guard.os, "_exit"),
+                          (guard.os, "pipe"), (guard.signal, "signal"),
+                          (guard.signal, "pthread_sigmask"), (guard.signal, "sigpending"),
+                          (guard.signal, "setitimer"),
+                          (guard.time, "sleep"), (guard, "Sampler"),
+                          (guard, "write_stop_receipt")):
+            mocker = patch.object(obj, name, side_effect=forbidden)
+            mocker.start()
+            self.addCleanup(mocker.stop)
+
+    def inventory(self, child, events, leader="Z", descendant=None):
+        def read(command, **kwargs):
+            self.assertIsNone(child.returncode, "process inventory used a released leader identity")
+            self.assertEqual(command[0], "/bin/ps")
+            self.assertLessEqual(kwargs.get("timeout", float("inf")), 2)
+            events.append(("ps",))
+            # Accept either the existing group-only view or a leader-aware view.
+            # This models OS facts rather than requiring a particular new helper.
+            columns = next((part for part in command if "stat=" in part), "")
+            rows = []
+            if "pid=" in columns.replace("pgid=", ""):
+                rows.append(f"123 123 {leader}")
+                if descendant is not None:
+                    rows.append(f"124 123 {descendant}")
+                rows.append("456 456 S")
+            elif "pgid=" in columns:
+                rows.append(f"123 {leader}")
+                if descendant is not None:
+                    rows.append(f"123 {descendant}")
+                rows.append("456 S")
+            else:
+                rows.append(leader)
+            return subprocess.CompletedProcess(command, 0, stdout="\n".join(rows) + "\n")
+        return read
+
+    def test_cleanup_refuses_reaped_leader_even_if_numeric_group_exists(self):
+        events = []
+        child = self.Child(events, reaped=True)
+        with patch.object(guard.os, "killpg") as send:
+            with self.assertRaises(RuntimeError):
+                guard.stop_child(child, grace_seconds=0)
+        send.assert_not_called()
+        self.assertEqual(events, [], "a released handle cannot recover group authority")
+
+    def test_direct_group_signal_refuses_reaped_leader(self):
+        child = self.Child([], reaped=True)
+        with patch.object(guard.os, "killpg") as send:
+            with self.assertRaises(RuntimeError):
+                guard.signal_owned_group(child, signal.SIGKILL)
+        send.assert_not_called()
+
+    def test_live_descendants_are_drained_before_the_held_leader_is_reaped(self):
+        for leader_exited in (False, True):
+            with self.subTest(leader_exited=leader_exited):
+                events = []
+                child = self.Child(events, exited=leader_exited)
+                killed = []
+                def send(pid, signum):
+                    self.assertEqual(pid, child.pid)
+                    self.assertIsNone(child.returncode, "group operation after leader reap can hit reused PGID")
+                    events.append(("killpg", signum))
+                    if signum == signal.SIGKILL:
+                        killed.append(True)
+                        if not child.exited:
+                            child.exited = True
+                            child.exit_status = -signal.SIGKILL
+                def read(command, **kwargs):
+                    return self.inventory(child, events,
+                                          leader="Z" if leader_exited or killed else "S",
+                                          descendant="Z" if killed else "S")(command, **kwargs)
+                with patch.object(guard.os, "killpg", side_effect=send), \
+                        patch.object(guard.subprocess, "run", side_effect=read), \
+                        patch.object(guard.time, "sleep"):
+                    guard.stop_child(child, grace_seconds=0)
+                self.assertTrue(killed, "necessary descendant cleanup was skipped")
+                self.assertEqual(events.count(("wait",)), 1)
+                self.assertEqual(events[-1], ("wait",), "wait must follow the last group access")
+                self.assertNotIn(("poll",), events, "poll reaps before group drain is complete")
+
+    def test_darwin_zombie_only_eperm_is_accepted_without_early_reap(self):
+        events = []
+        child = self.Child(events)
+        def send(pid, signum):
+            self.assertIsNone(child.returncode)
+            events.append(("killpg", signum))
+            raise PermissionError(errno.EPERM, "zombie-only XNU group")
+        with patch.object(guard.sys, "platform", "darwin"), \
+                patch.object(guard.os, "killpg", side_effect=send), \
+                patch.object(guard.subprocess, "run", side_effect=self.inventory(child, events)):
+            guard.stop_child(child)
+        self.assertEqual(events.count(("wait",)), 1)
+        self.assertEqual(events[-1], ("wait",))
+        self.assertNotIn(("poll",), events)
+
+    def test_eperm_with_live_or_unreadable_members_is_never_treated_as_drained(self):
+        for kind in ("leader-live", "descendant-live", "unreadable", "malformed"):
+            with self.subTest(kind=kind):
+                events = []
+                child = self.Child(events, exited=kind != "leader-live")
+                if kind == "unreadable":
+                    reader = OSError("inventory unavailable")
+                elif kind == "malformed":
+                    reader = subprocess.CompletedProcess([], 0, stdout="unparseable inventory\n")
+                else:
+                    reader = self.inventory(child, events,
+                                            leader="S" if kind == "leader-live" else "Z",
+                                            descendant="S" if kind == "descendant-live" else None)
+                with patch.object(guard.sys, "platform", "darwin"), \
+                        patch.object(guard.os, "killpg", side_effect=PermissionError(errno.EPERM, "denied")), \
+                        patch.object(guard.subprocess, "run", side_effect=reader if callable(reader) or isinstance(reader, BaseException) else None,
+                                     return_value=reader):
+                    with self.assertRaises((PermissionError, RuntimeError)):
+                        guard.stop_child(child)
+                self.assertIsNone(child.returncode, "failed cleanup cannot release identity then retry")
+                self.assertNotIn(("wait",), events)
+                self.assertNotIn(("poll",), events)
+
+    def test_missing_group_reaps_once_after_the_last_signal_attempt(self):
+        events = []
+        child = self.Child(events)
+        def missing(pid, signum):
+            self.assertIsNone(child.returncode)
+            events.append(("killpg", signum))
+            raise ProcessLookupError(errno.ESRCH, "gone")
+        with patch.object(guard.os, "killpg", side_effect=missing):
+            guard.stop_child(child)
+        self.assertEqual(events, [("killpg", signal.SIGTERM), ("wait",)])
+
+    def test_supervisor_keeps_exited_leader_pinned_through_final_cleanup(self):
+        events = []
+        child = self.Child(events)
+        class StopFile:
+            def exists(self):
+                return False
+            def unlink(self):
+                events.append(("unlink",))
+        sampler = unittest.mock.Mock()
+        sampler.system_usage.return_value = (100, 1000)
+        sampler.sample.return_value = guard.Observation(90, 100, 1000, 0)
+        limits = guard.Limits(100, 20, 50, 10, 5)
+        def send(pid, signum):
+            self.assertIsNone(child.returncode, "supervisor reaped before its finally cleanup")
+            events.append(("killpg", signum))
+        with patch.object(guard, "Sampler", return_value=sampler), \
+                patch.object(guard, "write_stop_receipt"), \
+                patch.object(guard.subprocess, "Popen", return_value=child), \
+                patch.object(guard.subprocess, "run", side_effect=self.inventory(child, events)), \
+                patch.object(guard.os, "killpg", side_effect=send), \
+                patch.object(guard.signal, "signal"), \
+                patch.object(guard.time, "sleep"):
+            self.assertEqual(guard.supervise(["fixed-no-execution"], limits, [], StopFile()), 0)
+        self.assertNotIn(("poll",), events)
+        self.assertEqual(events.count(("wait",)), 1)
+        wait_index = events.index(("wait",))
+        self.assertFalse(any(event[0] in ("killpg", "ps") for event in events[wait_index + 1:]))
+        self.assertEqual(events[-1], ("unlink",), "natural successful exit should retain existing fence semantics")
+
+
 if __name__ == "__main__":
     unittest.main()
