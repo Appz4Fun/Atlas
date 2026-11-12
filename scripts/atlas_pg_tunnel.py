@@ -278,13 +278,14 @@ def build_command(args):
     forward = str(args.socket.absolute()) + ":" + remote + ":" + str(args.remote_port)
     command = ["/usr/bin/ssh", "-F", "/dev/null", "-N", "-T", "-n", "-l", args.user,
                "-p", str(args.port), "-i", str(key)]
+    # OpenSSH emits keepalive timeouts at INFO; transient_exit needs that diagnostic.
     for option in ("BatchMode=yes", "StrictHostKeyChecking=yes", "UserKnownHostsFile=" + str(known),
                    "GlobalKnownHostsFile=/dev/null", "IdentitiesOnly=yes", "ExitOnForwardFailure=yes",
                    "ControlMaster=no", "ControlPath=none", "ControlPersist=no", "ForkAfterAuthentication=no",
                    "ProxyCommand=none", "ProxyJump=none", "PermitLocalCommand=no", "ForwardAgent=no",
                    "ForwardX11=no", "StreamLocalBindUnlink=no", "StreamLocalBindMask=0177",
                    "ConnectTimeout=5", "ConnectionAttempts=1", "ServerAliveInterval=5",
-                   "ServerAliveCountMax=3", "LogLevel=ERROR"):
+                   "ServerAliveCountMax=3", "LogLevel=INFO"):
         command.extend(["-o", option])
     return command + ["-L", forward, "--", args.host]
 
