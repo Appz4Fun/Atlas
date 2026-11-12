@@ -256,25 +256,28 @@ fn aspect(v: &mut VideoTrack, h: [u8; 4], mpeg2: bool) {
 
 /// An MPEG audio frame header: layer, rate, mono or not.
 pub(super) fn mpeg_audio(payload: &[u8], a: &mut AudioTrack) {
-    let Some(at) = payload.windows(2).position(|w| w[0] == 0xFF && w[1] & 0xE0 == 0xE0) else { return };
-    let Some(h) = payload.get(at..at + 4) else { return };
-    let version = (h[1] >> 3) & 3;
-    let layer = (h[1] >> 1) & 3;
-    a.codec = match layer {
-        1 => "mp3",
-        2 => "mp2",
-        3 => "mp1",
-        _ => "mp2",
+    for h in payload.windows(4) {
+        if h[0] != 0xFF || h[1] & 0xE0 != 0xE0 || h[2] >> 4 == 15 {
+            continue;
+        }
+        let codec = match (h[1] >> 1) & 3 {
+            1 => "mp3",
+            2 => "mp2",
+            3 => "mp1",
+            _ => continue,
+        };
+        let rates: [f64; 3] = match (h[1] >> 3) & 3 {
+            3 => [44100.0, 48000.0, 32000.0],
+            2 => [22050.0, 24000.0, 16000.0],
+            0 => [11025.0, 12000.0, 8000.0],
+            _ => continue,
+        };
+        let Some(rate) = rates.get(usize::from((h[2] >> 2) & 3)).copied() else { continue };
+        a.codec = codec.into();
+        a.sample_rate = Some(rate);
+        a.channels = Some(if h[3] >> 6 == 3 { 1 } else { 2 });
+        return;
     }
-    .into();
-    let rates: [f64; 3] = match version {
-        3 => [44100.0, 48000.0, 32000.0],
-        2 => [22050.0, 24000.0, 16000.0],
-        0 => [11025.0, 12000.0, 8000.0],
-        _ => return,
-    };
-    a.sample_rate = rates.get(usize::from((h[2] >> 2) & 3)).copied();
-    a.channels = Some(if h[3] >> 6 == 3 { 1 } else { 2 });
 }
 
 /// An AC-3 sync frame: rate, and channels from acmod and the LFE flag.
