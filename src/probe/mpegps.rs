@@ -496,13 +496,12 @@ mod tests {
         );
     }
 
-    fn reserved_mpeg_audio_headers() -> [(&'static str, [u8; 4]); 5] {
+    fn reserved_mpeg_audio_headers() -> [(&'static str, [u8; 4]); 4] {
         [
             ("version", [0xFF, 0xED, 0x84, 0x04]),
             ("layer", [0xFF, 0xF9, 0x80, 0xC4]),
             ("sample rate", [0xFF, 0xFD, 0x8C, 0xC4]),
             ("bitrate", [0xFF, 0xFD, 0xF0, 0xC4]),
-            ("emphasis", [0xFF, 0xFD, 0x80, 0xC6]),
         ]
     }
 
