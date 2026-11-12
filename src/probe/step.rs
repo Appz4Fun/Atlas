@@ -1323,6 +1323,9 @@ fn inspect(body: &[u8], password: Option<&str>, info: &mut ProbeInfo) {
 }
 
 #[cfg(test)]
+mod buffered_tags_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
