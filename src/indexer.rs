@@ -552,7 +552,7 @@ mod postgres_backend_tests {
 
     #[test]
     fn postgres_indexer_saves_releases_and_cursors_without_sqlite() {
-        let Some(schema) = crate::pg::testing::Schema::new() else { return };
+        let Some(schema) = crate::pg::testing::Schema::native_writer() else { return };
         let mut conn = schema.pool.get().unwrap();
         let database: String = conn.query_one("select current_database()", &[]).unwrap().get(0);
         let config = crate::pg::StorageConfig {

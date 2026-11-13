@@ -352,7 +352,7 @@ mod drawer_tests {
     #[test]
     #[ignore="requires explicit isolated fresh schema9 and native handler read admission"]
     fn actual_native_drawer_handler_renders_row_card_and_missing_release() {
-        let schema=pg::testing::Schema::new().expect("explicit fresh schema9");let mut client=schema.pool.get().unwrap();
+        let schema=pg::testing::Schema::native_writer().expect("explicit fresh schema9");let mut client=schema.pool.get().unwrap();
         pg::release_writer::save(&mut client,&[Release {name:"Drawer.Example.Release".into(),poster:"example & poster".into(),group:"alt.binaries.test".into(),date:"2020-01-01".into(),
             articles:vec![Article {filename:Some("video.mkv".into()),subject:"video.mkv yEnc (1/1)".into(),message_id:"<drawer@example.test>".into(),part:Some(1),total_parts:Some(1),bytes:17,..Default::default()}],..Default::default()}],1).unwrap();
         let id:i64=client.query_one("select id from releases",&[]).unwrap().get(0);
@@ -388,7 +388,7 @@ mod field_reader_tests {
     #[test]
     #[ignore="requires explicit isolated fresh schema9 and native handler read admission"]
     fn native_field_search_preserves_literal_predicates_and_never_needs_a_word_index() {
-        let schema=pg::testing::Schema::new().expect("explicit fresh PostgreSQL schema9");
+        let schema=pg::testing::Schema::native_writer().expect("explicit fresh PostgreSQL schema9");
         let mut client=schema.pool.get().unwrap();
         let releases=[("Alpha.Movie.2020-GRP","Poster <first%_@example.invalid>",64),
             ("Beta.Movie.2021-OTHER","Other <second@example.invalid>",128)].into_iter().enumerate().map(|(n,(name,poster,bytes))|Release {
@@ -427,7 +427,7 @@ mod relationship_reader_tests {
     #[test]
     #[ignore="requires explicit isolated fresh PostgreSQL schema9"]
     fn same_key_handler_reads_real_candidates_without_lending_hiding_or_exposing_keys() {
-        let schema=pg::testing::Schema::new().expect("explicit fresh PostgreSQL schema9");let mut client=schema.pool.get().unwrap();
+        let schema=pg::testing::Schema::native_writer().expect("explicit fresh PostgreSQL schema9");let mut client=schema.pool.get().unwrap();
         let releases=["Own.Movie.Release","Older.Linked.Release","Unrelated.Release","Newest.Linked.Release"].into_iter().enumerate().map(|(n,name)|Release {
             name:name.into(),group:"alt.binaries.test".into(),poster:"poster".into(),date:"Wed, 01 Jan 2020 00:00:00 +0000".into(),
             articles:vec![Article {filename:Some("video.mkv".into()),subject:"video.mkv yEnc (1/1)".into(),message_id:format!("related-{n}@example.invalid"),
@@ -457,7 +457,7 @@ mod stored_stats_reader_tests {
     #[test]
     #[ignore="requires isolated fresh PostgreSQL with the owner-approved posted_clock writer/schema"]
     fn stored_stats_handler_counts_real_posting_times_and_keeps_missing_timestamp_unavailable() {
-        let schema=pg::testing::Schema::new().expect("explicit fresh PostgreSQL schema");let mut client=schema.pool.get().unwrap();
+        let schema=pg::testing::Schema::native_writer().expect("explicit fresh PostgreSQL schema");let mut client=schema.pool.get().unwrap();
         let now=chrono::Utc::now();
         let releases=[("Current.Complete.Release",now.to_rfc2822(),1,17),
             ("Current.Partial.Release",now.to_rfc2822(),3,23),("Old.Release",(now-chrono::Duration::days(2)).to_rfc2822(),1,99)]
@@ -512,7 +512,7 @@ mod visual_related_tests {
     #[test]
     #[ignore="requires explicit isolated fresh PostgreSQL schema and bounded native handler admission"]
     fn same_picture_handler_keeps_strongest_tie_and_order_without_lending_or_asset_reads() {
-        let schema=pg::testing::Schema::new().expect("explicit isolated fresh schema");let mut client=schema.pool.get().unwrap();
+        let schema=pg::testing::Schema::native_writer().expect("explicit isolated fresh schema");let mut client=schema.pool.get().unwrap();
         let ids=catalog(&mut client,&["Own.Picture.Release","Exif.Linked.Release","Bytes.Linked.Release","Document.Linked.Release","Unrelated.Picture.Release"]);
         let a="a".repeat(64);let b="b".repeat(64);let c="c".repeat(64);
         picture(&mut client,ids[0],0,&a,Some("same-exif"),Some("same-document"));
@@ -541,7 +541,7 @@ mod visual_related_tests {
     #[test]
     #[ignore="requires explicit isolated fresh PostgreSQL schema and bounded native handler admission"]
     fn same_film_handler_requires_two_distinct_own_stills_and_preserves_time_rules() {
-        let schema=pg::testing::Schema::new().expect("explicit isolated fresh schema");let mut client=schema.pool.get().unwrap();
+        let schema=pg::testing::Schema::native_writer().expect("explicit isolated fresh schema");let mut client=schema.pool.get().unwrap();
         let ids=catalog(&mut client,&["Own.Film.Release","Matched.Timed.Release","One.Still.Release","Too.Far.Release","Fallback.Position.Release","Repeated.One.Release","No.Match.Release"]);
         // High signed bit must survive PG bigint storage. The two own hashes
         // differ in all bits, so a repeated candidate cannot match both.
@@ -574,7 +574,7 @@ mod native_continuation_tests {
     #[test]
     #[ignore="requires explicit isolated fresh PostgreSQL schema and bounded native handler admission"]
     fn native_results_render_real_first_middle_and_final_page_continuations() {
-        let schema=pg::testing::Schema::new().expect("explicit isolated fresh schema");let mut client=schema.pool.get().unwrap();
+        let schema=pg::testing::Schema::native_writer().expect("explicit isolated fresh schema");let mut client=schema.pool.get().unwrap();
         let releases=(0..105).map(|n|Release {name:format!("Paging.Fixture.Release.{n:03}"),group:"alt.binaries.test".into(),poster:"poster".into(),
             date:"Wed, 01 Jan 2020 00:00:00 +0000".into(),articles:vec![Article {filename:Some("video.mkv".into()),subject:"video.mkv yEnc (1/1)".into(),
                 message_id:format!("<paging-{n}@example.invalid>"),part:Some(1),total_parts:Some(1),bytes:17,..Default::default()}],..Default::default()}).collect::<Vec<_>>();
@@ -606,7 +606,7 @@ mod kept_details_tests {
     #[test]
     #[ignore="requires explicit isolated fresh PostgreSQL schema and bounded native handler admission"]
     fn kept_details_handler_uses_actual_id_lookup_and_tvdb_fallback_without_refreshing_cache() {
-        let schema=pg::testing::Schema::new().expect("explicit isolated fresh schema");let mut client=schema.pool.get().unwrap();
+        let schema=pg::testing::Schema::native_writer().expect("explicit isolated fresh schema");let mut client=schema.pool.get().unwrap();
         let mut ids=Vec::new();
         for n in 0..7 {
             let name=format!("Details.Fixture.Release.{n}");
@@ -658,7 +658,7 @@ mod advanced_native_query_tests {
     #[test]
     #[ignore="requires explicit isolated native PostgreSQL and bounded handler admission"]
     fn actual_field_tag_rating_and_visibility_filters_page_the_same_kept_facts_the_row_shows() {
-        let schema=pg::testing::Schema::new().expect("explicit isolated native schema");let mut client=schema.pool.get().unwrap();
+        let schema=pg::testing::Schema::native_writer().expect("explicit isolated native schema");let mut client=schema.pool.get().unwrap();
         let inputs=[("Alpha.Movie.2020.1080p.WEB-DL-GRP","shared",17,1,Some(80i64)),("Beta.Movie.2021.2160p.BluRay-GRP","shared",23,1,Some(90)),
             ("Gamma.Movie.2022.1080p.WEB-DL-GRP","shared",29,3,Some(95)),("Delta.Movie.2023.1080p.WEB-DL-GRP","other",31,1,Some(100)),
             ("Spot.Movie.2024.1080p.WEB-DL-GRP","shared",37,1,Some(97)),("Removed.Movie.2025.1080p.WEB-DL-GRP","shared",41,1,Some(85)),
@@ -979,7 +979,7 @@ mod native_own_enrichment_tests {
     #[test]
     #[ignore="requires explicit isolated PG and actual native writer; own hint and malformed/error boundaries"]
     fn own_password_facts_preserve_precedence_sources_and_never_borrow_neighbor_hints() {
-        let schema=pg::testing::Schema::new().expect("explicit isolated PG required");let mut client=schema.pool.get().unwrap();
+        let schema=pg::testing::Schema::native_writer().expect("explicit isolated PG required");let mut client=schema.pool.get().unwrap();
         let stored=save(&mut client,"Stored.Password.Release","data.rar","data.rar yEnc (1/1)","stored-hint@example.invalid");
         let named=save(&mut client,"Name.{{nameSecret42}}","data.rar","data.rar yEnc (1/1)","name-hint@example.invalid");
         let subject=save(&mut client,"Subject.Password.Release","data.rar","data.rar password=subjectSecret42 yEnc (1/1)","subject-hint@example.invalid");
@@ -1016,7 +1016,7 @@ mod native_own_enrichment_tests {
     #[test]
     #[ignore="requires explicit isolated PG; metadata target and sidecar rows stay read-only associations"]
     fn own_metadata_targets_and_sidecars_are_real_bounded_pg_associations() {
-        let schema=pg::testing::Schema::new().expect("explicit isolated PG required");let mut client=schema.pool.get().unwrap();
+        let schema=pg::testing::Schema::native_writer().expect("explicit isolated PG required");let mut client=schema.pool.get().unwrap();
         let own=save(&mut client,"Carrier.NZB.Release","carrier.nzb","carrier.nzb yEnc (1/1)","own-nzb-meta@example.invalid");
         let target=save(&mut client,"Target.Movie.2020-GRP","video.mkv","video.mkv yEnc (1/1)","target-meta@example.invalid");
         let uid_side=save(&mut client,"Posted.Uid.Sidecar","info.txt","info.txt yEnc (1/1)","uid-side-meta@example.invalid");
@@ -1045,7 +1045,7 @@ mod native_own_enrichment_tests {
     #[test]
     #[ignore="requires explicit isolated PG; recovery metadata uses real own filenames and PAR2-origin rows"]
     fn own_recovery_rows_distinguish_exact_unknown_and_non_recovery_without_lending() {
-        let schema=pg::testing::Schema::new().expect("explicit isolated PG required");let mut client=schema.pool.get().unwrap();
+        let schema=pg::testing::Schema::native_writer().expect("explicit isolated PG required");let mut client=schema.pool.get().unwrap();
         let exact=save(&mut client,"Own.Recovery.Exact","set.vol00+01.par2","set.vol00+01.par2 yEnc (1/1)","exact-par2@example.invalid");
         let unknown=save(&mut client,"Own.Recovery.Unknown","other.par2","other.par2 yEnc (1/1)","unknown-par2@example.invalid");
         let data=save(&mut client,"Ordinary.Data.Release","video.mkv","video.mkv yEnc (1/1)","own-data@example.invalid");

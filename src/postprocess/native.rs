@@ -133,6 +133,12 @@ impl Prepared {
                 fail(&self.owner,&error);return Err(error)
             }
         }
+        for hold in &self.holds {
+            if let Some(images)=hold.downcast_ref::<crate::pg::worker_assets::ImageFrame>()
+                && let Err(error)=images.check(&self.owner,claim.release_id()) {
+                fail(&self.owner,&error);return Err(error)
+            }
+        }
         let visit=self.visit.take().expect("prepared native visit");
         let result=queue.settle(claim,visit,now);
         if let Err(error)=&result {fail(&self.owner,error);}

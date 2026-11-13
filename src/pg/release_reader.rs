@@ -197,7 +197,7 @@ mod tests {
 
     #[test]
     fn inventory_reads_the_native_writers_exact_message_ids_in_order() {
-        let Some(test) = crate::pg::testing::Schema::new() else { return };
+        let Some(test) = crate::pg::testing::Schema::native_writer() else { return };
         let mut client = test.pool.get().unwrap();
         assert!(inventory(&mut client, 1).unwrap().is_none());
 

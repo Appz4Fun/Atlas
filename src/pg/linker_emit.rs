@@ -178,7 +178,7 @@ mod tests {
 
     #[test]
     fn immutable_emission_replays_committed_save_before_receipt_without_renumbering() {
-        let Some(schema) = crate::pg::testing::Schema::new() else { return };
+        let Some(schema) = crate::pg::testing::Schema::native_writer() else { return };
         // A fresh direct client models reconnecting the persisted metadata and
         // fixture writer connection; this does not exercise Owned lease restart.
         let connect = || {

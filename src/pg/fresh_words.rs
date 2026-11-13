@@ -113,7 +113,7 @@ mod group_search_tests {
     #[test]
     #[ignore="requires explicit isolated fresh schema, original owner, and owned Tantivy directory"]
     fn actual_pg_group_filter_keeps_tantivy_words_tags_and_case_sensitive_scope() {
-        let schema=pg::testing::Schema::new().expect("explicit fresh schema");let mut client=schema.pool.get().unwrap();
+        let schema=pg::testing::Schema::native_writer().expect("explicit fresh schema");let mut client=schema.pool.get().unwrap();
         client.query_one("select pg_advisory_lock(hashtext('atlas.indexer'),hashtext($1))",&[&schema.name]).unwrap();
         let root=tempfile::tempdir().unwrap();
         let headers=crate::config::HeaderStoreConfig {enabled:true,dir:root.path().to_str().unwrap().into()};

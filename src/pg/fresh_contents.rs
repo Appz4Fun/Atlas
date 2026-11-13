@@ -123,7 +123,7 @@ mod tests {
     #[test]
     #[ignore="requires explicit isolated fresh schema9 read-only web admission"]
     fn own_release_contents_keep_same_part_copy_bytes_and_actual_archive_absence() {
-        let schema=pg::testing::Schema::new().expect("explicit fresh schema9");let mut client=schema.pool.get().unwrap();
+        let schema=pg::testing::Schema::native_writer().expect("explicit fresh schema9");let mut client=schema.pool.get().unwrap();
         let articles=[("movie.rar",1,3,17),("movie.rar",1,3,19),("movie.rar",3,3,23),("movie.vol00+02.par2",1,1,11),("note.nfo",1,1,7)]
             .into_iter().enumerate().map(|(n,(file,part,total,bytes))|Article {filename:Some(file.into()),subject:format!("{file} yEnc ({part}/{total})"),message_id:format!("<part{n}@example.test>"),part:Some(part),total_parts:Some(total),bytes,..Default::default()}).collect();
         pg::release_writer::save(&mut client,&[Release {name:"Own.Film.Example".into(),poster:"poster".into(),group:"alt.binaries.test".into(),date:"2020-01-01".into(),articles,..Default::default()}],1).unwrap();

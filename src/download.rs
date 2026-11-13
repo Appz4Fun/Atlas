@@ -92,7 +92,7 @@ mod native_preflight_tests {
     #[test]
     #[ignore="requires explicit isolated fresh PostgreSQL schema and owned bounded NZB spool"]
     fn native_download_refuses_invalid_inputs_before_handoff_and_publishes_the_preflight_snapshot() {
-        let schema=pg::testing::Schema::new().expect("explicit isolated fresh schema");let mut client=schema.pool.get().unwrap();
+        let schema=pg::testing::Schema::native_writer().expect("explicit isolated fresh schema");let mut client=schema.pool.get().unwrap();
         for (n,(name,file,total)) in [("Complete.字幕.Release",Some("video.字幕.\"&.mkv"),1),("Incomplete.Preflight.Release",Some("video.mkv"),3),
             ("Uncaptured.Empty.Preflight",Some(""),1),("No.Articles.Preflight",Some("video.mkv"),1)].into_iter().enumerate() {
             let saved=pg::release_writer::save(&mut client,&[Release {name:name.into(),group:"alt.binaries.test".into(),poster:"original & poster".into(),

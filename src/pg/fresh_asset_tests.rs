@@ -39,7 +39,7 @@ fn admitted_asset_reads_check_manifest_content_and_refuse_unlisted_or_replaced_f
 fn native_asset_descriptors_require_real_pg_association_and_keep_original_poster_cache_name() {
     use crate::{parser::{Article,Release},pg::{self,fresh_reader::{ReadView,Budget}}};
     use std::{collections::HashMap,time::{Duration,Instant}};
-    let schema=pg::testing::Schema::new().expect("explicit fresh PostgreSQL schema9/cache10");let mut client=schema.pool.get().unwrap();
+    let schema=pg::testing::Schema::native_writer().expect("explicit fresh PostgreSQL schema9/cache10");let mut client=schema.pool.get().unwrap();
     let release=Release {name:"Artwork.Example.Release".into(),poster:"poster".into(),group:"alt.binaries.test".into(),date:"Wed, 01 Jan 2020 00:00:00 +0000".into(),
         articles:vec![Article {filename:Some("video.mkv".into()),subject:"video.mkv yEnc (1/1)".into(),message_id:"artwork@example.invalid".into(),part:Some(1),total_parts:Some(1),bytes:17,..Default::default()}],..Default::default()};
     assert_eq!(pg::release_writer::save(&mut client,&[release],1).unwrap().releases,1);

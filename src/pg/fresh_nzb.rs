@@ -226,7 +226,7 @@ mod tests {
     #[test]
     #[ignore="requires explicit isolated fresh PostgreSQL and spool admission"]
     fn real_native_writer_nzb_matches_own_payload_oracle_and_file_selection() {
-        let schema=crate::pg::testing::Schema::new().expect("explicit isolated PG fixture");
+        let schema=crate::pg::testing::Schema::native_writer().expect("explicit isolated PG fixture");
         let mut client=schema.pool.get().unwrap();
         let articles=(0..19).map(|n|Article {filename:Some("sample.字幕.\"&.bin".into()),subject:"sample.字幕.bin yEnc (1/1)".into(),
             message_id:format!("<<part{n}@example.test>>"),part:Some(1),total_parts:Some(1),bytes:17,..Article::default()}).collect();
@@ -261,7 +261,7 @@ mod sparse_nameless_tests {
     #[test]
     #[ignore="requires explicit isolated PostgreSQL and bounded native spool admission"]
     fn sparse_nameless_envelopes_are_distinct_files_with_matching_list_and_get_ordinals() {
-        let schema=crate::pg::testing::Schema::new().expect("explicit isolated PostgreSQL");let mut client=schema.pool.get().unwrap();
+        let schema=crate::pg::testing::Schema::native_writer().expect("explicit isolated PostgreSQL");let mut client=schema.pool.get().unwrap();
         let first_subject=format!("{}tail", "α & \"original\" ".repeat(800));
         let first=Release {name:"Sparse.Envelope.Release".into(),group:"alt.binaries.test".into(),poster:"first & poster".into(),date:"Wed, 01 Jan 2020 00:00:00 +0000".into(),
             articles:vec![Article {filename:None,subject:first_subject.clone(),message_id:"<alpha@example.invalid>".into(),part:Some(1),total_parts:Some(1),bytes:17,..Default::default()}],..Default::default()};
@@ -296,7 +296,7 @@ mod sparse_nameless_tests {
     #[test]
     #[ignore="requires explicit isolated PostgreSQL and bounded native spool admission"]
     fn uncaptured_empty_filename_cannot_be_relabelled_as_a_literal_none_envelope() {
-        let schema=crate::pg::testing::Schema::new().expect("explicit isolated PostgreSQL");let mut client=schema.pool.get().unwrap();
+        let schema=crate::pg::testing::Schema::native_writer().expect("explicit isolated PostgreSQL");let mut client=schema.pool.get().unwrap();
         let release=Release {name:"Empty.Filename.Control".into(),group:"alt.binaries.test".into(),poster:"poster".into(),date:"Wed, 01 Jan 2020 00:00:00 +0000".into(),
             articles:vec![Article {filename:Some(String::new()),subject:"empty filename input".into(),message_id:"empty@example.invalid".into(),part:Some(1),total_parts:Some(1),bytes:17,..Default::default()},
                 Article {filename:Some(String::new()),subject:"another empty filename input".into(),message_id:"another-empty@example.invalid".into(),part:Some(1),total_parts:Some(1),bytes:23,..Default::default()}],..Default::default()};
@@ -321,7 +321,7 @@ mod owned_adapter_tests {
     #[test]
     #[ignore="requires explicit isolated PostgreSQL and bounded native spool admission"]
     fn owned_native_adapter_retains_gap_details_copies_and_whole_download_refusal() {
-        let schema=crate::pg::testing::Schema::new().expect("explicit isolated PostgreSQL");let mut client=schema.pool.get().unwrap();
+        let schema=crate::pg::testing::Schema::native_writer().expect("explicit isolated PostgreSQL");let mut client=schema.pool.get().unwrap();
         let release=|name:&str,total|Release {name:name.into(),group:"alt.binaries.test".into(),poster:"accepted poster".into(),date:"Wed, 01 Jan 2020 00:00:00 +0000".into(),
             articles:[17,23].into_iter().enumerate().map(|(n,bytes)|Article {filename:Some("video.mkv".into()),subject:format!("video.mkv yEnc (1/{total})"),
                 message_id:format!("{name}-{n}@example.invalid"),part:Some(1),total_parts:Some(total),bytes,..Default::default()}).collect(),..Default::default()};

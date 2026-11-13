@@ -1,13 +1,14 @@
 //! Attempt-bound cover reuse. Configuration selects a physical namespace; only
 //! real owner-session associations plus verified bytes produce a frame hold.
 use anyhow::{Result,Context,ensure};
+use sha2::Digest;
 use std::{io::Read,cell::RefCell,sync::{Arc,Weak},marker::PhantomData,rc::Rc};
 use super::{indexer_runtime::Owner,fresh_assets::{AssetManifest,AssetRequest,AssetKind},natural_cache::{self,Key,Budget}};
 const COVER_BYTES:u64=crate::probe::media::MAX_COVER as u64;
 
 pub(crate) struct Grant {
     owner:Weak<Owner>,epoch:[u8;32],catalog:[u8;32],manifest:Arc<AssetManifest>,source:[u8;32],
-    pool:Arc<crate::nzb_spool::Pool>,art_pool:Arc<crate::nzb_spool::Pool>,_scratch:tempfile::TempDir,
+    pool:Arc<crate::nzb_spool::Pool>,art_pool:Arc<crate::nzb_spool::Pool>,image_pool:Arc<crate::nzb_spool::Pool>,image_writes:std::sync::atomic::AtomicU64,_scratch:tempfile::TempDir,
 }
 #[derive(Debug,PartialEq,Eq)]
 pub(crate) enum ArtworkStatus {Kept,Missing,Unavailable,Changed}
@@ -28,6 +29,86 @@ impl CoverHold {
         Ok(())
     }
 }
+#[derive(Debug)]
+pub(crate) struct ImageChanged;
+impl std::fmt::Display for ImageChanged {fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str("native image source changed")}}
+impl std::error::Error for ImageChanged {}
+/// One ImagesStep outcome, retained by Prepared through actual settlement.
+/// Neither a descriptor nor a digest supplied by a caller constructs this hold.
+pub(crate) struct ImageFrame {grant:Arc<Grant>,release:i64,revision:i64,limit:u64,held:std::collections::HashSet<String>,body:Option<crate::nzb_spool::Spool>}
+impl ImageFrame {
+    pub(crate) fn check(&self,owner:&Arc<Owner>,release:i64)->Result<()> {
+        self.grant.check_owner(owner)?;ensure!(release==self.release,"native image hold belongs to another frame");self.grant.manifest.check_root()?;
+        ensure!(self.body.as_ref().is_some_and(|body|body.is_complete()),"native image hold is incomplete");
+        // Header/route revisions are revalidated by Queue, under its release
+        // locks. Normal supersession must not become an owner failure here.
+        Ok(())
+    }
+    pub(crate) fn cached(&mut self,file:&str,name:&str)->Result<Option<Vec<u8>>> {
+        let digest=super::fresh_assets::digest(name)?;let owner=self.grant.owner()?;
+        let observed=owner.with(|client| {
+            let mut tx=client.build_transaction().isolation_level(postgres::IsolationLevel::RepeatableRead).read_only(true).start()?;
+            let current=tx.query_opt("select native_work_revision from releases where id=$1",&[&self.release])?.map(|row|row.try_get::<_,i64>(0)).transpose()?;
+            if current!=Some(self.revision){return Ok(None)}
+            let row=tx.query_opt("select bytes,case when octet_length(format)<=16 then format end from release_images where release_id=$1 and file=$2 and sha256=$3 order by position limit 1",&[&self.release,&file,&name])?;
+            let Some(row)=row else {return Ok(Some(None))};let bytes:i64=row.try_get(0)?;let format:Option<String>=row.try_get(1)?;
+            ensure!(bytes>0&&bytes as u64<=self.limit,"cached native image exceeds frame byte admission");let format=format.context("cached native image format exceeds admission")?;
+            ensure!(matches!(format.as_str(),"jpeg"|"png"|"gif"|"webp"|"bmp"),"cached native image format is invalid");
+            let request=AssetRequest {kind:AssetKind::Images,name:name.into(),digest:Some(digest),bytes:Some(bytes as u64),content_type:crate::images::content_type(&format)};
+            let receipt=super::fresh_assets::receipt_in(&mut tx,&request)?;tx.commit()?;Ok(Some(Some((request,receipt))))
+        })?;
+        let Some(observed)=observed else {return Err(ImageChanged.into())};let Some((request,receipt))=observed else {return Ok(None)};
+        let Some(mut body)=self.grant.manifest.read_associated(&request,&self.grant.image_pool,owner.epoch().context("native image epoch absent")?.catalog(),receipt.as_ref())? else{return Ok(None)};
+        let mut bytes=vec![0;usize::try_from(body.len())?];body.read_exact(&mut bytes)?;body.rewind()?;
+        ensure!(crate::images::sniff(&bytes).is_some_and(|info|crate::images::content_type(info.format)==request.content_type),"cached native image MIME/content mismatch");
+        owner.with(|_|Ok(()))?;self.grant.check_owner(&owner)?;self.pin(name,&bytes)?;Ok(Some(bytes))
+    }
+    fn pin(&mut self,name:&str,bytes:&[u8])->Result<()> {
+        use std::io::Write;
+        if self.held.contains(name){return Ok(())}ensure!(self.held.len()<10000,"native image frame exceeds result-file admission");
+        self.body.as_mut().context("native image hold was already finished")?.write_all(bytes)?;self.held.insert(name.into());Ok(())
+    }
+    pub(crate) fn finish(mut self)->Result<Self> {
+        self.body=Some(self.body.take().context("native image hold was already finished")?.finish()?);Ok(self)
+    }
+    pub(crate) fn keep(&mut self,bytes:&[u8])->Result<bool> {
+        ensure!(!bytes.is_empty()&&bytes.len() as u64<=self.limit,"native produced image exceeds frame byte admission");
+        ensure!(crate::images::sniff(bytes).is_some(),"native produced bytes are not a supported image");
+        let digest:[u8;32]=sha2::Sha256::digest(bytes).into();let name=super::fresh_assets::hex(&digest);let owner=self.grant.owner()?;
+        let current=owner.with(|client|Ok(client.query_opt("select native_work_revision from releases where id=$1",&[&self.release])?.map(|row|row.try_get::<_,i64>(0)).transpose()?))?;
+        if current!=Some(self.revision){return Err(ImageChanged.into())}
+        // Cached bytes already have an actual association and a retained spool.
+        // Avoid rewriting their content or reclassifying an imported receipt.
+        if self.held.contains(&name){self.grant.manifest.check_root()?;return Ok(true)}
+        let request=AssetRequest {kind:AssetKind::Images,name:name.clone(),digest:Some(digest),bytes:Some(bytes.len() as u64),content_type:"application/octet-stream"};
+        let body=match self.grant.manifest.read_recorded(&request,&self.grant.image_pool)? {
+            Some(body)=>body,
+            None=> {
+                let Some((stored,actual))=self.grant.manifest.store_image(bytes,&self.grant.image_writes,&owner.stop)? else{return Ok(false)};
+                ensure!(stored==name&&actual==digest,"native image writer content changed");
+                self.grant.manifest.read_recorded(&request,&self.grant.image_pool)?.context("native produced image disappeared")?
+            }
+        };
+        let captured=self.grant.manifest.has_entry(&request)?;
+        if captured {
+            // Captured originals keep their manifest authority and any existing
+            // compatible descriptor; no new native source stamp is fabricated.
+            let receipt=owner.with(|client|super::fresh_assets::receipt_in(client,&request))?;
+            let checked=self.grant.manifest.read_associated(&request,&self.grant.image_pool,owner.epoch().context("native image epoch absent")?.catalog(),receipt.as_ref())?;
+            ensure!(checked.is_some(),"captured native image disappeared");
+        }else {
+            let source=self.grant.manifest.native_source(AssetKind::Images,owner.epoch().context("native image epoch absent")?.catalog())?;
+            let stored=owner.with(|client| {
+                let mut tx=client.transaction()?;super::history_gate::native(&mut tx)?;
+                let current=tx.query_opt("select native_work_revision from releases where id=$1 for update",&[&self.release])?.map(|row|row.try_get::<_,i64>(0)).transpose()?;
+                if current!=Some(self.revision){return Ok(false)}
+                let count=tx.execute("insert into ext_asset_files as old(kind,name,byte_length,digest,source_digest) values('images',$1,$2,$3,$4) on conflict(kind,name) do update set name=excluded.name where old.byte_length=excluded.byte_length and old.digest=excluded.digest and old.source_digest=excluded.source_digest",&[&name,&(bytes.len() as i64),&digest.as_slice(),&source.as_slice()])?;
+                ensure!(count==1,"native image descriptor conflicts with existing namespace/content");tx.commit()?;Ok(true)
+            })?;if !stored{return Err(ImageChanged.into())}
+        }
+        owner.with(|_|Ok(()))?;self.grant.check_owner(&owner)?;drop(body);self.pin(&name,bytes)?;Ok(true)
+    }
+}
 impl Grant {
     pub(crate) fn open(owner:&Arc<Owner>,selection:Option<&crate::config::NativeAssetsConfig>)->Result<Option<Arc<Self>>> {
         let Some(selection)=selection else{return Ok(None)};
@@ -39,7 +120,15 @@ impl Grant {
         let scratch=tempfile::Builder::new().prefix("atlas-worker-assets-").tempdir()?;
         let pool=crate::nzb_spool::Pool::new(scratch.path().into(),crate::nzb_spool::Limits {requests:32,per_request_bytes:COVER_BYTES,total_bytes:32*COVER_BYTES,free_bytes:16*1024*1024})?;
         let art_pool=crate::nzb_spool::Pool::new(scratch.path().into(),crate::nzb_spool::Limits {requests:1,per_request_bytes:8<<20,total_bytes:8<<20,free_bytes:16<<20})?;
-        Ok(Some(Arc::new(Self {owner:Arc::downgrade(owner),epoch:*epoch.id(),catalog:*epoch.catalog().nonce(),manifest,source,pool,art_pool,_scratch:scratch})))
+        // One raw batch spool per live outcome avoids a descriptor per picture.
+        // These are disk limits; per-picture Rust buffers remain <=64MiB.
+        let image_pool=crate::nzb_spool::Pool::new(scratch.path().into(),crate::nzb_spool::Limits {requests:128,per_request_bytes:8<<30,total_bytes:16<<30,free_bytes:16<<20})?;
+        Ok(Some(Arc::new(Self {owner:Arc::downgrade(owner),epoch:*epoch.id(),catalog:*epoch.catalog().nonce(),manifest,source,pool,art_pool,image_pool,image_writes:std::sync::atomic::AtomicU64::new(0),_scratch:scratch})))
+    }
+    pub(crate) fn image_frame(self:&Arc<Self>,release:i64,limit:u64)->Result<ImageFrame> {
+        ensure!(limit>0&&limit<=super::fresh_assets::IMAGE_BYTES,"native image frame byte admission");let owner=self.owner()?;
+        let revision=owner.with(|client|Ok(client.query_opt("select native_work_revision from releases where id=$1",&[&release])?.map(|row|row.try_get::<_,i64>(0)).transpose()?))?.ok_or(ImageChanged)?;
+        self.manifest.check_root()?;let body=self.image_pool.open()?;Ok(ImageFrame {grant:self.clone(),release,revision,limit,held:std::collections::HashSet::new(),body:Some(body)})
     }
     /// Service factories must bind the grant to their exact original attempt
     /// before constructing any cache/provider clients or performing work.
@@ -173,3 +262,7 @@ pub(crate) fn current()->Result<Option<Arc<Grant>>> {
 #[cfg(all(test,unix))]
 #[path="worker_asset_tests.rs"]
 mod tests;
+
+#[cfg(all(test,unix))]
+#[path="worker_image_asset_tests.rs"]
+mod image_tests;

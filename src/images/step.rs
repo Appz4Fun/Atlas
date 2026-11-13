@@ -526,6 +526,12 @@ fn image_record(file: &str, bytes: &[u8], sha256: &str) -> Option<ImageRecord> {
         width: sniffed.width,height: sniffed.height,bytes: bytes.len() as i64,meta,exif_id,document_id })
 }
 
+fn image_error(error:anyhow::Error)->StepError {
+    if error.is::<crate::pg::worker_assets::ImageChanged>() || error.downcast_ref::<std::io::Error>().is_some() {
+        StepError::Transient(error.to_string())
+    }else{StepError::from_cache(error)}
+}
+
 #[derive(Default)]
 pub struct ImagesStep {
     limits: std::sync::Mutex<crate::config::ArchiveConfig>,
@@ -616,32 +622,38 @@ impl Step for ImagesStep {
         if wanted.is_empty() && books.is_empty() {
             return Ok(Outcome { writes: answers, ..Outcome::default() });
         }
+        let native=matches!(ctx.data(),crate::postprocess::data::StepData::Native(_));
+        let max_bytes = (limits.picture_max_parts.max(MAX_PARTS as i64) as usize).saturating_mul(1 << 20);
+        let mut image_frame=if native {
+            let grant=crate::pg::worker_assets::current().map_err(image_error)?.ok_or_else(||StepError::Transient("native image namespace has not been selected".into()))?;
+            Some(grant.image_frame(release_id,max_bytes as u64).map_err(image_error)?)
+        }else{None};
         let before = ctx.data().kept_images(release_id)?;
         // room for the biggest picture one may ask for, whatever `picture_max_parts` says
         let mut left = RUN_PARTS.max(limits.picture_max_parts.max(1) as usize);
         let mut writes = vec![StepWrite::for_mutation(release_id, StepMutation::ClearImages)];
         let mut kept = 0i64;
-        let mut row = |name: &str, body: &[u8], writes: &mut Vec<StepWrite>| -> bool {
+        let mut row = |name: &str, body: &[u8], writes: &mut Vec<StepWrite>, frame:&mut Option<crate::pg::worker_assets::ImageFrame>| -> Result<bool,StepError> {
             // read before it's kept: a file named .jpg that isn't a picture never reaches the folder
             let sha256 = sha256_hex(body);
-            let Some(image) = image_record(name, body, &sha256) else { return false };
-            if keep(body).is_none() {
-                return false;
-            }
+            let Some(image) = image_record(name, body, &sha256) else { return Ok(false) };
+            if let Some(frame)=frame {
+                if !frame.keep(body).map_err(image_error)? {return Err(StepError::Transient("native image cache could not reach its 2GiB target".into()));}
+            }else if keep(body).is_none(){return Ok(false);}
             writes.push(StepWrite::for_mutation(release_id, StepMutation::KeepImage { position: kept,image }));
             kept += 1;
-            true
+            Ok(true)
         };
         let mut unfinished = false;
         // out of time or budget, or a server's trouble, after some pictures came: those are kept and the rest wait
         // for the next run, which finds these in the folder, instead of all of them being fetched again for ever
         let mut stopped = false;
         // a picture read without asking may be as big as `MAX_PARTS` articles, whatever `picture_max_parts` says
-        let max_bytes = (limits.picture_max_parts.max(MAX_PARTS as i64) as usize).saturating_mul(1 << 20);
         for (file, was_asked) in wanted {
             // read on an earlier run and still in the folder: not fetched again
-            let cached =
-                before.get(&file.filename).and_then(|sha| image_file(sha)).and_then(|path| std::fs::read(path).ok());
+            let cached=if let Some(frame)=image_frame.as_mut() {
+                match before.get(&file.filename) {Some(sha)=>frame.cached(&file.filename,sha).map_err(image_error)?,None=>None}
+            }else {before.get(&file.filename).and_then(|sha|image_file(sha)).and_then(|path|std::fs::read(path).ok())};
             let body = match cached {
                 Some(body) => Some(body),
                 None if stopped => {
@@ -676,7 +688,7 @@ impl Step for ImagesStep {
                     other => other?,
                 },
             };
-            let shown = body.as_deref().is_some_and(|b| row(&file.filename, b, &mut writes));
+            let shown=match body.as_deref(){Some(body)=>row(&file.filename,body,&mut writes,&mut image_frame)?,None=>false};
             if was_asked {
                 let a = match (&body, shown) {
                     (_, true) => Answer::Shown,
@@ -696,17 +708,16 @@ impl Step for ImagesStep {
             }
             let Some(body) = crate::archive::steps::whole_file(ctx, file, &mut book_left)? else { continue };
             for inside in super::container::pictures(&body, room) {
-                if row(&format!("{} › {}", file.filename, inside.name), &inside.bytes, &mut writes) {
+                if row(&format!("{} › {}", file.filename, inside.name), &inside.bytes, &mut writes,&mut image_frame)? {
                     book_images += 1;
                 }
             }
         }
         let wait_until = unfinished.then_some(now + ASKED_RESUME_SECS);
-        if kept == 0 {
-            return Ok(Outcome { writes: answers, wait_until, ..Outcome::default() });
-        }
+        let hold=image_frame.map(|frame|frame.finish().map(|frame|Box::new(frame) as Box<dyn std::any::Any+Send>)).transpose().map_err(image_error)?;
+        if kept == 0 {return Ok(Outcome {writes:answers,wait_until,hold,..Outcome::default()});}
         writes.extend(answers);
-        Ok(Outcome { matched: true, writes, wait_until, ..Outcome::default() })
+        Ok(Outcome {matched:true,writes,wait_until,hold,..Outcome::default()})
     }
 }
 
@@ -819,3 +830,7 @@ mod tests {
         assert!(row_values("x.jpg", b"not a picture", "ab").is_none());
     }
 }
+
+#[cfg(all(test,unix))]
+#[path="native_image_step_tests.rs"]
+mod native_tests;

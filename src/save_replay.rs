@@ -104,6 +104,12 @@ fn open_pg_replay(config: StorageConfig, database: &str) -> Result<Writer> {
     tx.execute("select pg_advisory_xact_lock(hashtext('atlas.migrate.' || $1))", &[&pool.schema()])?;
     tx.batch_execute(&format!("create schema \"{}\"", pool.schema())).context("creating a fresh replay schema")?;
     crate::pg::migrate::run_in_transaction(&mut tx, pool.schema())?;
+    // This transaction just created the schema (reuse is refused above).
+    // Give direct replay saves the same real catalog key prerequisite as
+    // Runtime::open; never derive a replacement from schema/name/input data.
+    let mut key = [0; 8];
+    getrandom::fill(&mut key).map_err(|e| anyhow::anyhow!("creating replay catalog key: {e}"))?;
+    tx.execute("insert into meta(key,value) values('key_salt',$1)", &[&i64::from_le_bytes(key)])?;
     tx.commit()?;
     drop(conn);
     Ok(Writer::Postgres(Arc::new(pool)))

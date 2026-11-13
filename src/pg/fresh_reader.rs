@@ -200,7 +200,7 @@ mod recent_pagination_tests {
     #[test]
     #[ignore="requires explicit isolated PostgreSQL and bounded native reader admission"]
     fn deep_recent_pages_skip_descriptors_without_spending_returned_value_budget() {
-        let schema=pg::testing::Schema::new().expect("explicit isolated PostgreSQL");let mut client=schema.pool.get().unwrap();
+        let schema=pg::testing::Schema::native_writer().expect("explicit isolated PostgreSQL");let mut client=schema.pool.get().unwrap();
         let releases=(0..2305).map(|n|Release {name:format!("Recent.Visible.{n:04}"),group:"alt.binaries.test".into(),poster:"p".into(),date:"Wed, 01 Jan 2020 00:00:00 +0000".into(),
             articles:vec![Article {filename:Some("f.bin".into()),subject:"f.bin yEnc (1/1)".into(),message_id:format!("recent-{n}@example.invalid"),part:Some(1),total_parts:Some(1),bytes:1,..Default::default()}],..Default::default()}).collect::<Vec<_>>();
         assert_eq!(pg::release_writer::save(&mut client,&releases,1).unwrap().releases,2305);

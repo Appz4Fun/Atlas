@@ -4,7 +4,7 @@ use super::*;
 #[test]
 #[ignore="requires explicit isolated PG for caller-owned native header transactions"]
 fn inferred_header_writer_joins_actual_transaction_and_rolls_back_without_partial_payload() {
-    let schema=crate::pg::testing::Schema::new().expect("explicit isolated PG required");let mut client=schema.pool.get().unwrap();
+    let schema=crate::pg::testing::Schema::native_writer().expect("explicit isolated PG required");let mut client=schema.pool.get().unwrap();
     let release=Release {name:"Native.Inferred.Source".into(),group:"example.group".into(),articles:vec![Article {filename:Some("own.bin".into()),message_id:"<part3of4.own@example.invalid>".into(),subject:"Native.Inferred.Source - \"own.bin\" yEnc (3/4)".into(),part:Some(3),total_parts:Some(4),bytes:17,..Default::default()}],..Default::default()};
     let mut tx=client.transaction().unwrap();
     let stats=save_in(&mut tx,std::slice::from_ref(&release),10).unwrap();assert_eq!(stats.parts,1);

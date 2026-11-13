@@ -40,6 +40,41 @@ fn physical_directory(path:&Path)->Result<File> {
         _=>bail!("retained asset root contains a relative component"),
     }}ensure!(current.metadata()?.is_dir(),"retained asset root is not a directory");Ok(current)
 }
+pub(super) const IMAGE_BYTES:u64=64<<20;
+const IMAGE_CACHE_BYTES:u64=2<<30;
+fn image_charge(length:u64)->u64 {length.div_ceil(4096).saturating_mul(4096).max(16<<10)}
+#[cfg(unix)]
+fn trim_images(directory:&File,limit:u64,stop:&std::sync::atomic::AtomicBool,until:std::time::Instant)->Result<bool> {
+    use std::{ffi::{CStr,CString},os::fd::AsRawFd,sync::atomic::Ordering,time::SystemTime};
+    struct Entries(*mut libc::DIR);
+    impl Drop for Entries {fn drop(&mut self){unsafe{libc::closedir(self.0);}}}
+    // readdir_r's buffer is safe only with this explicit filesystem name bound.
+    // It returns an error code directly, so EOF cannot conceal an I/O error.
+    let max_name=unsafe{libc::fpathconf(directory.as_raw_fd(),libc::_PC_NAME_MAX)};
+    let mut entry:libc::dirent=unsafe{std::mem::zeroed()};ensure!(max_name>=0&&(max_name as usize)<entry.d_name.len(),"native image directory name extent unsupported");
+    let fd=unsafe{libc::fcntl(directory.as_raw_fd(),libc::F_DUPFD_CLOEXEC,0)};if fd<0{return Err(std::io::Error::last_os_error().into())}
+    let raw=unsafe{libc::fdopendir(fd)};if raw.is_null(){let error=std::io::Error::last_os_error();unsafe{libc::close(fd)};return Err(error.into())}let entries=Entries(raw);unsafe{libc::rewinddir(entries.0)};
+    struct Item {at:SystemTime,name:String,charge:u64,identity:std::fs::Metadata}
+    let mut items=Vec::new();let mut total=0u64;
+    loop {
+        if stop.load(Ordering::Acquire){return Err(super::outage::AttemptEnded.into())}ensure!(std::time::Instant::now()<until,"native image cache scan deadline expired");
+        let mut found=std::ptr::null_mut();let error=unsafe{libc::readdir_r(entries.0,&mut entry,&mut found)};
+        if error!=0{return Err(std::io::Error::from_raw_os_error(error).into())}if found.is_null(){break;}
+        let name=unsafe{CStr::from_ptr(entry.d_name.as_ptr())}.to_str()?;if matches!(name,"."|".."){continue;}cache_assets::filename(name)?;
+        ensure!(items.len()<IMAGE_CACHE_BYTES as usize/(16<<10)+64,"native image cache file-count admission");
+        let file=physical_child(directory,std::ffi::OsStr::new(name),false)?;let identity=file.metadata()?;ensure!(identity.is_file(),"native image cache contains a non-file");
+        let charge=image_charge(identity.len());total=total.checked_add(charge).context("native image cache charge overflow")?;
+        items.push(Item {at:identity.modified()?,name:name.into(),charge,identity});
+    }
+    items.sort_by(|a,b|a.at.cmp(&b.at).then_with(||a.name.cmp(&b.name)));
+    for item in items {
+        if total<=limit{break;}if stop.load(Ordering::Acquire){return Err(super::outage::AttemptEnded.into())}ensure!(std::time::Instant::now()<until,"native image cache trim deadline expired");
+        let file=match physical_child(directory,std::ffi::OsStr::new(&item.name),false){Ok(file)=>file,Err(error) if error.kind()==std::io::ErrorKind::NotFound=>{total-=item.charge;continue},Err(error)=>return Err(error.into())};
+        let current=file.metadata()?;ensure!(same_inode(&item.identity,&current)&&item.identity.len()==current.len()&&item.identity.modified()?==current.modified()?,"native image cache entry changed during trim");
+        let name=CString::new(item.name)?;if unsafe{libc::unlinkat(directory.as_raw_fd(),name.as_ptr(),0)}==0{total-=item.charge;}
+    }
+    Ok(total<=limit)
+}
 pub(super) struct Receipt {bytes:i64,digest:Vec<u8>,source:Vec<u8>}
 pub(super) fn receipt_in(client:&mut impl postgres::GenericClient,request:&AssetRequest)->Result<Option<Receipt>> {
     cache_assets::filename(&request.name)?;
@@ -60,7 +95,7 @@ impl AssetManifest {
         #[cfg(not(unix))] {bail!("asset namespaces require Unix")}
     }
     pub(super) fn native_source(&self,kind:AssetKind,catalog:&super::stage::CatalogIdentity)->Result<[u8;32]> {
-        let domain=match kind {AssetKind::Covers=>b"atlas.native-cover-writer.v1\0".as_slice(),AssetKind::Posters=>b"atlas.native-poster-writer.v1\0".as_slice(),_=>bail!("dynamic writer evidence unavailable for this asset family")};
+        let domain=match kind {AssetKind::Covers=>b"atlas.native-cover-writer.v1\0".as_slice(),AssetKind::Posters=>b"atlas.native-poster-writer.v1\0".as_slice(),AssetKind::Images=>b"atlas.native-image-writer.v1\0".as_slice(),_=>bail!("dynamic writer evidence unavailable for this asset family")};
         let mut digest=Sha256::new();digest.update(domain);digest.update(self.namespace()?);digest.update(catalog.nonce());Ok(digest.finalize().into())
     }
     pub(super) fn read_associated(&self,request:&AssetRequest,pool:&Arc<crate::nzb_spool::Pool>,catalog:&super::stage::CatalogIdentity,receipt:Option<&Receipt>)->Result<Option<crate::nzb_spool::Spool>> {
@@ -180,31 +215,67 @@ impl AssetManifest {
         self.store_named(AssetKind::Posters,name,bytes,8<<20)
     }
     fn store_named(&self,kind:AssetKind,name:&str,bytes:&[u8],limit:u64)->Result<[u8;32]> {
-        cache_assets::filename(name)?;ensure!(!bytes.is_empty()&&bytes.len() as u64<=limit,"native asset exceeds byte admission");
-        self.check_root()?;
+        cache_assets::filename(name)?;ensure!(!bytes.is_empty()&&bytes.len() as u64<=limit,"native asset exceeds byte admission");self.check_root()?;
         #[cfg(unix)] {
-            use std::os::fd::{AsRawFd,FromRawFd};
-            let covers=std::ffi::CString::new(kind.directory())?;
-            if unsafe{libc::mkdirat(self.root.as_raw_fd(),covers.as_ptr(),0o700)}<0 {
-                let error=std::io::Error::last_os_error();if error.kind()!=std::io::ErrorKind::AlreadyExists{return Err(error.into())}
-            }
-            let directory=physical_child(&self.root,std::ffi::OsStr::new(kind.directory()),true)?;
-            let value:[u8;32]=Sha256::digest(bytes).into();let final_name=std::ffi::CString::new(name)?;
-            let mut nonce=[0u8;16];getrandom::fill(&mut nonce).map_err(|_|anyhow::anyhow!("native cover entropy unavailable"))?;
-            let temporary=std::ffi::CString::new(format!(".atlas-cover-{}",hex(&nonce)))?;
-            let fd=unsafe{libc::openat(directory.as_raw_fd(),temporary.as_ptr(),libc::O_WRONLY|libc::O_CREAT|libc::O_EXCL|libc::O_NOFOLLOW|libc::O_CLOEXEC,0o600)};
-            if fd<0{return Err(std::io::Error::last_os_error().into())}
-            struct Pending<'a> {directory:&'a File,name:std::ffi::CString}
-            impl Drop for Pending<'_> {fn drop(&mut self){unsafe{libc::unlinkat(self.directory.as_raw_fd(),self.name.as_ptr(),0);}}}
-            let pending=Pending {directory:&directory,name:temporary};
-            let mut file=unsafe{File::from_raw_fd(fd)};file.write_all(bytes)?;file.sync_all()?;
-            if unsafe{libc::linkat(directory.as_raw_fd(),pending.name.as_ptr(),directory.as_raw_fd(),final_name.as_ptr(),0)}<0 {
-                let error=std::io::Error::last_os_error();if error.kind()!=std::io::ErrorKind::AlreadyExists{return Err(error.into())}
-            }
-            drop(pending);directory.sync_all()?;self.root.sync_all()?;self.check_root()?;
-            Ok(value)
+            let directory=self.writable_directory(kind)?;Ok(self.store_in_directory(&directory,name,bytes)?.0)
         }
-        #[cfg(not(unix))] {let _=bytes;bail!("native cover confinement requires Unix")}
+        #[cfg(not(unix))] {let _=(kind,bytes);bail!("native cover confinement requires Unix")}
+    }
+    #[cfg(unix)]
+    fn writable_directory(&self,kind:AssetKind)->Result<File> {
+        use std::os::fd::AsRawFd;
+        let name=std::ffi::CString::new(kind.directory())?;
+        if unsafe{libc::mkdirat(self.root.as_raw_fd(),name.as_ptr(),0o700)}<0 {
+            let error=std::io::Error::last_os_error();if error.kind()!=std::io::ErrorKind::AlreadyExists{return Err(error.into())}
+        }
+        Ok(physical_child(&self.root,std::ffi::OsStr::new(kind.directory()),true)?)
+    }
+    #[cfg(unix)]
+    fn store_in_directory(&self,directory:&File,name:&str,bytes:&[u8])->Result<([u8;32],bool)> {
+        use std::os::fd::{AsRawFd,FromRawFd};
+        let value:[u8;32]=Sha256::digest(bytes).into();let final_name=std::ffi::CString::new(name)?;
+        let mut nonce=[0u8;16];getrandom::fill(&mut nonce).map_err(|_|anyhow::anyhow!("native cover entropy unavailable"))?;
+        let temporary=std::ffi::CString::new(format!(".atlas-cover-{}",hex(&nonce)))?;
+        let fd=unsafe{libc::openat(directory.as_raw_fd(),temporary.as_ptr(),libc::O_WRONLY|libc::O_CREAT|libc::O_EXCL|libc::O_NOFOLLOW|libc::O_CLOEXEC,0o600)};
+        if fd<0{return Err(std::io::Error::last_os_error().into())}
+        struct Pending<'a> {directory:&'a File,name:std::ffi::CString}
+        impl Drop for Pending<'_> {fn drop(&mut self){unsafe{libc::unlinkat(self.directory.as_raw_fd(),self.name.as_ptr(),0);}}}
+        let pending=Pending {directory,name:temporary};let mut file=unsafe{File::from_raw_fd(fd)};file.write_all(bytes)?;file.sync_all()?;
+        let created=if unsafe{libc::linkat(directory.as_raw_fd(),pending.name.as_ptr(),directory.as_raw_fd(),final_name.as_ptr(),0)}<0 {
+            let error=std::io::Error::last_os_error();if error.kind()!=std::io::ErrorKind::AlreadyExists{return Err(error.into())}false
+        }else{true};
+        drop(pending);directory.sync_all()?;self.root.sync_all()?;self.check_root()?;Ok((value,created))
+    }
+    /// The old image cache target/cadence/charge, with every operation confined
+    /// to the opened directory. No selected manifest is rewritten by eviction.
+    pub(super) fn store_image(&self,bytes:&[u8],writes:&std::sync::atomic::AtomicU64,stop:&std::sync::atomic::AtomicBool)->Result<Option<(String,[u8;32])>> {
+        ensure!(!bytes.is_empty()&&bytes.len() as u64<=IMAGE_BYTES,"native image exceeds byte admission");self.check_root()?;
+        #[cfg(unix)] {
+            use std::{os::fd::AsRawFd,sync::atomic::Ordering,time::{Duration,Instant}};
+            let directory=self.writable_directory(AssetKind::Images)?;let until=Instant::now()+Duration::from_secs(10);
+            loop {
+                if stop.load(Ordering::Acquire){return Err(super::outage::AttemptEnded.into())}
+                ensure!(Instant::now()<until,"native image cache lock deadline expired");
+                if unsafe{libc::flock(directory.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}==0{break;}
+                let error=std::io::Error::last_os_error();if error.kind()!=std::io::ErrorKind::WouldBlock{return Err(error.into())}std::thread::sleep(Duration::from_millis(10));
+            }
+            let name=hex(&Sha256::digest(bytes));
+            let absent=match physical_child(&directory,std::ffi::OsStr::new(&name),false) {Ok(_)=>false,Err(error) if error.kind()==std::io::ErrorKind::NotFound=>true,Err(error)=>return Err(error.into())};
+            if absent&&writes.load(Ordering::Relaxed).is_multiple_of(64) {
+                // Reserve the incoming file on the same first/every64 turn.
+                // A full or malformed cache cannot accumulate another orphan
+                // on each retry, and the just-produced file is not evicted.
+                match trim_images(&directory,IMAGE_CACHE_BYTES-image_charge(bytes.len() as u64),stop,until) {
+                    Ok(true)=>{},Ok(false)=>return Ok(None),Err(error)=>return Err(error)
+                }
+            }
+            let (value,created)=self.store_in_directory(&directory,&name,bytes)?;if created{writes.fetch_add(1,Ordering::Relaxed);}
+            if stop.load(Ordering::Acquire){return Err(super::outage::AttemptEnded.into())}
+            let current=physical_child(&self.root,std::ffi::OsStr::new("images"),true)?;
+            ensure!(same_inode(&directory.metadata()?,&current.metadata()?),"native image directory changed during write");
+            directory.sync_all()?;self.check_root()?;Ok(Some((name,value)))
+        }
+        #[cfg(not(unix))] {let _=(writes,stop);bail!("native image confinement requires Unix")}
     }
 
 }
@@ -264,3 +335,7 @@ impl super::fresh_reader::ReadView<'_> {
         Ok(Some(AssetRequest {kind,name,digest:sha,bytes:length,content_type}))
     }
 }
+
+#[cfg(all(test,unix))]
+#[path="fresh_image_asset_tests.rs"]
+mod image_cache_tests;

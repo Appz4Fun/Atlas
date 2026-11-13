@@ -975,12 +975,12 @@ pub(crate) const ROUTE_SLACK_SECS: i64 = 90;
 /// this is a tenth of its time otherwise.
 #[derive(Debug, Default)]
 pub(crate) struct ArticleFacts {
-    date: Option<i64>,
-    id: crate::discovery::IdFacts,
+    pub(crate) date: Option<i64>,
+    pub(crate) id: crate::discovery::IdFacts,
 }
 
 impl ArticleFacts {
-    fn of(a: &Article) -> ArticleFacts {
+    pub(crate) fn of(a: &Article) -> ArticleFacts {
         ArticleFacts { date: crate::dates::naive_timestamp(&a.date), id: crate::discovery::id_facts(&a.message_id) }
     }
 }
@@ -1401,7 +1401,7 @@ pub(crate) struct IdKey {
 }
 
 /// SipHash of `text` under the pair, as `IdKey::hash`; never 0 (a release's own row in `release_ids`)
-fn keyed_hash(k0: u64, k1: u64, text: &str) -> i64 {
+pub(crate) fn keyed_hash(k0: u64, k1: u64, text: &str) -> i64 {
     #[allow(deprecated)]
     let mut h = std::hash::SipHasher::new_with_keys(k0, k1);
     std::hash::Hasher::write(&mut h, text.as_bytes());
