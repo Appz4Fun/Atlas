@@ -1,12 +1,11 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use indexmap::IndexMap;
 
-use crate::atomic::write_atomic;
 use crate::dates::article_timestamp;
-use crate::search::{ArticleRow, ReleaseRow, get_release};
+use crate::search::{ArticleRow, ReleaseRow};
 use crate::ui;
 
 pub fn nzb_filename(name: &str, release_id: Option<i64>) -> String {
@@ -434,37 +433,11 @@ pub fn build_nzb(release_id: i64) -> Result<Option<String>> {
 
 /// `build_nzb` with the gaps it found: the release is complete only when they are none.
 pub fn build_nzb_checked(release_id: i64) -> Result<Option<NzbBuild>> {
-    let storage=crate::config::checked_storage_config().map_err(anyhow::Error::msg)?;
-    if storage.is_postgres(){return crate::metrics::timed("nzb.build",||crate::pg::fresh_nzb_tools::build(&storage,release_id,crate::pg::fresh_nzb::Pick::Whole));}
-    crate::metrics::timed("nzb.build", || whole_nzb(release_id))
+    let storage = crate::config::checked_storage_config().map_err(anyhow::Error::msg)?;
+    crate::metrics::timed("nzb.build", || {
+        crate::pg::fresh_nzb_tools::build(&storage, release_id, crate::pg::fresh_nzb::Pick::Whole)
+    })
 }
-
-/// A release's articles and groups. For a post spread over several groups, or an upload linked by its PAR2 set, that's
-/// all of them: it only makes its files with all of them.
-/// Also returns the rows the articles came from: the release's own, or every row of its post.
-pub(crate) fn inventory(release: &ReleaseRow) -> crate::db::Result<(Vec<ArticleRow>, Vec<String>, Vec<i64>)> {
-    inventory_with(&crate::db::open()?, release)
-}
-
-/// `inventory` on `conn`, which has the shards attached.
-pub(crate) fn inventory_with(
-    conn: &rusqlite::Connection,
-    release: &ReleaseRow,
-) -> crate::db::Result<(Vec<ArticleRow>, Vec<String>, Vec<i64>)> {
-    if let Some(post) = crate::release_info::whole_post_with(conn, release)? {
-        let mut rows = Vec::new();
-        for id in &post.ids {
-            rows.push((*id, crate::store::articles(conn, *id)?));
-        }
-        // the rows of a linked upload are separate files, where a post cut across groups is one file under one name
-        if post.lead.is_some() {
-            keep_files_apart(&mut rows);
-        }
-        return Ok((merge_rows(rows), post.groups, post.ids));
-    }
-    Ok((crate::store::articles(conn, release.id)?, vec![release.group_name.clone()], vec![release.id]))
-}
-
 /// A post's rows' articles as one list, by file and part. An article in more than one row is listed once. Where rows
 /// hold the same part of a file (a file uploaded again, each upload spread over the groups), the part is listed once,
 /// under the first message-id: a reader keeps one segment of a number anyway, and the rest only inflate the size.
@@ -504,33 +477,6 @@ fn keep_files_apart(rows: &mut [(i64, Vec<ArticleRow>)]) {
     }
 }
 
-/// A release's articles with its gaps filled from its twins and file twins (`duplicates`): an article the same bytes
-/// were posted as, by anyone, stands in for one this posting lost.
-fn filled_inventory(release: &ReleaseRow) -> Result<(Vec<ArticleRow>, Vec<String>)> {
-    let (mut articles, groups, rows) = inventory(release)?;
-    if !articles.is_empty() {
-        let conn = crate::db::open()?;
-        let added = crate::duplicates::fill_from_copies_of(&conn, release.id, &rows, &mut articles)?;
-        if added > 0 {
-            crate::metrics::names::NZB_FILLED.inc(&[], added as u64);
-        }
-    }
-    Ok((articles, groups))
-}
-
-fn whole_nzb(release_id: i64) -> Result<Option<NzbBuild>> {
-    let Some(release) = get_release(release_id)? else { return Ok(None) };
-    let (articles, groups) = filled_inventory(&release)?;
-
-    if articles.is_empty() {
-        return Ok(None);
-    }
-
-    let built = render_checked(&release, &articles, &groups, true);
-    note_gaps(&release, &built);
-    Ok(Some(built))
-}
-
 /// One file of a release as its own NZB: `file` counts from 1, in the order the release's whole NZB lists them.
 pub fn build_nzb_file(release_id: i64, file: usize) -> Result<Option<String>> {
     Ok(build_nzb_file_checked(release_id, file)?.map(|b| b.xml))
@@ -538,11 +484,15 @@ pub fn build_nzb_file(release_id: i64, file: usize) -> Result<Option<String>> {
 
 /// `build_nzb_file` with the gaps it found.
 pub fn build_nzb_file_checked(release_id: i64, file: usize) -> Result<Option<NzbBuild>> {
-    let storage=crate::config::checked_storage_config().map_err(anyhow::Error::msg)?;
-    if storage.is_postgres(){return crate::metrics::timed("nzb.build_file",||crate::pg::fresh_nzb_tools::build(&storage,release_id,crate::pg::fresh_nzb::Pick::Ordinal(u64::try_from(file)?)));}
-    crate::metrics::timed("nzb.build_file", || one_file_nzb(release_id, file))
+    let storage = crate::config::checked_storage_config().map_err(anyhow::Error::msg)?;
+    crate::metrics::timed("nzb.build_file", || {
+        crate::pg::fresh_nzb_tools::build(
+            &storage,
+            release_id,
+            crate::pg::fresh_nzb::Pick::Ordinal(u64::try_from(file)?),
+        )
+    })
 }
-
 /// One file of a release, as its listing and `t=files` show it: where the whole NZB puts it, from 1.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListedFile {
@@ -568,17 +518,11 @@ fn listed(articles: &[ArticleRow]) -> Vec<ListedFile> {
         .collect()
 }
 
-/// The files a release's whole NZB lists, gaps filled from its copies as `t=get` fills them. None: no such release.
+/// The files the native release's own NZB lists. None: no such release.
 pub fn file_list(release_id: i64) -> Result<Option<Vec<ListedFile>>> {
-    let storage=crate::config::checked_storage_config().map_err(anyhow::Error::msg)?;
-    if storage.is_postgres(){return crate::metrics::timed("nzb.file_list",||crate::pg::fresh_nzb_tools::files(&storage,release_id));}
-    crate::metrics::timed("nzb.file_list", || {
-        let Some(release) = get_release(release_id)? else { return Ok(None) };
-        let (articles, _) = filled_inventory(&release)?;
-        Ok(Some(listed(&articles)))
-    })
+    let storage = crate::config::checked_storage_config().map_err(anyhow::Error::msg)?;
+    crate::metrics::timed("nzb.files", || crate::pg::fresh_nzb_tools::files(&storage, release_id))
 }
-
 /// The articles of every file named `name` in the whole NZB of `articles`: the one file, or, in an upload linked by
 /// its PAR2 set, each row's file of that name, which the NZB keeps apart as `name #id` and a release page lists as one.
 fn files_named(articles: &[ArticleRow], name: &str) -> Vec<ArticleRow> {
@@ -599,64 +543,16 @@ fn files_named(articles: &[ArticleRow], name: &str) -> Vec<ArticleRow> {
 /// One file of a release as its own NZB, picked by its name: a release page links each file this way, since its
 /// list is sorted by name and not in the NZB's order.
 pub fn build_nzb_named_checked(release_id: i64, name: &str) -> Result<Option<NzbBuild>> {
-    let storage=crate::config::checked_storage_config().map_err(anyhow::Error::msg)?;
-    if storage.is_postgres(){return crate::metrics::timed("nzb.build_file",||crate::pg::fresh_nzb_tools::build(&storage,release_id,crate::pg::fresh_nzb::Pick::Name(name)));}
+    let storage = crate::config::checked_storage_config().map_err(anyhow::Error::msg)?;
     crate::metrics::timed("nzb.build_file", || {
-        let Some(release) = get_release(release_id)? else { return Ok(None) };
-        let (articles, groups) = filled_inventory(&release)?;
-        let one = files_named(&articles, name);
-        if name.is_empty() || one.is_empty() {
-            return Ok(None);
-        }
-        let built = render_checked(&release, &one, &groups, false);
-        note_gaps(&release, &built);
-        Ok(Some(built))
+        crate::pg::fresh_nzb_tools::build(&storage, release_id, crate::pg::fresh_nzb::Pick::Name(name))
     })
 }
-
-fn one_file_nzb(release_id: i64, file: usize) -> Result<Option<NzbBuild>> {
-    let Some(release) = get_release(release_id)? else { return Ok(None) };
-    let (articles, groups) = filled_inventory(&release)?;
-    // the same files, in the same order, as the whole NZB
-    let Some(one) = nth_file(&articles, file) else { return Ok(None) };
-    let built = render_checked(&release, &one, &groups, false);
-    note_gaps(&release, &built);
-    Ok(Some(built))
-}
-
 /// Write the nzb for a release, into `output_dir` or the current dir.
 pub fn generate_nzb(release_id: i64, output_dir: Option<&Path>) -> Result<PathBuf> {
-    let storage=crate::config::checked_storage_config().map_err(anyhow::Error::msg)?;
-    if storage.is_postgres(){return crate::pg::fresh_nzb_tools::generate(&storage,release_id,output_dir);}
-    let release = get_release(release_id)?.ok_or_else(|| {
-        ui::error("Release not found");
-        anyhow!("release not found")
-    })?;
-
-    let Some(built) = build_nzb_checked(release_id)? else {
-        ui::error("No articles found");
-        return Err(anyhow!("no articles found"));
-    };
-    for g in &built.gaps {
-        ui::warn(&format!("incomplete: {}", describe(g)));
-    }
-    let content = built.xml;
-
-    let filename = nzb_filename(&release.name, Some(release.id));
-    let target = match output_dir {
-        Some(dir) => dir.join(&filename),
-        None => PathBuf::from(&filename),
-    };
-
-    if let Err(e) = write_atomic(&target, content) {
-        ui::error(&format!("couldnt save nzb: {e}"));
-        return Err(e.into());
-    }
-
-    ui::success(&format!("Saved {}", target.display()));
-    Ok(target)
+    let storage = crate::config::checked_storage_config().map_err(anyhow::Error::msg)?;
+    crate::pg::fresh_nzb_tools::generate(&storage, release_id, output_dir)
 }
-
 #[cfg(test)]
 mod tests {
 

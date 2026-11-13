@@ -1,67 +1,24 @@
-//! Other postings of the same content. An **xpost** is the same upload seen in another group: the very same
-//! articles, by message-id. A **twin** is another upload of the same posted files, proven by PAR2 hashes, soo its
-//! articles can stand in for this one's. An **alt** holds the same files packed differently, soo it's another whole
-//! download, not a source of articles.
-//!
-//! Each release keeps two fingerprints in its shard, and copies are found by looking them up in every
-//! shard, soo there are no clusters to keep in step: purging a release takes its row with it.
+//! Pure relationship facts, fingerprints, names and article-vector transforms.
+//! Native database readers own their source bindings and verified payload
+//! admission. Fingerprints here are candidate descriptions; calling these
+//! functions does not grant native copying, inheritance or lending authority.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use regex::Regex;
-use rusqlite::{Connection, OptionalExtension};
 use sha1::{Digest, Sha1};
 
-use crate::db;
 use crate::par2::Par2File;
-use crate::postprocess::schema::ShardTable;
-use crate::search::{ArticleRow, ReleaseRow, get_release_with};
-use crate::store;
-
-pub const FINGERPRINT: ShardTable = ShardTable {
-    name: "release_fingerprint",
-    create: "create table if not exists release_fingerprint (
-        release_id INTEGER PRIMARY KEY,
-        posted     BLOB,
-        content    BLOB
-    )",
-    indexes: &[
-        (
-            "release_fingerprint_posted",
-            "create index if not exists release_fingerprint_posted on release_fingerprint(posted) where posted is not null",
-        ),
-        (
-            "release_fingerprint_content",
-            "create index if not exists release_fingerprint_content on release_fingerprint(content) where content is not null",
-        ),
-    ],
-    release_key: Some("release_id"),
-    added: &[("par2_block", "INTEGER"), ("par2_blocks", "INTEGER"), ("posted_names", "BLOB")],
-};
-
-pub const SET_POSTED: &str = "insert into release_fingerprint (release_id, posted) values (?1, ?2)
-    on conflict(release_id) do update set posted = excluded.posted";
-pub const SET_PAR2_SIZES: &str =
-    "insert into release_fingerprint (release_id, par2_block, par2_blocks) values (?1, ?2, ?3)
-    on conflict(release_id) do update set par2_block = excluded.par2_block, par2_blocks = excluded.par2_blocks";
-pub const SET_CONTENT: &str = "insert into release_fingerprint (release_id, content) values (?1, ?2)
-    on conflict(release_id) do update set content = excluded.content";
-
-/// A release that no longer proves what it did, as when more of it has arrived. Its old answer goes.
-pub const CLEAR_POSTED: &str = "update release_fingerprint set posted = null, par2_block = null,
-    par2_blocks = null where release_id = ?1";
-pub const CLEAR_CONTENT: &str = "update release_fingerprint set content = null where release_id = ?1";
+use crate::search::{ArticleRow, ReleaseRow};
 
 /// Files smaller than this don't count: NFOs, samples' subtitles, and the like differ between postings.
 const MIN_CONTENT_FILE: u64 = 1 << 20;
-const MAX_COPIES: i64 = 50;
 
 /// Everything a posting is, from a complete PAR2 set and the files posted with it: the set itself and its block size,
 /// each file's name, size and MD5, and every posted file's name with its article count, recovery volumes included.
-/// Two equal ones are the same posting in all but message-ids, which is what makes a **twin**: the same bytes under the
-/// same names, cut up the same way, with the same repair. Part counts and sizes equal means articles are too, and sizes
-/// on the wire can't say more, as they also count headers that differ between posters.
+/// The versioned result describes these supplied facts. Native lending also
+/// requires the caller's actual target-bound verified payload admission.
 pub fn twin_fingerprint(files: &[Par2File], block_size: Option<u64>, posted: &[(&str, i64)]) -> Option<Vec<u8>> {
     let first = files.first()?;
     let mut named: Vec<(&str, u64, [u8; 16])> = files.iter().map(|f| (f.name.as_str(), f.size, f.md5)).collect();
@@ -91,31 +48,6 @@ pub fn twin_fingerprint(files: &[Par2File], block_size: Option<u64>, posted: &[(
 
 /// Marks a fingerprint as this kind. Ones from before a twin meant all of this are as long as the hash alone.
 const TWIN_VERSION: u8 = 2;
-
-/// Those older ones proved less, soo they go when indexing starts: nothing may lend articles on their word. Their
-/// releases are read again for the new kind, including any whose old fingerprint went before this queued them: they
-/// have a PAR2 set's sizes and no fingerprint, which nothing else leaves behind.
-pub fn forget_old_twins(conn: &Connection) {
-    let bit = crate::postprocess::step::mask(crate::archive::steps::PAR2_STEP);
-    let now = crate::media::http::now_secs();
-    for s in 0..store::SHARDS {
-        let old = "(posted is not null and length(posted) != 21) or (posted is null and par2_block is not null)";
-        let sql = format!(
-            "begin immediate;
-             insert into s{s}.pp_queue (release_id, due_at)
-                 select release_id, {now} from s{s}.release_fingerprint where {old}
-                 on conflict(release_id) do update set due_at = excluded.due_at;
-             update s{s}.pp_state set done = done & ~{bit}, failed = failed & ~{bit}
-                 where release_id in (select release_id from s{s}.release_fingerprint where {old});
-             update s{s}.release_fingerprint set posted = null, par2_block = null, par2_blocks = null where {old};
-             commit;"
-        );
-        // a shard that hasn't got the tables yet has none
-        if conn.execute_batch(&sql).is_err() {
-            let _ = conn.execute_batch("rollback");
-        }
-    }
-}
 
 /// Whether one archive's listing says what a whole release holds: everything real in it is that archive's volumes.
 /// Names that differ count as different archives, soo an obfuscated set makes no fingerprint, which is the safe way
@@ -207,136 +139,7 @@ pub enum Copy {
     Alt,
 }
 
-/// Whether two releases hold the same articles: a file of one starts with the very message-id a file of the other
-/// does. Message-ids are unique, soo that's one upload crossposted to both groups, not two uploads of the same bytes.
-/// A file's first message-id is that of its lowest part seen, soo a copy missing a file's first part can still tie
-/// by another file. False when either is gone or a shard hasn't got the table.
-pub fn shares_articles(conn: &Connection, a: i64, b: i64) -> bool {
-    let (sa, sb) = (store::shard_of_id(a), store::shard_of_id(b));
-    let sql = format!(
-        "select 1 from s{sb}.files where release_id = ?2 and subject_mid in
-             (select subject_mid from s{sa}.files where release_id = ?1 and subject_mid is not null)
-         limit 1"
-    );
-    conn.prepare_cached(&sql).and_then(|mut stmt| stmt.exists(rusqlite::params![a, b])).unwrap_or(false)
-}
-
-/// How many other releases with this posted fingerprint hold `id`'s very articles, over every shard and uncapped,
-/// soo it can be taken from a tally of the fingerprint.
-fn count_xposts(conn: &Connection, id: i64, posted: &[u8]) -> i64 {
-    let own = store::shard_of_id(id);
-    (0..store::SHARDS)
-        .filter_map(|s| {
-            let sql = format!(
-                "select count(*) from s{s}.release_fingerprint f where f.posted = ?1 and f.release_id != ?2
-                 and exists (select 1 from s{s}.files x where x.release_id = f.release_id and x.subject_mid in
-                     (select subject_mid from s{own}.files where release_id = ?2 and subject_mid is not null))"
-            );
-            // a shard that hasn't got the tables yet has none
-            conn.query_row(&sql, rusqlite::params![posted, id], |r| r.get::<_, i64>(0)).ok()
-        })
-        .sum()
-}
-
-/// Of these copies of `id` proven to hold the same files, an xpost when it shares articles with `id`, else a twin.
-fn same_files_kind(conn: &Connection, id: i64, other: i64) -> Copy {
-    if shares_articles(conn, id, other) { Copy::Xpost } else { Copy::Twin }
-}
-
-fn matching(conn: &Connection, column: &str, fingerprint: &[u8], id: i64) -> db::Result<Vec<i64>> {
-    let mut found = Vec::new();
-    for s in 0..store::SHARDS {
-        let sql = format!(
-            "select release_id from s{s}.release_fingerprint where {column} = ?1 and release_id != ?2 limit {MAX_COPIES}"
-        );
-        match conn.prepare_cached(&sql) {
-            Ok(mut stmt) => {
-                let ids = stmt.query_map(rusqlite::params![fingerprint, id], |r| r.get::<_, i64>(0))?;
-                found.extend(ids.collect::<db::Result<Vec<_>>>()?);
-            }
-            // a shard that hasn't got the table yet has no copies
-            Err(_) => continue,
-        }
-    }
-    Ok(found)
-}
-
 /// A release's (posted, content) fingerprints, either one when a read has kept it.
-type FingerprintPair = (Option<Vec<u8>>, Option<Vec<u8>>);
-
-/// A release's posted and content fingerprints, when a read has kept them. A release with no fingerprint row can
-/// still have file twins by its set.
-fn fingerprints_with(conn: &Connection, id: i64) -> db::Result<FingerprintPair> {
-    let s = store::shard_of_id(id);
-    let sql = format!("select posted, content from s{s}.release_fingerprint where release_id = ?");
-    Ok(match conn.prepare(&sql) {
-        Ok(mut stmt) => stmt
-            .query_row([id], |r| Ok((r.get::<_, Option<Vec<u8>>>(0)?, r.get::<_, Option<Vec<u8>>>(1)?)))
-            .optional()?
-            .unwrap_or((None, None)),
-        Err(_) => (None, None),
-    })
-}
-
-/// The other postings with this release's posted fingerprint: the same files, cut up the same way, in every shard.
-/// Those lend articles file by file under the posted names; a file twin lends only the files its set vouches for.
-pub fn twins_with(conn: &Connection, id: i64) -> db::Result<Vec<i64>> {
-    match fingerprints_with(conn, id)?.0 {
-        Some(fingerprint) => matching(conn, "posted", &fingerprint, id),
-        None => Ok(Vec::new()),
-    }
-}
-
-/// The other postings of a release's content: xposts, then twins, then alts. The other rows of its own post aren't
-/// among them: a post whose articles each went to one of several groups is a row per group, each holding parts no
-/// other has, and those rows share the post's files and PAR2 set the way a twin would, but they are this upload.
-pub fn copies_with(conn: &Connection, id: i64) -> db::Result<Vec<(Copy, ReleaseRow)>> {
-    let (_, content) = fingerprints_with(conn, id)?;
-    let own_post = own_post_rows(conn, id);
-    let twins: Vec<i64> = twins_with(conn, id)?.into_iter().filter(|twin| !own_post.contains(twin)).collect();
-    let alts = match &content {
-        Some(fingerprint) => matching(conn, "content", fingerprint, id)?,
-        None => Vec::new(),
-    };
-    let mut out = Vec::new();
-    for twin in &twins {
-        if let Some(release) = get_release_with(conn, *twin)? {
-            out.push((same_files_kind(conn, id, *twin), release));
-        }
-    }
-    for file_twin in file_twins_with(conn, id) {
-        if !twins.contains(&file_twin.id)
-            && !own_post.contains(&file_twin.id)
-            && let Some(release) = get_release_with(conn, file_twin.id)?
-        {
-            out.push((same_files_kind(conn, id, file_twin.id), release));
-        }
-    }
-    // the same upload first: it's this release, seen in another group
-    out.sort_by_key(|(kind, _)| *kind);
-    let listed: HashSet<i64> = out.iter().map(|(_, r)| r.id).collect();
-    for alt in alts.iter().filter(|alt| !listed.contains(alt) && !own_post.contains(alt)) {
-        if let Some(release) = get_release_with(conn, *alt)? {
-            out.push((Copy::Alt, release));
-        }
-    }
-    Ok(out)
-}
-
-/// The rows of the post a release is part of, cut across groups or linked by its PAR2 set, itself among them. Empty
-/// when it's a post of its own.
-fn own_post_rows(conn: &Connection, id: i64) -> HashSet<i64> {
-    get_release_with(conn, id)
-        .ok()
-        .flatten()
-        .and_then(|release| crate::release_info::whole_post_with(conn, &release).ok().flatten())
-        .map(|post| post.ids.into_iter().chain(post.recovery).collect())
-        .unwrap_or_default()
-}
-
-pub fn copies(id: i64) -> db::Result<Vec<(Copy, ReleaseRow)>> {
-    copies_with(&db::open()?, id)
-}
 
 /// Which copies a list of clusters is of.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -354,70 +157,6 @@ impl ClusterKind {
     }
 }
 
-/// Every fingerprint in every shard, as `release_id, posted, content`. Empty: no shard has the table yet.
-fn all_fingerprints(conn: &Connection) -> String {
-    (0..store::SHARDS)
-        .filter(|s| conn.prepare(&format!("select 1 from s{s}.release_fingerprint limit 0")).is_ok())
-        // a row can outlive its release, and a blocked group's are never shown
-        .map(|s| {
-            format!(
-                "select f.release_id, f.posted, f.content from s{s}.release_fingerprint f
-                 join s{s}.releases r on r.id = f.release_id where not atlas_blocked(r.group_name)"
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" union all ")
-}
-
-/// Which fingerprints make a cluster: twins are equal posted files, and an alt has to differ in them.
-fn cluster_sql(conn: &Connection, kind: ClusterKind) -> Option<String> {
-    let all = all_fingerprints(conn);
-    if all.is_empty() {
-        return None;
-    }
-    let column = kind.column();
-    let copies = match kind {
-        ClusterKind::Twins => "count(*)",
-        ClusterKind::Alts => "count(distinct coalesce(posted, release_id))",
-    };
-    Some(format!(
-        "select {column} as fingerprint, count(*) as members from ({all}) where {column} is not null
-         group by {column} having {copies} > 1"
-    ))
-}
-
-/// How many clusters there are of this kind.
-pub fn cluster_count_with(conn: &Connection, kind: ClusterKind) -> db::Result<i64> {
-    let Some(sql) = cluster_sql(conn, kind) else { return Ok(0) };
-    conn.query_row(&format!("select count(*) from ({sql})"), [], |r| r.get(0))
-}
-
-/// A page of clusters, biggest first, each as the releases in it. Every release of a cluster is listed, up to
-/// `MAX_COPIES` a shard.
-pub fn clusters_with(
-    conn: &Connection,
-    kind: ClusterKind,
-    offset: i64,
-    limit: i64,
-) -> db::Result<Vec<Vec<ReleaseRow>>> {
-    let Some(sql) = cluster_sql(conn, kind) else { return Ok(Vec::new()) };
-    let mut stmt =
-        conn.prepare(&format!("select fingerprint from ({sql}) order by members desc, fingerprint limit ? offset ?"))?;
-    let prints = stmt.query_map([limit, offset], |r| r.get::<_, Vec<u8>>(0))?.collect::<db::Result<Vec<_>>>()?;
-    let mut out = Vec::with_capacity(prints.len());
-    for print in prints {
-        let mut members = Vec::new();
-        // no release has id 0, soo nothing is left out
-        for id in matching(conn, kind.column(), &print, 0)? {
-            members.extend(get_release_with(conn, id)?);
-        }
-        if members.len() > 1 {
-            out.push(members);
-        }
-    }
-    Ok(out)
-}
-
 /// How many other copies a release has.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CopyCount {
@@ -428,148 +167,9 @@ pub struct CopyCount {
     pub alts: i64,
 }
 
-type Fingerprints = HashMap<i64, (Option<Vec<u8>>, Option<Vec<u8>>)>;
-
-fn fingerprints_of(conn: &Connection, ids: &[i64]) -> db::Result<Fingerprints> {
-    let mut out = HashMap::with_capacity(ids.len());
-    for s in 0..store::SHARDS {
-        let list: Vec<String> = ids.iter().filter(|id| store::shard_of_id(**id) == s).map(i64::to_string).collect();
-        if list.is_empty() {
-            continue;
-        }
-        let sql = format!(
-            "select release_id, posted, content from s{s}.release_fingerprint where release_id in ({})",
-            list.join(",")
-        );
-        // a shard without the table has no fingerprints
-        let Ok(mut stmt) = conn.prepare(&sql) else { continue };
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, (r.get(1)?, r.get(2)?))))?;
-        for row in rows {
-            let (id, prints) = row?;
-            out.insert(id, prints);
-        }
-    }
-    Ok(out)
-}
-
-/// How often each fingerprint appears, over every shard: one query per shard and column.
-fn tally(conn: &Connection, column: &str, prints: &[&Vec<u8>]) -> db::Result<HashMap<Vec<u8>, i64>> {
-    let mut out: HashMap<Vec<u8>, i64> = HashMap::new();
-    if prints.is_empty() {
-        return Ok(out);
-    }
-    let marks = vec!["?"; prints.len()].join(",");
-    for s in 0..store::SHARDS {
-        let sql = format!(
-            "select {column}, count(*) from s{s}.release_fingerprint where {column} in ({marks}) group by {column}"
-        );
-        let Ok(mut stmt) = conn.prepare(&sql) else { continue };
-        let rows = stmt.query_map(rusqlite::params_from_iter(prints.iter()), |r| {
-            Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?))
-        })?;
-        for row in rows {
-            let (print, count) = row?;
-            *out.entry(print).or_default() += count;
-        }
-    }
-    Ok(out)
-}
-
-type PrintCounts = HashMap<(Vec<u8>, Vec<u8>), i64>;
-
-/// How many releases have each posted and content fingerprint together, for these content fingerprints.
-fn tally_both(conn: &Connection, prints: &[&Vec<u8>]) -> db::Result<PrintCounts> {
-    let mut out = PrintCounts::new();
-    if prints.is_empty() {
-        return Ok(out);
-    }
-    let marks = vec!["?"; prints.len()].join(",");
-    for s in 0..store::SHARDS {
-        let sql = format!(
-            "select posted, content, count(*) from s{s}.release_fingerprint
-             where content in ({marks}) and posted is not null group by posted, content"
-        );
-        let Ok(mut stmt) = conn.prepare(&sql) else { continue };
-        let rows = stmt.query_map(rusqlite::params_from_iter(prints.iter()), |r| {
-            Ok(((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?), r.get::<_, i64>(2)?))
-        })?;
-        for row in rows {
-            let (key, count) = row?;
-            *out.entry(key).or_default() += count;
-        }
-    }
-    Ok(out)
-}
-
-/// Copies per release, for a page of results.
-pub fn counts_with(conn: &Connection, ids: &[i64]) -> db::Result<HashMap<i64, CopyCount>> {
-    let prints = fingerprints_of(conn, ids)?;
-    let posted: Vec<&Vec<u8>> = prints.values().filter_map(|(p, _)| p.as_ref()).collect();
-    let content: Vec<&Vec<u8>> = prints.values().filter_map(|(_, c)| c.as_ref()).collect();
-    let both = tally_both(conn, &content)?;
-    let (posted, content) = (tally(conn, "posted", &posted)?, tally(conn, "content", &content)?);
-    let mut out = HashMap::new();
-    for (id, (p, c)) in &prints {
-        let twins = p.as_ref().and_then(|p| posted.get(p)).map_or(0, |n| (n - 1).max(0));
-        // a twin with the same content is a twin, not an alt as well
-        let same_posting = match (p, c) {
-            (Some(p), Some(c)) => both.get(&(p.clone(), c.clone())).map_or(0, |n| (n - 1).max(0)),
-            _ => 0,
-        };
-        let alts = c.as_ref().and_then(|c| content.get(c)).map_or(0, |n| (n - 1 - same_posting).max(0));
-        // of those with the same posted files, the ones holding this release's very articles are it, crossposted
-        let xposts = match p {
-            Some(p) if twins > 0 => count_xposts(conn, *id, p),
-            _ => 0,
-        };
-        let twins = (twins - xposts).max(0);
-        if xposts > 0 || twins > 0 || alts > 0 {
-            out.insert(*id, CopyCount { xposts, twins, alts });
-        }
-    }
-    Ok(out)
-}
-
-pub fn counts(ids: &[i64]) -> db::Result<HashMap<i64, CopyCount>> {
-    if ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-    counts_with(&db::open()?, ids)
-}
-
-/// Of these releases, in order, those that repeat the content of one before them.
-pub fn later_copies(ids: &[i64]) -> db::Result<Vec<i64>> {
-    if ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let prints = fingerprints_of(&db::open()?, ids)?;
-    let mut seen: HashSet<&Vec<u8>> = HashSet::new();
-    let mut later = Vec::new();
-    for id in ids {
-        let Some((posted, content)) = prints.get(id) else { continue };
-        let mut repeat = false;
-        for print in [posted, content].into_iter().flatten() {
-            repeat |= !seen.insert(print);
-        }
-        if repeat {
-            later.push(*id);
-        }
-    }
-    Ok(later)
-}
-
-/// A PAR2 set's block size and how many data blocks it has, when a read has kept them.
-pub fn par2_sizes(conn: &Connection, id: i64) -> Option<(i64, i64)> {
-    let s = store::shard_of_id(id);
-    let sql = format!("select par2_block, par2_blocks from s{s}.release_fingerprint where release_id = ?");
-    conn.query_row(&sql, [id], |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?)))
-        .ok()
-        .and_then(|(block, blocks)| Some((block?, blocks?)))
-}
-
-/// A file another posting has too, as the two PAR2 sets describe it: the same size, first 16 KiB and whole MD5, soo
-/// its articles hold the same bytes, cut up the same way when their counts and sizes agree, whatever the two posts
-/// called it and whoever posted them. A **file twin** lends articles file by file where a twin lends them all.
+/// A supplied file-name mapping for an already admitted relationship. Native
+/// callers must bind verified payload bytes separately before transforming
+/// article vectors with this mapping.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileTwin {
     pub id: i64,
@@ -595,105 +195,16 @@ pub struct Inherited {
     pub from_name: String,
 }
 
-/// The most copies looked at for a password to carry over: the first ones with one of their own answer.
-const MAX_PASSWORD_SOURCES: usize = 12;
-
-/// The password a release's own names, NFO and files hint at, or else the name its PAR2 set gives its files when
-/// they were posted under another (`par2_name_password`).
-pub fn own_password_hint(
-    conn: &Connection,
-    id: i64,
-    names: Option<&crate::release_info::Names>,
-) -> Option<crate::release_info::PasswordHint> {
-    crate::release_info::password_hint_with(conn, id, names).or_else(|| par2_name_password(conn, id))
-}
-
-/// Whether two postings are proven to hold the same whole payload, not just a file of it: the same posted fingerprint
-/// (set, names, part counts and hashes), or sets that describe the very same data files, sidecars aside, by size and
-/// MD5. A file twin by an NFO alone, or by one volume of two archives, isn't, soo nothing is carried between those.
-pub fn same_payload(conn: &Connection, a: i64, b: i64) -> bool {
-    if let (Ok((Some(pa), _)), Ok((Some(pb), _))) = (fingerprints_with(conn, a), fingerprints_with(conn, b))
-        && pa == pb
-    {
-        return true;
-    }
-    let data = |id: i64| {
-        let mut files: Vec<(u64, [u8; 16])> = crate::archive::store::par2_files_with(conn, id)
-            .into_iter()
-            .filter(|f| f.bound && !is_sidecar(&f.name))
-            .map(|f| (f.size, f.md5))
-            .collect();
-        files.sort_unstable();
-        files.dedup();
-        files
-    };
-    let mine = data(a);
-    !mine.is_empty() && mine == data(b)
-}
-
-/// The password that comes to `id` from elsewhere: first from the other rows of its own post (one upload, one
-/// password, though `copies_with` doesn't list them), then from its xposts and twins holding its whole payload
-/// (`same_payload`), the first with a password hint of its own.
-pub fn carried_password(conn: &Connection, id: i64, copies: &[(Copy, ReleaseRow)]) -> Option<Inherited> {
-    let mut rows: Vec<i64> = own_post_rows(conn, id).into_iter().filter(|row| *row != id).collect();
-    rows.sort_unstable();
-    let post: Vec<ReleaseRow> = rows.into_iter().filter_map(|row| get_release_with(conn, row).ok().flatten()).collect();
-    first_password(conn, post.iter()).or_else(|| first_password(conn, carriers(conn, id, copies).iter().copied()))
-}
-
-/// The copies of `id` a password carries to and from: xposts and twins holding its whole payload.
-pub fn carriers<'a>(conn: &Connection, id: i64, copies: &'a [(Copy, ReleaseRow)]) -> Vec<&'a ReleaseRow> {
-    copies
-        .iter()
-        .filter(|(kind, r)| matches!(kind, Copy::Xpost | Copy::Twin) && same_payload(conn, id, r.id))
-        .map(|(_, r)| r)
-        .collect()
-}
-
-/// Of these postings, every one holding the same bytes, the first with a password hint of its own.
-pub fn first_password<'a>(conn: &Connection, rows: impl IntoIterator<Item = &'a ReleaseRow>) -> Option<Inherited> {
-    rows.into_iter().take(MAX_PASSWORD_SOURCES).find_map(|r| {
-        let names = crate::release_info::names_with(conn, r.id).ok().flatten();
-        own_password_hint(conn, r.id, names.as_ref()).map(|hint| Inherited {
-            hint,
-            from: r.id,
-            from_name: r.name.clone(),
-        })
-    })
-}
-
-/// The name a release's PAR2 set gives its archive, when the volumes were posted under another: a repost that
-/// renamed the files kept the set made for the first upload, and an uploader that names an archive and its password
-/// from one random string leaves the password there. Only a generated-looking name counts (letters and digits,
-/// mixed case, 10 to 64 of them), and only one archive's volumes, every one renamed: a set of unpacked files has none.
-pub fn par2_name_password(conn: &Connection, id: i64) -> Option<crate::release_info::PasswordHint> {
-    let set = crate::archive::store::par2_files_with(conn, id);
-    let data: Vec<&crate::par2::Par2File> = set.iter().filter(|f| f.bound && !is_sidecar(&f.name)).collect();
-    // an unpacked file posted under another name has no password to give: only archive volumes are named for one
-    if !data.iter().all(|f| is_archive(&f.name)) {
-        return None;
-    }
-    let mut stems = data.iter().map(|f| volume_set(&f.name));
-    let stem = stems.next()?;
-    if !stems.all(|other| other == stem) || !looks_generated(stem) {
-        return None;
-    }
-    let s = store::shard_of_id(id);
-    let mut stmt = conn.prepare(&format!("select filename from s{s}.files where release_id = ?")).ok()?;
-    let posted: Vec<String> = stmt.query_map([id], |r| r.get(0)).ok()?.filter_map(Result::ok).collect();
-    // posted under the set's own name: nothing was renamed, soo the name says nothing more than it did
-    if posted.is_empty() || posted.iter().any(|name| volume_set(name).eq_ignore_ascii_case(stem)) {
-        return None;
-    }
-    Some(crate::release_info::PasswordHint { password: stem.to_string(), source: "the PAR2 set's file names" })
-}
-
 /// The existing own-set name hint, with the reads supplied by a native RR
 /// loader. A hint is never a password verdict or cross-post payload proof.
-pub(crate) fn par2_password_stem<'a>(names:impl IntoIterator<Item=&'a str>)->Option<&'a str> {
-    let mut data=names.into_iter().filter(|name|!is_sidecar(name));let first=data.next()?;
-    if !is_archive(first){return None;}let stem=volume_set(first);
-    (looks_generated(stem)&&data.all(|name|is_archive(name)&&volume_set(name)==stem)).then_some(stem)
+pub(crate) fn par2_password_stem<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    let mut data = names.into_iter().filter(|name| !is_sidecar(name));
+    let first = data.next()?;
+    if !is_archive(first) {
+        return None;
+    }
+    let stem = volume_set(first);
+    (looks_generated(stem) && data.all(|name| is_archive(name) && volume_set(name) == stem)).then_some(stem)
 }
 
 /// A name an uploader made up, not a title: letters and digits only, both cases.
@@ -702,30 +213,6 @@ fn looks_generated(stem: &str) -> bool {
         && stem.bytes().all(|b| b.is_ascii_alphanumeric())
         && stem.bytes().any(|b| b.is_ascii_uppercase())
         && stem.bytes().any(|b| b.is_ascii_lowercase())
-}
-
-/// How many data files, sidecars aside, a release's set describes.
-fn data_files_in_set(conn: &Connection, id: i64) -> usize {
-    crate::archive::store::par2_files_with(conn, id).iter().filter(|f| f.bound && !is_sidecar(&f.name)).count()
-}
-
-/// The other postings that hold one or more of this release's files, by the sets' hashes, in every shard.
-pub fn file_twins_with(conn: &Connection, id: i64) -> Vec<FileTwin> {
-    let own = crate::archive::store::par2_files_with(conn, id);
-    let mine_one = own.iter().filter(|f| f.bound && !is_sidecar(&f.name)).count() == 1;
-    let mut by_release: HashMap<i64, Vec<(String, String)>> = HashMap::new();
-    for file in own.iter().filter(|f| f.bound) {
-        for (other, name) in crate::archive::store::same_par2_file_with(conn, file.size, &file.md5_16k, &file.md5, id) {
-            by_release.entry(other).or_default().push((name, file.name.clone()));
-        }
-    }
-    let mut out: Vec<FileTwin> = by_release
-        .into_iter()
-        .map(|(id, names)| FileTwin { id, names, one_file: mine_one && data_files_in_set(conn, id) == 1 })
-        .collect();
-    out.sort_by_key(|t| t.id);
-    out.truncate(MAX_COPIES as usize);
-    out
 }
 
 /// The posted name a set's name stands for among a release's articles: the same name, or the same but for case, or,
@@ -837,60 +324,6 @@ pub fn fill_gaps_from(
     fill_gaps_checked(own, &renamed, known)
 }
 
-/// Adds what `own` is missing from every twin and file twin of `release`, and returns how many articles that was.
-/// A file twin lends only the files its set vouches for, under the names the sets map; a twin by the posted
-/// fingerprint lends every file by its posted name. `conn` has the shards attached.
-pub fn fill_from_copies_with(conn: &Connection, id: i64, own: &mut Vec<ArticleRow>) -> db::Result<usize> {
-    fill_from_copies_of(conn, id, &[id], own)
-}
-
-/// `fill_from_copies_with` for articles gathered from several rows (`rows`: a post cut across groups, or a linked
-/// upload), soo what each row's articles were read to hold is checked against the donors too.
-pub fn fill_from_copies_of(conn: &Connection, id: i64, rows: &[i64], own: &mut Vec<ArticleRow>) -> db::Result<usize> {
-    let mut added = 0;
-    // what every posting seen soo far was read to hold: an article borrowed from one donor keeps its CRC, soo the
-    // next donor's copy of that part is checked against it too
-    let mut known = crate::archive::store::segment_crcs_with(conn, id);
-    for row in rows.iter().filter(|row| **row != id) {
-        known.extend(crate::archive::store::segment_crcs_with(conn, *row));
-    }
-    for twin in file_twins_with(conn, id) {
-        known.extend(crate::archive::store::segment_crcs_with(conn, twin.id));
-        added += fill_gaps_from(own, &store::articles(conn, twin.id)?, &twin.names, twin.one_file, &known);
-    }
-    let mut seen: HashSet<i64> = rows.iter().copied().collect();
-    for twin in twins_with(conn, id)? {
-        if seen.insert(twin) {
-            known.extend(crate::archive::store::segment_crcs_with(conn, twin));
-            added += fill_gaps_checked(own, &store::articles(conn, twin)?, &known);
-        }
-    }
-    // a file of the same size and whole-file CRC32 in a posting no fingerprint or set hash ties to this one: a repost
-    // under other names, or a set that hashes the same bytes differently. It lends by `fill_gaps`'s rules, soo only
-    // when it was cut up the same way, and only to a file of this release that is missing parts.
-    for mine in crate::keys::named_crc_files(conn, id) {
-        let Some(posted) = posted_name(own, &mine.name, false, false).map(str::to_string) else { continue };
-        if !has_gaps(own, &posted) {
-            continue;
-        }
-        for (donor, theirs) in crate::keys::crc_donors(conn, id, mine.file, mine.md5.as_deref()) {
-            if rows.contains(&donor) {
-                continue;
-            }
-            known.extend(crate::archive::store::segment_crcs_with(conn, donor));
-            let lent = fill_gaps_from(own, &store::articles(conn, donor)?, &[(theirs, posted.clone())], false, &known);
-            if lent > 0 {
-                crate::metrics::names::NZB_FILLED_BY_CRC.inc(&[], lent as u64);
-            }
-            added += lent;
-            if !has_gaps(own, &posted) {
-                break;
-            }
-        }
-    }
-    Ok(added)
-}
-
 /// Whether the file posted as `name` is missing parts among `articles`: fewer distinct parts than its subject counts.
 fn has_gaps(articles: &[ArticleRow], name: &str) -> bool {
     let mut parts: HashSet<i64> = HashSet::new();
@@ -970,27 +403,8 @@ pub fn can_fill(copies: &[(Copy, ReleaseRow)]) -> bool {
     copies.iter().any(|(kind, _)| matches!(kind, Copy::Twin | Copy::Xpost))
 }
 
-/// For a cluster of postings with the same files, in order, which are an xpost of one listed before them: the same
-/// upload seen in another group. The rest are each a separate upload, twins of one another.
-pub fn xposts_of_earlier(conn: &Connection, members: &[ReleaseRow]) -> Vec<bool> {
-    // every member before it, not one of each upload: two rows can tie only through a third, as each file's first
-    // message-id is the lowest part that row saw, and crossposts can miss different parts in different groups
-    (0..members.len())
-        .map(|i| {
-            members[i.saturating_sub(MAX_XPOST_WITNESSES)..i]
-                .iter()
-                .any(|earlier| shares_articles(conn, earlier.id, members[i].id))
-        })
-        .collect()
-}
-
 /// How many members before it a cluster member is checked against: a cluster is rarely more than a few uploads.
 const MAX_XPOST_WITNESSES: usize = 64;
-
-/// A release's NZB, its gaps filled from its twins: what every NZB is now, kept for the page's own link to it.
-pub fn filled_nzb(id: i64) -> db::Result<Option<String>> {
-    crate::nzb::build_nzb(id).map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))
-}
 
 #[cfg(test)]
 mod tests {
