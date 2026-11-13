@@ -39,7 +39,7 @@ fn run_until_stuck(
     harness.configure(mode, port, 1);
     let mut runner = harness.start();
     runner.wait_for("a real stalled request and preceding committed slices", |run| {
-        state.stalled.load(Ordering::SeqCst) > 0 && run.cursors() == expected
+        state.stalled.load(Ordering::SeqCst) > 0 && run.saved() > 0 && run.cursors() == expected
     });
     assert_eq!(runner.cursors(), expected, "preceding slices commit before TERM");
     assert!(runner.stop_within(PROMPT) < PROMPT, "stalled read must drain promptly");
@@ -52,8 +52,7 @@ fn run_until_stuck(
 #[test]
 #[ignore = "requires explicit isolated ATLAS_PG_TEST_URL and actual Atlas BIN"]
 fn a_pass_stopped_partway_keeps_the_cursor_past_what_it_saved() {
-    let mut harness = native_background::Harness::new();
-    harness.seed_cursors(0, 200);
+    let mut harness = native_background::Harness::new(Some((0, 200)));
     assert_eq!(run_until_stuck(&mut harness, "live", 41, (40, 200), 40), (40, 200));
     assert_eq!(run_until_stuck(&mut harness, "backfill", 141, (40, 160), 80), (40, 160));
 }

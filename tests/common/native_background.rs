@@ -7,7 +7,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use super::nntp::GROUP;
+use super::nntp::{GROUP, Server, spawn_server};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 struct Schema {
     client: postgres::Client,
@@ -55,10 +59,14 @@ pub struct Harness {
 }
 
 impl Harness {
-    pub fn new() -> Self {
+    pub fn new(initial_cursors: Option<(i64, i64)>) -> Self {
         let schema = Schema::open();
         let home = tempfile::tempdir().expect("private background fixture home");
-        Self { schema, home: Some(home), starts: 0 }
+        let mut fixture = Self { schema, home: Some(home), starts: 0 };
+        if let Some((live, backfill)) = initial_cursors {
+            fixture.prepare_cursors(live, backfill);
+        }
+        fixture
     }
 
     fn home(&self) -> &Path {
@@ -86,10 +94,58 @@ impl Harness {
         file.write_all(text.as_bytes()).unwrap_or_else(|_| panic!("write private fixture configuration"));
     }
 
-    /// The original cursor regression starts at (0,200). No identity, owner,
-    /// queue, timing or receipt state is fabricated: normal Atlas bootstraps it.
-    pub fn seed_cursors(&mut self, live: i64, backfill: i64) {
-        assert_eq!(self.starts, 0, "seed only before the first real owner");
+    /// Bootstrap the real empty native catalog before constructing the old
+    /// cursor precondition. The provider greeting is gated, so the actual
+    /// Runtime can establish its identity without accepting any GROUP/XOVER.
+    fn prepare_cursors(&mut self, live: i64, backfill: i64) {
+        struct ReleaseGate(Arc<AtomicBool>);
+        impl Drop for ReleaseGate {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let entered = Arc::new(AtomicBool::new(false));
+        let released = Arc::new(AtomicBool::new(false));
+        let release = ReleaseGate(released.clone());
+        let mut server = Server::new(vec![]);
+        let observed = entered.clone();
+        Arc::get_mut(&mut server).unwrap().before_connection = Some(Arc::new(move || {
+            observed.store(true, Ordering::Release);
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !released.load(Ordering::Acquire) {
+                assert!(Instant::now() < deadline, "fixture greeting gate was not released");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }));
+        let port = spawn_server(server);
+        self.configure("live", port, 1);
+        let mut runner = self.start();
+        runner.wait_for("original empty native bootstrap before provider greeting", |run| {
+            entered.load(Ordering::Acquire)
+                && run
+                    .fixture
+                    .schema
+                    .client
+                    .query_one("select count(*) from native_catalog_identity where singleton", &[])
+                    .unwrap_or_else(|_| panic!("observe actual native bootstrap"))
+                    .get::<_, i64>(0)
+                    == 1
+        });
+        runner.stop_within(Duration::from_secs(3));
+        drop(runner);
+        drop(release);
+        assert_eq!(self.saved(), 0, "bootstrap accepted no release input");
+        assert_eq!(
+            self.schema
+                .client
+                .query_one("select count(*) from groups", &[])
+                .unwrap_or_else(|_| panic!("observe pristine post-bootstrap cursors"))
+                .get::<_, i64>(0),
+            0
+        );
+        // Only this historical test's cursor row is seeded after the original
+        // owner exits and its lock is verified gone. No identity, epoch, queue,
+        // timing, publication/readiness or receipt state is fabricated.
         self.schema
             .client
             .execute(
@@ -141,7 +197,8 @@ impl Harness {
             .unwrap_or_else(|_| panic!("read actual bootstrapped native header identity"))
             .get(0);
         let root = PathBuf::from(root);
-        assert!(root.starts_with(self.home()), "native fixture header identity escaped its private home");
+        let canonical_home = std::fs::canonicalize(self.home()).expect("canonical private fixture home");
+        assert!(root.starts_with(&canonical_home), "native fixture header identity escaped its private home");
         let keep = atlas::nxv_store::KeepSet {
             live_from: i64::MIN,
             claimed: Default::default(),
@@ -254,6 +311,11 @@ impl Runner<'_> {
                     .unwrap_or_else(|_| panic!("observe actual owner session drain"))
                     .get(0);
                 assert!(!locked, "exited Atlas must release its original owner session");
+                // Atlas may leave a stale PID file after a normal exit. Retire
+                // only the exact joined child's fixture file before restart.
+                assert!(self.owned_pid_ready(), "joined Atlas still owns its recorded fixture PID");
+                std::fs::remove_file(self.fixture.home().join("bg_indexer.pid"))
+                    .expect("remove only the joined child's private PID file");
                 return elapsed;
             }
             if began.elapsed() >= limit {
