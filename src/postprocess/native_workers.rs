@@ -299,3 +299,7 @@ pub(crate) async fn run(owner:Arc<Owner>,db:crate::indexer::Db,headers:crate::co
     };
     if let Err(error)=result {fail(&owner,&error);}
 }
+
+#[cfg(test)]
+#[path = "../../tests/common/native_mixed_contract.rs"]
+mod mixed_contract;
