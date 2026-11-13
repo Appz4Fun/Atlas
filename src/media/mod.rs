@@ -28,7 +28,7 @@ use self::resolve::{Ids, Provider};
 use self::store::{STATE_FOUND, TitleRow};
 use self::title::Kind;
 
-pub use self::steps::{MEDIA_RELEASE, media_target};
+pub use self::steps::media_target;
 
 const MAX_CLAIMS: usize = 4_000_000;
 

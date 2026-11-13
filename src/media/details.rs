@@ -36,34 +36,6 @@ const BACKFILL_REST: Duration = Duration::from_secs(6 * 3600);
 /// Past a start, soo it doesn't add to what starting up does.
 const BACKFILL_DELAY: Duration = Duration::from_secs(30);
 
-pub(crate) const SCHEMA: &str = "
-create table if not exists details (
-    kind       INTEGER NOT NULL,
-    tmdb_id    INTEGER NOT NULL,
-    title      TEXT,
-    overview   TEXT,
-    genres     TEXT,
-    runtime    INTEGER,
-    status     TEXT,
-    network    TEXT,
-    cast_names TEXT,
-    released   TEXT,
-    bluray     TEXT,
-    poster     TEXT,
-    tmdb_score INTEGER,
-    imdb_score INTEGER,
-    rotten     INTEGER,
-    metacritic INTEGER,
-    trakt_score INTEGER,
-    fetched_at INTEGER NOT NULL,
-    primary key (kind, tmdb_id)
-) without rowid;
-create table if not exists details_lookups (
-    lookup     TEXT PRIMARY KEY,
-    tmdb_id    INTEGER,
-    checked_at INTEGER NOT NULL
-) without rowid;
-";
 
 /// Scores are out of 100, whatever scale the source uses.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
