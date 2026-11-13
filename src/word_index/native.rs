@@ -48,7 +48,7 @@ impl Record {
     fn indexed(self) -> Indexed {
         Indexed { id: self.id, name: self.name, display_name: self.display_name,
             group: self.group, posted: self.posted, size: self.size, category: self.category,
-            title_key: None, known_as: self.known_as }
+            known_as: self.known_as }
     }
 }
 
@@ -202,7 +202,7 @@ impl WordIndex {
         let reader = index.reader_builder().reload_policy(ReloadPolicy::OnCommitWithDelay).try_into()?;
         let result = Self {
             index, reader, fields, ranks: category_ranks(), dir: dir.to_path_buf(),
-            ready: AtomicBool::new(false), built_from: AtomicI64::new(0), writer: Mutex::new(None),
+            ready: AtomicBool::new(false), writer: Mutex::new(None),
             keeping: AtomicBool::new(false), pulse: Mutex::new(Pulse::default()), pulsed: Condvar::new(),
             counts: Mutex::new(HashMap::new()),
         };

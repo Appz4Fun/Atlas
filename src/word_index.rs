@@ -1,20 +1,14 @@
-//! Every word search over every release: a Tantivy index of release names kept next to the database, with what a page
-//! sorts and filters by in fast fields, soo a search ranks, sorts and filters all of its matches, not the newest few
-//! thousand of them.
-//!
-//! The database stays what's true. Triggers in each shard put the id of a release that changed, or whose category did,
-//! in `word_queue`, and the web server's process takes them from there into the index every few seconds. An index
-//! that's missing, or made by another version of this file, is built again from the shards in the background, going
-//! on from its last commit after a restart, and searches go to the database as before until it's ready. Each hit is read from the database again before it's shown,
-//! soo an index a few seconds behind never shows a release a client may no longer see.
+//! Native Tantivy word search with stable tokenization, prefix scoring, tag
+//! fields and ordering. PostgreSQL is the source of visible rows. Its canonical
+//! owner performs bounded builds and queue delivery through the native module;
+//! request readers neither open SQLite nor become index writers.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use rusqlite::{Connection, OptionalExtension};
 use tantivy::collector::sort_key::{NaturalComparator, SortBySimilarityScore, SortByStaticFastValue, SortByString};
 use tantivy::collector::{Collector, Count, SegmentSortKeyComputer, SortKeyComputer, TopDocs};
 use tantivy::directory::MmapDirectory;
@@ -26,8 +20,7 @@ use tantivy::{
 };
 
 use crate::category::{CatFilter, TABLE, UNCATEGORIZED, label};
-use crate::search::{ReleaseRow, VISIBLE_RELEASE, visible_release};
-use crate::store;
+use crate::search::ReleaseRow;
 pub(crate) mod native;
 
 /// Bumped whenever what's in a document changes: an index made by another version is built again.
@@ -36,14 +29,7 @@ const VERSION: u32 = 1;
 const WORDS: &str = "atlas_words";
 /// The tag filters the page offers, worked out of each name once, when it's indexed.
 pub const TAGS: &[&str] = &["2160p", "1080p", "DV", "HDR", "Remux", "WEB-DL", "BluRay"];
-/// How often the web server's process takes what changed into the index.
-const DRAIN_EVERY: Duration = Duration::from_secs(3);
-/// Releases taken from the queues at most per commit.
-const DRAIN_BATCH: usize = 20_000;
-/// Releases read from a shard at a time when building: short reads, soo the indexer's writes don't wait on one.
-const BUILD_BATCH: i64 = 5_000;
-/// Releases a build adds between its commits: about what a restart in the middle of one has to read again.
-const BUILD_COMMIT_EVERY: usize = 1_000_000;
+/// The sole native keeper opens its writer under this heap admission.
 const WRITER_HEAP: usize = 256 * 1024 * 1024;
 
 /// What a search sorts its matches by.
@@ -177,19 +163,17 @@ pub struct WordIndex {
     ranks: HashMap<i64, u64>,
     dir: PathBuf,
     ready: AtomicBool,
-    /// The database's `word_index` token the index was built from: another one means a new database.
-    built_from: AtomicI64,
     writer: Mutex<Option<IndexWriter>>,
-    /// Whether this process keeps the index up to date (`keep_up` runs here).
+    /// Whether this process keeps the index up to date (the native keeper runs here).
     keeping: AtomicBool,
-    /// How a search asks `keep_up` to drain now, and sees when it has.
+    /// How a search asks the native keeper to drain now, and sees when it has.
     pulse: Mutex<Pulse>,
     pulsed: Condvar,
     /// Counts that took a while, kept a moment: a click through a big category counts it once, not on every page.
     counts: Mutex<HashMap<String, (Instant, usize)>>,
 }
 
-/// `keep_up`'s steps: asked for, begun, and done, counted.
+/// the native keeper's steps: asked for, begun, and done, counted.
 #[derive(Default)]
 struct Pulse {
     asked: bool,
@@ -204,7 +188,7 @@ const COUNT_SLOW: Duration = Duration::from_millis(50);
 /// Counts kept at the most, one for each category and filters asked lately.
 const COUNTS_KEPT: usize = 256;
 
-/// The longest a search waits for `keep_up` to take in what's queued: past that it reads what's indexed.
+/// The longest a search waits for the native keeper to take in what's queued: past that it reads what's indexed.
 const CATCH_UP_WAIT: Duration = Duration::from_millis(500);
 
 impl WordIndex {
@@ -222,16 +206,13 @@ impl WordIndex {
         index.tokenizers().register(WORDS, analyzer());
         std::fs::write(&stamp_file, &stamp)?;
         let reader = index.reader_builder().reload_policy(ReloadPolicy::OnCommitWithDelay).try_into()?;
-        let built_from =
-            std::fs::read_to_string(dir.join("atlas-built")).ok().and_then(|s| s.trim().parse::<i64>().ok());
         Ok(WordIndex {
             index,
             reader,
             fields,
             ranks: category_ranks(),
             dir: dir.to_path_buf(),
-            ready: AtomicBool::new(built_from.is_some()),
-            built_from: AtomicI64::new(built_from.unwrap_or(0)),
+            ready: AtomicBool::new(false),
             writer: Mutex::new(None),
             keeping: AtomicBool::new(false),
             pulse: Mutex::new(Pulse::default()),
@@ -242,22 +223,6 @@ impl WordIndex {
 
     pub fn ready(&self) -> bool {
         self.ready.load(Ordering::Acquire)
-    }
-
-    /// Whether `conn` is the database the index was built from. A database wiped and indexed again reuses
-    /// release ids, and words left from the old one would find the new releases that took their ids.
-    fn built_from(&self, conn: &Connection) -> rusqlite::Result<bool> {
-        let token = database_token(conn)?;
-        Ok(token == Some(self.built_from.load(Ordering::Acquire)))
-    }
-
-    /// Takes the writer: only one process at a time keeps the index. False: another one has it.
-    fn take_writer(&self) -> bool {
-        let mut writer = lock(&self.writer);
-        if writer.is_none() {
-            *writer = self.index.writer(WRITER_HEAP).ok();
-        }
-        writer.is_some()
     }
 
     fn doc(&self, row: &Indexed) -> TantivyDocument {
@@ -296,191 +261,10 @@ impl WordIndex {
         doc
     }
 
-    /// Everything again from the shards. What changes meanwhile is queued, and taken in by the next drain.
-    pub fn build(&self, conn: &Connection) -> anyhow::Result<usize> {
-        self.build_in(conn, BUILD_BATCH, BUILD_COMMIT_EVERY, || true)
-    }
-
-    /// `build`, reading `batch` releases at a time and committing about every `every` of them, with where it got to
-    /// in the commit's payload: a build cut short by a restart goes on from its last commit instead of starting again.
-    /// It stops after a commit when `go_on` says so.
-    fn build_in(
-        &self,
-        conn: &Connection,
-        batch: i64,
-        every: usize,
-        mut go_on: impl FnMut() -> bool,
-    ) -> anyhow::Result<usize> {
-        let mut guard = lock(&self.writer);
-        let Some(writer) = guard.as_mut() else { anyhow::bail!("another process keeps the word index") };
-        let _ = std::fs::remove_file(self.dir.join("atlas-built"));
-        self.ready.store(false, Ordering::Release);
-        // made once per database, the same `meta` the id counter is kept in
-        conn.execute_batch(
-            "create table if not exists main.meta (key TEXT PRIMARY KEY, value INTEGER);
-             insert or ignore into main.meta (key, value) values ('word_index', random());",
-        )?;
-        let token = database_token(conn)?.unwrap_or_default();
-        // what an attempt that failed added after its last commit: the cursor below is from before it
-        writer.rollback()?;
-        let resumed = self.index.load_metas()?.payload.as_deref().and_then(|p| building_at(p, token));
-        let (first, mut after) = match resumed {
-            Some(at) => at,
-            None => {
-                // forgotten first: whatever changes from here on is queued again
-                for s in 0..store::SHARDS {
-                    conn.execute(&format!("delete from s{s}.word_queue"), [])?;
-                }
-                writer.delete_all_documents()?;
-                commit_with(writer, &building(token, 0, 0))?;
-                (0, 0)
-            }
-        };
-        let mut added = 0;
-        let mut since_commit = 0;
-        for s in first..store::SHARDS {
-            loop {
-                let mut rows = read_rows(conn, s, &format!("r.id > ?1 order by r.id limit {batch}"), after)?;
-                let Some(last) = rows.last() else { break };
-                after = last.id;
-                known_as(conn, &mut rows);
-                for doc in self.docs(&rows) {
-                    writer.add_document(doc)?;
-                }
-                added += rows.len();
-                since_commit += rows.len();
-                if since_commit >= every {
-                    commit_with(writer, &building(token, s, after))?;
-                    since_commit = 0;
-                    if !go_on() {
-                        return Ok(added);
-                    }
-                }
-            }
-            after = 0;
-        }
-        commit_with(writer, &format!("built {token}"))?;
-        std::fs::write(self.dir.join("atlas-built"), token.to_string())?;
-        self.reader.reload()?;
-        self.built_from.store(token, Ordering::Release);
-        self.ready.store(true, Ordering::Release);
-        Ok(added)
-    }
-
-    /// The documents of `rows`, worked out on every core: reading a name's tags is the slow part.
-    fn docs(&self, rows: &[Indexed]) -> Vec<TantivyDocument> {
-        let cores = std::thread::available_parallelism().map_or(4, |n| n.get()).max(1);
-        let per = rows.len().div_ceil(cores).max(1);
-        std::thread::scope(|scope| {
-            let parts: Vec<_> = rows
-                .chunks(per)
-                .map(|part| scope.spawn(move || part.iter().map(|r| self.doc(r)).collect::<Vec<_>>()))
-                .collect();
-            parts.into_iter().flat_map(|p| p.join().unwrap_or_else(|e| std::panic::resume_unwind(e))).collect()
-        })
-    }
-
-    /// Takes what changed into the index: each release queued is read again, and indexed if a client may see it.
-    pub fn drain(&self, conn: &Connection) -> anyhow::Result<usize> {
-        let mut guard = lock(&self.writer);
-        let Some(writer) = guard.as_mut() else { anyhow::bail!("another process keeps the word index") };
-        let mut taken: Vec<(usize, i64, i64)> = Vec::new();
-        for s in 0..store::SHARDS {
-            let left = DRAIN_BATCH - taken.len();
-            if left == 0 {
-                break;
-            }
-            let mut stmt = conn
-                .prepare_cached(&format!("select release_id, n from s{s}.word_queue order by release_id limit ?1"))?;
-            let queued = stmt.query_map([left as i64], |r| Ok((s, r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
-            taken.extend(queued.collect::<rusqlite::Result<Vec<_>>>()?);
-        }
-        if taken.is_empty() {
-            return Ok(0);
-        }
-        let mut rows = Vec::new();
-        for &(s, id, _) in &taken {
-            writer.delete_term(Term::from_field_u64(self.fields.id, id as u64));
-            rows.extend(read_rows(conn, s, "r.id = ?1", id)?);
-        }
-        known_as(conn, &mut rows);
-        for doc in self.docs(&rows) {
-            writer.add_document(doc)?;
-        }
-        writer.commit()?;
-        // searched straight after, not once the reader looks again
-        self.reader.reload()?;
-        // a release queued again since it was read keeps its place: its count went up. One shard at a time, each in
-        // its own transaction: one over them all would keep the shards it already wrote locked while it waits for
-        // the next one's writer, and their writers out (shard 0's saves failed as locked). What a failure leaves
-        // queued is read and indexed again the next time
-        for s in 0..store::SHARDS {
-            if !taken.iter().any(|t| t.0 == s) {
-                continue;
-            }
-            let tx = conn.unchecked_transaction()?;
-            {
-                let mut delete =
-                    tx.prepare_cached(&format!("delete from s{s}.word_queue where release_id = ?1 and n = ?2"))?;
-                for &(_, id, n) in taken.iter().filter(|t| t.0 == s) {
-                    delete.execute([id, n])?;
-                }
-            }
-            tx.commit()?;
-        }
-        Ok(taken.len())
-    }
-
     /// A page of what matches `words` in `filter` with every tag in `tags`, sorted `by`, and how many match.
     #[allow(clippy::too_many_arguments)]
-    pub fn search(
-        &self,
-        conn: &Connection,
-        words: &str,
-        filter: Option<&CatFilter>,
-        tags: &[&str],
-        by: By,
-        descending: bool,
-        offset: usize,
-        limit: usize,
-    ) -> anyhow::Result<Hits> {
-        self.catch_up(conn);
-        let query = self.query(words, filter, tags);
-        let searcher = self.reader.searcher();
-        let (found, total) = self.top(&searcher, query.as_ref(), by, descending, offset, limit)?;
-        let mut rows = Vec::with_capacity(found.len());
-        for id in found {
-            // read again: what a client may see is the database's to say
-            if let Some(row) = visible_release(conn, id)? {
-                rows.push(row);
-            }
-        }
-        Ok(Hits { rows, total })
-    }
 
-    /// What's queued taken in before a search, soo a release saved a moment ago is found and not only once the
-    /// background drain comes round. The search only asks `keep_up` to drain now and waits a moment for it: the
-    /// drain itself, its reads and its commit, never runs on a request's thread or holds the writer for one.
-    fn catch_up(&self, conn: &Connection) {
-        if !self.keeping.load(Ordering::Acquire) {
-            return;
-        }
-        let queued = (0..store::SHARDS).any(|s| {
-            conn.query_row(&format!("select exists (select 1 from s{s}.word_queue)"), [], |r| r.get::<_, bool>(0))
-                .unwrap_or(false)
-        });
-        if !queued {
-            return;
-        }
-        let mut pulse = lock(&self.pulse);
-        // a step already begun may have read the queue before this release was in it: the next one has it
-        let wanted = pulse.begun + 1;
-        pulse.asked = true;
-        self.pulsed.notify_all();
-        let _ = self.pulsed.wait_timeout_while(pulse, CATCH_UP_WAIT, |p| p.done < wanted);
-    }
-
-    /// `keep_up` waits here between steps: `every`, or until a search asks.
+    /// the native keeper waits here between steps: `every`, or until a search asks.
     fn pause(&self, every: Duration) {
         let pulse = lock(&self.pulse);
         let (mut pulse, _) =
@@ -488,7 +272,7 @@ impl WordIndex {
         pulse.asked = false;
     }
 
-    /// A `keep_up` step begins; the number it gets is the one `finished` takes.
+    /// A the native keeper step begins; the number it gets is the one `finished` takes.
     fn begin(&self) -> u64 {
         let mut pulse = lock(&self.pulse);
         pulse.asked = false;
@@ -499,20 +283,6 @@ impl WordIndex {
     fn finished(&self, step: u64) {
         lock(&self.pulse).done = step;
         self.pulsed.notify_all();
-    }
-
-    /// How many releases match, as `search` counts them. A count with no words, a category's or a filter's, may be up
-    /// to `COUNT_KEPT` old: a big one reads millions of documents, and a few seconds' new releases don't change it much.
-    pub fn count(&self, words: &str, filter: Option<&CatFilter>, tags: &[&str]) -> anyhow::Result<usize> {
-        let browsing = words.trim().is_empty();
-        if !browsing {
-            // what was saved a moment ago is found, soo it's counted too
-            let _ = crate::db::with_reader(|conn| {
-                self.catch_up(conn);
-                Ok(())
-            });
-        }
-        self.count_indexed(words, filter, tags)
     }
 
     fn count_indexed(&self, words: &str, filter: Option<&CatFilter>, tags: &[&str]) -> anyhow::Result<usize> {
@@ -547,12 +317,19 @@ impl WordIndex {
 
     /// `query`, where a word is matched from its start only while the words it starts hold fewer than `cap` postings.
     fn query_with(&self, words: &str, filter: Option<&CatFilter>, tags: &[&str], cap: u64) -> Box<dyn Query> {
-        self.query_in(&self.reader.searcher(),words,filter,tags,cap)
+        self.query_in(&self.reader.searcher(), words, filter, tags, cap)
     }
 
     /// Build prefix/scoring decisions against the same committed searcher
     /// that will evaluate them, including a multi-batch native PG scan.
-    fn query_in(&self,searcher:&Searcher,words:&str,filter:Option<&CatFilter>,tags:&[&str],cap:u64)->Box<dyn Query> {
+    fn query_in(
+        &self,
+        searcher: &Searcher,
+        words: &str,
+        filter: Option<&CatFilter>,
+        tags: &[&str],
+        cap: u64,
+    ) -> Box<dyn Query> {
         let f = &self.fields;
         let mut must: Vec<(Occur, Box<dyn Query>)> = Vec::new();
         let mut tokens = Vec::new();
@@ -763,134 +540,8 @@ struct Indexed {
     posted: Option<String>,
     size: Option<i64>,
     category: Option<i64>,
-    /// The media title key of a release named by an id in place of its title (`AC317772.2026...`, AlloCiné's).
-    title_key: Option<i64>,
     /// What that id is the title of, as the media lookup decoded it: a search for the title finds the release.
     known_as: Option<String>,
-}
-
-/// A name that starts with an AlloCiné id in place of the title, as SQLite's `glob` has it.
-const ID_NAMED: &str = "'AC[0-9][0-9][0-9][0-9]*'";
-
-/// The releases of shard `s` that a client may see, picked by `clause` with `?1` bound to `value`.
-fn read_rows(conn: &Connection, s: usize, clause: &str, value: i64) -> rusqlite::Result<Vec<Indexed>> {
-    let sql = format!(
-        "select r.id, r.name, r.display_name, r.group_name, r.posted_date, r.size, c.category,
-                iif(r.name glob {ID_NAMED} or r.display_name glob {ID_NAMED}, m.title_key, null)
-           from s{s}.releases r left join s{s}.release_category c on c.release_id = r.id
-                left join s{s}.media_release m on m.release_id = r.id
-          where {VISIBLE_RELEASE} and {clause}"
-    );
-    let mut stmt = conn.prepare_cached(&sql)?;
-    stmt.query_map([value], |r| {
-        Ok(Indexed {
-            id: r.get(0)?,
-            name: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
-            display_name: r.get(2)?,
-            group: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
-            posted: r.get(4)?,
-            size: r.get(5)?,
-            category: r.get(6)?,
-            title_key: r.get(7)?,
-            known_as: None,
-        })
-    })?
-    .collect()
-}
-
-/// The decoded titles of the `rows` named by an id, from the media lookup's titles beside the main database. One
-/// it hasn't decoded yet, or a media database that can't be read, leaves the release found by its name alone: the
-/// lookup's writes to `media_release` queue it again.
-fn known_as(conn: &Connection, rows: &mut [Indexed]) {
-    if rows.iter().all(|r| r.title_key.is_none()) {
-        return;
-    }
-    let Some(main) = conn.path().filter(|p| !p.is_empty()) else { return };
-    let path = crate::media::store::path_for(Path::new(main));
-    if !path.exists() {
-        return;
-    }
-    let Ok(media) = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else { return };
-    let Ok(mut stmt) = media.prepare("select found_title, title from media_titles where title_key = ?1") else {
-        return;
-    };
-    for row in rows.iter_mut() {
-        let Some(key) = row.title_key else { continue };
-        let titles: Option<(Option<String>, String)> =
-            stmt.query_row([key], |r| Ok((r.get(0)?, r.get(1)?))).optional().ok().flatten();
-        let Some((found, asked)) = titles else { continue };
-        // a title cached before ids were decoded is the id itself, which the name already has
-        row.known_as = native::decoded_title(found.as_deref(), &asked);
-    }
-}
-
-/// The queue and the triggers that fill it, in a shard. Its `releases` and `release_category` are there already.
-pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
-    let queue = |id: &str| {
-        format!("insert into word_queue (release_id) values ({id}) on conflict (release_id) do update set n = n + 1;")
-    };
-    conn.execute_batch(&format!(
-        "
-        -- releases to read again into the word index (`word_index.rs`), with how often they were queued
-        create table if not exists word_queue (release_id INTEGER PRIMARY KEY, n INTEGER NOT NULL DEFAULT 1);
-        create trigger if not exists word_queue_ai after insert on releases begin {new} end;
-        create trigger if not exists word_queue_ad after delete on releases begin {old} end;
-        create trigger if not exists word_queue_au after update of name, display_name, group_name, size, posted_date,
-            is_obfuscated on releases
-        when old.name is not new.name or old.display_name is not new.display_name
-            or old.group_name is not new.group_name or old.size is not new.size
-            or old.posted_date is not new.posted_date or old.is_obfuscated is not new.is_obfuscated
-        begin {new} end;
-        create trigger if not exists word_queue_ci after insert on release_category begin {new_c} end;
-        create trigger if not exists word_queue_cd after delete on release_category begin {old_c} end;
-        create trigger if not exists word_queue_cu after update on release_category begin {new_c} {old_c} end;
-        -- a release named by an AlloCiné id is found by the title it decodes to (`known_as`), once the lookup has it
-        create trigger if not exists word_queue_mi after insert on media_release
-        when exists (select 1 from releases where id = new.release_id and {id_named})
-        begin {new_c} end;
-        create trigger if not exists word_queue_mu after update of title_key, tvdb_id, tvmaze_id, trakt_id, tmdb_id,
-            imdb_id on media_release
-        when (old.title_key is not new.title_key or old.tvdb_id is not new.tvdb_id
-            or old.tvmaze_id is not new.tvmaze_id or old.trakt_id is not new.trakt_id
-            or old.tmdb_id is not new.tmdb_id or old.imdb_id is not new.imdb_id)
-            and exists (select 1 from releases where id = new.release_id and {id_named})
-        begin {new_c} end;
-        ",
-        new = queue("new.id"),
-        old = queue("old.id"),
-        new_c = queue("new.release_id"),
-        old_c = queue("old.release_id"),
-        id_named = format!("(name glob {ID_NAMED} or display_name glob {ID_NAMED})"),
-    ))
-}
-
-/// The token `build` leaves in the main database, None when it was never built from this one.
-fn database_token(conn: &Connection) -> rusqlite::Result<Option<i64>> {
-    let has_meta: bool = conn.query_row(
-        "select exists (select 1 from main.sqlite_master where type = 'table' and name = 'meta')",
-        [],
-        |r| r.get(0),
-    )?;
-    if !has_meta {
-        return Ok(None);
-    }
-    conn.query_row("select value from main.meta where key = 'word_index'", [], |r| r.get(0)).optional()
-}
-
-/// A build's commit payload: the database it's built from, and the shard and last release id it got to.
-fn building(token: i64, shard: usize, after: i64) -> String {
-    format!("building {token} {shard} {after}")
-}
-
-/// Where a build left off, when `payload` is one of `building`'s for the database of `token`.
-fn building_at(payload: &str, token: i64) -> Option<(usize, i64)> {
-    let mut words = payload.strip_prefix("building ")?.split(' ');
-    if words.next()?.parse::<i64>().ok()? != token {
-        return None;
-    }
-    let shard = words.next()?.parse().ok()?;
-    let after = words.next()?.parse().ok()?;
-    Some((shard, after))
 }
 
 fn commit_with(writer: &mut IndexWriter, payload: &str) -> tantivy::Result<()> {
@@ -904,155 +555,48 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-// ---------------------------------------------------------------- the one this process uses
-
-static INDEX: OnceLock<Option<Arc<WordIndex>>> = OnceLock::new();
-
-/// Where the index of the database at `main` lives.
-pub fn dir_for(main: &Path) -> PathBuf {
-    main.with_extension("words")
-}
-
-/// The index, once it has been built: None sends a search to the database.
-pub fn ready() -> Option<Arc<WordIndex>> {
-    INDEX.get()?.as_ref().filter(|i| i.ready()).cloned()
-}
-
-/// Opens the index and keeps it up to date from here on, building it first when it has to be. Once per process.
-pub fn start(main: PathBuf) {
-    static STARTED: std::sync::Once = std::sync::Once::new();
-    STARTED.call_once(|| {
-        std::thread::spawn(move || {
-            let index = match WordIndex::open(&dir_for(&main)) {
-                Ok(index) => Arc::new(index),
-                Err(e) => {
-                    eprintln!("word index: can't open it, searches use the database: {e}");
-                    let _ = INDEX.set(None);
-                    return;
-                }
-            };
-            let _ = INDEX.set(Some(index.clone()));
-            if !index.take_writer() {
-                eprintln!("word index: another process keeps it");
-                return;
-            }
-            keep_up(&index, &main);
-        });
-    });
-}
-
-fn keep_up(index: &WordIndex, main: &Path) {
-    // said once, not every few seconds while it lasts
-    let mut last_error = String::new();
-    index.keeping.store(true, Ordering::Release);
-    loop {
-        let begun = index.begin();
-        let step = crate::db::open_with_shards(main).map_err(anyhow::Error::from).and_then(|conn| {
-            // its commits to the shards dont copy their WALs each time (see the constant)
-            conn.execute_batch(&format!(
-                "pragma wal_autocheckpoint = {}",
-                crate::db::OCCASIONAL_WRITER_AUTOCHECKPOINT
-            ))?;
-            if index.ready() && !index.built_from(&conn)? {
-                // the database was wiped and started again: what's in the index belongs to the old one
-                index.ready.store(false, Ordering::Release);
-            }
-            if index.ready() {
-                index.drain(&conn)
-            } else {
-                // what's built is in the index's own folder; the menu's screen isn't told
-                index.build(&conn).map(|_| 0)
-            }
-        });
-        index.finished(begun);
-        match step {
-            // more queued than one batch: straight on
-            Ok(n) if n >= DRAIN_BATCH => continue,
-            Ok(_) => last_error.clear(),
-            Err(e) => {
-                let error = e.to_string();
-                if error != last_error {
-                    eprintln!("word index: {error}");
-                    last_error = error;
-                }
-            }
-        }
-        index.pause(DRAIN_EVERY);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db;
 
     struct Fixture {
         dir: tempfile::TempDir,
-        main: PathBuf,
+        rows: std::cell::RefCell<Vec<native::Record>>,
     }
-
     fn fixture() -> Fixture {
-        let dir = tempfile::tempdir().unwrap();
-        let main = dir.path().join("atlas.db");
-        db::create_db_at(&main).unwrap();
-        Fixture { dir, main }
+        Fixture { dir: tempfile::tempdir().unwrap(), rows: std::cell::RefCell::new(Vec::new()) }
     }
-
-    fn release(name: &str, group: &str) -> crate::parser::Release {
-        let article = crate::parser::Article {
-            message_id: format!("<{name}@x>"),
-            subject: format!("\"{name}\" yEnc (1/1)"),
-            author: "p <p@x>".into(),
-            filename: Some(format!("{name}.bin")),
-            part: Some(1),
-            total_parts: Some(1),
-            bytes: 10,
-            ..Default::default()
-        };
-        crate::parser::Release {
-            name: name.into(),
-            group: group.into(),
-            articles: vec![article],
-            size: 10,
-            complete: true,
-            ..Default::default()
-        }
-    }
-
     impl Fixture {
         fn add(&self, name: &str, group: &str, size: i64, category: Option<i64>) -> i64 {
-            store::save(&self.main, &[release(name, group)]).unwrap();
-            let shard = self.shard(group);
-            let id: i64 = shard.query_row("select id from releases where name = ?", [name], |r| r.get(0)).unwrap();
-            shard.execute("update releases set size = ?2 where id = ?1", [id, size]).unwrap();
-            if let Some(c) = category {
-                shard.execute("insert into release_category (release_id, category) values (?, ?)", [id, c]).unwrap();
-            }
+            let mut rows = self.rows.borrow_mut();
+            let id = rows.len() as i64 + 1;
+            rows.push(native::Record {
+                id,
+                name: name.into(),
+                display_name: None,
+                group: group.into(),
+                posted: None,
+                size: Some(size),
+                category,
+                known_as: None,
+            });
             id
         }
-
-        fn shard(&self, group: &str) -> Connection {
-            db::open_shard(&store::shard_path(&self.main, store::shard_of(group))).unwrap()
+        fn set_display(&self, id: i64, name: &str) {
+            self.rows.borrow_mut().iter_mut().find(|row| row.id == id).unwrap().display_name = Some(name.into());
         }
-
-        fn index(&self) -> WordIndex {
-            let index = WordIndex::open(&self.dir.path().join("atlas.words")).unwrap();
-            assert!(index.take_writer());
-            index
+        fn set_known(&self, id: i64, name: &str) {
+            self.rows.borrow_mut().iter_mut().find(|row| row.id == id).unwrap().known_as = Some(name.into());
         }
-
-        fn conn(&self) -> Connection {
-            db::open_with_shards(&self.main).unwrap()
+        fn remove(&self, id: i64) {
+            self.rows.borrow_mut().retain(|row| row.id != id);
         }
     }
-
     fn ids(hits: &Hits) -> Vec<i64> {
-        hits.rows.iter().map(|r| r.id).collect()
+        hits.rows.iter().map(|row| row.id).collect()
     }
-
     const UHD: i64 = 2045;
     const HD: i64 = 2040;
-
     struct NativeFixtureSource {
         rows: Vec<native::Record>,
         releases: Vec<ReleaseRow>,
@@ -1061,26 +605,38 @@ mod tests {
         expected_extra: u64,
     }
     impl NativeFixtureSource {
-        fn from_legacy(conn: &Connection) -> Self {
-            let mut rows = read_rows(conn, 0, "r.id > ?1 order by r.id", 0).unwrap();
-            known_as(conn, &mut rows);
-            let releases = rows.iter().map(|row| visible_release(conn, row.id).unwrap().unwrap()).collect();
-            let rows = rows.into_iter().map(|row| native::Record {
-                id: row.id, name: row.name, display_name: row.display_name, group: row.group,
-                posted: row.posted, size: row.size, category: row.category, known_as: row.known_as,
-            }).collect();
+        fn from_fixture(fixture: &Fixture) -> Self {
+            let rows = fixture.rows.borrow().clone();
+            let releases = rows
+                .iter()
+                .map(|row| ReleaseRow {
+                    id: row.id,
+                    name: row.display_name.as_ref().unwrap_or(&row.name).clone(),
+                    group_name: row.group.clone(),
+                    posted_date: row.posted.clone(),
+                    size: row.size,
+                    complete: true,
+                    ..Default::default()
+                })
+                .collect();
             Self { rows, releases, queued: Vec::new(), fail_ack: false, expected_extra: 0 }
         }
     }
     impl native::SearchSource for NativeFixtureSource {
-        fn stamp(&mut self) -> anyhow::Result<[u8; 32]> { Ok([7; 32]) }
-        fn pending(&mut self) -> anyhow::Result<bool> { Ok(!self.queued.is_empty()) }
+        fn stamp(&mut self) -> anyhow::Result<[u8; 32]> {
+            Ok([7; 32])
+        }
+        fn pending(&mut self) -> anyhow::Result<bool> {
+            Ok(!self.queued.is_empty())
+        }
         fn visible_rows(&mut self, ids: &[i64], _budget: native::Budget) -> anyhow::Result<Vec<ReleaseRow>> {
             Ok(ids.iter().filter_map(|id| self.releases.iter().find(|row| row.id == *id).cloned()).collect())
         }
     }
     impl native::BuildSource for NativeFixtureSource {
-        fn expected_documents(&mut self) -> anyhow::Result<u64> { Ok(self.rows.len() as u64 + self.expected_extra) }
+        fn expected_documents(&mut self) -> anyhow::Result<u64> {
+            Ok(self.rows.len() as u64 + self.expected_extra)
+        }
         fn build_page(&mut self, after: i64, budget: native::Budget) -> anyhow::Result<Vec<native::Record>> {
             Ok(self.rows.iter().filter(|row| row.id > after).take(budget.rows).cloned().collect())
         }
@@ -1088,66 +644,141 @@ mod tests {
     impl native::Source for NativeFixtureSource {
         fn changes(&mut self, budget: native::Budget) -> anyhow::Result<native::Changes> {
             let receipts: Vec<_> = self.queued.iter().take(budget.rows).copied().collect();
-            let rows = self.rows.iter().filter(|row| receipts.iter().any(|receipt| receipt.id == row.id)).cloned().collect();
+            let rows =
+                self.rows.iter().filter(|row| receipts.iter().any(|receipt| receipt.id == row.id)).cloned().collect();
             Ok(native::Changes { receipts, rows })
         }
-        fn acknowledge(&mut self, commit: &native::IndexCommitReceipt, receipts: &[native::Changed]) -> anyhow::Result<()> {
-            assert_eq!(commit.stamp(), &[7;32]);
-            assert_eq!(*commit.batch_digest(), native::batch_digest([7;32], receipts, &self.rows.iter().filter(|row| receipts.iter().any(|claim| claim.id == row.id)).cloned().collect::<Vec<_>>())?);
-            if self.fail_ack { self.fail_ack = false; anyhow::bail!("synthetic lost acknowledgment"); }
+        fn acknowledge(
+            &mut self,
+            commit: &native::IndexCommitReceipt,
+            receipts: &[native::Changed],
+        ) -> anyhow::Result<()> {
+            assert_eq!(commit.stamp(), &[7; 32]);
+            assert_eq!(
+                *commit.batch_digest(),
+                native::batch_digest(
+                    [7; 32],
+                    receipts,
+                    &self
+                        .rows
+                        .iter()
+                        .filter(|row| receipts.iter().any(|claim| claim.id == row.id))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                )?
+            );
+            if self.fail_ack {
+                self.fail_ack = false;
+                anyhow::bail!("synthetic lost acknowledgment");
+            }
             self.queued.retain(|queued| !receipts.contains(queued));
             Ok(())
         }
     }
 
     #[test]
-    fn native_tantivy_keeps_the_existing_prefix_rank_tag_and_sort_oracle() {
+    fn native_prefix_display_tag_and_sort_golden_vectors() {
         let f = fixture();
-        f.add("Café.Alpha.Movie.2020.2160p.UHD.BluRay.REMUX-X", "alt.binaries.a", 61_000, Some(UHD));
+        f.add("Café.Alpha.Movie.2020.2160p.UHD.BluRay.REMUX-X", "alt.binaries.a", 61000, Some(UHD));
         let renamed = f.add("Alpha.Movie.2021.1080p.WEB-DL-Y", "alt.binaries.b", 500, Some(HD));
         f.add("Alpha.Show.S01E01.1080p.WEB-DL-Y", "alt.binaries.c", 400, Some(HD));
         f.add("Unrelated.2025.1080p-W", "alt.binaries.d", 900, None);
-        f.shard("alt.binaries.b").execute("update releases set display_name='Beta.Alpha.2021.1080p.WEB-DL-Y' where id=?1", [renamed]).unwrap();
-        let conn = f.conn();
-        let legacy = f.index();
-        legacy.build(&conn).unwrap();
-        let mut source = NativeFixtureSource::from_legacy(&conn);
+        f.set_display(renamed, "Beta.Alpha.2021.1080p.WEB-DL-Y");
+        let mut source = NativeFixtureSource::from_fixture(&f);
         let index = WordIndex::open_native(&f.dir.path().join("native.words"), [7; 32]).unwrap();
         assert!(index.build_native(&mut source, native::Budget::default(), || true).unwrap().complete);
         let hd = crate::category::parse_filter("2040").unwrap();
-        for words in ["", "alpha", "alph", "cafe", "beta"] {
+        for (words, matching) in [
+            ("", vec![1, 2, 3, 4]),
+            ("alpha", vec![1, 2, 3]),
+            ("alph", vec![1, 2, 3]),
+            ("cafe", vec![1]),
+            ("beta", vec![2]),
+        ] {
             for by in [By::Relevance, By::Newest, By::Size, By::Posted, By::Name, By::Group, By::Category] {
                 for descending in [false, true] {
                     for (filter, tags) in [(None, Vec::new()), (Some(&hd), Vec::new()), (None, vec!["2160p"])] {
-                        let expected = legacy.search(&conn, words, filter, &tags, by, descending, 0, 10).unwrap();
-                        let actual = index.search_native(&mut source, words, filter, &tags, by, descending, 0, 10, native::Budget::default()).unwrap();
-                        assert_eq!((ids(&actual), actual.total), (ids(&expected), expected.total), "{words} {descending}");
+                        let mut expected = matching.clone();
+                        if filter.is_some() {
+                            expected.retain(|id| [2, 3].contains(id));
+                        }
+                        if !tags.is_empty() {
+                            expected.retain(|id| *id == 1);
+                        }
+                        let hits = index
+                            .search_native(
+                                &mut source,
+                                words,
+                                filter,
+                                &tags,
+                                by,
+                                descending,
+                                0,
+                                10,
+                                native::Budget::default(),
+                            )
+                            .unwrap();
+                        let mut found = ids(&hits);
+                        found.sort_unstable();
+                        assert_eq!(
+                            (found, hits.total),
+                            (expected.clone(), expected.len()),
+                            "{words} {by:?} {descending}"
+                        );
                     }
                 }
             }
+        }
+        for (by, descending, expected) in [
+            (By::Size, false, vec![3, 2, 4, 1]),
+            (By::Size, true, vec![1, 4, 2, 3]),
+            (By::Name, false, vec![3, 2, 1, 4]),
+            (By::Name, true, vec![4, 1, 2, 3]),
+            (By::Group, false, vec![1, 2, 3, 4]),
+            (By::Group, true, vec![4, 3, 2, 1]),
+            (By::Category, false, vec![3, 2, 1, 4]),
+            (By::Category, true, vec![4, 1, 3, 2]),
+            (By::Posted, false, vec![4, 3, 2, 1]),
+            (By::Posted, true, vec![4, 3, 2, 1]),
+        ] {
+            let hits = index
+                .search_native(&mut source, "", None, &[], by, descending, 0, 10, native::Budget::default())
+                .unwrap();
+            assert_eq!(ids(&hits), expected, "{by:?} {descending}");
         }
     }
 
     #[test]
     fn native_membership_pins_one_committed_searcher_across_reload_between_batches() {
-        let f=fixture();
-        f.add("Alpha.Movie.2020.1080p-X","alt.binaries.a",10,Some(HD));
-        f.add("Alpha.Movie.2021.1080p-X","alt.binaries.b",11,Some(HD));
-        let conn=f.conn();let mut source=NativeFixtureSource::from_legacy(&conn);
-        let index=WordIndex::open_native(&f.dir.path().join("native.words"),[7;32]).unwrap();
-        assert!(index.build_native(&mut source,native::Budget::default(),||true).unwrap().complete);
-        let first=source.rows[0].id;let second=source.rows[1].id;
-        let pinned=index.native_membership(&mut source,"alph",None,&["1080p"],None,native::Budget::default()).unwrap();
-        assert_eq!(pinned.matching_ids(&[first]).unwrap(),[first]);
-        source.rows[1].name="Unrelated.Movie.2021.2160p-X".into();
-        source.releases.iter_mut().find(|row|row.id==second).unwrap().name=source.rows[1].name.clone();
-        source.queued.push(native::Changed {id:second,version:1});
-        assert_eq!(index.drain_native(&mut source,native::Budget::default()).unwrap(),1);
-        assert_eq!(index.count_native(&mut source,"alph",None,&["1080p"]).unwrap(),1,"new committed reader really changed");
-        assert_eq!(pinned.matching_ids(&[second]).unwrap(),[second],"later batch retains the original committed membership");
-        let fresh=index.native_membership(&mut source,"alph",None,&["1080p"],None,native::Budget::default()).unwrap();
+        let f = fixture();
+        f.add("Alpha.Movie.2020.1080p-X", "alt.binaries.a", 10, Some(HD));
+        f.add("Alpha.Movie.2021.1080p-X", "alt.binaries.b", 11, Some(HD));
+        let mut source = NativeFixtureSource::from_fixture(&f);
+        let index = WordIndex::open_native(&f.dir.path().join("native.words"), [7; 32]).unwrap();
+        assert!(index.build_native(&mut source, native::Budget::default(), || true).unwrap().complete);
+        let first = source.rows[0].id;
+        let second = source.rows[1].id;
+        let pinned =
+            index.native_membership(&mut source, "alph", None, &["1080p"], None, native::Budget::default()).unwrap();
+        assert_eq!(pinned.matching_ids(&[first]).unwrap(), [first]);
+        source.rows[1].name = "Unrelated.Movie.2021.2160p-X".into();
+        source.releases.iter_mut().find(|row| row.id == second).unwrap().name = source.rows[1].name.clone();
+        source.queued.push(native::Changed { id: second, version: 1 });
+        assert_eq!(index.drain_native(&mut source, native::Budget::default()).unwrap(), 1);
+        assert_eq!(
+            index.count_native(&mut source, "alph", None, &["1080p"]).unwrap(),
+            1,
+            "new committed reader really changed"
+        );
+        assert_eq!(
+            pinned.matching_ids(&[second]).unwrap(),
+            [second],
+            "later batch retains the original committed membership"
+        );
+        let fresh =
+            index.native_membership(&mut source, "alph", None, &["1080p"], None, native::Budget::default()).unwrap();
         assert!(fresh.matching_ids(&[second]).unwrap().is_empty());
-        assert_eq!(fresh.matching_ids(&[first]).unwrap(),[first]);
+        assert_eq!(fresh.matching_ids(&[first]).unwrap(), [first]);
     }
 
     #[test]
@@ -1167,32 +798,42 @@ mod tests {
 
     #[test]
     fn native_new_read_snapshot_restarts_unfinished_base_and_preserves_ready_index() {
-        let f=fixture();
-        for i in 0..5 {f.add(&format!("Alpha.Movie.202{i}.1080p-X"),"alt.binaries.a",10+i,Some(HD));}
-        let conn=f.conn();let mut first=NativeFixtureSource::from_legacy(&conn);
-        let directory=f.dir.path().join("native.words");let stamp=[7;32];
-        let index=WordIndex::open_native(&directory,stamp).unwrap();
-        let budget=native::Budget {rows:1,bytes:512,commit_bytes:512};
-        let partial=index.build_native(&mut first,budget,||false).unwrap();
-        assert!(!partial.complete);assert_eq!(partial.documents,1);
-        let removed=first.rows[0].id;drop(first);
-        f.shard("alt.binaries.a").execute("delete from releases where id=?1",[removed]).unwrap();
-        let mut changed=NativeFixtureSource::from_legacy(&conn);
-        assert_eq!(changed.rows.len(),4);
+        let f = fixture();
+        for i in 0..5 {
+            f.add(&format!("Alpha.Movie.202{i}.1080p-X"), "alt.binaries.a", 10 + i, Some(HD));
+        }
+        let mut first = NativeFixtureSource::from_fixture(&f);
+        let directory = f.dir.path().join("native.words");
+        let stamp = [7; 32];
+        let index = WordIndex::open_native(&directory, stamp).unwrap();
+        let budget = native::Budget { rows: 1, bytes: 512, commit_bytes: 512 };
+        let partial = index.build_native(&mut first, budget, || false).unwrap();
+        assert!(!partial.complete);
+        assert_eq!(partial.documents, 1);
+        let removed = first.rows[0].id;
+        drop(first);
+        f.remove(removed);
+        let mut changed = NativeFixtureSource::from_fixture(&f);
+        assert_eq!(changed.rows.len(), 4);
         index.restart_native_build(stamp).unwrap();
-        assert_eq!(index.build_native(&mut changed,budget,||true).unwrap().documents,4);
-        let found=index.search_native(&mut changed,"alpha",None,&[],By::Newest,true,0,10,native::Budget::default()).unwrap();
-        assert_eq!(found.rows.len(),4);assert!(!found.rows.iter().any(|row|row.id==removed));
-        assert!(index.restart_native_build(stamp).is_err(),"ready indexes catch up through the durable queue");
+        assert_eq!(index.build_native(&mut changed, budget, || true).unwrap().documents, 4);
+        let found = index
+            .search_native(&mut changed, "alpha", None, &[], By::Newest, true, 0, 10, native::Budget::default())
+            .unwrap();
+        assert_eq!(found.rows.len(), 4);
+        assert!(!found.rows.iter().any(|row| row.id == removed));
+        assert!(index.restart_native_build(stamp).is_err(), "ready indexes catch up through the durable queue");
         assert!(index.native_ready(stamp).unwrap());
     }
 
     #[test]
     fn native_tantivy_resume_and_ack_replay_never_duplicate_public_ids() {
         let f = fixture();
-        for i in 0..5 { f.add(&format!("Alpha.Movie.202{i}.1080p-X"), "alt.binaries.a", 10 + i, Some(HD)); }
-        let conn = f.conn();
-        let mut source = NativeFixtureSource::from_legacy(&conn);
+        for i in 0..5 {
+            f.add(&format!("Alpha.Movie.202{i}.1080p-X"), "alt.binaries.a", 10 + i, Some(HD));
+        }
+
+        let mut source = NativeFixtureSource::from_fixture(&f);
         let directory = f.dir.path().join("native.words");
         let budget = native::Budget { rows: 1, bytes: 512, commit_bytes: 512 };
         {
@@ -1216,7 +857,9 @@ mod tests {
         assert_eq!(source.queued.len(), 1);
         assert_eq!(index.drain_native(&mut source, native::Budget::default()).unwrap(), 1);
         assert!(source.queued.is_empty());
-        let hits = index.search_native(&mut source, "", None, &[], By::Newest, true, 0, 10, native::Budget::default()).unwrap();
+        let hits = index
+            .search_native(&mut source, "", None, &[], By::Newest, true, 0, 10, native::Budget::default())
+            .unwrap();
         assert_eq!(hits.rows.len(), 5);
         assert_eq!(ids(&hits).into_iter().collect::<std::collections::HashSet<_>>().len(), 5);
         assert_eq!(index.count_native(&mut source, "gamma", None, &[]).unwrap(), 1);
@@ -1226,7 +869,7 @@ mod tests {
     fn native_tantivy_cannot_mark_incomplete_source_coverage_ready() {
         let f = fixture();
         f.add("Alpha.Movie.2020.1080p-X", "alt.binaries.a", 10, Some(HD));
-        let mut source = NativeFixtureSource::from_legacy(&f.conn());
+        let mut source = NativeFixtureSource::from_fixture(&f);
         source.expected_extra = 1;
         let index = WordIndex::open_native(&f.dir.path().join("native.words"), [7; 32]).unwrap();
         assert!(index.build_native(&mut source, native::Budget::default(), || true).is_err());
@@ -1263,42 +906,6 @@ mod tests {
     }
 
     #[test]
-    fn a_build_cut_short_goes_on_from_its_last_commit() {
-        let f = fixture();
-        for i in 0..40 {
-            f.add(&format!("Show.S01E{i:02}.1080p.WEB-DL-G{i}"), &format!("alt.binaries.g{}", i % 5), 10, Some(HD));
-        }
-        let conn = f.conn();
-        {
-            let index = f.index();
-            let mut commits = 0;
-            let added = index
-                .build_in(&conn, 3, 6, || {
-                    commits += 1;
-                    commits < 2
-                })
-                .unwrap();
-            assert!(added > 0 && added < 40, "{added}");
-            assert!(!index.ready());
-        }
-        // the process restarts: a new index on the same folder, which isn't ready
-        let index = f.index();
-        assert!(!index.ready());
-        // an attempt that failed after adding some, past its last commit
-        let rows = read_rows(&conn, 0, "r.id > ?1 order by r.id limit 3", 0).unwrap();
-        for doc in index.docs(&rows) {
-            lock(&index.writer).as_mut().unwrap().add_document(doc).unwrap();
-        }
-        let rest = index.build_in(&conn, 3, 6, || true).unwrap();
-        assert!(rest < 40, "it went on rather than starting again: {rest}");
-        assert!(index.ready());
-        assert_eq!(index.count("show", None, &[]).unwrap(), 40, "each release once");
-        // a finished build starts again from nothing the next time it's asked for
-        assert_eq!(index.build(&conn).unwrap(), 40);
-        assert_eq!(index.count("show", None, &[]).unwrap(), 40);
-    }
-
-    #[test]
     fn a_search_sorts_every_match_and_counts_them() {
         let f = fixture();
         let old = f.add("Batman.Begins.2005.2160p.UHD.BluRay.REMUX-X", "alt.binaries.a", 61_000, Some(UHD));
@@ -1307,36 +914,66 @@ mod tests {
             newer.push(f.add(&format!("Batman.Show.S01E{i:02}.1080p.WEB-DL-Y"), "alt.binaries.b", 100 + i, Some(HD)));
         }
         f.add("Superman.2025.1080p.WEB-DL-Z", "alt.binaries.c", 99_000, Some(HD));
-        let index = f.index();
-        let conn = f.conn();
-        assert_eq!(index.build(&conn).unwrap(), 32);
+        let mut source = NativeFixtureSource::from_fixture(&f);
+        let index = WordIndex::open_native(&f.dir.path().join("native.words"), [7; 32]).unwrap();
+        assert_eq!(index.build_native(&mut source, native::Budget::default(), || true).unwrap().documents, 32);
         let movies = crate::category::parse_filter("2000").unwrap();
-        let hits = index.search(&conn, "batman", Some(&movies), &[], By::Size, true, 0, 3).unwrap();
+        let hits = index
+            .search_native(&mut source, "batman", Some(&movies), &[], By::Size, true, 0, 3, native::Budget::default())
+            .unwrap();
         assert_eq!(hits.total, 31);
         assert_eq!(ids(&hits), [old, newer[29], newer[28]]);
-        let up = index.search(&conn, "batman", Some(&movies), &[], By::Size, false, 29, 5).unwrap();
+        let up = index
+            .search_native(&mut source, "batman", Some(&movies), &[], By::Size, false, 29, 5, native::Budget::default())
+            .unwrap();
         assert_eq!(ids(&up), [newer[29], old], "the last page, past whatever a window held");
         // words from their start, any case, in any order
-        assert_eq!(index.count("BAT begins", None, &[]).unwrap(), 1);
-        assert_eq!(index.count("atman", None, &[]).unwrap(), 0);
+        assert_eq!(index.count_native(&mut source, "BAT begins", None, &[]).unwrap(), 1);
+        assert_eq!(index.count_native(&mut source, "atman", None, &[]).unwrap(), 0);
         // tags over all of them
-        let remux = index.search(&conn, "batman", None, &["Remux"], By::Relevance, true, 0, 10).unwrap();
+        let remux = index
+            .search_native(
+                &mut source,
+                "batman",
+                None,
+                &["Remux"],
+                By::Relevance,
+                true,
+                0,
+                10,
+                native::Budget::default(),
+            )
+            .unwrap();
         assert_eq!(ids(&remux), [old]);
-        assert_eq!(index.count("", Some(&movies), &["WEB-DL"]).unwrap(), 31);
+        assert_eq!(index.count_native(&mut source, "", Some(&movies), &["WEB-DL"]).unwrap(), 31);
         let uhd = crate::category::parse_filter("2045").unwrap();
-        assert_eq!(index.count("batman", Some(&uhd), &[]).unwrap(), 1);
+        assert_eq!(index.count_native(&mut source, "batman", Some(&uhd), &[]).unwrap(), 1);
         // with no words: a category's, every release's, and its newest filtered by tag over all of them
-        assert_eq!(index.count("", Some(&movies), &[]).unwrap(), 32);
-        assert_eq!(index.count("", Some(&uhd), &[]).unwrap(), 1);
-        assert_eq!(index.count("", None, &[]).unwrap(), 32);
-        let newest = index.search(&conn, "", Some(&movies), &["WEB-DL"], By::Newest, true, 0, 3).unwrap();
+        assert_eq!(index.count_native(&mut source, "", Some(&movies), &[]).unwrap(), 32);
+        assert_eq!(index.count_native(&mut source, "", Some(&uhd), &[]).unwrap(), 1);
+        assert_eq!(index.count_native(&mut source, "", None, &[]).unwrap(), 32);
+        let newest = index
+            .search_native(
+                &mut source,
+                "",
+                Some(&movies),
+                &["WEB-DL"],
+                By::Newest,
+                true,
+                0,
+                3,
+                native::Budget::default(),
+            )
+            .unwrap();
         assert_eq!((newest.total, newest.rows.len()), (31, 3));
         assert!(newest.rows.windows(2).all(|w| w[0].id > w[1].id), "newest first: {:?}", ids(&newest));
         // newest first among equals, and by name
-        let by_name = index.search(&conn, "show", None, &[], By::Name, false, 0, 2).unwrap();
+        let by_name = index
+            .search_native(&mut source, "show", None, &[], By::Name, false, 0, 2, native::Budget::default())
+            .unwrap();
         assert_eq!(ids(&by_name), [newer[0], newer[1]]);
         // words with nothing the index keeps match nothing here, and go to the database instead
-        assert_eq!(index.count("---", Some(&movies), &[]).unwrap(), 0);
+        assert_eq!(index.count_native(&mut source, "---", Some(&movies), &[]).unwrap(), 0);
         assert!(!searchable("---") && !searchable("") && !searchable(&"a".repeat(64)));
         assert!(searchable("batman 1080p") && searchable(&"a".repeat(63)));
         // a start too common to read every word of is the word alone: `bat` starts 31 releases' words and is none
@@ -1349,118 +986,31 @@ mod tests {
         assert_eq!(count_with("bat", 5), 0);
         assert_eq!(count_with("batman", 5), 31, "the word itself is still found");
         // past the deepest page: nothing, and the count still
-        let far = index.search(&conn, "batman", None, &[], By::Relevance, true, usize::MAX / 2, 50).unwrap();
+        let far = index
+            .search_native(
+                &mut source,
+                "batman",
+                None,
+                &[],
+                By::Relevance,
+                true,
+                usize::MAX / 2,
+                50,
+                native::Budget::default(),
+            )
+            .unwrap();
         assert!(far.rows.is_empty());
         assert_eq!(far.total, 31);
     }
 
     #[test]
-    #[ignore = "needs more than one shard; store::SHARDS is 1"]
-    fn a_drain_writes_one_shard_at_a_time() {
-        let f = fixture();
-        // alt.binaries.c is in shard 0, alt.binaries.b in shard 3
-        assert_eq!((store::shard_of("alt.binaries.c"), store::shard_of("alt.binaries.b")), (0, 3));
-        let index = f.index();
-        let conn = f.conn();
-        index.build(&conn).unwrap();
-        f.add("Gamma.Movie.2020.1080p-X", "alt.binaries.c", 5, Some(HD));
-        f.add("Delta.Movie.2021.1080p-X", "alt.binaries.b", 9, Some(HD));
-        let queued = |group: &str| -> i64 {
-            f.shard(group).query_row("select count(*) from word_queue", [], |r| r.get(0)).unwrap()
-        };
-        // shard 3's writer is in a save: the drain waits for it, and fails
-        let busy = f.shard("alt.binaries.b");
-        busy.execute_batch("begin immediate").unwrap();
-        conn.busy_timeout(Duration::ZERO).unwrap();
-        assert!(index.drain(&conn).is_err());
-        // shard 0 was done and committed before: its writer isn't kept waiting for shard 3's
-        assert_eq!((queued("alt.binaries.c"), queued("alt.binaries.b")), (0, 1));
-        let other = f.shard("alt.binaries.c");
-        other.busy_timeout(Duration::ZERO).unwrap();
-        other.execute_batch("begin immediate; commit").unwrap();
-        busy.execute_batch("commit").unwrap();
-        // the rest is taken in the next time
-        assert_eq!(index.drain(&conn).unwrap(), 1);
-        assert_eq!(queued("alt.binaries.b"), 0);
-        index.reader.reload().unwrap();
-        assert_eq!(index.count("delta", None, &[]).unwrap(), 1);
-        assert_eq!(index.count("gamma", None, &[]).unwrap(), 1);
-    }
-
-    #[test]
-    fn a_release_named_by_an_allocine_id_is_found_by_its_decoded_title() {
-        let f = fixture();
-        let index = f.index();
-        let conn = f.conn();
-        let group = "alt.binaries.r2d2";
-        let ac = f.add("AC317772.2026.MULTi.VFF.2160p.DV.WEB.H265-FRQC", group, 5, Some(UHD));
-        let plain = f.add("Other.Movie.2026.2160p.WEB.H265-FRQC", group, 5, Some(UHD));
-        let old = f.add("AC267335.2026.MULTi.1080p.WEB.H264-FRQC", group, 5, Some(HD));
-        index.build(&conn).unwrap();
-        assert_eq!(index.count("matchbox", None, &[]).unwrap(), 0);
-        // the media lookup's titles: one decoded, one cached as the id itself before ids were decoded
-        let media = crate::media::store::open(&crate::media::store::path_for(&f.main)).unwrap();
-        let title = |key: i64, title: &str, found: Option<&str>| crate::media::store::TitleRow {
-            key,
-            kind: 1,
-            title: title.into(),
-            found_title: found.map(str::to_string),
-            ..Default::default()
-        };
-        crate::media::store::put(&media, &title(11, "Matchbox: The Movie", Some("Matchbox the Movie"))).unwrap();
-        crate::media::store::put(&media, &title(22, "AC267335", None)).unwrap();
-        crate::media::store::put(&media, &title(33, "Coyote vs. Acme", None)).unwrap();
-        let shard = f.shard(group);
-        shard.execute("delete from word_queue", []).unwrap();
-        let link = "insert into media_release (release_id, kind, title_key, quality) values (?1, 1, ?2, 0)";
-        for (id, key) in [(ac, 11), (old, 22), (plain, 33)] {
-            shard.execute(link, [id, key]).unwrap();
-        }
-        let queued: Vec<i64> = shard
-            .prepare("select release_id from word_queue order by release_id")
-            .unwrap()
-            .query_map([], |r| r.get(0))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
-        assert_eq!(queued, vec![ac, old], "a release named by its title isn't read again for its media row");
-        index.drain(&conn).unwrap();
-        let found = |words: &str| ids(&index.search(&conn, words, None, &[], By::Relevance, true, 0, 10).unwrap());
-        assert_eq!(found("matchbox"), vec![ac]);
-        assert_eq!(found("matchbox movie 2160p"), vec![ac], "with the words of its name too");
-        assert_eq!(found("ac317772"), vec![ac], "and still by the id");
-        assert!(found("coyote").is_empty(), "a title is only added to a release named by an id");
-        // the ids found later queue it again, and a build reads the titles too
-        shard.execute("update media_release set tmdb_id = 1148365 where release_id = ?1", [ac]).unwrap();
-        let n: i64 = shard.query_row("select count(*) from word_queue", [], |r| r.get(0)).unwrap();
-        assert_eq!(n, 1);
-        crate::media::store::put(&media, &title(22, "AC267335", Some("Coyote vs. Acme"))).unwrap();
-        index.build(&conn).unwrap();
-        assert_eq!(found("matchbox"), vec![ac]);
-        assert_eq!(found("coyote acme"), vec![old]);
-    }
-
-    #[test]
     fn movies_and_episodes_come_before_every_other_match() {
         let f = fixture();
-        let index = f.index();
-        let conn = f.conn();
         let g = "alt.binaries.r2d2";
         // as prod has it: a film named by its AlloCiné id, found by the title it decodes to, among short album names
         // that have the word in their shown name too
         let film = f.add("AC317772.2026.MULTi.VFF.AD.2160p.HDR.DV.WEB.EAC3.5.1.Atmos.H265-FRQC", g, 5, Some(UHD));
-        let media = crate::media::store::open(&crate::media::store::path_for(&f.main)).unwrap();
-        let title = crate::media::store::TitleRow {
-            key: 11,
-            kind: 2,
-            title: "Matchbox: The Movie".into(),
-            found_title: Some("Matchbox: The Movie".into()),
-            ..Default::default()
-        };
-        crate::media::store::put(&media, &title).unwrap();
-        f.shard(g)
-            .execute("insert into media_release (release_id, kind, title_key, quality) values (?1, 2, 11, 0)", [film])
-            .unwrap();
+        f.set_known(film, "Matchbox: The Movie");
         let mut albums = Vec::new();
         for (name, category) in [
             ("Matchbox Twenty - Unwell", 3010),
@@ -1470,13 +1020,19 @@ mod tests {
             ("Matchbox Twenty - Matchbox Twenty Live", 3050),
         ] {
             let id = f.add(name, g, 5, Some(category));
-            f.shard(g).execute("update releases set display_name = name where id = ?1", [id]).unwrap();
+            f.set_display(id, name);
             albums.push(id);
         }
         let episode = f.add("Matchbox.Show.S01E02.Second.Episode.Title.1080p.WEB.H264-GRP", g, 5, Some(5040));
         let exact = f.add("Match.Point.Soundtrack.2005.MP3", g, 5, Some(3010));
-        index.build(&conn).unwrap();
-        let found = |words: &str| ids(&index.search(&conn, words, None, &[], By::Relevance, true, 0, 10).unwrap());
+        let mut source = NativeFixtureSource::from_fixture(&f);
+        let index = WordIndex::open_native(&f.dir.path().join("native.words"), [7; 32]).unwrap();
+        assert!(index.build_native(&mut source, native::Budget::default(), || true).unwrap().complete);
+        let mut found = |words: &str| {
+            ids(&index
+                .search_native(&mut source, words, None, &[], By::Relevance, true, 0, 10, native::Budget::default())
+                .unwrap())
+        };
         let first = found("matchbox");
         assert_eq!(first[..2].iter().copied().collect::<std::collections::HashSet<_>>(), [film, episode].into());
         assert_eq!(
@@ -1487,64 +1043,5 @@ mod tests {
         // among the others, the best match leads as before
         let other = found("match");
         assert_eq!(other.iter().position(|&id| id == exact), Some(2), "{other:?}");
-    }
-
-    #[test]
-    fn what_changes_is_taken_in_by_the_next_drain() {
-        let f = fixture();
-        let a = f.add("Alpha.Movie.2020.1080p-X", "alt.binaries.a", 5, Some(HD));
-        let index = f.index();
-        let conn = f.conn();
-        index.build(&conn).unwrap();
-        let b = f.add("Alpha.Other.2021.1080p-X", "alt.binaries.b", 9, None);
-        assert_eq!(index.drain(&conn).unwrap(), 1);
-        index.reader.reload().unwrap();
-        assert_eq!(index.count("alpha", None, &[]).unwrap(), 2);
-        let other = CatFilter { leaves: Vec::new(), uncategorized: true };
-        assert_eq!(ids(&index.search(&conn, "alpha", Some(&other), &[], By::Relevance, true, 0, 5).unwrap()), [b]);
-        // a new name, a category, a size, and a release gone
-        f.shard("alt.binaries.a")
-            .execute("update releases set display_name = 'Beta.Movie.2020.1080p-X', size = 50 where id = ?", [a])
-            .unwrap();
-        f.shard("alt.binaries.b").execute("insert into release_category values (?, ?)", [b, UHD]).unwrap();
-        index.drain(&conn).unwrap();
-        index.reader.reload().unwrap();
-        assert_eq!(index.count("beta", None, &[]).unwrap(), 1);
-        assert_eq!(index.count("alpha", Some(&crate::category::parse_filter("2045").unwrap()), &[]).unwrap(), 1);
-        f.shard("alt.binaries.b").execute("delete from releases where id = ?", [b]).unwrap();
-        index.drain(&conn).unwrap();
-        index.reader.reload().unwrap();
-        assert_eq!(index.count("alpha", None, &[]).unwrap(), 1, "Alpha.Movie is still in its first name");
-        assert_eq!(index.drain(&conn).unwrap(), 0, "the queue is empty");
-    }
-
-    #[test]
-    fn hidden_releases_are_left_out_and_a_new_version_starts_over() {
-        let f = fixture();
-        f.add("a8f3k2j4h5g6d7s8a9q0", "alt.binaries.a", 5, None);
-        let index = f.index();
-        let conn = f.conn();
-        assert_eq!(index.build(&conn).unwrap(), 0, "an obfuscated name without a real one isn't shown");
-        assert!(index.ready());
-        drop(index);
-        std::fs::write(f.dir.path().join("atlas.words").join("atlas-version"), "0").unwrap();
-        assert!(!f.index().ready(), "made by another version: built again");
-    }
-
-    #[test]
-    fn a_database_started_again_is_indexed_again() {
-        let f = fixture();
-        f.add("Alpha.Movie.2020.1080p", "alt.binaries.a", 5, None);
-        let index = f.index();
-        let conn = f.conn();
-        assert!(!index.built_from(&conn).unwrap(), "never built from it");
-        assert_eq!(index.build(&conn).unwrap(), 1);
-        assert!(index.built_from(&conn).unwrap());
-        drop(index);
-        let index = f.index();
-        assert!(index.ready() && index.built_from(&conn).unwrap(), "opened again: the same database");
-        // wiped and indexed again: release ids start over, and the token the build left is gone with it
-        conn.execute("delete from main.meta where key = 'word_index'", []).unwrap();
-        assert!(!index.built_from(&conn).unwrap(), "a new database: built again");
     }
 }

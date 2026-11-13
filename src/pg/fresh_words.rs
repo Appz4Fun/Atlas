@@ -141,3 +141,89 @@ mod group_search_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod shipping_cache_title_tests {
+    use super::*;
+    use crate::{
+        parser::{Article, Release},
+        pg::{self, Backend, StorageConfig},
+    };
+    use std::time::{Duration, Instant};
+
+    #[test]
+    #[ignore = "requires explicit isolated PostgreSQL source and original-owner admission"]
+    fn native_word_rows_use_only_applicable_decoded_pg_cache_titles() {
+        let schema = pg::testing::Schema::native_writer().expect("explicit isolated native PG schema");
+        let mut client = schema.pool.get().unwrap();
+        client.query_one("select pg_advisory_lock(hashtext('atlas.indexer'),hashtext($1))", &[&schema.name]).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let headers = crate::config::HeaderStoreConfig { enabled: true, dir: root.path().to_str().unwrap().into() };
+        let storage = StorageConfig {
+            backend: Backend::Postgres,
+            url: schema.url.clone(),
+            schema: schema.name.clone(),
+            max_connections: 4,
+            allow_plaintext: true,
+        };
+        let version = pg::migrate::version(&mut client, &schema.name).unwrap();
+        let _epoch = pg::stage::open_epoch(&mut client, &storage, &headers, version).unwrap();
+        let names =
+            ["AC317772.2026.MULTi.2160p.WEB-X", "AC267335.2026.MULTi.1080p.WEB-X", "Other.Movie.2026.2160p.WEB-X"];
+        let releases = names
+            .iter()
+            .enumerate()
+            .map(|(n, name)| Release {
+                name: (*name).into(),
+                group: "alt.binaries.word-cache".into(),
+                poster: "fixture".into(),
+                date: "Wed, 01 Jan 2020 00:00:00 +0000".into(),
+                articles: vec![Article {
+                    message_id: format!("word-cache-{n}@example.invalid"),
+                    subject: format!("\"file{n}.mkv\" yEnc (1/1)"),
+                    filename: Some(format!("file{n}.mkv")),
+                    part: Some(1),
+                    total_parts: Some(1),
+                    bytes: 64,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pg::release_writer::save(&mut client, &releases, 1).unwrap(),
+            pg::release_writer::SaveStats { releases: 3, files: 3, parts: 3 }
+        );
+        for (name, key, title, found) in [
+            (names[0], 11i64, "Matchbox: The Movie", Some("Matchbox the Movie")),
+            (names[1], 22i64, "AC267335", None),
+            (names[2], 33i64, "Coyote vs. Acme", Some("Coyote vs. Acme")),
+        ] {
+            let id: i64 = client.query_one("select id from releases where name=$1", &[&name]).unwrap().get(0);
+            client
+                .execute(
+                    "insert into ext_media_titles(title_key,kind,title,state,checked_mask,checked_at,found_title)
+                values($1,1,$2,1,0,1,$3)",
+                    &[&key, &title, &found],
+                )
+                .unwrap();
+            client
+                .execute("insert into media_release(release_id,kind,title_key,quality) values($1,1,$2,0)", &[&id, &key])
+                .unwrap();
+        }
+        let view = ReadView::open(
+            &mut client,
+            &schema.name,
+            super::super::fresh_reader::Budget { rows: 100, ..Default::default() },
+            Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap();
+        let mut source = Search::open(&view).unwrap();
+        let rows = source.build_page(0, Budget::default()).unwrap();
+        assert_eq!(rows.len(), 3);
+        let known = |name: &str| rows.iter().find(|row| row.name == name).unwrap().known_as.as_deref();
+        assert_eq!(known(names[0]), Some("Matchbox the Movie"));
+        assert_eq!(known(names[1]), None, "an undecoded AC identifier is not a title");
+        assert_eq!(known(names[2]), None, "a plain title never inherits an unrelated cache title");
+    }
+}
