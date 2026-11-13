@@ -1353,7 +1353,7 @@ async fn report(sched: Arc<Scheduler>) {
 }
 
 fn native_service_config_pin(native:bool,config:&Config,servers:&[UsenetServer],plan:&[(usize,usize)]) -> Option<crate::postprocess::native::ConfigPin> {
-    (native && (config.postprocess.enabled || config.predb.enabled)).then(||crate::postprocess::native::ConfigPin::capture(config,servers,plan))
+    native.then(||crate::postprocess::native::ConfigPin::capture(config,servers,plan))
 }
 
 /// Index with this set of servers until stopping, the config needs a rebuild
