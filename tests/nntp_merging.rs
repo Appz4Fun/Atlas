@@ -22,6 +22,8 @@ fn make_par2_packet(set_id: [u8; 16], kind: &[u8; 16], body: &[u8]) -> Vec<u8> {
     pkt.extend_from_slice(&set_id);
     pkt.extend_from_slice(kind);
     pkt.extend_from_slice(body);
+    let packet_md5 = md5::Md5::digest(&pkt[32..]);
+    pkt[16..32].copy_from_slice(&packet_md5);
     pkt
 }
 

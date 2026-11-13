@@ -5,6 +5,24 @@ use crate::archive::testkit::{
     r4_block, r4_file, r4_file_fields, r4_main, r5_block, r5_end, r5_file, r5_main, rar4, rar5, sz_wrap, vint,
 };
 
+#[test]
+fn aes_previews_remain_unauthenticated_even_when_all_plaintext_is_available() {
+    let (file, plain) = crate::archive::testkit::authenticated_aes_nzb();
+    let complete = unwrap_nzb_with_password(&file, Some("secret"));
+    assert_eq!(complete.inner.as_ref(), plain);
+    assert!(!complete.layers[0].unauthenticated);
+    for missing in [1, 10, 30] {
+        let preview = unwrap_nzb_with_password(&file[..file.len() - missing], Some("secret"));
+        assert!(!preview.inner.is_empty());
+        assert!(preview.layers[0].unauthenticated, "missing {missing}");
+        if missing <= 10 {
+            assert_eq!(preview.inner.as_ref(), plain);
+        } else {
+            assert!(plain.starts_with(&preview.inner));
+        }
+    }
+}
+
 /// The start of a Matroska file, then filler: what sits at the bottom of the chain.
 fn video() -> Vec<u8> {
     let mut v =

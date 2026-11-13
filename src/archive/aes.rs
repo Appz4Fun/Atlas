@@ -16,6 +16,11 @@ impl Aes {
     pub fn decrypt_block(&self, s: &mut [u8; 16]) {
         *s = self.0.decrypt_block(s);
     }
+
+    /// Decrypts complete CBC blocks in place, retaining the final ciphertext block in `iv`.
+    pub(crate) fn decrypt_cbc_in_place(&self, iv: &mut [u8; 16], data: &mut [u8]) {
+        self.0.decrypt_cbc_in_place(iv, data);
+    }
 }
 
 /// AES-CBC decryption over all complete 16-byte blocks in `data`.

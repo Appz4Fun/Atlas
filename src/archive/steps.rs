@@ -195,12 +195,41 @@ fn nzb_stored_in(listing: &Listing, body: &[u8], password: Option<&str>) -> Opti
         }
     }
     let unwrapped = crate::probe::nest::unwrap_nzb_with_password(body, password);
-    if !nzb::is_nzb(&unwrapped.inner) {
+    if unwrapped.layers.iter().any(|layer| layer.unauthenticated) || !nzb::is_nzb(&unwrapped.inner) {
         return None;
     }
     let inside = nzb::list(&unwrapped.inner);
     let pw = nzb::meta_password(&unwrapped.inner).or(name_pw);
     (!inside.files.is_empty()).then_some((inside, pw))
+}
+
+#[cfg(test)]
+mod winzip_authentication_tests {
+    use super::*;
+
+    #[test]
+    fn an_unauthenticated_aes_preview_cannot_supply_an_nzb_or_password() {
+        let (file, _) = crate::archive::testkit::authenticated_aes_nzb();
+        let listing = zip::list_head(&file);
+        let (inside, password) = nzb_stored_in(&listing, &file, Some("secret")).unwrap();
+        assert!(!inside.files.is_empty());
+        assert_eq!(password.as_deref(), Some("inner-secret"));
+        assert!(nzb_stored_in(&listing, &file, Some("wrong")).is_none());
+        let mut damaged = file.clone();
+        *damaged.last_mut().unwrap() ^= 1;
+        assert!(nzb_stored_in(&listing, &damaged, Some("secret")).is_none());
+        for missing in [1, 10, 30] {
+            let mut truncated = file[..file.len() - missing].to_vec();
+            assert!(nzb_stored_in(&listing, &truncated, Some("secret")).is_none(), "missing {missing}");
+            // The XML still starts correctly after a ciphertext change, but is not authenticated.
+            let data_at = 30 + b"Next.nzb".len() + 11 + 18;
+            truncated[data_at + b"<nzb><head><meta type=\"password\">".len() + 1] ^= 1;
+            let preview = crate::probe::nest::unwrap_nzb_with_password(&truncated, Some("secret"));
+            assert!(nzb::is_nzb(&preview.inner));
+            assert!(preview.layers[0].unauthenticated);
+            assert!(nzb_stored_in(&listing, &truncated, Some("secret")).is_none());
+        }
+    }
 }
 
 /// The NZB an archive of this release names inside, read whole from the release's own articles when the release is
