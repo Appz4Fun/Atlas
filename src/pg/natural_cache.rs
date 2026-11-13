@@ -87,6 +87,12 @@ fn read_scoped(
     client:&mut impl GenericClient,family:Family,key:Key<'_>,budget:Budget,exact:bool,scope:&str,
 ) -> Result<Option<Facts>> {
     let (byte_limit,row_limit,limit)=budget.checked()?;
+    let encoded_name;
+    let key = if matches!(family,Family::NfoPassword) {
+        ensure!(key.name.len()<=budget.bytes.saturating_sub(crate::raw_store::nfo_key::PREFIX.len())/2,"NFO natural name exceeds byte budget");
+        encoded_name=crate::raw_store::nfo_key::encode(key.name);
+        Key {name:&encoded_name,..key}
+    } else {key};
     if key.content_id.is_empty() {return Ok(None)}
     ensure!(key.name.len().checked_add(key.group.len()).and_then(|n|n.checked_add(key.content_id.len())).is_some_and(|n|n<=budget.bytes),"natural cache key exceeds byte budget");
     let (table,name,columns,order)=family.shape();
@@ -282,6 +288,11 @@ pub(crate) fn archive(client:&mut impl GenericClient,key:Key<'_>,parts:i64,compl
 // They neither acquire a connection nor commit/retry a partial result. The
 // canonical native owner/operation actor wraps this transaction and settles it.
 fn archive_current(tx:&mut postgres::Transaction<'_>,family:Family,key:Key<'_>)->Result<()> {
+    let encoded_name;
+    let key = if matches!(family,Family::NfoPassword) {
+        encoded_name=crate::raw_store::nfo_key::encode(key.name);
+        Key {name:&encoded_name,..key}
+    } else {key};
     let (table,name,_,_)=family.shape();
     let statement=tx.prepare(&format!("select * from {table} limit 0"))?;
     let descriptor=serde_json::to_string(&statement.columns().iter().map(|column|(column.name(),column.type_().name())).collect::<Vec<_>>())?;
@@ -340,8 +351,11 @@ pub(crate) fn put_probe(tx:&mut postgres::Transaction<'_>,record:&crate::raw_sto
 }
 
 pub(crate) fn put_nfo_password(tx:&mut postgres::Transaction<'_>,key:Key<'_>,password:&str,budget:Budget)->Result<()> {
-    write_budget(key,password.len(),1,budget)?;
+    ensure!(key.name.len()<=budget.bytes.saturating_sub(crate::raw_store::nfo_key::PREFIX.len())/2,"NFO natural name exceeds byte budget");
+    let encoded_name=crate::raw_store::nfo_key::encode(key.name);
+    write_budget(Key {name:&encoded_name,..key},password.len(),1,budget)?;
     archive_current(tx,Family::NfoPassword,key)?;
+    let key=Key {name:&encoded_name,..key};
     let n=tx.execute("insert into ext_raw_nfo_passwords(name,group_name,content_id,password) values($1,$2,$3,$4)
       on conflict(natural_name_key,natural_group_key) do update set content_id=excluded.content_id,password=excluded.password
       where ext_raw_nfo_passwords.name=excluded.name and ext_raw_nfo_passwords.group_name=excluded.group_name",
@@ -478,7 +492,7 @@ mod tests {
         client.batch_execute("insert into ext_raw_probes(name,group_name,content_id,info,parts,complete,config_stamp,probed_at) values
           ('Kept','a.cross',decode('0102','hex'),'cross',5,1,7,11),
           ('Kept','z.own',decode('0102','hex'),'own',4,0,1,13);
-          insert into ext_raw_nfo_passwords(name,group_name,content_id,password) values('Kept','a.cross',decode('0102','hex'),'');
+          insert into ext_raw_nfo_passwords(name,group_name,content_id,password) values('atlas.nfo-name.v1:4b657074','a.cross',decode('0102','hex'),'');
           insert into ext_raw_covers(name,group_name,content_id,mime,sha256) values('Kept','a.cross',decode('0102','hex'),'image/jpeg','cover')").unwrap();
         let key=Key {name:"Kept",group:"z.own",content_id:&[1,2]};
         assert!(probe(&mut *client,key,5,true,7,BUDGET).unwrap().is_none(),"stale own group does not borrow a different group's fresher result");
@@ -488,6 +502,52 @@ mod tests {
         assert_eq!(cross.info,"cross");assert_eq!(cross.nfo_password.as_deref(),Some(""));
         assert_eq!(cross.cover,Some(("image/jpeg".into(),"cover".into())));
         assert!(probe(&mut *client,Key {content_id:&[9],..key},1,false,0,BUDGET).unwrap().is_none());
+    }
+
+    #[test]
+    fn natural_nfo_codec_roundtrips_all_names_and_preserves_replaced_originals() {
+        let Some(schema)=crate::pg::testing::Schema::new() else {return};
+        let mut client=schema.pool.get().unwrap();
+        let names=["Kept","kept","Kept\0nzb","atlas.nfo-name.v1:4b657074","é\0nzb",""];
+        for name in names {
+            let key=Key {name,group:"g",content_id:&[1]};
+            let mut tx=client.transaction().unwrap();
+            put_nfo_password(&mut tx,key,"original",BUDGET).unwrap();tx.commit().unwrap();
+            assert_eq!(nfo_password(&mut *client,key,BUDGET).unwrap().as_deref(),Some("original"));
+            let encoded=crate::raw_store::nfo_key::encode(name);
+            let row=client.query_one("select name,password,content_id from ext_raw_nfo_passwords where name=$1",&[&encoded]).unwrap();
+            assert_eq!(crate::raw_store::nfo_key::decode(&row.get::<_,String>(0)).unwrap(),name);
+            assert_eq!(row.get::<_,String>(1),"original");assert_eq!(row.get::<_,Vec<u8>>(2),[1]);
+            let mut tx=client.transaction().unwrap();
+            put_nfo_password(&mut tx,Key {content_id:&[2],..key},"",BUDGET).unwrap();tx.commit().unwrap();
+            assert!(nfo_password(&mut *client,key,BUDGET).unwrap().is_none());
+            assert_eq!(nfo_password(&mut *client,Key {content_id:&[2],..key},BUDGET).unwrap().as_deref(),Some(""));
+            let row=client.query_one("select name,content_id,row_bytes from ext_preserved_cache_rows where family='ext_raw_nfo_passwords' and name=$1",&[&encoded]).unwrap();
+            assert_eq!(crate::raw_store::nfo_key::decode(&row.get::<_,String>(0)).unwrap(),name);
+            assert_eq!(row.get::<_,Vec<u8>>(1),[1]);
+            let original:serde_json::Value=serde_json::from_slice(&row.get::<_,Vec<u8>>(2)).unwrap();
+            assert_eq!(crate::raw_store::nfo_key::decode(original["name"].as_str().unwrap()).unwrap(),name);
+            assert_eq!(original["password"],"original");assert_eq!(original["content_id"],"\\x01");
+        }
+        assert_eq!(client.query_one("select count(*) from ext_raw_nfo_passwords",&[]).unwrap().get::<_,i64>(0),names.len() as i64);
+        assert_eq!(client.query_one("select count(*) from ext_preserved_cache_rows where family='ext_raw_nfo_passwords'",&[]).unwrap().get::<_,i64>(0),names.len() as i64);
+    }
+
+    #[test]
+    fn natural_nfo_codec_budget_and_database_failures_are_not_misses() {
+        let Some(schema)=crate::pg::testing::Schema::new() else {return};
+        let mut client=schema.pool.get().unwrap();
+        let name="n".repeat(3000);let key=Key {name:&name,group:"g",content_id:&[1]};
+        let budget=Budget {bytes:5000,rows:1};
+        assert!(nfo_password(&mut *client,key,budget).is_err(),"admit encoded name before allocation/query");
+        let mut tx=client.transaction().unwrap();assert!(put_nfo_password(&mut tx,key,"",budget).is_err());tx.rollback().unwrap();
+        assert_eq!(client.query_one("select count(*) from ext_raw_nfo_passwords",&[]).unwrap().get::<_,i64>(0),0);
+        client.batch_execute("drop table ext_raw_nfo_passwords").unwrap();
+        let key=Key {name:"Kept\0nzb",group:"g",content_id:&[1]};
+        let error=nfo_password(&mut *client,key,BUDGET).unwrap_err();
+        assert!(error.downcast_ref::<postgres::Error>().is_some());
+        let mut tx=client.transaction().unwrap();let error=put_nfo_password(&mut tx,key,"",BUDGET).unwrap_err();
+        assert!(error.downcast_ref::<postgres::Error>().is_some());tx.rollback().unwrap();
     }
 
     #[test]
