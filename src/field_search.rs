@@ -127,11 +127,14 @@ pub(crate) fn team_pattern(team: &str) -> String {
 }
 
 pub(crate) fn team_condition(name: &str, param: &str) -> String {
-    let shapes: Vec<String> = ["'%-'", "'%- '"]
+    let mut shapes: Vec<String> = ["'%-'", "'%- '"]
         .into_iter()
         .flat_map(|head| ["''", "'.%'", "' %'", "'[%'"].map(|tail| (head, tail)))
         .map(|(head, tail)| format!(r"{name} like {head} || {param} || {tail} escape '\'"))
         .collect();
+    // PTT also recognizes a leading [group]. Keep its closing bracket literal,
+    // so a team link cannot match a longer group sharing only that prefix.
+    shapes.push(format!(r"{name} like '[' || {param} || ']%' escape '\'"));
     format!("({})", shapes.join(" or "))
 }
 
