@@ -5,7 +5,6 @@ use std::time::{Duration, Instant};
 
 use crate::pg::sql::{Sql, vals};
 use anyhow::{Result, anyhow};
-use rusqlite::Connection;
 
 use crate::config::{DEFAULT_BATCH_SIZE, DEFAULT_REQUEST_SIZE};
 use crate::db;
@@ -342,21 +341,12 @@ impl Default for PassSettings {
 /// slices saved together in one transaction at most.
 const MAX_BATCH: usize = 32;
 
-/// The indexer's database, shared by every pass. Small writes (cursors) run on
-/// the main database's connection directly. Slices go to the writer thread of
-/// their group's shard (see store.rs); each saves whatever queued up for it
-/// while it was busy in one transaction, and the shards save in parallel.
+/// The indexer's checked PostgreSQL sessions, shared by every pass.
+/// Cursor writes and slice admission retain the original native destination.
 #[derive(Clone)]
 pub struct Db {
     conn: Arc<MainConnection>,
     native: Option<crate::pg::ingest::Native>,
-    saves: Vec<std::sync::mpsc::SyncSender<WriterJob>>,
-    /// each shard writer's lane for small jobs someone waits on (`on_writer_first`): read between saves, ahead of
-    /// both the saves and the stage work queued in `saves`
-    firsts: Vec<std::sync::mpsc::Sender<StageJob>>,
-    /// last field: dropping the final clone closes the queues above, then waits
-    /// for the writer threads to finish what they were doing
-    _writers: Arc<Writers>,
 }
 
 pub use crate::pg::ingest::PgWriteLimits;
@@ -364,7 +354,6 @@ pub use crate::pg::ingest::PgWriteLimits;
 impl Db {
     pub(crate) fn bind_native_cache_scope(&self) -> Result<Option<crate::pg::cache_actor::NativeCacheScope>> {
         match &*self.conn {
-            MainConnection::Sqlite(_) => Ok(None),
             MainConnection::OwnedPostgres(owner) => crate::pg::cache_actor::NativeCacheScope::bind(owner).map(Some),
             MainConnection::Postgres(_) => anyhow::bail!("cache commands require the fenced native owner"),
         }
@@ -378,7 +367,6 @@ impl Db {
 }
 
 enum MainConnection {
-    Sqlite(Mutex<Connection>),
     Postgres(Arc<crate::pg::Pool>),
     OwnedPostgres(Arc<crate::pg::indexer_runtime::Owner>),
 }
@@ -387,11 +375,6 @@ impl MainConnection {
     fn with_sql<T>(&self, f: impl FnOnce(&dyn Sql) -> Result<T>) -> Result<T> {
         let t = std::time::Instant::now();
         match self {
-            Self::Sqlite(conn) => {
-                let conn = conn.lock().map_err(|_| anyhow!("the database connection is poisoned"))?;
-                crate::profile::DB_WAIT.add_since(t);
-                f(&*conn)
-            }
             Self::Postgres(pool) => {
                 let conn = pool.get()?;
                 crate::profile::DB_WAIT.add_since(t);
@@ -415,8 +398,7 @@ pub(crate) fn owned_postgres_db(
     Ok(db)
 }
 
-/// Opt-in native indexer storage. The destination must already exist and be migrated; this never opens SQLite
-/// or creates a schema. Background services using SQLite-only stage callbacks still require their own port.
+/// Native indexer storage. The destination must already exist and be migrated; this never creates a schema.
 /// Call during synchronous startup or on a blocking thread, as with the synchronous PostgreSQL pool itself.
 pub fn shared_postgres_db(
     config: &crate::pg::StorageConfig,
@@ -444,9 +426,6 @@ pub fn shared_postgres_db(
     Ok(Db {
         conn: Arc::new(MainConnection::Postgres(pool.clone())),
         native: Some(crate::pg::ingest::Native::new(pool, limits)?),
-        saves: Vec::new(),
-        firsts: Vec::new(),
-        _writers: Arc::new(Writers(Vec::new())),
     })
 }
 
@@ -566,7 +545,6 @@ mod postgres_backend_tests {
         let db = shared_postgres_db(&config, &database, PgWriteLimits::default()).unwrap();
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
-            on_sqlite_db(&db, |_| panic!("PostgreSQL must not run SQLite schema upkeep")).await.unwrap();
             on_db(&db, |sql| Ok(crate::store::put_meta(sql, "native_indexer_test", 17)?)).await.unwrap();
             db.save(vec![Release {
                 name: "Example.Release".into(),
@@ -594,474 +572,35 @@ mod postgres_backend_tests {
         assert_eq!(conn.query_one("select count(*) from releases", &[]).unwrap().get::<_, i64>(0), 1);
         assert_eq!(conn.query_one("select count(*) from files", &[]).unwrap().get::<_, i64>(0), 1);
         assert_eq!(conn.query_one("select count(*) from segments", &[]).unwrap().get::<_, i64>(0), 1);
-        assert!(db.on_writer(0, "db.stage.test", Box::new(|_| panic!("SQLite stage work"))).is_err());
-        assert!(db.on_writer_first(0, "db.stage.test", Box::new(|_| panic!("SQLite stage work"))).is_err());
     }
-}
-
-/// The writer threads, joined when dropped.
-struct Writers(Vec<std::thread::JoinHandle<()>>);
-
-impl Drop for Writers {
-    fn drop(&mut self) {
-        for writer in self.0.drain(..) {
-            let _ = writer.join();
-        }
-    }
-}
-
-struct SaveJob {
-    releases: Vec<Release>,
-    /// what of them needs no database, worked out before the job reached the writer (`store::prepare`)
-    prepared: crate::store::Prepared,
-    done: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
-}
-
-/// a write of the processing stage's, in one transaction on the shard's writer
-pub(crate) type StageWork = Box<dyn FnOnce(&Connection) -> rusqlite::Result<()> + Send>;
-
-pub(crate) struct StageJob {
-    /// what the job is, for its own `atlas_function_duration_seconds` series (`db.stage.*`)
-    kind: &'static str,
-    work: StageWork,
-    done: std::sync::mpsc::SyncSender<std::result::Result<(), String>>,
-}
-
-enum WriterJob {
-    Save(SaveJob),
-    Stage(StageJob),
-    /// a job came in on the writer's `firsts` lane: wakes a writer waiting for work
-    Wake,
-}
-
-/// time a writer spends on stage work after each save, and with no save waiting
-const STAGE_BUDGET_BUSY: Duration = Duration::from_millis(25);
-const STAGE_BUDGET_IDLE: Duration = Duration::from_millis(200);
-/// While saves come in, stage work gets this much of a writer's time per second it spent saving, banked up to
-/// `STAGE_BANK` seconds. A stage job can take seconds and saves queue behind it: on prod the stage took about 80% of
-/// the writers' time while slices waited 88 s on average to be saved, with the unsaved headers budget full, and
-/// indexing waited for that budget.
-const STAGE_SHARE: f64 = 0.5;
-const STAGE_BANK: f64 = 10.0;
-/// with no save for this long, stage work runs as much as it likes
-const STAGE_QUIET: Duration = Duration::from_secs(1);
-
-/// `conn` is the main database. The writer threads end once every clone of
-/// the `Db` is gone, and the last clone to go waits for them.
-pub fn shared_db(conn: Connection) -> Db {
-    shared_db_idling(conn, Duration::from_secs(crate::store::SEAL_WALK_EVERY as u64))
-}
-
-/// `shared_db` whose writers, with nothing to save for `every`, look for
-/// files due to be sealed.
-fn shared_db_idling(conn: Connection, every: Duration) -> Db {
-    let main = conn.path().map(std::path::PathBuf::from).unwrap_or_else(crate::paths::database);
-    let ids = Arc::new(crate::store::Ids::new(&main));
-    let mut saves = Vec::new();
-    let mut firsts = Vec::new();
-    let mut writers = Vec::new();
-    for shard in 0..crate::store::SHARDS {
-        let (save, jobs) = std::sync::mpsc::sync_channel(4096);
-        let (first, first_jobs) = std::sync::mpsc::channel();
-        let (path, ids) = (crate::store::shard_path(&main, shard), ids.clone());
-        let handle = std::thread::Builder::new()
-            .name(format!("atlas-db-writer-{shard}"))
-            .spawn(move || writer(shard, &path, &ids, jobs, first_jobs, every))
-            .expect("couldnt start a db writer");
-        saves.push(save);
-        firsts.push(first);
-        writers.push(handle);
-    }
-    Db {
-        conn: Arc::new(MainConnection::Sqlite(Mutex::new(conn))),
-        native: None,
-        saves,
-        firsts,
-        _writers: Arc::new(Writers(writers)),
-    }
-}
-
-/// A shard's writer: saves what comes in, and between saves (or after
-/// `idle` with nothing to save) seals what is due and checkpoints.
-fn writer(
-    shard: usize,
-    path: &std::path::Path,
-    ids: &crate::store::Ids,
-    jobs: std::sync::mpsc::Receiver<WriterJob>,
-    first_jobs: std::sync::mpsc::Receiver<StageJob>,
-    idle: Duration,
-) {
-    use crate::profile::{LOAD, Load};
-    use std::sync::atomic::Ordering::Relaxed;
-    use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
-
-    let mut opened = db::open_shard(path).and_then(|conn| db::tune_for_writing(&conn).map(|_| conn));
-    // each save on disk when committed: the WAL is no longer checkpointed (and soo synced) after every save (#228),
-    // and the group cursors in atlas.db, which move once a save is committed, mustnt reach the disk before it
-    if let Ok(conn) = &opened
-        && let Err(e) = conn.execute_batch("pragma main.synchronous = full")
-    {
-        eprintln!("couldnt make the saves in {} synchronous: {e}", path.display());
-    }
-    // the frozen file, which only this writer has: without it nothing freezes and nothing thaws here
-    if let Ok(conn) = &opened
-        && let Err(e) = crate::frozen::attach(conn, path)
-    {
-        eprintln!("couldnt open the frozen file of {}: {e}", path.display());
-    }
-    let mut store = crate::store::ShardWriter::new(shard);
-    // a job taken off the queue to see if more were waiting
-    let mut next: Option<SaveJob> = None;
-    // stage work waits here, between saves
-    let mut stage: std::collections::VecDeque<StageJob> = Default::default();
-    let mut last_housekeeping = std::time::Instant::now();
-    // stage time owed while saves come in (see `STAGE_SHARE`), and when the last save was
-    let mut bank = 0.0f64;
-    let mut last_save: Option<std::time::Instant> = None;
-    // jobs from the `firsts` lane waiting to run: a few at a time between saves (`STAGE_BUDGET_BUSY`), outside stage
-    // work's share
-    let mut firsts: std::collections::VecDeque<StageJob> = Default::default();
-    // when the WAL is copied into the shard and starts over: by its size or age, not after every save (#228)
-    let mut checkpoints = db::Checkpoints::for_writer();
-
-    loop {
-        run_firsts(&mut opened, path, &first_jobs, &mut firsts);
-        let since_save = last_save.map_or(STAGE_QUIET, |t| t.elapsed());
-        let wait = if !firsts.is_empty() {
-            // the firsts lane has jobs left over from its last turn
-            Duration::ZERO
-        } else if stage.is_empty() {
-            // a writer with nothing to do wakes for idle freezing too, and does the rest of its housekeeping every `idle`
-            // (and for pruning the message-id index while its walk isnt resting)
-            let pruning = store.prune_ids_awake(chrono::Utc::now().timestamp());
-            if crate::frozen::idle_ticks_on() || pruning { idle.min(crate::frozen::IDLE_TICK_EVERY) } else { idle }
-        } else if bank > 0.0 || since_save >= STAGE_QUIET {
-            Duration::ZERO
-        } else {
-            // saves are coming and stage work has had its share: give a save the chance to come first
-            STAGE_QUIET - since_save
-        };
-        let first = match next.take() {
-            Some(job) => job,
-            None => match jobs.recv_timeout(wait) {
-                Ok(WriterJob::Save(job)) => job,
-                Ok(WriterJob::Stage(job)) => {
-                    stage.push_back(job);
-                    continue;
-                }
-                Ok(WriterJob::Wake) => continue,
-                // nothing to save: files still come due as they go stale
-                Err(RecvTimeoutError::Timeout) if stage.is_empty() && last_housekeeping.elapsed() < idle => {
-                    if let Ok(conn) = &mut opened {
-                        freeze_idle(conn, &mut store);
-                    }
-                    continue;
-                }
-                Err(RecvTimeoutError::Timeout) if stage.is_empty() => {
-                    if let Ok(conn) = &mut opened {
-                        housekeeping(conn, &mut store, &mut checkpoints, true, true, false, true);
-                    }
-                    last_housekeeping = std::time::Instant::now();
-                    continue;
-                }
-                Err(RecvTimeoutError::Timeout) => {
-                    let quiet = last_save.is_none_or(|t| t.elapsed() >= STAGE_QUIET);
-                    let spent = run_stage_jobs(&mut opened, path, &mut stage, Some(STAGE_BUDGET_IDLE));
-                    if !quiet {
-                        bank -= spent;
-                    }
-                    if last_housekeeping.elapsed() >= Duration::from_secs(1) {
-                        if let Ok(conn) = &mut opened {
-                            housekeeping(conn, &mut store, &mut checkpoints, true, false, false, false);
-                        }
-                        last_housekeeping = std::time::Instant::now();
-                    }
-                    continue;
-                }
-                Err(RecvTimeoutError::Disconnected) => break,
-            },
-        };
-        let mut batch = vec![first];
-        while batch.len() < MAX_BATCH {
-            match jobs.try_recv() {
-                Ok(WriterJob::Save(job)) => batch.push(job),
-                Ok(WriterJob::Stage(job)) => stage.push_back(job),
-                Ok(WriterJob::Wake) => {}
-                Err(_) => break,
-            }
-        }
-        LOAD.writer_queued.fetch_sub(batch.len() as u64, Relaxed);
-        // nobody waits for a slice whose pass was dropped (stopping): its
-        // cursor didnt move and its headers get fetched again, soo skip it
-        batch.retain(|job| !job.done.is_closed());
-        if batch.is_empty() {
-            continue;
-        }
-
-        let t = std::time::Instant::now();
-        let span = crate::metrics::span("db.save_batch");
-        let mut prepared = crate::store::Prepared::new();
-        for job in &mut batch {
-            prepared.extend(std::mem::take(&mut job.prepared));
-        }
-        let result = match &mut opened {
-            Ok(conn) => db::with_full_flush(conn, |conn| {
-                store.save_prepared(conn, ids, batch.iter().map(|job| job.releases.as_slice()), &prepared)
-            })
-            .and_then(|saved| saved)
-            .map_err(|e| e.to_string()),
-            Err(e) => Err(format!("couldnt open {}: {e}", path.display())),
-        };
-        if result.is_err() {
-            span.failed();
-        }
-        drop(span);
-        Load::add_since(&LOAD.writer_busy_ns, t);
-        LOAD.writer_batches.fetch_add(1, Relaxed);
-        LOAD.writer_slices.fetch_add(batch.len() as u64, Relaxed);
-
-        // the whole batch rolled back on an error, every slice in it failed.
-        // the save is committed by now: the slices dont wait for the housekeeping
-        let saved = result.is_ok();
-        for job in batch {
-            let _ = job.done.send(result.clone());
-        }
-        bank = (bank + t.elapsed().as_secs_f64() * STAGE_SHARE).min(STAGE_BANK);
-        last_save = Some(std::time::Instant::now());
-        run_firsts(&mut opened, path, &first_jobs, &mut firsts);
-        if bank > 0.0 {
-            bank -= run_stage_jobs(&mut opened, path, &mut stage, Some(STAGE_BUDGET_BUSY));
-        }
-
-        // housekeeping between transactions
-        if let Ok(conn) = &mut opened {
-            // more slices waiting: saving them comes first. a closed queue
-            // means the indexer is stopping, it waits for this thread
-            let mut seal = saved;
-            loop {
-                match jobs.try_recv() {
-                    Ok(WriterJob::Save(job)) => {
-                        next = Some(job);
-                        seal = false;
-                        break;
-                    }
-                    Ok(WriterJob::Stage(job)) => stage.push_back(job),
-                    Ok(WriterJob::Wake) => {}
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        seal = false;
-                        break;
-                    }
-                }
-            }
-            // nothing came in meanwhile and no stage work waits: the writer would sit idle
-            let idle = next.is_none() && stage.is_empty() && saved;
-            housekeeping(conn, &mut store, &mut checkpoints, seal, idle, next.is_some(), false);
-            last_housekeeping = std::time::Instant::now();
-        }
-    }
-    // stopping: whoever queued these is told
-    firsts.extend(first_jobs.try_iter());
-    run_stage_jobs(&mut opened, path, &mut firsts, None);
-    run_stage_jobs(&mut opened, path, &mut stage, None);
-}
-
-/// The `firsts` lane's jobs, in the order they came, for at most `STAGE_BUDGET_BUSY`; the rest wait for the next turn,
-/// which comes between saves or when the writer next looks for work.
-fn run_firsts(
-    opened: &mut rusqlite::Result<Connection>,
-    path: &std::path::Path,
-    lane: &std::sync::mpsc::Receiver<StageJob>,
-    firsts: &mut std::collections::VecDeque<StageJob>,
-) {
-    firsts.extend(lane.try_iter());
-    if !firsts.is_empty() {
-        run_stage_jobs(opened, path, firsts, Some(STAGE_BUDGET_BUSY));
-    }
-}
-
-/// Stage jobs, each in one transaction, for at most `budget` (None: all of them). Returns the seconds they took.
-fn run_stage_jobs(
-    opened: &mut rusqlite::Result<Connection>,
-    path: &std::path::Path,
-    stage: &mut std::collections::VecDeque<StageJob>,
-    budget: Option<Duration>,
-) -> f64 {
-    use crate::profile::{LOAD, Load};
-    use std::sync::atomic::Ordering::Relaxed;
-
-    let start = std::time::Instant::now();
-    while let Some(job) = stage.pop_front() {
-        let t = std::time::Instant::now();
-        let span = crate::metrics::span("db.stage_transaction");
-        let by_kind = crate::metrics::span(job.kind);
-        let result = match opened {
-            Ok(conn) => stage_transaction(conn, job.work).map_err(|e| e.to_string()),
-            Err(e) => Err(format!("couldnt open {}: {e}", path.display())),
-        };
-        if result.is_err() {
-            span.failed();
-            by_kind.failed();
-        }
-        drop((span, by_kind));
-        let _ = job.done.send(result);
-        Load::add_since(&LOAD.writer_stage_ns, t);
-        Load::add_since(&LOAD.writer_busy_ns, t);
-        LOAD.writer_stage_jobs.fetch_add(1, Relaxed);
-        if budget.is_some_and(|b| start.elapsed() >= b) {
-            break;
-        }
-    }
-    start.elapsed().as_secs_f64()
-}
-
-fn stage_transaction(conn: &Connection, work: StageWork) -> rusqlite::Result<()> {
-    conn.execute_batch("begin immediate")?;
-    match work(conn) {
-        Ok(()) => conn.execute_batch("commit"),
-        Err(e) => {
-            let _ = conn.execute_batch("rollback");
-            Err(e)
-        }
-    }
-}
-
-/// The idle freezing and pruning steps of `housekeeping`, for a writer woken with nothing to do between its
-/// housekeepings.
-fn freeze_idle(conn: &mut Connection, store: &mut crate::store::ShardWriter) {
-    let t = std::time::Instant::now();
-    // (this wake may be the pruning walk's alone, with freezing's idle ticks off)
-    if crate::frozen::idle_ticks_on() {
-        let span = crate::metrics::span("db.freeze");
-        if let Err(e) = store.freezer.tick_idle(conn, chrono::Utc::now().timestamp()) {
-            span.failed();
-            eprintln!("freezing in shard {} failed: {e}", store.shard);
-        }
-        drop(span);
-    }
-    prune_ids(conn, store, true, false);
-    // the writer's time like any other housekeeping's
-    crate::profile::Load::add_since(&crate::profile::LOAD.writer_busy_ns, t);
-}
-
-/// A pruning step of quiet releases' message-id index, when one is due (`ShardWriter::prune_ids_some`).
-fn prune_ids(conn: &mut Connection, store: &mut crate::store::ShardWriter, idle: bool, queued: bool) {
-    let now = chrono::Utc::now().timestamp();
-    if store.prune_ids_due(now, idle, queued) {
-        let span = crate::metrics::span("db.prune_ids");
-        if let Err(e) = store.prune_ids_some(conn, now, idle, queued) {
-            span.failed();
-            eprintln!("pruning release_ids in shard {} failed: {e}", store.shard);
-        }
-        drop(span);
-    }
-}
-
-/// A writer's work between saves: seal some of what is due (when `seal`),
-/// and copy the WAL into the shard once `checkpoints` says it is due.
-/// `idle`: nothing waits for the writer, soo freezing may take longer (`frozen::Ticker::tick_idle`).
-/// `queued`: another save is waiting already. `nothing_to_save`: the writer woke with nothing to do.
-fn housekeeping(
-    conn: &mut Connection,
-    store: &mut crate::store::ShardWriter,
-    checkpoints: &mut db::Checkpoints,
-    seal: bool,
-    idle: bool,
-    queued: bool,
-    nothing_to_save: bool,
-) {
-    use crate::profile::{LOAD, Load};
-    use std::sync::atomic::Ordering::Relaxed;
-
-    let t = std::time::Instant::now();
-    if seal {
-        let sealing = std::time::Instant::now();
-        let span = crate::metrics::span("db.seal");
-        if store.seal_some(conn, chrono::Utc::now().timestamp()).is_err() {
-            span.failed();
-            LOAD.writer_seal_errors.fetch_add(1, Relaxed);
-        }
-        drop(span);
-        Load::add_since(&LOAD.writer_seal_ns, sealing);
-    }
-    // what the freezing rules queued, a little at a time (`frozen::Ticker`)
-    let span = crate::metrics::span("db.freeze");
-    let now = chrono::Utc::now().timestamp();
-    let ticked = if idle { store.freezer.tick_idle(conn, now) } else { store.freezer.tick(conn, now) };
-    if let Err(e) = ticked {
-        span.failed();
-        eprintln!("freezing in shard {} failed: {e}", store.shard);
-    }
-    drop(span);
-    // the index of quiet releases' message-ids, a cache that is made again when needed (`ShardWriter::prune_ids_some`);
-    // with more saves queued only a short step now and then
-    // the bigger idle steps only on a writer with nothing to save (here or in `freeze_idle`): after a save another
-    // may come any moment
-    prune_ids(conn, store, nothing_to_save, queued);
-    // the shared catalog's sent changes, as far as Postgres has them (`shared_catalog::prune_acked`)
-    let span = crate::metrics::span("db.catalog_prune");
-    if crate::shared_catalog::prune_acked(conn).is_err() {
-        span.failed();
-    }
-    drop(span);
-    let checkpointing = std::time::Instant::now();
-    let span = crate::metrics::span("db.checkpoint");
-    if checkpoints.checkpoint_if_due(conn).is_err() {
-        span.failed();
-    }
-    drop(span);
-    Load::add_since(&LOAD.writer_checkpoint_ns, checkpointing);
-    Load::add_since(&LOAD.writer_busy_ns, t);
 }
 
 impl Db {
-    pub(crate) fn check_native_owner(&self,owner:&Arc<crate::pg::indexer_runtime::Owner>)->Result<()> {
-        anyhow::ensure!(matches!(&*self.conn,MainConnection::OwnedPostgres(actual) if Arc::ptr_eq(actual,owner)),"native service requires its original Db owner");
-        self.native.as_ref().ok_or_else(||anyhow!("native service requires native writer admission"))?.check_native_owner(owner)
+    pub(crate) fn check_native_owner(&self, owner: &Arc<crate::pg::indexer_runtime::Owner>) -> Result<()> {
+        anyhow::ensure!(
+            matches!(&*self.conn,MainConnection::OwnedPostgres(actual) if Arc::ptr_eq(actual,owner)),
+            "native service requires its original Db owner"
+        );
+        self.native
+            .as_ref()
+            .ok_or_else(|| anyhow!("native service requires native writer admission"))?
+            .check_native_owner(owner)
     }
 
-    pub(crate) async fn reserve_native_for_owner(&self,owner:&Arc<crate::pg::indexer_runtime::Owner>)->Result<crate::pg::ingest::NativeSavePermit> {
+    pub(crate) async fn reserve_native_for_owner(
+        &self,
+        owner: &Arc<crate::pg::indexer_runtime::Owner>,
+    ) -> Result<crate::pg::ingest::NativeSavePermit> {
         self.check_native_owner(owner)?;
-        self.native.as_ref().ok_or_else(||anyhow!("native service requires native writer admission"))?.reserve_native_for_owner(owner).await
+        self.native
+            .as_ref()
+            .ok_or_else(|| anyhow!("native service requires native writer admission"))?
+            .reserve_native_for_owner(owner)
+            .await
     }
 
     pub(crate) fn is_native(&self) -> bool {
         self.native.is_some()
-    }
-
-    /// Run `work` in one transaction on `shard`'s writer, between saves. The
-    /// answer comes when it has committed; jobs queued when the writer stops still run.
-    /// `kind` (`db.stage.*`) times it apart from the other kinds: one job can hold the writer for minutes.
-    pub(crate) fn on_writer(
-        &self,
-        shard: usize,
-        kind: &'static str,
-        work: StageWork,
-    ) -> Result<std::sync::mpsc::Receiver<std::result::Result<(), String>>> {
-        anyhow::ensure!(self.native.is_none(), "SQLite stage work is unavailable on native PostgreSQL storage");
-        let (done, answer) = std::sync::mpsc::sync_channel(1);
-        self.saves[shard]
-            .send(WriterJob::Stage(StageJob { kind, work, done }))
-            .map_err(|_| anyhow!("db writer stopped"))?;
-        Ok(answer)
-    }
-
-    /// `on_writer` for a small job someone waits on. It comes in on the writer's own lane, so it waits neither behind
-    /// the saves queued before it nor behind the stage work: the writer runs such jobs between saves, a few at a time
-    /// (`STAGE_BUDGET_BUSY`), outside stage work's share. Never blocks. Behind a backlog of processing work an
-    /// ordinary job waited minutes on prod.
-    pub(crate) fn on_writer_first(
-        &self,
-        shard: usize,
-        kind: &'static str,
-        work: StageWork,
-    ) -> Result<std::sync::mpsc::Receiver<std::result::Result<(), String>>> {
-        anyhow::ensure!(self.native.is_none(), "SQLite stage work is unavailable on native PostgreSQL storage");
-        let (done, answer) = std::sync::mpsc::sync_channel(1);
-        self.firsts[shard].send(StageJob { kind, work, done }).map_err(|_| anyhow!("db writer stopped"))?;
-        // a writer waiting for work wakes; a full queue means it's busy, and looks at the lane between saves anyway
-        let _ = self.saves[shard].try_send(WriterJob::Wake);
-        Ok(answer)
     }
 
     pub(crate) async fn save_native_at(&self, releases: Vec<Release>, logical_now: i64) -> Result<()> {
@@ -1069,51 +608,14 @@ impl Db {
         native.save_at(releases, logical_now).await
     }
 
-    /// Save one slice's releases. Returns once they are committed. Dropping
-    /// the future before the writer gets to the slice drops the slice too
-    /// (its pass didnt finish, soo the cursor didnt move past it); once the
-    /// writer has it, it gets saved.
+    /// Save one slice through the checked native admission queue and wait for its commit.
     pub(crate) async fn save(&self, releases: Vec<Release>) -> Result<()> {
-        if let Some(native) = &self.native {
-            return native.save(releases).await;
-        }
-        let prepared = crate::store::prepare(&releases);
-        self.save_prepared(releases, prepared).await
+        self.native
+            .as_ref()
+            .ok_or_else(|| anyhow!("slice saves require native PostgreSQL storage"))?
+            .save(releases)
+            .await
     }
-
-    /// `save`, with what of the releases needs no database worked out already (`store::prepare`, on a parse thread):
-    /// the writer is what limits saving. The job is queued before the first await, soo a dropped future after that
-    /// still has its slice saved.
-    pub(crate) async fn save_prepared(&self, releases: Vec<Release>, prepared: crate::store::Prepared) -> Result<()> {
-        if let Some(native) = &self.native {
-            drop(prepared);
-            return native.save(releases).await;
-        }
-        // a slice is one group, soo one shard
-        let Some(shard) = releases.first().map(|r| crate::store::shard_of(&r.group)) else { return Ok(()) };
-        let (done, saved) = tokio::sync::oneshot::channel();
-        crate::profile::LOAD.writer_queued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if self.saves[shard].send(WriterJob::Save(SaveJob { releases, prepared, done })).is_err() {
-            crate::profile::LOAD.writer_queued.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            return Err(anyhow!("db writer stopped"));
-        }
-        saved.await.map_err(|_| anyhow!("db writer stopped"))?.map_err(|e| anyhow!("saving releases: {e}"))
-    }
-}
-
-/// Schema upkeep of a main database on SQLite (tables added since it was made); on Postgres the migrations made
-/// them, soo there's nothing to do.
-pub(crate) async fn on_sqlite_db(db: &Db, f: impl FnOnce(&Connection) -> Result<()> + Send + 'static) -> Result<()> {
-    let conn = db.conn.clone();
-    tokio::task::spawn_blocking(move || match &*conn {
-        MainConnection::Sqlite(conn) => {
-            let conn = conn.lock().map_err(|_| anyhow!("the database connection is poisoned"))?;
-            f(&conn)
-        }
-        MainConnection::Postgres(_) | MainConnection::OwnedPostgres(_) => Ok(()),
-    })
-    .await
-    .map_err(|e| anyhow!("db task failed: {e}"))?
 }
 
 /// Native database work shares the already-validated indexer session.
@@ -1124,7 +626,6 @@ fn native_db_work<T>(db: &Db, work: impl FnOnce(&mut postgres::Client) -> Result
             work(&mut conn)
         }
         MainConnection::OwnedPostgres(owner) => owner.with(work),
-        MainConnection::Sqlite(_) => anyhow::bail!("native database work requires PostgreSQL"),
     }
 }
 
@@ -2038,7 +1539,6 @@ impl Drop for GiveBackOnDrop<'_> {
             return;
         }
         let conn = self.db.conn.clone();
-        let postgres = !matches!(&*conn, MainConnection::Sqlite(_));
         let claim = self.chunk.clone();
         let release = move || {
             if let Err(e) = conn.with_sql(|conn| Ok(crate::chunks::release(conn, &claim)?)) {
@@ -2048,9 +1548,7 @@ impl Drop for GiveBackOnDrop<'_> {
         };
         // Cancellation drops this guard on an async worker. PostgreSQL's synchronous client must never run
         // there; owned state also lets cleanup finish after the cancelled pass has released its Db clone.
-        if !postgres {
-            release();
-        } else if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn_blocking(release);
         } else {
             release();
@@ -2935,7 +2433,6 @@ async fn parse_and_save(
     let t = std::time::Instant::now();
     let parsing = {
         let group = group.to_string();
-        let prepare_sqlite = db.native.is_none();
         move || {
             let _span = crate::metrics::span("indexer.parse_slice");
             // articles whose every subject is random are left to the header store's linker (`xref::hold`)
@@ -2944,13 +2441,10 @@ async fn parse_and_save(
             let mut releases: Vec<Release> =
                 crate::collections::group_articles(&group, articles).into_values().collect();
             releases.extend(uploads);
-            // what the writer would otherwise work out itself (the articles dont move from here on)
-            let prepared =
-                if prepare_sqlite { crate::store::prepare(&releases) } else { crate::store::Prepared::new() };
-            anyhow::Ok((releases, skipped, prepared))
+            anyhow::Ok((releases, skipped))
         }
     };
-    let (mut releases, skipped, prepared) =
+    let (mut releases, skipped) =
         tokio::task::spawn_blocking(parsing).await.map_err(|e| anyhow!("parse task failed: {e}"))??;
     crate::profile::PARSE.add_since(t);
     crate::profile::Load::add_since(&crate::profile::LOAD.parse_ns, t);
@@ -2981,7 +2475,7 @@ async fn parse_and_save(
     let count = releases.len() as i64;
     {
         let span = crate::metrics::span("indexer.wait_for_save");
-        let saved = db.save_prepared(releases, prepared).await;
+        let saved = db.save(releases).await;
         if saved.is_err() {
             span.failed();
         }
@@ -3067,7 +2561,7 @@ pub struct Indexer {
 }
 
 impl Indexer {
-    pub fn new(client: BlockingPool, mode: &str, conn: Connection) -> Self {
+    pub fn new(client: BlockingPool, mode: &str, db: Db) -> Self {
         let defaults = PassSettings::default();
         Indexer {
             client,
@@ -3080,7 +2574,7 @@ impl Indexer {
             batch_size: defaults.batch_size,
             request_size: defaults.request_size,
             stop: Arc::new(AtomicBool::new(false)),
-            db: shared_db(conn),
+            db,
         }
     }
 
@@ -3149,6 +2643,24 @@ impl Indexer {
 mod tests {
     use super::*;
     use crate::parser::Article;
+
+    fn native_fixture() -> Option<(crate::pg::testing::Schema, Db)> {
+        let schema = crate::pg::testing::Schema::native_writer()?;
+        let database: String = schema.pool.get().unwrap().query_one("select current_database()", &[]).unwrap().get(0);
+        let db = shared_postgres_db(
+            &crate::pg::StorageConfig {
+                backend: crate::pg::Backend::Postgres,
+                url: schema.url.clone(),
+                schema: schema.name.clone(),
+                allow_plaintext: true,
+                ..Default::default()
+            },
+            &database,
+            PgWriteLimits::default(),
+        )
+        .unwrap();
+        Some((schema, db))
+    }
 
     #[test]
     fn a_refused_slice_is_passed_over_only_after_an_hour_and_three_refusals() {
@@ -3275,15 +2787,14 @@ mod tests {
 
     #[test]
     fn each_speculative_window_has_to_hold_enough_on_its_own() {
+        let Some((schema, db)) = native_fixture() else { return };
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
-        rt.block_on(each_speculative_window());
+        rt.block_on(each_speculative_window(&db));
+        drop(db);
+        drop(schema);
     }
 
-    async fn each_speculative_window() {
-        let dir = tempfile::tempdir().unwrap();
-        let main = dir.path().join("atlas.db");
-        db::create_db_at(&main).unwrap();
-        let db = shared_db(db::open_at(&main).unwrap());
+    async fn each_speculative_window(db: &Db) {
         let (r, g) = (20_000, "g");
         let start = crate::chunks::Speculative { runner_up_day: r, reach: SPECULATIVE_WINDOW, days: 0, articles: 0 };
         on_db(&db, move |c| Ok(crate::chunks::set_speculative(c, g, &start)?)).await.unwrap();
@@ -3301,15 +2812,14 @@ mod tests {
 
     #[test]
     fn a_speculative_window_is_judged_once_every_day_of_it_is_done() {
+        let Some((schema, db)) = native_fixture() else { return };
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
-        rt.block_on(a_window_judged_when_done());
+        rt.block_on(a_window_judged_when_done(&db));
+        drop(db);
+        drop(schema);
     }
 
-    async fn a_window_judged_when_done() {
-        let dir = tempfile::tempdir().unwrap();
-        let main = dir.path().join("atlas.db");
-        db::create_db_at(&main).unwrap();
-        let db = shared_db(db::open_at(&main).unwrap());
+    async fn a_window_judged_when_done(db: &Db) {
         let (r, g) = (20_000, "g");
         let floor = r - SPECULATIVE_WINDOW;
         let start = crate::chunks::Speculative { runner_up_day: r, reach: SPECULATIVE_WINDOW, days: 0, articles: 0 };
@@ -3347,15 +2857,14 @@ mod tests {
 
     #[test]
     fn a_chunk_taken_over_leaves_the_older_days_and_the_window_alone() {
+        let Some((schema, db)) = native_fixture() else { return };
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
-        rt.block_on(a_chunk_taken_over());
+        rt.block_on(a_chunk_taken_over(&db));
+        drop(db);
+        drop(schema);
     }
 
-    async fn a_chunk_taken_over() {
-        let dir = tempfile::tempdir().unwrap();
-        let main = dir.path().join("atlas.db");
-        db::create_db_at(&main).unwrap();
-        let db = shared_db(db::open_at(&main).unwrap());
+    async fn a_chunk_taken_over(db: &Db) {
         let (r, g) = (20_000, "g");
         let floor = r - SPECULATIVE_WINDOW;
         let start = crate::chunks::Speculative { runner_up_day: r, reach: SPECULATIVE_WINDOW, days: 0, articles: 0 };
@@ -3436,10 +2945,8 @@ mod tests {
 
     #[test]
     fn cursors_saved_under_a_servers_old_key_are_adopted_once() {
-        let dir = tempfile::tempdir().unwrap();
-        let main = dir.path().join("atlas.db");
-        db::create_db_at(&main).unwrap();
-        let conn = db::open_at(&main).unwrap();
+        let Some(schema) = crate::pg::testing::Schema::new() else { return };
+        let conn = crate::pg::sql::Pg::new(schema.pool.get().unwrap());
         let state = db::GroupState { live_cursor: 900, backfill_cursor: 500 };
         db::save_group_state(&conn, "g@x@a.example:563", state).unwrap();
         let legacy = ["a.example:563".to_string(), "x@a.example:563".to_string()];
@@ -3457,10 +2964,8 @@ mod tests {
     /// before it doesnt hand them to the new one
     #[test]
     fn plain_cursors_stay_with_the_server_that_kept_them() {
-        let dir = tempfile::tempdir().unwrap();
-        let main = dir.path().join("atlas.db");
-        db::create_db_at(&main).unwrap();
-        let conn = db::open_at(&main).unwrap();
+        let Some(schema) = crate::pg::testing::Schema::new() else { return };
+        let conn = crate::pg::sql::Pg::new(schema.pool.get().unwrap());
         let state = db::GroupState { live_cursor: 900, backfill_cursor: 500 };
         db::save_group_state(&conn, "g", state).unwrap();
 
@@ -3483,8 +2988,8 @@ mod tests {
         assert_eq!(adopted(1), Some(state), "the old one keeps its place");
 
         // plain cursors from before anyone was recorded, with two servers: no one's
-        db::create_db_at(&dir.path().join("other.db")).unwrap();
-        let conn2 = db::open_at(&dir.path().join("other.db")).unwrap();
+        let schema2 = crate::pg::testing::Schema::new().unwrap();
+        let conn2 = crate::pg::sql::Pg::new(schema2.pool.get().unwrap());
         db::save_group_state(&conn2, "g", state).unwrap();
         claim_plain_cursors(&conn2, &both).unwrap();
         for i in 0..2 {
@@ -3559,77 +3064,6 @@ mod tests {
     }
 
     #[test]
-    fn a_slice_nobody_waits_for_isnt_saved() {
-        let dir = tempfile::tempdir().unwrap();
-        let main = dir.path().join("atlas.db");
-        db::create_db_at(&main).unwrap();
-        let shared = shared_db(db::open_at(&main).unwrap());
-        let release = |name: &str| Release {
-            name: name.into(),
-            group: "alt.binaries.t".into(),
-            articles: vec![crate::parser::Article { message_id: format!("<{name}@x>"), ..Default::default() }],
-            ..Default::default()
-        };
-
-        // a pass that was dropped while stopping: nobody waits for its slice
-        let (done, gone) = tokio::sync::oneshot::channel();
-        drop(gone);
-        crate::profile::LOAD.writer_queued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let shard = crate::store::shard_of("alt.binaries.t");
-        shared.saves[shard]
-            .send(WriterJob::Save(SaveJob { releases: vec![release("dropped")], prepared: Default::default(), done }))
-            .unwrap();
-        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
-        rt.block_on(shared.save(vec![release("kept")])).unwrap();
-        drop(shared);
-
-        let conn = db::open_with_shards(&main).unwrap();
-        let names: Vec<String> = conn
-            .prepare("select name from releases")
-            .unwrap()
-            .query_map([], |r| r.get(0))
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect();
-        assert_eq!(names, vec!["kept".to_string()]);
-    }
-
-    #[test]
-    fn an_idle_writer_still_seals_what_is_due() {
-        let dir = tempfile::tempdir().unwrap();
-        let main = dir.path().join("atlas.db");
-        db::create_db_at(&main).unwrap();
-        // one part of two, untouched for long: due though never completed
-        let part = crate::parser::Article {
-            message_id: "<a1@x>".into(),
-            subject: "\"a.rar\" yEnc (1/2)".into(),
-            filename: Some("a.rar".into()),
-            part: Some(1),
-            total_parts: Some(2),
-            bytes: 10,
-            ..Default::default()
-        };
-        let release =
-            Release { name: "Rel".into(), group: "alt.binaries.t".into(), articles: vec![part], ..Default::default() };
-        crate::store::save(&main, &[release]).unwrap();
-        let shard = db::open_at(&crate::store::shard_path(&main, crate::store::shard_of("alt.binaries.t"))).unwrap();
-        shard.execute("update files set touched_at = 0", []).unwrap();
-        let sealed = || -> i64 {
-            shard.query_row("select count(*) from files where blob is not null", [], |r| r.get(0)).unwrap()
-        };
-        assert_eq!(sealed(), 0);
-
-        // no save ever comes
-        let shared = shared_db_idling(db::open_at(&main).unwrap(), Duration::from_millis(50));
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while sealed() == 0 && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert_eq!(sealed(), 1, "the idle writer sealed the stale file");
-        drop(shared);
-    }
-
-    #[test]
     fn a_release_looks_at_a_few_bodies_for_its_name() {
         let article = |i: usize, name: &str| crate::parser::Article {
             subject: format!(r#""{name}" yEnc (1/1)"#),
@@ -3641,168 +3075,5 @@ mod tests {
         let sources = name_sources(&Release { articles, ..Default::default() });
         assert_eq!(sources.len(), MAX_NAME_BODIES);
         assert_eq!(sources[0].0, "<99@x>", "the par2 first");
-    }
-
-    fn stage_db() -> (tempfile::TempDir, Db, std::path::PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
-        let main = dir.path().join("atlas.db");
-        db::create_db_at(&main).unwrap();
-        let conn = db::open_at(&main).unwrap();
-        let shard = crate::store::shard_path(&main, 0);
-        (dir, shared_db(conn), shard)
-    }
-
-    #[test]
-    fn a_job_on_the_firsts_lane_runs_ahead_of_queued_stage_work() {
-        let (_dir, db, _shard) = stage_db();
-        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let job = |name: &'static str, slow: bool| -> StageWork {
-            let order = order.clone();
-            Box::new(move |_| {
-                if slow {
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                order.lock().unwrap().push(name);
-                Ok(())
-            })
-        };
-        // 30 jobs of 20 ms, three times the writer's idle stage budget, then one on the firsts lane
-        let mut answers: Vec<_> =
-            (0..30).map(|_| db.on_writer(0, "db.stage.test", job("queued", true)).unwrap()).collect();
-        answers.push(db.on_writer_first(0, "db.stage.test", job("first", false)).unwrap());
-        for answer in answers {
-            answer.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
-        }
-        let order = order.lock().unwrap();
-        let at = order.iter().position(|n| *n == "first").unwrap();
-        assert!(at < 20, "ran {at}th: {order:?}");
-    }
-
-    #[test]
-    fn jobs_on_the_firsts_lane_run_in_order_and_before_the_writer_stops() {
-        let (_dir, db, _shard) = stage_db();
-        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let answers: Vec<_> = (0..20)
-            .map(|n| {
-                let order = order.clone();
-                db.on_writer_first(
-                    0,
-                    "db.stage.test",
-                    Box::new(move |_| {
-                        order.lock().unwrap().push(n);
-                        Ok(())
-                    }),
-                )
-                .unwrap()
-            })
-            .collect();
-        drop(db);
-        for answer in answers {
-            answer.recv().unwrap().unwrap();
-        }
-        assert_eq!(*order.lock().unwrap(), (0..20).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn a_stage_job_runs_on_the_writer_and_answers() {
-        let (_dir, db, shard) = stage_db();
-        let answer = db
-            .on_writer(
-                0,
-                "db.stage.test",
-                Box::new(|conn| {
-                    conn.execute("insert into pp_queue (release_id, due_at) values (1, 2)", [])?;
-                    Ok(())
-                }),
-            )
-            .unwrap();
-        answer.recv().unwrap().unwrap();
-        let rows: i64 =
-            db::open_shard(&shard).unwrap().query_row("select count(*) from pp_queue", [], |r| r.get(0)).unwrap();
-        assert_eq!(rows, 1);
-    }
-
-    #[test]
-    fn stage_jobs_dont_hold_up_saves() {
-        let (_dir, db, _shard) = stage_db();
-        let group = (0..).map(|i| format!("alt.binaries.g{i}")).find(|g| crate::store::shard_of(g) == 0).unwrap();
-        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let answers: Vec<_> = (0..500)
-            .map(|_| {
-                let ran = ran.clone();
-                db.on_writer(
-                    0,
-                    "db.stage.test",
-                    Box::new(move |_| {
-                        std::thread::sleep(Duration::from_millis(2));
-                        ran.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        Ok(())
-                    }),
-                )
-                .unwrap()
-            })
-            .collect();
-        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
-        let article = crate::parser::Article {
-            message_id: "<a@x>".into(),
-            filename: Some("a".into()),
-            part: Some(1),
-            total_parts: Some(1),
-            ..Default::default()
-        };
-        runtime
-            .block_on(db.save(vec![Release { name: "a".into(), group, articles: vec![article], ..Default::default() }]))
-            .unwrap();
-        assert!(ran.load(std::sync::atomic::Ordering::SeqCst) < 250);
-        for answer in answers {
-            answer.recv().unwrap().unwrap();
-        }
-    }
-
-    /// right after a save, stage work waits its share or a quiet moment, and then runs
-    #[test]
-    fn stage_jobs_run_once_saves_go_quiet() {
-        let (_dir, db, _shard) = stage_db();
-        let group = (0..).map(|i| format!("alt.binaries.g{i}")).find(|g| crate::store::shard_of(g) == 0).unwrap();
-        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
-        let article = crate::parser::Article {
-            message_id: "<a@x>".into(),
-            filename: Some("a".into()),
-            part: Some(1),
-            total_parts: Some(1),
-            ..Default::default()
-        };
-        runtime
-            .block_on(db.save(vec![Release { name: "a".into(), group, articles: vec![article], ..Default::default() }]))
-            .unwrap();
-        let start = std::time::Instant::now();
-        let answers: Vec<_> = (0..20)
-            .map(|_| {
-                db.on_writer(
-                    0,
-                    "db.stage.test",
-                    Box::new(|_| {
-                        std::thread::sleep(Duration::from_millis(50));
-                        Ok(())
-                    }),
-                )
-                .unwrap()
-            })
-            .collect();
-        for answer in answers {
-            answer.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
-        }
-        assert!(start.elapsed() < STAGE_QUIET + Duration::from_secs(3), "{:?}", start.elapsed());
-    }
-
-    #[test]
-    fn queued_stage_jobs_run_before_the_writer_stops() {
-        let (_dir, db, _shard) = stage_db();
-        let answers: Vec<_> =
-            (0..50).map(|_| db.on_writer(0, "db.stage.test", Box::new(|_| Ok(()))).unwrap()).collect();
-        drop(db);
-        for answer in answers {
-            answer.recv().unwrap().unwrap();
-        }
     }
 }
