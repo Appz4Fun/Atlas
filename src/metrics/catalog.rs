@@ -165,6 +165,7 @@ impl Tally {
     /// unbounded group/feed/category map. A rejected walk is never published.
     pub(crate) fn add_native(&mut self, row: &Row<'_>, feed: Option<&str>) -> anyhow::Result<()> {
         use anyhow::ensure;
+        ensure!(row.size >= 0 && row.parts >= 0, "native catalog has a negative size or part count");
         ensure!(row.group.len() <= crate::filters::MAX_GROUP_NAME, "native catalog group exceeds admission");
         ensure!(self.groups.contains_key(row.group) || self.groups.len() < 10_000,
             "native catalog group cardinality exceeds admission");
@@ -399,6 +400,8 @@ mod tests {
         let oversized="x".repeat(4097);
         assert!(tally.add_native(&row,Some(&oversized)).is_err());
         assert_eq!(tally.rows,1,"failed admission must not add a partial row");
+        let negative=Row {size:-1,..row};
+        assert!(tally.add_native(&negative,Some("feed-seven")).is_err());assert_eq!(tally.rows,1);
     }
 
     #[test]
