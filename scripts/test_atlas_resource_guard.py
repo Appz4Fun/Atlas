@@ -110,6 +110,8 @@ class ResourceGuardTests(unittest.TestCase):
                 self.assertLess(time.monotonic(), deadline, "child did not exit")
                 time.sleep(0.01)
             # Do not poll/reap first: XNU reports EPERM for this zombie-only group.
+            self.assertFalse(guard.signal_owned_group(child, 0))
+            self.assertIsNone(child.returncode, "zero-probe proof must not reap the leader")
             guard.stop_child(child)
             self.assertEqual(child.returncode, 0)
         finally:
