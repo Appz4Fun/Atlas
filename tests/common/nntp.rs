@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::config::UsenetServer;
+use super::atlas_api::config::UsenetServer;
 
 pub const GROUP: &str = "alt.binaries.test";
 
