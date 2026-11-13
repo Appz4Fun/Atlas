@@ -80,36 +80,91 @@ fn inspected_article(body: &[u8], full_size: usize, multipart: bool) -> ProbeInf
 }
 
 fn with_no_fetch<T>(parts: i64, run: impl FnOnce(&mut StepCtx<'_>, &FileInfo) -> T) -> T {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    // A real needed part reaches the closed fetch lane instead of being hidden
-    // by an empty segment query. No persistent store or provider is available.
-    conn.execute_batch("create table files(id integer primary key, blob blob);
-        create table domains(id integer primary key, suffix text);
-        create table segments(file_id integer, local blob, domain integer, part integer, bytes integer);
-        insert into files values(1,null);
-        insert into segments values(1,x'003c6e65656465643e',0,2,100);").unwrap();
+    let schema = crate::pg::testing::Schema::new().expect("explicit isolated PostgreSQL required");
+    let header_dir = tempfile::tempdir().unwrap();
+    let mut config = crate::config::Config::default();
+    config.postprocess.enabled = false;
+    config.predb.enabled = false;
+    config.spots.enabled = false;
+    config.inferred_parts = false;
+    config.media.tvmaze.enabled = false;
+    config.media.allocine.enabled = false;
+    config.media.details_per_minute = 0;
+    let storage = crate::pg::StorageConfig {
+        backend: crate::pg::Backend::Postgres,
+        url: schema.url.clone(),
+        schema: schema.name.clone(),
+        max_connections: 1,
+        allow_plaintext: true,
+    };
+    let headers = crate::config::HeaderStoreConfig { enabled: true, dir: header_dir.path().to_str().unwrap().into() };
+    let native = crate::pg::indexer_runtime::Runtime::open(&config, storage, headers, &[], &mut None).unwrap();
+    let id = native
+        .owner
+        .with(|client| {
+            // The buffered bytes are already owned by the test. The catalog holds
+            // an actual later article so a missing Tags part cannot masquerade as
+            // successful no-fetch behavior through an empty segment inventory.
+            crate::pg::release_writer::save(
+                client,
+                &[crate::parser::Release {
+                    name: "Buffered.Tags.Fixture".into(),
+                    group: "alt.binaries.fixture".into(),
+                    articles: vec![crate::parser::Article {
+                        filename: Some("fixture.mkv".into()),
+                        message_id: "<needed>".into(),
+                        part: Some(2),
+                        total_parts: Some(parts.max(2)),
+                        file_total: Some(1),
+                        bytes: 100,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                1,
+            )?;
+            Ok(client.query_one("select id from releases", &[])?.get::<_, i64>(0))
+        })
+        .unwrap();
+    let reads = crate::pg::stage_reads::StepReads::for_owner(&native.owner).unwrap();
+    let data = crate::postprocess::data::StepData::Native(&reads);
+    let mut files = data.release_files(id).unwrap();
+    assert_eq!(files.len(), 1);
+    let file = files.remove(0);
+    assert_eq!(file.filename, "fixture.mkv");
+    assert_eq!(file.expected, Some(parts.max(2)));
+    assert_eq!(file.parts_seen, 1);
+    let needed = data.file_segments(file.id, &SegmentPick::Parts(vec![2])).unwrap();
+    assert_eq!(needed.len(), 1);
+    assert_eq!((needed[0].message_id.as_str(), needed[0].part, needed[0].bytes), ("<needed>", Some(2), 100));
+    assert!(data.file_segments(file.id, &SegmentPick::Parts(vec![3])).unwrap().is_empty());
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     let pool = Arc::new(crate::nntp::Pool::new(&[]));
     let stats = Arc::new(crate::postprocess::stats::Stats::default());
     let bodies = crate::postprocess::bodies::BodyFetcher::new(
-        pool.clone(), runtime.handle().clone(), Arc::new(AtomicBool::new(false)),
-        crate::config::PostprocessConfig::default(), stats.clone(),
+        pool.clone(),
+        runtime.handle().clone(),
+        Arc::new(AtomicBool::new(false)),
+        crate::config::PostprocessConfig::default(),
+        stats.clone(),
     );
     let mut ctx = StepCtx {
-        release: ReleaseInfo { id: 1, group: "alt.binaries.fixture".into(), ..Default::default() },
-        data: crate::postprocess::data::StepData::LegacySqlite(&conn), facts: Vec::new(), bodies: &bodies, used_bodies: 0,
-        deadline: Instant::now() + Duration::from_secs(5), lane_can_fetch: false,
-        crcs: Vec::new(), pictures: false,
-    };
-    let file = FileInfo {
-        id: 1, filename: "fixture.mkv".into(), subject: None, subject_part: None,
-        expected: Some(parts), file_total: Some(1), parts_seen: parts, touched_at: None, sealed: false,
+        release: ReleaseInfo { id, group: "alt.binaries.fixture".into(), ..Default::default() },
+        data,
+        facts: Vec::new(),
+        bodies: &bodies,
+        used_bodies: 0,
+        deadline: Instant::now() + Duration::from_secs(5),
+        lane_can_fetch: false,
+        crcs: Vec::new(),
+        pictures: false,
     };
     let result = run(&mut ctx, &file);
     assert_eq!(ctx.used_bodies, 0);
     assert!(ctx.crcs.is_empty());
     assert_eq!(stats.bodies.load(Ordering::Relaxed), 0);
     assert!(!pool.is_connected());
+    native.owner.close();
     result
 }
 
@@ -122,6 +177,7 @@ fn assert_tail_statistics(info: &ProbeInfo) {
 }
 
 #[test]
+#[ignore = "requires explicit isolated PostgreSQL for native buffered Tags inventory"]
 fn complete_buffered_tags_without_ypart_are_read_without_fetch() {
     let (front, tags_at) = matroska(None);
     let mut info = inspected_article(&front, front.len(), false);
@@ -134,6 +190,7 @@ fn complete_buffered_tags_without_ypart_are_read_without_fetch() {
 }
 
 #[test]
+#[ignore = "requires explicit isolated PostgreSQL for native buffered Tags inventory"]
 fn incomplete_buffered_tags_without_layout_are_not_reported_whole() {
     let (whole, tags_at) = matroska(None);
     let front = &whole[..tags_at + 5];
@@ -144,6 +201,7 @@ fn incomplete_buffered_tags_without_layout_are_not_reported_whole() {
 }
 
 #[test]
+#[ignore = "requires explicit isolated PostgreSQL for native buffered Tags inventory"]
 fn multipart_tags_reuse_the_known_last_part_without_fetch() {
     let (whole, tags_at) = matroska(None);
     let front = &whole[..tags_at];
@@ -159,6 +217,7 @@ fn multipart_tags_reuse_the_known_last_part_without_fetch() {
 }
 
 #[test]
+#[ignore = "requires explicit isolated PostgreSQL for native buffered Tags inventory"]
 fn multipart_missing_tags_still_require_a_fetch() {
     let (whole, tags_at) = matroska(None);
     let front = &whole[..tags_at];
@@ -169,6 +228,7 @@ fn multipart_missing_tags_still_require_a_fetch() {
 }
 
 #[test]
+#[ignore = "requires explicit isolated PostgreSQL for native buffered Tags inventory"]
 fn invalid_seek_and_declared_file_bounds_do_not_parse_or_fetch() {
     for position in [0, u64::MAX] {
         let (front, _) = matroska(Some(position));
