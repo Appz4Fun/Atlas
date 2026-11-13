@@ -162,6 +162,9 @@ fn close_walk(f: &Fixture) {
 }
 fn run_group(f: &Fixture, runner: &crate::postprocess::native::Runner, id: i64, group: &str, bit: i64) {
     f.walk(group, bit);
+    // A redo request does not clear old done bits until its actual leased
+    // visit runs. Drive that nomination before observing terminal state.
+    assert!(f.visit(runner), "the newly nominated native walk is actually visited");
     f.run_until(runner, || done(f, id, bit));
     close_walk(f);
 }
