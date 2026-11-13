@@ -122,3 +122,25 @@ fn native_media_count_refuses_a_different_header_root_before_counting() {
     assert!(Service::new(&runtime.owner,runtime.db.clone(),&changed).is_err());
     runtime.owner.with(|client| {assert!(observed(client).is_empty());Ok(())}).unwrap();runtime.owner.close();
 }
+
+#[test]
+#[ignore="requires explicit isolated owned PostgreSQL; real healthy owner contention exceeds five seconds"]
+fn native_media_count_work_deadline_begins_after_healthy_original_owner_contention() {
+    let schema=pg::testing::Schema::new().expect("explicit isolated PostgreSQL required");let (runtime,headers,_root)=runtime(&schema);
+    runtime.owner.with(|client| {pg::release_writer::save(client,&[release("alt.binaries.uhd","Movie.2160p",0,4<<30)],1)?;Ok(())}).unwrap();
+    let mut service=Service::new(&runtime.owner,runtime.db.clone(),&headers).unwrap();
+    let owner=runtime.owner.clone();let (entered_tx,entered_rx)=std::sync::mpsc::channel();let (go_tx,go_rx)=std::sync::mpsc::channel();
+    let holder=std::thread::spawn(move||owner.with(|client| {
+        entered_tx.send(()).unwrap();go_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        // Real healthy PG work on the original Owner, not a replacement client
+        // or an injected deadline clock. The counting call must wait its turn.
+        client.query_one("select pg_sleep(6)",&[])?;Ok(())
+    }));
+    entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();let began=Instant::now();go_tx.send(()).unwrap();
+    let result=service.tick();holder.join().unwrap().unwrap();
+    assert!(began.elapsed()>=Duration::from_secs(5),"fixture must exercise a real wait beyond the media work budget");
+    assert_eq!(result.unwrap(),Tick::Stored,"healthy owner contention must not consume the subsequent page work budget");
+    assert_eq!(runtime.owner.failure(),None);
+    runtime.owner.with(|client| {assert_eq!(observed(client),vec![("alt.binaries.uhd".into(),1)]);
+        assert_eq!(client.query_one("select 1::bigint",&[])?.get::<_,i64>(0),1);Ok(())}).unwrap();runtime.owner.close();
+}
