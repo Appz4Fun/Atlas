@@ -256,25 +256,28 @@ fn aspect(v: &mut VideoTrack, h: [u8; 4], mpeg2: bool) {
 
 /// An MPEG audio frame header: layer, rate, mono or not.
 pub(super) fn mpeg_audio(payload: &[u8], a: &mut AudioTrack) {
-    let Some(at) = payload.windows(2).position(|w| w[0] == 0xFF && w[1] & 0xE0 == 0xE0) else { return };
-    let Some(h) = payload.get(at..at + 4) else { return };
-    let version = (h[1] >> 3) & 3;
-    let layer = (h[1] >> 1) & 3;
-    a.codec = match layer {
-        1 => "mp3",
-        2 => "mp2",
-        3 => "mp1",
-        _ => "mp2",
+    for h in payload.windows(4) {
+        if h[0] != 0xFF || h[1] & 0xE0 != 0xE0 || h[2] >> 4 == 15 {
+            continue;
+        }
+        let codec = match (h[1] >> 1) & 3 {
+            1 => "mp3",
+            2 => "mp2",
+            3 => "mp1",
+            _ => continue,
+        };
+        let rates: [f64; 3] = match (h[1] >> 3) & 3 {
+            3 => [44100.0, 48000.0, 32000.0],
+            2 => [22050.0, 24000.0, 16000.0],
+            0 => [11025.0, 12000.0, 8000.0],
+            _ => continue,
+        };
+        let Some(rate) = rates.get(usize::from((h[2] >> 2) & 3)).copied() else { continue };
+        a.codec = codec.into();
+        a.sample_rate = Some(rate);
+        a.channels = Some(if h[3] >> 6 == 3 { 1 } else { 2 });
+        return;
     }
-    .into();
-    let rates: [f64; 3] = match version {
-        3 => [44100.0, 48000.0, 32000.0],
-        2 => [22050.0, 24000.0, 16000.0],
-        0 => [11025.0, 12000.0, 8000.0],
-        _ => return,
-    };
-    a.sample_rate = rates.get(usize::from((h[2] >> 2) & 3)).copied();
-    a.channels = Some(if h[3] >> 6 == 3 { 1 } else { 2 });
 }
 
 /// An AC-3 sync frame: rate, and channels from acmod and the LFE flag.
@@ -481,6 +484,103 @@ mod tests {
         assert_eq!(info.video[0].display_width, Some(1024), "16:9 by MPEG-2's table");
         assert_eq!((info.audio[0].codec.as_str(), info.audio[0].sample_rate), ("mp2", Some(48000.0)));
         assert_eq!(info.audio.len(), 1);
+    }
+
+    #[test]
+    fn mpeg_audio_skips_false_sync_before_a_valid_header_in_one_pes() {
+        let mut data = pack();
+        data.extend(pes(0xC0, &[0xFF, 0xE0, 0x00, 0x00, 0xFF, 0xFD, 0x84, 0x04]));
+        data.extend(pes(0xC0, &[0xFF, 0xFD, 0x84, 0x04]));
+        let info = super::super::media::parse(&data).unwrap();
+        assert_eq!(info.audio.len(), 1);
+        assert_eq!(
+            (info.audio[0].codec.as_str(), info.audio[0].sample_rate, info.audio[0].channels),
+            ("mp2", Some(48000.0), Some(2))
+        );
+    }
+
+    fn reserved_mpeg_audio_headers() -> [(&'static str, [u8; 4]); 4] {
+        [
+            ("version", [0xFF, 0xED, 0x84, 0x04]),
+            ("layer", [0xFF, 0xF9, 0x80, 0xC4]),
+            ("sample rate", [0xFF, 0xFD, 0x8C, 0xC4]),
+            ("bitrate", [0xFF, 0xFD, 0xF0, 0xC4]),
+        ]
+    }
+
+    #[test]
+    fn mpeg_audio_rejects_reserved_headers_without_inventing_metadata() {
+        for (field, header) in reserved_mpeg_audio_headers() {
+            let mut data = pack();
+            data.extend(pes(0xC0, &header));
+            let info = mpeg_ps(&data);
+            assert_eq!(info.audio.len(), 1, "reserved {field}");
+            assert_eq!(info.audio[0].sample_rate, None, "reserved {field}");
+            assert_eq!(info.audio[0].channels, None, "reserved {field}");
+        }
+    }
+
+    #[test]
+    fn mpeg_audio_searches_past_each_reserved_header_candidate() {
+        for (field, header) in reserved_mpeg_audio_headers() {
+            let mut data = pack();
+            data.extend(pes(0xC0, &[header.as_slice(), &[0xFF, 0xFD, 0x84, 0x04]].concat()));
+            let info = mpeg_ps(&data);
+            assert_eq!(info.audio.len(), 1, "reserved {field}");
+            assert_eq!(info.audio[0].codec, "mp2", "reserved {field}");
+            assert_eq!(info.audio[0].sample_rate, Some(48000.0), "reserved {field}");
+            assert_eq!(info.audio[0].channels, Some(2), "reserved {field}");
+        }
+    }
+
+    #[test]
+    fn mpeg_audio_can_read_a_later_pes_after_a_reserved_header() {
+        for (field, header) in reserved_mpeg_audio_headers() {
+            let mut data = pack();
+            data.extend(pes(0xC0, &header));
+            data.extend(pes(0xC0, &[0xFF, 0xFD, 0x84, 0x04]));
+            let info = mpeg_ps(&data);
+            assert_eq!(info.audio.len(), 1, "reserved {field}");
+            assert_eq!(info.audio[0].sample_rate, Some(48000.0), "reserved {field}");
+            assert_eq!(info.audio[0].channels, Some(2), "reserved {field}");
+        }
+    }
+
+    #[test]
+    fn mpeg_audio_keeps_truncated_headers_unresolved_until_the_next_pes() {
+        let header = [0xFF, 0xFD, 0x84, 0x04];
+        for cut in 0..header.len() {
+            let mut data = pack();
+            data.extend(pes(0xC0, &header[..cut]));
+            let partial = mpeg_ps(&data);
+            assert_eq!(partial.audio[0].sample_rate, None, "header length {cut}");
+            assert_eq!(partial.audio[0].channels, None, "header length {cut}");
+            data.extend(pes(0xC0, &header[cut..]));
+            let complete = mpeg_ps(&data);
+            assert_eq!(complete.audio.len(), 1, "header length {cut}");
+            assert_eq!(complete.audio[0].sample_rate, Some(48000.0), "header length {cut}");
+            assert_eq!(complete.audio[0].channels, Some(2), "header length {cut}");
+        }
+    }
+
+    #[test]
+    fn mpeg_audio_accepts_valid_versions_layers_and_free_format() {
+        for (header, codec, rate, channels) in [
+            ([0xFF, 0xFF, 0x84, 0x04], "mp1", 48000.0, 2),
+            ([0xFF, 0xFD, 0x84, 0x04], "mp2", 48000.0, 2),
+            ([0xFF, 0xFB, 0x90, 0xC0], "mp3", 44100.0, 1),
+            ([0xFF, 0xF3, 0x84, 0x04], "mp3", 24000.0, 2),
+            ([0xFF, 0xE3, 0x84, 0xC0], "mp3", 12000.0, 1),
+            ([0xFF, 0xFD, 0x04, 0x04], "mp2", 48000.0, 2),
+        ] {
+            let mut data = pack();
+            data.extend(pes(0xC0, &header));
+            let info = mpeg_ps(&data);
+            assert_eq!(info.audio.len(), 1, "header {header:02X?}");
+            assert_eq!(info.audio[0].codec, codec, "header {header:02X?}");
+            assert_eq!(info.audio[0].sample_rate, Some(rate), "header {header:02X?}");
+            assert_eq!(info.audio[0].channels, Some(channels), "header {header:02X?}");
+        }
     }
 
     #[test]
