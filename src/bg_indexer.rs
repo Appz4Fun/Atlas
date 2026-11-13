@@ -239,7 +239,7 @@ impl Stats {
             let stage=self.final_services.as_ref().map(|services|services.stage.as_ref().cloned().unwrap_or(serde_json::Value::Null))
                 .unwrap_or_else(||crate::postprocess::native::stats_snapshot().unwrap_or(serde_json::Value::Null));
             map.insert("postprocess".into(),stage);
-            if let Some(services)=&self.final_services {map.insert("predb".into(),services.predb.as_ref().cloned().unwrap_or(serde_json::Value::Null));}
+            map.insert("predb".into(),self.final_services.as_ref().and_then(|services|services.predb.as_ref().cloned()).unwrap_or(serde_json::Value::Null));
         }
 
         if let Ok(bytes)=crate::postprocess::native::stats_json(&data) {

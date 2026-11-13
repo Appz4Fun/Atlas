@@ -118,3 +118,46 @@ fn wrong_owner_and_unacknowledged_coordinator_panic_cannot_consume_final_counter
     assert!(drain.take_after_join(&other.owner).is_err());
     other.owner.close();runtime.owner.close();
 }
+
+#[test]
+#[ignore="Root-only owned configured PostgreSQL home; actual65-candidate bounded late page"]
+fn actual_late_page_budget_requires_a_known_unexamined_candidate() {
+    const TITLE:&str="Real.Bounded.Predb.Drain.2026.1080p-GRP";
+    let runtime=runtime();let service=pg::service_cache::predb::Service::new(&runtime.owner).unwrap();
+    struct NoFetch;
+    impl crate::predb::poll::Fetch for NoFetch {fn get(&self,_:&str)->std::result::Result<crate::predb::poll::HttpReply,String> {panic!("empty selected sources must never fetch")}}
+    let cfg=crate::config::PredbConfig {enabled:true,sources:vec![],..Default::default()};
+    let end=Instant::now()+Duration::from_secs(10);
+    while matches!(service.tick(&cfg,&NoFetch,1,&|_|true).unwrap(),pg::service_cache::predb::Tick::Pending) {assert!(Instant::now()<end);}
+    runtime.owner.with(|client| {
+        let releases:Vec<_>=(0..65).map(|id|crate::parser::Release {name:format!("Unrelated.Collision.{id}.2026-GRP"),group:"example.group".into(),
+            articles:vec![crate::parser::Article {filename:Some(format!("file{id}.bin")),message_id:format!("<candidate{id}@drain.test>"),
+                part:Some(1),total_parts:Some(1),bytes:1,..Default::default()}],..Default::default()}).collect();
+        pg::release_writer::save(client,&releases,1)?;
+        let mut tx=client.transaction()?;tx.execute("insert into ext_predb_feeds(source,key) values(1,'predb_club')",&[])?;
+        assert!(matches!(pg::predb_cache::import_page_in(&mut tx,1,&[crate::predb::import::Entry {title:TITLE.into(),..Default::default()}],1,None)?,pg::predb_cache::ImportStatus::Applied{..}));
+        tx.commit()?;Ok(())
+    }).unwrap();
+    // Build actual native name keys before the title is old enough to scan.
+    for _ in 0..3 {service.late_tick(0,32).unwrap();}
+    runtime.owner.with(|client| {
+        assert_eq!(client.query_one("select count(*) from releases",&[])?.get::<_,i64>(0),65);
+        assert!(!client.query_one("select exists(select 1 from predb_name_pending)",&[])?.get::<_,bool>(0));
+        // A genuine collision fixture nominates65 nonmatching releases. Actual
+        // evidence must reject them; no readiness/settlement row is fabricated.
+        client.execute("insert into predb_name_keys(key,release_id) select $1,id from releases on conflict do nothing",&[&crate::predb::keys::name_key(TITLE)])?;Ok(())
+    }).unwrap();
+    let now=chrono::Utc::now().timestamp();let page=service.late_tick(now,32).unwrap();
+    assert!(page.pending&&page.budget_exhausted);assert_eq!(page.titles,0);
+    assert_eq!(service.counters.snapshot()["late"]["native_budget_pages"],1);
+    let page=service.late_tick(now,32).unwrap();assert_eq!(page.titles,1);assert!(!page.budget_exhausted);
+    let cfg=crate::config::PredbConfig {enabled:true,late_per_second:1,..Default::default()};
+    service.maintenance(&cfg,now).unwrap();
+    assert_eq!(service.counters.snapshot()["late"]["native_budget_pages"],1,"completed/empty work is not a new exhausted page");
+    assert!(service.counters.snapshot()["late"]["out_of_budget"].is_null(),"legacy time-budget semantics are unavailable");
+    let actual=service.counters.snapshot();crate::metrics::report_service_counters(None,Some(&actual),202);
+    let metrics=crate::metrics::render();
+    assert!(metrics.contains("atlas_predb_late_total{kind=\"native_budget_pages\"} 1\n"));
+    assert!(!metrics.contains("atlas_predb_late_total{kind=\"out_of_budget\"}"),"unobservable legacy timing is not a fresh zero counter");
+    runtime.owner.close();
+}

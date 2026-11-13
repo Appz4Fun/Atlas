@@ -20,11 +20,14 @@ pub(crate) struct Drain {
 }
 #[derive(Default)]
 struct Retained {stage:Option<StageCounters>,predb:Option<Arc<crate::pg::service_cache::predb::Counters>>}
-struct StageCounters {stats:Arc<crate::postprocess::stats::Stats>,lanes:Arc<LaneCounters>,config:crate::config::PostprocessConfig,enabled:i64}
+struct StageCounters {stats:Arc<crate::postprocess::stats::Stats>,lanes:Arc<LaneCounters>,budget:i64,walks:i64,enabled:i64}
 pub(crate) struct FinalCounters {pub(crate) stage:Option<Value>,pub(crate) predb:Option<Value>}
 impl FinalCounters {
     pub(crate) fn stage_value(stats:&crate::postprocess::stats::Stats,lanes:&LaneCounters,config:&crate::config::PostprocessConfig,enabled:i64)->Value {
-        let mut value=stats.snapshot(config.body_fetches_per_minute,config.backlog_per_second,enabled);
+        Self::stage_values(stats,lanes,config.body_fetches_per_minute,config.backlog_per_second,enabled)
+    }
+    fn stage_values(stats:&crate::postprocess::stats::Stats,lanes:&LaneCounters,budget:i64,walks:i64,enabled:i64)->Value {
+        let mut value=stats.snapshot(budget,walks,enabled);
         // A final counter reading never revives the last queue/lease gauges.
         for key in ["queue_due","net_wanted","failed","archive_names_over_quota"] {value[key]=Value::Null;}
         value["walk"]["done"]=Value::Null;value["walk"]["total"]=Value::Null;
@@ -49,7 +52,8 @@ impl Drain {
         let mut retained=self.retained.lock().map_err(|_|anyhow::anyhow!("native service drain poisoned"))?;
         let retained=retained.as_mut().ok_or_else(||anyhow::anyhow!("native service drain already consumed"))?;
         ensure!(retained.stage.is_none()&&!self.joined.load(Ordering::Acquire),"native Stage drain duplicate or ended registration");
-        retained.stage=Some(StageCounters {stats:runner.stats.clone(),lanes,config:runner.config.postprocess.clone(),enabled:runner.steps.enabled});Ok(())
+        retained.stage=Some(StageCounters {stats:runner.stats.clone(),lanes,budget:runner.config.postprocess.body_fetches_per_minute,
+            walks:runner.config.postprocess.backlog_per_second,enabled:runner.steps.enabled});Ok(())
     }
     pub(super) fn retain_predb(&self,owner:&Arc<Owner>,counters:Arc<crate::pg::service_cache::predb::Counters>)->Result<()> {
         self.check(owner)?;
@@ -65,7 +69,7 @@ impl Drain {
         self.check(owner)?;if !self.joined.load(Ordering::Acquire) {return Ok(None)}
         let retained=self.retained.lock().map_err(|_|anyhow::anyhow!("native service drain poisoned"))?.take();
         Ok(retained.map(|retained|FinalCounters {
-            stage:retained.stage.map(|stage|FinalCounters::stage_value(&stage.stats,&stage.lanes,&stage.config,stage.enabled)),
+            stage:retained.stage.map(|stage|FinalCounters::stage_values(&stage.stats,&stage.lanes,stage.budget,stage.walks,stage.enabled)),
             predb:retained.predb.map(|predb|predb.snapshot()),
         }))
     }

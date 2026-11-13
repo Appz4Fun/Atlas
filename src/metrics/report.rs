@@ -240,7 +240,7 @@ fn report_predb(predb: &Value, pool: u64) {
 }
 
 fn report_predb_counters(predb:&Value,pool:u64) {
-    for key in ["titles","reruns","overflow","out_of_budget","errors"] {
+    for key in ["titles","reruns","overflow","out_of_budget","native_budget_pages","errors"] {
         if let Some(n)=predb["late"][key].as_u64() {grow(&PREDB_LATE,&[("kind",key)],pool,n);}
     }
 }

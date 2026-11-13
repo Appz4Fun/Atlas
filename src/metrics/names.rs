@@ -127,7 +127,7 @@ families! {
     PREDB_MATCHES "atlas_predb_matches_total" Counter &[], "Releases matched to a PreDB title, by how and by PreDB category, reruns included.";
     PREDB_TITLES "atlas_predb_titles" Gauge &[], "Titles in the PreDB.";
     PREDB_FILE_BYTES "atlas_predb_file_bytes" Gauge &[], "Size of the PreDB file.";
-    PREDB_LATE "atlas_predb_late_total" Counter &[], "Late title matching: titles, reruns, overflow, out_of_budget, errors.";
+    PREDB_LATE "atlas_predb_late_total" Counter &[], "Late title matching: titles, reruns, overflow, out_of_budget, native_budget_pages, errors. Native budget pages retain unexamined candidates; legacy time-budget counts are unavailable.";
     PREDB_LATE_BEHIND "atlas_predb_late_behind" Gauge &[], "Titles the late matcher has yet to look at.";
     PREDB_FEED_POLLS "atlas_predb_feed_polls_total" Counter &[], "Polls of each PreDB feed, by result.";
     PREDB_FEED_FAILURES "atlas_predb_feed_failures" Gauge &[], "Failures in a row of each PreDB feed.";

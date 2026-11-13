@@ -16,12 +16,12 @@ struct FeedCounters {id:i64,key:&'static str,inserted:AtomicU64,updated:AtomicU6
 /// These are this service's events, never persisted feed/catalog gauges.
 pub(crate) struct Counters {
     feeds:Vec<FeedCounters>,pub(super) titles:AtomicU64,pub(super) reruns:AtomicU64,pub(super) overflow:AtomicU64,
-    pub(super) out_of_budget:AtomicU64,pub(super) late_errors:AtomicU64,poll_errors:AtomicU64,
+    native_budget_pages:AtomicU64,pub(super) late_errors:AtomicU64,poll_errors:AtomicU64,
 }
 impl Counters {
     fn new()->Self {Self {feeds:crate::predb::feeds::SOURCES.iter().map(|spec|FeedCounters {id:spec.id,key:spec.key,
         inserted:AtomicU64::new(0),updated:AtomicU64::new(0),skipped:AtomicU64::new(0)}).collect(),
-        titles:AtomicU64::new(0),reruns:AtomicU64::new(0),overflow:AtomicU64::new(0),out_of_budget:AtomicU64::new(0),late_errors:AtomicU64::new(0),poll_errors:AtomicU64::new(0)}}
+        titles:AtomicU64::new(0),reruns:AtomicU64::new(0),overflow:AtomicU64::new(0),native_budget_pages:AtomicU64::new(0),late_errors:AtomicU64::new(0),poll_errors:AtomicU64::new(0)}}
     fn imported(&self,source:i64,counts:Counts) {
         if let Some(feed)=self.feeds.iter().find(|feed|feed.id==source) {
             feed.inserted.fetch_add(counts.inserted,Relaxed);feed.updated.fetch_add(counts.updated,Relaxed);feed.skipped.fetch_add(counts.skipped,Relaxed);
@@ -29,6 +29,7 @@ impl Counters {
     }
     pub(super) fn page(&self,page:&super::LateReport) {
         self.titles.fetch_add(page.titles as u64,Relaxed);self.reruns.fetch_add(page.reruns as u64,Relaxed);self.overflow.fetch_add(page.overflow as u64,Relaxed);
+        self.native_budget_pages.fetch_add(u64::from(page.budget_exhausted),Relaxed);
     }
     pub(crate) fn snapshot(&self)->serde_json::Value {
         let sources:Vec<_>=self.feeds.iter().map(|feed|serde_json::json!({"key":feed.key,"inserted":null,"updated":null,
@@ -36,7 +37,7 @@ impl Counters {
             "failures":null,"last_ok_at":null,"last_rows":null})).collect();
         serde_json::json!({"titles":null,"file_bytes":null,"late_behind":null,"errors":self.poll_errors.load(Relaxed),
             "late":{"titles":self.titles.load(Relaxed),"reruns":self.reruns.load(Relaxed),"overflow":self.overflow.load(Relaxed),
-                "out_of_budget":self.out_of_budget.load(Relaxed),"errors":self.late_errors.load(Relaxed)},"sources":sources})
+                "out_of_budget":null,"native_budget_pages":self.native_budget_pages.load(Relaxed),"errors":self.late_errors.load(Relaxed)},"sources":sources})
     }
 }
 pub(crate) enum Tick { NotDue, Pending, Polled(PollEnd) }
