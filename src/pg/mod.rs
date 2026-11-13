@@ -107,13 +107,12 @@ use anyhow::{Context, Result, bail};
 
 pub use postgres::Client;
 
-/// The `[storage] backend` choice.
+/// PostgreSQL product storage; unsupported names are retained only for validation.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum Backend {
     #[default]
-    Sqlite,
     Postgres,
-    /// a name that's neither: refused by `StorageConfig::check` rather than taken for one of them
+    /// An unsupported name, refused by `StorageConfig::check`.
     Unknown(String),
 }
 
@@ -134,7 +133,7 @@ pub struct StorageConfig {
 impl Default for StorageConfig {
     fn default() -> Self {
         StorageConfig {
-            backend: Backend::Sqlite,
+            backend: Backend::Postgres,
             url: String::new(),
             schema: "atlas".into(),
             max_connections: 16,
@@ -149,7 +148,6 @@ impl StorageConfig {
         let Some(v) = v else { return c };
         if let Some(b) = v.get("backend").and_then(serde_json::Value::as_str) {
             c.backend = match b.to_ascii_lowercase().as_str() {
-                "sqlite" => Backend::Sqlite,
                 "postgres" | "postgresql" | "pg" => Backend::Postgres,
                 _ => Backend::Unknown(b.to_string()),
             };
@@ -174,17 +172,19 @@ impl StorageConfig {
         self.backend == Backend::Postgres
     }
 
-    /// An error for a `[storage]` that can't be what was meant: a backend name that's neither, or Postgres with no
-    /// url or a schema that isn't a plain name. Checked at start, soo data never goes quietly to the wrong place.
+    /// Refuse unsupported backends, absent destinations and invalid schema names before startup.
     pub fn check(&self) -> Result<()> {
         match &self.backend {
-            Backend::Sqlite => Ok(()),
-            Backend::Unknown(b) => bail!("storage: backend {b:?} is neither \"sqlite\" nor \"postgres\""),
-            Backend::Postgres if self.url.is_empty() => bail!("storage: backend is postgres but there's no url"),
+            Backend::Unknown(_) => bail!("storage: only the postgres backend is supported"),
+            Backend::Postgres if self.url.trim().is_empty() => bail!("storage: postgres requires a destination url"),
             Backend::Postgres if !valid_schema(&self.schema) => {
                 bail!("storage: schema {:?} isn't a plain lowercase name", self.schema)
             }
-            Backend::Postgres => Ok(()),
+            Backend::Postgres => self
+                .url
+                .parse::<postgres::Config>()
+                .map(|_| ())
+                .map_err(|_| anyhow::anyhow!("storage: invalid PostgreSQL destination url")),
         }
     }
 }
@@ -247,6 +247,7 @@ impl Drop for Pool {
 
 impl Pool {
     pub fn new(storage: &StorageConfig) -> Result<Pool> {
+        storage.check()?;
         if !valid_schema(&storage.schema) {
             bail!("storage: schema {:?} isn't a plain lowercase name", storage.schema);
         }
@@ -528,8 +529,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn storage_config_reads_its_object_and_defaults_to_sqlite() {
-        assert_eq!(StorageConfig::from_value(None).backend, Backend::Sqlite);
+    fn storage_config_requires_a_postgres_destination_without_a_sqlite_default() {
+        assert_eq!(StorageConfig::from_value(None).backend, Backend::Postgres);
+        assert!(StorageConfig::from_value(None).check().is_err());
+        for backend in ["sqlite", "SQLite", "postgress"] {
+            let value = serde_json::json!({"backend": backend, "url": "host=127.0.0.1 dbname=fixture"});
+            assert!(StorageConfig::from_value(Some(&value)).check().is_err());
+        }
+        assert!(StorageConfig { url: "   ".into(), ..StorageConfig::default() }.check().is_err());
         let v = serde_json::json!({"backend": "Postgres", "url": "host=10.0.0.2 dbname=atlas", "schema": "atlas2",
                                    "max_connections": 1000, "allow_plaintext": true});
         let c = StorageConfig::from_value(Some(&v));
@@ -545,7 +552,7 @@ mod tests {
         let c = StorageConfig::from_value(Some(&typo));
         assert!(
             !c.is_postgres() && c.check().is_err(),
-            "a backend name that's neither is refused, not taken for sqlite"
+            "an unsupported backend cannot select a catalog"
         );
         let pg = serde_json::json!({"backend": "postgresql", "url": "host=10.0.0.2"});
         assert!(StorageConfig::from_value(Some(&pg)).is_postgres());

@@ -1,122 +1,67 @@
 use std::process::ExitCode;
 
-use atlas::{app, bg_indexer, compact, convert, db, paths, postprocess, procs, store};
+use atlas::{app, bg_indexer, procs};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let has = |flag: &str| args.iter().any(|a| a == flag);
+    let has = |flag: &str| args.iter().any(|arg| arg == flag);
 
     if has("--version") || has("-V") {
         println!("atlas {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
     }
-
     if has("--help") || has("-h") {
         println!(
-            "atlas {}\n\nusage: atlas [--selftest | --bg-indexer | --convert]\n\n  (no args)     interactive menu\n  --selftest    check the login on every usenet server and exit\n  --bg-indexer  run the indexing loop headless (the menu starts this for you)\n  --convert     move a database from before the shards into them, then exit\n                (the indexer does this on its own when it starts)\n  --compact     rewrite the shards smaller (stop indexing first), then exit\n  --purge       delete what no step can help, a dry run unless --apply. Alone it takes\n                fragments only: [--fragments] [--blocked] [--too-small [--below BYTES]]\n                [--image-only] [--rejected] [--dead] [--sample N] [--apply]\n  --reprocess   look at stored releases again, a dry run unless --apply:\n                [--step NAME]... [--group NAME]... [--failed] [--apply]\n  --reflag-obfuscated  flag old rows the current check calls random, a dry run unless\n                --apply: [--sample N] [--apply]\n  --unname      clear names taken from subjects and posted files, a dry run unless\n                --apply: [--sample N] [--apply]\n  --recount-articles  size and parts back to every article held, for rows with a file saved since:\n                --since UNIX_TIME, a dry run unless --apply: [--sample N] [--apply]\n  --undo-mojibake  rows named from a subject a server encoded twice (CultFilmsâ„¢): into the row of the\n                same articles under the right name, or renamed, a dry run unless --apply: [--sample N] [--apply]\n  --count-repair-candidates  count the article bytes of releases a PAR2 repair may make whole, soo they
-                can show as NEEDS REPAIR; runs beside the indexer, a dry run unless --apply: [--sample N] [--apply]\n  --split-reposts  one release per upload of a post uploaded again under the same names: --list\n                [--sample N] (read only), or --id RELEASE_ID [--server HOST] [--apply]\n  --sealed-log-move  move sealed articles to the sealed log at full speed (stop indexing first)\n  --predb-import  read PreDB titles from a local file, a dry run unless --apply:\n                FILE [--apply]\n  --replay-raw-predb  re-parse all archived raw PreDB feed payloads in atlas.raw.db:\n                [--apply]\n  --reset-shards  harvest shard probes/hashes to atlas.raw.db and wipe only shards/headers:\n                [--apply]\n  --export-keep  copy what re-indexing can't bring back (PreDB, media provider and OpenSubtitles answers, hand\n                thaws) to keep-export/<time>/keep.db, checked, and with --apply into Postgres's keep schema:\n                [--apply] [--force] (a table may shrink), or a dry run [--allow-missing]\n  --move-ext  copy the external data (PreDB, media providers, OpenSubtitles, HTTP cache, hand thaws) from the SQLite\n                files into Postgres's ext_* tables once, checked, topped up from the keep snapshot: [--apply] [--keep-schema NAME]\n  --dump-ext  dump the ext_* tables now to ext-dumps/<time>/ (the indexer does it nightly on Postgres):\n                [--allow-shrink] (keep a dump with fewer rows than an earlier one)\n  --restore-ext  put a dump back: DIR [--replace]\n  --restore-keep --snapshot DIR  verify a keep export against its manifest, or restore it into a new\n                PostgreSQL staging schema with --apply --database NAME --schema keep_restore_NAME\n  --import-main --snapshot FILE  inspect an SQLite main database backup, or import it into a new\n                PostgreSQL staging schema with --apply --database NAME --schema atlas_stage_NAME\n  --import-history --manifest FILE --verify-bytes N  verify explicit consolidated captures; apply only to\n                --destination FILE --url-env NAME --spool DIR --spool-quota N --apply\n                [--max-pages N]; publication ends at identity_ready and does not activate runtime\n  --save-replay --store DIR --db DIR  replay copied NXV headers through the SQLite writer, or use\n                --pg-database NAME --pg-schema atlas_replay_NAME for a fresh PostgreSQL schema\n                [--pg-header-source ID] also archives the sealed header blocks in PostgreSQL\n  --header-store  read a copy of the header store (the indexer's own is locked while it runs):\n                link --store DIR --from UNIX --to UNIX | link-day --store DIR --day YYYY-MM-DD | stats --store DIR\n  --search-indexes  index poster, size, posted date and name, for searching and sorting
-                on them (stop indexing first),\n                a dry run unless --apply: [--apply]\n  --thaw        put frozen releases back into their shards: RELEASE_ID...\n  --frozen-stats  count frozen releases per shard and reason\n  --overview    read the overview archive (no provider): SERVER GROUP [stats | verify | START-END | <message-id>]\n  --crc-links   count releases the file and first-article CRC keys link, reading only:\n                [--sample N]",
+            "atlas {}\n\nusage: atlas [--selftest | --bg-indexer | --dump-ext | --restore-ext DIR]\n\n  (no args)     start the native Web service with checked PostgreSQL storage\n  --selftest    check the login on every Usenet server and exit\n  --bg-indexer  run the native PostgreSQL indexing loop\n  --dump-ext    dump PostgreSQL ext_* tables to ext-dumps/<time>/\n                [--allow-shrink]\n  --restore-ext DIR  restore a PostgreSQL ext_* dump [--replace]\n  --save-replay --store DIR --db DIR --pg-database NAME --pg-schema atlas_replay_NAME\n                replay copied NXV headers into a fresh PostgreSQL staging schema;\n                set ATLAS_REPLAY_PG_URL [--pg-header-source ID]\n  --header-store  read a copied header store independently of catalog storage:\n                link --store DIR --from UNIX --to UNIX | link-day --store DIR --day YYYY-MM-DD | stats --store DIR\n  --overview    read the overview archive without a provider or catalog:\n                SERVER GROUP [stats | verify | START-END | <message-id>]\n\nPostgreSQL storage configuration is required for runtime and backup commands.\nCatalog maintenance still awaiting native implementations is refused explicitly;\nsee docs/POSTGRES_FRONTDOORS.md for the remaining maintenance contracts.",
             env!("CARGO_PKG_VERSION")
         );
         return ExitCode::SUCCESS;
     }
 
-    // Refuse legacy catalog tools before their dispatchers can initialize a
-    // default SQLite database. Explicit valuable-cache/staging tools retain
-    // their own source and destination admission.
-    if let Some(command) = app::legacy_catalog_command(&args) {
-        match atlas::config::checked_storage_config() {
-            Ok(storage) if storage.backend == atlas::pg::Backend::Postgres => {
-                eprintln!("{command} is not available for the PostgreSQL catalog; no legacy catalog was opened");
-                return ExitCode::from(1);
-            }
-            Ok(_) => {}
-            Err(_) => {
-                eprintln!("storage configuration is invalid; refusing catalog maintenance");
-                return ExitCode::from(1);
-            }
-        }
+    // Admission precedes every dispatcher, including mixed command lines and pure tools.
+    // No retired source catalog is opened and no configuration migration can run here.
+    if let Some(command) = app::retired_storage_command(&args) {
+        eprintln!("{command} is retired from the PostgreSQL product; no storage was opened");
+        return ExitCode::from(1);
     }
-
-    if has("--import-history") {
-        return ExitCode::from(atlas::pg::history_cli::run_cli(&args) as u8);
+    if let Some(command) = app::unavailable_native_maintenance_command(&args) {
+        eprintln!("{command} requires a native PostgreSQL maintenance implementation; no storage was opened");
+        return ExitCode::from(1);
     }
-    if has("--restore-keep") {
-        return ExitCode::from(atlas::keep_export::run_restore(&args) as u8);
-    }
-    if has("--import-main") {
-        return ExitCode::from(atlas::pg::main_import::run_cli(&args) as u8);
+    if app::replay_requires_postgres(&args) {
+        eprintln!("--save-replay requires --pg-database and --pg-schema; no storage was opened");
+        return ExitCode::from(1);
     }
     if has("--save-replay") {
-        return ExitCode::from(atlas::save_replay::run_cli(&args) as u8);
+        return ExitCode::from(atlas::save_replay::run_cli(&args).clamp(0, 255) as u8);
     }
-
-    // Even runtime/default startup must reject a bad selected entry before
-    // config migration can replace it from an older JSON file. The explicit
-    // import/replay tools above keep their own source/destination admission.
-    if atlas::config::checked_storage_config().is_err() {
-        eprintln!("storage configuration is invalid; Atlas was not started");
+    if has("--header-store") {
+        return ExitCode::from(atlas::nxv_store::tools::run_cli(&args).clamp(0, 255) as u8);
+    }
+    if has("--overview") {
+        return ExitCode::from(atlas::overview_archive::run_cli(&args).clamp(0, 255) as u8);
+    }
+    if !args.is_empty() && !has("--dump-ext") && !has("--restore-ext") && !has("--selftest") && !has(procs::BG_FLAG) {
+        eprintln!("unrecognized command; use --help");
         return ExitCode::from(1);
     }
 
+    // Check the selected entry before migration, provider setup, catalog startup or backup.
+    if atlas::config::checked_storage_config().is_err() {
+        eprintln!(
+            "PostgreSQL storage configuration is unavailable in {}; Atlas was not started",
+            atlas::paths::app_dir().display()
+        );
+        return ExitCode::from(1);
+    }
     match atlas::config::migrate_to_toml() {
         Ok(Some(path)) => eprintln!("config.json is now {}, and the old file is config.json.bak-toml", path.display()),
         Ok(None) => {}
-        Err(e) => eprintln!("couldnt convert config.json to config.toml, still using it: {e}"),
+        Err(error) => eprintln!("couldnt convert config.json to config.toml, still using it: {error}"),
     }
 
-    atlas::sealed_store::configure(&atlas::config::sealed_log_config().addr);
-
-    let code = if has("--convert") {
-        run_convert()
-    } else if has("--compact") {
-        run_compact()
-    } else if has("--purge") {
-        postprocess::purge::main(&args)
-    } else if has("--reprocess") {
-        postprocess::reprocess::main(&args)
-    } else if has("--predb-import") {
-        atlas::predb::file_import::run(&args)
-    } else if has("--replay-raw-predb") {
-        atlas::raw_store::run_replay_predb(&args)
-    } else if has("--header-store") {
-        atlas::nxv_store::tools::run_cli(&args)
-    } else if has("--move-ext") {
-        atlas::pg::ext::run_move(&args)
-    } else if has("--dump-ext") || has("--restore-ext") {
+    let code = if has("--dump-ext") || has("--restore-ext") {
         atlas::pg::ext::run_cli(&args)
-    } else if has("--export-keep") {
-        atlas::keep_export::run(&args)
-    } else if has("--reset-shards") {
-        atlas::raw_store::run_reset_shards(&args)
-    } else if has("--reflag-obfuscated") {
-        atlas::naming::reflag::run(&args)
-    } else if has("--unname") {
-        atlas::naming::unname::run(&args)
-    } else if has("--recount-articles") {
-        atlas::naming::recount::run(&args)
-    } else if has("--count-repair-candidates") {
-        atlas::repair_counts::run(&args)
-    } else if has("--split-reposts") {
-        atlas::repost_split::run(&args)
-    } else if has("--undo-mojibake") {
-        atlas::naming::mojibake::run(&args)
-    } else if has("--sealed-log-move") {
-        atlas::sealed_store::run_move()
-    } else if has("--shared-catalog-fill") {
-        atlas::shared_catalog::run_fill()
-    } else if has("--shared-catalog-check") {
-        atlas::shared_catalog::run_check(has("--prune"))
-    } else if has("--search-indexes") {
-        atlas::field_search::run(&args)
-    } else if has("--thaw") {
-        atlas::frozen::run_thaw(&args)
-    } else if has("--frozen-stats") {
-        atlas::frozen::run_stats()
-    } else if has("--overview") {
-        atlas::overview_archive::run_cli(&args)
-    } else if has("--crc-links") {
-        atlas::keys::run_report(&args)
     } else if has("--selftest") {
         app::selftest()
     } else if has(procs::BG_FLAG) {
@@ -124,56 +69,5 @@ fn main() -> ExitCode {
     } else {
         app::main_menu()
     };
-
     ExitCode::from(code.clamp(0, 255) as u8)
-}
-
-/// `--convert`: the one time move into the shards, in the foreground.
-fn run_convert() -> i32 {
-    let main = paths::database();
-    // a swap cut short is finished (or undone) by `run_alone`, not skipped
-    if !convert::to_do(&main) {
-        println!("{} is already converted (or doesnt exist)", main.display());
-        return 0;
-    }
-    if procs::indexer_alive() {
-        println!("stop indexing first");
-        return 1;
-    }
-    // alone: not alongside the indexer, a compaction or another conversion
-    match convert::run_alone(&main, &|msg| println!("{msg}")) {
-        Ok(Some(_)) => 0,
-        Ok(None) => {
-            println!("{} is already converted (or doesnt exist)", main.display());
-            0
-        }
-        Err(e) => {
-            println!("couldnt convert, nothing was changed: {e:#}");
-            1
-        }
-    }
-}
-
-/// `--compact`: rewrite the shards smaller, in the foreground.
-fn run_compact() -> i32 {
-    if procs::indexer_alive() {
-        println!("stop indexing first");
-        return 1;
-    }
-    // nothing sets it: only the indexer stops a compaction early
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    match compact::run(&paths::database(), &|msg| println!("{msg}"), &stop) {
-        Ok(_) => {
-            // noted like the indexer's own compaction does, soo the auto one waits its interval
-            // never made here: an empty main database would pass for the real one
-            if let Ok(conn) = db::open_shard(&paths::database()) {
-                let _ = store::set_meta(&conn, "last_compact", chrono::Utc::now().timestamp());
-            }
-            0
-        }
-        Err(e) => {
-            println!("couldnt compact: {e:#}");
-            1
-        }
-    }
 }

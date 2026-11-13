@@ -4,7 +4,8 @@ use std::process::Command;
 
 fn run(home: &std::path::Path) -> String {
     let out = Command::new(env!("CARGO_BIN_EXE_atlas"))
-        .arg("--reflag-obfuscated")
+        .arg("--selftest")
+        .env_clear()
         .env("ATLAS_HOME", home)
         .env("ATLAS_NO_KEYRING", "1")
         .output()
@@ -18,6 +19,7 @@ fn a_config_json_becomes_config_toml_once() {
     let (json, toml, kept) =
         (home.path().join("config.json"), home.path().join("config.toml"), home.path().join("config.json.bak-toml"));
     let old = serde_json::json!({
+        "storage": {"backend":"postgres", "url":"host=127.0.0.1 dbname=fixture"},
         "api_port": 9091,
         "groups": ["alt.binaries.a"],
         "note": null,

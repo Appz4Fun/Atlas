@@ -175,9 +175,9 @@ keep_hot = 2
 zstd_level = 9
 
 [storage]
-# where the data lives: "sqlite" (the files next to config.toml) or "postgres" (src/pg/). Postgres is being brought
-# in one area at a time; until then "sqlite" is the only working choice
-backend = "sqlite"
+# Product storage is PostgreSQL only. Supply a destination URL before startup; an
+# absent URL or a SQLite selection is refused without opening a local catalog.
+backend = "postgres"
 # a Postgres connection string: "host=... port=... user=... password=... dbname=..." or "postgresql://..."
 url = ""
 schema = "atlas"

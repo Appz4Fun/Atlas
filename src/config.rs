@@ -901,7 +901,7 @@ impl SharedCatalogConfig {
     }
 }
 
-/// The file's `storage` object: which backend holds the data, and the Postgres to use for it (`crate::pg`).
+/// The file's PostgreSQL storage object. Callers must validate its destination before use.
 pub fn storage_config() -> crate::pg::StorageConfig {
     read_file()
         .map_or_else(crate::pg::StorageConfig::default, |v| crate::pg::StorageConfig::from_value(v.get("storage")))
@@ -915,7 +915,7 @@ pub fn checked_storage_config() -> Result<crate::pg::StorageConfig, String> {
 
 fn checked_storage_config_in(dir: &Path) -> Result<crate::pg::StorageConfig, String> {
     // symlink_metadata observes the selected entry itself. A dangling TOML
-    // symlink must not silently select JSON/default SQLite instead.
+    // symlink must not silently select JSON or an implicit destination instead.
     for name in ["config.toml", "config.json"] {
         let path = dir.join(name);
         match fs::symlink_metadata(&path) {
@@ -924,12 +924,11 @@ fn checked_storage_config_in(dir: &Path) -> Result<crate::pg::StorageConfig, Str
             Err(_) => return Err("storage configuration unavailable".into()),
         }
     }
-    Ok(crate::pg::StorageConfig::default())
+    Err("PostgreSQL storage configuration required".into())
 }
 
 fn checked_storage_config_at(path: &Path) -> Result<crate::pg::StorageConfig, String> {
-    // Once an entry was observed, even its disappearance is an error. Only
-    // the genuinely absent initial configuration above gets legacy defaults.
+    // Once an entry was observed, even its disappearance is an error.
     let text = fs::read_to_string(path).map_err(|_| "storage configuration unavailable".to_string())?;
     let value = parse_config(path, &text).map_err(|_| "storage configuration unavailable".to_string())?;
     if !value.is_object() { return Err("storage configuration unavailable".into()); }
@@ -1912,7 +1911,7 @@ mod tests {
     fn checked_storage_selection_refuses_invalid_selected_files_without_fallback() {
         let dir=tempfile::tempdir().unwrap();
         let json=dir.path().join("config.json");let toml=dir.path().join("config.toml");
-        fs::write(&json,r#"{"storage":{"backend":"sqlite"}}"#).unwrap();
+        fs::write(&json,r#"{"storage":{"backend":"postgres","url":"host=127.0.0.1 dbname=fixture"}}"#).unwrap();
         for invalid in ["[storage", "[storage]\nbackend=42", "[storage]\nbackend='postgres'", "storage='postgres'", "[storage]\nbackend='unknown'"] {
             fs::write(&toml,invalid).unwrap();assert!(checked_storage_config_in(dir.path()).is_err());
         }
@@ -1924,7 +1923,7 @@ mod tests {
     #[test]
     fn checked_storage_selection_refuses_dangling_toml_but_reads_explicit_postgres() {
         let dir=tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("config.json"),r#"{"storage":{"backend":"sqlite"}}"#).unwrap();
+        fs::write(dir.path().join("config.json"),r#"{"storage":{"backend":"postgres","url":"host=127.0.0.1 dbname=fixture"}}"#).unwrap();
         let toml=dir.path().join("config.toml");
         std::os::unix::fs::symlink(dir.path().join("missing"),&toml).unwrap();
         assert!(checked_storage_config_in(dir.path()).is_err());
@@ -1934,10 +1933,19 @@ mod tests {
     }
 
     #[test]
-    fn checked_storage_selection_preserves_defaults_only_for_a_genuinely_absent_config() {
-        let dir=tempfile::tempdir().unwrap();
-        assert_eq!(checked_storage_config_in(dir.path()).unwrap().backend,crate::pg::Backend::Sqlite);
-        fs::write(dir.path().join("config.json"),b"{broken").unwrap();
+    fn checked_storage_selection_requires_an_explicit_usable_postgres_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(checked_storage_config_in(dir.path()).is_err());
+        for source in [
+            r#"{}"#,
+            r#"{"storage":{}}"#,
+            r#"{"storage":{"backend":"sqlite","url":"host=127.0.0.1 dbname=fixture"}}"#,
+            r#"{"storage":{"backend":"postgres","url":"invalid connection text"}}"#,
+        ] {
+            fs::write(dir.path().join("config.json"), source).unwrap();
+            assert!(checked_storage_config_in(dir.path()).is_err());
+        }
+        fs::write(dir.path().join("config.json"), b"{broken").unwrap();
         assert!(checked_storage_config_in(dir.path()).is_err());
     }
 

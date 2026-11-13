@@ -43,14 +43,14 @@ Use Atlas from the terminal, browse its built-in Web UI, or point Prowlarr, NZBH
 > [!IMPORTANT]
 > Atlas is a single native binary written in **[Rust](https://www.rust-lang.org) 1.99.0**, edition 2024.
 
-The Rust version replaces the original Python version. It keeps the same menus, converts an existing `atlas.db` once into its own faster and smaller layout, and indexes many times faster.
+The Rust version replaces the original Python version. This PostgreSQL cutover branch requires a checked PostgreSQL destination for product startup. SQLite conversion commands and the old terminal menu are retired; legacy modules and dependencies still await build-graph cleanup. See [current commands and remaining maintenance ports](docs/POSTGRES_FRONTDOORS.md). Service activation and deployment require their separate native qualification.
 
 | Component | Crate |
 |---|---|
 | Toolchain | Rust **1.99.0**, pinned in `rust-toolchain.toml` and set as `rust-version = "1.99"` in `Cargo.toml` |
 | Async network I/O | [`tokio`](https://tokio.rs) with [`rustls`](https://github.com/rustls/rustls) for Transport Layer Security (TLS) |
 | Terminal UI | [`ratatui`](https://ratatui.rs) |
-| Database | [`rusqlite`](https://github.com/rusqlite/rusqlite) with bundled SQLite, Write-Ahead Logging (WAL), and an FTS5 search index |
+| Database | Native PostgreSQL catalog and cache ports; legacy SQLite code remains pending build-graph cleanup |
 | Web UI & Newznab API | [`tiny_http`](https://github.com/tiny-http/tiny-http) + embedded [`htmx`](https://htmx.org) and Oxide CSS |
 | Compression & archives | [`zstd`](https://github.com/gyscos/zstd-rs), [`flate2`](https://github.com/rust-lang/flate2-rs), [`lzma-rs`](https://github.com/gendx/lzma-rs), and native RAR/7z/ZIP/PPMd/bzip2/lz4 decoders |
 | yEnc decoding | [`nntmux-yenc`](https://github.com/xbmc4lyfe/newznab-tmux) shared with `newznab-tmux` |
@@ -77,7 +77,7 @@ rustup installs the pinned toolchain the first time you build, and the `just` re
 - **Serve a Newznab API** for Prowlarr, NZBHydra2, Sonarr, and Radarr: `search`, `tvsearch`, `movie`, `music`, `book`, `caps`, and `get`, which downloads an NZB (or a single file with `file=N`, listed by `t=files`), its gaps filled from any twin of the same bytes.
 - **Search from the terminal** in one group or all groups, or use **AI search**, which turns a request like `find me 4k hdr movies` into groups and keywords with a local [Ollama](https://ollama.com) model.
 - **Watch progress** on the live dashboard, dig into CPU, memory, backfill, content, post-processing, and per-server numbers on the 6-page terminal stats dashboard, or scrape Prometheus metrics with the 7 included Grafana dashboards.
-- **Keep everything local** in an 8-shard SQLite database with zstd-sealed article blobs and an FTS5 full-text index.
+- **PostgreSQL catalog storage** with owned native transactions and NXV header files. The cutover branch still requires full worker, maintenance, and no-SQLite build qualification.
 
 ![Atlas live dashboard](img/live-dashboard.png)
 
@@ -103,10 +103,10 @@ Atlas was originally created in Python by [Eraxty](https://github.com/Eraxty) (`
 
 | Area | Original Python Implementation (`v5.2.1`) | Rust Edition (`Appz4Fun/Atlas`) |
 |---|---|---|
-| **Runtime & Binary** | Python 3.10+ interpreter, virtualenv, and `pip` dependencies | Single native Rust **1.99.0** (edition 2024) binary with zero runtime dependencies |
+| **Runtime & Binary** | Python 3.10+ interpreter, virtualenv, and `pip` dependencies | Single native Rust **1.99.0** (edition 2024) binary with PostgreSQL catalog storage |
 | **Configuration & Paths** | `config.json` in the working directory; single Usenet server only | `config.toml` (auto-migrates `config.json` with comment preservation); defaults to `~/.atlas`; supports unlimited parallel `[[usenet_servers]]` with priorities and `index = false` fill servers |
 | **NNTP Engine & Backfill** | Sequential single-server header fetching | Async `tokio` + `rustls` connection pools across all servers simultaneously, `XFEATURE COMPRESS GZIP`, UTC day-chunk backfill splitting across providers, automatic connection-limit step-down, and `max_unsaved_headers` memory backpressure |
-| **Database Architecture** | Single `atlas.db` SQLite file storing raw article rows | `atlas.db` + **8 parallel shard files** (`atlas.s0.db`–`atlas.s7.db`), custom alphabet-packed message IDs (~4× smaller), zstd-compressed sealed file blobs, online/foreground `--compact`, and optional remote `sealed-log` offload service |
+| **Database Architecture** | Single `atlas.db` SQLite file storing raw article rows | Native PostgreSQL catalog/cache ports and NXV header storage; old shard conversion, compaction and mirroring commands are retired in the cutover branch |
 | **Web Interface** | None (terminal UI only) | Built-in **Oxide Web UI** (`src/web.rs`, `src/web_meta.rs`) with htmx, derived cookie auth, instant in-memory sorting, quality filter chips, field search, duplicates browser, 6 forensic panels, `+` inline drawers, video stills, cover art, and **Ask AI** (Google Gemini) |
 | **Release Grouping & Linking** | Basic subject grouping; per-article obfuscated spam created millions of 1-part rows | 1,154 per-group collection & naming regexes (ported from `newznab-tmux`), PAR2-set linking of fully obfuscated uploads, cross-group post folding, per-article obfuscated upload gathering/filtering, and automatic minor-labeled group blocking |
 | **Post-Processing & Probing** | Inline PAR2/NFO deobfuscation during save only | Persistent two-lane post-processing stage (`src/postprocess/`) with rate-budgeted article probes, 10-layer nested archive decompression (RAR4/5, 7z, ZIP, PPMd, LZMA2, bzip2, lz4), MKV/MP4 stream inspection, H.264/HEVC keyframe still extraction, and `pHash` same-film matching |
@@ -129,7 +129,7 @@ cd Atlas
 just run            # or: cargo run --release
 ```
 
-`just run` and `cargo run` keep `config.toml`, `atlas.db`, and the logs in the repository folder, as set in `.cargo/config.toml`. The Python version kept them in the same place, so an existing setup carries over. To see which Rust the recipes use, run `just toolchain`.
+`just run` and `cargo run` keep `config.toml` and logs in the repository folder, as set in `.cargo/config.toml`. Configure the PostgreSQL destination before starting the product. To see which Rust the recipes use, run `just toolchain`.
 
 To install Atlas as a command instead:
 
@@ -141,28 +141,17 @@ atlas
 Atlas keeps its data in `~/.atlas` unless `ATLAS_HOME` points somewhere else. A binary with a config or `atlas.db` already next to it keeps using that folder, so an older install carries on as it was. To move one, stop Atlas and move those files to `~/.atlas`.
 
 ```text
-usage: atlas [--selftest | --bg-indexer | --convert]
+usage: atlas [--selftest | --bg-indexer | --dump-ext | --restore-ext DIR]
 
-  (no args)     interactive menu
-  --selftest    check the login on every usenet server and exit
-  --bg-indexer  run the indexing loop headless (the menu starts this for you)
-  --convert     move a database from before the shards into them, then exit
-                (the indexer does this on its own when it starts)
-  --compact     rewrite the shards smaller (stop indexing first), then exit
-  --purge       delete what no step can help, a dry run unless --apply. Alone it takes
-                fragments only: [--fragments] [--blocked] [--too-small [--below BYTES]]
-                [--image-only] [--rejected] [--dead] [--sample N] [--apply]
-  --reprocess   look at stored releases again, a dry run unless --apply:
-                [--step NAME]... [--group NAME]... [--failed] [--apply]
-  --reflag-obfuscated  flag old rows the current check calls random, a dry run unless
-                --apply: [--sample N] [--apply]
-  --unname      clear names taken from subjects and posted files, a dry run unless
-                --apply: [--sample N] [--apply]
-  --sealed-log-move  move sealed articles to the sealed log at full speed (stop indexing first)
-  --predb-import  read PreDB titles from a local file, a dry run unless --apply:
-                FILE [--apply]
-  --search-indexes  index poster and size, for searching on them (stop indexing first),
-                a dry run unless --apply: [--apply]
+  (no args)       start the native Web service with checked PostgreSQL storage
+  --selftest      check configured Usenet server logins
+  --bg-indexer    run the native PostgreSQL indexing loop
+  --dump-ext      dump PostgreSQL ext_* tables [--allow-shrink]
+  --restore-ext DIR  restore a PostgreSQL ext_* dump [--replace]
+  --save-replay --store DIR --db DIR --pg-database NAME --pg-schema atlas_replay_NAME
+                 replay NXV headers into a fresh native staging schema
+  --header-store read a copied header store independently of catalog storage
+  --overview     read an overview archive without a provider or catalog
 ```
 
 ### Prebuilt binaries
@@ -176,7 +165,7 @@ When you push a release tag (`v*`), the `build-executables` workflow builds `atl
 
 An existing `config.json` converts itself at the next start. Atlas writes `config.toml` and keeps the old file as `config.json.bak-toml`, which you can delete once you are happy. Comments you add to `config.toml` stay when Atlas saves a change, except on a key it changes.
 
-On first run, Atlas asks for one server (host, username, password, and port) and writes `config.toml`. You can edit everything else in the menus or directly in the file. The repository includes a template without secrets, [`config.example.toml`](config.example.toml).
+Before startup, create `config.toml` from the template without secrets, [`config.example.toml`](config.example.toml), and supply a usable `[storage]` PostgreSQL URL and schema. Missing configuration or an explicit SQLite backend is refused before storage/provider startup. Supported worker settings retain their native admission checks; this change does not disable enabled workers to pass admission.
 
 ### Full example
 
@@ -333,7 +322,9 @@ ATLAS_HOME=. cargo run --release --example probe_connections -- --max 300
 
 The probe opens and logs in connections on every server until the provider refuses one, reports the maximum per server, and checks whether servers on the same account share a limit. Set `connections` below the measured maximum, for example to 75%, to leave room for other apps on the same account.
 
-## Usage
+## Historical terminal usage
+
+The following terminal, shard-storage, conversion, and mirroring descriptions document the retired implementation. Their commands are not accepted by this PostgreSQL product frontdoor. Use the current command list above and [maintenance transition](docs/POSTGRES_FRONTDOORS.md); preserve valuable caches and recovery copies before any separately authorized data retirement.
 
 ![First-time setup prompt](img/login.png)
 
