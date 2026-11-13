@@ -3077,3 +3077,7 @@ mod tests {
         assert_eq!(sources[0].0, "<99@x>", "the par2 first");
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/common/native_provider_contract.rs"]
+mod native_provider_contract;
