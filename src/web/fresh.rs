@@ -54,7 +54,7 @@ fn dispatch_with_assets(view:&ReadView<'_>,path:&str,args:&HashMap<String,String
             for row in &rows {
                 let facts=facts.remove(&row.id).context("native result facts disappeared")?;
                 body.push_str(&row_from_facts(row,ResultFacts {category:facts.category,password:facts.password.as_ref(),media:facts.media.as_ref(),
-                    details:facts.details.as_ref().map(ResultDetails::from),poster:None,recovery:None,copies:None,spot:None,whole:None,repair:false}));
+                    details:facts.details.as_ref().map(ResultDetails::from),poster:None,recovery:facts.recovery.as_ref().map(release_info::RecoveryOnly::repairs_bytes),copies:None,spot:None,whole:None,repair:false}));
             }
             let next=search.offset.checked_add(PAGE_SIZE).context("native result page offset overflow")?;
             if next<total.count {body.push_str(&search.load_more());}
@@ -212,19 +212,23 @@ fn own_release_page(view:&ReadView<'_>,id:i64,key:&str)->Result<String> {
     let groups=[release_info::GroupPosting {id,group:row.group_name.clone(),articles:row.parts.unwrap_or(0)}];
     // An own row's completion is the native writer's verdict. Unqualified
     // cross-row/PAR2 relationships never turn it into repaired/lent payload.
-    let (shown,raw,tags,facts)=release_header_from_facts(&row,&inner,listing.media.as_ref(),Some(&names),&contents,None,
-        ReleaseHeaderFacts {category:listing.category,details:listing.details.as_ref(),spot:None,spot_removed:false,repair:false,groups:&groups,password:""});
     let found=view.probe(id)?.map(|probe|seven_z_first_file(probe,&inner,&contents));
+    let kept_nfo=if found.as_ref().is_some_and(|probe|probe.nfo.is_some()){None}else{view.own_nfo_text(id)?};
+    let nfo_text=found.as_ref().and_then(|probe|probe.nfo.as_deref()).or(kept_nfo.as_deref());
     let nfo=match found.as_ref().and_then(|probe|probe.nfo.as_ref().map(|text|(text,&probe.imdb_ids))) {
-        Some((text,ids))=>nfo_html(text,ids),
-        None=>view.own_nfo_text(id)?.map(|text|nfo_html(&text,&[])).unwrap_or_default(),
+        Some((text,ids))=>nfo_html(text,ids),None=>kept_nfo.as_deref().map(|text|nfo_html(text,&[])).unwrap_or_default(),
     };
+    let password=view.own_password_hint(id,&names,&inner,nfo_text)?.as_ref().map(|hint|password_fact(&inner,hint)).unwrap_or_default();
+    let recovery=listing.recovery.as_ref();
+    let (shown,raw,tags,facts)=release_header_from_facts(&row,&inner,listing.media.as_ref(),Some(&names),&contents,recovery,
+        ReleaseHeaderFacts {category:listing.category,details:listing.details.as_ref(),spot:None,spot_removed:false,repair:false,groups:&groups,password:&password});
     let subtitles=view.own_subtitles(id)?;let salt=view.own_key_salt()?;
     let probe=found.as_ref().map(|probe|probe_html(probe,subtitles.as_ref(),None,salt)).unwrap_or_default();
     // Full-page relationship/asset qualification is deliberately separate
     // from these real own facts. Unavailability is visible, never absence.
-    let warning=diag("note","Additional release panels unavailable",
-        "Related postings and sidecar lookups, password hints and borrowed artwork are unavailable in the native reader. Own picture bytes require the selected asset root and manifest.");
+    let mut warning=diag("note","Additional release panels unavailable",
+        "Verified copy relationships, inherited passwords and borrowed artwork are unavailable in the native reader. Own picture bytes require the selected asset root and manifest.");
+    if let Some(recovery)=recovery {warning.push_str(&recovery_warning(recovery));}
     let inputs=crate::web_meta::MetaInputs {release:&row,names:Some(&names),inner:&inner,contents:&contents,probe:found.as_ref()};
     let metadata=view.own_metadata(&inputs)?;
     let meta=crate::web_meta::meta_from_facts(&inputs,&metadata);
@@ -234,7 +238,7 @@ fn own_release_page(view:&ReadView<'_>,id:i64,key:&str)->Result<String> {
         states.insert(file.name.clone(),native_picture_state(&file.name,&pictures,&etas));
     }
     let nzb_files=nzb_files_html_with(id,&contents,&states,&crate::web_settings::csrf_token(key),native_picture_state_html);
-    let files=inner_files_html(&inner,false);
+    let files=inner_files_html(&inner,recovery.is_some());
     Ok(release_page_from_facts(&row,&shown,raw.as_deref(),&tags,&facts,listing.category,
         ReleaseSections {fill:String::new(),warning,spot:String::new(),nfo,images:images_html(id,&pictures.images),stills:stills_html(id,&pictures.stills,None),copies:String::new(),meta,probe,nzb_files,files}))
 }
@@ -946,5 +950,107 @@ mod native_own_picture_tests {
             assert_eq!(response.status,200);assert!(response.body.contains("new final &lt;reason&gt;"));assert!(!response.body.contains("QUEUED"));
         }
         live.owner.close();
+    }
+}
+
+#[cfg(test)]
+mod native_own_enrichment_tests {
+    use super::*;
+    use crate::parser::{Article,Release};
+    use std::time::{Instant,Duration};
+    fn save(client:&mut postgres::Client,name:&str,file:&str,subject:&str,mid:&str)->i64 {
+        let saved=pg::release_writer::save(client,&[Release {name:name.into(),poster:"poster".into(),group:"alt.binaries.test".into(),date:"Wed, 01 Jan 2020 00:00:00 +0000".into(),
+            articles:vec![Article {filename:Some(file.into()),subject:subject.into(),message_id:mid.into(),part:Some(1),total_parts:Some(1),bytes:17,..Default::default()}],..Default::default()}],1).unwrap();
+        assert_eq!((saved.releases,saved.files,saved.parts),(1,1,1));client.query_one("select id from releases where name=$1",&[&name]).unwrap().get(0)
+    }
+    fn page(client:&mut postgres::Client,schema:&str,id:i64)->Result<ApiResponse> {
+        let view=ReadView::open(client,schema,pg::fresh_reader::Budget {rows:100,..Default::default()},Instant::now()+Duration::from_secs(10))?;
+        dispatch(&view,"/ui/release",&HashMap::from([("id".into(),id.to_string())]),"http://example.invalid","fixture-key")
+    }
+    #[test]
+    #[ignore="requires explicit isolated PG and actual native writer; own hint and malformed/error boundaries"]
+    fn own_password_facts_preserve_precedence_sources_and_never_borrow_neighbor_hints() {
+        let schema=pg::testing::Schema::new().expect("explicit isolated PG required");let mut client=schema.pool.get().unwrap();
+        let stored=save(&mut client,"Stored.Password.Release","data.rar","data.rar yEnc (1/1)","stored-hint@example.invalid");
+        let named=save(&mut client,"Name.{{nameSecret42}}","data.rar","data.rar yEnc (1/1)","name-hint@example.invalid");
+        let subject=save(&mut client,"Subject.Password.Release","data.rar","data.rar password=subjectSecret42 yEnc (1/1)","subject-hint@example.invalid");
+        let inner=save(&mut client,"Inner.Password.Release","data.rar","data.rar yEnc (1/1)","inner-hint@example.invalid");
+        let absent=save(&mut client,"No.Own.Password.Release","data.rar","data.rar yEnc (1/1)","absent-hint@example.invalid");
+        let neighbor=save(&mut client,"Neighbor.Only.Password.Release","data.rar","data.rar yEnc (1/1)","neighbor-hint@example.invalid");
+        let renamed=save(&mut client,"Own.Renamed.Archive","random.rar","plain yEnc (1/1)","renamed-hint@example.invalid");
+        let unchanged=save(&mut client,"Own.Unchanged.Archive","AbCdEf1234.rar","plain yEnc (1/1)","unchanged-hint@example.invalid");
+        let unbound=save(&mut client,"Own.Unbound.Archive","random.rar","plain yEnc (1/1)","unbound-hint@example.invalid");
+        for (id,bound) in [(renamed,1i64),(unchanged,1),(unbound,0)] {
+            client.execute("insert into par2_files(release_id,file_id,set_id,md5,md5_16k,size,name,bound) values($1,decode(repeat('11',16),'hex'),decode(repeat('22',16),'hex'),decode(repeat('33',16),'hex'),decode(repeat('44',16),'hex'),17,'AbCdEf1234.part01.rar',$2)",&[&id,&bound]).unwrap();
+        }
+        client.execute("insert into release_nfo_password(release_id,password) values($1,'own<&secret>'),($2,'neighbor-only')",&[&stored,&neighbor]).unwrap();
+        client.execute("insert into release_nfo(release_id,file,text) values($1,'own.nfo','Password: own<&secret>')",&[&stored]).unwrap();
+        client.execute("insert into archive_release(release_id,password,password_check) values($1,2,null)",&[&stored]).unwrap();
+        client.execute("insert into archive_inner_files(release_id,seq,name,size,source) values($1,1,'Nested-{{insideSecret42}}.nzb',null,$2)",&[&inner,&crate::archive::store::SOURCE_RAR]).unwrap();
+        for (id,want) in [(stored,"<code>own&lt;&amp;secret&gt;</code> found in the NFO, not tried"),(named,"<code>nameSecret42</code> found in the release name"),
+            (subject,"<code>subjectSecret42</code> found in the subject"),(inner,"<code>insideSecret42</code> found in a file inside")] {
+            let response=page(&mut client,&schema.name,id).unwrap();assert_eq!(response.status,200);assert!(response.body.contains(want),"missing {want}: {}",response.body);
+            assert!(!response.body.contains("neighbor-only"));
+        }
+        let response=page(&mut client,&schema.name,absent).unwrap();assert!(!response.body.contains("found in")&&!response.body.contains("neighbor-only"));
+        let response=page(&mut client,&schema.name,renamed).unwrap();assert!(response.body.contains("<code>AbCdEf1234</code> found in the PAR2 set's file names"),"{}",response.body);assert!(!response.body.contains("WORKS"));
+        for id in [unchanged,unbound] {let response=page(&mut client,&schema.name,id).unwrap();assert!(!response.body.contains("<code>AbCdEf1234</code> found"),"{}",response.body);}
+        client.execute("update release_nfo_password set password=$2 where release_id=$1",&[&stored,&"x".repeat(256*1024)]).unwrap();
+        assert!(page(&mut client,&schema.name,stored).is_err(),"oversize password data must refuse before decode/render");
+        client.execute("update release_nfo_password set password='own<&secret>' where release_id=$1",&[&stored]).unwrap();
+        client.execute("update archive_release set password_check=$2 where release_id=$1",&[&stored,&vec![1u8,2]]).unwrap();
+        assert!(page(&mut client,&schema.name,stored).is_err(),"malformed own archive check cannot become unchecked success");
+        client.execute("update archive_release set password_check=null where release_id=$1",&[&stored]).unwrap();
+        client.batch_execute("alter table release_nfo_password rename to unavailable_password_facts").unwrap();
+        assert!(page(&mut client,&schema.name,stored).is_err(),"PG errors never fall back to empty hints or SQLite");
+    }
+    #[test]
+    #[ignore="requires explicit isolated PG; metadata target and sidecar rows stay read-only associations"]
+    fn own_metadata_targets_and_sidecars_are_real_bounded_pg_associations() {
+        let schema=pg::testing::Schema::new().expect("explicit isolated PG required");let mut client=schema.pool.get().unwrap();
+        let own=save(&mut client,"Carrier.NZB.Release","carrier.nzb","carrier.nzb yEnc (1/1)","own-nzb-meta@example.invalid");
+        let target=save(&mut client,"Target.Movie.2020-GRP","video.mkv","video.mkv yEnc (1/1)","target-meta@example.invalid");
+        let uid_side=save(&mut client,"Posted.Uid.Sidecar","info.txt","info.txt yEnc (1/1)","uid-side-meta@example.invalid");
+        let named_side=save(&mut client,"Posted.Name.Sidecar","info.nfo","info.nfo yEnc (1/1)","name-side-meta@example.invalid");
+        let other_side=save(&mut client,"Other.Sidecar","other.nfo","other.nfo yEnc (1/1)","other-side-meta@example.invalid");
+        client.execute("insert into archive_inner_files(release_id,seq,name,size,source) values($1,1,'Target.Movie.2020-GRP.part01.rar',17,$2),($1,2,'Target.Movie.2020-GRP.par2',1,$2),($1,3,'Missing.Movie.2021-GRP.mkv',1,$2)",&[&own,&crate::archive::store::SOURCE_NZB]).unwrap();
+        let probe=crate::probe::ProbeInfo {media:Some(crate::probe::media::MediaInfo {segment_uid:Some("ABCD1234".into()),..Default::default()}),..Default::default()};
+        client.execute("insert into release_probe(release_id,info) values($1,$2)",&[&own,&serde_json::to_string(&probe).unwrap()]).unwrap();
+        for (id,title,uid,text,at) in [(uid_side,"unrelated name",Some("abcd1234"),Some("UID <first>"),1i64),(named_side,"carrier.nzb.release",None,Some("NFO <second>"),2),
+            (other_side,"other carrier",Some("different"),Some("neighbor-only-sidecar"),3),(own,"Carrier.NZB.Release",Some("abcd1234"),Some("self-only-sidecar"),4)] {
+            client.execute("insert into sidecars(release_id,name,group_name,file,kind,release_name,segment_uid,text,at) values($1,$2,'alt.binaries.test','info.nfo','nfo',$3,$4,$5,$6)",&[&id,&format!("sidecar-{id}"),&title,&uid,&text,&at]).unwrap();
+        }
+        let response=page(&mut client,&schema.name,own).unwrap();assert_eq!(response.status,200);
+        assert!(response.body.contains(&format!("href=\"/ui/release?id={target}\"")),"{}",response.body);
+        for text in ["Points to","Missing.Movie.2021-GRP","not indexed here","UID &lt;first&gt;","NFO &lt;second&gt;","same file, by its Segment UID","by name"] {assert!(response.body.contains(text),"missing {text}: {}",response.body);}
+        assert!(response.body.find("UID &lt;first&gt;").unwrap()<response.body.find("NFO &lt;second&gt;").unwrap());
+        assert!(!response.body.contains("neighbor-only-sidecar")&&!response.body.contains("self-only-sidecar"));
+        client.execute("update sidecars set text=null where release_id=$1",&[&uid_side]).unwrap();
+        let response=page(&mut client,&schema.name,own).unwrap();assert!(response.body.contains("same file, by its Segment UID")&&!response.body.contains("UID &lt;first&gt;"));
+        client.execute("update sidecars set text=$2 where release_id=$1",&[&named_side,&"x".repeat(1024*1024)]).unwrap();
+        assert!(page(&mut client,&schema.name,own).is_err(),"oversize sidecar refuses before transfer; no truncation or empty fallback");
+        client.execute("update sidecars set text='NFO <second>' where release_id=$1",&[&named_side]).unwrap();
+        client.batch_execute("alter table sidecars rename to unavailable_sidecar_facts").unwrap();
+        assert!(page(&mut client,&schema.name,own).is_err(),"PG lookup failure is unavailable, not a fake empty sidecar list");
+    }
+    #[test]
+    #[ignore="requires explicit isolated PG; recovery metadata uses real own filenames and PAR2-origin rows"]
+    fn own_recovery_rows_distinguish_exact_unknown_and_non_recovery_without_lending() {
+        let schema=pg::testing::Schema::new().expect("explicit isolated PG required");let mut client=schema.pool.get().unwrap();
+        let exact=save(&mut client,"Own.Recovery.Exact","set.vol00+01.par2","set.vol00+01.par2 yEnc (1/1)","exact-par2@example.invalid");
+        let unknown=save(&mut client,"Own.Recovery.Unknown","other.par2","other.par2 yEnc (1/1)","unknown-par2@example.invalid");
+        let data=save(&mut client,"Ordinary.Data.Release","video.mkv","video.mkv yEnc (1/1)","own-data@example.invalid");
+        client.execute("insert into archive_inner_files(release_id,seq,name,size,source) values($1,1,'movie.mkv',100,$4),($1,2,'sub.srt',20,$4),($2,1,'unknown.mkv',null,$4),($3,1,'video.mkv',17,$4)",&[&exact,&unknown,&data,&crate::archive::store::SOURCE_PAR2]).unwrap();
+        let response=page(&mut client,&schema.name,exact).unwrap();assert!(response.body.contains("PAR2 recovery data only")&&response.body.contains("120 bytes"),"{}",response.body);
+        assert!(!response.body.contains("NEEDS REPAIR"),"describing a recovery set grants no whole-download repair or lending authority");
+        let response=page(&mut client,&schema.name,unknown).unwrap();assert!(response.body.contains("PAR2 recovery data only"));assert!(!response.body.contains("120 bytes"));
+        let response=page(&mut client,&schema.name,data).unwrap();assert!(!response.body.contains("PAR2 recovery data only"),"a matching own data filename is not a sniffed PAR2 file");
+        let view=ReadView::open(&mut client,&schema.name,pg::fresh_reader::Budget {rows:100,..Default::default()},Instant::now()+Duration::from_secs(10)).unwrap();
+        let response=dispatch(&view,"/ui/results",&HashMap::new(),"http://example.invalid","fixture-key").unwrap();assert_eq!(response.status,200);assert!(response.body.contains("PAR2 ONLY"),"{}",response.body);drop(view);
+        client.execute("update archive_inner_files set size=$2 where release_id=$1 and seq=1",&[&exact,&i64::MAX]).unwrap();
+        client.execute("update archive_inner_files set size=1 where release_id=$1 and seq=2",&[&exact]).unwrap();
+        assert!(page(&mut client,&schema.name,exact).is_err(),"overflow cannot be rendered as a falsely exact saturated recovery total");
+        client.execute("update archive_inner_files set size=-1 where release_id=$1 and seq=1",&[&exact]).unwrap();
+        assert!(page(&mut client,&schema.name,exact).is_err(),"invalid own set sizes refuse rather than fabricate a total");
     }
 }

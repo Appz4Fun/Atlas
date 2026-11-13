@@ -418,9 +418,16 @@ pub fn recovery_only_with(conn: &Connection, id: i64) -> Result<Option<RecoveryO
                 .collect::<Result<_>>()
         })
         .unwrap_or_default();
-    let all_named_par2 = names.iter().all(|name| is_par2(name));
-    let one_sniffed = names.len() == 1 && !repairs.is_empty() && !repairs.iter().any(|(name, _)| *name == names[0]);
-    Ok((all_named_par2 || one_sniffed).then_some(RecoveryOnly { repairs }))
+    Ok(recovery_only_from_facts(&names,repairs))
+}
+
+/// Presentation of an own row's files and its own parsed set. This does not
+/// assert that another row supplies the data or authorize copying/lending.
+pub(crate) fn recovery_only_from_facts(names:&[String],repairs:Vec<(String,Option<i64>)>)->Option<RecoveryOnly> {
+    if names.is_empty()||names.len()>RECOVERY_ONLY_FILES{return None;}
+    let all_named_par2=names.iter().all(|name|is_par2(name));
+    let one_sniffed=names.len()==1&&!repairs.is_empty()&&!repairs.iter().any(|(name,_)|*name==names[0]);
+    (all_named_par2||one_sniffed).then_some(RecoveryOnly {repairs})
 }
 
 /// `recovery_only_with` for a page of results. Any failure reads as not known.

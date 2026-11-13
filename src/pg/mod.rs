@@ -668,3 +668,5 @@ pub(crate) mod fresh_statistics;
 pub(crate) mod fresh_visual_related;
 
 pub(crate) mod fresh_pictures;
+mod fresh_own_enrichment;
+mod fresh_metadata_links;

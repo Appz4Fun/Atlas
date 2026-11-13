@@ -141,7 +141,7 @@ pub fn one_archive_set<'a>(mut names: impl Iterator<Item = &'a str>) -> bool {
 }
 
 /// A volume's name without what makes it that volume: `a.part01.rar`, `a.r00`, `a.z01`, `a.7z.001` and `a.001` are `a`.
-fn volume_set(name: &str) -> &str {
+pub(crate) fn volume_set(name: &str) -> &str {
     static VOLUME_END: LazyLock<Regex> = LazyLock::new(|| {
         #[allow(clippy::unwrap_used)]
         Regex::new(r"(?i)(\.part\d+\.rar|\.7z\.\d+|\.[^./\\]+)$").unwrap()
@@ -686,6 +686,14 @@ pub fn par2_name_password(conn: &Connection, id: i64) -> Option<crate::release_i
         return None;
     }
     Some(crate::release_info::PasswordHint { password: stem.to_string(), source: "the PAR2 set's file names" })
+}
+
+/// The existing own-set name hint, with the reads supplied by a native RR
+/// loader. A hint is never a password verdict or cross-post payload proof.
+pub(crate) fn par2_password_stem<'a>(names:impl IntoIterator<Item=&'a str>)->Option<&'a str> {
+    let mut data=names.into_iter().filter(|name|!is_sidecar(name));let first=data.next()?;
+    if !is_archive(first){return None;}let stem=volume_set(first);
+    (looks_generated(stem)&&data.all(|name|is_archive(name)&&volume_set(name)==stem)).then_some(stem)
 }
 
 /// A name an uploader made up, not a title: letters and digits only, both cases.
