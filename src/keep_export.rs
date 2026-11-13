@@ -79,6 +79,25 @@ pub(crate) struct Column {
     pub(crate) name: String,
     pub(crate) decl: String,
     pub(crate) pg: PgKind,
+    text_encoding: TextEncoding,
+}
+
+/// Source admission is derived from the real relation/column metadata, never
+/// from query text. Only this codec changes PostgreSQL's NUL-text restriction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TextEncoding {
+    Plain,
+    NfoNameV1,
+}
+
+impl Column {
+    pub(crate) fn plain(name: String, decl: String, pg: PgKind) -> Self {
+        Self { name, decl, pg, text_encoding: TextEncoding::Plain }
+    }
+
+    fn encoded_nfo_name(&self) -> bool {
+        self.pg == PgKind::Text && self.name == "name" && self.text_encoding == TextEncoding::NfoNameV1
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,7 +140,13 @@ pub(crate) fn columns(conn: &Connection, schema: &str, table: &str) -> Result<Ve
     let cols = stmt
         .query_map([table, schema], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(cols.into_iter().map(|(name, decl)| Column { pg: PgKind::of(&decl), name, decl }).collect())
+    Ok(cols.into_iter().map(|(name, decl)| {
+        let mut column = Column::plain(name, decl.clone(), PgKind::of(&decl));
+        if table == "raw_nfo_passwords" && column.pg == PgKind::Text && column.name == "name" {
+            column.text_encoding = TextEncoding::NfoNameV1;
+        }
+        column
+    }).collect())
 }
 
 /// A row's bytes for the digest: each value tagged by its kind, soo 1 and '1' differ.
@@ -197,6 +222,7 @@ pub(crate) fn tally_sql(conn: &Connection, sql: &str, cols: &[Column]) -> Result
             }
             if let Value::Text(t) = &v
                 && t.contains('\0')
+                && !col.encoded_nfo_name()
             {
                 bail!("{}: a text with a zero byte, which Postgres's text refuses", col.name);
             }
@@ -220,7 +246,7 @@ pub(crate) fn select_list(cols: &[Column]) -> String {
 fn freeze_exempt_columns() -> Vec<Column> {
     [("release_id", "INTEGER"), ("at", "INTEGER"), ("name", "TEXT"), ("group_name", "TEXT")]
         .into_iter()
-        .map(|(n, d)| Column { name: n.into(), decl: d.into(), pg: PgKind::of(d) })
+        .map(|(n, d)| Column::plain(n.into(), d.into(), PgKind::of(d)))
         .collect()
 }
 
@@ -945,6 +971,60 @@ mod tests {
         assert!(z.exists());
         assert!(build(&main, &out, true).is_err(), "never over an earlier copy");
         assert!(build(&main, &dir.path().join("strict.db"), false).is_err(), "a missing table stops it unless allowed");
+    }
+
+    #[test]
+    fn nfo_source_tally_preserves_original_zero_byte_name_digest() {
+        let db=Connection::open_in_memory().unwrap();
+        db.execute_batch("create table raw_nfo_passwords(name text,group_name text,content_id blob,password text)").unwrap();
+        let names=["Kept\0nzb","é\0nzb","atlas.nfo-name.v1:4b657074","Kept","kept"];
+        let (mut expected,mut encoded,mut scratch)=(Tally::default(),Tally::default(),Vec::new());
+        for name in names {
+            db.execute("insert into raw_nfo_passwords values(?1,'g',x'01','')",[name]).unwrap();
+            let mut row=vec![Value::Text(name.into()),Value::Text("g".into()),Value::Blob(vec![1]),Value::Text(String::new())];
+            expected.add(&row,&mut scratch);row[0]=Value::Text(crate::raw_store::nfo_key::encode(name));encoded.add(&row,&mut scratch);
+        }
+        let cols=columns(&db,"main","raw_nfo_passwords").unwrap();
+        assert_eq!(tally_sql(&db,"select * from raw_nfo_passwords",&cols).unwrap(),expected);
+        assert_ne!(expected,encoded,"source digest must hash original values, not encoded PG spelling");
+        assert_eq!(db.query_row("select name from raw_nfo_passwords limit 1",[],|r|r.get::<_,String>(0)).unwrap(),names[0]);
+    }
+
+    #[test]
+    fn nfo_tally_exception_never_admits_other_zero_byte_text_or_wrong_value_types() {
+        let db=Connection::open_in_memory().unwrap();
+        db.execute_batch("create table raw_nfo_passwords(name text,group_name text,password text); create table other_cache(name text)").unwrap();
+        let nfo=columns(&db,"main","raw_nfo_passwords").unwrap();
+        for (group,password) in [("bad\0group",""),("g","bad\0password")] {
+            db.execute("delete from raw_nfo_passwords",[]).unwrap();
+            db.execute("insert into raw_nfo_passwords values('Kept',?1,?2)",[group,password]).unwrap();
+            assert!(tally_sql(&db,"select * from raw_nfo_passwords",&nfo).is_err());
+        }
+        db.execute("insert into other_cache values(?1)",["Kept\0nzb"]).unwrap();
+        let other=columns(&db,"main","other_cache").unwrap();
+        assert!(tally_sql(&db,"select name from other_cache /* raw_nfo_passwords.name */",&other).is_err(),"SQL text cannot grant codec admission");
+        db.execute_batch("delete from raw_nfo_passwords; insert into raw_nfo_passwords values(x'4b00','g','')").unwrap();
+        assert!(tally_sql(&db,"select * from raw_nfo_passwords",&nfo).is_err(),"encoded name remains a TEXT field");
+    }
+
+    #[test]
+    fn keep_build_and_snapshot_readback_preserve_nested_nfo_names() {
+        let dir=tempfile::tempdir().unwrap();let main=dir.path().join("atlas.db");crate::db::create_at(&main).unwrap();
+        crate::predb::db::create(&crate::predb::db::path_for(&main)).unwrap();
+        crate::media::store::open(&crate::media::store::path_for(&main)).unwrap();
+        let details=crate::db::create_at(&crate::media::details::path_for(&main)).unwrap();details.execute_batch(crate::media::details::SCHEMA).unwrap();details.execute_batch("alter table details add column backdrop text").unwrap();drop(details);
+        let raw=crate::raw_store::create(&crate::raw_store::path_for(&main)).unwrap();
+        for name in ["Kept\0nzb","atlas.nfo-name.v1:4b657074"] {raw.execute("insert into raw_nfo_passwords(name,group_name,content_id,password) values(?1,'g',x'01','')",[name]).unwrap();}drop(raw);
+        let out=dir.path().join("keep.db");let copied=build(&main,&out,false).unwrap();
+        let mut manifest=serde_json::Map::new();
+        for table in &copied {manifest.insert(table.name.clone(),serde_json::json!({"rows":table.tally.rows,"digest":table.tally.hex()}));}
+        manifest.insert("_left_out".into(),serde_json::json!([]));manifest.insert("_format".into(),serde_json::json!(2));
+        std::fs::write(dir.path().join("manifest.json"),serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let snapshot=Connection::open(&out).unwrap();let checked=verify_snapshot(dir.path(),&snapshot).unwrap();
+        assert_eq!(checked.iter().find(|t|t.name=="raw_nfo_passwords").unwrap().tally,copied.iter().find(|t|t.name=="raw_nfo_passwords").unwrap().tally);
+        assert!(snapshot.prepare("select 1 from raw_nfo_passwords where name=?1 and password='' ").unwrap().exists(["Kept\0nzb"]).unwrap());
+        snapshot.execute("update raw_nfo_passwords set name=?1 where name=?2",["Changed\0nzb","Kept\0nzb"]).unwrap();
+        assert!(verify_snapshot(dir.path(),&snapshot).is_err(),"manifest detects original-name changes with unchanged row count");
     }
 
     #[test]

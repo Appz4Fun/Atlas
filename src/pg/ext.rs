@@ -378,7 +378,7 @@ fn copy_external(c:&mut Client,main:&Path,schema:&str,apply:bool,source:KeepSour
                         Type::INT8=>PgKind::Int,Type::TEXT=>PgKind::Text,Type::FLOAT8=>PgKind::Real,Type::BYTEA=>PgKind::Blob,
                         _=>bail!("UnsupportedSchema: external receipt column type"),
                     };
-                    Ok(Column{name:col.name().into(),decl:String::new(),pg})
+                    Ok(Column::plain(col.name().into(),String::new(),pg))
                 }).collect::<Result<Vec<_>>>()?;
                 let final_tally=keep_export::pg_tally(&mut tx,&keep_export::quoted(&table),&cols)?;
                 relations.push(super::history_companion::relation(&table,final_tally.rows,final_tally.digest));
@@ -1348,7 +1348,7 @@ mod tests {
                  (3, 'Some.fıle.Title-GRP', 3, 1)"
         ))
         .unwrap();
-        let col = |name: &str, pg| Column { name: name.into(), decl: String::new(), pg };
+        let col = |name: &str, pg| Column::plain(name.into(), String::new(), pg);
         let cols = [
             col("id", PgKind::Int),
             col("title", PgKind::Text),
