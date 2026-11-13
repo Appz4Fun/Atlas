@@ -4,31 +4,6 @@ use super::result_value::Value;
 
 use crate::probe::opensubtitles::Feature;
 
-/// Deferred legacy cache resolution is explicit and cannot be submitted as a native mutation.
-pub enum DeferredLegacyStepMutation {
-    MediaParse { media: std::sync::Arc<crate::media::Media>, kind: crate::media::title::Kind,
-        title_key: i64, parsed: crate::media::parse::Parsed },
-}
-
-impl DeferredLegacyStepMutation {
-    pub(crate) fn sqlite_sql(&self) -> &'static str {
-        match self { Self::MediaParse { .. } => crate::media::steps::UPSERT }
-    }
-
-    pub(crate) fn sqlite_parameters(self, release_id: i64) -> Vec<Value> {
-        match self {
-            Self::MediaParse { media, kind, title_key, parsed } => {
-                // Evaluated on the legacy writer, after any preceding fan-out work, as before.
-                let ids = media.cached_ids(title_key).unwrap_or_default();
-                let number = |value: Option<i32>| value.map_or(Value::Null, |value| Value::Integer(i64::from(value)));
-                vec![release_id.into(),(kind as i64).into(),title_key.into(),number(parsed.season),number(parsed.episode),
-                    number(parsed.episode_last),number(parsed.air_date),number(parsed.year),i64::from(parsed.quality).into(),
-                    ids.tvdb.into(),ids.tvmaze.into(),ids.trakt.into(),ids.tmdb.into(),ids.imdb.into(),ids.tvrage.into()]
-            }
-        }
-    }
-}
-
 pub struct SidecarRecord {
     pub name: String,
     pub group: String,
@@ -175,30 +150,30 @@ impl StepMutation {
             Self::SetProbeInfo { json } => (
                 "update release_probe set info=?2 where release_id=?1", vec![release_id.into(), json.clone().into()],
             ),
-            Self::KeepSidecar(record) => (crate::sidecar::SET, vec![
+            Self::KeepSidecar(record) => (super::result_v1_tags::SIDECAR_SET, vec![
                 release_id.into(),record.name.clone().into(),record.group.clone().into(),record.file.clone().into(),
                 record.kind.clone().into(),record.release_name.clone().into(),record.segment_uid.clone().into(),
                 record.text.clone().into(),record.at.into(),
             ]),
-            Self::EvictSidecarTexts { max_bytes } => (crate::sidecar::EVICT, vec![release_id.into(), (*max_bytes).into()]),
+            Self::EvictSidecarTexts { max_bytes } => (super::result_v1_tags::SIDECAR_EVICT, vec![release_id.into(), (*max_bytes).into()]),
             Self::KeepNfo { file, text } => (
                 "insert or ignore into release_nfo(release_id,file,text) values(?1,?2,?3)",
-                vec![release_id.into(),file.clone().into(),text.chars().take(crate::probe::nfo_store::MAX_CHARS).collect::<String>().into()],
+                vec![release_id.into(),file.clone().into(),text.chars().take(super::result_v1_tags::PROBE_NFO_STORE_MAX_CHARS).collect::<String>().into()],
             ),
-            Self::SetNfoPassword { password } => (crate::archive::store::SET_NFO_PASSWORD, vec![release_id.into(),password.clone().into()]),
+            Self::SetNfoPassword { password } => (super::result_v1_tags::ARCHIVE_STORE_SET_NFO_PASSWORD, vec![release_id.into(),password.clone().into()]),
             Self::ClearMedia => ("delete from media_release where release_id=?1", vec![release_id.into()]),
             Self::ParseMedia {kind,title_key,parsed} => {
                 let number=|n:Option<i32>|n.map(i64::from).into();
-                (crate::media::steps::UPSERT,vec![release_id.into(),(*kind as i64).into(),(*title_key).into(),number(parsed.season),number(parsed.episode),number(parsed.episode_last),number(parsed.air_date),number(parsed.year),i64::from(parsed.quality).into(),Value::Null,Value::Null,Value::Null,Value::Null,Value::Null,Value::Null])
+                (super::result_v1_tags::MEDIA_STEPS_UPSERT,vec![release_id.into(),(*kind as i64).into(),(*title_key).into(),number(parsed.season),number(parsed.episode),number(parsed.episode_last),number(parsed.air_date),number(parsed.year),i64::from(parsed.quality).into(),Value::Null,Value::Null,Value::Null,Value::Null,Value::Null,Value::Null])
             },
-            Self::FoundMediaIds { title_key, ids } => (crate::media::steps::FOUND, vec![
+            Self::FoundMediaIds { title_key, ids } => (super::result_v1_tags::MEDIA_STEPS_FOUND, vec![
                 release_id.into(),(*title_key).into(),ids.tvdb.into(),ids.tvmaze.into(),ids.trakt.into(),ids.tmdb.into(),ids.imdb.into(),ids.tvrage.into(),
             ]),
             Self::ReindexWords => (
                 "insert into word_queue(release_id) values(?1) on conflict(release_id) do update set n=n+1", vec![release_id.into()],
             ),
             Self::RecordSegmentCrc { message_id, decoded, crc32 } => (
-                crate::archive::store::SET_SEGMENT_CRC,
+                super::result_v1_tags::ARCHIVE_STORE_SET_SEGMENT_CRC,
                 vec![release_id.into(),message_id.clone().into(),(*decoded).into(),i64::from(*crc32).into()],
             ),
             Self::ClearPredbInnerKeys => ("delete from predb_inner_key where release_id=?1", vec![release_id.into()]),
@@ -216,7 +191,7 @@ impl StepMutation {
                 "insert or replace into predb_match(release_id,title_id,kind,category,pre_at,nuked,matched_at) values(?1,?2,?3,?4,?5,?6,?7)",
                 vec![release_id.into(),(*title_id).into(),(*kind as i64).into(),category.clone().into(),(*pre_at).into(),(*nuked).into(),(*matched_at).into()],
             ),
-            Self::KeepReleaseKeys { keys } => (crate::keys::UPSERT, vec![
+            Self::KeepReleaseKeys { keys } => (super::result_v1_tags::KEYS_UPSERT, vec![
                 release_id.into(),keys.account.into(),keys.host.into(),keys.layout.into(),keys.lines.into(),keys.file_crc.into(),
                 keys.body_crc.into(),keys.video.into(),keys.audio.into(),keys.mux.into(),keys.encode.into(),keys.thread.into(),
                 keys.subs.into(),keys.fonts.into(),keys.chapters.into(),keys.volumes.into(),
@@ -237,11 +212,11 @@ impl StepMutation {
             Self::KeepAudioAnchor { anchor } => (
                 "insert or ignore into release_audio_anchor(release_id,anchor) values(?1,?2)",vec![release_id.into(),(*anchor).into()],
             ),
-            Self::KeepProbe { crc32, agent, json, moviehash } => (crate::probe::SET_PROBE,
+            Self::KeepProbe { crc32, agent, json, moviehash } => (super::result_v1_tags::PROBE_SET_PROBE,
                 vec![release_id.into(),(*crc32).into(),agent.clone().into(),json.clone().into(),moviehash.clone().into()]),
-            Self::KeepCover { mime, sha256 } => (crate::probe::SET_COVER,vec![release_id.into(),mime.clone().into(),sha256.clone().into()]),
-            Self::ClearCover => (crate::probe::DROP_COVER,vec![release_id.into()]),
-            Self::DropNfoCopy { file } => (crate::probe::nfo_store::DROP,vec![release_id.into(),file.clone().into()]),
+            Self::KeepCover { mime, sha256 } => (super::result_v1_tags::PROBE_SET_COVER,vec![release_id.into(),mime.clone().into(),sha256.clone().into()]),
+            Self::ClearCover => (super::result_v1_tags::PROBE_DROP_COVER,vec![release_id.into()]),
+            Self::DropNfoCopy { file } => (super::result_v1_tags::PROBE_NFO_STORE_DROP,vec![release_id.into(),file.clone().into()]),
             Self::PinTagImdb { imdb_id } => (
                 "update media_release set imdb_id=?2,imdb_from_nfo=1 where release_id=?1 and kind=2",vec![release_id.into(),(*imdb_id).into()],
             ),
@@ -262,56 +237,56 @@ impl StepMutation {
                 "update picture_requests set done_at=?3,outcome=?4 where release_id=?1 and file=?2",
                 vec![release_id.into(),file.clone().into(),(*done_at).into(),answer.word().to_string().into()],
             ),
-            Self::ClearArchiveSource { source } => (crate::archive::store::DELETE_SOURCE,vec![release_id.into(),(*source).into()]),
-            Self::KeepArchiveFile { sequence, source, file } => (crate::archive::store::INSERT_FILE_FACTS,
+            Self::ClearArchiveSource { source } => (super::result_v1_tags::ARCHIVE_STORE_DELETE_SOURCE,vec![release_id.into(),(*source).into()]),
+            Self::KeepArchiveFile { sequence, source, file } => (super::result_v1_tags::ARCHIVE_STORE_INSERT_FILE_FACTS,
                 vec![release_id.into(),(*sequence).into(),file.name.clone().into(),file.size.and_then(|size| i64::try_from(size).ok()).into(),
                     (*source).into(),file.crc32.map(i64::from).into(),file.mtime.into(),file.host_os.map(i64::from).into()]),
-            Self::AdjustArchiveNameBytes { delta } => (crate::archive::store::ADD_NAME_BYTES,vec![(*delta).into()]),
-            Self::ArchiveNamesOverQuota => (crate::archive::store::COUNT_OVER_QUOTA,vec![]),
-            Self::SetArchivePassword { password } => (crate::archive::store::UPSERT_RELEASE,vec![release_id.into(),password.code().into()]),
-            Self::SetArchiveEncryption { encryption, names_hidden, check } => (crate::archive::store::SET_ENCRYPTION,
+            Self::AdjustArchiveNameBytes { delta } => (super::result_v1_tags::ARCHIVE_STORE_ADD_NAME_BYTES,vec![(*delta).into()]),
+            Self::ArchiveNamesOverQuota => (super::result_v1_tags::ARCHIVE_STORE_COUNT_OVER_QUOTA,vec![]),
+            Self::SetArchivePassword { password } => (super::result_v1_tags::ARCHIVE_STORE_UPSERT_RELEASE,vec![release_id.into(),password.code().into()]),
+            Self::SetArchiveEncryption { encryption, names_hidden, check } => (super::result_v1_tags::ARCHIVE_STORE_SET_ENCRYPTION,
                 vec![release_id.into(),encryption.map(crate::archive::Encryption::code).into(),i64::from(*names_hidden).into(),
                     check.map(|check| check.to_bytes()).into()]),
-            Self::SetArchiveKeys { keys, facts } => (crate::archive::store::SET_KEYS,
+            Self::SetArchiveKeys { keys, facts } => (super::result_v1_tags::ARCHIVE_STORE_SET_KEYS,
                 vec![release_id.into(),keys.packer.clone().into(),keys.twin_key.into(),keys.owner_key.into(),keys.zone_key.into(),(*facts).into()]),
-            Self::ClearRevVolumes => (crate::archive::rev::DELETE_REV_VOLUMES,vec![release_id.into()]),
-            Self::KeepRevVolume(volume) => (crate::archive::rev::INSERT_REV_VOLUME,
+            Self::ClearRevVolumes => (super::result_v1_tags::ARCHIVE_REV_DELETE_REV_VOLUMES,vec![release_id.into()]),
+            Self::KeepRevVolume(volume) => (super::result_v1_tags::ARCHIVE_REV_INSERT_REV_VOLUME,
                 vec![release_id.into(),i64::from(volume.index).into(),i64::try_from(volume.size).unwrap_or(i64::MAX).into(),i64::from(volume.crc32).into()]),
-            Self::RememberUploadCandidate { candidate_id } => (crate::archive::link::TRIED,vec![release_id.into(),(*candidate_id).into()]),
-            Self::PlaceBesideFile { row_id, owner_id, par2_file } => (crate::archive::link::SET_BESIDE,
+            Self::RememberUploadCandidate { candidate_id } => (super::result_v1_tags::ARCHIVE_LINK_TRIED,vec![release_id.into(),(*candidate_id).into()]),
+            Self::PlaceBesideFile { row_id, owner_id, par2_file } => (super::result_v1_tags::ARCHIVE_LINK_SET_BESIDE,
                 vec![(*row_id).into(),(*owner_id).into(),par2_file.clone().into()]),
-            Self::NameUploadLead { lead_id, name, source } => (crate::archive::link::NAME_LEAD,
+            Self::NameUploadLead { lead_id, name, source } => (super::result_v1_tags::ARCHIVE_LINK_NAME_LEAD,
                 vec![(*lead_id).into(),name.clone().into(),i64::from(*source).into()]),
-            Self::RerunUploadLead { lead_id, clear, net } => (crate::archive::link::RERUN_LEAD,
+            Self::RerunUploadLead { lead_id, clear, net } => (super::result_v1_tags::ARCHIVE_LINK_RERUN_LEAD,
                 vec![(*lead_id).into(),(*clear).into(),(*net).into()]),
-            Self::QueueUploadLead { lead_id, due_at } => (crate::archive::link::QUEUE_LEAD,vec![(*lead_id).into(),(*due_at).into()]),
-            Self::MoveUpload { from_id, to_id } => (crate::archive::link::MOVE_UPLOAD,vec![(*from_id).into(),(*to_id).into()]),
-            Self::LinkUploadData { member_id, lead_id, par2_file } => (crate::archive::link::LINK_DATA,
+            Self::QueueUploadLead { lead_id, due_at } => (super::result_v1_tags::ARCHIVE_LINK_QUEUE_LEAD,vec![(*lead_id).into(),(*due_at).into()]),
+            Self::MoveUpload { from_id, to_id } => (super::result_v1_tags::ARCHIVE_LINK_MOVE_UPLOAD,vec![(*from_id).into(),(*to_id).into()]),
+            Self::LinkUploadData { member_id, lead_id, par2_file } => (super::result_v1_tags::ARCHIVE_LINK_LINK_DATA,
                 vec![(*member_id).into(),(*lead_id).into(),par2_file.to_vec().into()]),
-            Self::LinkUploadRecovery { lead_id, wanted, set_id } => (crate::archive::link::LINK_RECOVERY,
+            Self::LinkUploadRecovery { lead_id, wanted, set_id } => (super::result_v1_tags::ARCHIVE_LINK_LINK_RECOVERY,
                 vec![release_id.into(),(*lead_id).into(),(*wanted).into(),set_id.map(|id| id.to_vec()).into()]),
-            Self::ClearContentFingerprint => (crate::duplicates::CLEAR_CONTENT,vec![release_id.into()]),
+            Self::ClearContentFingerprint => (super::result_v1_tags::DUPLICATES_CLEAR_CONTENT,vec![release_id.into()]),
             Self::KeepNfoForLegacyTarget { target_id, file, text } => (
                 "insert or ignore into release_nfo(release_id,file,text) values(?1,?2,?3)",
-                vec![(*target_id).into(),file.clone().into(),text.chars().take(crate::probe::nfo_store::MAX_CHARS).collect::<String>().into()],
+                vec![(*target_id).into(),file.clone().into(),text.chars().take(super::result_v1_tags::PROBE_NFO_STORE_MAX_CHARS).collect::<String>().into()],
             ),
-            Self::MarkPointed { name } => (crate::archive::store::MARK_POINTED,vec![name.clone().into(),release_id.into()]),
-            Self::RankPointed { name } => (crate::archive::store::RANK_POINTED.as_str(),vec![name.clone().into(),release_id.into()]),
-            Self::RerunPointedList { name } => (crate::archive::store::RERUN_POINTED_LIST.as_str(),vec![name.clone().into(),release_id.into()]),
-            Self::RerunPointedProbe { name } => (crate::archive::store::RERUN_POINTED_PROBE.as_str(),vec![name.clone().into(),release_id.into()]),
-            Self::SetPointedPassword { name, password } => (crate::archive::store::MARK_POINTED_PASSWORD,vec![name.clone().into(),release_id.into(),password.clone().into()]),
-            Self::SetContentFingerprint { content } => (crate::duplicates::SET_CONTENT,vec![release_id.into(),content.clone().into()]),
-            Self::SetPostedFingerprint { posted } => (crate::duplicates::SET_POSTED,vec![release_id.into(),posted.clone().into()]),
-            Self::ClearPostedFingerprint => (crate::duplicates::CLEAR_POSTED,vec![release_id.into()]),
-            Self::SetPar2Sizes { block, blocks } => (crate::duplicates::SET_PAR2_SIZES,vec![release_id.into(),(*block).into(),(*blocks).into()]),
-            Self::ClearPar2Files => (crate::archive::store::DELETE_PAR2_FILES,vec![release_id.into()]),
-            Self::KeepPar2File { file, sealed, complete } => (crate::archive::store::INSERT_PAR2_FILE,
+            Self::MarkPointed { name } => (super::result_v1_tags::ARCHIVE_STORE_MARK_POINTED,vec![name.clone().into(),release_id.into()]),
+            Self::RankPointed { name } => (super::result_v1_tags::ARCHIVE_STORE_RANK_POINTED.as_str(),vec![name.clone().into(),release_id.into()]),
+            Self::RerunPointedList { name } => (super::result_v1_tags::ARCHIVE_STORE_RERUN_POINTED_LIST.as_str(),vec![name.clone().into(),release_id.into()]),
+            Self::RerunPointedProbe { name } => (super::result_v1_tags::ARCHIVE_STORE_RERUN_POINTED_PROBE.as_str(),vec![name.clone().into(),release_id.into()]),
+            Self::SetPointedPassword { name, password } => (super::result_v1_tags::ARCHIVE_STORE_MARK_POINTED_PASSWORD,vec![name.clone().into(),release_id.into(),password.clone().into()]),
+            Self::SetContentFingerprint { content } => (super::result_v1_tags::DUPLICATES_SET_CONTENT,vec![release_id.into(),content.clone().into()]),
+            Self::SetPostedFingerprint { posted } => (super::result_v1_tags::DUPLICATES_SET_POSTED,vec![release_id.into(),posted.clone().into()]),
+            Self::ClearPostedFingerprint => (super::result_v1_tags::DUPLICATES_CLEAR_POSTED,vec![release_id.into()]),
+            Self::SetPar2Sizes { block, blocks } => (super::result_v1_tags::DUPLICATES_SET_PAR2_SIZES,vec![release_id.into(),(*block).into(),(*blocks).into()]),
+            Self::ClearPar2Files => (super::result_v1_tags::ARCHIVE_STORE_DELETE_PAR2_FILES,vec![release_id.into()]),
+            Self::KeepPar2File { file, sealed, complete } => (super::result_v1_tags::ARCHIVE_STORE_INSERT_PAR2_FILE,
                 vec![release_id.into(),file.file_id.to_vec().into(),file.set_id.to_vec().into(),file.md5.to_vec().into(),file.md5_16k.to_vec().into(),
                     i64::try_from(file.size).unwrap_or(i64::MAX).into(),file.name.clone().into(),file.crc32.map(i64::from).into(),
                     i64::from(file.bound).into(),i64::from(*sealed).into(),i64::from(*complete).into()]),
-            Self::SetPar2Creator { set_id, creator } => (crate::archive::store::SET_PAR2_CREATOR,vec![release_id.into(),set_id.to_vec().into(),creator.clone().into()]),
-            Self::VouchComplete => (crate::store::SET_VOUCHED_COMPLETE,vec![release_id.into()]),
-            Self::DropPcCategory => (crate::junk::DROP_CATEGORY,vec![release_id.into()]),
+            Self::SetPar2Creator { set_id, creator } => (super::result_v1_tags::ARCHIVE_STORE_SET_PAR2_CREATOR,vec![release_id.into(),set_id.to_vec().into(),creator.clone().into()]),
+            Self::VouchComplete => (super::result_v1_tags::STORE_SET_VOUCHED_COMPLETE,vec![release_id.into()]),
+            Self::DropPcCategory => (super::result_v1_tags::JUNK_DROP_CATEGORY,vec![release_id.into()]),
         }
     }
 
@@ -367,13 +342,11 @@ mod tests {
     }
 
     #[test]
-    fn legacy_or_modified_sql_cannot_be_submitted_as_a_native_mutation() {
+    fn closed_writes_preserve_target_without_a_sql_or_callback_constructor() {
         use crate::postprocess::step::StepWrite;
-        assert!(StepWrite::new("select 1", vec![]).native_mutation().is_err());
-        let mut write = StepWrite::for_mutation(1, StepMutation::PinOpenSubtitlesMovieImdb { imdb_id: 101 });
-        assert!(write.native_mutation().is_ok());
-        write.sql = "select 1";
-        assert!(write.native_mutation().is_err());
+        let write=StepWrite::for_mutation(1,StepMutation::PinOpenSubtitlesMovieImdb {imdb_id:101});
+        assert!(write.native_mutation_for(1).is_ok());
+        assert!(write.native_mutation_for(2).is_err());
     }
 
     #[test]
@@ -652,9 +625,11 @@ mod tests {
 
     #[test]
     fn pointed_name_result_keeps_legacy_parameter_order_and_requires_the_resolver() {
-        let write = crate::postprocess::step::StepWrite::for_mutation(7,StepMutation::MarkPointed { name: "Example.Release".into() });
-        assert_eq!(write.sql,crate::archive::store::MARK_POINTED);
-        assert_eq!(write.params,vec!["Example.Release".to_string().into(),7i64.into()]);
+        let mutation=StepMutation::MarkPointed {name:"Example.Release".into()};
+        let (tag,values)=mutation.v1_fields(7);
+        assert_eq!(tag,super::result_v1_tags::ARCHIVE_STORE_MARK_POINTED);
+        assert_eq!(values,vec!["Example.Release".to_string().into(),7i64.into()]);
+        let write=crate::postprocess::step::StepWrite::for_mutation(7,mutation);
         assert!(matches!(write.native_mutation(),Err(crate::postprocess::step::StepError::Retry(_))));
     }
 
@@ -673,7 +648,7 @@ mod tests {
         inventory.sealed.push((file.set_id,file.file_id));
         inventory.creators.push((file.set_id,"synthetic'creator".into()));
         for write in crate::archive::store::par2_file_writes(1,&inventory) {
-            conn.execute(write.sql,rusqlite::params_from_iter(write.params)).unwrap();
+            write.native_mutation().unwrap().apply_sqlite(&conn,1).unwrap();
         }
         let row: (i64,Option<i64>,i64,i64,i64,String) = conn.query_row(
             "select size,crc32,bound,sealed,complete,creator from par2_files", [],
@@ -689,21 +664,15 @@ mod tests {
     }
 
     #[test]
-    fn deferred_media_parse_stays_legacy_and_keeps_writer_time_values() {
-        let home = tempfile::tempdir().unwrap();
-        let media = crate::media::Media::new(&home.path().join("atlas.db"));
-        let parsed = crate::media::parse::Parsed { title: "Example".into(),year: Some(2020),season: Some(2),
-            episode: Some(3),episode_last: Some(4),air_date: Some(20000101),quality: 1080,..Default::default() };
-        let mut write = crate::postprocess::step::StepWrite::for_deferred_legacy(7,DeferredLegacyStepMutation::MediaParse {
-            media,kind: crate::media::title::Kind::Tv,title_key: 77,parsed,
-        });
-        assert_eq!(write.sql,crate::media::steps::UPSERT);
-        assert!(write.params.is_empty());
-        assert!(matches!(write.native_mutation(),Err(crate::postprocess::step::StepError::Retry(_))));
-        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(),0);
-        let params = write.late_params.take().unwrap()();
-        assert_eq!(&params[..9],&[7i64.into(),1i64.into(),77i64.into(),2i64.into(),3i64.into(),4i64.into(),20000101i64.into(),2020i64.into(),1080i64.into()]);
-        assert_eq!(&params[9..],&[Value::Null,Value::Null,Value::Null,Value::Null,Value::Null,Value::Null]);
-        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(),0);
+    fn native_media_parse_keeps_digest_fields_without_a_deferred_legacy_callback() {
+        let parsed=crate::media::parse::Parsed {title:"Example".into(),year:Some(2020),season:Some(2),
+            episode:Some(3),episode_last:Some(4),air_date:Some(20000101),quality:1080,..Default::default()};
+        let mutation=StepMutation::ParseMedia {kind:crate::media::title::Kind::Tv,title_key:77,parsed};
+        let (tag,values)=mutation.v1_fields(7);
+        assert_eq!(tag,super::result_v1_tags::MEDIA_STEPS_UPSERT);
+        assert_eq!(&values[..9],&[7i64.into(),1i64.into(),77i64.into(),2i64.into(),3i64.into(),4i64.into(),20000101i64.into(),2020i64.into(),1080i64.into()]);
+        assert_eq!(&values[9..],&[Value::Null,Value::Null,Value::Null,Value::Null,Value::Null,Value::Null]);
+        assert!(crate::postprocess::step::StepWrite::for_mutation(7,mutation).native_mutation_for(7).is_ok());
     }
+
 }

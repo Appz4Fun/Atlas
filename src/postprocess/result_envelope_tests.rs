@@ -49,19 +49,12 @@ fn category() -> StepWrite {
     StepWrite::for_mutation(7, StepMutation::SetCategory { category: 2045 })
 }
 
-// Catches accepting a forged shadow, caller SQL or a deferred callback as native authority.
+// The public API constructs only closed mutations. Numeric targets still
+// cannot borrow another release's lease. Raw SQL/callback construction was retired.
 #[test]
-fn native_envelope_refuses_sql_parameter_and_callback_mismatches() {
-    assert!(StepWrite::new("select 1", vec![]).native_mutation().is_err());
-    let mut sql = category(); sql.sql = "select 1";
-    let mut value = category(); value.params[1] = Value::Integer(5040);
-    let late = category().with_late_params(Box::new(|| panic!("native validation executed a legacy callback")));
-    for write in [sql, value, late] {
-        assert!(write.native_mutation_for(7).is_err());
-        assert!(write.encode_native_v1(4, &mut 0, &mut |_| {}).is_err());
-    }
+fn closed_native_envelope_preserves_target_and_mutation_without_sql_shadows() {
     assert!(category().native_mutation_for(8).is_err());
-    assert!(category().native_mutation_for(7).is_ok());
+    assert!(matches!(category().native_mutation_for(7).unwrap(),StepMutation::SetCategory {category:2045}));
 }
 
 // Catches loss of native participant resolution when moving the representation.
@@ -74,19 +67,25 @@ fn native_envelope_does_not_turn_numeric_sidecar_targets_into_authority() {
     assert!(write.native_mutation_for(8).is_err());
 }
 
-// Catches sidecar field reordering, dropping NULL versus empty, or unsigned timestamp conversion.
+// Retained v1 fields distinguish NULL/empty and preserve signed/NUL input
+// without exposing a mutable SQL representation on StepWrite.
 #[test]
 fn native_sidecar_envelope_retains_exact_nullable_order_and_detects_changes() {
-    let mut write = StepWrite::for_mutation(7, StepMutation::KeepSidecar(SidecarRecord {
-        name: "n\0".into(), group: "g".into(), file: None, kind: "text".into(),
-        release_name: Some(String::new()), segment_uid: None, text: Some("é".into()), at: i64::MIN,
-    }));
-    assert_eq!(write.params, vec![Value::Integer(7), Value::Text("n\0".into()), Value::Text("g".into()),
-        Value::Null, Value::Text("text".into()), Value::Text(String::new()), Value::Null,
-        Value::Text("é".into()), Value::Integer(i64::MIN)]);
-    assert!(write.native_mutation_for(7).is_ok());
-    write.params[5] = Value::Null;
-    assert!(write.native_mutation_for(7).is_err());
+    let make=|release_name|StepMutation::KeepSidecar(SidecarRecord {
+        name:"n\0".into(),group:"g".into(),file:None,kind:"text".into(),
+        release_name,segment_uid:None,text:Some("é".into()),at:i64::MIN,
+    });
+    let mutation=make(Some(String::new()));
+    let (_,values)=mutation.v1_fields(7);
+    assert_eq!(values,vec![Value::Integer(7),Value::Text("n\0".into()),Value::Text("g".into()),
+        Value::Null,Value::Text("text".into()),Value::Text(String::new()),Value::Null,
+        Value::Text("é".into()),Value::Integer(i64::MIN)]);
+    let encode_write=|mutation| {
+        let write=StepWrite::for_mutation(7,mutation);let mut bytes=Vec::new();
+        assert!(write.native_mutation_for(7).is_ok());
+        write.encode_native_v1(4,&mut 0,&mut |part|bytes.extend_from_slice(part)).unwrap();bytes
+    };
+    assert_ne!(encode_write(make(Some(String::new()))),encode_write(make(None)));
 }
 
 // Catches changing the existing full write digest; literal bytes are independent of v1_fields.
