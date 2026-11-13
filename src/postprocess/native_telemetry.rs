@@ -1,6 +1,6 @@
 //! Completed native Stage stats; BG is the sole stats.json/status.json writer.
 use anyhow::{Result,ensure};
-use std::{sync::{Arc,Weak,Mutex,atomic::Ordering},time::{Duration,Instant},path::PathBuf};
+use std::{sync::{Arc,Weak,Mutex,atomic::{AtomicBool,Ordering}},time::{Duration,Instant},path::PathBuf};
 use serde_json::{Value,json};
 use crate::pg::{indexer_runtime::{Owner,CacheDestination},stage::{OwnerEpoch},stage_stats::{self,Masks,Observation},stage_telemetry::LaneCounters};
 use super::Runner;
@@ -11,6 +11,65 @@ const _:()=assert!(crate::catalog_facts::SHARDS==1);
 struct Reading {at:Instant,value:Value,backlog:i64}
 struct Slot {owner:Weak<Owner>,epoch:[u8;32],root:PathBuf,reading:Option<Reading>}
 static CURRENT:Mutex<Option<Slot>>=Mutex::new(None);
+
+/// A retained counter source is not a current database observation. The BG
+/// scheduler consumes it only after its tasks and the actual stage join drain.
+pub(crate) struct Drain {
+    owner:Weak<Owner>,epoch:[u8;32],root:PathBuf,joined:AtomicBool,
+    retained:Mutex<Option<Retained>>,
+}
+#[derive(Default)]
+struct Retained {stage:Option<StageCounters>,predb:Option<Arc<crate::pg::service_cache::predb::Counters>>}
+struct StageCounters {stats:Arc<crate::postprocess::stats::Stats>,lanes:Arc<LaneCounters>,config:crate::config::PostprocessConfig,enabled:i64}
+pub(crate) struct FinalCounters {pub(crate) stage:Option<Value>,pub(crate) predb:Option<Value>}
+impl FinalCounters {
+    pub(crate) fn stage_value(stats:&crate::postprocess::stats::Stats,lanes:&LaneCounters,config:&crate::config::PostprocessConfig,enabled:i64)->Value {
+        let mut value=stats.snapshot(config.body_fetches_per_minute,config.backlog_per_second,enabled);
+        // A final counter reading never revives the last queue/lease gauges.
+        for key in ["queue_due","net_wanted","failed","archive_names_over_quota"] {value[key]=Value::Null;}
+        value["walk"]["done"]=Value::Null;value["walk"]["total"]=Value::Null;
+        let rows=lanes.walk_rows.load(Ordering::Relaxed);value["walk"]["rows"]=json!(rows);
+        value["lane_totals"]=json!({"net_visits":[lanes.net_visits.load(Ordering::Relaxed)],
+            "net_finished":[lanes.net_finished.load(Ordering::Relaxed)],"queue_taken":[lanes.queue_taken.load(Ordering::Relaxed)],"walk_rows":[rows]});
+        // Rates were refreshed by a different lane and are not final totals.
+        value["lanes"]=Value::Null;value["net_claims"]=Value::Null;value
+    }
+}
+impl Drain {
+    pub(crate) fn new(owner:&Arc<Owner>)->Result<Self> {
+        let epoch=*owner.epoch().ok_or_else(||anyhow::anyhow!("native drain epoch unavailable"))?.id();
+        Ok(Self {owner:Arc::downgrade(owner),epoch,root:crate::paths::app_dir(),joined:AtomicBool::new(false),retained:Mutex::new(Some(Retained::default()))})
+    }
+    fn check(&self,owner:&Arc<Owner>)->Result<()> {
+        ensure!(Weak::ptr_eq(&self.owner,&Arc::downgrade(owner))&&owner.epoch().is_some_and(|epoch|*epoch.id()==self.epoch)
+            &&self.root==crate::paths::app_dir(),"native service drain original attempt changed");Ok(())
+    }
+    pub(super) fn retain_stage(&self,runner:&Arc<Runner>,lanes:Arc<LaneCounters>)->Result<()> {
+        self.check(&runner.owner)?;
+        let mut retained=self.retained.lock().map_err(|_|anyhow::anyhow!("native service drain poisoned"))?;
+        let retained=retained.as_mut().ok_or_else(||anyhow::anyhow!("native service drain already consumed"))?;
+        ensure!(retained.stage.is_none()&&!self.joined.load(Ordering::Acquire),"native Stage drain duplicate or ended registration");
+        retained.stage=Some(StageCounters {stats:runner.stats.clone(),lanes,config:runner.config.postprocess.clone(),enabled:runner.steps.enabled});Ok(())
+    }
+    pub(super) fn retain_predb(&self,owner:&Arc<Owner>,counters:Arc<crate::pg::service_cache::predb::Counters>)->Result<()> {
+        self.check(owner)?;
+        let mut retained=self.retained.lock().map_err(|_|anyhow::anyhow!("native service drain poisoned"))?;
+        let retained=retained.as_mut().ok_or_else(||anyhow::anyhow!("native service drain already consumed"))?;
+        ensure!(retained.predb.is_none()&&!self.joined.load(Ordering::Acquire),"native PreDB drain duplicate or ended registration");
+        retained.predb=Some(counters);Ok(())
+    }
+    // Only the explicit returned join path calls this. A coordinator panic is
+    // not proof its raw descendant JoinHandles drained, so cannot acknowledge.
+    pub(super) fn joined(&self) {self.joined.store(true,Ordering::Release);}
+    pub(crate) fn take_after_join(&self,owner:&Arc<Owner>)->Result<Option<FinalCounters>> {
+        self.check(owner)?;if !self.joined.load(Ordering::Acquire) {return Ok(None)}
+        let retained=self.retained.lock().map_err(|_|anyhow::anyhow!("native service drain poisoned"))?.take();
+        Ok(retained.map(|retained|FinalCounters {
+            stage:retained.stage.map(|stage|FinalCounters::stage_value(&stage.stats,&stage.lanes,&stage.config,stage.enabled)),
+            predb:retained.predb.map(|predb|predb.snapshot()),
+        }))
+    }
+}
 
 pub(crate) struct Producer {
     runner:Arc<Runner>,owner:Arc<Owner>,destination:CacheDestination,epoch:OwnerEpoch,stats:Arc<crate::postprocess::stats::Stats>,
@@ -98,3 +157,7 @@ pub(crate) fn stats_json(value:&Value)->std::io::Result<Vec<u8>> {
 #[cfg(test)]
 #[path="native_telemetry_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path="native_counter_drain_tests.rs"]
+mod drain_tests;

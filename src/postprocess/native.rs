@@ -9,8 +9,8 @@ mod net;
 mod workers;
 #[path="native_telemetry.rs"]
 mod telemetry;
-pub(crate) use telemetry::{snapshot as stats_snapshot,backlog as backlog_snapshot,stats_json};
-pub(crate) use workers::run;
+pub(crate) use telemetry::{snapshot as stats_snapshot,backlog as backlog_snapshot,stats_json,Drain,FinalCounters};
+pub(crate) use workers::{run,run_with_drain};
 #[path="native_config.rs"]
 mod settings;
 pub(crate) use settings::ConfigPin;
