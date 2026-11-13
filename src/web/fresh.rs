@@ -781,7 +781,7 @@ mod native_asset_route_tests {
         let original=[&[0xff,0xd8,0xff,0xe0][..],b"original poster",&[0xff,0xd9]].concat();
         std::fs::create_dir(home.path().join("posters")).unwrap();std::fs::write(home.path().join("posters/retained.jpg"),&original).unwrap();
         let manifest=evidence.path().join("assets.jsonl");
-        pg::cache_assets::capture_file(home.path(),&manifest,pg::cache_assets::Limits {min_files:1,max_files:16,max_file_bytes:1<<20,max_total_bytes:16<<20,read_bytes_per_second:32<<20}).unwrap();
+        pg::testing::capture_asset_manifest(home.path(),&manifest,pg::testing::AssetCaptureLimits {min_files:1,max_files:16,max_file_bytes:1<<20,max_total_bytes:16<<20,read_bytes_per_second:32<<20}).unwrap();
         let manifest_bytes=std::fs::read(&manifest).unwrap();
         let selection=crate::config::NativeAssetsConfig {root:home.path().canonicalize().unwrap().to_str().unwrap().into(),manifest:manifest.canonicalize().unwrap().to_str().unwrap().into(),whole_sha256:hex(&Sha256::digest(&manifest_bytes))};
         let assets=pg::fresh_assets::AssetManifest::from_selection(&selection).unwrap();

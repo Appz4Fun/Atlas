@@ -1570,7 +1570,7 @@ mod native_asset_selection_tests {
         let root=tempfile::tempdir().unwrap();let evidence=tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("posters")).unwrap();std::fs::write(root.path().join("posters/original.jpg"),b"retained original bytes").unwrap();
         let manifest=evidence.path().join("assets.jsonl");
-        crate::pg::cache_assets::capture_file(root.path(),&manifest,crate::pg::cache_assets::Limits {min_files:1,max_files:8,max_file_bytes:1<<20,max_total_bytes:8<<20,read_bytes_per_second:32<<20}).unwrap();
+        crate::pg::testing::capture_asset_manifest(root.path(),&manifest,crate::pg::testing::AssetCaptureLimits {min_files:1,max_files:8,max_file_bytes:1<<20,max_total_bytes:8<<20,read_bytes_per_second:32<<20}).unwrap();
         let digest=Sha256::digest(std::fs::read(&manifest).unwrap()).iter().map(|byte|format!("{byte:02x}")).collect::<String>();
         let selection=crate::config::NativeAssetsConfig {root:root.path().canonicalize().unwrap().to_str().unwrap().into(),manifest:manifest.canonicalize().unwrap().to_str().unwrap().into(),whole_sha256:digest};
         assert!(selected_asset_manifest(Some(&selection)).unwrap().is_some());

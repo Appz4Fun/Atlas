@@ -154,7 +154,7 @@ fn native_details_factory_rejects_cross_owner_asset_grant_before_provider_or_pg_
     a.owner.with(|client|pg_details::put_in(client,&metadata)).unwrap();b.owner.with(|client|pg_details::put_in(client,&metadata)).unwrap();
     let home=tempfile::tempdir().unwrap();let evidence=tempfile::tempdir().unwrap();std::fs::create_dir(home.path().join("covers")).unwrap();
     let bytes=[0xff,0xd8,0xff,0xe0,0xff,0xd9];let name=hex(&Sha256::digest(bytes));std::fs::write(home.path().join("covers").join(name),bytes).unwrap();
-    let manifest=evidence.path().join("assets.jsonl");pg::cache_assets::capture_file(home.path(),&manifest,pg::cache_assets::Limits {min_files:1,max_files:8,max_file_bytes:1024,max_total_bytes:8192,read_bytes_per_second:32<<20}).unwrap();
+    let manifest=evidence.path().join("assets.jsonl");pg::testing::capture_asset_manifest(home.path(),&manifest,pg::testing::AssetCaptureLimits {min_files:1,max_files:8,max_file_bytes:1024,max_total_bytes:8192,read_bytes_per_second:32<<20}).unwrap();
     let selection=crate::config::NativeAssetsConfig {root:home.path().canonicalize().unwrap().to_str().unwrap().into(),manifest:manifest.canonicalize().unwrap().to_str().unwrap().into(),whole_sha256:hex(&Sha256::digest(std::fs::read(&manifest).unwrap()))};
     let grant=Grant::open(&b.owner,Some(&selection)).unwrap().unwrap();
     let observer=std::net::TcpListener::bind("127.0.0.1:0").unwrap();observer.set_nonblocking(true).unwrap();
