@@ -1894,8 +1894,8 @@ mod tests {
     use super::*;
     use crate::pg::sql::Sql;
 
-    fn native_fixture() -> Option<(crate::pg::testing::Schema, Db)> {
-        let schema = crate::pg::testing::Schema::native_writer()?;
+    fn native_fixture() -> (crate::pg::testing::Schema, Db) {
+        let schema = crate::pg::testing::Schema::native_writer().expect("explicit isolated ATLAS_PG_TEST_URL required");
         let database: String = schema.pool.get().unwrap().query_one("select current_database()", &[]).unwrap().get(0);
         let db = crate::indexer::shared_postgres_db(
             &crate::pg::StorageConfig {
@@ -1909,7 +1909,7 @@ mod tests {
             crate::indexer::PgWriteLimits::default(),
         )
         .unwrap();
-        Some((schema, db))
+        (schema, db)
     }
 
     #[test]
@@ -2610,8 +2610,9 @@ mod tests {
 
     /// a sweep due on a server comes before another group's day chunks
     #[test]
+    #[ignore = "requires an explicit isolated ATLAS_PG_TEST_URL"]
     fn a_due_sweep_comes_before_other_groups_chunks() {
-        let Some((schema, db)) = native_fixture() else { return };
+        let (schema, db) = native_fixture();
         let pool = Pool::new(&[UsenetServer::new("a.test", "u", "p", 119), UsenetServer::new("b.test", "u", "p", 119)]);
         // "done" split with its chunks all done, "busy" with many to go
         let conn = crate::pg::sql::Pg::new(schema.pool.get().unwrap());
@@ -2633,8 +2634,9 @@ mod tests {
     /// a config `ban` alone, without ranking: the banned server takes none of the group's live passes or day chunks,
     /// and banned from every server the group isn't read at all
     #[test]
+    #[ignore = "requires an explicit isolated ATLAS_PG_TEST_URL"]
     fn a_config_ban_alone_keeps_a_group_off_a_server() {
-        let Some((schema, db)) = native_fixture() else { return };
+        let (schema, db) = native_fixture();
         let ban = |hosts: &[&str]| crate::config::IndexingConfig {
             ban: vec![("g".into(), hosts.iter().map(|h| h.to_string()).collect())],
             ..Default::default()
@@ -2663,8 +2665,9 @@ mod tests {
 
     /// home groups that keep every worker busy dont hold a due sweep off
     #[test]
+    #[ignore = "requires an explicit isolated ATLAS_PG_TEST_URL"]
     fn a_due_sweep_runs_while_home_groups_keep_workers_busy() {
-        let Some((schema, db)) = native_fixture() else { return };
+        let (schema, db) = native_fixture();
         let pool = Pool::new(&[UsenetServer::new("a.test", "u", "p", 119), UsenetServer::new("b.test", "u", "p", 119)]);
         let conn = crate::pg::sql::Pg::new(schema.pool.get().unwrap());
         crate::chunks::add(&conn, "done", 20_000, 19_990).unwrap();
@@ -2688,8 +2691,9 @@ mod tests {
     /// a server of two workers runs one day chunk ahead of its due groups (`chunk_share`), the other keeps to its
     /// groups, and that worker takes a due group of its own next
     #[test]
+    #[ignore = "requires an explicit isolated ATLAS_PG_TEST_URL"]
     fn one_worker_a_server_runs_a_day_chunk_ahead_of_due_groups() {
-        let Some((schema, db)) = native_fixture() else { return };
+        let (schema, db) = native_fixture();
         let pool = Pool::new(&[UsenetServer::new("a.test", "u", "p", 119), UsenetServer::new("b.test", "u", "p", 119)]);
         let conn = crate::pg::sql::Pg::new(schema.pool.get().unwrap());
         crate::chunks::add(&conn, "split", 20_000, 19_990).unwrap();
@@ -2716,8 +2720,9 @@ mod tests {
     /// ahead of due groups, a worker whose pass found nothing joins them up to half the server's workers, and one with
     /// nothing due takes a chunk whatever the count
     #[test]
+    #[ignore = "requires an explicit isolated ATLAS_PG_TEST_URL"]
     fn day_chunk_workers_scale_with_a_servers_connections() {
-        let Some((schema, db)) = native_fixture() else { return };
+        let (schema, db) = native_fixture();
         let mut servers = [UsenetServer::new("a.test", "u", "p", 119), UsenetServer::new("b.test", "u", "p", 119)];
         for s in &mut servers {
             s.connections = Some(64);
@@ -2784,8 +2789,9 @@ mod tests {
 
     /// a worker alone on its server alternates a due sweep with its home group
     #[test]
+    #[ignore = "requires an explicit isolated ATLAS_PG_TEST_URL"]
     fn a_lone_worker_alternates_a_due_sweep_with_its_home_group() {
-        let Some((schema, db)) = native_fixture() else { return };
+        let (schema, db) = native_fixture();
         let pool = Pool::new(&[UsenetServer::new("a.test", "u", "p", 119), UsenetServer::new("b.test", "u", "p", 119)]);
         let conn = crate::pg::sql::Pg::new(schema.pool.get().unwrap());
         crate::chunks::add(&conn, "done", 20_000, 19_990).unwrap();

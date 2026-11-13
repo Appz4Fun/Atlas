@@ -5,9 +5,8 @@
 fn fresh_stage_preserves_every_registered_added_column() {
     let Some(schema) = super::testing::Schema::new() else { return };
     let mut client = schema.pool.get().unwrap();
-    // Independent baseline vector: the original 40 SHARD_TABLES additions
-    // and RELEASE_COLUMNS' releases.name_source make all 41 contracts.
-    // The retired registry is no longer needed to exercise the real PG schema.
+    // Literal inventory of all 41 original SHARD_TABLES added-column contracts.
+    // PAR2_FILES.creator is included. The root release column is checked separately.
     const COLUMNS: &[(&str, &str, &str)] = &[
         ("pp_state", "net_transient", "INTEGER"),
         ("pp_state", "net_rank", "INTEGER"),
@@ -23,6 +22,7 @@ fn fresh_stage_preserves_every_registered_added_column() {
         ("archive_release", "owner_key", "INTEGER"),
         ("archive_release", "zone_key", "INTEGER"),
         ("archive_release", "facts", "INTEGER"),
+        ("par2_files", "creator", "TEXT"),
         ("release_fingerprint", "par2_block", "INTEGER"),
         ("release_fingerprint", "par2_blocks", "INTEGER"),
         ("release_fingerprint", "posted_names", "BLOB"),
@@ -49,9 +49,9 @@ fn fresh_stage_preserves_every_registered_added_column() {
         ("release_keys", "chapters", "INTEGER"),
         ("release_keys", "volumes", "INTEGER"),
         ("spots", "xml", "TEXT"),
-        ("releases", "name_source", "INTEGER"),
     ];
-    for &(table, column, declaration) in COLUMNS {
+    const RELEASE_COLUMNS: &[(&str, &str, &str)] = &[("releases", "name_source", "INTEGER")];
+    for &(table, column, declaration) in COLUMNS.iter().chain(RELEASE_COLUMNS) {
         let row=client.query_one("select data_type,is_nullable,column_default from information_schema.columns where table_schema=$1 and table_name=$2 and column_name=$3",
             &[&schema.name,&table,&column]).unwrap();
         let expected = declaration.split_whitespace().next().unwrap();

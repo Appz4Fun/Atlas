@@ -331,7 +331,7 @@ mod tests {
 
     #[test]
     fn multi_file_golden_matches_indexes_group_ties_lossy_ids_and_repeated_posters() {
-        let Some(schema) = crate::pg::testing::Schema::new() else { return };
+        let Some(schema) = crate::pg::testing::Schema::native_writer() else { return };
         let dir = tempfile::tempdir().unwrap();
         let (store, _) = Store::open(
             StoreConfig { sealers: 1, ..StoreConfig::new(dir.path()) },
@@ -556,7 +556,7 @@ mod tests {
     #[test]
     fn unknown_generation_same_and_larger_counts_reconcile_unpublished_ids_once() {
         for blocks in [1, 2] {
-            let Some(schema) = crate::pg::testing::Schema::new() else { return };
+            let Some(schema) = crate::pg::testing::Schema::native_writer() else { return };
             let dir = tempfile::tempdir().unwrap();
             let (store, _) = Store::open(
                 StoreConfig { sealers: 1, ..StoreConfig::new(dir.path()) },
@@ -655,7 +655,7 @@ mod tests {
 
     #[test]
     fn tiny_pages_resume_every_phase_and_publish_mixed_block_future_rows_later() {
-        let Some(schema) = crate::pg::testing::Schema::new() else { return };
+        let Some(schema) = crate::pg::testing::Schema::native_writer() else { return };
         let dir = tempfile::tempdir().unwrap();
         let (store, _) = Store::open(
             StoreConfig { sealers: 1, ..StoreConfig::new(dir.path()) },
