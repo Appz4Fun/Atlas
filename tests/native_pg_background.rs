@@ -49,6 +49,96 @@ impl Drop for Schema {
     }
 }
 
+enum InvalidSelectedConfig { Malformed, Dangling, Directory }
+
+// This is deliberately the real Atlas binary: a library call cannot observe
+// main's config migration or sealed-store setup before bg_indexer::run.
+fn binary_refuses_selected_config_before_startup(kind: InvalidSelectedConfig) {
+    let home = tempfile::tempdir().unwrap();
+    let json = br#"{"storage":{"backend":"sqlite"}}"#;
+    let json_path = home.path().join("config.json");
+    let selected = home.path().join("config.toml");
+    let missing = home.path().join("missing.toml");
+    let malformed = b"[storage]\nbackend='postgres'\nurl='fixture-secret-sentinel'\n[broken";
+    std::fs::write(&json_path, json).unwrap();
+    match kind {
+        InvalidSelectedConfig::Malformed => std::fs::write(&selected, malformed).unwrap(),
+        InvalidSelectedConfig::Dangling => {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&missing, &selected).unwrap();
+            #[cfg(not(unix))]
+            return;
+        }
+        InvalidSelectedConfig::Directory => std::fs::create_dir(&selected).unwrap(),
+    }
+    let provider = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    provider.set_nonblocking(true).unwrap();
+    let log_path = home.path().join("refusal.log");
+    let log = File::create(&log_path).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_atlas"))
+        .arg("--bg-indexer")
+        .env_clear()
+        .env("ATLAS_HOME", home.path())
+        .env("ATLAS_NO_KEYRING", "1")
+        .env("ATLAS_SAB_DIR", home.path().join("absent-sab"))
+        .env("ATLAS_NNTP_HOST", "127.0.0.1")
+        .env("ATLAS_NNTP_PORT", provider.local_addr().unwrap().port().to_string())
+        .env("ATLAS_NNTP_USER", "fixture")
+        .env("ATLAS_NNTP_PASS", "fixture")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log.try_clone().unwrap()))
+        .stderr(Stdio::from(log))
+        .spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() { break Some(status); }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(status.and_then(|status| status.code()), Some(1),
+        "the real binary must refuse before migration, databases or provider startup");
+    assert!(matches!(provider.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "selected-file refusal must precede every provider connection");
+    let mut names = std::fs::read_dir(home.path()).unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap()).collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(names, ["config.json", "config.toml", "refusal.log"],
+        "no SQLite, PID, status, NXV, backup or migrated config artifact may be created");
+    assert_eq!(std::fs::read(&json_path).unwrap(), json);
+    assert!(!missing.exists());
+    match kind {
+        InvalidSelectedConfig::Malformed => assert_eq!(std::fs::read(&selected).unwrap(), malformed),
+        InvalidSelectedConfig::Dangling => assert_eq!(std::fs::read_link(&selected).unwrap(), missing),
+        InvalidSelectedConfig::Directory => {
+            assert!(selected.is_dir());
+            assert!(std::fs::read_dir(&selected).unwrap().next().is_none());
+        }
+    }
+    assert!(std::fs::metadata(&log_path).unwrap().len() <= 64 * 1024);
+    let output = std::fs::read_to_string(log_path).unwrap();
+    assert!(!output.contains("fixture-secret-sentinel"), "source values must not appear in refusal output");
+}
+
+#[test]
+fn actual_binary_refuses_malformed_selected_config_without_migration_or_sqlite() {
+    binary_refuses_selected_config_before_startup(InvalidSelectedConfig::Malformed);
+}
+
+#[cfg(unix)]
+#[test]
+fn actual_binary_refuses_dangling_selected_config_without_json_fallback() {
+    binary_refuses_selected_config_before_startup(InvalidSelectedConfig::Dangling);
+}
+
+#[test]
+fn actual_binary_refuses_unreadable_selected_entry_without_json_fallback() {
+    binary_refuses_selected_config_before_startup(InvalidSelectedConfig::Directory);
+}
+
 #[test]
 fn background_entrypoint_persists_postgres_and_nxv_without_sqlite() {
     let Ok(url) = std::env::var("ATLAS_PG_TEST_URL") else { return };

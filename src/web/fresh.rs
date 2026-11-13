@@ -59,7 +59,7 @@ fn query(view:&ReadView<'_>,search:&Search)->Result<(Vec<ReleaseRow>,u64)> {
         return Ok((view.recent(search.offset,PAGE_SIZE as usize)?,view.visible_count()?));
     }
     let mut source=pg::fresh_words::Search::open(view)?;let stamp=source.stamp()?;
-    let directory=native::directory(&crate::paths::app_dir(),stamp);
+    let directory=view.word_index_root(&crate::config::header_store_config())?;
     let index=word_index::WordIndex::read_native(&directory,stamp)?;
     let by=match search.sort {Some(SortBy::Name)=>word_index::By::Name,Some(SortBy::Category)=>word_index::By::Category,
         Some(SortBy::Size)=>word_index::By::Size,Some(SortBy::Posted)=>word_index::By::Posted,Some(SortBy::Group)=>word_index::By::Group,

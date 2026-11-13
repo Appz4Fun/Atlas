@@ -25,6 +25,9 @@ pub mod history_catalog;
 mod history_companion;
 pub(crate) mod indexer_runtime;
 pub(crate) mod stage;
+pub(crate) mod stage_words;
+#[cfg(test)]
+mod stage_words_tests;
 pub(crate) mod outage;
 pub mod ingest;
 pub(crate) mod linker;

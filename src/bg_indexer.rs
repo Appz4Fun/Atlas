@@ -1856,6 +1856,12 @@ async fn supervise(
 }
 
 pub fn run() -> i32 {
+    // Resolve the selected file before environment credentials can produce a
+    // usable Config. A parse/read failure is never a SQLite backend choice.
+    let storage=match crate::config::checked_storage_config() {
+        Ok(storage)=>storage,
+        Err(_)=>{ui::error("storage configuration unavailable");return 1;},
+    };
     let Some(config) = load_config().filter(|c| !c.servers.is_empty()) else {
         match crate::config::file_problem() {
             Some(problem) => println!("{problem}"),
@@ -1869,7 +1875,10 @@ pub fn run() -> i32 {
         return 1;
     }
 
-    let storage = crate::config::storage_config();
+    if crate::config::checked_storage_config().ok().as_ref()!=Some(&storage) {
+        ui::error("storage configuration changed or unavailable");
+        return 1;
+    }
     if storage.check().is_err() {
         ui::error("invalid storage configuration");
         return 1;
@@ -2006,7 +2015,7 @@ fn run_native(config: Config, storage: crate::pg::StorageConfig) -> i32 {
             ui::error("native PostgreSQL configuration unavailable");
             break 1;
         };
-        if crate::config::storage_config() != storage
+        if crate::config::checked_storage_config().ok().as_ref()!=Some(&storage)
             || crate::config::header_store_config() != headers
             || NativeProfile::check(&current, &headers).is_err()
         {
@@ -2097,7 +2106,18 @@ fn run_native(config: Config, storage: crate::pg::StorageConfig) -> i32 {
         });
         // index owns and drops its Tokio runtime, joining detached blocking work
         // before returning. No old runtime or session is reused by the next run.
-        let result = index(current.clone(), stop.clone(), None, Some(native));
+        let keeper=crate::pg::stage_words::Keeper::start(&owner,headers.clone());
+        let result=match keeper {
+            Ok(keeper)=>{
+                let result=index(current.clone(),stop.clone(),None,Some(native));
+                if let Err(error)=keeper.finish() {owner.fail(classify(&error));}
+                result
+            },
+            Err(error) if crate::pg::outage::is_attempt_ended(&error)
+                && (stop.load(Ordering::Acquire)||owner.stop.load(Ordering::Acquire))
+                && owner.failure().is_none()=>{drop(native);0},
+            Err(error)=>{owner.fail(classify(&error));drop(native);1},
+        };
         monitor_done.store(true, Ordering::Release);
         if monitor.join().is_err() {
             owner.fail(Failure::Fatal);
@@ -2127,7 +2147,7 @@ fn native_pause(config: &Config, stop: &AtomicBool, backoff: &mut crate::pg::out
     NATIVE_PAUSED.store(true, Ordering::Release);
     write_status(true, "PostgreSQL unavailable", &config.index_mode, true, "postgres_paused", false, 0);
     let until = Instant::now() + backoff.next();
-    let destination = crate::config::storage_config();
+    let Ok(destination)=crate::config::checked_storage_config() else {return;};
     let headers = crate::config::header_store_config();
     let mut checked = Instant::now();
     while Instant::now() < until && !stop.load(Ordering::Acquire) {
@@ -2135,7 +2155,7 @@ fn native_pause(config: &Config, stop: &AtomicBool, backoff: &mut crate::pg::out
         if checked.elapsed() >= Duration::from_secs(1) {
             checked = Instant::now();
             if load_config().is_none_or(|current| NativeProfile::check(&current, &headers).is_err())
-                || crate::config::storage_config() != destination
+                || crate::config::checked_storage_config().ok().as_ref()!=Some(&destination)
                 || crate::config::header_store_config() != headers
             {
                 break;
@@ -2214,6 +2234,57 @@ fn index(config: Config, stop: Arc<AtomicBool>, writing: Option<WriteGuard>, nat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checked_background_startup_child() {
+        if std::env::var("ATLAS_BG_STARTUP_CHILD").as_deref()!=Ok("1") {return;}
+        assert_eq!(super::run(),1,"invalid selected configuration must refuse startup");
+    }
+
+    fn refused_selected_startup(dangling:bool) {
+        let home=tempfile::tempdir().unwrap();
+        fs::write(home.path().join("config.json"),r#"{"storage":{"backend":"sqlite"}}"#).unwrap();
+        let toml=home.path().join("config.toml");
+        if dangling {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(home.path().join("missing.toml"),&toml).unwrap();
+            #[cfg(not(unix))]
+            return;
+        } else {
+            fs::write(&toml,"[storage]\nbackend='postgres'\nurl='fixture-secret-sentinel'\n[broken").unwrap();
+        }
+        let provider=std::net::TcpListener::bind("127.0.0.1:0").unwrap();provider.set_nonblocking(true).unwrap();
+        let mut child=std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","bg_indexer::tests::checked_background_startup_child","--nocapture","--test-threads=1"])
+            .env_clear().env("ATLAS_HOME",home.path()).env("ATLAS_BG_STARTUP_CHILD","1")
+            .env("ATLAS_NNTP_HOST","127.0.0.1").env("ATLAS_NNTP_PORT",provider.local_addr().unwrap().port().to_string())
+            .env("ATLAS_NNTP_USER","fixture").env("ATLAS_NNTP_PASS","fixture")
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+        let deadline=Instant::now()+Duration::from_secs(3);
+        let status=loop {
+            if let Some(status)=child.try_wait().unwrap() {break Some(status);}
+            if Instant::now()>=deadline {child.kill().unwrap();break None;}
+            thread::sleep(Duration::from_millis(10));
+        };
+        let output=child.wait_with_output().unwrap();
+        assert!(status.is_some_and(|status|status.success()),"selected-file refusal must finish before database/provider startup");
+        assert!(matches!(provider.accept(),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock),"no provider connection before selector refusal");
+        let names=fs::read_dir(home.path()).unwrap().map(|entry|entry.unwrap().file_name().to_string_lossy().into_owned()).collect::<Vec<_>>();
+        assert!(names.iter().all(|name|matches!(name.as_str(),"config.toml"|"config.json")),"no database, PID, status or NXV startup artifacts: {names:?}");
+        let log=String::from_utf8_lossy(&output.stdout).to_string()+&String::from_utf8_lossy(&output.stderr);
+        assert!(!log.contains("fixture-secret-sentinel"),"configuration failure must not print source values");
+    }
+
+    #[test]
+    fn checked_background_startup_rejects_malformed_selected_toml_before_side_effects() {
+        refused_selected_startup(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checked_background_startup_rejects_dangling_selected_toml_before_side_effects() {
+        refused_selected_startup(true);
+    }
 
     fn native_cursor_fixture() -> (crate::pg::testing::Schema, Config, NativeRuntime, std::net::TcpListener) {
         // These focused regressions require an admitted PostgreSQL fixture;

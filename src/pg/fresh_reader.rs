@@ -37,6 +37,11 @@ impl<'client> ReadView<'client> {
         super::stage::CatalogIdentity::read_in(&mut *self.tx.borrow_mut())?.header_config(configured)
     }
 
+    pub(crate) fn word_index_root(&self,configured:&crate::config::HeaderStoreConfig)->Result<std::path::PathBuf> {
+        self.before_query()?;
+        super::stage::CatalogIdentity::read_in(&mut *self.tx.borrow_mut())?.word_index_root(configured)
+    }
+
     pub(super) fn admit_owned(&self,bytes:u64)->Result<()> {
         let total=self.owned.get().checked_add(bytes).context("native request allocation admission overflow")?;
         ensure!(total<=self.budget.bytes,"native request owned data exceeds byte admission");self.owned.set(total);Ok(())

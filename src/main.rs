@@ -21,6 +21,23 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // Refuse legacy catalog tools before their dispatchers can initialize a
+    // default SQLite database. Explicit valuable-cache/staging tools retain
+    // their own source and destination admission.
+    if let Some(command) = app::legacy_catalog_command(&args) {
+        match atlas::config::checked_storage_config() {
+            Ok(storage) if storage.backend == atlas::pg::Backend::Postgres => {
+                eprintln!("{command} is not available for the PostgreSQL catalog; no legacy catalog was opened");
+                return ExitCode::from(1);
+            }
+            Ok(_) => {}
+            Err(_) => {
+                eprintln!("storage configuration is invalid; refusing catalog maintenance");
+                return ExitCode::from(1);
+            }
+        }
+    }
+
     if has("--import-history") {
         return ExitCode::from(atlas::pg::history_cli::run_cli(&args) as u8);
     }
@@ -32,6 +49,14 @@ fn main() -> ExitCode {
     }
     if has("--save-replay") {
         return ExitCode::from(atlas::save_replay::run_cli(&args) as u8);
+    }
+
+    // Even runtime/default startup must reject a bad selected entry before
+    // config migration can replace it from an older JSON file. The explicit
+    // import/replay tools above keep their own source/destination admission.
+    if atlas::config::checked_storage_config().is_err() {
+        eprintln!("storage configuration is invalid; Atlas was not started");
+        return ExitCode::from(1);
     }
 
     match atlas::config::migrate_to_toml() {
