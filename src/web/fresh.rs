@@ -93,12 +93,7 @@ fn dispatch_with_assets(view:&ReadView<'_>,path:&str,args:&HashMap<String,String
             view.verify_runtime(current.owner.as_ref())?;Ok(html(200,body))
         }
         "/ui/poster"|"/ui/cover"|"/ui/still"|"/ui/image"=>{
-            let Some(request)=view.asset_request(path,args)? else{return Ok(ApiResponse::not_found())};
-            let assets=assets.context("retained asset manifest/root has not been admitted")?;
-            let Some(body)=assets.read(&request,&crate::api::fresh::spools()?)? else{return Ok(ApiResponse::not_found())};
-            let mut response=ApiResponse::xml(200,String::new());response.content_type=Some(request.content_type);response.spool=Some(body);
-            response.headers=vec![("Cache-Control".into(),"private, max-age=86400".into()),("X-Content-Type-Options".into(),"nosniff".into()),
-                ("Content-Security-Policy".into(),"default-src 'none'; img-src 'self'; sandbox".into())];Ok(response)
+            asset_fragment(view,path,args,assets,&crate::api::fresh::spools()?)
         }
         "/ui/settings/groups/search"=>{
             let query=args.get("q").map_or("",String::as_str).trim();
@@ -159,6 +154,15 @@ fn dispatch_with_assets(view:&ReadView<'_>,path:&str,args:&HashMap<String,String
         _=>anyhow::bail!("fresh native view loader is not yet connected"),
     }
 }
+fn asset_fragment(view:&ReadView<'_>,path:&str,args:&HashMap<String,String>,assets:Option<&pg::fresh_assets::AssetManifest>,pool:&Arc<crate::nzb_spool::Pool>)->Result<ApiResponse> {
+    let Some(request)=view.asset_request(path,args)? else{return Ok(ApiResponse::not_found())};
+    let assets=assets.context("retained asset manifest/root has not been admitted")?;
+    let Some(body)=view.read_asset(assets,&request,pool)? else{return Ok(ApiResponse::not_found())};
+    let mut response=ApiResponse::xml(200,String::new());response.content_type=Some(request.content_type);response.spool=Some(body);
+    response.headers=vec![("Cache-Control".into(),"private, max-age=86400".into()),("X-Content-Type-Options".into(),"nosniff".into()),
+        ("Content-Security-Policy".into(),"default-src 'none'; img-src 'self'; sandbox".into())];Ok(response)
+}
+
 fn own_release_page(view:&ReadView<'_>,id:i64,key:&str)->Result<String> {
     let row=view.release(id)?.context("native release disappeared")?;
     let names=view.own_names(id)?.context("native release name disappeared")?;
@@ -593,7 +597,6 @@ mod kept_details_tests {
     }
 }
 
-
 #[cfg(test)]
 mod advanced_native_query_tests {
     use super::*;
@@ -761,5 +764,60 @@ mod bounded_native_string_sort_tests {
         args.insert("q".into(),"bound missing".into());
         let view=ReadView::open(&mut client,&schema.name,pg::fresh_reader::Budget {rows:100,..Default::default()},Instant::now()+Duration::from_secs(15)).unwrap();
         let (rows,total)=query_using_headers(&view,&Search::from_args(&args),&headers).unwrap();assert!(rows.is_empty());assert_eq!((total.count,total.exact),(0,true));
+    }
+}
+
+#[cfg(all(test,unix))]
+mod native_asset_route_tests {
+    use super::*;
+    use sha2::{Digest,Sha256};
+    use std::{io::Read,time::{Instant,Duration}};
+    fn hex(bytes:&[u8])->String {bytes.iter().map(|b|format!("{b:02x}")).collect()}
+    #[test]
+    #[ignore="requires explicit isolated PG owner, genuine asset writer and Unix physical asset confinement"]
+    fn actual_generated_poster_receipt_reaches_the_native_route_without_manifest_rewrite() {
+        let schema=pg::testing::Schema::new().expect("explicit isolated PG required");let runtime=pg::stage_queue_tests::runtime(&schema);
+        let home=tempfile::tempdir().unwrap();let evidence=tempfile::tempdir().unwrap();let scratch=tempfile::tempdir().unwrap();
+        let original=[&[0xff,0xd8,0xff,0xe0][..],b"original poster",&[0xff,0xd9]].concat();
+        std::fs::create_dir(home.path().join("posters")).unwrap();std::fs::write(home.path().join("posters/retained.jpg"),&original).unwrap();
+        let manifest=evidence.path().join("assets.jsonl");
+        pg::cache_assets::capture_file(home.path(),&manifest,pg::cache_assets::Limits {min_files:1,max_files:16,max_file_bytes:1<<20,max_total_bytes:16<<20,read_bytes_per_second:32<<20}).unwrap();
+        let manifest_bytes=std::fs::read(&manifest).unwrap();
+        let selection=crate::config::NativeAssetsConfig {root:home.path().canonicalize().unwrap().to_str().unwrap().into(),manifest:manifest.canonicalize().unwrap().to_str().unwrap().into(),whole_sha256:hex(&Sha256::digest(&manifest_bytes))};
+        let assets=pg::fresh_assets::AssetManifest::from_selection(&selection).unwrap();
+        let grant=pg::worker_assets::Grant::open(&runtime.owner,Some(&selection)).unwrap().unwrap();
+        let pool=crate::nzb_spool::Pool::new(scratch.path().into(),crate::nzb_spool::Limits {requests:2,per_request_bytes:1<<20,total_bytes:2<<20,free_bytes:0}).unwrap();
+        let generated=[&[0xff,0xd8,0xff,0xe0][..],b"genuine generated poster",&[0xff,0xd9]].concat();
+        for (id,path) in [(42,"/generated.jpg"),(43,"/retained.jpg")] {
+            let details=crate::media::details::Details {kind:2,tmdb_id:id,poster:Some(path.into()),fetched_at:1,..Default::default()};
+            runtime.owner.with(|client|pg::service_cache::details::put_in(client,&details)).unwrap();
+        }
+        assert_eq!(grant.produce_poster(2,42,"/generated.jpg",&generated).unwrap(),pg::worker_assets::ArtworkStatus::Kept);
+        assert_eq!(std::fs::read(&manifest).unwrap(),manifest_bytes,"genuine new receipt needs no manifest rewrite");
+        let mut client=schema.pool.get().unwrap();
+        for (id,wanted) in [(42,&generated),(43,&original)] {
+            let view=ReadView::open(&mut client,&schema.name,pg::fresh_reader::Budget::default(),Instant::now()+Duration::from_secs(10)).unwrap();
+            let args=HashMap::from([("kind".into(),"2".into()),("tmdb".into(),id.to_string())]);
+            let mut response=asset_fragment(&view,"/ui/poster",&args,Some(&assets),&pool).unwrap();
+            assert_eq!(response.status,200);assert_eq!(response.content_type,Some("image/jpeg"));
+            assert!(response.headers.iter().any(|(name,value)|name=="X-Content-Type-Options"&&value=="nosniff"));
+            let mut body=Vec::new();response.spool.as_mut().unwrap().read_to_end(&mut body).unwrap();assert_eq!(&body,wanted);
+        }
+        let args=HashMap::from([("kind".into(),"2".into()),("tmdb".into(),"42".into())]);
+        std::fs::remove_file(home.path().join("posters/generated.jpg")).unwrap();
+        {
+            let view=ReadView::open(&mut client,&schema.name,pg::fresh_reader::Budget::default(),Instant::now()+Duration::from_secs(10)).unwrap();
+            let response=asset_fragment(&view,"/ui/poster",&args,Some(&assets),&pool).unwrap();assert_eq!(response.status,404);assert!(response.spool.is_none());
+        }
+        std::fs::write(home.path().join("posters/generated.jpg"),vec![b'X';generated.len()]).unwrap();
+        {
+            let view=ReadView::open(&mut client,&schema.name,pg::fresh_reader::Budget::default(),Instant::now()+Duration::from_secs(10)).unwrap();
+            assert!(asset_fragment(&view,"/ui/poster",&args,Some(&assets),&pool).is_err(),"corruption is unavailable, never provider fallback");
+        }
+        std::fs::write(home.path().join("posters/generated.jpg"),&generated).unwrap();
+        runtime.owner.with(|client|{client.execute("update ext_asset_files set source_digest=decode(repeat('00',32),'hex') where kind='posters' and name='generated.jpg'",&[])?;Ok(())}).unwrap();
+        let view=ReadView::open(&mut client,&schema.name,pg::fresh_reader::Budget::default(),Instant::now()+Duration::from_secs(10)).unwrap();
+        assert!(asset_fragment(&view,"/ui/poster",&args,Some(&assets),&pool).is_err(),"an unbound PG receipt cannot grant file access");
+        drop(view);runtime.owner.close();
     }
 }
