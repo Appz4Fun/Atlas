@@ -161,7 +161,7 @@ fn name_lookups_spread_over_servers() {
 
     let extract: atlas::nntp::Extract = atlas::nfo::display_name;
     let jobs = posts.iter().map(|p| vec![(p.message_id.clone(), extract)]).collect();
-    let names = pool.first_names(jobs);
+    let names = pool.first_names(jobs).unwrap();
     assert!(names.iter().all(Option::is_some), "{names:?}");
 
     let sent: Vec<usize> = servers.iter().map(|s| s.bodies_sent.load(Ordering::SeqCst)).collect();
@@ -187,7 +187,7 @@ fn name_lookups_fall_back_on_a_missing_article() {
 
     let extract: atlas::nntp::Extract = atlas::nfo::display_name;
     let jobs = posts.iter().map(|p| vec![(p.message_id.clone(), extract)]).collect();
-    assert!(pool.first_names(jobs).iter().all(Option::is_some));
+    assert!(pool.first_names(jobs).unwrap().iter().all(Option::is_some));
     assert_eq!(has.bodies_sent.load(Ordering::SeqCst), 10);
 }
 

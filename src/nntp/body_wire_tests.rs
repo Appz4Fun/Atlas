@@ -139,3 +139,88 @@ fn forged_yenc_declared_size_never_controls_output_capacity() {
     });
 }
 
+#[test]
+fn small_multiline_raw_response_and_yenc_partial_grammar_remain_exact() {
+    run(async {
+        let (mut conn, server) = response(b"221 head\r\nA\r\nB\r\n.\r\n".to_vec()).await;
+        assert_eq!(conn.head("<owned@test>", 4).await.unwrap(), Some(b"A\nB\n".to_vec()));
+        assert!(!conn.poisoned);
+        drop(conn);
+        server.await.unwrap();
+        for encoded in [b"abc=".as_slice(), b"ab==".as_slice(), b"a=\r=b\n===".as_slice()] {
+            let lines = [b"=ybegin size=9999999999999 name=x".to_vec(), encoded.to_vec()];
+            let mut decoder = super::body_wire::Decoder::new(128);
+            for line in &lines {
+                assert!(decoder.line(line));
+            }
+            assert_eq!(decoder.finish(), yenc_decode(&lines).unwrap());
+        }
+    });
+}
+
+async fn name_pool(reply: Vec<u8>) -> (Arc<Pool>, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = BufReader::new(socket);
+        socket.get_mut().write_all(b"200 owned fixture\r\n").await.unwrap();
+        let mut command = String::new();
+        socket.read_line(&mut command).await.unwrap();
+        assert!(command.starts_with("BODY "));
+        let _ = tokio::time::timeout(Duration::from_secs(15), socket.get_mut().write_all(&reply)).await;
+    });
+    let mut cfg = UsenetServer::new("127.0.0.1", "", "", address.port());
+    cfg.ssl = Some(false);
+    cfg.compress = Some(false);
+    cfg.connections = Some(1);
+    (Arc::new(Pool::new(&[cfg])), task)
+}
+fn extract_owned_name(body: &[u8]) -> Option<String> {
+    std::str::from_utf8(body).ok().map(str::to_owned)
+}
+#[test]
+fn checked_name_lookup_distinguishes_missing_from_unavailable_and_too_big() {
+    run(async {
+        for (reply, expected) in [
+            (b"222 body\r\nRelease.Name\r\n.\r\n".to_vec(), Some("Release.Name")),
+            (b"430 no such article\r\n".to_vec(), None),
+        ] {
+            let (pool, server) = name_pool(reply).await;
+            assert_eq!(
+                first_names(pool, vec![vec![("<name@test>".into(), extract_owned_name as Extract)]]).await.unwrap(),
+                vec![expected.map(str::to_owned)]
+            );
+            server.await.unwrap();
+        }
+        let mut oversized = b"222 body\r\n".to_vec();
+        oversized.resize(oversized.len() + crate::archive::ARTICLE_CAP + 1, b'x');
+        oversized.extend(b"\r\n.\r\n");
+        for reply in [b"503 temporarily unavailable\r\n".to_vec(), oversized] {
+            let (pool, server) = name_pool(reply).await;
+            assert!(
+                first_names(pool, vec![vec![("<name@test>".into(), extract_owned_name as Extract)]]).await.is_err(),
+                "unavailable/budget failure cannot be a successful empty name batch"
+            );
+            server.await.unwrap();
+        }
+    });
+}
+#[test]
+fn name_job_aggregate_is_admitted_before_task_fanout() {
+    run(async {
+        let jobs = vec![Vec::new(); super::body_wire::default_limit() / 2048 + 1];
+        assert!(first_names(Arc::new(Pool::new(&[])), jobs).await.is_err());
+    });
+}
+
+#[test]
+fn prefix_keeps_a_fitting_final_whole_line_without_claiming_completion() {
+    run(async {
+        let (mut conn, server) = response(b"222 body\r\n1234567\r\n.\r\n".to_vec()).await;
+        assert_eq!(conn.body_prefix("<owned@test>", 8).await.unwrap(), (b"1234567".to_vec(), false));
+        assert!(conn.poisoned);
+        drop(conn);
+        server.await.unwrap();
+    });
+}
