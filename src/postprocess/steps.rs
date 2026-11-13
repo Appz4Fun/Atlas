@@ -21,7 +21,7 @@ pub(crate) fn catalog() -> &'static [Descriptor] {
     const fn step(id: u8, name: &'static str, rank: u16, needs: Needs) -> Descriptor {
         Descriptor { id: StepId(id), name, rank, needs }
     }
-    &[
+    static CATALOG:[Descriptor;20] = [
         step(1, "archive_par2", 100, Needs::Bodies), step(2, "archive_list", 110, Needs::Bodies),
         step(4, "probe", 120, Needs::Bodies), step(5, "opensubtitles", 130, Needs::External),
         step(6, "stills", 140, Needs::Bodies), step(7, "upload_link", 150, Needs::Bodies),
@@ -32,7 +32,8 @@ pub(crate) fn catalog() -> &'static [Descriptor] {
         step(32, "media_parse", 500, Needs::Database), step(35, "opensubtitles_imdb", 505, Needs::Database),
         step(33, "media_lookup", 510, Needs::External), step(34, "media_nfo", 520, Needs::Bodies),
         step(40, "keys", 600, Needs::Database), step(41, "audio_print", 610, Needs::Bodies),
-    ]
+    ];
+    &CATALOG
 }
 
 pub fn all() -> Vec<Arc<dyn Step>> {
