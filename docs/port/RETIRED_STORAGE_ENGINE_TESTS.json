@@ -1,0 +1,383 @@
+{
+  "status": "source retirement only; all new graph execution UNRUN",
+  "files": {
+    "src/compact.rs": {
+      "sha256": "6a415b543c490812bc5908fa9e9bb1a669c84604191857235c5e687abe13d7ff",
+      "tests": [
+        {
+          "name": "a_rewrite_that_changes_a_message_id_stops_the_shard",
+          "line": 1192,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "the_search_indexes_outlast_a_compact",
+          "line": 1209,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "writes_from_outside_are_refused_while_compacting",
+          "line": 1225,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "a_second_compaction_at_once_is_refused",
+          "line": 1250,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "a_write_from_outside_holds_off_compaction",
+          "line": 1268,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "a_category_filter_works_after_a_compaction",
+          "line": 1355,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "an_id_search_works_after_a_compaction",
+          "line": 1381,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "a_compaction_leaves_the_media_cache_alone",
+          "line": 1416,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "the_check_compares_digests_and_works_copies_out_on_disk",
+          "line": 1504,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "domain_uses_are_counted_on_disk_and_the_file_goes_with_them",
+          "line": 1558,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "compacting_drops_single_use_domains_repacks_seals_and_keeps_every_nzb",
+          "line": 1586,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "compacting_shards_from_before_sealing_adds_what_they_lack_and_keeps_every_nzb",
+          "line": 1633,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "a_huge_sparse_domain_id_costs_no_memory_to_count",
+          "line": 1674,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "compacting_keeps_what_a_new_row_held_back",
+          "line": 1751,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "the_stop_hook_is_removed_when_its_guard_drops",
+          "line": 1772,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "a_stop_during_a_large_held_back_stream_ends_it_promptly",
+          "line": 1784,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "a_stop_during_a_tail_of_copies_ends_it_by_rows_examined",
+          "line": 1811,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "compacting_streams_many_held_back_entries_and_keeps_the_index",
+          "line": 1849,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "compacting_a_copy_away_takes_its_part_out_of_completeness",
+          "line": 1879,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "compacting_sealed_shards_again_keeps_every_nzb",
+          "line": 1915,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "compacting_drops_a_loose_row_its_blob_already_has",
+          "line": 2002,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "compacting_drops_a_packed_row_whose_blob_has_the_same_id_whole",
+          "line": 2044,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "a_dropped_domains_long_message_id_leaves_the_blob_as_a_row",
+          "line": 2092,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "a_dropped_domains_long_blob_segment_and_its_loose_copy_are_one_row",
+          "line": 2125,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "a_long_blob_segments_loose_copy_past_the_buffered_rows_is_one_row",
+          "line": 2177,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "a_huge_files_tail_is_deduplicated_without_holding_its_ids",
+          "line": 2231,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "a_file_over_the_cap_is_copied_as_rows_and_its_nzb_is_the_same",
+          "line": 2282,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "a_corrupt_blob_stops_compacting_and_keeps_the_original",
+          "line": 2325,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "a_failed_shard_doesnt_stop_the_others",
+          "line": 2355,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "a_stop_before_the_start_leaves_every_shard_as_it_was",
+          "line": 2403,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "a_stop_while_copying_drops_the_copies_and_keeps_the_originals",
+          "line": 2418,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "a_swap_cut_short_gets_its_original_back_on_the_next_start",
+          "line": 2454,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "a_missing_shard_with_others_there_is_refused_not_made_empty",
+          "line": 2469,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "a_shard_is_left_alone_while_a_compaction_holds_the_lock",
+          "line": 2498,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "a_compaction_puts_back_what_a_cut_swap_left_before_starting",
+          "line": 2518,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "a_backup_left_next_to_a_shard_in_place_is_kept",
+          "line": 2530,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "a_shard_and_its_backup_together_refuse_writes_but_not_the_menu",
+          "line": 2549,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "a_checkpoint_a_reader_holds_back_is_refused",
+          "line": 2583,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "a_cut_swap_puts_the_originals_wal_back_with_it",
+          "line": 2602,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "compacting_keeps_the_shared_catalog_outbox_and_its_triggers",
+          "line": 2626,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "compacting_keeps_collections_and_where_they_started",
+          "line": 2673,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "every_registered_table_and_column_survives_compaction",
+          "line": 2743,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "a_column_out_of_order_lands_in_the_right_place",
+          "line": 2800,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "a_table_this_build_doesnt_know_stops_the_shard",
+          "line": 2824,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "refusing_names_what_it_wont_carry",
+          "line": 2840,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "collections_is_a_core_table",
+          "line": 2860,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "the_check_counts_every_registered_table",
+          "line": 2870,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "a_compaction_waits_a_moment_for_a_reader_on_its_way_out",
+          "line": 2894,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        }
+      ],
+      "test_count": 48
+    },
+    "src/convert.rs": {
+      "sha256": "d542dabd1d69cbf52c44b5c90e5821d5c7bac65fc5ccb27f05b35e51b7f182dc",
+      "tests": [
+        {
+          "name": "a_copied_shard_is_durable_before_it_is_marked",
+          "line": 956,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        }
+      ],
+      "test_count": 1
+    },
+    "src/shared_catalog.rs": {
+      "sha256": "0aa0b2775b3ffa182f6d945a0fdb6130df663a1433d03df3b1c9ed316a23b405",
+      "tests": [
+        {
+          "name": "only_the_catalog_tables_a_shard_has_are_copied",
+          "line": 1714,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "every_change_lands_in_the_outbox_and_a_batch_sends_each_row_once_as_it_is_now",
+          "line": 1724,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "a_batch_stops_at_its_limit_and_the_rest_waits",
+          "line": 1756,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "a_batch_of_long_rows_stops_at_its_byte_budget_and_the_rest_waits",
+          "line": 1770,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "a_compaction_waits_for_the_publisher_to_let_go_and_keeps_it_away_till_done",
+          "line": 1786,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "a_table_no_longer_copied_loses_its_triggers",
+          "line": 1812,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "an_outbox_has_an_epoch_and_a_batch_starts_after_what_postgres_has",
+          "line": 1848,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "a_seq_is_never_given_out_twice_even_after_the_outbox_empties",
+          "line": 1869,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "a_compaction_keeps_the_next_seq_past_an_emptied_outboxs",
+          "line": 1883,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "a_compaction_carries_an_outbox_from_before_autoincrement",
+          "line": 1909,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "an_outbox_made_before_autoincrement_is_rebuilt_with_its_rows_and_seqs",
+          "line": 1937,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "the_writer_prunes_what_the_cursor_file_says_postgres_has_for_this_outbox_only",
+          "line": 1956,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "turned_off_the_triggers_and_outbox_go",
+          "line": 1987,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "postgres_statements_key_shard_local_tables_by_shard",
+          "line": 1999,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "sqlite_values_become_the_column_type_or_null",
+          "line": 2018,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "plaintext_only_goes_to_this_machine_or_a_private_address_unless_allowed",
+          "line": 2030,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "a_compaction_carries_the_waiting_changes_and_the_releases_it_resized",
+          "line": 2050,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "pages_walk_a_table_in_key_order_one_page_after_another",
+          "line": 2121,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "a_fill_writes_and_refreshes_every_row_under_the_shard_lock_and_a_check_prunes_what_the_shard_deleted",
+          "line": 2173,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "the_publisher_sends_a_shards_changes_and_waits_out_a_compaction",
+          "line": 2228,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "the_group_lookup_reads_the_catalog_through_its_index",
+          "line": 2280,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "split_post_lookups_read_names_and_stems_as_sqlite_compares_them",
+          "line": 2324,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        },
+        {
+          "name": "a_batch_lands_in_postgres_and_lands_the_same_when_sent_twice",
+          "line": 2367,
+          "classification": "retired SQLite shard conversion/compaction/mirror implementation"
+        }
+      ],
+      "test_count": 23
+    }
+  }
+}
