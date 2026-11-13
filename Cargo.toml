@@ -57,11 +57,11 @@ memmap2 = "0.9"
 libc = "0.2"
 crc32fast = "1"
 nntmux-yenc = { git = "https://github.com/xbmc4lyfe/newznab-tmux", rev = "8dade08ca0372e046af2bd9d3040e23a47379bd4" }
-zipfast = { git = "https://github.com/xbmc4lyfe/zipfast", rev = "f0274b2e7fb4b024b25afdfa31878fd135e12849" }
-zipview = { git = "https://github.com/xbmc4lyfe/zipview", rev = "2c3d73a06b29987cea1510e903e437a482076745" }
+zipfast = { git = "https://github.com/xbmc4lyfe/zipfast", rev = "7c681b66a603d36b9ed603ed49f0630a37f9617b" }
+zipview = { git = "https://github.com/xbmc4lyfe/zipfast", rev = "7c681b66a603d36b9ed603ed49f0630a37f9617b" }
 # PAR2 parsing and GF(2) CRC algebra; atlas::parity wraps it. Only the parsing/algebra side is used, so
 # "parallel" (rayon) and "mmap" (memmap2) stay off until Atlas calls repair.
-par-rs = { git = "https://github.com/xbmc4lyfe/par-rs", branch = "main", default-features = false }
+par-rs = { git = "https://github.com/xbmc4lyfe/par-rs", rev = "fb13bd33ca741d4b73ae37d28442d9e2401da4b4", default-features = false }
 tantivy = "0.27"
 quick-xml = "0.42"
 postgres = "0.19"

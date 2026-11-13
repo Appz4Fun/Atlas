@@ -51,6 +51,137 @@ fn two_file_set(slice_size: usize) -> (Vec<u8>, Vec<u8>, Par2Set) {
 }
 
 #[test]
+fn archive_inventory_keeps_crc_beyond_the_old_ifsc_budget() {
+    // This file crosses both old limits: 4,096 slices per file and 16,384 per set.
+    let bytes = data(4 * 16_385 - 1, 81);
+    let set = build_set("large", &[("large.mkv", bytes.as_slice())], &opts(4, 0, VolumeScheme::Exponential)).unwrap();
+    let inventory = atlas::par2::inventory(&set.index);
+    assert!(inventory.complete);
+    assert_eq!(inventory.files.len(), 1);
+    assert_eq!(inventory.files[0].crc32, Some(parity::crc32(&bytes)));
+    assert!(inventory.files[0].bound);
+    assert_eq!(inventory.sealed, [(inventory.files[0].set_id, inventory.files[0].file_id)]);
+}
+
+#[test]
+fn archive_inventory_checks_packet_md5_before_trusting_metadata() {
+    let (_, _, set) = two_file_set(2048);
+    let inspection = parity::inspect(&set.index);
+    let description = inspection.packets.iter().find(|packet| packet.kind == parity::PacketKind::FileDesc).unwrap();
+    let mut damaged = set.index.clone();
+    damaged[description.offset + 64 + 48] ^= 1;
+    let inventory = atlas::par2::inventory(&damaged);
+    assert!(!inventory.complete);
+    assert_eq!(inventory.files.len(), 1);
+}
+
+#[test]
+fn archive_binding_and_sealing_do_not_require_ifsc() {
+    let (_, _, set) = two_file_set(2048);
+    let inspection = parity::inspect(&set.index);
+    let metadata: Vec<u8> = inspection
+        .packets
+        .iter()
+        .filter(|packet| packet.kind != parity::PacketKind::Ifsc)
+        .flat_map(|packet| set.index[packet.offset..packet.offset + packet.length as usize].iter().copied())
+        .collect();
+    let inventory = atlas::par2::inventory(&metadata);
+    assert!(inventory.complete);
+    assert_eq!(inventory.sealed.len(), 2, "Atlas seals authenticated Main lists, independently of IFSC");
+    assert!(inventory.files.iter().all(|file| file.bound && file.crc32.is_none()));
+
+    // Re-signing a changed description validates its packet, but cannot bind its old file id.
+    let packet = inspection.packets.iter().find(|packet| packet.kind == parity::PacketKind::FileDesc).unwrap();
+    let mut changed = set.index[packet.offset + 64..packet.offset + packet.length as usize].to_vec();
+    changed[48] ^= 1;
+    let encoded =
+        par_rs::packet::encode_packet(&par_rs::packet::SetId(packet.set_id), &par_rs::packet::TYPE_FILEDESC, &changed);
+    let mut replaced = Vec::new();
+    replaced.extend_from_slice(&set.index[..packet.offset]);
+    replaced.extend(encoded);
+    replaced.extend_from_slice(&set.index[packet.offset + packet.length as usize..]);
+    let inventory = atlas::par2::inventory(&replaced);
+    let file_id: [u8; 16] = changed[..16].try_into().unwrap();
+    let file = inventory.files.iter().find(|file| file.file_id == file_id).unwrap();
+    assert!(!file.bound, "Main membership must not replace the FileDesc hash binding");
+    assert!(inventory.sealed.contains(&(file.set_id, file.file_id)), "the Main list still authenticates the old id");
+}
+
+#[test]
+fn archive_inventory_preserves_creator_privacy() {
+    let mut options = opts(2048, 0, VolumeScheme::Exponential);
+    options.creator = "par-rs 0.2.0 user@example.org https://user:password@tool.example/path".into();
+    let set = build_set("privacy", &[("movie.mkv", b"movie".as_slice())], &options).unwrap();
+    let inventory = atlas::par2::inventory(&set.index);
+    assert_eq!(inventory.creators.len(), 1);
+    assert_eq!(inventory.creators[0].1, "par-rs 0.2.0 https://tool.example/path");
+}
+
+#[test]
+fn archive_inventory_rejects_ifsc_with_a_partial_checksum_tail() {
+    let (_, _, set) = two_file_set(2048);
+    let inspection = parity::inspect(&set.index);
+    let mut metadata = Vec::new();
+    for packet in &inspection.packets {
+        let end = packet.offset + packet.length as usize;
+        if packet.kind == parity::PacketKind::Ifsc {
+            let mut body = set.index[packet.offset + 64..end].to_vec();
+            body.extend([0; 4]);
+            metadata.extend(par_rs::packet::encode_packet(
+                &par_rs::packet::SetId(packet.set_id),
+                &par_rs::packet::TYPE_IFSC,
+                &body,
+            ));
+        } else {
+            metadata.extend_from_slice(&set.index[packet.offset..end]);
+        }
+    }
+    let inventory = atlas::par2::inventory(&metadata);
+    assert!(!inventory.complete);
+    assert!(inventory.sealed.is_empty());
+    assert_eq!(inventory.files.len(), 2);
+    assert!(inventory.files.iter().all(|file| file.crc32.is_none()));
+}
+
+#[test]
+fn archive_inventory_never_completes_a_capped_prefix() {
+    let (_, _, set) = two_file_set(2048);
+    let mut oversized = set.index.clone();
+    oversized.resize(2 * atlas::archive::ARTICLE_CAP + 1, 0);
+    let inventory = atlas::par2::inventory(&oversized);
+    assert_eq!(inventory.files.len(), 2);
+    assert!(!inventory.complete);
+    assert!(inventory.truncated);
+    assert!(inventory.sealed.is_empty());
+}
+
+#[test]
+fn archive_inventory_bounds_decoding_before_accepting_large_ifsc() {
+    // Encoded input fits two articles, but decoding this IFSC would exceed the
+    // adapter's aggregate working-set ledger. Keep descriptors without a CRC claim.
+    let (_, _, set) = two_file_set(2048);
+    let inspection = parity::inspect(&set.index);
+    let packet = inspection.packets.iter().find(|packet| packet.kind == parity::PacketKind::Ifsc).unwrap();
+    let body = par_rs::packet::encode_ifsc_body(
+        &par_rs::packet::FileId(inspection.ifsc[0].file_id),
+        &vec![par_rs::packet::SliceChecksum { md5: [0; 16], crc32: 0 }; 60_000],
+    );
+    let mut metadata = set.index[..packet.offset].to_vec();
+    metadata.extend(par_rs::packet::encode_packet(
+        &par_rs::packet::SetId(packet.set_id),
+        &par_rs::packet::TYPE_IFSC,
+        &body,
+    ));
+    assert!(metadata.len() < 2 * atlas::archive::ARTICLE_CAP);
+    let inventory = atlas::par2::inventory(&metadata);
+    assert_eq!(inventory.files.len(), 1);
+    assert!(!inventory.complete);
+    assert!(inventory.truncated);
+    assert!(inventory.sealed.is_empty());
+    assert!(inventory.files.iter().all(|file| file.crc32.is_none()));
+}
+
+#[test]
 fn sniffs_formats_and_names() {
     let (_, _, set) = two_file_set(2048);
     assert_eq!(parity::format_of(&set.index), Some(ParFormat::Par2));

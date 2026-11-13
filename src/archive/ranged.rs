@@ -256,6 +256,36 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_names_keep_their_own_payloads_in_directory_order() {
+        let file = zip_of(&[("Next.nzb", b"first"), ("Next.nzb", b"second")]);
+        let pieces = cut(&file, 64);
+        let mut p = posted(&pieces);
+        let mut asked = Vec::new();
+        let mut fetch = fetcher(&pieces, &mut asked);
+        let (index, _) = p.zip_directory(&mut fetch).unwrap().unwrap();
+        assert_eq!(index.len(), 2);
+        assert_eq!(p.zip_entry(&index, &index.entries()[0], &mut fetch).unwrap().unwrap(), b"first");
+        assert_eq!(p.zip_entry(&index, &index.entries()[1], &mut fetch).unwrap().unwrap(), b"second");
+    }
+
+    #[test]
+    fn an_entry_on_another_zip_disk_does_not_fetch_a_same_offset_article() {
+        let before = vec![0; 130_000];
+        let after = vec![0; 300_000];
+        let mut file = zip_of(&[("before.bin", &before), ("Next.nzb", b"<nzb/>"), ("after.bin", &after)]);
+        let at = file.windows(4).enumerate().filter_map(|(at, w)| (w == b"PK\x01\x02").then_some(at)).nth(1).unwrap();
+        file[at + 34..at + 36].copy_from_slice(&1u16.to_le_bytes());
+        let pieces = cut(&file, 64 << 10);
+        let mut p = posted(&pieces);
+        let mut asked = Vec::new();
+        let (index, _) = p.zip_directory(&mut fetcher(&pieces, &mut asked)).unwrap().unwrap();
+        let reads_before = asked.clone();
+        let entry = index.by_name("Next.nzb").unwrap();
+        assert!(p.zip_entry(&index, entry, &mut fetcher(&pieces, &mut asked)).unwrap().is_none());
+        assert_eq!(asked, reads_before, "a different disk's offset must not fetch a local article");
+    }
+
+    #[test]
     fn a_damaged_directory_reads_as_none() {
         let mut file = many(20);
         let at = file.windows(4).rposition(|w| w == b"PK\x05\x06").unwrap();

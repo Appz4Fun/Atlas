@@ -259,3 +259,18 @@ pub fn zip_of(files: &[(&str, &[u8])]) -> Vec<u8> {
     let eocd = zip_eocd(files.len() as u16, cd.len() as u32, body.len() as u32, b"");
     [body, cd, eocd].concat()
 }
+
+/// AES-256 stored NZB: Python hashlib PBKDF2/HMAC and OpenSSL AES-ECB counter keystream.
+pub fn authenticated_aes_nzb() -> (Vec<u8>, &'static [u8]) {
+    let plain = b"<nzb><head><meta type=\"password\">inner-secret</meta></head><file subject=\"movie.mkv\"><groups><group>alt.test</group></groups><segments><segment bytes=\"1\" number=\"1\">message@test</segment></segments></file></nzb>";
+    let hex = "000102030405060708090a0b0c0d0e0fa33666d7442270a9dc80e5149c88a9b1216fd111911ac4a0858c119745ade9ad6de9ca5e7daa33a7f4c10f906e121899e3efbcc0ffa93d452e89a519a303b7ade4cc40ccf1e1a6eeb5b25c60e66430d7d4e755ae3347073043c4d46325ba7fb0942ee86be01c8e5228540547ab87a9bfd0471f791dae32d0a3dbd8d1226ac7b94dd7e50e96ac0fa843b570bd621c47c418586d9918c7f38b12e1ebb3011b6a8181de713022e58b2dde01956f371f79ed51c8b0119df9ba0457458743929c784715e263d1550f105da9d78a18f6f44669e09f4ab2ab291d263a1ff7d6199586";
+    let payload: Vec<u8> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();
+    let name = b"Next.nzb";
+    let extra = [1, 0x99, 7, 0, 2, 0, b'A', b'E', 3, 0, 0];
+    let mut file = zip_local(1, 99, name, &payload);
+    file[14..18].fill(0); // AE-2 uses authentication rather than CRC.
+    file[22..26].copy_from_slice(&(plain.len() as u32).to_le_bytes());
+    file[28..30].copy_from_slice(&(extra.len() as u16).to_le_bytes());
+    file.splice(30 + name.len()..30 + name.len(), extra);
+    (file, plain)
+}

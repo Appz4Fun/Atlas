@@ -46,6 +46,9 @@ pub struct Layer {
     /// the decoded bytes were cut short by a limit, not by the end of what was read
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub capped: bool,
+    /// plaintext is a WinZip AES preview whose authentication trailer was not available
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unauthenticated: bool,
     /// the file inside goes on in another volume
     #[serde(skip)]
     pub continues: bool,
@@ -68,11 +71,7 @@ enum View {
     /// decoded from `from` on
     Decode { from: usize, codec: Codec },
     /// decrypted (and, when compressed, decoded) from `from` on
-    Decrypted {
-        from: usize,
-        out: Vec<u8>,
-        capped: bool,
-    },
+    Decrypted { from: usize, out: Vec<u8>, capped: bool, unauthenticated: bool },
     /// not reached: the reason why
     Stop(&'static str),
 }
@@ -214,7 +213,7 @@ pub fn unwrap_for_with_password<'a>(
                 buf = Cow::Owned(out);
                 layers.push(layer);
             }
-            View::Decrypted { from, out, capped } => {
+            View::Decrypted { from, out, capped, unauthenticated } => {
                 layer.offset = from as u64;
                 if out.is_empty() {
                     layer.stop = Some("nothing decoded".to_string());
@@ -222,6 +221,7 @@ pub fn unwrap_for_with_password<'a>(
                     break;
                 }
                 layer.capped = capped;
+                layer.unauthenticated = unauthenticated;
                 budget -= out.len().min(budget);
                 outer_at = None;
                 (lo, hi) = (0, out.len());
@@ -399,7 +399,9 @@ fn from_entries(
         };
         let to = end(head.packed);
         return match decrypt_entry(data, at, to, head, format, pw, budget, rar4_cache) {
-            Ok((out, capped)) => Opened { layer, view: View::Decrypted { from: at, out, capped } },
+            Ok((out, capped, unauthenticated)) => {
+                Opened { layer, view: View::Decrypted { from: at, out, capped, unauthenticated } }
+            }
             Err(why) => Opened { layer, view: View::Stop(why) },
         };
     }
@@ -462,7 +464,7 @@ fn decrypt_entry(
     pw: &str,
     budget: usize,
     rar4_cache: &mut crate::archive::rar::Rar4KeyCache,
-) -> Result<(Vec<u8>, bool), &'static str> {
+) -> Result<(Vec<u8>, bool, bool), &'static str> {
     let packed_slice = data.get(at..to).filter(|s| !s.is_empty()).ok_or("no file starts in what was read")?;
     let complete_packed = !head.continues && head.packed.is_some_and(|p| p <= packed_slice.len() as u64);
     let verify_crc = format == "RAR4" || (format == "ZIP" && head.zip_aes.is_none());
@@ -477,7 +479,7 @@ fn decrypt_entry(
         }
         Ok(())
     };
-    let finish_stored = |mut dec: Vec<u8>| -> Result<(Vec<u8>, bool), &'static str> {
+    let finish_stored = |mut dec: Vec<u8>| -> Result<(Vec<u8>, bool, bool), &'static str> {
         let capped = if let Some(unpacked) = head.unpacked.and_then(|u| usize::try_from(u).ok()) {
             let cap = unpacked.min(budget);
             dec.truncate(cap);
@@ -491,7 +493,7 @@ fn decrypt_entry(
         if dec.is_empty() {
             return Err("nothing decoded");
         }
-        Ok((dec, capped))
+        Ok((dec, capped, false))
     };
     let method = head.method.as_deref().unwrap_or_default();
     match format {
@@ -521,7 +523,7 @@ fn decrypt_entry(
                 }
                 let capped = end == End::Limit;
                 check_crc(&out, capped)?;
-                Ok((out, capped))
+                Ok((out, capped, false))
             } else {
                 Err("a RAR algorithm newer than this knows")
             }
@@ -553,29 +555,34 @@ fn decrypt_entry(
                 }
                 let capped = end == End::Limit;
                 check_crc(&out, capped)?;
-                Ok((out, capped))
+                Ok((out, capped, false))
             } else {
                 Err("no decoder for this yet")
             }
         }
         "ZIP" => {
-            let (dec, actual_method) = if let Some((strength, actual)) = head.zip_aes {
-                let d = crate::archive::zip::decrypt_winzip_aes(pw, strength, packed_slice, head.packed)
-                    .ok_or("encrypted")?;
-                (d, archive::zip_method(actual))
+            let (dec, actual_method, unauthenticated) = if let Some((strength, actual)) = head.zip_aes {
+                let full_payload = head.packed == Some(packed_slice.len() as u64);
+                let d = if full_payload {
+                    crate::archive::zip::decrypt_winzip_aes(pw, strength, packed_slice, head.packed)
+                } else {
+                    crate::archive::zip::decrypt_winzip_aes_preview(pw, strength, packed_slice, head.packed)
+                }
+                .ok_or("encrypted")?;
+                (d, archive::zip_method(actual), !full_payload)
             } else if let Some(check) = head.zip_crypto_check {
                 let d = crate::archive::zip::decrypt_zipcrypto(pw, check, packed_slice).ok_or("encrypted")?;
-                (d, method)
+                (d, method, false)
             } else {
                 return Err("encrypted");
             };
             match actual_method {
-                "store" => finish_stored(dec),
+                "store" => finish_stored(dec).map(|(out, capped, _)| (out, capped, unauthenticated)),
                 "xz" => {
                     if dec.is_empty() {
                         Err("nothing decoded")
                     } else {
-                        Ok((dec, false))
+                        Ok((dec, false, unauthenticated))
                     }
                 }
                 "deflate" | "deflate64" | "bzip2" | "zstd" | "ppmd" | "lzma" => {
@@ -606,7 +613,7 @@ fn decrypt_entry(
                     if head.zip_aes.is_none() {
                         check_crc(&out, capped)?;
                     }
-                    Ok((out, capped))
+                    Ok((out, capped, unauthenticated))
                 }
                 _ => Err("no decoder for this yet"),
             }

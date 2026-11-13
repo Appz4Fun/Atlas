@@ -918,7 +918,13 @@ pub(crate) fn decrypt_rar5_header(data: &[u8], pos: usize, key: &[u8; 32]) -> Re
         return Ok(None);
     };
     let Ok(iv): Result<[u8; 16], _> = iv_slice.try_into() else { return Ok(None) };
-    let Some(first_dec) = super::aes::decrypt_cbc(key, &iv, first_ct) else { return Err(()) };
+    let aes = super::aes::Aes::new(key).ok_or(())?;
+    let mut previous: [u8; 16] = first_ct.try_into().map_err(|_| ())?;
+    let mut first_dec = previous;
+    aes.decrypt_block(&mut first_dec);
+    for (byte, iv_byte) in first_dec.iter_mut().zip(iv) {
+        *byte ^= iv_byte;
+    }
     let (mut size, mut size_len) = (0usize, 0usize);
     loop {
         let Some(byte) = first_dec.get(4 + size_len).copied() else { return Err(()) };
@@ -939,9 +945,13 @@ pub(crate) fn decrypt_rar5_header(data: &[u8], pos: usize, key: &[u8; 32]) -> Re
     let Some(total_hdr) = 16usize.checked_add(enc_len) else { return Err(()) };
     let Some(hdr_end) = pos.checked_add(total_hdr) else { return Ok(None) };
     let Some(enc_hdr) = data.get(pos + 16..hdr_end) else { return Ok(None) };
-    let Some(dec) = super::aes::decrypt_cbc(key, &iv, enc_hdr) else { return Err(()) };
+    // The first block already supplied the bounded length. Reuse its plaintext and key schedule;
+    // only the remaining complete blocks need decryption into the owned header buffer.
+    let mut dec = enc_hdr.to_vec();
+    dec.get_mut(..16).ok_or(())?.copy_from_slice(&first_dec);
+    aes.decrypt_cbc_in_place(&mut previous, dec.get_mut(16..).ok_or(())?);
     let Some(body) = dec.get(4..raw_len) else { return Err(()) };
-    if le32(&dec, 0) != Some(crc32(body)) {
+    if le32(&dec, 0) != Some(zipfast::crc32::hash(body)) {
         return Err(());
     }
     let Some(inner) = body.get(size_len..) else { return Err(()) };
@@ -978,6 +988,7 @@ impl Rar4KeyCache {
 }
 
 /// Decrypts one RAR4 `-hp` encrypted block header at `pos` (where the 8-byte salt sits).
+/// The returned byte count includes the salt and padded header, relative to `pos`.
 pub(crate) fn decrypt_rar4_header(
     data: &[u8],
     pos: usize,
@@ -990,6 +1001,116 @@ pub(crate) fn decrypt_rar4_header(
     cache.headers += 1;
     let salt: [u8; 8] = data.get(pos..pos.checked_add(8)?)?.try_into().ok()?;
     let (key, iv) = cache.derive(password, &salt)?;
-    let (header, enc_len) = zipfast::crypto::decrypt_rar4_header(data, pos + 8, &key, &iv)?;
-    Some((8 + enc_len, header, salt))
+    let (header, end) = zipfast::crypto::decrypt_rar4_header(data, pos + 8, &key, &iv)?;
+    Some((end.checked_sub(pos)?, header, salt))
+}
+
+#[cfg(test)]
+mod zipfast_header_tests {
+    use super::*;
+
+    const KEY: [u8; 32] = [0x11; 32];
+    const IV: [u8; 16] = [0x22; 16];
+
+    fn encrypted_header(inner: &[u8]) -> Vec<u8> {
+        let mut body = super::super::testkit::vint(inner.len() as u64);
+        body.extend_from_slice(inner);
+        let mut plain = crc32fast::hash(&body).to_le_bytes().to_vec();
+        plain.extend(body);
+        plain.resize(plain.len().next_multiple_of(16), 0);
+        let mut wire = IV.to_vec();
+        wire.extend(zipfast::crypto::encrypt_cbc(&KEY, &IV, &plain).unwrap());
+        wire
+    }
+
+    #[test]
+    fn encrypted_rar5_headers_keep_single_and_multiple_block_payloads() {
+        for inner in [vec![5, 0, 0], vec![0x35; 300]] {
+            let wire = encrypted_header(&inner);
+            let mut article = vec![0xaa; 7];
+            article.extend_from_slice(&wire);
+            article.extend_from_slice(b"payload after header");
+            assert_eq!(decrypt_rar5_header(&article, 7, &KEY), Ok(Some((wire.len(), inner))));
+        }
+    }
+
+    #[test]
+    fn encrypted_rar5_headers_distinguish_truncation_from_damage() {
+        let wire = encrypted_header(&[0x35; 300]);
+        for len in 0..wire.len() {
+            assert_eq!(decrypt_rar5_header(&wire[..len], 0, &KEY), Ok(None), "prefix length {len}");
+        }
+        assert_eq!(decrypt_rar5_header(&wire, usize::MAX, &KEY), Ok(None));
+        let mut bad_crc = wire.clone();
+        bad_crc[0] ^= 1;
+        assert_eq!(decrypt_rar5_header(&bad_crc, 0, &KEY), Err(()));
+        let mut zero_size = encrypted_header(&[5, 0, 0]);
+        zero_size[4] ^= 3;
+        assert_eq!(decrypt_rar5_header(&zero_size, 0, &KEY), Err(()));
+        let mut overlong_size = wire;
+        overlong_size[5] ^= 0x80;
+        overlong_size[6] ^= 0x80;
+        assert_eq!(decrypt_rar5_header(&overlong_size, 0, &KEY), Err(()));
+    }
+
+    #[test]
+    fn encrypted_rar5_key_derivation_keeps_article_kdf_limit() {
+        assert_eq!(derive_rar5_key("password", 17, &[0; 16], None), None);
+        let check = PasswordCheck::new(17, [0; 16], [0; 8]);
+        assert_eq!(check.accepts("password"), None);
+    }
+
+    fn encrypted_rar4_header(plain: &[u8], salt: &[u8; 8], key: &[u8; 16], iv: &[u8; 16]) -> Vec<u8> {
+        let mut padded = plain.to_vec();
+        padded.resize(padded.len().next_multiple_of(16), 0);
+        let mut wire = salt.to_vec();
+        wire.extend(zipfast::crypto::encrypt_cbc(key, iv, &padded).unwrap());
+        wire
+    }
+
+    #[test]
+    fn encrypted_rar4_headers_use_relative_spans_at_embedded_offsets() {
+        let salt = [0x33; 8];
+        let key = [0x44; 16];
+        let iv = [0x55; 16];
+        let plain = super::super::testkit::r4_end();
+        let wire = encrypted_rar4_header(&plain, &salt, &key, &iv);
+        for offset in [0, 7, 20] {
+            let mut article = vec![0xaa; offset];
+            article.extend_from_slice(&wire);
+            article.extend_from_slice(b"next header");
+            let mut cache = Rar4KeyCache { entries: vec![(salt, key, iv)], headers: 0 };
+            let (span, header, got_salt) = decrypt_rar4_header(&article, offset, "password", &mut cache).unwrap();
+            assert_eq!(span, 24);
+            assert_eq!(&article[offset + span..], b"next header");
+            assert_eq!(&header[..7], plain);
+            assert_eq!(got_salt, salt);
+            for len in 0..24 {
+                assert!(decrypt_rar4_header(&article[..offset + len], offset, "password", &mut cache).is_none());
+            }
+            // Flipping the CBC IV changes only a stored CRC byte in the first plaintext block.
+            cache.entries[0].2[0] ^= 1;
+            assert!(decrypt_rar4_header(&article, offset, "password", &mut cache).is_none());
+        }
+    }
+
+    #[test]
+    fn encrypted_rar4_listing_reaches_the_header_after_a_file_payload() {
+        use super::super::testkit::{r4_block, r4_end, r4_file_fields, r4_main, rar4};
+
+        let salt = [0x33; 8];
+        let (key, iv) = derive_rar4_key_iv("password", &salt);
+        let file = r4_block(0x74, 0, &r4_file_fields(b"movie.mkv", 3), Some(3));
+        let mut article = rar4(&[r4_main(0x0080)]);
+        article.extend(encrypted_rar4_header(&file, &salt, &key, &iv));
+        article.extend_from_slice(b"abc");
+        article.extend(encrypted_rar4_header(&r4_end(), &salt, &key, &iv));
+
+        let listing = list4_with_password(&article, Some("password"));
+        assert!(listing.complete && !listing.damaged);
+        assert!(listing.encrypted && listing.headers_encrypted);
+        assert_eq!(listing.files.len(), 1);
+        assert_eq!(listing.files[0].name, "movie.mkv");
+        assert_eq!(listing.files[0].size, Some(3));
+    }
 }

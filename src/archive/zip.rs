@@ -186,7 +186,7 @@ pub(crate) fn decrypt_zipcrypto(password: &str, check: u8, data: &[u8]) -> Optio
     zipview::decrypt_zipcrypto(password, check, data)
 }
 
-/// Decrypts a WinZip AES (method 99) entry starting at `data` (`salt + verifier + ciphertext [+ 10-byte auth]`).
+/// Decrypts a WinZip AES payload. `Some(packed)` requires the complete authenticated payload.
 pub(crate) fn decrypt_winzip_aes(
     password: &str,
     strength: u8,
@@ -194,6 +194,24 @@ pub(crate) fn decrypt_winzip_aes(
     full_packed: Option<u64>,
 ) -> Option<Vec<u8>> {
     zipview::decrypt_winzip_aes(password, strength, data, full_packed)
+}
+
+/// Decrypts an unauthenticated prefix for inspection, excluding any available authentication-tag bytes.
+/// Callers must retain that provenance and must not adopt an NZB or password from this preview.
+pub(crate) fn decrypt_winzip_aes_preview(
+    password: &str,
+    strength: u8,
+    data: &[u8],
+    full_packed: Option<u64>,
+) -> Option<Vec<u8>> {
+    if let Some(packed) = full_packed {
+        if data.len() as u64 >= packed {
+            return None;
+        }
+        let end = usize::try_from((data.len() as u64).min(packed.checked_sub(10)?)).ok()?;
+        return zipview::decrypt_winzip_aes(password, strength, data.get(..end)?, None);
+    }
+    zipview::decrypt_winzip_aes(password, strength, data, None)
 }
 
 /// AES's own extra field, 0x9901: `(strength, actual_method)`.
@@ -368,6 +386,51 @@ pub fn list(head: &[u8], tail: &[u8]) -> Listing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn authenticated_aes_payload() -> Vec<u8> {
+        // PBKDF2/HMAC from Python hashlib; CTR keystream from OpenSSL AES-256-ECB
+        // over little-endian counters starting at one. Password: secret, salt: 0..16.
+        let hex = "000102030405060708090a0b0c0d0e0fa33666d7442270f4c191ec15ccc0adb7347a9401c804c4eed39914c47880c4e326a58e552d2d328ebca47dfd0f6cc0";
+        (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect()
+    }
+
+    #[test]
+    fn a_complete_aes_payload_requires_its_authentication_tag() {
+        let data = authenticated_aes_payload();
+        let packed = Some(data.len() as u64);
+        assert_eq!(decrypt_winzip_aes("secret", 3, &data, packed).unwrap(), b"<nzb>authenticated nested NZB</nzb>");
+        for at in [18, data.len() - 1] {
+            let mut damaged = data.clone();
+            damaged[at] ^= 1;
+            assert!(decrypt_winzip_aes("secret", 3, &damaged, packed).is_none(), "byte {at}");
+        }
+        assert!(decrypt_winzip_aes("wrong", 3, &data, packed).is_none());
+        for end in [data.len() - 10, data.len() - 1] {
+            assert!(decrypt_winzip_aes("secret", 3, &data[..end], packed).is_none());
+        }
+    }
+
+    #[test]
+    fn an_aes_preview_keeps_only_the_available_ciphertext() {
+        let data = authenticated_aes_payload();
+        let plain = b"<nzb>authenticated nested NZB</nzb>";
+        // The final incomplete range reaches into the tag; none of that tag is plaintext.
+        for end in [23, data.len() - 10, data.len() - 5] {
+            let want = (end - 18).min(plain.len());
+            assert_eq!(
+                decrypt_winzip_aes_preview("secret", 3, &data[..end], Some(data.len() as u64)).unwrap(),
+                plain[..want],
+            );
+        }
+        assert!(decrypt_winzip_aes_preview("secret", 3, &data, Some(data.len() as u64)).is_none());
+        assert!(decrypt_winzip_aes_preview("wrong", 3, &data[..23], Some(data.len() as u64)).is_none());
+    }
+
+    #[test]
+    fn an_aes_payload_larger_than_declared_is_rejected() {
+        let data = authenticated_aes_payload();
+        assert!(decrypt_winzip_aes("secret", 3, &data, Some(data.len() as u64 - 1)).is_none());
+    }
 
     #[test]
     fn a_real_zipcrypto_zip_tests_its_password() {
