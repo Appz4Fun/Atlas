@@ -6,7 +6,8 @@ use std::process::Command;
 fn the_binary_defaults_to_the_users_home() {
     let home = tempfile::tempdir().unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_atlas"))
-        .arg("--reflag-obfuscated")
+        .arg("--selftest")
+        .env_clear()
         .env_remove("ATLAS_HOME")
         .env("HOME", home.path())
         .env("ATLAS_NO_KEYRING", "1")
