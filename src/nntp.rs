@@ -24,6 +24,8 @@ use crate::nxv_store::live::Fetch as HeaderFetch;
 use crate::parser::Article;
 
 pub(crate) mod group_capture;
+#[cfg(test)]
+mod inferred_tests;
 
 #[derive(Debug)]
 pub enum NntpError {
@@ -1845,6 +1847,15 @@ pub enum BackgroundBody {
     TooBig,
 }
 
+/// Actual complete HEAD response from the shared all-provider reader. Only
+/// this module constructs it, after consuming the terminator on that lease.
+pub(crate) struct HeadReply {provider:[u8;32],bytes:Vec<u8>}
+impl HeadReply {
+    pub(crate) fn provider_binding(&self)->&[u8;32] {&self.provider}
+    pub(crate) fn bytes(&self)->&[u8] {&self.bytes}
+}
+pub(crate) enum HeadAnswer {Found(HeadReply),Missing,TooBig}
+
 #[derive(Clone, Copy)]
 pub enum BackgroundRead {
     Capped,
@@ -3053,7 +3064,7 @@ impl Pool {
 
     /// A connection to server `i` for background work: only when nobody waits
     /// for one and more than a quarter of its connections are free. None: no room.
-    async fn background_lease(&self, i: usize) -> Result<Option<Lease>> {
+    async fn background_lease_bounded(&self,i:usize,status_limit:Option<usize>)->Result<Option<Lease>> {
         let server = self.servers[i].clone();
         self.heal_limit(&server);
         let limit = server.limit.load(Ordering::Relaxed);
@@ -3064,7 +3075,7 @@ impl Pool {
             return Ok(None);
         }
         let Ok(permit) = server.permits.clone().try_acquire_owned() else { return Ok(None) };
-        self.connect_with_permit(&server, permit, None, false).await
+        self.connect_with_permit_with_status_bound(&server,permit,None,false,status_limit).await
     }
 
     /// A body for background work. Tries each server, least busy first, taking a
@@ -3085,12 +3096,27 @@ impl Pool {
         let server=self.servers.get(index).ok_or_else(Self::no_servers)?;
         group_capture::provider_binding(&server.cfg)
     }
+    pub(crate) async fn background_head(&self,message_id:&str)->Result<HeadAnswer> {
+        if message_id.len()>65536||!message_id.starts_with('<')||!message_id.ends_with('>')||message_id.bytes().any(|byte|byte.is_ascii_control()||byte==b' ') {
+            return Err(NntpError::Protocol("invalid inferred HEAD command".into()));
+        }
+        // A real HEAD status may echo the complete requested MID. Bound it
+        // independently without imposing LIST's unrelated short-status cap.
+        let (source,body)=self.background_source(message_id,65536,BackgroundRead::Head,Some(65536)).await?;
+        match body {
+            BackgroundBody::Body(bytes)=>Ok(HeadAnswer::Found(HeadReply {provider:self.provider_binding_on(source.ok_or_else(Self::no_servers)?)?,bytes})),
+            BackgroundBody::Missing=>Ok(HeadAnswer::Missing),BackgroundBody::TooBig=>Ok(HeadAnswer::TooBig),
+        }
+    }
     pub async fn background_read(
         &self,
         message_id: &str,
         max_bytes: usize,
         read: BackgroundRead,
     ) -> Result<BackgroundBody> {
+        self.background_source(message_id,max_bytes,read,None).await.map(|(_,body)|body)
+    }
+    async fn background_source(&self,message_id:&str,max_bytes:usize,read:BackgroundRead,status_limit:Option<usize>)->Result<(Option<usize>,BackgroundBody)> {
         let mut left = self.indexing_tier();
         left.sort_by(|&a, &b| self.background_rank(a).total_cmp(&self.background_rank(b)));
         let others: Vec<usize> = (0..self.servers.len()).filter(|i| !left.contains(i)).collect();
@@ -3134,9 +3160,9 @@ impl Pool {
                 // a server resting after a failure was counted then, not each time it's passed over
                 let resting = self.is_down(i);
                 let lease = if start.elapsed() >= self.body_patience {
-                    self.lease(i, false).await.map(Some)
+                    self.lease_for_with_status_bound(i,None,false,status_limit).await.map(Some)
                 } else {
-                    self.background_lease(i).await
+                    self.background_lease_bounded(i,status_limit).await
                 };
                 let mut lease = match lease {
                     Ok(Some(lease)) => lease,
@@ -3184,12 +3210,12 @@ impl Pool {
                         }
                         crate::profile::LOAD.bg_bodies.fetch_add(1, Ordering::Relaxed);
                         crate::profile::LOAD.bg_body_bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
-                        return Ok(BackgroundBody::Body(body));
+                        return Ok((Some(i),BackgroundBody::Body(body)));
                     }
                     // the rest is unread: the lease stays busy, soo the connection is thrown away
                     Ok((_, None)) => {
                         self.served(i, true);
-                        return Ok(BackgroundBody::TooBig);
+                        return Ok((Some(i),BackgroundBody::TooBig));
                     }
                     Err(e) => match lease.check::<()>(Err(e)) {
                         // couldnt ask, or anything else that says nothing about the article: if no server has it, it
@@ -3218,7 +3244,7 @@ impl Pool {
             (Some((_, e)), _) => Err(e),
             // only a fallback server couldnt be asked, and none other could either
             (None, Some((_, e))) if !answered => Err(e),
-            _ => Ok(BackgroundBody::Missing),
+            _ => Ok((None,BackgroundBody::Missing)),
         }
     }
 
