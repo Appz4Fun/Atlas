@@ -6,9 +6,20 @@ use anyhow::{Result,ensure,Context};
 use std::collections::HashMap;
 use crate::{archive::Password,media::{query::MediaAttrs,resolve::Ids,details::Details}};
 
+pub(crate) struct ApiFacts {pub category:i64,pub password:Option<Password>,pub media:Option<MediaAttrs>}
 pub(crate) struct Facts {pub category:i64,pub password:Option<Password>,pub media:Option<MediaAttrs>,pub details:Option<Details>}
 impl ReadView<'_> {
     pub(crate) fn listing_facts(&self,ids:&[i64])->Result<HashMap<i64,Facts>> {
+        self.api_facts(ids)?.into_iter().map(|(id,facts)|{
+            let details=match facts.media.as_ref() {
+                Some(media)=>self.kept_details_for(media.kind,&media.ids)?,None=>None,
+            };
+            Ok((id,Facts {category:facts.category,password:facts.password,media:facts.media,details}))
+        }).collect()
+    }
+    /// API output uses its own IDs/raw names; it does not load UI details,
+    /// inherited title associations or artwork that the feed never renders.
+    pub(crate) fn api_facts(&self,ids:&[i64])->Result<HashMap<i64,ApiFacts>> {
         ensure!(ids.len()<=self.budget.rows,"native listing exceeds row admission");
         if ids.is_empty(){return Ok(HashMap::new());}
         self.before_query()?;
@@ -23,11 +34,31 @@ impl ReadView<'_> {
             let media=if let Some(kind)=row.try_get::<_,Option<i64>>(3)? {Some(MediaAttrs {kind,season:row.try_get(4)?,episode:row.try_get(5)?,air_date:row.try_get(6)?,year:row.try_get(7)?,
                 ids:Ids {tvdb:row.try_get(8)?,tvmaze:row.try_get(9)?,trakt:row.try_get(10)?,tmdb:row.try_get(11)?,imdb:row.try_get(12)?,tvrage:row.try_get(13)?}})}else{None};
             let password=row.try_get::<_,Option<i64>>(2)?.map(|code|Password::from_code(code).context("native password code is invalid")).transpose()?;
-            let details=match media.as_ref().and_then(|media|media.ids.tmdb.map(|tmdb|(media.kind,tmdb))) {
-                Some((kind,tmdb))=>self.kept_details(kind,tmdb)?,None=>None,
-            };
-            result.insert(id,Facts {category:row.try_get::<_,Option<i64>>(1)?.unwrap_or(crate::category::UNCATEGORIZED),password,media,details});
+            result.insert(id,ApiFacts {category:row.try_get::<_,Option<i64>>(1)?.unwrap_or(crate::category::UNCATEGORIZED),password,media});
         }Ok(result)
+    }
+    /// Same no-fetch selection as details::kept_for: an explicit TMDB ID
+    /// precedes the retained lookup, then a television title may use its own
+    /// negative TVDB cache key. Cache age and provider switches do not make a
+    /// retained record unreadable, and negative lookup answers never fetch.
+    fn kept_details_for(&self,kind:i64,ids:&Ids)->Result<Option<Details>> {
+        let tmdb=match ids.tmdb {
+            Some(id)=>Some(id),None=>{
+                let key=crate::media::details::lookup_key(kind,ids);
+                self.admit_owned((key.len() as u64).checked_add(128).context("native detail lookup extent overflow")?)?;
+                self.before_query()?;
+                self.tx.borrow_mut().query_opt("select tmdb_id from ext_media_details_lookups where lookup=$1",&[&key])?
+                    .map(|row|row.try_get::<_,Option<i64>>(0)).transpose()?.flatten()
+            }
+        };
+        if let Some(tmdb)=tmdb {if let Some(details)=self.kept_details(kind,tmdb)? {return Ok(Some(details));}}
+        if kind==crate::media::title::Kind::Tv as i64 {
+            if let Some(tvdb)=ids.tvdb {
+                let key=tvdb.checked_neg().context("native TVDB cache key is out of range")?;
+                return self.kept_details(kind,key);
+            }
+        }
+        Ok(None)
     }
     pub(crate) fn kept_details(&self,kind:i64,tmdb:i64)->Result<Option<Details>> {
         self.before_query()?;

@@ -272,30 +272,8 @@ pub fn par2_name_map(
     let Ok(rows) = stmt.query_map([release_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))) else {
         return out;
     };
-    let is_par2 = |name: &str| matches!(classify(name), Kind::Par2Base | Kind::Par2Vol(_));
-    let mut unmatched_par2: Vec<(String, u64)> =
-        rows.flatten().filter(|(name, _)| !is_par2(name)).collect();
-    if unmatched_par2.is_empty() {
-        return out;
-    }
-    let mut unmatched_files: Vec<&FileInfo> = files
-        .iter()
-        .filter(|f| !is_par2(&f.filename) && !out.contains_key(&f.filename))
-        .collect();
-    unmatched_files.retain(|f| {
-        if let Some(pos) = unmatched_par2.iter().position(|(name, _)| name.eq_ignore_ascii_case(&f.filename)) {
-            let (par2_name, _) = unmatched_par2.remove(pos);
-            if f.filename != par2_name {
-                out.insert(f.filename.clone(), par2_name);
-            }
-            false
-        } else {
-            true
-        }
-    });
-    if unmatched_files.is_empty() || unmatched_par2.is_empty() {
-        return out;
-    }
+    let (unmatched_files,unmatched_par2)=prepare_par2_names(&mut out,files,rows.flatten().collect());
+    if unmatched_files.is_empty() || unmatched_par2.is_empty() {return out;}
     let mut wire_sizes: std::collections::HashMap<i64, u64> = std::collections::HashMap::new();
     if let Ok(mut wstmt) = conn.prepare_cached(
         "select id, coalesce((select sum(bytes) from segments where file_id = files.id), 0), blob
@@ -316,6 +294,83 @@ pub fn par2_name_map(
             wire_sizes.insert(fid, bytes);
         }
     }
+    finish_par2_names(out,unmatched_files,unmatched_par2,&wire_sizes)
+}
+
+/// Posted NZBs to read: at most 2, fewest parts first, and only one whose every article is indexed and few enough
+/// to take whole.
+pub fn nzb_sources(files: &[FileInfo]) -> Vec<&FileInfo> {
+    nzb_sources_with_par2(files, &std::collections::HashMap::new())
+}
+
+/// Like [`nzb_sources`], also matching files whose PAR2-verified name ends in `.nzb`.
+pub fn nzb_sources_with_par2<'a>(
+    files: &'a [FileInfo],
+    par2_names: &std::collections::HashMap<String, String>,
+) -> Vec<&'a FileInfo> {
+    let mut found: Vec<&FileInfo> = files
+        .iter()
+        .filter(|f| {
+            classify(&f.filename) == Kind::Nzb
+                || par2_names.get(&f.filename).is_some_and(|p| classify(p) == Kind::Nzb)
+        })
+        .filter(|f| (1..=super::nzb::MAX_NZB_PARTS).contains(&parts(f)) && f.parts_seen >= parts(f))
+        .collect();
+    found.sort_by_key(|f| (parts(f), f.filename.clone()));
+    found.truncate(2);
+    found
+}
+
+/// NFOs to read: at most 2, fewest parts first.
+pub fn nfo_sources(files: &[FileInfo]) -> Vec<&FileInfo> {
+    nfo_sources_with_par2(files, &std::collections::HashMap::new())
+}
+
+/// Like [`nfo_sources`], also matching files whose PAR2-verified name is `.nfo` or `.txt`.
+pub fn nfo_sources_with_par2<'a>(
+    files: &'a [FileInfo],
+    par2_names: &std::collections::HashMap<String, String>,
+) -> Vec<&'a FileInfo> {
+    let mut found: Vec<&FileInfo> = files
+        .iter()
+        .filter(|f| {
+            classify(&f.filename) == Kind::Nfo
+                || f.subject.as_deref().is_some_and(nfo::is_nfo)
+                || par2_names.get(&f.filename).is_some_and(|p| classify(p) == Kind::Nfo)
+        })
+        .collect();
+    found.sort_by_key(|f| (parts(f), f.filename.clone()));
+    found.truncate(2);
+    found
+}
+
+/// Storage-pure initial case/name matching, shared by native reads.
+pub(crate) fn prepare_par2_names<'a>(out:&mut std::collections::HashMap<String,String>,files:&'a [FileInfo],rows:Vec<(String,u64)>)->(Vec<&'a FileInfo>,Vec<(String,u64)>) {
+    let is_par2 = |name: &str| matches!(classify(name), Kind::Par2Base | Kind::Par2Vol(_));
+    let mut unmatched_par2: Vec<(String, u64)> =
+        rows.into_iter().filter(|(name, _)| !is_par2(name)).collect();
+
+    let mut unmatched_files: Vec<&FileInfo> = files
+        .iter()
+        .filter(|f| !is_par2(&f.filename) && !out.contains_key(&f.filename))
+        .collect();
+    unmatched_files.retain(|f| {
+        if let Some(pos) = unmatched_par2.iter().position(|(name, _)| name.eq_ignore_ascii_case(&f.filename)) {
+            let (par2_name, _) = unmatched_par2.remove(pos);
+            if f.filename != par2_name {
+                out.insert(f.filename.clone(), par2_name);
+            }
+            false
+        } else {
+            true
+        }
+    });
+
+    (unmatched_files,unmatched_par2)
+}
+
+/// Storage-pure iterative wire-size matcher, unchanged from the legacy path.
+pub(crate) fn finish_par2_names(mut out:std::collections::HashMap<String,String>,mut unmatched_files:Vec<&FileInfo>,mut unmatched_par2:Vec<(String,u64)>,wire_sizes:&std::collections::HashMap<i64,u64>)->std::collections::HashMap<String,String> {
     let wire_of = |f: &FileInfo| wire_sizes.get(&f.id).copied().unwrap_or(0);
     loop {
         let mut progressed = false;
@@ -383,51 +438,4 @@ pub fn par2_name_map(
         }
     }
     out
-}
-
-/// Posted NZBs to read: at most 2, fewest parts first, and only one whose every article is indexed and few enough
-/// to take whole.
-pub fn nzb_sources(files: &[FileInfo]) -> Vec<&FileInfo> {
-    nzb_sources_with_par2(files, &std::collections::HashMap::new())
-}
-
-/// Like [`nzb_sources`], also matching files whose PAR2-verified name ends in `.nzb`.
-pub fn nzb_sources_with_par2<'a>(
-    files: &'a [FileInfo],
-    par2_names: &std::collections::HashMap<String, String>,
-) -> Vec<&'a FileInfo> {
-    let mut found: Vec<&FileInfo> = files
-        .iter()
-        .filter(|f| {
-            classify(&f.filename) == Kind::Nzb
-                || par2_names.get(&f.filename).is_some_and(|p| classify(p) == Kind::Nzb)
-        })
-        .filter(|f| (1..=super::nzb::MAX_NZB_PARTS).contains(&parts(f)) && f.parts_seen >= parts(f))
-        .collect();
-    found.sort_by_key(|f| (parts(f), f.filename.clone()));
-    found.truncate(2);
-    found
-}
-
-/// NFOs to read: at most 2, fewest parts first.
-pub fn nfo_sources(files: &[FileInfo]) -> Vec<&FileInfo> {
-    nfo_sources_with_par2(files, &std::collections::HashMap::new())
-}
-
-/// Like [`nfo_sources`], also matching files whose PAR2-verified name is `.nfo` or `.txt`.
-pub fn nfo_sources_with_par2<'a>(
-    files: &'a [FileInfo],
-    par2_names: &std::collections::HashMap<String, String>,
-) -> Vec<&'a FileInfo> {
-    let mut found: Vec<&FileInfo> = files
-        .iter()
-        .filter(|f| {
-            classify(&f.filename) == Kind::Nfo
-                || f.subject.as_deref().is_some_and(nfo::is_nfo)
-                || par2_names.get(&f.filename).is_some_and(|p| classify(p) == Kind::Nfo)
-        })
-        .collect();
-    found.sort_by_key(|f| (parts(f), f.filename.clone()));
-    found.truncate(2);
-    found
 }

@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::Read;
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -16,6 +16,10 @@ use crate::nzb::{build_nzb_checked, build_nzb_file_checked, nzb_filename};
 use crate::search::{all_releases, get_release, newest_in_categories, search_all_releases, search_in_categories};
 use crate::ui;
 pub(crate) mod fresh;
+
+#[cfg(test)]
+#[path = "api/native_pg_readers.rs"]
+mod native_pg_readers;
 
 const WORKERS: usize = 4;
 /// Reads several GB when little is cached, which on a machine short of memory is every pass, soo not often.
@@ -54,7 +58,7 @@ pub struct ApiResponse {
 }
 
 impl ApiResponse {
-    fn xml(status: u16, body: String) -> Self {
+    pub(crate) fn xml(status: u16, body: String) -> Self {
         ApiResponse { status, content_type: Some(XML), body, headers: Vec::new(), bytes: None, spool: None, disposition: None, failed: false }
     }
 
@@ -91,6 +95,9 @@ struct Running {
 }
 
 static RUNNING: Mutex<Option<Running>> = Mutex::new(None);
+// A legacy keeper/warming thread can outlive an API restart. Changing backend
+// or destination requires a fresh process, never reusing those initializers.
+static PROCESS_STORAGE:OnceLock<crate::pg::StorageConfig>=OnceLock::new();
 
 pub fn escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
@@ -139,18 +146,23 @@ pub fn handle(path: &str, query: &str, base: &str, api_key: &str) -> ApiResponse
         return ApiResponse::not_found();
     }
 
-    let args = parse_query(query);
-    let t = args.get("t").map(String::as_str);
-
     let storage = match crate::config::checked_storage_config() {
         Ok(storage) => storage,
         Err(_) => return fresh::unavailable(),
     };
+    handle_with_storage(path,query,base,api_key,&storage)
+}
+
+fn handle_with_storage(path:&str,query:&str,base:&str,api_key:&str,storage:&crate::pg::StorageConfig)->ApiResponse {
+    if path!="/api" {return ApiResponse::not_found();}
+    let args = parse_query(query);
+    let t = args.get("t").map(String::as_str);
+
     if storage.is_postgres() {
         if t != Some("caps") && args.get("apikey").map(String::as_str) != Some(api_key) {
             return ApiResponse::xml(401, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<error code=\"100\" description=\"Invalid API Key\"/>".into());
         }
-        return fresh::handle(&storage, &args, base, api_key);
+        return fresh::handle(storage, &args, base, api_key);
     }
 
     if t == Some("caps") {
@@ -608,6 +620,39 @@ fn rss(
     rss_listed(base, api_key, offset, listed, passwords, categories, media, on)
 }
 
+
+struct RssItemFacts<'a> {
+    size:i64,complete:bool,repair:bool,category:i64,password:Option<&'a crate::archive::Password>,
+    media:Option<&'a crate::media::query::MediaAttrs>,copies:Option<&'a crate::duplicates::CopyCount>,spot:Option<&'a crate::spotnet::store::Tagged>,
+}
+/// Presentation only: no storage/provider or relationship resolution here.
+fn rss_item(base:&str,api_key:&str,r:&crate::search::ReleaseRow,on:&crate::media::query::IdParams,facts:RssItemFacts<'_>)->String {
+    let size=facts.size;
+    let nzb_url = format!("{base}/api?t=get&id={}&apikey={api_key}", r.id);
+    // listed only with `incomplete=1` (`wants_incomplete`): said soo, not passed off as whole
+    // and one whole once repaired from its PAR2 volumes says that: a client that won't repair can skip it
+    let incomplete = if !facts.complete {
+        "<newznab:attr name=\"complete\" value=\"0\"/>"
+    } else if facts.repair {
+        "<newznab:attr name=\"repair\" value=\"1\"/>"
+    } else {
+        ""
+    };
+    let password = facts.password
+        .map_or(String::new(), |p| format!("<newznab:attr name=\"password\" value=\"{}\"/>", p.code()));
+    let category = facts.category;
+    let attrs = facts.media.map_or(String::new(), |a| a.xml(on));
+    let attrs = format!("{attrs}{}{incomplete}", release_attrs(r, facts.copies, facts.spot));
+    format!(
+        "    <item>      <title>{}</title>      <guid isPermaLink=\"false\">{}</guid>      <link>{}</link>      <size>{size}</size>      <pubDate>{}</pubDate>      <enclosure url=\"{}\" type=\"application/x-nzb\" length=\"{size}\"/>      <newznab:attr name=\"category\" value=\"{category}\"/><newznab:attr name=\"size\" value=\"{size}\"/>{attrs}{password}    </item>",
+        escape(&r.name),
+        r.id,
+        escape(&nzb_url),
+        pub_date(r.posted_date.as_deref().unwrap_or("")),
+        escape(&nzb_url),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn rss_listed(
     base: &str,
@@ -636,31 +681,9 @@ fn rss_listed(
         .zip(keep)
         .filter(|(_, keep)| *keep)
         .map(|((((r, whole), complete), repair), _)| {
-            let nzb_url = format!("{base}/api?t=get&id={}&apikey={api_key}", r.id);
-            // listed only with `incomplete=1` (`wants_incomplete`): said soo, not passed off as whole
-            // and one whole once repaired from its PAR2 volumes says that: a client that won't repair can skip it
-            let incomplete = if !complete {
-                "<newznab:attr name=\"complete\" value=\"0\"/>"
-            } else if repair {
-                "<newznab:attr name=\"repair\" value=\"1\"/>"
-            } else {
-                ""
-            };
-            let size = whole.map_or(r.size.unwrap_or(0), |post| post.size);
-            let password = passwords
-                .get(&r.id)
-                .map_or(String::new(), |p| format!("<newznab:attr name=\"password\" value=\"{}\"/>", p.code()));
-            let category = categories.get(&r.id).copied().unwrap_or(crate::category::UNCATEGORIZED);
-            let attrs = media.get(&r.id).map_or(String::new(), |a| a.xml(on));
-            let attrs = format!("{attrs}{}{incomplete}", release_attrs(r, copies.get(&r.id), spots.get(&r.id)));
-            format!(
-                "    <item>      <title>{}</title>      <guid isPermaLink=\"false\">{}</guid>      <link>{}</link>      <size>{size}</size>      <pubDate>{}</pubDate>      <enclosure url=\"{}\" type=\"application/x-nzb\" length=\"{size}\"/>      <newznab:attr name=\"category\" value=\"{category}\"/><newznab:attr name=\"size\" value=\"{size}\"/>{attrs}{password}    </item>",
-                escape(&r.name),
-                r.id,
-                escape(&nzb_url),
-                pub_date(r.posted_date.as_deref().unwrap_or("")),
-                escape(&nzb_url),
-            )
+            rss_item(base,api_key,r,on,RssItemFacts {size:whole.map_or(r.size.unwrap_or(0),|post|post.size),complete,repair,
+                category:categories.get(&r.id).copied().unwrap_or(crate::category::UNCATEGORIZED),password:passwords.get(&r.id),
+                media:media.get(&r.id),copies:copies.get(&r.id),spot:spots.get(&r.id)})
         })
         .collect();
 
@@ -801,7 +824,23 @@ fn endpoint_of(path: &str, query: &str) -> Endpoint {
 /// turned away whole, never read in part.
 const MAX_FORM_BODY: u64 = 8192;
 
-fn respond(mut request: Request, api_key: &str, fallback_host: &str) {
+fn read_form(request:&mut Request)->Result<String,u16> {
+    let declared=request.body_length();
+    if declared.is_some_and(|length|length as u64>MAX_FORM_BODY) {return Err(413);}
+    let mut body=Vec::with_capacity(MAX_FORM_BODY as usize+1);
+    let read=request.as_reader().take(MAX_FORM_BODY+1).read_to_end(&mut body);
+    if body.len() as u64>MAX_FORM_BODY {return Err(413);}
+    if read.is_err() {
+        return Err(if request.control().is_some_and(|control|control.body_limit_exceeded()){413}else{400});
+    }
+    if declared.is_some_and(|length|length!=body.len()) {return Err(400);}
+    String::from_utf8(body).map_err(|_|400)
+}
+
+fn respond(request:Request,api_key:&str,fallback_host:&str,storage:&crate::pg::StorageConfig) {
+    respond_with_assets(request,api_key,fallback_host,storage,None)
+}
+fn respond_with_assets(mut request:Request,api_key:&str,fallback_host:&str,storage:&crate::pg::StorageConfig,assets:Option<&crate::pg::fresh_assets::AssetManifest>) {
     let url = request.url().to_string();
     let (path, query) = url.split_once('?').unwrap_or((&url, ""));
 
@@ -818,22 +857,22 @@ fn respond(mut request: Request, api_key: &str, fallback_host: &str) {
     let is_get = matches!(request.method(), tiny_http::Method::Get | tiny_http::Method::Head);
     let endpoint = endpoint_of(path, query);
     let span = crate::metrics::span(endpoint.function);
-    let resp = if is_get {
-        crate::web::get(path, query, cookies.as_deref(), &base, api_key)
-            .unwrap_or_else(|| handle(path, query, &base, api_key))
+    let resp = if crate::config::checked_storage_config().as_ref().ok()!=Some(storage) {
+        fresh::unavailable()
+    } else if is_get {
+        crate::web::get_with_storage_and_assets(path, query, cookies.as_deref(), &base, api_key, storage,assets)
+            .unwrap_or_else(|| handle_with_storage(path, query, &base, api_key, storage))
     } else if *request.method() == tiny_http::Method::Post && crate::web::takes_post(path) {
-        let mut body = String::new();
-        let _ = request.as_reader().take(MAX_FORM_BODY + 1).read_to_string(&mut body);
-        let too_long = body.len() as u64 > MAX_FORM_BODY;
+        let form=read_form(&mut request);
         let htmx = request.headers().iter().any(|h| h.field.equiv("HX-Request"));
         let csrf = request
             .headers()
             .iter()
             .find(|h| h.field.equiv(crate::web_settings::CSRF_HEADER))
             .map(|h| h.value.as_str().to_string());
-        if too_long {
+        if let Err(status)=form {
             ApiResponse {
-                status: 413,
+                status,
                 content_type: None,
                 body: String::new(),
                 headers: Vec::new(),
@@ -843,7 +882,7 @@ fn respond(mut request: Request, api_key: &str, fallback_host: &str) {
                 failed: false,
             }
         } else {
-            crate::web::post(path, &body, cookies.as_deref(), htmx, csrf.as_deref(), &base, api_key)
+            crate::web::post_with_storage(path, &form.unwrap(), cookies.as_deref(), htmx, csrf.as_deref(), &base, api_key, storage)
                 .unwrap_or_else(ApiResponse::not_found)
         }
     } else {
@@ -894,11 +933,29 @@ fn respond(mut request: Request, api_key: &str, fallback_host: &str) {
 
 /// Start the api on a few worker threads. Returns false when it couldnt bind.
 pub fn start(config: &mut Config) -> bool {
-    // Activation remains closed while the full fresh native UI/cache/runtime
-    // qualification is incomplete. Do this before binding or legacy warmers.
-    if match crate::config::checked_storage_config() { Ok(storage) => storage.is_postgres(), Err(_) => true } {
-        ui::print("[yellow]native Web UI is awaiting full reader and runtime qualification[/yellow]");
-        return false;
+    let storage=match crate::config::checked_storage_config() {
+        Ok(storage)=>storage,Err(_)=>{ui::print("[yellow]storage configuration unavailable; API not started[/yellow]");return false;}
+    };
+    start_for_storage(config,&storage)
+}
+
+/// The native bootstrap supplies its already selected backend. A changed
+/// configuration refuses startup rather than choosing another storage engine.
+pub(crate) fn start_for_storage(config:&mut Config,storage:&crate::pg::StorageConfig)->bool {
+    start_for_storage_with_assets(config,storage,None)
+}
+/// The bootstrap may supply a real root/manifest-checked retained-asset reader.
+/// Its presence never bypasses native listener/runtime qualification.
+pub(crate) fn start_for_storage_with_assets(config:&mut Config,storage:&crate::pg::StorageConfig,assets:Option<Arc<crate::pg::fresh_assets::AssetManifest>>)->bool {
+    if crate::config::checked_storage_config().as_ref().ok()!=Some(storage) {
+        ui::print("[yellow]storage configuration changed; API not started[/yellow]");return false;
+    }
+    if PROCESS_STORAGE.get().is_some_and(|bound|bound!=storage) {
+        ui::print("[yellow]storage backend or destination changed; restart Atlas before starting the API[/yellow]");return false;
+    }
+    // Activation remains closed before binding or any legacy initializer.
+    if storage.is_postgres() {
+        ui::print("[yellow]native Web UI is awaiting full reader and runtime qualification[/yellow]");return false;
     }
     let (api_key, created) = get_api_key(config);
 
@@ -911,7 +968,12 @@ pub fn start(config: &mut Config) -> bool {
     let bind_host = if host.contains(':') && !host.starts_with('[') { format!("[{host}]") } else { host.clone() };
     let addr = format!("{bind_host}:{port}");
 
-    let server = match Server::http(&addr) {
+    let listener=if storage.is_postgres() {
+        Server::http_bounded(&addr,tiny_http::RequestLimits {max_connections:WORKERS*2,
+            read_idle:Duration::from_secs(5),write_idle:Duration::from_secs(10),request_timeout:Duration::from_secs(30),
+            max_header_bytes:65536,max_header_count:128,max_request_line_bytes:65536,max_body_wire_bytes:65536})
+    }else{Server::http(&addr)};
+    let server = match listener {
         Ok(s) => Arc::new(s),
         Err(_) => {
             ui::print(&format!("[red]port {port} is already in use, api not started[/red]"));
@@ -920,6 +982,10 @@ pub fn start(config: &mut Config) -> bool {
         }
     };
 
+    if PROCESS_STORAGE.get_or_init(||storage.clone())!=storage {
+        ui::print("[yellow]storage backend or destination changed; API not started[/yellow]");return false;
+    }
+
     ui::print(&format!("[dim]newznab api on http://{addr} — apikey required for search/get[/dim]"));
 
     let workers = (0..WORKERS)
@@ -927,17 +993,21 @@ pub fn start(config: &mut Config) -> bool {
             let server = server.clone();
             let key = api_key.clone();
             let fallback = addr.clone();
+            let storage=storage.clone();
+            let assets=assets.clone();
             thread::spawn(move || {
                 for request in server.incoming_requests() {
-                    respond(request, &key, &fallback);
+                    respond_with_assets(request, &key, &fallback, &storage,assets.as_deref());
                 }
             })
         })
         .collect();
 
     *RUNNING.lock().unwrap() = Some(Running { server, workers });
-    crate::word_index::start(crate::paths::database());
-    start_warming();
+    if !storage.is_postgres() {
+        crate::word_index::start(crate::paths::database());
+        start_warming();
+    }
     true
 }
 
@@ -1341,4 +1411,138 @@ mod tests {
         assert!(items[0].contains(r#"<newznab:attr name="repair" value="1"/>"#), "{}", items[0]);
         assert!(!items[1].contains(r#"name="repair""#), "{}", items[1]);
     }
+}
+
+#[cfg(test)]
+mod native_form_body_tests {
+    use super::*;
+    use std::{io::{Read,Write},net::{TcpStream,Shutdown},thread};
+    fn exchange(length:usize,body:&[u8],half_close:bool)->Option<u16> {
+        let server=Server::http_bounded("127.0.0.1:0",tiny_http::RequestLimits {max_connections:2,
+            read_idle:Duration::from_millis(150),write_idle:Duration::from_secs(1),request_timeout:Duration::from_secs(2),
+            max_header_bytes:4096,max_header_count:32,max_request_line_bytes:4096,max_body_wire_bytes:16384}).unwrap();
+        let address=server.server_addr().to_ip().unwrap();
+        let worker=thread::spawn(move||{
+            let mut request=server.recv_timeout(Duration::from_secs(2)).unwrap().expect("owned POST request");
+            let status=match read_form(&mut request){Ok(_)=>200,Err(status)=>status};
+            let response=Response::empty(status).with_header(Header::from_bytes("Connection","close").unwrap());
+            let _=request.respond(response);
+        });
+        let mut client=TcpStream::connect(address).unwrap();client.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        write!(client,"POST /login HTTP/1.1\r\nHost: fixture.invalid\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n").unwrap();
+        client.write_all(body).unwrap();client.flush().unwrap();if half_close{client.shutdown(Shutdown::Write).unwrap();}
+        let mut response=String::new();client.take(16384).read_to_string(&mut response).unwrap();worker.join().unwrap();
+        response.split_whitespace().nth(1).map(|status|status.parse().unwrap())
+    }
+    #[test]
+    fn truncated_declared_form_cannot_publish_a_valid_login_prefix(){assert_eq!(exchange(2048,b"key=valid",true),Some(400));}
+    #[test]
+    fn quiet_incomplete_form_expires_without_accepting_its_login_prefix(){assert!(matches!(exchange(2048,b"key=valid",false),None|Some(400)));}
+    #[test]
+    fn invalid_utf8_form_is_rejected_as_a_whole(){assert_eq!(exchange(2,&[b'x',0xff],true),Some(400));}
+    #[test]
+    fn complete_small_form_remains_accepted(){assert_eq!(exchange(9,b"key=valid",true),Some(200));}
+    #[test]
+    fn complete_streamed_form_keeps_the_declared_body() {
+        let mut body=b"key=valid&padding=".to_vec();body.resize(2048,b'x');
+        assert_eq!(exchange(body.len(),&body,true),Some(200));
+    }
+    #[test]
+    fn complete_form_at_the_byte_limit_remains_accepted() {
+        let mut body=b"key=valid&padding=".to_vec();body.resize(8192,b'x');
+        assert_eq!(exchange(body.len(),&body,true),Some(200));
+    }
+    #[test]
+    fn declared_oversize_form_is_rejected_without_accepting_a_partial_body() {
+        assert_eq!(exchange(8193,b"",true),Some(413));
+    }
+    #[test]
+    fn invalid_utf8_after_a_valid_key_never_becomes_a_login_prefix() {
+        let body=b"key=valid&note=\xff";
+        assert_eq!(exchange(body.len(),body,true),Some(400));
+    }
+    #[test]
+    fn rejected_complete_form_keeps_the_next_pipelined_body_distinct() {
+        let server=Server::http_bounded("127.0.0.1:0",tiny_http::RequestLimits {max_connections:2,
+            read_idle:Duration::from_millis(150),write_idle:Duration::from_secs(1),request_timeout:Duration::from_secs(2),
+            max_header_bytes:4096,max_header_count:32,max_request_line_bytes:4096,max_body_wire_bytes:16384}).unwrap();
+        let address=server.server_addr().to_ip().unwrap();
+        let worker=thread::spawn(move|| {
+            let mut accepted=Vec::new();
+            for _ in 0..2 {
+                let mut request=server.recv_timeout(Duration::from_secs(2)).unwrap().expect("owned pipelined POST");
+                let (status,body)=match read_form(&mut request) {Ok(body)=>(200,Some(body)),Err(status)=>(status,None)};
+                accepted.push(body);request.respond(Response::empty(status)).unwrap();
+            }
+            accepted
+        });
+        let mut client=TcpStream::connect(address).unwrap();client.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        client.write_all(b"POST /login HTTP/1.1\r\nHost: fixture.invalid\r\nContent-Length: 2\r\n\r\nx\xffPOST /login HTTP/1.1\r\nHost: fixture.invalid\r\nContent-Length: 9\r\nConnection: close\r\n\r\nkey=valid").unwrap();client.flush().unwrap();
+        let mut response=String::new();client.take(16384).read_to_string(&mut response).unwrap();
+        let statuses=response.lines().filter_map(|line|line.strip_prefix("HTTP/1.1 ").and_then(|rest|rest.split_whitespace().next())).collect::<Vec<_>>();
+        assert_eq!(statuses,["400","200"],"{response}");
+        assert_eq!(worker.join().unwrap(),[None,Some("key=valid".into())],"invalid bytes never become accepted form data or consume a following request");
+    }
+    #[test]
+    fn truncated_stream_flushes_rejection_then_closes_instead_of_reusing_its_remainder() {
+        let server=Server::http_bounded("127.0.0.1:0",tiny_http::RequestLimits {max_connections:2,
+            read_idle:Duration::from_millis(150),write_idle:Duration::from_secs(1),request_timeout:Duration::from_secs(2),
+            max_header_bytes:4096,max_header_count:32,max_request_line_bytes:4096,max_body_wire_bytes:16384}).unwrap();
+        let address=server.server_addr().to_ip().unwrap();
+        let worker=thread::spawn(move|| {
+            let mut request=server.recv_timeout(Duration::from_secs(2)).unwrap().expect("owned truncated POST");
+            let status=match read_form(&mut request){Ok(_)=>200,Err(status)=>status};
+            // No explicit response Connection header: the bounded transport
+            // must force close for the incomplete request on its own.
+            request.respond(Response::empty(status)).unwrap();
+            assert!(server.recv_timeout(Duration::from_millis(200)).unwrap().is_none(),"a remainder cannot become a new request");
+        });
+        let mut client=TcpStream::connect(address).unwrap();client.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        client.write_all(b"POST /login HTTP/1.1\r\nHost: fixture.invalid\r\nContent-Length: 2048\r\n\r\nkey=validGET /unexpected HTTP/1.1\r\nHost: fixture.invalid\r\n\r\n").unwrap();
+        client.flush().unwrap();client.shutdown(Shutdown::Write).unwrap();
+        let mut response=String::new();client.take(16384).read_to_string(&mut response).unwrap();worker.join().unwrap();
+        assert_eq!(response.split_whitespace().nth(1),Some("400"),"{response}");
+        assert!(response.to_ascii_lowercase().contains("connection: close"),"{response}");
+        assert_eq!(response.lines().filter(|line|line.starts_with("HTTP/1.1 ")).count(),1,"{response}");
+    }
+
+    fn chunked_exchange(wire:&[u8])->(Option<u16>,Option<String>) {
+        let server=Server::http_bounded("127.0.0.1:0",tiny_http::RequestLimits {max_connections:2,
+            read_idle:Duration::from_millis(150),write_idle:Duration::from_secs(1),request_timeout:Duration::from_secs(2),
+            max_header_bytes:4096,max_header_count:32,max_request_line_bytes:4096,max_body_wire_bytes:16384}).unwrap();
+        let address=server.server_addr().to_ip().unwrap();
+        let worker=thread::spawn(move|| {
+            let mut request=server.recv_timeout(Duration::from_secs(2)).unwrap().expect("owned chunked POST");
+            let (status,body)=match read_form(&mut request) {Ok(body)=>(200,Some(body)),Err(status)=>(status,None)};
+            request.respond(Response::empty(status).with_header(Header::from_bytes("Connection","close").unwrap())).unwrap();body
+        });
+        let mut client=TcpStream::connect(address).unwrap();client.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        client.write_all(b"POST /login HTTP/1.1\r\nHost: fixture.invalid\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").unwrap();
+        client.write_all(wire).unwrap();client.flush().unwrap();client.shutdown(Shutdown::Write).unwrap();
+        let mut response=String::new();client.take(16384).read_to_string(&mut response).unwrap();
+        (response.split_whitespace().nth(1).map(|status|status.parse().unwrap()),worker.join().unwrap())
+    }
+    #[test]
+    fn chunked_form_requires_the_complete_chunk_and_terminal_chunk() {
+        for wire in [b"1000\r\nkey=valid".as_slice(),b"9\r\nkey=valid\r\n".as_slice(),b"9\r\nkey=vali".as_slice()] {
+            assert_eq!(chunked_exchange(wire),(Some(400),None),"unfinished framing cannot publish a valid prefix");
+        }
+        assert_eq!(chunked_exchange(b"9\r\nkey=valid\r\n0\r\n\r\n"),(Some(200),Some("key=valid".into())));
+    }
+    #[test]
+    fn complete_chunked_invalid_utf8_cannot_publish_a_login_prefix() {
+        let body=b"key=valid&note=\xff";
+        let wire=[format!("{:x}\r\n",body.len()).into_bytes(),body.to_vec(),b"\r\n0\r\n\r\n".to_vec()].concat();
+        assert_eq!(chunked_exchange(&wire),(Some(400),None));
+    }
+
+    #[test]
+    fn chunked_delimiter_eof_flushes_a_rejection_without_accepting_the_form_prefix() {
+        for wire in [b"9\r\nkey=valid".as_slice(),b"9\r\nkey=valid\r".as_slice(),
+            b"9\r\nkey=valid\r\n0\r".as_slice(),b"9\r\nkey=valid\r\n0\r\n".as_slice(),
+            b"9\r\nkey=valid\r\n0\r\n\r".as_slice()] {
+            assert_eq!(chunked_exchange(wire),(Some(400),None),"delimiter EOF must reject the whole form and flush before closing");
+        }
+    }
+
 }

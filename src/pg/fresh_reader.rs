@@ -42,6 +42,7 @@ impl<'client> ReadView<'client> {
         super::stage::CatalogIdentity::read_in(&mut *self.tx.borrow_mut())?.word_index_root(configured)
     }
 
+    pub(super) fn remaining_owned(&self)->u64 {self.budget.bytes-self.owned.get()}
     pub(super) fn admit_owned(&self,bytes:u64)->Result<()> {
         let total=self.owned.get().checked_add(bytes).context("native request allocation admission overflow")?;
         ensure!(total<=self.budget.bytes,"native request owned data exceeds byte admission");self.owned.set(total);Ok(())

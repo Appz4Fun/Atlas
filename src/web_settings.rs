@@ -541,8 +541,13 @@ fn groups_section(cfg: &Config, managed: &Managed, token: &str) -> String {
 pub(crate) fn group_search(args: &HashMap<String, String>, api_key: &str) -> String {
     let query = args.get("q").map_or("", String::as_str);
     let cfg = current();
+    group_results(crate::groups_menu::search_groups(&cfg, query),api_key)
+}
+
+/// Render the existing group picker from an already selected data source.
+pub(crate) fn group_results(result:Result<Vec<String>,String>,api_key:&str)->String {
     let token = csrf_token(api_key);
-    match crate::groups_menu::search_groups(&cfg, query) {
+    match result {
         Ok(groups) if groups.is_empty() => "<p class=\"hint\">No matching groups found.</p>".into(),
         Ok(groups) => groups.into_iter().map(|group| format!(r#"<div class="search-result"><code>{}</code><form method="post" action="/ui/settings/groups"><input type="hidden" name="_csrf" value="{}"><input type="hidden" name="group" value="{}"><button class="button" name="do" value="add">Add</button></form></div>"#, escape(&group), attr(&token), attr(&group))).collect(),
         Err(message) => format!("<p class=\"hint\">{}</p>", escape(&message)),

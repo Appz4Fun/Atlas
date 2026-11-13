@@ -114,12 +114,19 @@ impl Owner {
         *self.busy_since.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::time::Instant::now());
         let result = match held.as_mut() {
             Some(client) if !client.is_closed() => self.epoch.as_ref().map_or(Ok(()),|epoch|epoch.verify(client))
-                .and_then(|()|work(client)),
+                .and_then(|()|{
+                    if !self.accepting.load(Ordering::Acquire) || self.stop.load(Ordering::Acquire) {
+                        Err(AttemptEnded.into())
+                    } else {work(client)}
+                }),
             _ => Err(SessionUnavailable.into()),
         };
         *self.busy_since.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         if let Err(error) = &result {
-            self.fail(classify(error));
+            // A bounded read can observe the operator's stop between pages.
+            // It did no new work; preserve any independently recorded failure.
+            let canceled=super::outage::is_attempt_ended(error) && self.stop.load(Ordering::Acquire);
+            if !canceled || self.failure().is_some() {self.fail(classify(error));}
         }
         result
     }
@@ -154,6 +161,35 @@ impl Owner {
         self.stop.store(true, Ordering::Release);
         let mut held = self.client.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         drop(held.take());
+    }
+
+    /// Closed intentional-stop accounting, after actual worker joins and before
+    /// close. This is not a stop-tolerant callback API or replacement session.
+    pub(crate) fn finalize_native_stop(&self,joined:&crate::postprocess::native::JoinedWorkers,now:i64)->Result<Vec<super::stage_queue::StopDisposition>> {
+        use super::stage_queue::StopAuthorityError;
+        if !joined.for_owner(self) || !self.stop.load(Ordering::Acquire) || tokio::runtime::Handle::try_current().is_ok() {
+            return Err(StopAuthorityError.into())
+        }
+        let recorded=||match self.failure() {
+            None=>Ok(()),Some(Failure::Unavailable)=>Err(anyhow::Error::new(SessionUnavailable)),
+            Some(Failure::Fatal)=>Err(anyhow::anyhow!("native stop finalization has a recorded fatal failure")),
+        };
+        recorded()?;
+        let mut held=self.client.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        recorded()?;
+        let client=held.as_mut().ok_or_else(||anyhow::Error::new(super::outage::AttemptEnded))?;
+        let epoch=self.epoch.as_ref().ok_or_else(||anyhow::Error::new(StopAuthorityError))?;
+        *self.busy_since.lock().unwrap_or_else(std::sync::PoisonError::into_inner)=Some(std::time::Instant::now());
+        let result=(|| {
+            epoch.verify(client)?;
+            let mut tx=client.transaction()?;super::history_gate::native(&mut tx)?;epoch.verify(&mut tx)?;
+            let mut report=Vec::new();
+            for claim in joined.pending() {report.push(super::stage_queue::finalize_stop_in(&mut tx,epoch,claim,now)?);}
+            epoch.verify(&mut tx)?;recorded()?;tx.commit()?;Ok(report)
+        })();
+        *self.busy_since.lock().unwrap_or_else(std::sync::PoisonError::into_inner)=None;
+        if let Err(error)=&result {self.fail(classify(error));}
+        result
     }
 }
 
@@ -273,6 +309,22 @@ fn owner_connection_config(storage: &super::StorageConfig) -> Result<postgres::C
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn cooperative_attempt_end_during_operator_stop_does_not_invent_storage_failure() {
+        let Some(schema)=super::super::testing::Schema::new() else {return};
+        let owner=Owner::new(postgres::Client::connect(&schema.url,postgres::NoTls).unwrap());
+        let result:Result<()>=owner.with(|_|{
+            owner.stop.store(true,Ordering::Release);
+            Err(AttemptEnded.into())
+        });
+        assert!(super::super::outage::is_attempt_ended(&result.unwrap_err()));
+        assert_eq!(owner.failure(),None);
+        owner.fail(Failure::Fatal);
+        let result:Result<()>=owner.with(|_|panic!("canceled owner callback executed"));
+        assert!(result.is_err());assert_eq!(owner.failure(),Some(Failure::Fatal));
+        owner.close();
+    }
 
     #[test]
     fn close_waits_for_current_work_and_rejects_queued_stale_callbacks() {

@@ -12,6 +12,8 @@
 //!   re-querying OpenSubtitles or re-downloading probed Usenet article bodies, video stills or audio windows.
 
 pub(crate) mod nfo_key;
+mod native_costly;
+pub use native_costly::*;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -817,7 +819,7 @@ fn first_segment_mid_in(
     Ok(best.map(|(_, mid)| mid).unwrap_or_default())
 }
 
-fn hash_file_fields_into(hasher: &mut Sha256, filename: &str, first_mid: &str, expected: Option<i64>, seen: &[u8]) {
+pub(crate) fn hash_file_fields_into(hasher: &mut Sha256, filename: &str, first_mid: &str, expected: Option<i64>, seen: &[u8]) {
     hasher.update((filename.len() as u64).to_le_bytes());
     hasher.update(filename.as_bytes());
     hasher.update((first_mid.len() as u64).to_le_bytes());
@@ -856,18 +858,27 @@ fn hash_file_row_into(
 /// and seen-parts bitmap (folded identically from `articles` in legacy pre-sharding databases).
 /// Returns `None` if the release has no indexed files or articles.
 pub fn release_content_id_in(conn: &Connection, schema: &str, release_id: i64) -> Option<Vec<u8>> {
-    if has_table(conn, schema, "files").unwrap_or(false) {
+    release_content_id_in_checked(conn, schema, release_id).ok().flatten()
+}
+
+/// Checked cache-preservation variant. SQLite lookup, schema, row decoding and
+/// first-segment failures remain errors; only genuine absence is `Ok(None)`.
+/// It does not install a thread-local raw-store path or mutate the source.
+pub(crate) fn release_content_id_in_checked(
+    conn: &Connection, schema: &str, release_id: i64,
+) -> rusqlite::Result<Option<Vec<u8>>> {
+    if has_table(conn, schema, "files")? {
         type FileRow = (i64, String, Option<String>, Option<i64>, Vec<u8>, Option<Vec<u8>>);
         let sql = format!(
             "SELECT id, filename, subject_mid, expected, seen, blob
              FROM {schema}.files WHERE release_id = ?1 ORDER BY filename, id"
         );
-        let mut stmt = conn.prepare_cached(&sql).ok()?;
+        let mut stmt = conn.prepare_cached(&sql)?;
         let rows: Vec<FileRow> = stmt
             .query_map([release_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
-            .ok()?
+            ?
             .collect::<rusqlite::Result<Vec<_>>>()
-            .ok()?;
+            ?;
         if !rows.is_empty() {
             let mut hasher = Sha256::new();
             for (file_id, filename, subject_mid, expected, seen, blob) in &rows {
@@ -882,27 +893,27 @@ pub fn release_content_id_in(conn: &Connection, schema: &str, release_id: i64) -
                     seen,
                     blob.as_deref(),
                 )
-                .ok()?;
+                ?;
             }
-            return Some(hasher.finalize().to_vec());
+            return Ok(Some(hasher.finalize().to_vec()));
         }
     }
-    if has_table(conn, schema, "articles").unwrap_or(false) {
+    if has_table(conn, schema, "articles")? {
         let sql = format!(
             "SELECT coalesce(filename, ''), coalesce(message_id, ''), part, total_parts
              FROM {schema}.articles WHERE release_id = ?1"
         );
-        let mut stmt = conn.prepare_cached(&sql).ok()?;
-        let mut rows = stmt.query([release_id]).ok()?;
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let mut rows = stmt.query([release_id])?;
         let mut files: BTreeMap<String, crate::store::FileState> = BTreeMap::new();
-        while let Some(r) = rows.next().ok()? {
-            let filename: String = r.get(0).ok()?;
-            let mid: String = r.get(1).ok()?;
+        while let Some(r) = rows.next()? {
+            let filename: String = r.get(0)?;
+            let mid: String = r.get(1)?;
             if mid.is_empty() {
                 continue;
             }
-            let part: Option<i64> = r.get(2).ok()?;
-            let total_parts: Option<i64> = r.get(3).ok()?;
+            let part: Option<i64> = r.get(2)?;
+            let total_parts: Option<i64> = r.get(3)?;
             files.entry(filename).or_default().add(&crate::parser::Article {
                 message_id: mid,
                 part,
@@ -921,10 +932,10 @@ pub fn release_content_id_in(conn: &Connection, schema: &str, release_id: i64) -
                     &f.seen,
                 );
             }
-            return Some(hasher.finalize().to_vec());
+            return Ok(Some(hasher.finalize().to_vec()));
         }
     }
-    None
+    Ok(None)
 }
 
 /// Computes the deterministic SHA-256 content identity for `release_id` in `main` (`conn`),
@@ -952,7 +963,7 @@ pub fn get_opensubtitles(moviehash: &str) -> anyhow::Result<Option<Option<Featur
     use crate::pg::cache_actor::{NativeCacheCommand, NativeCacheReply, execute_if_native};
     match execute_if_native(NativeCacheCommand::LookupOpenSubtitles { hash: moviehash.to_owned() })? {
         Some(NativeCacheReply::Lookup(found)) => Ok(found),
-        Some(NativeCacheReply::Stored) => anyhow::bail!("invalid cache lookup reply"),
+        Some(_) => anyhow::bail!("invalid cache lookup reply"),
         None => Ok(get_opensubtitles_sqlite(moviehash)),
     }
 }
@@ -1005,7 +1016,7 @@ pub fn put_opensubtitles(moviehash: &str, feature: Option<&Feature>) -> anyhow::
         hash: moviehash.to_owned(), feature: feature.cloned(), checked_at: chrono::Utc::now().timestamp(),
     })? {
         Some(NativeCacheReply::Stored) => Ok(()),
-        Some(NativeCacheReply::Lookup(_)) => anyhow::bail!("invalid cache store reply"),
+        Some(_) => anyhow::bail!("invalid cache store reply"),
         None => { put_opensubtitles_sqlite(moviehash, feature); Ok(()) }
     }
 }
@@ -3254,6 +3265,30 @@ pub fn run_reset_shards(args: &[String]) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn checked_content_identity_distinguishes_absence_from_schema_failure() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        assert_eq!(super::release_content_id_in_checked(&conn, "main", 1).unwrap(), None);
+        assert!(super::release_content_id_in_checked(&conn, "missing_schema", 1).is_err());
+        conn.execute_batch("create table files(id integer primary key, release_id integer);").unwrap();
+        assert!(super::release_content_id_in_checked(&conn, "main", 1).is_err());
+        assert_eq!(super::release_content_id_in(&conn, "main", 1), None);
+    }
+
+    #[test]
+    fn checked_content_identity_preserves_the_original_encoding() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("create table files(id integer primary key,release_id integer,filename text,subject_mid text,expected integer,seen blob,blob blob);").unwrap();
+        assert_eq!(super::release_content_id_in_checked(&conn, "main", 1).unwrap(), None);
+        conn.execute("insert into files values(9,1,?1,?2,2,?3,NULL)",
+            rusqlite::params!["a\0.bin", "<one@example.test>", vec![6u8]]).unwrap();
+        let checked = super::release_content_id_in_checked(&conn, "main", 1).unwrap().unwrap();
+        let mut hash = sha2::Sha256::new();
+        super::hash_file_fields_into(&mut hash, "a\0.bin", "<one@example.test>", Some(2), &[6]);
+        assert_eq!(checked, hash.finalize().to_vec());
+        assert_eq!(super::release_content_id_in(&conn, "main", 1), Some(checked));
+    }
+
     use super::*;
 
     #[test]

@@ -38,7 +38,6 @@ impl Step for Naming {
         Reruns { on_rename: false, on_growth: true }
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
-        let retry = |e: rusqlite::Error| StepError::Retry(e.to_string());
         let id = ctx.release().id;
         let inner = ctx.data().archive_inner_files(id)?;
         // new inner files reach PreDB matching too, renamed or not. Bit 16 is its step: unregistered bits are ignored
@@ -52,7 +51,7 @@ impl Step for Naming {
             return Ok(Outcome { rerun, ..Outcome::default() });
         }
         // and a name the user cleared came from subject text, soo only what's inside the post can name it again
-        let files = if cleared && !opted_in { Vec::new() } else { ctx.files().map_err(retry)? };
+        let files = if cleared && !opted_in { Vec::new() } else { ctx.files().map_err(StepError::from_inventory)? };
         let passworded = ctx.data().archive_password(id)? == Some(Password::Yes);
         let name = decide(ctx.release(), &files, &inner, passworded);
         Ok(Outcome { matched: name.is_some(), name, rerun, ..Outcome::default() })
@@ -94,7 +93,6 @@ impl Step for NfoName {
         Reruns { on_rename: false, on_growth: true }
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
-        let retry = |e: rusqlite::Error| StepError::Retry(e.to_string());
         let rel_id = ctx.release().id;
         let rel_name = ctx.release().name.clone();
         let rel_group = ctx.release().group.clone();
@@ -103,7 +101,7 @@ impl Step for NfoName {
         let (names_hidden, probe_encrypted) = ctx.data().nfo_password_rerun_flags(rel_id)?;
         let mut writes = Vec::new();
         let mut rerun = 0;
-        if let Some(saved_pw) = crate::raw_store::get_nfo_password(&rel_name, &rel_group, &content_id) {
+        if let Some(saved_pw) = crate::raw_store::get_nfo_password_checked(&rel_name, &rel_group, &content_id).map_err(StepError::from_cache)? {
             if existing_db_pw.as_deref() != Some(saved_pw.as_str()) {
                 if names_hidden {
                     rerun |= mask(archive::steps::LIST_STEP);
@@ -122,7 +120,7 @@ impl Step for NfoName {
         {
             return Ok(Outcome { writes, rerun, ..Outcome::default() });
         }
-        let files = ctx.files().map_err(retry)?;
+        let files = ctx.files().map_err(StepError::from_inventory)?;
         let par2_names = ctx.data().par2_names(rel_id, &files)?;
         let check = ctx.data().local_password_check(rel_id)?;
         let mut pw_known = !writes.is_empty();
@@ -148,7 +146,7 @@ impl Step for NfoName {
                 && let Some(password) = release_info::find_verified_password([decoded.as_str()], &[], check.as_ref())
             {
                 pw_known = true;
-                crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, &password);
+                crate::raw_store::put_nfo_password_checked(&rel_name, &rel_group, &content_id, &password).map_err(StepError::from_cache)?;
                 if existing_db_pw.as_deref() != Some(password.as_str()) {
                     if names_hidden {
                         rerun |= mask(archive::steps::LIST_STEP);

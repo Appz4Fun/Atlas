@@ -422,7 +422,7 @@ fn key_code(text: &str) -> String {
 }
 
 /// The `<details>` shell of a lazy fragment: nothing loads until the reader opens it.
-fn details(id: i64, part: &str, title: &str) -> String {
+pub(crate) fn details(id: i64, part: &str, title: &str) -> String {
     format!(
         "<details class=\"meta meta-{part}\" hx-get=\"/ui/meta?id={id}&amp;part={part}\" hx-trigger=\"toggle once\" hx-target=\"find .meta-body\" hx-swap=\"innerHTML\"><summary>{title}</summary><div class=\"meta-body\"><p class=\"dim\">Loading…</p></div></details>"
     )
@@ -2428,22 +2428,26 @@ fn headers_fragment(conn: &Connection, id: i64) -> String {
 /// Render fully loaded header facts. Native readers supply source-qualified
 /// data; this function has no connection, shard opener or provider capability.
 pub(crate) fn headers_from_facts(probe: Option<&crate::probe::ProbeInfo>, l: &MetaFacts) -> String {
+    headers_from_fields(l.first_id.as_deref(),l.main.as_ref().and_then(|main|main.subject.as_deref()),l.salt,probe.map(|probe|&probe.headers))
+}
+
+pub(crate) fn headers_from_fields(first_id:Option<&str>,subject:Option<&str>,salt:Option<i64>,headers:Option<&BTreeMap<String,String>>)->String {
     let mut rows = String::new();
     let mut row = |name: &str, value: String, bytes: usize| {
         let _ = write!(rows, "<tr><td>{}</td><td>{value}</td><td class=\"num\">{bytes}</td></tr>", escape(name));
     };
-    if let Some(id) = &l.first_id {
+    if let Some(id) = first_id {
         row("Message-ID", escape(id), id.len());
     }
-    if let Some(subject) = l.main.as_ref().and_then(|m| m.subject.as_deref()) {
+    if let Some(subject) = subject {
         row("Subject", escape(subject), subject.len());
     }
-    if let Some(p) = &probe {
+    if let Some(kept) = headers {
         let rank = |name: &str| header_order(name).0;
-        let mut headers: Vec<(&String, &String)> = p.headers.iter().collect();
+        let mut headers: Vec<(&String, &String)> = kept.iter().collect();
         headers.sort_by_key(|(name, _)| rank(name));
         for (name, value) in headers {
-            row(name, redact_header(name, value, l.salt), value.len());
+            row(name, redact_header(name, value, salt), value.len());
         }
     }
     if rows.is_empty() {
@@ -2793,6 +2797,20 @@ fn compact_html(i: &MetaInputs<'_>, l: &MetaFacts) -> String {
     } else {
         format!("<dl class=\"facts facts-wide\">{facts}</dl>")
     }
+}
+
+/// Only facts consumed by the compact drawer. This cannot stand in for the
+/// full-page relationship/timing/PreDB/key inventory.
+pub(crate) struct DrawerFacts {
+    pub files: Vec<FileInfo>,
+    pub main: Option<FileInfo>,
+    pub first_id: Option<String>,
+    pub salt: Option<i64>,
+}
+pub(crate) fn drawer_from_loaded(i: &MetaInputs<'_>, facts: DrawerFacts, as_card: bool) -> String {
+    let compact = MetaFacts { files: facts.files, main: facts.main, first_id: facts.first_id,
+        salt: facts.salt, ..MetaFacts::default() };
+    drawer_from_facts(i, &compact, as_card)
 }
 
 /// The exact existing drawer shell over already admitted native facts.

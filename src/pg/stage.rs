@@ -65,6 +65,8 @@ fn require_pristine_catalog(client:&mut impl GenericClient)->Result<()> {
     // Closed canonical table names, never request-supplied identifiers. Cache
     // ext_* tables deliberately do not participate in this fresh-data test.
     const EMPTY:&[&str]=&["releases","files","segments","segment_nzb_metadata","file_parts","header_blocks","pp_queue","pp_state","pp_walks",
+        "predb_name_keys","predb_name_pending","predb_late_scan","predb_late_matches",
+        "native_group_captures","native_group_capture_rows","native_group_capture_current",
         "groups","backfill_chunks","backfill_deepest","backfill_media","backfill_speculative","backfill_sweep_gen",
         "backfill_sweeps","backfill_wanted","spot_comments","spot_disposals","spot_reports","spots_seen",
         "inferred_asked","inferred_ids","repair_tried","repair_older","archive_inner_files","sidecars","archive_release",
@@ -148,6 +150,13 @@ pub(crate) fn open_epoch(
             &[&&nonce[..],&root,&storage.schema])?;
     }
     let catalog=CatalogIdentity::read_in(&mut tx)?;catalog.header_config(headers)?;
+    // Mint only in the canonical checked catalog transaction. Kept cache
+    // namespaces never install a previous catalog's privacy salt here.
+    if tx.query_opt("select 1 from meta where key='key_salt'",&[])?.is_none() {
+        let mut bytes=[0;8];getrandom::fill(&mut bytes).map_err(|_|anyhow::anyhow!("native key salt entropy unavailable"))?;
+        tx.execute("insert into meta(key,value) values('key_salt',$1)",&[&i64::from_le_bytes(bytes)])?;
+    }
+    let _:i64=tx.query_one("select value from meta where key='key_salt'",&[])?.try_get(0)?;
     let mut epoch=[0;32];getrandom::fill(&mut epoch).map_err(|_|anyhow::anyhow!("native owner entropy unavailable"))?;
     let code:[u8;32]=Sha256::digest(env!("ATLAS_GIT_SHA").as_bytes()).into();
     let row=tx.query_one("insert into native_runtime_epochs
@@ -162,6 +171,7 @@ pub(crate) fn open_epoch(
     // The previous actual session has drained and the new exclusive fence is
     // held. Reclaim only now; logical operation identities survive lease loss.
     tx.execute("update pp_queue set lease_token=null,lease_until=null,lease_epoch=null where lease_token is not null",&[])?;
+    tx.execute("update pp_state set native_net_token=null,native_net_until=null,native_net_epoch=null,native_net_before=null where native_net_token is not null",&[])?;
     let owner=OwnerEpoch {id:epoch,catalog,pid:row.try_get(0)?,started:row.try_get(1)?,schema:storage.schema.clone(),version,code};
     owner.verify(&mut tx)?;tx.commit()?;Ok(owner)
 }

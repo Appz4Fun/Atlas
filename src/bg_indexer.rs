@@ -302,6 +302,8 @@ fn say_blocked(blocked: &[String]) {
 /// State shared by the scheduler's workers for one set of servers.
 struct Scheduler {
     native: Option<NativeProfile>,
+    native_owner: Option<Arc<crate::pg::indexer_runtime::Owner>>,
+    native_workers: Option<crate::postprocess::native::ConfigPin>,
     fatal: AtomicBool,
     ctx: PassContext,
     settings: RwLock<PassSettings>,
@@ -498,6 +500,13 @@ impl RankCache {
 }
 
 impl Scheduler {
+    fn fail(&self) {
+        self.fatal.store(true,Ordering::Release);
+        // Record the reason before publishing cancellation. Native NET drain
+        // must not refund an attempt ended by configuration or a task panic.
+        if let Some(owner)=&self.native_owner {owner.fail(crate::pg::outage::Failure::Fatal);}
+        self.ctx.stop.store(true,Ordering::Release);
+    }
     fn stopping(&self) -> bool {
         self.wind_down.load(Ordering::Relaxed) || self.ctx.stop.load(Ordering::Relaxed)
     }
@@ -1235,8 +1244,7 @@ async fn watch_config(sched: Arc<Scheduler>, servers: Vec<UsenetServer>) {
         let Some(config) = load_config() else {
             if sched.native.is_some() {
                 ui::error("native indexing configuration unavailable");
-                sched.fatal.store(true, Ordering::Relaxed);
-                sched.ctx.stop.store(true, Ordering::Release);
+                sched.fail();
                 return;
             }
             continue;
@@ -1245,9 +1253,14 @@ async fn watch_config(sched: Arc<Scheduler>, servers: Vec<UsenetServer>) {
             && let Err(error) = profile.check_reload(&config)
         {
             ui::error(&format!("native indexing configuration refused: {error}"));
-            sched.fatal.store(true, Ordering::Relaxed);
-            sched.ctx.stop.store(true, Ordering::Relaxed);
+            sched.fail();
             return;
+        }
+        // Native Steps/providers capture these settings on real standard
+        // threads. Refuse before any legacy/global reconfiguration instead of
+        // continuing with stale worker objects or silently changing their mask.
+        if let Some(pin)=&sched.native_workers && let Err(error)=pin.check(&config,&usable_servers(&config),&plan_workers(&config)) {
+            ui::error(&error.to_string());sched.fail();return;
         }
 
         if needs_rebuild(&sched, &config, &servers) {
@@ -1366,6 +1379,8 @@ async fn run_servers(
 
     let sched = Arc::new(Scheduler {
         native: native.map(|runtime| runtime.profile.clone()),
+        native_owner: native.map(|runtime|runtime.owner.clone()),
+        native_workers: (native.is_some() && (config.postprocess.enabled || config.predb.enabled)).then(||crate::postprocess::native::ConfigPin::capture(config,&servers,&plan)),
         fatal: AtomicBool::new(false),
         ctx: PassContext { pool, states, stop, verbose: false },
         settings: RwLock::new(settings_of(config)),
@@ -1446,12 +1461,16 @@ async fn run_servers(
         };
     }
     // before the stage: its step reads this file, and a missing one is an error it would spend attempts on
-    if config.predb.enabled
+    if native.is_none() && config.predb.enabled
         && let Err(e) = crate::predb::db::create(&paths::predb_database())
     {
         eprintln!("predb: {e}");
     }
-    if config.postprocess.enabled {
+    if (config.postprocess.enabled || config.predb.enabled) && let Some(runtime)=native {
+        let s=sched.clone();
+        tasks.spawn(named!("native stage".into(),crate::postprocess::native::run(
+            runtime.owner.clone(),config.clone(),sched.ctx.pool.clone(),move||s.stopping())));
+    } else if config.postprocess.enabled {
         let stage = Stage::start(StageParams {
             main: paths::database(),
             db: db.clone(),
@@ -1464,7 +1483,7 @@ async fn run_servers(
         let s = sched.clone();
         tasks.spawn(named!("the stage".into(), crate::postprocess::run(stage, move || s.stopping())));
     }
-    if config.predb.enabled {
+    if native.is_none() && config.predb.enabled {
         let started = crate::predb::Service::start(crate::predb::ServiceParams {
             main: paths::database(),
             config: config.predb.clone(),
@@ -1481,7 +1500,7 @@ async fn run_servers(
             Err(e) => eprintln!("predb: {e:#}"),
         }
     }
-    if config.postprocess.enabled && config.media.any_provider() {
+    if native.is_none() && config.postprocess.enabled && config.media.any_provider() {
         let s = sched.clone();
         tasks
             .spawn(named!("media".into(), crate::media::run(crate::media::shared(), db.clone(), move || s.stopping())));
@@ -1585,8 +1604,7 @@ async fn run_servers(
     while let Some(result) = tasks.join_next().await {
         if result.is_err() || !sched.stopping() {
             ui::error("an indexer task ended unexpectedly; draining and stopping");
-            sched.fatal.store(true, Ordering::Relaxed);
-            sched.ctx.stop.store(true, Ordering::Relaxed);
+            sched.fail();
         }
         if sched.stopping() {
             sched.wind_down.store(true, Ordering::Relaxed);
@@ -2534,6 +2552,8 @@ mod tests {
     fn scheduler(pool: Pool, groups: Vec<String>) -> Scheduler {
         Scheduler {
             native: None,
+            native_owner: None,
+            native_workers: None,
             fatal: AtomicBool::new(false),
             ctx: PassContext {
                 pool: Arc::new(pool),
@@ -2569,6 +2589,18 @@ mod tests {
             auto_compact: AtomicBool::new(false),
             passes: AtomicUsize::new(0),
         }
+    }
+
+    #[test]
+    fn native_scheduler_failure_is_recorded_before_worker_cancellation() {
+        let Some(schema)=crate::pg::testing::Schema::new() else {return};
+        let runtime=crate::pg::stage_queue_tests::runtime(&schema);
+        let mut sched=scheduler(Pool::new(&[]),Vec::new());sched.native_owner=Some(runtime.owner.clone());
+        sched.fail();
+        assert_eq!(runtime.owner.failure(),Some(crate::pg::outage::Failure::Fatal));
+        assert!(runtime.owner.stop.load(Ordering::Acquire));assert!(sched.stopping());
+        assert!(matches!(crate::pg::outage::AttemptOutcome::from_exit(0,runtime.owner.failure()),crate::pg::outage::AttemptOutcome::Fatal));
+        runtime.owner.close();
     }
 
     /// by rank every group is the best server's; one due while all of that server's workers are busy goes to the next

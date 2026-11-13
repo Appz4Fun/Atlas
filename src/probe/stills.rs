@@ -55,7 +55,7 @@ fn still_dir() -> std::path::PathBuf {
     crate::paths::app_dir().join("stills")
 }
 
-fn still_file(sha256: &str) -> Option<std::path::PathBuf> {
+pub(crate) fn still_file(sha256: &str) -> Option<std::path::PathBuf> {
     (sha256.len() == 64 && sha256.bytes().all(|b| b.is_ascii_hexdigit())).then(|| still_dir().join(sha256))
 }
 
@@ -288,8 +288,7 @@ fn part_at<'a>(layout: &Layout<'a>, percent: u8) -> Option<(&'a FileInfo, i64)> 
 
 /// Part `part` of a file, decoded, with what the yEnc header says it starts at.
 pub(super) fn read(ctx: &mut StepCtx<'_>, file: &FileInfo, part: i64) -> Result<Option<(u64, Vec<u8>)>, StepError> {
-    let retry = |e: rusqlite::Error| StepError::Retry(e.to_string());
-    let segs = ctx.segments(file.id, &SegmentPick::Parts(vec![part])).map_err(retry)?;
+    let segs = ctx.segments(file.id, &SegmentPick::Parts(vec![part])).map_err(StepError::from_inventory)?;
     let Some(seg) = segs.into_iter().next().filter(|s| s.part.is_none_or(|p| p == part)) else { return Ok(None) };
     let Got::Body(raw) = fetch_raw(ctx, &seg.message_id, &file.filename)? else { return Ok(None) };
     let article = yenc::split_article(&raw);
@@ -877,7 +876,6 @@ impl Step for StillsStep {
         1 | 2 | 4
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
-        let retry = |e: rusqlite::Error| StepError::Retry(e.to_string());
         let release_id = ctx.release().id;
         // a release whose stills are all still on disk, and hashed, keeps them: the walk for a new stamp bit fetches
         // nothing. One trimmed from the folder, or from before hashes, is made again.
@@ -890,7 +888,7 @@ impl Step for StillsStep {
         let rel_name = ctx.release().name.clone();
         let rel_group = ctx.release().group.clone();
         let content_id = ctx.data().release_content_id(release_id)?.unwrap_or_default();
-        let saved_stills = crate::raw_store::get_stills(&rel_name, &rel_group, &content_id);
+        let saved_stills = crate::raw_store::get_stills_checked(&rel_name, &rel_group, &content_id).map_err(StepError::from_cache)?;
         if !ctx.data().explicit_rerun(release_id, STILLS_STEP)?
             && saved_stills.len() == POSITIONS.len()
             && saved_stills.iter().all(|s| s.phash.is_some() && still_file(&s.sha256).is_some_and(|f| f.exists()))
@@ -922,9 +920,7 @@ impl Step for StillsStep {
         if !ctx.data().explicit_rerun(release_id, STILLS_STEP)? {
             let lookup = ctx.data().stills_lookup(release_id)?;
             if SAME_FILE.iter().any(|k| lookup.has(*k)) {
-                let main = ctx.data().legacy_main_path()?;
-                let all = crate::db::open_with_shards(&main).map_err(retry)?;
-                if let Some((_, kind)) = same_file_stills(&all, release_id, &lookup) {
+                if let Some(kind) = ctx.data().same_file_stills(release_id, &lookup)? {
                     crate::metrics::names::STILLS_SHARED.inc(&[("key", kind.word())], 1);
                     return Ok(Outcome {
                         matched: true,
@@ -934,7 +930,7 @@ impl Step for StillsStep {
                 }
             }
         }
-        let files = ctx.files().map_err(retry)?;
+        let files = ctx.files().map_err(StepError::from_inventory)?;
         let Some(first) = main_file(&files) else { return Ok(Outcome::default()) };
         let found = if matroska {
             mkv_frames(ctx, &files, first)?
@@ -975,7 +971,7 @@ impl Step for StillsStep {
             return Ok(Outcome { matched: true, ..Outcome::default() });
         }
         if !raw_saved.is_empty() {
-            crate::raw_store::put_stills(&rel_name, &rel_group, &content_id, &raw_saved);
+            crate::raw_store::put_stills_checked(&rel_name, &rel_group, &content_id, &raw_saved).map_err(StepError::from_cache)?;
         }
         Ok(Outcome { matched: made > 0, writes, ..Outcome::default() })
     }

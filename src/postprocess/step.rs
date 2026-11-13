@@ -374,6 +374,26 @@ impl StepWrite {
         Self { sql, params, late_params: None, mutation: Some((release_id, mutation)) }
     }
 
+    pub(crate) fn legacy_allowed(&self)->bool {
+        !matches!(self.mutation,Some((_,StepMutation::ParseMedia {..}|StepMutation::PredbRead {..})))
+    }
+
+    /// The queue actor checks the retained target as well as the closed
+    /// representation. A result for another release cannot borrow its lease.
+    pub(crate) fn native_mutation_for(&self, release_id:i64)->Result<&StepMutation,StepError> {
+        if self.mutation.as_ref().is_none_or(|(id,_)|*id!=release_id) {
+            return Err(StepError::Retry("native Step result targets another release".into()));
+        }
+        self.native_mutation()
+    }
+    pub(crate) fn native_observed_for(&self,release_id:i64,targets:&crate::pg::stage_queue::participants::Observed)->Result<&StepMutation,StepError> {
+        let (id,mutation)=self.mutation.as_ref().ok_or_else(||StepError::Retry("Step mutation is not ported to native storage".into()))?;
+        if *id!=release_id || !targets.permits(release_id,mutation) {return Err(StepError::Retry("native result has no observed target".into()))}
+        let (sql,params)=mutation.sqlite_statement(*id);
+        if self.sql!=sql || self.params!=params || self.late_params.is_some() {return Err(StepError::Retry("Step mutation representation changed".into()))}
+        Ok(mutation)
+    }
+
     /// Legacy SQL cannot be submitted as a native mutation. The retained legacy ID is not native authority;
     /// native application still requires a reference from the future reviewed resolver and its live epoch gate.
     pub fn native_mutation(&self) -> Result<&StepMutation, StepError> {
@@ -403,6 +423,9 @@ pub struct NameChange {
 
 #[derive(Debug)]
 pub enum StepError {
+    /// A native storage/cache error retains its driver cause. The owner drains;
+    /// this cannot be converted to a cache miss or a per-release retry ACK.
+    Native(anyhow::Error),
     /// a real failure: uses an attempt and backs off
     Retry(String),
     /// failed bit now
@@ -413,6 +436,14 @@ pub enum StepError {
     OutOfBudget,
     /// shutting down
     Stopped,
+}
+
+impl StepError {
+    pub fn from_cache(error:anyhow::Error)->Self {Self::Native(error)}
+    pub fn from_inventory(error:rusqlite::Error)->Self {
+        if matches!(error,rusqlite::Error::UserFunctionError(_)) {Self::Native(error.into())}
+        else {Self::Retry(error.to_string())}
+    }
 }
 
 #[cfg(test)]

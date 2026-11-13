@@ -35,7 +35,7 @@ const NET_PAUSE_AFTER: i64 = 20;
 
 /// Seconds of rest after `in_a_row` transient failures: none at first, then
 /// doubling.
-fn net_pause_secs(in_a_row: i64) -> i64 {
+pub(crate) fn net_pause_secs(in_a_row: i64) -> i64 {
     if in_a_row < NET_PAUSE_AFTER {
         return 0;
     }
@@ -52,18 +52,18 @@ const TRANSIENT_FREE: i64 = 3;
 /// Seconds until a net step runs again after its `in_a_row`th transient failure. They are counted apart from
 /// `net_attempts` (in `net_transient`), soo they never spend the retries `max_attempts` allows, and never fail a
 /// release.
-fn transient_wait(in_a_row: i64, release_id: i64) -> i64 {
+pub(crate) fn transient_wait(in_a_row: i64, release_id: i64) -> i64 {
     if in_a_row <= TRANSIENT_FREE { 300 } else { backoff(in_a_row - TRANSIENT_FREE, release_id) }
 }
 
 /// What `pp_state.last_error` keeps of a step's error: which step, then what went wrong, soo errors can be told apart
 /// by step where several share a release.
-fn step_error(step: &str, error: &str) -> String {
+pub(crate) fn step_error(step: &str, error: &str) -> String {
     format!("{step}: {error}")
 }
 
 /// seconds until an attempt's retry, and a little per release soo they dont bunch
-fn backoff(attempt: i64, release_id: i64) -> i64 {
+pub(crate) fn backoff(attempt: i64, release_id: i64) -> i64 {
     let shift = (attempt.max(1) - 1).min(16) as u32;
     (900i64.saturating_mul(4i64.saturating_pow(shift))).min(604_800) + release_id.rem_euclid(60)
 }
@@ -197,10 +197,11 @@ struct Batch {
     through: Option<i64>,
     /// a step said it's stopping
     stopped: bool,
+    storage_failure:Option<anyhow::Error>,
 }
 
 /// One run of a step, a panic being an error like any other, with its numbers.
-fn run_step(step: &dyn Step, ctx: &mut StepCtx<'_>) -> Ran {
+pub(crate) fn run_step(step: &dyn Step, ctx: &mut StepCtx<'_>) -> Ran {
     let span = crate::metrics::span(crate::metrics::step_function(step.name()));
     let ran = match catch_unwind(AssertUnwindSafe(|| step.run(ctx))) {
         Ok(Ok(mut outcome)) => {
@@ -222,13 +223,14 @@ fn run_step(step: &dyn Step, ctx: &mut StepCtx<'_>) -> Ran {
         Ran::Outcome(o) if o.wait_until.is_some() => "waiting",
         Ran::Outcome(o) if o.matched => "matched",
         Ran::Outcome(_) => "unmatched",
+        Ran::Error(StepError::Native(_)) => "storage_error",
         Ran::Error(StepError::Stopped) => "stopped",
         Ran::Error(StepError::OutOfBudget) => "out_of_budget",
         Ran::Error(StepError::Retry(_)) => "retry",
         Ran::Error(StepError::Permanent(_)) => "permanent",
         Ran::Error(StepError::Transient(_)) => "transient",
     };
-    if matches!(result, "retry" | "permanent" | "transient") {
+    if matches!(result, "retry" | "permanent" | "transient" | "storage_error") {
         span.failed();
     }
     crate::metrics::names::STEP_RUNS.inc(&[("step", step.name()), ("result", result)], 1);
@@ -236,7 +238,7 @@ fn run_step(step: &dyn Step, ctx: &mut StepCtx<'_>) -> Ran {
 }
 
 /// How a step's run changed a visit.
-enum Ran {
+pub(crate) enum Ran {
     /// a result, or an error the lane acts on
     Outcome(Outcome),
     Error(StepError),
@@ -611,6 +613,7 @@ impl Inner {
             if let Some(a) = self.visit(conn, row, summary, due, redo, now, &rules, batch) {
                 batch.applied.push(a);
             }
+            if let Some(error)=batch.storage_failure.take() {return Err(error);}
             if batch.stopped {
                 break;
             }
@@ -758,6 +761,10 @@ impl Inner {
                         }
                         a.names.push((bit, name));
                     }
+                }
+                Ran::Error(StepError::Native(error)) => {
+                    self.stop.store(true,Relaxed);
+                    batch.stopped=true;batch.storage_failure=Some(error);return None;
                 }
                 Ran::Error(StepError::Stopped) => {
                     batch.stopped = true;
@@ -1131,6 +1138,9 @@ impl Inner {
                         }
                     }
                 }
+                Ran::Error(StepError::Native(error)) => {
+                    self.stop.store(true,Relaxed);return Err(error);
+                }
                 Ran::Error(StepError::Stopped) => {
                     a.net_attempts = Some(attempts_before);
                     a.net_next_at = Some(now);
@@ -1201,12 +1211,12 @@ fn base_copy(a: &Applied) -> Applied {
 }
 
 /// whether this source may set the name at all
-fn name_counts(release: &ReleaseInfo, name: &NameChange) -> bool {
+pub(crate) fn name_counts(release: &ReleaseInfo, name: &NameChange) -> bool {
     i64::from(name.source) >= release.name_source.unwrap_or(0)
         && (name.display_name.is_some() || name.obfuscated.is_some())
 }
 
-fn apply_name(release: &mut ReleaseInfo, name: &NameChange) {
+pub(crate) fn apply_name(release: &mut ReleaseInfo, name: &NameChange) {
     if let Some(d) = &name.display_name {
         release.display_name = Some(d.clone());
     }

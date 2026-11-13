@@ -11,8 +11,12 @@
 //! run again even when the first try's commit landed and only its answer was lost (see `with_retry`).
 
 pub(crate) mod cache_actor;
+pub(crate) mod worker_assets;
 pub mod ext;
 pub(crate) mod cache_keys;
+pub(crate) mod service_cache;
+pub(crate) mod predb_cache;
+pub(crate) mod natural_cache;
 pub mod header_blocks;
 mod history_gate;
 mod history_digest;
@@ -26,8 +30,21 @@ mod history_companion;
 pub(crate) mod indexer_runtime;
 pub(crate) mod stage;
 pub(crate) mod stage_words;
+pub(crate) mod content_id;
+pub mod stage_reads;
+pub(crate) mod stage_telemetry;
+mod stage_mutations;
+pub(crate) mod stage_queue;
+pub(crate) mod fresh_reader;
+pub(crate) mod fresh_words;
+#[cfg(test)]
+mod stage_schema_tests;
+#[cfg(test)]
+pub(crate) mod stage_queue_tests;
 #[cfg(test)]
 mod stage_words_tests;
+#[cfg(test)]
+mod stage_mutation_tests;
 pub(crate) mod outage;
 pub mod ingest;
 pub(crate) mod linker;
@@ -50,16 +67,27 @@ mod linker_source;
 mod linker_stage;
 pub mod main_import;
 pub mod migrate;
-pub(crate) mod natural_cache;
 pub mod release_queue;
 pub mod release_reader;
-pub(crate) mod fresh_reader;
 mod fresh_files;
+mod fresh_fields;
+mod fresh_related;
+mod fresh_stats;
+pub(crate) mod fresh_assets;
+mod cache_assets;
+mod fresh_query;
+mod fresh_waits;
+mod fresh_pace;
+mod fresh_meta;
+mod fresh_probe;
+mod fresh_hashes;
+mod fresh_contents;
+mod fresh_metadata_facts;
+pub(crate) mod fresh_nzb_tools;
 pub(crate) mod fresh_processing;
 pub(crate) mod fresh_live;
 mod fresh_listing;
 pub(crate) mod fresh_nzb;
-pub(crate) mod fresh_words;
 pub mod release_writer;
 pub mod sql;
 #[cfg(test)]
@@ -625,3 +653,11 @@ mod tests {
         });
     }
 }
+
+pub(crate) mod probe_decode;
+
+pub(crate) mod fresh_group_capture;
+
+pub(crate) mod fresh_statistics;
+
+pub(crate) mod fresh_visual_related;

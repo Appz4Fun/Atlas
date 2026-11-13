@@ -82,7 +82,7 @@ impl Step for CategoryStep {
         }
         // there is no PC category: a PC match is junk, unless it has video, which then goes uncategorized
         if crate::junk::is_pc(d.category) {
-            let files = ctx.files().map_err(|e| StepError::Retry(e.to_string()))?;
+            let files = ctx.files().map_err(StepError::from_inventory)?;
             if crate::junk::pc_is_junk(files.iter().map(|f| f.filename.as_str())) {
                 return Ok(Outcome { junk: Some(crate::junk::PC), ..Outcome::default() });
             }

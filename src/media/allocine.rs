@@ -78,6 +78,7 @@ impl Allocine {
             match self.page(kind, id) {
                 Ok(page) => page,
                 // Wikidata's ids are good without the page's name: they aren't held back by it
+                Err(Trouble::Cache(error))=>return Err(Trouble::Cache(error)),
                 Err(_) if ids.any() => None,
                 Err(e) => return Err(e),
             }
@@ -117,7 +118,7 @@ impl Allocine {
             Kind::Tv => format!("{}/series/ficheserie_gen_cserie={id}.html", self.site),
         };
         // what was taken from the page, not the page: a few bytes in place of a third of a megabyte
-        if let Some((200, kept)) = crate::raw_store::get_http_cache("allocine", &url)
+        if let Some((200, kept)) = self.pages.cached("allocine", &url)?
             && let Ok(kept) = serde_json::from_str::<Value>(&kept)
             && let Some(title) = kept.get("title").and_then(Value::as_str)
         {
@@ -128,7 +129,7 @@ impl Allocine {
         let found = page_answer(kind, &html);
         if let Some((title, year)) = &found {
             let kept = serde_json::json!({ "title": title, "year": year });
-            crate::raw_store::put_http_cache("allocine", &url, 200, &kept.to_string());
+            self.pages.keep("allocine",&url,200,&kept.to_string())?;
         }
         Ok(found)
     }

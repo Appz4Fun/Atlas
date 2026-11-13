@@ -74,10 +74,16 @@ pub enum StepMutation {
     PinNfoMovieImdb { imdb_id: i64 },
     ClearMedia,
     FoundMediaIds { title_key: i64, ids: crate::media::resolve::Ids },
+    /// Native cache IDs are checked on the original writer transaction, after
+    /// preceding fanout; no legacy Media object or late callback is captured.
+    ParseMedia { kind:crate::media::title::Kind,title_key:i64,parsed:crate::media::parse::Parsed },
     ReindexWords,
     RecordSegmentCrc { message_id: String, decoded: i64, crc32: u32 },
     ClearPredbInnerKeys,
     AddPredbInnerKey { key: i64 },
+    PredbRead { revision:i64 },
+    XrefRead { generation:i64 },
+    XrefTried { generation:i64,count:i64 },
     KeepPredbMatch { title_id: i64, kind: crate::predb::matcher::Kind, category: Option<String>, pre_at: Option<i64>, nuked: i64, matched_at: i64 },
     KeepReleaseKeys { keys: crate::keys::Keys },
     ClearReleaseKeys,
@@ -180,6 +186,10 @@ impl StepMutation {
             ),
             Self::SetNfoPassword { password } => (crate::archive::store::SET_NFO_PASSWORD, vec![release_id.into(),password.clone().into()]),
             Self::ClearMedia => ("delete from media_release where release_id=?1", vec![release_id.into()]),
+            Self::ParseMedia {kind,title_key,parsed} => {
+                let number=|n:Option<i32>|n.map(i64::from).into();
+                (crate::media::steps::UPSERT,vec![release_id.into(),(*kind as i64).into(),(*title_key).into(),number(parsed.season),number(parsed.episode),number(parsed.episode_last),number(parsed.air_date),number(parsed.year),i64::from(parsed.quality).into(),Value::Null,Value::Null,Value::Null,Value::Null,Value::Null,Value::Null])
+            },
             Self::FoundMediaIds { title_key, ids } => (crate::media::steps::FOUND, vec![
                 release_id.into(),(*title_key).into(),ids.tvdb.into(),ids.tvmaze.into(),ids.trakt.into(),ids.tmdb.into(),ids.imdb.into(),ids.tvrage.into(),
             ]),
@@ -192,6 +202,15 @@ impl StepMutation {
             ),
             Self::ClearPredbInnerKeys => ("delete from predb_inner_key where release_id=?1", vec![release_id.into()]),
             Self::AddPredbInnerKey { key } => ("insert or ignore into predb_inner_key(key,release_id) values(?1,?2)", vec![(*key).into(),release_id.into()]),
+            Self::PredbRead {revision} => (
+                "select revision from ext_predb_key_meta where singleton=1 and revision=?1",vec![(*revision).into()],
+            ),
+            Self::XrefRead {generation} => (
+                "select generation from linker_uploads where release_name=(select name from releases where id=?1) and generation=?2",vec![release_id.into(),(*generation).into()],
+            ),
+            Self::XrefTried {generation,count} => (
+                "update linker_uploads set probed=max(probed,?3) where release_name=(select name from releases where id=?1) and generation=?2",vec![release_id.into(),(*generation).into(),(*count).into()],
+            ),
             Self::KeepPredbMatch { title_id, kind, category, pre_at, nuked, matched_at } => (
                 "insert or replace into predb_match(release_id,title_id,kind,category,pre_at,nuked,matched_at) values(?1,?2,?3,?4,?5,?6,?7)",
                 vec![release_id.into(),(*title_id).into(),(*kind as i64).into(),category.clone().into(),(*pre_at).into(),(*nuked).into(),(*matched_at).into()],
@@ -297,6 +316,7 @@ impl StepMutation {
 
     #[cfg(test)]
     fn apply_sqlite(&self, conn: &rusqlite::Connection, release_id: i64) -> rusqlite::Result<usize> {
+        if matches!(self,Self::ParseMedia {..}|Self::PredbRead {..}|Self::XrefRead {..}|Self::XrefTried {..}) {return Err(rusqlite::Error::InvalidQuery);}
         let (sql, params) = self.sqlite_statement(release_id);
         conn.execute(sql, rusqlite::params_from_iter(params))
     }

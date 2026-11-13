@@ -165,7 +165,7 @@ impl Step for MediaParse {
         Needs::Database
     }
     fn enabled(&self, cfg: &Config) -> bool {
-        self.0.set_config(cfg);
+        self.0.configure(cfg);
         cfg.media.parse
     }
     fn reruns(&self) -> Reruns {
@@ -185,9 +185,9 @@ impl Step for MediaParse {
             return Ok(Outcome { writes, ..Outcome::default() });
         };
         let key = key_of(kind, &p);
-        let write = StepWrite::for_deferred_legacy(id,DeferredLegacyStepMutation::MediaParse {
-            media: self.0.clone(),kind,title_key: key,parsed: p,
-        });
+        let write = if self.0.is_native() {
+            StepWrite::for_mutation(id,StepMutation::ParseMedia {kind,title_key:key,parsed:p})
+        } else {StepWrite::for_deferred_legacy(id,DeferredLegacyStepMutation::MediaParse {media:self.0.clone(),kind,title_key:key,parsed:p})};
         let mut writes = vec![write];
         // the title a probed file's own tags name, put on the row as it's made: a release named only after its probe
         // ran had no row for the probe to pin them on, and the probe isn't run again for a rename
@@ -239,7 +239,7 @@ impl Step for MediaLookup {
         Needs::External
     }
     fn enabled(&self, cfg: &Config) -> bool {
-        self.0.set_config(cfg);
+        self.0.configure(cfg);
         cfg.media.any_provider()
     }
     fn reruns(&self) -> Reruns {
@@ -249,13 +249,13 @@ impl Step for MediaLookup {
         u64::from(self.0.provider_bits())
     }
     fn applies(&self, r: &ReleaseInfo) -> bool {
-        target_of(&self.0, r).is_some_and(|(kind, p)| self.0.wants(kind, key_of(kind, &p), r.id, now_secs()))
+        target_of(&self.0, r).is_some_and(|(kind, p)| self.0.is_native() || self.0.wants(kind, key_of(kind, &p), r.id, now_secs()))
     }
     /// Without `wants`, which claims a title for the release that asks: the page mustn't.
     fn skip_reason(&self, r: &ReleaseInfo) -> Option<&'static str> {
         match target_of(&self.0, r) {
             None => Some("no movie or TV title in its name to look up"),
-            Some((kind, p)) if self.0.looked_up(kind, key_of(kind, &p), now_secs()) => {
+            Some((kind, p)) if !self.0.is_native() && self.0.looked_up(kind, key_of(kind, &p), now_secs()) => {
                 Some("its title's IDs are already known, or it was looked up lately")
             }
             Some(_) => None,
@@ -269,6 +269,12 @@ impl Step for MediaLookup {
         let Some((kind, p)) = target_of(&self.0, ctx.release()) else { return Ok(Outcome::default()) };
         let key = key_of(kind, &p);
         let (title, country) = split_country(&p.title);
+        let _claim=if self.0.is_native() {
+            match self.0.claim_native(key,id,now_secs()) {
+                Some(claim)=>Some(claim),
+                None=>return Ok(Outcome {wait_until:Some(now_secs()+1),..Outcome::default()}),
+            }
+        } else {None};
         // `AC31594` is AlloCiné's: what it is, by name and by whatever ids Wikidata has, before any provider
         let decoded = match (allocine_id(title), self.0.allocine()) {
             (Some(ac), Some(allocine)) => match allocine.decode(kind, ac) {
@@ -282,6 +288,7 @@ impl Step for MediaLookup {
                     self.0.clear_claim(key);
                     return Err(StepError::Retry(e));
                 }
+                Err(Trouble::Cache(error))=>return Err(StepError::from_cache(error.into_error())),
             },
             _ => None,
         };
@@ -292,10 +299,10 @@ impl Step for MediaLookup {
         let seed = decoded.as_ref().map(|d| (&d.ids, d.title.as_str()));
         let resolved = {
             let ctx_ref = &*ctx;
-            self.0.resolve_seeded(&q, key, now_secs(), &|| ctx_ref.stopping(), seed)
+            self.0.resolve_seeded_checked(&q, key, now_secs(), &|| ctx_ref.stopping(), seed)
         };
         let reindex = || decoded.as_ref().map(|_| StepWrite::for_mutation(id, StepMutation::ReindexWords));
-        match resolved.map_err(StepError::Retry)? {
+        match resolved.map_err(|error|match error {super::resolve::ResolveFailure::Cache(error)=>self.0.cache_step_error(error),super::resolve::ResolveFailure::Provider(error)=>StepError::Retry(error)})? {
             Resolved::Found(ids) => {
                 let writes = std::iter::once(found_write(id, key, &ids)).chain(reindex()).collect();
                 Ok(Outcome { matched: true, writes, ..Outcome::default() })
@@ -305,7 +312,7 @@ impl Step for MediaLookup {
                 // and a title decoded from an AlloCiné id: its other releases are found by it too, once fan-out
                 // queues them for the word index
                 if decoded.is_some() || ctx.data().stale_media_ids(key)? {
-                    self.0.fan_out_again(key).map_err(StepError::Retry)?;
+                    self.0.fan_out_again_checked(key).map_err(|error|self.0.cache_step_error(error))?;
                 }
                 Ok(Outcome { writes: reindex().into_iter().collect(), ..Outcome::default() })
             }
@@ -331,26 +338,29 @@ impl Step for MediaNfo {
         Needs::Bodies
     }
     fn enabled(&self, cfg: &Config) -> bool {
-        self.0.set_config(cfg);
+        self.0.configure(cfg);
         cfg.media.nfo && cfg.media.parse && cfg.postprocess.body_fetches_per_minute > 0
     }
     fn reruns(&self) -> Reruns {
         Reruns { on_rename: true, on_growth: true }
     }
     fn applies(&self, r: &ReleaseInfo) -> bool {
-        target_of(&self.0, r).is_some_and(|(kind, p)| kind == Kind::Movie && !self.0.imdb_known(key_of(kind, &p)))
+        target_of(&self.0, r).is_some_and(|(kind, p)| kind == Kind::Movie && (self.0.is_native() || !self.0.imdb_known(key_of(kind, &p))))
     }
     fn skip_reason(&self, r: &ReleaseInfo) -> Option<&'static str> {
         match target_of(&self.0, r) {
             None => Some("no movie title in its name to find an IMDb id for"),
             Some((Kind::Tv, _)) => Some("an episode: only a movie's NFO is read for its IMDb id"),
-            Some((kind, p)) if self.0.imdb_known(key_of(kind, &p)) => Some("its title's IMDb id is already known"),
+            Some((kind, p)) if !self.0.is_native() && self.0.imdb_known(key_of(kind, &p)) => Some("its title's IMDb id is already known"),
             Some(_) => None,
         }
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
-        let retry = |e: rusqlite::Error| StepError::Retry(e.to_string());
+        let retry = |e: rusqlite::Error| self.0.cache_step_error(anyhow::Error::new(e));
         let id = ctx.release().id;
+        if self.0.is_native() && let Some((kind,parsed))=target_of(&self.0,ctx.release()) {
+            if self.0.imdb_known_checked(key_of(kind,&parsed)).map_err(StepError::from_cache)? {return Ok(Outcome::default())}
+        }
         let current = ctx.data().media_imdb_marker(id)?;
         if !matches!(current, Some(None)) {
             return Ok(Outcome::default());

@@ -51,6 +51,17 @@ pub(crate) struct Applied {
     pub freeze_check: bool,
 }
 
+impl Applied {
+    /// Fresh native releases stay in PostgreSQL. The legacy setting still
+    /// governs SQLite shards, but never requests their frozen-file routing here.
+    pub(crate) fn native_database(release_id:i64,claimed_gen:i64,claimed_due:i64,db_mask:StepMask,net_steps:StepMask)->Self {
+        Self {release_id,claimed_gen,claimed_due:Some(claimed_due),db_mask,net_steps,..Default::default()}
+    }
+    pub(crate) fn native_network(release_id:i64,claimed_gen:i64,db_mask:StepMask,net_steps:StepMask)->Self {
+        Self {release_id,claimed_gen,lane:Lane::Net,db_mask,net_steps,..Default::default()}
+    }
+}
+
 /// Names a transaction wrote: each one's source, and whether it was the first
 /// real name of an obfuscated post. Counted once they are committed, see `count_names`.
 pub(crate) type Renames = Vec<(u8, bool)>;
@@ -176,6 +187,7 @@ fn write(conn: &Connection, mut a: Applied, now: i64, renames: &mut Renames) -> 
         if step & dropped != 0 {
             continue;
         }
+        if !w.legacy_allowed() {return Err(rusqlite::Error::InvalidQuery);}
         let params: Vec<Value> = match w.late_params {
             Some(late) => late(),
             None => w.params,

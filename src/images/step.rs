@@ -566,7 +566,7 @@ impl Step for ImagesStep {
         // pictures are what this step reads: the fetcher refuses them to every other
         ctx.allow_pictures();
         let limits = self.limits.lock().unwrap().clone();
-        let mut files = ctx.files().map_err(|e| StepError::Retry(e.to_string()))?;
+        let mut files = ctx.files().map_err(StepError::from_inventory)?;
         // the small files found beside this release, as a thumbnail posted under a subject of its own, and the rows
         // of an upload it leads (`archive::link`)
         files.extend(ctx.data().linked_image_files(ctx.release().id)?);
@@ -589,7 +589,7 @@ impl Step for ImagesStep {
         let sizes: std::collections::HashMap<i64, i64> = if all.len() <= auto_limits.count {
             let mut sizes = std::collections::HashMap::new();
             for f in &all {
-                sizes.insert(f.id, posted_bytes(ctx, f).map_err(|e| StepError::Retry(e.to_string()))?);
+                sizes.insert(f.id, posted_bytes(ctx, f).map_err(StepError::from_inventory)?);
             }
             sizes
         } else {

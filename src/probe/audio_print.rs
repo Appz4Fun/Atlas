@@ -425,7 +425,6 @@ impl Step for AudioPrintStep {
         release.size >= crate::postprocess::schema::SMALL_VIDEO
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
-        let retry = |e: rusqlite::Error| StepError::Retry(e.to_string());
         let id = ctx.release().id;
         // a release printed before keeps its prints: nothing is fetched again
         if ctx.data().has_audio_print(id)? {
@@ -446,7 +445,7 @@ impl Step for AudioPrintStep {
         let (name, group) = (ctx.release().name.clone(), ctx.release().group.clone());
         let content_id = ctx.data().release_content_id(id)?.unwrap_or_default();
         if !ctx.data().explicit_rerun(id, AUDIO_PRINT_STEP)? {
-            let saved: Prints = crate::raw_store::get_audio_prints(&name, &group, &content_id)
+            let saved: Prints = crate::raw_store::get_audio_prints_checked(&name, &group, &content_id).map_err(StepError::from_cache)?
                 .into_iter()
                 .map(|p| (p.position, p.at_ms, audio::from_blob(&p.items)))
                 .filter(|(_, _, items)| !items.is_empty())
@@ -456,15 +455,12 @@ impl Step for AudioPrintStep {
             }
         }
         // only for a release no other key ties to another
-        let main = ctx.data().legacy_main_path()?;
-        let all = crate::db::open_with_shards(&main).map_err(retry)?;
         let lookup = ctx.data().release_lookup(id, Some(ctx.release().parts))?;
-        if linked_by(&all, id, &lookup).is_some() {
+        if ctx.data().audio_linked_by(id, &lookup)?.is_some() {
             count("linked");
             return Ok(Outcome::default());
         }
-        drop(all);
-        let files = ctx.files().map_err(retry)?;
+        let files = ctx.files().map_err(StepError::from_inventory)?;
         let Some(first) = main_file(&files) else { return Ok(Outcome::default()) };
         let volumes = if plan.stored {
             match volume_slots(&first.filename, super::moviehash::volumes(&first.filename, &files)) {
@@ -500,7 +496,7 @@ impl Step for AudioPrintStep {
                 items: audio::to_blob(items),
             })
             .collect();
-        crate::raw_store::put_audio_prints(&name, &group, &content_id, &saved);
+        crate::raw_store::put_audio_prints_checked(&name, &group, &content_id, &saved).map_err(StepError::from_cache)?;
         Ok(Outcome { matched: true, writes: print_writes(id, &prints), ..Outcome::default() })
     }
 }

@@ -131,7 +131,7 @@ fn is_par2(filename: &str) -> bool {
 }
 
 /// The `MM` of `name.vol000+MM.par2`, or the span of `name.volNNN-MMM.par2`.
-fn recovery_blocks(filename: &str) -> i64 {
+pub(crate) fn recovery_blocks(filename: &str) -> i64 {
     static BLOCKS: LazyLock<Regex> = LazyLock::new(|| {
         #[allow(clippy::unwrap_used)]
         Regex::new(r"(?i)\.vol(\d+)([+-])(\d+)\.par2$").unwrap()

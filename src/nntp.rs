@@ -23,6 +23,8 @@ use crate::dates::to_iso_date;
 use crate::nxv_store::live::Fetch as HeaderFetch;
 use crate::parser::Article;
 
+pub(crate) mod group_capture;
+
 #[derive(Debug)]
 pub enum NntpError {
     Io(io::Error),
@@ -783,6 +785,8 @@ impl Ends {
 pub struct Conn {
     io: BufReader<Box<dyn AsyncStream>>,
     timeout: Duration,
+    // Optional policy for capture-only control replies, including login.
+    status_limit: Option<usize>,
     /// group selected on this connection, XOVER needs one
     pub group: Option<String>,
     /// server agreed to XFEATURE COMPRESS GZIP on this connection
@@ -850,6 +854,10 @@ impl Conn {
     /// Connect and log in. With `compress` it also asks for gzip compressed
     /// header listings (XFEATURE COMPRESS GZIP), which servers may refuse.
     pub async fn open(server: &UsenetServer, timeout: Duration, compress: bool) -> Result<Conn> {
+        Self::open_with_status_bound(server,timeout,compress,None).await
+    }
+
+    async fn open_with_status_bound(server:&UsenetServer,timeout:Duration,compress:bool,status_limit:Option<usize>)->Result<Conn> {
         let host = server.host.trim().trim_matches(['[', ']']).to_string();
         let tcp = with_timeout(timeout, TcpStream::connect((host.as_str(), server.port))).await?;
         let _ = tcp.set_nodelay(true);
@@ -864,6 +872,7 @@ impl Conn {
         };
 
         let mut conn = Conn::over(stream, timeout);
+        conn.status_limit=status_limit;
         conn.server = server_key(server).into();
         let measure = conn.measure("LOGIN", "nntp.login");
         let r = conn.log_in(server, compress).await;
@@ -929,6 +938,7 @@ impl Conn {
         Conn {
             io: BufReader::with_capacity(256 * 1024, stream),
             timeout,
+            status_limit: None,
             group: None,
             compressed: false,
             gzip_refused: false,
@@ -1060,7 +1070,10 @@ impl Conn {
     }
 
     async fn read_status(&mut self) -> Result<(u16, String)> {
-        let line = self.read_raw_line().await?;
+        let line = if let Some(limit)=self.status_limit {
+            let line=self.read_line_capped(limit).await?.ok_or_else(||NntpError::Protocol("NNTP status exceeds capture admission".into()))?;
+            if line.len()>limit{return Err(NntpError::Protocol("NNTP status exceeds capture admission".into()));}line
+        }else{self.read_raw_line().await?};
         let line = String::from_utf8_lossy(&line);
         let (code, message) = line.split_once(' ').unwrap_or((&line, ""));
 
@@ -2882,6 +2895,10 @@ impl Pool {
     /// Like `lease`, but an idle connection that already has `group` selected
     /// is taken first (saves a GROUP round trip when many groups share a server).
     async fn lease_for(&self, i: usize, group: Option<&str>, force: bool) -> Result<Lease> {
+        self.lease_for_with_status_bound(i,group,force,None).await
+    }
+
+    async fn lease_for_with_status_bound(&self,i:usize,group:Option<&str>,force:bool,status_limit:Option<usize>)->Result<Lease> {
         let server = self.servers.get(i).cloned().ok_or_else(Self::no_servers)?;
 
         loop {
@@ -2893,7 +2910,7 @@ impl Pool {
             };
             crate::profile::Load::add_since(&crate::profile::LOAD.lease_wait_ns, waited);
 
-            if let Some(lease) = self.connect_with_permit(&server, permit, group, force).await? {
+            if let Some(lease) = self.connect_with_permit_with_status_bound(&server,permit,group,force,status_limit).await? {
                 return Ok(lease);
             }
         }
@@ -2908,6 +2925,10 @@ impl Pool {
         group: Option<&str>,
         force: bool,
     ) -> Result<Option<Lease>> {
+        self.connect_with_permit_with_status_bound(server,permit,group,force,None).await
+    }
+
+    async fn connect_with_permit_with_status_bound(&self,server:&Arc<Server>,permit:OwnedSemaphorePermit,group:Option<&str>,force:bool,status_limit:Option<usize>)->Result<Option<Lease>> {
         let idle = {
             let mut idle = server.idle.lock().unwrap();
             // a server closes a connection that sat idle a while, and the next request on it would fail the pass
@@ -2919,6 +2940,8 @@ impl Pool {
             }
         };
         if let Some(mut conn) = idle {
+            // Reset capture-only policy when a normal caller reuses this connection.
+            conn.status_limit=status_limit;
             conn.set_rate_limiter(self.rate_limiter.clone());
             return Ok(Some(Lease::new(conn, server.clone(), permit)));
         }
@@ -2932,7 +2955,7 @@ impl Pool {
         }
 
         let connecting = crate::metrics::span("nntp.connect");
-        let opened = Conn::open(&server.cfg, self.timeout, server.compress(self.compress_retry)).await;
+        let opened = Conn::open_with_status_bound(&server.cfg,self.timeout,server.compress(self.compress_retry),status_limit).await;
         let connects = |result: &'static str| {
             crate::metrics::names::NNTP_CONNECTS.inc(&[("server", server.key.as_str()), ("result", result)], 1);
         };

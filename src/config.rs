@@ -204,6 +204,20 @@ pub struct Config {
     pub overview_archive: OverviewArchiveConfig,
     pub freeze: FreezeConfig,
     pub shared_catalog: SharedCatalogConfig,
+    /// Explicit asset selection; physical verification, not configuration, grants reuse.
+    pub native_assets: Option<NativeAssetsConfig>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct NativeAssetsConfig {pub root:String,pub manifest:String,pub whole_sha256:String}
+impl std::fmt::Debug for NativeAssetsConfig {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str("NativeAssetsConfig { selected: true }")}
+}
+impl NativeAssetsConfig {
+    fn from_value(value:&Value)->Self {
+        let text=|key:&str|value.get(key).and_then(Value::as_str).unwrap_or_default().to_string();
+        Self {root:text("root"),manifest:text("manifest"),whole_sha256:text("whole_sha256")}
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1220,6 +1234,7 @@ impl Default for Config {
             sealed_log: SealedLogConfig::default(),
             overview_archive: OverviewArchiveConfig::default(),
             shared_catalog: SharedCatalogConfig::default(),
+            native_assets: None,
             predb: PredbConfig::default(),
             spots: SpotsConfig::default(),
             category: CategoryConfig::default(),
@@ -1405,6 +1420,7 @@ impl Config {
             sealed_log: SealedLogConfig::from_value(v.get("sealed_log")),
             overview_archive: OverviewArchiveConfig::from_value(v.get("overview_archive")),
             shared_catalog: SharedCatalogConfig::from_value(v.get("shared_catalog")),
+            native_assets: v.get("native_assets").map(NativeAssetsConfig::from_value),
             predb: PredbConfig::from_value(v.get("predb")),
             spots: SpotsConfig::from_value(v.get("spots")),
             category: CategoryConfig::from_value(v.get("category")),

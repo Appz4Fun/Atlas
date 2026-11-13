@@ -66,6 +66,17 @@ const HTMX_CONFIG: &str =
 
 /// A GET the ui answers. None: not ours, the api decides.
 pub fn get(path: &str, query: &str, cookies: Option<&str>, base: &str, api_key: &str) -> Option<ApiResponse> {
+    let storage=match crate::config::checked_storage_config() {
+        Ok(storage)=>storage,Err(_)=>return Some(html(503,diag("caution","catalog unavailable","Storage configuration could not be read."))),
+    };
+    get_with_storage(path,query,cookies,base,api_key,&storage)
+}
+
+pub(crate) fn get_with_storage(path:&str,query:&str,cookies:Option<&str>,base:&str,api_key:&str,storage:&crate::pg::StorageConfig)->Option<ApiResponse> {
+    get_with_storage_and_assets(path,query,cookies,base,api_key,storage,None)
+}
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn get_with_storage_and_assets(path:&str,query:&str,cookies:Option<&str>,base:&str,api_key:&str,storage:&crate::pg::StorageConfig,assets:Option<&crate::pg::fresh_assets::AssetManifest>)->Option<ApiResponse> {
     let signed_in = signed_in(cookies, api_key);
     let mut args = parse_query(query);
     let remember = incomplete_choice(&mut args, cookies);
@@ -74,11 +85,7 @@ pub fn get(path: &str, query: &str, cookies: Option<&str>, base: &str, api_key: 
         resp
     };
     if signed_in && (matches!(path,"/"|"") || path.starts_with("/ui/")) {
-        match crate::config::checked_storage_config() {
-            Ok(storage) if storage.is_postgres()=>return fresh::get(path,&args,base,api_key,&storage).map(remembered),
-            Err(_)=>return Some(html(503,diag("caution","catalog unavailable","Storage configuration could not be read."))),
-            _=>{},
-        }
+        if storage.is_postgres() {return fresh::get_with_assets(path,&args,base,api_key,storage,assets).map(remembered);}
     }
     Some(match path {
         "/static/htmx.min.js" => asset("text/javascript; charset=utf-8", HTMX),
@@ -138,8 +145,16 @@ pub fn post(
     base: &str,
     api_key: &str,
 ) -> Option<ApiResponse> {
+    let storage=match crate::config::checked_storage_config() {
+        Ok(storage)=>storage,Err(_)=>return Some(html(503,diag("caution","catalog unavailable","Storage configuration could not be read."))),
+    };
+    post_with_storage(path,body,cookies,htmx,csrf,base,api_key,&storage)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn post_with_storage(path:&str,body:&str,cookies:Option<&str>,htmx:bool,csrf:Option<&str>,base:&str,api_key:&str,storage:&crate::pg::StorageConfig)->Option<ApiResponse> {
     let signed_in = signed_in(cookies, api_key);
-    if signed_in && path.starts_with("/ui/") && match crate::config::checked_storage_config() {Ok(storage)=>storage.is_postgres(),Err(_)=>true} {
+    if signed_in && path.starts_with("/ui/") && storage.is_postgres() {
         return Some(html(503,diag("caution","native operation unavailable","Native mutation admission is awaiting qualification.")));
     }
     match path {
@@ -2987,24 +3002,25 @@ fn release_problem(status: u16, level: &str, title: &str, body: &str) -> ApiResp
     html(status, page("Atlas", &content))
 }
 
+/// Own/qualified display facts only. Loading and trust decisions precede this
+/// renderer; it cannot obtain missing metadata, copies, or provider data.
+struct ReleaseHeaderFacts<'a> {
+    category:i64,
+    details:Option<&'a crate::media::details::Details>,
+    spot:Option<SpotBadge<'a>>,
+    spot_removed:bool,
+    repair:bool,
+    groups:&'a [release_info::GroupPosting],
+    password:&'a str,
+}
 #[allow(clippy::too_many_arguments)]
-fn release_html(
-    r: &ReleaseRow,
-    category: Option<i64>,
-    inner: &crate::archive::store::InnerView,
-    media: Option<&MediaAttrs>,
-    names: Option<&release_info::Names>,
-    contents: &release_info::Contents,
-    recovery: Option<&release_info::RecoveryOnly>,
-    split_groups: Option<&[release_info::GroupPosting]>,
-    post_ids: &[i64],
-    api_key: &str,
-) -> String {
-    let category = category.unwrap_or(UNCATEGORIZED);
-    // only what's kept: the title panel below fetches what isn't
-    let details =
-        media.and_then(|m| crate::media::details::kept_for(std::iter::once((r.id, m.kind, &m.ids))).remove(&r.id));
-    let (shown, raw) = shown_names(r, category, media, details.as_ref());
+fn release_header_from_facts(
+    r:&ReleaseRow,inner:&crate::archive::store::InnerView,media:Option<&MediaAttrs>,
+    names:Option<&release_info::Names>,contents:&release_info::Contents,
+    recovery:Option<&release_info::RecoveryOnly>,loaded:ReleaseHeaderFacts<'_>,
+)->(String,Option<String>,String,String) {
+    let category = loaded.category;
+    let (shown, raw) = shown_names(r, category, media, loaded.details);
     let mut tags = String::new();
     if let Some(text) = media.and_then(media_label) {
         tags.push_str(&tag("tag-ref", &text));
@@ -3013,22 +3029,12 @@ fn release_html(
         tags.push_str(&recovery_tag(recovery));
     }
     tags.push_str(&password_tag(inner.password.as_ref()));
-    let spot = crate::spotnet::store::detail_of(r.id).unwrap_or_else(|e| {
-        eprintln!("web release {}: its spot: {e}", r.id);
-        None
-    });
-    if let Some(spot) = &spot {
-        match spot.removed {
-            Some(_) => tags.push_str(&tag("tag-warn", "SPOT REMOVED")),
-            None => tags.push_str(&spot_tag(&spot.spot.poster, &spot.spot.title)),
-        }
+    if loaded.spot_removed {
+        tags.push_str(&tag("tag-warn", "SPOT REMOVED"));
+    } else if let Some(spot) = loaded.spot {
+        tags.push_str(&spot_tag(spot.poster, spot.title));
     }
-    // missing data its PAR2 volumes can rebuild: listed as whole, as a client repairs it, and said soo
-    let repair = !r.complete
-        && split_groups.is_none()
-        && recovery.is_none()
-        && contents.data_articles_seen < contents.data_articles_expected
-        && contents.repairable();
+    let repair = loaded.repair;
     tags.push_str(&if r.complete || repair { tag("tag-ok", "COMPLETE") } else { tag("tag-warn", "INCOMPLETE") });
     if repair {
         tags.push_str(&repair_tag());
@@ -3066,10 +3072,7 @@ fn release_html(
         );
     }
     fact("Posted", escape(&fmt_date(r.posted_date.as_deref())));
-    let posted_name = names.map_or(r.name.as_str(), |n| n.posted.as_str());
-    let groups = split_groups
-        .map(<[release_info::GroupPosting]>::to_vec)
-        .unwrap_or_else(|| release_info::groups_of(posted_name).unwrap_or_default());
+    let groups = loaded.groups;
     if groups.len() > 1 {
         let list: Vec<String> = groups
             .iter()
@@ -3126,24 +3129,7 @@ fn release_html(
         fact("Parts", parts.to_string());
     }
     fact("Encryption", encryption_fact(inner));
-    let conn = crate::db::open().ok();
-    // the other postings, read once: the password below and the copies further down both use them
-    let found_copies = conn.as_ref().and_then(|c| crate::duplicates::copies_with(c, r.id).ok()).unwrap_or_default();
-    let own_hint = conn.as_ref().and_then(|c| crate::duplicates::own_password_hint(c, r.id, names));
-    let inherited = match (&own_hint, conn.as_ref()) {
-        (Some(hint), _) => Some(crate::duplicates::Inherited {
-            hint: release_info::PasswordHint { password: hint.password.clone(), source: hint.source },
-            from: r.id,
-            from_name: r.name.clone(),
-        }),
-        (None, Some(c)) => crate::duplicates::carried_password(c, r.id, &found_copies),
-        (None, None) => None,
-    };
-    if let Some(hint) = &own_hint {
-        fact("Password", password_fact(inner, hint));
-    } else if let Some(from) = &inherited {
-        fact("Password", inherited_password_fact(from));
-    }
+    fact("Password", loaded.password.to_owned());
     if contents.files > 0 {
         fact("Files", contents.files.to_string());
     }
@@ -3159,26 +3145,65 @@ fn release_html(
         fact("Links", links);
     }
 
+    (shown, raw, tags, facts)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn release_html(
+    r: &ReleaseRow,
+    category: Option<i64>,
+    inner: &crate::archive::store::InnerView,
+    media: Option<&MediaAttrs>,
+    names: Option<&release_info::Names>,
+    contents: &release_info::Contents,
+    recovery: Option<&release_info::RecoveryOnly>,
+    split_groups: Option<&[release_info::GroupPosting]>,
+    post_ids: &[i64],
+    api_key: &str,
+) -> String {
+    let category = category.unwrap_or(UNCATEGORIZED);
+    // only what's kept: the title panel below fetches what isn't
+    let details =
+        media.and_then(|m| crate::media::details::kept_for(std::iter::once((r.id, m.kind, &m.ids))).remove(&r.id));
+    let spot = crate::spotnet::store::detail_of(r.id).unwrap_or_else(|e| {
+        eprintln!("web release {}: its spot: {e}", r.id);
+        None
+    });
+    // missing data its PAR2 volumes can rebuild: listed as whole, as a client repairs it, and said soo
+    let repair = !r.complete
+        && split_groups.is_none()
+        && recovery.is_none()
+        && contents.data_articles_seen < contents.data_articles_expected
+        && contents.repairable();
+    let posted_name = names.map_or(r.name.as_str(), |n| n.posted.as_str());
+    let groups = split_groups
+        .map(<[release_info::GroupPosting]>::to_vec)
+        .unwrap_or_else(|| release_info::groups_of(posted_name).unwrap_or_default());
+    let conn = crate::db::open().ok();
+    // the other postings, read once: the password below and the copies further down both use them
+    let found_copies = conn.as_ref().and_then(|c| crate::duplicates::copies_with(c, r.id).ok()).unwrap_or_default();
+    let own_hint = conn.as_ref().and_then(|c| crate::duplicates::own_password_hint(c, r.id, names));
+    let inherited = match (&own_hint, conn.as_ref()) {
+        (Some(hint), _) => Some(crate::duplicates::Inherited {
+            hint: release_info::PasswordHint { password: hint.password.clone(), source: hint.source },
+            from: r.id,
+            from_name: r.name.clone(),
+        }),
+        (None, Some(c)) => crate::duplicates::carried_password(c, r.id, &found_copies),
+        (None, None) => None,
+    };
+    let password = if let Some(hint) = &own_hint {
+        password_fact(inner, hint)
+    } else if let Some(from) = &inherited {
+        inherited_password_fact(from)
+    } else { String::new() };
+    let (shown, raw, tags, facts) = release_header_from_facts(r, inner, media, names, contents, recovery,
+        ReleaseHeaderFacts {category,details:details.as_ref(),spot:spot.as_ref().map(|detail|SpotBadge {poster:&detail.spot.poster,title:&detail.spot.title}),
+            spot_removed:spot.as_ref().is_some_and(|detail|detail.removed.is_some()),repair,groups:&groups,password:&password});
+
     // the post's rows, this one first: its pictures and NFO can be in any of them
     let rows: Vec<i64> = if post_ids.is_empty() { vec![r.id] } else { post_ids.to_vec() };
-    let (heading, listed) = inner_files_listed(inner, recovery.is_some());
-    let files = if listed.is_empty() {
-        String::new()
-    } else {
-        let rows: String = listed
-            .iter()
-            .map(|f| {
-                format!(
-                    "<tr><td class=\"name\">{}</td><td class=\"num\">{}</td></tr>",
-                    escape(&f.name),
-                    fmt_size(f.size)
-                )
-            })
-            .collect();
-        format!(
-            "<h2>{heading}</h2><div class=\"table-wrap\"><table><thead><tr><th>Name</th><th class=\"num\">Size</th></tr></thead><tbody>{rows}</tbody></table></div>"
-        )
-    };
+    let files = inner_files_html(inner, recovery.is_some());
 
     // the probe row is decoded once: the panels below read the same one
     // its own stills, or those of a release with the same video file: shown from there, never made or kept twice
@@ -3241,6 +3266,16 @@ fn release_html(
         spot_html(d, &said)
     });
 
+    release_page_from_facts(r, &shown, raw.as_deref(), &tags, &facts, category,
+        ReleaseSections {fill,warning,spot,nfo,images,stills,copies,meta,probe,nzb_files,files})
+}
+
+struct ReleaseSections {
+    fill:String,warning:String,spot:String,nfo:String,images:String,stills:String,
+    copies:String,meta:String,probe:String,nzb_files:String,files:String,
+}
+fn release_page_from_facts(r:&ReleaseRow,shown:&str,raw:Option<&str>,tags:&str,facts:&str,category:i64,sections:ReleaseSections)->String {
+    let ReleaseSections {fill,warning,spot,nfo,images,stills,copies,meta,probe,nzb_files,files}=sections;
     page(
         &format!("{shown} · Atlas"),
         &format!(
@@ -3264,9 +3299,30 @@ fn release_html(
             masthead = masthead(true),
             id = r.id,
             name = escape(&shown),
-            raw = raw_name_html(raw.as_deref()),
+            raw = raw_name_html(raw),
         ),
     )
+}
+
+fn inner_files_html(inner:&crate::archive::store::InnerView,repairs:bool)->String {
+    let (heading, listed) = inner_files_listed(inner, repairs);
+    if listed.is_empty() {
+        String::new()
+    } else {
+        let rows: String = listed
+            .iter()
+            .map(|f| {
+                format!(
+                    "<tr><td class=\"name\">{}</td><td class=\"num\">{}</td></tr>",
+                    escape(&f.name),
+                    fmt_size(f.size)
+                )
+            })
+            .collect();
+        format!(
+            "<h2>{heading}</h2><div class=\"table-wrap\"><table><thead><tr><th>Name</th><th class=\"num\">Size</th></tr></thead><tbody>{rows}</tbody></table></div>"
+        )
+    }
 }
 
 /// The release page's list of the files a release holds, and its heading. An archive's own headers say what is
@@ -4587,6 +4643,11 @@ fn same_key_page(args: &HashMap<String, String>) -> ApiResponse {
             return release_problem(500, "caution", "the list could not be read", "The error is in Atlas's log.");
         }
     };
+    same_key_page_from_facts(&release,kind,has,&rows)
+}
+
+fn same_key_page_from_facts(release:&ReleaseRow,kind:crate::keys::Kind,has:bool,rows:&[ReleaseRow])->ApiResponse {
+    let id=release.id;
     let body = if !has {
         diag("note", "this release has no such key", "Its probe, PAR2 set or article timing doesn't give one.")
     } else if rows.is_empty() {
@@ -4606,8 +4667,8 @@ fn same_key_page(args: &HashMap<String, String>) -> ApiResponse {
                 )
             })
             .collect();
-        let capped = if rows.len() as i64 >= keys::LIST_CAP {
-            format!("<p class=\"sort\">The newest {} are listed.</p>", keys::LIST_CAP)
+        let capped = if rows.len() as i64 >= crate::keys::LIST_CAP {
+            format!("<p class=\"sort\">The newest {} are listed.</p>", crate::keys::LIST_CAP)
         } else {
             String::new()
         };

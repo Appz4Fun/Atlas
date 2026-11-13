@@ -152,7 +152,7 @@ pub fn read(ctx: &mut StepCtx<'_>, files: &[FileInfo], explicit: bool) -> Result
     let rel = ctx.release();
     let (id, name, group) = (rel.id, rel.name.clone(), rel.group.clone());
     let content_id = ctx.data().release_content_id(id)?.unwrap_or_default();
-    if !explicit && let Some(saved) = crate::raw_store::get_rev_volumes(&name, &group, &content_id) {
+    if !explicit && let Some(saved) = crate::raw_store::get_rev_volumes_checked(&name, &group, &content_id).map_err(StepError::from_cache)? {
         return Ok(writes(id, &kept(&saved)));
     }
     for file in sources.into_iter().take(TRIES) {
@@ -163,7 +163,7 @@ pub fn read(ctx: &mut StepCtx<'_>, files: &[FileInfo], explicit: bool) -> Result
         if volumes.is_empty() {
             continue;
         }
-        crate::raw_store::put_rev_volumes(&name, &group, &content_id, &volumes);
+        crate::raw_store::put_rev_volumes_checked(&name, &group, &content_id, &volumes).map_err(StepError::from_cache)?;
         return Ok(writes(id, &volumes));
     }
     Ok(Vec::new())

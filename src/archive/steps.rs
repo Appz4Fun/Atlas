@@ -35,13 +35,13 @@ fn named_as_an_image(release: &ReleaseInfo) -> bool {
 
 /// A file's first article. None: it was never indexed, and a fetch would read the wrong bytes.
 pub(crate) fn first_article(ctx: &StepCtx<'_>, file: &FileInfo) -> Result<Option<SegmentRef>, StepError> {
-    let seg = ctx.segments(file.id, &SegmentPick::First(1)).map_err(retry)?.into_iter().next();
+    let seg = ctx.segments(file.id, &SegmentPick::First(1)).map_err(StepError::from_inventory)?.into_iter().next();
     Ok(seg.filter(|s| s.part.is_none_or(|p| p <= 1)))
 }
 
 /// A file's last articles, last one last. Empty when its last isnt indexed.
 pub(crate) fn tail_articles(ctx: &StepCtx<'_>, file: &FileInfo) -> Result<Vec<SegmentRef>, StepError> {
-    let segs = ctx.segments(file.id, &SegmentPick::Last(2)).map_err(retry)?;
+    let segs = ctx.segments(file.id, &SegmentPick::Last(2)).map_err(StepError::from_inventory)?;
     let last_is_there = match (file.expected, segs.last().and_then(|s| s.part)) {
         (Some(expected), Some(part)) => part == expected,
         (Some(_), None) => false,
@@ -56,19 +56,20 @@ pub(crate) fn tail_articles(ctx: &StepCtx<'_>, file: &FileInfo) -> Result<Vec<Se
 /// generation, and whether any are left after these, when the upload is known.
 #[allow(clippy::type_complexity)]
 fn xref_heads<'a>(
-    ctx: &StepCtx<'_>,
+    ctx: &mut StepCtx<'_>,
     files: &'a [FileInfo],
 ) -> Result<(Vec<(Head<'a>, SegmentRef)>, Option<(i64, i64)>, bool), StepError> {
-    if crate::pg::linker_runtime::active() {
-        return Err(retry("native archive lead traversal requires the durable probe-window port"));
-    }
     let volumes = select::volumes(files);
     let name = ctx.release().name.clone();
-    let tried = crate::xref::tried(&name);
+    let id=ctx.release().id;
+    let tried = ctx.data().xref_tried(id,&name)?;
+    if matches!(ctx.data(),crate::postprocess::data::StepData::Native(_)) && let Some((_,generation))=tried {
+        ctx.crcs.push(StepWrite::for_mutation(id,StepMutation::XrefRead {generation}));
+    }
     let (heads, left) = xref_order(&volumes, tried.map_or(0, |(n, _)| n.max(0) as usize), |f| {
-        let leads = crate::xref::file_of(&f.filename).map(|k| crate::xref::leads(&name, k)).unwrap_or_default();
+        let leads = crate::xref::file_of(&f.filename).map(|k|ctx.data().xref_leads(id,&name,k,tried.map(|(_,generation)|generation))).transpose()?.unwrap_or_default();
         let pick = if leads.is_empty() { SegmentPick::First(crate::xref::LEADS) } else { SegmentPick::Parts(leads) };
-        ctx.segments(f.id, &pick).map_err(retry)
+        ctx.segments(f.id, &pick).map_err(StepError::from_inventory)
     })?;
     let heads = heads.into_iter().map(|(f, seg)| (Head { file: f, tail: f, probe: true }, seg)).collect();
     Ok((heads, tried, left))
@@ -140,14 +141,14 @@ pub(crate) fn whole_file_within(
         return Ok(None);
     }
     let mut by_part: std::collections::BTreeMap<i64, Vec<SegmentRef>> = std::collections::BTreeMap::new();
-    for seg in ctx.segments(file.id, &SegmentPick::Parts((1..=parts).collect())).map_err(retry)? {
+    for seg in ctx.segments(file.id, &SegmentPick::Parts((1..=parts).collect())).map_err(StepError::from_inventory)? {
         if let Some(part) = seg.part {
             by_part.entry(part).or_default().push(seg);
         }
     }
     // one article posted with no counter has no part number to pick it by
     if parts == 1 && by_part.is_empty() {
-        by_part.insert(1, ctx.segments(file.id, &SegmentPick::First(1)).map_err(retry)?);
+        by_part.insert(1, ctx.segments(file.id, &SegmentPick::First(1)).map_err(StepError::from_inventory)?);
     }
     if by_part.len() as i64 != parts || by_part.values().any(Vec::is_empty) {
         return Ok(None);
@@ -337,7 +338,7 @@ fn trusted_part(
         return Ok(None);
     }
     left.articles -= 1;
-    let segs = ctx.segments(file.id, &SegmentPick::Parts(vec![part])).map_err(retry)?;
+    let segs = ctx.segments(file.id, &SegmentPick::Parts(vec![part])).map_err(StepError::from_inventory)?;
     let Some(seg) = segs.into_iter().find(|s| s.part == Some(part)) else { return Ok(None) };
     let Some(body) = fetch_one(ctx, &seg, &file.filename)? else { return Ok(None) };
     kept.push((seg.message_id, body.clone()));
@@ -355,14 +356,14 @@ fn own_whole(ctx: &StepCtx<'_>, file: &FileInfo) -> Result<Option<follow::Whole>
         return Ok(None);
     }
     let mut ids: std::collections::BTreeMap<i64, String> = std::collections::BTreeMap::new();
-    for seg in ctx.segments(file.id, &SegmentPick::Parts((1..=parts).collect())).map_err(retry)? {
+    for seg in ctx.segments(file.id, &SegmentPick::Parts((1..=parts).collect())).map_err(StepError::from_inventory)? {
         if let Some(part) = seg.part {
             ids.entry(part).or_insert(seg.message_id);
         }
     }
     // one article posted with no counter has no part number to pick it by
     if parts == 1 && ids.is_empty() {
-        for seg in ctx.segments(file.id, &SegmentPick::First(1)).map_err(retry)? {
+        for seg in ctx.segments(file.id, &SegmentPick::First(1)).map_err(StepError::from_inventory)? {
             ids.insert(1, seg.message_id);
         }
     }
@@ -387,7 +388,7 @@ fn with_nzb(
     let content_id = ctx.data().release_content_id(rel.id)?.unwrap_or_default();
     let Some((inside, nzb_pw)) = inside else {
         if has_inner_nzb && (!wrapper_encrypted || pw_available) {
-            crate::raw_store::put_nested_nzb_password(&rel.name, &rel.group, &content_id, "");
+            crate::raw_store::put_nested_nzb_password_checked(&rel.name, &rel.group, &content_id, "").map_err(StepError::from_cache)?;
         }
         return Ok(outcome);
     };
@@ -396,10 +397,10 @@ fn with_nzb(
     }
     let mut nested = finish(ctx, SOURCE_NZB, inside, limits)?;
     if let Some(pw) = nzb_pw {
-        crate::raw_store::put_nested_nzb_password(&rel.name, &rel.group, &content_id, &pw);
+        crate::raw_store::put_nested_nzb_password_checked(&rel.name, &rel.group, &content_id, &pw).map_err(StepError::from_cache)?;
         add_pointed_password_writes(ctx, &mut nested.writes, &pw, !wrapper_encrypted)?;
     } else {
-        crate::raw_store::put_nested_nzb_password(&rel.name, &rel.group, &content_id, "");
+        crate::raw_store::put_nested_nzb_password_checked(&rel.name, &rel.group, &content_id, "").map_err(StepError::from_cache)?;
     }
     Ok(merge_nzb(outcome, nested))
 }
@@ -409,7 +410,7 @@ fn add_pointed_password_writes(ctx: &StepCtx<'_>, writes: &mut Vec<StepWrite>, p
     let id = rel.id;
     if set_self {
         let content_id = ctx.data().release_content_id(id)?.unwrap_or_default();
-        crate::raw_store::put_nfo_password(&rel.name, &rel.group, &content_id, pw);
+        crate::raw_store::put_nfo_password_checked(&rel.name, &rel.group, &content_id, pw).map_err(StepError::from_cache)?;
         writes.push(StepWrite::for_mutation(id, StepMutation::SetNfoPassword { password: pw.to_string() }));
     }
     let target_names: Vec<String> = writes
@@ -441,7 +442,7 @@ fn known_or_post_password(
     if let Some(pw) = ctx.data().nfo_password(rel.id)? {
         extra.push(pw);
     }
-    if let Some(pw) = crate::raw_store::get_nfo_password(&rel.name, &rel.group, &content_id)
+    if let Some(pw) = crate::raw_store::get_nfo_password_checked(&rel.name, &rel.group, &content_id).map_err(StepError::from_cache)?
         && !extra.contains(&pw)
     {
         extra.push(pw);
@@ -543,13 +544,13 @@ fn restore_nzb(
         return Ok(None);
     }
     let rel = ctx.release();
-    let saved = crate::raw_store::get_archive_files(&rel.name, &rel.group, content_id, SOURCE_NZB);
+    let saved = crate::raw_store::get_archive_files_checked(&rel.name, &rel.group, content_id, SOURCE_NZB).map_err(StepError::from_cache)?;
     if saved.is_empty() {
         return Ok(None);
     }
     let pw = known_or_post_password(ctx, files, None)?
         .or_else(|| saved.iter().find_map(|f| crate::release_info::find_password(&f.name)));
-    if require_checked && pw.is_none() && !crate::raw_store::has_nfo_password_record(&rel.name, &rel.group, content_id)
+    if require_checked && pw.is_none() && !crate::raw_store::has_nfo_password_record_checked(&rel.name, &rel.group, content_id).map_err(StepError::from_cache)?
     {
         return Ok(None);
     }
@@ -645,7 +646,7 @@ fn finish_full(
         writes.push(StepWrite::for_mutation(id, StepMutation::ArchiveNamesOverQuota));
     }
     // part of a list would call two releases the same when only their first files are
-    let files = ctx.files().map_err(retry)?;
+    let files = ctx.files().map_err(StepError::from_inventory)?;
     let is_par2 = |name: &str| name.to_ascii_lowercase().ends_with(".par2");
     let speaks_for_release = if source == SOURCE_PAR2 {
         listing.files.len() == files.iter().filter(|f| !is_par2(&f.filename)).count()
@@ -663,7 +664,7 @@ fn finish_full(
     if persist_raw {
         let content_id = ctx.data().release_content_id(id)?.unwrap_or_default();
         let check_bytes = listing.password_check.map(|c| c.to_bytes());
-        crate::raw_store::put_archive(&crate::raw_store::ArchiveRecord {
+        crate::raw_store::put_archive_checked(&crate::raw_store::ArchiveRecord {
             name: &release.name,
             group_name: &release.group,
             content_id: &content_id,
@@ -682,7 +683,7 @@ fn finish_full(
             keys: if is_archive { keys.clone() } else { Default::default() },
             key_salt: salt.map(crate::keys::salt_id),
             facts: if is_archive { facts } else { 0 },
-        });
+        }).map_err(StepError::from_cache)?;
     }
     // a PAR2 set of archive volumes says nothing about what's inside them: that's the archive step's to say
     let leaves_it = source == SOURCE_NZB
@@ -777,26 +778,26 @@ fn restore_archive(
         .find_map(|f| crate::release_info::find_password(&f.name));
     let mut outcome =
         finish_full(ctx, source, listing, password_override, Some(saved.content_fp), false, restored, limits)?;
-    let posted_files = ctx.files().unwrap_or_default();
+    let posted_files = ctx.files().map_err(StepError::from_inventory)?;
     let wrapper_pw = if encrypted { known_or_post_password(ctx, &posted_files, wrapper_check.as_ref())? } else { None };
     let rel = ctx.release();
     if require_password_inspected
         && encrypted
         && wrapper_pw.is_none()
-        && !crate::raw_store::has_nfo_password_record(&rel.name, &rel.group, content_id)
+        && !crate::raw_store::has_nfo_password_record_checked(&rel.name, &rel.group, content_id).map_err(StepError::from_cache)?
     {
         return Ok(None);
     }
     if let Some(ref pw) = wrapper_pw {
-        crate::raw_store::put_nfo_password(&rel.name, &rel.group, content_id, pw);
+        crate::raw_store::put_nfo_password_checked(&rel.name, &rel.group, content_id, pw).map_err(StepError::from_cache)?;
         outcome.writes.push(StepWrite::for_mutation(rel.id, StepMutation::SetNfoPassword { password: pw.clone() }));
     }
-    let nested = crate::raw_store::get_archive_files(&rel.name, &rel.group, content_id, SOURCE_NZB);
+    let nested = crate::raw_store::get_archive_files_checked(&rel.name, &rel.group, content_id, SOURCE_NZB).map_err(StepError::from_cache)?;
     if nested.is_empty() {
         if require_password_inspected
             && has_inner_nzb
             && (!encrypted || wrapper_pw.is_some())
-            && !crate::raw_store::has_nested_nzb_password_record(&rel.name, &rel.group, content_id)
+            && !crate::raw_store::has_nested_nzb_password_record_checked(&rel.name, &rel.group, content_id).map_err(StepError::from_cache)?
         {
             return Ok(None);
         }
@@ -804,7 +805,7 @@ fn restore_archive(
     }
     if require_password_inspected
         && inner_nzb_pw.is_none()
-        && !crate::raw_store::has_nested_nzb_password_record(&rel.name, &rel.group, content_id)
+        && !crate::raw_store::has_nested_nzb_password_record_checked(&rel.name, &rel.group, content_id).map_err(StepError::from_cache)?
     {
         return Ok(None);
     }
@@ -812,7 +813,7 @@ fn restore_archive(
     let hop_pw = files.iter().find_map(|f| crate::release_info::find_password(&f.name));
     let listing = Listing { files, complete: true, ..Default::default() };
     let mut nested = finish_with_override(ctx, SOURCE_NZB, listing, None, Some(None), false, limits)?;
-    let mut nzb_pw = crate::raw_store::get_nested_nzb_password(&rel.name, &rel.group, content_id)
+    let mut nzb_pw = crate::raw_store::get_nested_nzb_password_checked(&rel.name, &rel.group, content_id).map_err(StepError::from_cache)?
         .or(inner_nzb_pw)
         .or(hop_pw);
     if nzb_pw.is_none() && !encrypted { nzb_pw = known_or_post_password(ctx, &posted_files, None)?; }
@@ -904,7 +905,7 @@ fn read_set(ctx: &mut StepCtx<'_>, file: &FileInfo) -> Result<Option<par2::Inven
     let is_base = select::classify(&file.filename) == Kind::Par2Base;
     // a volume can start with a recovery slice and end with the list: either end will do to start from
     let last = |ctx: &StepCtx<'_>| -> Result<Option<SegmentRef>, StepError> {
-        Ok(ctx.segments(file.id, &SegmentPick::Last(1)).map_err(retry)?.into_iter().last())
+        Ok(ctx.segments(file.id, &SegmentPick::Last(1)).map_err(StepError::from_inventory)?.into_iter().last())
     };
     let (seg, from_end) = match first_article(ctx, file)? {
         Some(seg) => (seg, false),
@@ -919,7 +920,7 @@ fn read_set(ctx: &mut StepCtx<'_>, file: &FileInfo) -> Result<Option<par2::Inven
     if !inventory.complete {
         // a base's next article, or a volume's other end
         let next = if is_base {
-            ctx.segments(file.id, &SegmentPick::First(2)).map_err(retry)?.into_iter().last()
+            ctx.segments(file.id, &SegmentPick::First(2)).map_err(StepError::from_inventory)?.into_iter().last()
         } else if from_end {
             first_article(ctx, file)?
         } else {
@@ -968,7 +969,7 @@ impl Step for Par2Step {
         1
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
-        let files = ctx.files().map_err(retry)?;
+        let files = ctx.files().map_err(StepError::from_inventory)?;
         let explicit = ctx.data().explicit_rerun(ctx.release().id, PAR2_STEP)?;
         let mut outcome = self.read_par2(ctx, &files)?;
         // RAR recovery volumes repair a set as PAR2 does, and are often posted in its place. Read after the set, soo
@@ -993,8 +994,8 @@ impl Par2Step {
         let rel_parts = ctx.release().parts;
         let rel_complete = ctx.release().complete;
         let content_id = ctx.data().release_content_id(rel_id)?.unwrap_or_default();
-        let saved_par2 = crate::raw_store::get_archive_files(&rel_name, &rel_group, &content_id, SOURCE_PAR2);
-        let par2_meta = crate::raw_store::get_par2(&rel_name, &rel_group, &content_id, rel_parts, rel_complete);
+        let saved_par2 = crate::raw_store::get_archive_files_checked(&rel_name, &rel_group, &content_id, SOURCE_PAR2).map_err(StepError::from_cache)?;
+        let par2_meta = crate::raw_store::get_par2_checked(&rel_name, &rel_group, &content_id, rel_parts, rel_complete).map_err(StepError::from_cache)?;
         if !ctx.data().explicit_rerun(rel_id, PAR2_STEP)?
             && !saved_par2.is_empty()
             && let Some(meta) = par2_meta.as_ref().filter(|m| m.inventory.is_some())
@@ -1048,7 +1049,7 @@ impl Par2Step {
         let content_fp = (covers_all && !leaves_content)
             .then(|| duplicates::content_fingerprint(inventory.files.iter().map(|f| (f.name.as_str(), Some(f.size)))))
             .flatten();
-        crate::raw_store::put_par2(&crate::raw_store::Par2Record {
+        crate::raw_store::put_par2_checked(&crate::raw_store::Par2Record {
             name: &rel_name,
             group_name: &rel_group,
             content_id: &content_id,
@@ -1059,7 +1060,7 @@ impl Par2Step {
             complete: rel_complete,
             content_fp: content_fp.as_deref(),
             inventory: Some(&inventory),
-        });
+        }).map_err(StepError::from_cache)?;
         // the set's files, hashes and all: what the link step and twin fill go by without reading the set again
         let kept = archive_store::par2_file_writes(ctx.release().id, &inventory);
         let mut outcome = finish(ctx, SOURCE_PAR2, listing_of(inventory), &limits)?;
@@ -1183,7 +1184,7 @@ fn part_of(
     left: &mut usize,
     kept: &mut Vec<(String, Vec<u8>)>,
 ) -> Result<Option<Vec<u8>>, StepError> {
-    let segs = ctx.segments(file.id, &SegmentPick::Parts(vec![part])).map_err(retry)?;
+    let segs = ctx.segments(file.id, &SegmentPick::Parts(vec![part])).map_err(StepError::from_inventory)?;
     let Some(seg) = segs.into_iter().find(|s| s.part == Some(part)) else { return Ok(None) };
     let body = budgeted(ctx, &seg, &file.filename, left)?;
     if let Some(body) = &body {
@@ -1303,7 +1304,7 @@ impl Step for ListStep {
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let limits = self.limits.lock().unwrap().clone();
-        let files = ctx.files().map_err(retry)?;
+        let files = ctx.files().map_err(StepError::from_inventory)?;
         let rel = ctx.release();
         let rel_id = rel.id;
         let rel_name = rel.name.clone();
@@ -1311,7 +1312,7 @@ impl Step for ListStep {
         let content_id = ctx.data().release_content_id(rel_id)?.unwrap_or_default();
         if !ctx.data().explicit_rerun(rel_id, LIST_STEP)? {
             if let Some(saved) =
-                crate::raw_store::get_archive(&rel_name, &rel_group, &content_id, rel.parts, rel.complete)
+                crate::raw_store::get_archive_checked(&rel_name, &rel_group, &content_id, rel.parts, rel.complete).map_err(StepError::from_cache)?
                 && saved.facts >= archive_store::FACTS
                 && !(saved.names_hidden && saved.files.is_empty())
                 && let Some(outcome) = restore_archive(ctx, saved, &content_id, true, &limits)?
@@ -1322,10 +1323,10 @@ impl Step for ListStep {
                 return Ok(outcome);
             }
             if select::par2_source(&files).is_none() {
-                let saved_par2 = crate::raw_store::get_archive_files(&rel_name, &rel_group, &content_id, SOURCE_PAR2);
+                let saved_par2 = crate::raw_store::get_archive_files_checked(&rel_name, &rel_group, &content_id, SOURCE_PAR2).map_err(StepError::from_cache)?;
                 if !saved_par2.is_empty()
                     && let Some(inv) =
-                        crate::raw_store::get_par2_files(&rel_name, &rel_group, &content_id).filter(|i| i.complete)
+                        crate::raw_store::get_par2_files_checked(&rel_name, &rel_group, &content_id).map_err(StepError::from_cache)?.filter(|i| i.complete)
                 {
                     let restored = saved_par2.into_iter().map(|f| f.into_inner()).collect();
                     let mut outcome = finish_with_override(
@@ -1398,7 +1399,9 @@ impl Step for ListStep {
                     matches!(identify(b), Format::Rar4 | Format::Rar5 | Format::Zip | Format::SevenZip)
                 });
                 if !is_start && let Some((before, generation)) = xref_tried {
-                    crate::xref::tried_through(&rel_name, generation, before + k as i64 + 1);
+                    if matches!(ctx.data(),crate::postprocess::data::StepData::Native(_)) {
+                        ctx.crcs.push(StepWrite::for_mutation(ctx.release().id,StepMutation::XrefTried {generation,count:before+k as i64+1}));
+                    } else {crate::xref::tried_through(&rel_name, generation, before + k as i64 + 1);}
                 }
                 got
             } else if head.probe {
@@ -1444,12 +1447,12 @@ impl Step for ListStep {
                     let mut outcome = finish(ctx, SOURCE_RAR, listing, &limits)?;
                     outcome.writes.append(&mut nfo_writes);
                     if let Some(pw) = pw_found {
-                        crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, &pw);
+                        crate::raw_store::put_nfo_password_checked(&rel_name, &rel_group, &content_id, &pw).map_err(StepError::from_cache)?;
                         outcome
                             .writes
                             .push(StepWrite::for_mutation(rel_id, StepMutation::SetNfoPassword { password: pw }));
                     } else if wrapper_encrypted {
-                        crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, "");
+                        crate::raw_store::put_nfo_password_checked(&rel_name, &rel_group, &content_id, "").map_err(StepError::from_cache)?;
                     }
                     return with_nzb(ctx, outcome, inside, wrapper_encrypted, has_inner_nzb, pw_available, &limits);
                 }
@@ -1487,12 +1490,12 @@ impl Step for ListStep {
                     let mut outcome = finish(ctx, SOURCE_ZIP, listing, &limits)?;
                     outcome.writes.append(&mut nfo_writes);
                     if let Some(pw) = pw_found {
-                        crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, &pw);
+                        crate::raw_store::put_nfo_password_checked(&rel_name, &rel_group, &content_id, &pw).map_err(StepError::from_cache)?;
                         outcome
                             .writes
                             .push(StepWrite::for_mutation(rel_id, StepMutation::SetNfoPassword { password: pw }));
                     } else if wrapper_encrypted {
-                        crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, "");
+                        crate::raw_store::put_nfo_password_checked(&rel_name, &rel_group, &content_id, "").map_err(StepError::from_cache)?;
                     }
                     return with_nzb(ctx, outcome, inside, wrapper_encrypted, has_inner_nzb, pw_available, &limits);
                 }
@@ -1519,12 +1522,12 @@ impl Step for ListStep {
                     let mut outcome = finish(ctx, SOURCE_7Z, listing, &limits)?;
                     outcome.writes.append(&mut nfo_writes);
                     if let Some(pw) = pw_found {
-                        crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, &pw);
+                        crate::raw_store::put_nfo_password_checked(&rel_name, &rel_group, &content_id, &pw).map_err(StepError::from_cache)?;
                         outcome
                             .writes
                             .push(StepWrite::for_mutation(rel_id, StepMutation::SetNfoPassword { password: pw }));
                     } else if wrapper_encrypted {
-                        crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, "");
+                        crate::raw_store::put_nfo_password_checked(&rel_name, &rel_group, &content_id, "").map_err(StepError::from_cache)?;
                     }
                     return with_nzb(ctx, outcome, inside, wrapper_encrypted, has_inner_nzb, pw_available, &limits);
                 }
@@ -1534,7 +1537,7 @@ impl Step for ListStep {
                     if inventory.files.is_empty() {
                         continue;
                     }
-                    crate::raw_store::put_par2_files(&rel_name, &rel_group, &content_id, &inventory);
+                    crate::raw_store::put_par2_files_checked(&rel_name, &rel_group, &content_id, &inventory).map_err(StepError::from_cache)?;
                     let kept = archive_store::par2_file_writes(ctx.release().id, &inventory);
                     let listing = listing_of(inventory);
                     let listed = listing.files.len();
@@ -1579,13 +1582,13 @@ impl Step for ListStep {
                 if let Some(pw) = pw {
                     add_pointed_password_writes(ctx, &mut outcome.writes, &pw, true)?;
                 } else {
-                    crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, "");
+                    crate::raw_store::put_nfo_password_checked(&rel_name, &rel_group, &content_id, "").map_err(StepError::from_cache)?;
                 }
                 return Ok(outcome);
             }
         }
         let rel = ctx.release();
-        if let Some(saved) = crate::raw_store::get_archive(&rel.name, &rel.group, &content_id, 0, false)
+        if let Some(saved) = crate::raw_store::get_archive_checked(&rel.name, &rel.group, &content_id, 0, false).map_err(StepError::from_cache)?
             && let Some(outcome) = restore_archive(ctx, saved, &content_id, false, &limits)?
         {
             return Ok(outcome);
@@ -1595,7 +1598,7 @@ impl Step for ListStep {
             return Ok(outcome);
         }
         if select::par2_source(&files).is_none() {
-            let saved_par2 = crate::raw_store::get_archive_files(&rel_name, &rel_group, &content_id, SOURCE_PAR2);
+            let saved_par2 = crate::raw_store::get_archive_files_checked(&rel_name, &rel_group, &content_id, SOURCE_PAR2).map_err(StepError::from_cache)?;
             if !saved_par2.is_empty() {
                 let restored = saved_par2.into_iter().map(|f| f.into_inner()).collect();
                 let mut outcome = finish_with_override(
@@ -1607,7 +1610,7 @@ impl Step for ListStep {
                     false,
                     &limits,
                 )?;
-                if let Some(inv) = crate::raw_store::get_par2_files(&rel_name, &rel_group, &content_id) {
+                if let Some(inv) = crate::raw_store::get_par2_files_checked(&rel_name, &rel_group, &content_id).map_err(StepError::from_cache)? {
                     outcome.writes.extend(archive_store::par2_file_writes(rel_id, &inv));
                 }
                 return Ok(outcome);

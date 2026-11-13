@@ -152,7 +152,7 @@ const MIN_LINKED: u64 = 1 << 20;
 const MIN_SIZE_ONLY: u64 = 64 << 20;
 /// How far apart, in ids of this shard, an upload's rows can be: they're read from one run of articles, but other
 /// groups' saves come in between, and an upload cut across groups lands in each group's own run.
-pub(super) const ID_WINDOW: i64 = 2_000_000;
+pub(crate) const ID_WINDOW: i64 = 2_000_000;
 
 /// The ids `saves` saves either way of `id`, one id to a save.
 pub(super) fn id_window(id: i64, saves: i64) -> (i64, i64) {
@@ -160,16 +160,16 @@ pub(super) fn id_window(id: i64, saves: i64) -> (i64, i64) {
 }
 /// How far apart, in seconds, a small file posted beside a release can say it was posted: an upload's files go up
 /// within a minute or two of each other, and this allows a slow one.
-pub(super) const BESIDE_SECS: i64 = 30 * 60;
+pub(crate) const BESIDE_SECS: i64 = 30 * 60;
 /// Rows checked, at most, for the small files one release's set names.
-const BESIDE_CHECKS: usize = 8;
+pub(crate) const BESIDE_CHECKS: usize = 8;
 /// Names looked up, at most, for one release's small files.
 const BESIDE_LOOKUPS: usize = 32;
 /// How far apart in days an upload's files can say they were posted. Real ones are an hour or two; a slow or resumed
 /// upload a day or two.
-const DAY_WINDOW: f64 = 3.0;
+pub(crate) const DAY_WINDOW: f64 = 3.0;
 /// Rows looked at, at most, and articles fetched to check them, per run.
-const MAX_CANDIDATES: usize = 20_000;
+pub(crate) const MAX_CANDIDATES: usize = 20_000;
 const MAX_CHECKS: usize = 64;
 /// A volume whose files haven't turned up looks again this often, while it's this new.
 const LOOK_AGAIN_SECS: i64 = 3 * 3600;
@@ -327,6 +327,13 @@ pub(crate) struct Candidate {
     /// days from the volume's own date
     apart: f64,
     clock: Option<Clock>,
+}
+
+impl Candidate {
+    /// Checked storage adapters supply read facts, never mutation authority.
+    pub(crate) fn from_read(id:i64,bytes:i64,parts:i64,file:FileInfo,apart:f64,clock:Option<Clock>)->Self {
+        Self {id,bytes,parts,file,apart,clock}
+    }
 }
 
 /// A file's clock, from its timing row.
@@ -529,7 +536,7 @@ impl LinkStep {
         }
         let mut inventory = par2::inventory(&body);
         if !inventory.complete {
-            let last = ctx.segments(file.id, &SegmentPick::Last(1)).map_err(retry)?.into_iter().last();
+            let last = ctx.segments(file.id, &SegmentPick::Last(1)).map_err(StepError::from_inventory)?.into_iter().last();
             if let Some(last) = last.filter(|s| first.as_ref().is_none_or(|f| s.message_id != f.message_id))
                 && let Some(more) = fetch_one(ctx, &last, &file.filename)?
             {
@@ -620,7 +627,7 @@ impl LinkStep {
         if let Some(first) = first_article(ctx, file)? {
             return Ok(Some(first));
         }
-        Ok(ctx.segments(file.id, &SegmentPick::First(1)).map_err(retry)?.into_iter().next())
+        Ok(ctx.segments(file.id, &SegmentPick::First(1)).map_err(StepError::from_inventory)?.into_iter().next())
     }
 
     /// What a candidate's article says, or None when this run may fetch no more.
@@ -648,7 +655,7 @@ impl LinkStep {
 
     /// A file's last article, unless that's the one already tried.
     fn last_article(&self, ctx: &StepCtx<'_>, file: &FileInfo, tried: &str) -> Result<Option<SegmentRef>, StepError> {
-        let last = ctx.segments(file.id, &SegmentPick::Last(1)).map_err(retry)?.into_iter().last();
+        let last = ctx.segments(file.id, &SegmentPick::Last(1)).map_err(StepError::from_inventory)?.into_iter().last();
         Ok(last.filter(|s| s.message_id != tried))
     }
 
@@ -709,7 +716,7 @@ impl Step for LinkStep {
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let id = ctx.release().id;
-        let files = ctx.files().map_err(retry)?;
+        let files = ctx.files().map_err(StepError::from_inventory)?;
         let Some(par2_file) = self.par2_file(ctx, &files)? else {
             // small files its set names, then the ones it doesn't: an NFO posted on its own, a counted thumbnail
             let by_set = self.small_beside(ctx, &files)?;
@@ -881,7 +888,7 @@ fn beside_wanted<'a>(files: &'a [Par2File], own: &HashSet<String>) -> Vec<&'a Pa
 }
 
 /// `posted` (as releases keep it, `YYYY-MM-DD HH:MM:SS`) less and plus `secs`, in the same form.
-pub(super) fn beside_window(posted: &str, secs: i64) -> Option<(String, String)> {
+pub(crate) fn beside_window(posted: &str, secs: i64) -> Option<(String, String)> {
     let at = chrono::NaiveDateTime::parse_from_str(posted.get(..19)?, "%Y-%m-%d %H:%M:%S").ok()?;
     let shift = chrono::Duration::seconds(secs);
     let form = |t: chrono::NaiveDateTime| t.format("%Y-%m-%d %H:%M:%S").to_string();

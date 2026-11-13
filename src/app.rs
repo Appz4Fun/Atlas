@@ -753,6 +753,15 @@ fn status_line(config: &Config, indexing: bool) -> Line {
     line
 }
 
+fn native_web(storage:&crate::pg::StorageConfig)->i32 {
+    let Some(mut config)=load_config() else {ui::error("configuration unavailable; native Web UI was not started");return 1;};
+    if !api::start_for_storage(&mut config,storage) {return 1;}
+    crate::metrics::start(&config,crate::metrics::Role::Api);
+    // The API already owns its worker threads. Service termination closes
+    // read-only connections and anonymous spools; no terminal/shard loop runs.
+    loop {std::thread::park();}
+}
+
 /// Tools whose implementation still targets the legacy default catalog.
 /// Classification opens no config, database, asset, or provider. Callers must
 /// check it before dispatch, including when multiple command flags are given.
@@ -790,6 +799,13 @@ mod native_cli_boundary_tests {
 }
 
 pub fn main_menu() -> i32 {
+    // Select the native Web path before create_db, conversion, shard setup or
+    // terminal search factories can initialize a SQLite database.
+    match crate::config::checked_storage_config() {
+        Ok(storage) if storage.is_postgres()=>return native_web(&storage),
+        Err(_)=>{ui::error("storage configuration unavailable; Atlas was not started");return 1;}
+        _=>{},
+    }
     // compaction is held off only while setting up: the menu itself doesnt
     // write (its saves hold it off for themselves)
     match create_db() {

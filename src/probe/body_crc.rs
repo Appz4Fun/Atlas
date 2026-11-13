@@ -78,15 +78,14 @@ pub fn wanted_headers(head: &[u8]) -> Vec<(&'static str, String)> {
 /// The message-id of the article the probe read its yEnc lines from: its file's part `yenc.part`, or its first
 /// article when that is part 1 or says none (as `archive::steps::first_article` takes it).
 fn probed_article(ctx: &StepCtx<'_>, probe: &ProbeInfo) -> Result<Option<(String, String)>, StepError> {
-    let retry = |e: rusqlite::Error| StepError::Retry(e.to_string());
     let Some(name) = probe.file.as_deref() else { return Ok(None) };
     let part = probe.yenc.as_ref().and_then(|y| y.part).map_or(1, i64::from);
-    let files = ctx.files().map_err(retry)?;
+    let files = ctx.files().map_err(StepError::from_inventory)?;
     let Some(file) = files.iter().find(|f| f.filename == name) else { return Ok(None) };
     let segment = if part <= 1 {
         crate::archive::steps::first_article(ctx, file)?
     } else {
-        ctx.segments(file.id, &store::SegmentPick::Parts(vec![part])).map_err(retry)?.into_iter().next()
+        ctx.segments(file.id, &store::SegmentPick::Parts(vec![part])).map_err(StepError::from_inventory)?.into_iter().next()
     };
     Ok(segment.map(|s| (s.message_id, file.filename.clone())))
 }

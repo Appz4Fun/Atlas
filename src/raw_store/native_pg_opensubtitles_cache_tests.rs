@@ -233,9 +233,15 @@ fn child_with_backend(url: &str, schema: &str, action: &str, sqlite_oracle: bool
         .spawn()
         .unwrap();
     let until = Instant::now() + Duration::from_secs(10);
+    let term=matches!(action,"net-stop"|"net-stop-header"|"net-stop-rerun"|"net-stop-owner"|"net-stop-receipt"|"net-stop-outage");let mut term_sent=false;
     loop {
         if child.try_wait().unwrap().is_some() {
             break;
+        }
+        if term && !term_sent && home.path().join("native-term-ready").exists() {
+            // The retained Child owns this exact waiting PID; its marker is
+            // written only after the original NET begin and worker handshake.
+            assert_eq!(unsafe {libc::kill(child.id() as libc::pid_t,libc::SIGTERM)},0);term_sent=true;
         }
         if Instant::now() >= until {
             child.kill().unwrap();
@@ -245,6 +251,7 @@ fn child_with_backend(url: &str, schema: &str, action: &str, sqlite_oracle: bool
         std::thread::sleep(Duration::from_millis(20));
     }
     let output = child.wait_with_output().unwrap();
+    assert!(!term || term_sent,"stop fixture never received its real TERM");
     assert!(
         output.status.success(),
         "configured cache child failed: {}\n{}",
@@ -264,6 +271,28 @@ fn child_with_backend(url: &str, schema: &str, action: &str, sqlite_oracle: bool
         );
     }
     home
+}
+
+// These are closed worker fixtures in the same configured child lane. The
+// parent retains the URL and schema; workers receive only the real Runtime.
+pub(crate) enum WorkerCase { Category, Held, PredbOnly, FeedHeld, Factory, FanoutFence, AssetReuse, AssetStale, AssetDrain, AssetMissing, AssetUnselected, AssetCorrupt, AssetWaitMissing, AssetWaitUnselected }
+
+pub(crate) fn native_worker_parent(case:WorkerCase) {
+    let Some(mut schema)=Schema::new() else { return };
+    schema.seed();
+    let kept=schema.rows();
+    let action=match case {WorkerCase::Category=>"worker-loop",WorkerCase::Held=>"worker-held",WorkerCase::PredbOnly=>"worker-predb",WorkerCase::FeedHeld=>"worker-feed",WorkerCase::Factory=>"worker-factory",WorkerCase::FanoutFence=>"worker-fanout-fence",WorkerCase::AssetReuse=>"worker-asset-reuse",WorkerCase::AssetStale=>"worker-asset-stale",WorkerCase::AssetDrain=>"worker-asset-drain",WorkerCase::AssetMissing=>"worker-asset-missing",WorkerCase::AssetUnselected=>"worker-asset-unselected",WorkerCase::AssetCorrupt=>"worker-asset-corrupt",WorkerCase::AssetWaitMissing=>"worker-asset-wait-missing",WorkerCase::AssetWaitUnselected=>"worker-asset-wait-unselected"};
+    child(&schema.url,&schema.name,action);
+    assert_eq!(schema.rows(),kept,"native completion changed retained cache facts");
+    assert_eq!(schema.client.query_one("select count(*) from releases",&[]).unwrap().get::<_,i64>(0),if matches!(case,WorkerCase::PredbOnly|WorkerCase::Factory) {0}else{1});
+    if matches!(case,WorkerCase::PredbOnly|WorkerCase::Factory) {
+        assert_eq!(schema.client.query_one("select count(*) from pp_state",&[]).unwrap().get::<_,i64>(0),0);
+        assert_eq!(schema.client.query_one("select count(*) from pp_walks",&[]).unwrap().get::<_,i64>(0),0);
+    }
+    if matches!(case,WorkerCase::Held) {
+        assert_eq!(schema.client.query_one("select count(*) from native_operations",&[]).unwrap().get::<_,i64>(0),0);
+        assert_eq!(schema.client.query_one("select count(*) from pp_queue",&[]).unwrap().get::<_,i64>(0),1);
+    }
 }
 
 #[test]
@@ -373,6 +402,128 @@ fn invalid_initial_cache_configuration_is_an_error_without_echoing_its_contents(
     child("host=127.0.0.1 port=1 user=example dbname=example connect_timeout=1", "cache_fixture", "config-initial");
 }
 
+#[test]
+fn configured_costly_cache_roundtrips_on_owner_and_rejects_ended_attempt() {
+    let Some(schema) = Schema::new() else { return };
+    child(&schema.url, &schema.name, "costly");
+}
+
+#[test]
+fn native_database_runner_keeps_default_freeze_releases_and_cache_without_sqlite() {
+    let Some(mut schema)=Schema::new() else {return};schema.seed();let before=schema.rows();
+    child(&schema.url,&schema.name,"database-runner");
+    assert_eq!(schema.rows(),before,"native completion changed the kept external cache");
+    let count:i64=schema.client.query_one(&format!("select count(*) from {}.releases",schema.name),&[]).unwrap().get(0);
+    assert_eq!(count,1,"native completion must retain its catalog row in PostgreSQL");
+}
+
+#[test]
+fn native_network_runner_commits_a_real_body_crc_step_without_sqlite_or_http() {
+    let Some(mut schema)=Schema::new() else {return};schema.seed();let before=schema.rows();
+    child(&schema.url,&schema.name,"network-runner");assert_eq!(schema.rows(),before);
+}
+
+fn net_stop_parent(action:&str) {let Some(mut schema)=Schema::new() else {return};schema.seed();let before=schema.rows();child(&schema.url,&schema.name,action);assert_eq!(schema.rows(),before);}
+#[test]
+fn native_net_intentional_term_restores_before_budget_after_real_worker_join() {net_stop_parent("net-stop");}
+#[test]
+fn native_net_stop_refuses_changed_header() {net_stop_parent("net-stop-header");}
+#[test]
+fn native_net_stop_refuses_changed_rerun() {net_stop_parent("net-stop-rerun");}
+#[test]
+fn native_net_stop_refuses_a_different_owner() {net_stop_parent("net-stop-owner");}
+#[test]
+fn native_net_stop_refuses_a_committed_operation_receipt() {net_stop_parent("net-stop-receipt");}
+#[test]
+fn native_net_stop_outage_preserves_spent_attempts() {net_stop_parent("net-stop-outage");}
+
+fn costly_roundtrip() {
+    use atlas::raw_store::*;
+    let (name, group, content) = ("Kept", "own.group", &[1u8, 2][..]);
+    assert!(get_probe_checked(name, group, content, 4, true, 1).unwrap().is_none());
+    assert!(!has_nfo_password_record_checked(name, group, content).unwrap());
+    put_nfo_password_checked(name, group, content, "").unwrap();
+    assert!(has_nfo_password_record_checked(name, group, content).unwrap());
+    assert_eq!(get_nfo_password_checked(name, group, content).unwrap(), None);
+    for key in ["atlas.nfo-name.v1:4b657074", "kept", "é\0nzb"] {
+        put_nfo_password_checked(key, group, content, "distinct").unwrap();
+        assert_eq!(get_nfo_password_checked(key, group, content).unwrap().as_deref(),Some("distinct"));
+    }
+    assert_eq!(get_nfo_password_checked(name,group,content).unwrap(),None);
+    put_nested_nzb_password_checked(name, group, content, "nested-secret").unwrap();
+    assert_eq!(get_nested_nzb_password_checked(name, group, content).unwrap().as_deref(), Some("nested-secret"));
+    assert_eq!(get_nfo_password_checked(name, group, content).unwrap(), None);
+    assert!(has_nested_nzb_password_record_checked(name, group, content).unwrap());
+    put_nested_nzb_password_checked(name, group, content, "").unwrap();
+    assert!(has_nested_nzb_password_record_checked(name, group, content).unwrap());
+    assert_eq!(get_nested_nzb_password_checked(name, group, content).unwrap(), None);
+    let probe = ProbeRecord {name, group_name:group, content_id:content, crc32:Some(19), agent:Some("tool"),
+        info:r#"{"opaque":[1,2]}"#, moviehash:None, parts:4, complete:true, config_stamp:7,
+        nfo_password:Some(""), cover:Some(("image/jpeg","digest"))};
+    put_probe_checked(&probe).unwrap();
+    let saved = get_probe_checked(name, "cross.group", content, 4, true, 7).unwrap().unwrap();
+    assert_eq!(saved.info, probe.info);
+    assert_eq!(saved.nfo_password.as_deref(), Some(""));
+    assert_eq!(saved.cover, Some(("image/jpeg".into(),"digest".into())));
+    assert!(get_probe_checked(name, group, &[9], 4, true, 7).unwrap().is_none());
+    let still = SavedStill {position:25, at_ms:None, sha256:"digest".into(), width:2, height:3, phash:Some(-7)};
+    put_stills_checked(name, group, content, &[still.clone()]).unwrap();
+    assert_eq!(get_stills_checked(name, group, content).unwrap(), vec![still]);
+    let print = SavedPrint {position:50, at_ms:17, items:vec![0,255,0,1]};
+    put_audio_prints_checked(name, group, content, &[print.clone()]).unwrap();
+    assert_eq!(get_audio_prints_checked(name, group, content).unwrap(), vec![print]);
+    let files = [atlas::archive::InnerFile::new("inner".into(), Some(31))];
+    let archive = ArchiveRecord {name, group_name:group, content_id:content, source:2, files:&files, password:Some(0),
+        encryption:None, names_hidden:false, password_check:None, parts:4, complete:true, listing_complete:true,
+        listing_damaged:false, content_fp:Some(&[3]), max_names_bytes:1024, keys:Default::default(), key_salt:None, facts:1};
+    put_archive_checked(&archive).unwrap();
+    assert_eq!(get_archive_checked(name,group,content,4,true).unwrap().unwrap().files[0].name, "inner");
+    assert_eq!(get_archive_files_checked(name,group,content,2).unwrap()[0].name, "inner");
+    let inventory = atlas::par2::Inventory {files:vec![atlas::par2::Par2File {set_id:[1;16],file_id:[2;16],md5:[3;16],
+        md5_16k:[4;16],size:31,name:"inner".into(),bound:true,crc32:Some(19)}],complete:true,..Default::default()};
+    put_par2_files_checked(name,group,content,&inventory).unwrap();
+    assert_eq!(get_par2_files_checked(name,group,content).unwrap().unwrap().files, inventory.files);
+    let posted = [2;21];
+    put_par2_checked(&Par2Record {name, group_name:group, content_id:content,covers_all:true,posted:Some(&posted),
+        sizes:Some((1024,3)),parts:4,complete:true,content_fp:None,inventory:Some(&inventory)}).unwrap();
+    assert_eq!(get_par2_checked(name,group,content,4,true).unwrap().unwrap().posted, Some(posted.to_vec()));
+    let volume = atlas::archive::rev::Volume {index:0,size:31,crc32:19};
+    put_rev_volumes_checked(name,group,content,&[volume]).unwrap();
+    assert_eq!(get_rev_volumes_checked(name,group,content).unwrap(), Some(vec![volume]));
+}
+
+fn costly_errors() {
+    use atlas::raw_store::*;
+    let (n,g,c) = ("Kept", "own.group", &[1u8,2][..]);
+    assert!(get_probe_checked(n,g,c,4,true,7).is_err());
+    assert!(get_nfo_password_checked(n,g,c).is_err());
+    assert!(has_nfo_password_record_checked(n,g,c).is_err());
+    assert!(get_nested_nzb_password_checked(n,g,c).is_err());
+    assert!(has_nested_nzb_password_record_checked(n,g,c).is_err());
+    assert!(get_stills_checked(n,g,c).is_err());
+    assert!(get_audio_prints_checked(n,g,c).is_err());
+    assert!(get_archive_checked(n,g,c,4,true).is_err());
+    assert!(get_archive_files_checked(n,g,c,2).is_err());
+    assert!(get_par2_checked(n,g,c,4,true).is_err());
+    assert!(get_par2_files_checked(n,g,c).is_err());
+    assert!(get_rev_volumes_checked(n,g,c).is_err());
+    assert!(put_nfo_password_checked(n,g,c,"").is_err());
+    assert!(put_nested_nzb_password_checked(n,g,c,"").is_err());
+    assert!(put_stills_checked(n,g,c,&[]).is_err());
+    assert!(put_audio_prints_checked(n,g,c,&[]).is_err());
+    assert!(put_par2_files_checked(n,g,c,&Default::default()).is_err());
+    assert!(put_rev_volumes_checked(n,g,c,&[]).is_err());
+    assert!(put_probe_checked(&ProbeRecord {name:n,group_name:g,content_id:c,crc32:None,agent:None,info:"{}",
+        moviehash:None,parts:4,complete:true,config_stamp:7,nfo_password:None,cover:None}).is_err());
+    assert!(put_archive_checked(&ArchiveRecord {name:n,group_name:g,content_id:c,source:2,files:&[],password:None,
+        encryption:None,names_hidden:false,password_check:None,parts:4,complete:true,listing_complete:true,
+        listing_damaged:false,content_fp:None,max_names_bytes:1024,keys:Default::default(),key_salt:None,facts:1}).is_err());
+    assert!(put_par2_checked(&Par2Record {name:n,group_name:g,content_id:c,covers_all:false,posted:None,
+        sizes:None,parts:4,complete:true,content_fp:None,inventory:None}).is_err());
+    // Even empty identities must validate the active attempt before becoming a genuine miss.
+    assert!(get_probe_checked(n,g,&[],4,true,7).is_err());
+}
+
 pub(crate) fn open_test_native_owner() -> anyhow::Result<crate::pg::indexer_runtime::Runtime> {
     let storage = crate::config::checked_storage_config().map_err(|_| anyhow::anyhow!("fixture storage configuration"))?;
     let mut config = crate::config::Config::default();
@@ -435,13 +586,32 @@ fn configured_cache_child() {
                 .unwrap();
             atlas::raw_store::put_opensubtitles(POSITIVE, None).checked().unwrap();
         }
+        "costly" => {
+            costly_roundtrip();
+            native.as_ref().unwrap().owner.close();
+            let error = atlas::raw_store::get_probe_checked("Kept","own.group",&[1,2],4,true,7).unwrap_err();
+            assert!(atlas::pg::outage::is_attempt_ended(&error), "ended owner cause was erased");
+            assert_eq!(atlas::pg::outage::classify(&error),atlas::pg::outage::Failure::Unavailable);
+            costly_errors();
+        }
+        action @ ("worker-asset-reuse"|"worker-asset-stale"|"worker-asset-drain"|"worker-asset-missing"|"worker-asset-unselected"|"worker-asset-corrupt"|"worker-asset-wait-missing"|"worker-asset-wait-unselected")=>crate::postprocess::native::asset_tests::run(native.as_ref().unwrap(),action),
+        "worker-loop"=>crate::postprocess::native::worker_tests::run_category_loop(native.as_ref().unwrap()),
+        "worker-fanout-fence"=>crate::postprocess::native::worker_tests::run_fanout_fence(native.as_ref().unwrap()),
+        "worker-factory"=>crate::postprocess::native::run_factory_fixture(native.as_ref().unwrap()),
+        "worker-feed"=>crate::postprocess::native::worker_tests::run_held_feed(native.as_ref().unwrap()),
+        "worker-predb"=>crate::postprocess::native::worker_tests::run_predb_only(native.as_ref().unwrap()),
+        "worker-held"=>crate::postprocess::native::worker_tests::run_held_drain(native.as_ref().unwrap()),
+        "database-runner"=>crate::postprocess::native::run_category_fixture(native.as_ref().unwrap()),
+        "network-runner"=>crate::postprocess::native::run_network_fixture(native.as_ref().unwrap()),
+        action @ ("net-stop"|"net-stop-header"|"net-stop-rerun"|"net-stop-owner"|"net-stop-receipt"|"net-stop-outage")=>crate::postprocess::native::stop_tests::run(native.as_ref().unwrap(),action),
         "unavailable" => {
             assert!(open_test_native_owner().is_err(), "unavailable destination admitted a canonical owner");
             assert_cache_error();
+            costly_errors();
         }
         "context" => {
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-            runtime.block_on(async { assert_cache_error(); });
+            runtime.block_on(async { assert_cache_error(); costly_errors(); });
             drop(runtime);
             let db = native.as_ref().unwrap().db.clone();
             std::thread::Builder::new().name("cache-stage-fixture".into())
@@ -462,6 +632,7 @@ fn configured_cache_child() {
                 _ => unreachable!(),
             }
             assert_cache_error();
+            costly_errors();
         }
         "config-initial" => {
             let marker = "fixture-private-config-marker";
