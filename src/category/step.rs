@@ -2,31 +2,10 @@
 
 use std::sync::RwLock;
 
-#[cfg(test)]
-use rusqlite::Connection;
-
 use crate::config::Config;
-use crate::postprocess::schema::ShardTable;
 use crate::postprocess::step::{Needs, Outcome, Reruns, Step, StepCtx, StepError, StepId, StepMutation, StepWrite};
 
 use super::rules::{Options, classify_release, stores};
-
-pub const RELEASE_CATEGORY: ShardTable = ShardTable {
-    name: "release_category",
-    create: "create table if not exists release_category (release_id INTEGER PRIMARY KEY, category INTEGER NOT NULL)",
-    indexes: &[(
-        "category_release",
-        "create index if not exists category_release on release_category(category, release_id)",
-    )],
-    release_key: Some("release_id"),
-    added: &[],
-};
-
-/// The kind and subcategories of release `id`'s spot, when it was saved from one (`spotnet::store::SPOTS`).
-#[cfg(test)]
-fn spot_of(conn: &Connection, id: i64) -> Result<Option<(crate::spotnet::Kind, crate::spotnet::Subcats)>, StepError> {
-    crate::postprocess::data::StepData::LegacySqlite(conn).category_spot(id)
-}
 
 /// The category step's id, for a rerun of it alone.
 pub const STEP: StepId = StepId(24);
@@ -115,19 +94,57 @@ impl Step for CategoryStep {
 mod tests {
     use super::*;
 
+    // Port of the former spot_of SQLite fixture through the genuine original-XML producer/owner.
     #[test]
+    #[ignore = "explicit isolated PG; original Spotnet kind and subcategories through StepReads"]
     fn reads_a_releases_spot() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(crate::spotnet::store::SPOTS.create).unwrap();
-        conn.execute(
-            "insert into spots (release_id, message_id, kind, title, subcats) values (8, 'a', 'series', 'A', 'a9|d18|z1|'), (16, 'b', 'book', 'B', '')",
-            [],
-        )
-        .unwrap();
-        let (kind, subcats) = spot_of(&conn, 8).unwrap().unwrap();
+        use crate::postprocess::data::StepData;
+        let (_schema, runtime, _directory, id) = crate::spotnet::native_read_fixture_tests::fixture();
+        let reads = crate::pg::stage_reads::StepReads::for_owner(&runtime.owner).unwrap();
+        let data = StepData::Native(&reads);
+        let original = crate::spotnet::full::parse(crate::spotnet::native_read_fixture_tests::XML).unwrap();
+        let (kind, subcats) = data.category_spot(id).unwrap().unwrap();
         assert_eq!(kind, crate::spotnet::Kind::Series);
-        assert_eq!(subcats.d, [18]);
-        assert!(spot_of(&conn, 16).unwrap().is_none(), "not a kind Atlas takes");
-        assert!(spot_of(&conn, 24).unwrap().is_none());
+        assert_eq!(subcats, original.subcats);
+        assert_eq!(subcats.z, [1]);
+        assert_eq!(reads.spot_detail(id).unwrap().unwrap().spot, original, "the original XML is unchanged");
+        let no_spot = runtime
+            .owner
+            .with(|client| {
+                crate::pg::release_writer::save(
+                    client,
+                    &[crate::parser::Release {
+                        name: "Ordinary.Release".into(),
+                        group: "example.no.spot".into(),
+                        articles: vec![crate::parser::Article {
+                            filename: Some("sample.bin".into()),
+                            message_id: "<category-no-spot@fixture.test>".into(),
+                            part: Some(1),
+                            total_parts: Some(1),
+                            bytes: 1,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                    -100_000,
+                )?;
+                Ok(client.query_one("select id from releases where group_name='example.no.spot'", &[])?.get(0))
+            })
+            .unwrap();
+        assert!(data.category_spot(no_spot).unwrap().is_none());
+        runtime
+            .owner
+            .with(|client| {
+                client.execute("update spots set kind='book' where release_id=$1", &[&id])?;
+                Ok(())
+            })
+            .unwrap();
+        // Unsupported stored metadata is corruption under the native original-byte contract, not a miss.
+        let error = data.category_spot(id).unwrap_err();
+        assert!(
+            matches!(error, StepError::Native(ref cause) if cause.to_string().contains("native Spotnet kind does not match its original"))
+        );
+        runtime.owner.close();
+        assert!(matches!(data.category_spot(no_spot), Err(StepError::Native(_))));
     }
 }
