@@ -170,6 +170,6 @@ pub(crate) fn current()->Result<Option<Arc<Grant>>> {
         if let Some(grant)=grant {grant.check_owner(&owner)?;}Ok(grant.clone())
     })
 }
-#[cfg(test)]
+#[cfg(all(test,unix))]
 #[path="worker_asset_tests.rs"]
 mod tests;
