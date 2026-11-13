@@ -56,7 +56,7 @@ impl ReadView<'_> {
         let mut rows=tx.query_raw("select f.id,f.expected,octet_length(f.filename)::bigint,count(s.message_key)
             from files f join segments s on s.file_id=f.id and s.release_id=f.release_id
             where f.release_id=$1 and ($2::text is null or f.filename=$2)
-            group by f.id order by f.filename collate \"C\",f.id",&[&id as &(dyn postgres::types::ToSql+Sync),&match pick{Pick::Name(name)=>Some(name),_=>None}])?;
+            group by f.id order by f.filename collate \"C\",f.id",[&id as &(dyn postgres::types::ToSql+Sync),&match pick{Pick::Name(name)=>Some(name),_=>None}])?;
         let mut ordinal=0u64;let mut selected=0u64;
         while let Some(row)=rows.next()? {
             self.check_deadline()?;ordinal=ordinal.checked_add(1).context("native file ordinal overflow")?;
