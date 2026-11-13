@@ -3,7 +3,7 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use rusqlite::types::Value;
+use crate::postprocess::result_value::Value;
 
 use crate::duplicates;
 

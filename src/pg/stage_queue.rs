@@ -20,6 +20,9 @@ mod walk_tests;
 #[cfg(test)]
 #[path="stage_target_tests.rs"]
 mod target_tests;
+#[cfg(test)]
+#[path="stage_result_codec_tests.rs"]
+mod result_codec_tests;
 
 pub(crate) struct Queue {owner:Arc<Owner>,epoch:[u8;32],catalog:[u8;32]}
 pub(crate) struct Claim {
@@ -61,18 +64,7 @@ impl Visit {
         let mut bytes=0usize;
         for (step,write) in &applied.writes {
             mutation(write,claim.id,targets.as_ref())?;
-            digest.update(step.to_le_bytes());feed(&mut digest,write.sql.as_bytes(),&mut bytes)?;
-            for value in &write.params {
-                use rusqlite::types::Value;
-                match value {
-                    Value::Null=>digest.update([0]),
-                    Value::Integer(n)=>{digest.update([1]);digest.update(n.to_le_bytes());},
-                    Value::Real(n)=>{digest.update([2]);digest.update(n.to_bits().to_le_bytes());},
-                    Value::Text(text)=>{digest.update([3]);feed(&mut digest,text.as_bytes(),&mut bytes)?;},
-                    Value::Blob(blob)=>{digest.update([4]);feed(&mut digest,blob,&mut bytes)?;},
-                }
-            }
-            digest.update([255]);
+            write.encode_native_v1(*step,&mut bytes,&mut |part|digest.update(part))?;
         }
         for (step,name) in &applied.names {
             digest.update(step.to_le_bytes());digest.update([name.source]);
