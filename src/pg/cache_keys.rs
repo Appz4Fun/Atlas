@@ -2,7 +2,7 @@
 //! a fresh catalog's identity. No allocator/cursor/operational meta is copied.
 
 use anyhow::{Result, ensure};
-use rusqlite::{Connection, DatabaseName};
+use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
 const KEYS:[&str;3]=["id_key0","id_key1","key_salt"];
@@ -20,7 +20,7 @@ pub(crate) struct PreservedKeys {
 }
 
 pub(crate) fn capture(source:&Connection)->Result<CapturedKeys> {
-    ensure!(source.is_readonly(DatabaseName::Main)?,"cache keys require a read-only SQLite source");
+    ensure!(source.is_readonly("main")?,"cache keys require a read-only SQLite source");
     ensure!(!source.is_autocommit(),"cache keys require an explicit source snapshot");
     let has=source.prepare("select 1 from sqlite_schema where type='table' and name='meta'")?.exists([])?;
     let mut values=Vec::new();
