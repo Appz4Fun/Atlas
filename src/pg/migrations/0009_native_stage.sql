@@ -359,6 +359,8 @@ create table media_release (
         imdb_id       bigint,
         tvrage_id     bigint,
         imdb_from_nfo bigint NOT NULL DEFAULT 0,
+        tmdb_from_tag bigint NOT NULL DEFAULT 0,
+        tvdb_from_tag bigint NOT NULL DEFAULT 0,
         foreign key(release_id) references releases(id) on delete cascade
     );
 
