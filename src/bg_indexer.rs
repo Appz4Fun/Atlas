@@ -11,15 +11,11 @@ use serde::Serialize;
 use serde_json::json;
 
 use crate::atomic::write_atomic;
-use crate::compact::WriteGuard;
 use crate::config::{Config, UsenetServer, load_config};
-use crate::db;
-use crate::indexer::{Db, NotCarried, PassContext, PassSettings, Progress, RunStates, TooOld, run_pass_on, shared_db};
+use crate::indexer::{Db, NotCarried, PassContext, PassSettings, Progress, RunStates, TooOld, run_pass_on};
 use crate::nntp::{Pool, RankView, unless_stopped};
 use crate::paths;
 use crate::pg::indexer_runtime::{Profile as NativeProfile, Runtime as NativeRuntime};
-use crate::postprocess::{Stage, StageParams};
-use crate::sab;
 use crate::ui;
 
 const HISTORY_LEN: f64 = 60.0;
@@ -33,11 +29,6 @@ const CONFIG_RELOAD: Duration = Duration::from_secs(5);
 /// how often the groups big releases come from are read again (`follow_media`)
 const MEDIA_EVERY: Duration = Duration::from_secs(600);
 
-/// how often auto_run_compact compacts the database
-pub const COMPACT_EVERY: Duration = Duration::from_secs(24 * 3600);
-/// a compaction that couldnt take the lock (a `--compact` or a menu write
-/// holds it) is tried again after this long
-const COMPACT_RETRY: Duration = Duration::from_secs(10 * 60);
 static NATIVE_PAUSED: AtomicBool = AtomicBool::new(false);
 static STATUS_WRITE: Mutex<()> = Mutex::new(());
 
@@ -98,6 +89,8 @@ struct Stats {
     total_bytes: i64,
     total_releases: i64,
     total_skipped: i64,
+    // Unknown until a completed identity-bound native relation-size sample.
+    database_bytes: Option<u64>,
     start_time: f64,
     groups_indexed: HashSet<String>,
     error_count: u32,
@@ -121,6 +114,7 @@ impl Stats {
             total_bytes: 0,
             total_releases: 0,
             total_skipped: 0,
+            database_bytes: None,
             start_time: now(),
             groups_indexed: HashSet::new(),
             error_count: 0,
@@ -199,7 +193,7 @@ impl Stats {
 
     fn write(&self, group: &str, mode: &str, running: bool, idle: bool) {
         let (peak_a, peak_b, avg_a, avg_b) = self.speeds();
-        let db_size = crate::store::database_bytes(&paths::database());
+        let db_size = self.database_bytes;
 
         let groups: serde_json::Map<String, serde_json::Value> = self
             .group_stats
@@ -252,15 +246,6 @@ pub(crate) async fn nap(d: Duration, done: impl Fn() -> bool) {
     }
 }
 
-/// how often auto_run_compact compacts (ATLAS_COMPACT_EVERY_SECS for tests)
-fn compact_every() -> Duration {
-    std::env::var("ATLAS_COMPACT_EVERY_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .map(Duration::from_secs)
-        .unwrap_or(COMPACT_EVERY)
-}
-
 fn settings_of(config: &Config) -> PassSettings {
     PassSettings {
         mode: config.index_mode.clone(),
@@ -310,9 +295,6 @@ struct Scheduler {
     groups: RwLock<Vec<String>>,
     /// configured groups left out of `groups`, see `filters::group_blocked`
     blocked: Mutex<Vec<String>>,
-    /// the processing stage, when it's on
-    stage: OnceLock<Arc<Stage>>,
-    predb: OnceLock<Arc<crate::predb::Service>>,
     /// what the stage was started with: its threads and body permits are fixed then
     stage_shape: StageShape,
     /// (server, groups at once) for every indexing server
@@ -348,12 +330,6 @@ struct Scheduler {
     stats: Arc<Mutex<Stats>>,
     /// wind down (servers changed or stopping): finish current passes, start no new ones
     wind_down: AtomicBool,
-    /// the compaction interval passed (set together with `wind_down`)
-    compact_due: AtomicBool,
-    /// no compaction before this (one couldnt take the lock)
-    compact_after: Option<SystemTime>,
-    /// auto_run_compact as config.toml has it now
-    auto_compact: AtomicBool,
     passes: AtomicUsize,
 }
 
@@ -501,11 +477,13 @@ impl RankCache {
 
 impl Scheduler {
     fn fail(&self) {
-        self.fatal.store(true,Ordering::Release);
+        self.fatal.store(true, Ordering::Release);
         // Record the reason before publishing cancellation. Native NET drain
         // must not refund an attempt ended by configuration or a task panic.
-        if let Some(owner)=&self.native_owner {owner.fail(crate::pg::outage::Failure::Fatal);}
-        self.ctx.stop.store(true,Ordering::Release);
+        if let Some(owner) = &self.native_owner {
+            owner.fail(crate::pg::outage::Failure::Fatal);
+        }
+        self.ctx.stop.store(true, Ordering::Release);
     }
     fn stopping(&self) -> bool {
         self.wind_down.load(Ordering::Relaxed) || self.ctx.stop.load(Ordering::Relaxed)
@@ -931,26 +909,14 @@ impl Scheduler {
         stats.extra.insert("servers".into(), json!(servers));
         stats.extra.insert("groups_configured".into(), json!(groups.len()));
         stats.extra.insert("groups_blocked".into(), json!(self.blocked.lock().unwrap().len()));
-        if let Some(stage) = self.stage.get() {
-            stats.extra.insert("postprocess".into(), stage.snapshot());
-        }
-        if let Some(predb) = self.predb.get() {
-            stats.extra.insert("predb".into(), predb.snapshot());
-        }
-        if self.stage_shape.4 {
-            stats.extra.insert("media".into(), crate::media::shared().snapshot());
-        }
         stats.extra.insert("workers".into(), json!(self.workers));
         stats.extra.insert("pid".into(), json!(std::process::id()));
         let mut load = crate::profile::LOAD.snapshot();
         load["unsaved_headers"] = json!(self.ctx.pool.unsaved_headers());
         load["max_unsaved_headers"] = json!(self.ctx.pool.max_unsaved());
         stats.extra.insert("load".into(), load);
-        let live = crate::metrics::Live {
-            pool: self.ctx.pool.id(),
-            stage: self.stage.get().is_some(),
-            predb: self.predb.get().is_some(),
-        };
+        let live =
+            crate::metrics::Live { pool: self.ctx.pool.id(), stage: self.stage_shape.0, predb: self.stage_shape.3 };
         crate::metrics::report_indexer(&stats.extra, stats.error_count, idle, live);
         stats.write("", &mode, true, idle);
     }
@@ -1215,6 +1181,42 @@ async fn follow_media(sched: Arc<Scheduler>, db: Db) {
     }
 }
 
+/// Maintain the daily native release-row tally on the original standard owner lane.
+async fn native_media_counts(
+    sched: Arc<Scheduler>,
+    db: Db,
+    owner: Arc<crate::pg::indexer_runtime::Owner>,
+    headers: crate::config::HeaderStoreConfig,
+) {
+    let observed_owner = owner.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let mut service = crate::pg::media_counts::Service::new(&owner, db.clone(), &headers)?;
+        while !sched.stopping() {
+            match service.tick()? {
+                crate::pg::media_counts::Tick::Stored => {
+                    let groups = crate::indexer::on_native_db_sync(&db, |client| {
+                        Ok(crate::chunks::media_groups(&crate::pg::sql::Pg::new(client))?)
+                    })?;
+                    *sched.media.write().unwrap() = groups;
+                }
+                crate::pg::media_counts::Tick::Progress => std::thread::yield_now(),
+                crate::pg::media_counts::Tick::Idle => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
+        Ok(())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error))
+            if crate::pg::outage::is_attempt_ended(&error)
+                && observed_owner.stop.load(Ordering::Acquire)
+                && observed_owner.failure().is_none() => {}
+        Ok(Err(error)) => observed_owner.fail(crate::pg::outage::classify(&error)),
+        Err(_) => observed_owner.fail(crate::pg::outage::Failure::Fatal),
+    }
+}
+
 /// on, database threads, net threads, and whether PreDB's service and the media fan-out run
 type StageShape = (bool, usize, usize, bool, bool);
 
@@ -1231,8 +1233,8 @@ fn needs_rebuild(sched: &Scheduler, config: &Config, servers: &[UsenetServer]) -
         || stage_shape(config) != sched.stage_shape
 }
 
-/// Re-read config.toml while indexing: new groups / mode / batch settings /
-/// auto compaction apply right away. Returns when servers, the parallelism or
+/// Re-read config.toml while indexing: new groups / mode / batch settings
+/// apply right away. Returns when servers, the parallelism or
 /// the unsaved headers cap changed (the caller rebuilds) or when stopping.
 async fn watch_config(sched: Arc<Scheduler>, servers: Vec<UsenetServer>) {
     loop {
@@ -1259,8 +1261,12 @@ async fn watch_config(sched: Arc<Scheduler>, servers: Vec<UsenetServer>) {
         // Native Steps/providers capture these settings on real standard
         // threads. Refuse before any legacy/global reconfiguration instead of
         // continuing with stale worker objects or silently changing their mask.
-        if let Some(pin)=&sched.native_workers && let Err(error)=pin.check(&config,&usable_servers(&config),&plan_workers(&config)) {
-            ui::error(&error.to_string());sched.fail();return;
+        if let Some(pin) = &sched.native_workers
+            && let Err(error) = pin.check(&config, &usable_servers(&config), &plan_workers(&config))
+        {
+            ui::error(&error.to_string());
+            sched.fail();
+            return;
         }
 
         if needs_rebuild(&sched, &config, &servers) {
@@ -1268,23 +1274,7 @@ async fn watch_config(sched: Arc<Scheduler>, servers: Vec<UsenetServer>) {
             sched.wind_down.store(true, Ordering::Relaxed);
             return;
         }
-        if sched.native.is_some() {
-            crate::archive::set_inline_lookups(false);
-        } else {
-            crate::archive::sync_inline_lookups(&config);
-        }
-        if let Some(stage) = sched.stage.get() {
-            let (stage, config) = (stage.clone(), config.clone());
-            let _ = tokio::task::spawn_blocking(move || stage.set_config(&config)).await;
-        }
-        if let Some(predb) = sched.predb.get() {
-            predb.set_config(&config);
-        }
-
-        let auto = config.auto_run_compact;
-        if sched.auto_compact.swap(auto, Ordering::Relaxed) != auto {
-            println!("auto compaction turned {}", if auto { "on" } else { "off" });
-        }
+        crate::archive::set_inline_lookups(false);
 
         let settings = settings_of(&config);
         {
@@ -1316,28 +1306,6 @@ async fn watch_config(sched: Arc<Scheduler>, servers: Vec<UsenetServer>) {
     }
 }
 
-/// While auto_run_compact is on (looked at every second, config.toml can
-/// change it): once the interval has passed since the last compaction (or
-/// since the indexer started, when there was none), wind down so `supervise`
-/// can compact.
-async fn compact_timer(sched: Arc<Scheduler>) {
-    let every = compact_every();
-    let last = db::open_at(&paths::database()).ok().and_then(|conn| crate::store::get_meta(&conn, "last_compact").ok());
-    // no stored time: count from when the indexer started (rebuilds dont reset it)
-    let last = last.flatten().unwrap_or_else(|| sched.stats.lock().unwrap().start_time as i64);
-    let due =
-        (UNIX_EPOCH + Duration::from_secs(last.max(0) as u64) + every).max(sched.compact_after.unwrap_or(UNIX_EPOCH));
-    while !sched.stopping() {
-        if sched.auto_compact.load(Ordering::Relaxed) && SystemTime::now() >= due {
-            println!("compacting the database, indexing resumes after");
-            sched.compact_due.store(true, Ordering::Relaxed);
-            sched.wind_down.store(true, Ordering::Relaxed);
-            return;
-        }
-        nap(Duration::from_secs(1), || sched.stopping()).await;
-    }
-}
-
 /// status.json / stats.json once a second for the menu and dashboard
 /// (plus a timing breakdown every 30s with ATLAS_PROFILE)
 async fn report(sched: Arc<Scheduler>) {
@@ -1352,22 +1320,25 @@ async fn report(sched: Arc<Scheduler>) {
     }
 }
 
-fn native_service_config_pin(native:bool,config:&Config,servers:&[UsenetServer],plan:&[(usize,usize)]) -> Option<crate::postprocess::native::ConfigPin> {
-    native.then(||crate::postprocess::native::ConfigPin::capture(config,servers,plan))
+fn native_service_config_pin(
+    native: bool,
+    config: &Config,
+    servers: &[UsenetServer],
+    plan: &[(usize, usize)],
+) -> Option<crate::postprocess::native::ConfigPin> {
+    native.then(|| crate::postprocess::native::ConfigPin::capture(config, servers, plan))
 }
 
-/// Index with this set of servers until stopping, the config needs a rebuild
-/// or a compaction is due (true), not before `compact_after`.
+/// Index with the original native runtime until stopping or the configuration needs a rebuild.
 async fn run_servers(
     config: &Config,
     pool: Arc<Pool>,
     states: RunStates,
     stats: Arc<Mutex<Stats>>,
-    stop: Arc<AtomicBool>,
-    compact_after: Option<SystemTime>,
-    native: Option<&NativeRuntime>,
-) -> anyhow::Result<bool> {
-    let stop = native.map_or(stop, |runtime| runtime.owner.stop.clone());
+    native: &NativeRuntime,
+) -> anyhow::Result<()> {
+    let runtime = native;
+    let stop = runtime.owner.stop.clone();
     let servers = usable_servers(config);
     let groups = config.tracked_groups();
     say_blocked(&config.blocked_groups());
@@ -1382,16 +1353,14 @@ async fn run_servers(
     states.set_tracked(&groups);
 
     let sched = Arc::new(Scheduler {
-        native: native.map(|runtime| runtime.profile.clone()),
-        native_owner: native.map(|runtime|runtime.owner.clone()),
-        native_workers: native_service_config_pin(native.is_some(),config,&servers,&plan),
+        native: Some(runtime.profile.clone()),
+        native_owner: Some(runtime.owner.clone()),
+        native_workers: native_service_config_pin(true, config, &servers, &plan),
         fatal: AtomicBool::new(false),
         ctx: PassContext { pool, states, stop, verbose: false },
         settings: RwLock::new(settings_of(config)),
         groups: RwLock::new(groups),
         blocked: Mutex::new(config.blocked_groups()),
-        stage: OnceLock::new(),
-        predb: OnceLock::new(),
         stage_shape: stage_shape(config),
         plan: plan.clone(),
         workers,
@@ -1410,52 +1379,17 @@ async fn run_servers(
         failed: Mutex::new(HashMap::new()),
         stats,
         wind_down: AtomicBool::new(false),
-        compact_due: AtomicBool::new(false),
-        compact_after,
-        auto_compact: AtomicBool::new(config.auto_run_compact),
         passes: AtomicUsize::new(0),
     });
 
-    // a rebuild or a compaction stopped the last run: these writers freeze again
-    crate::frozen::STOPPING.store(false, Ordering::Relaxed);
-    let db = if let Some(runtime) = native {
-        let db = runtime.db.clone();
-        let pool = sched.ctx.pool.clone();
-        crate::indexer::on_db(&db, move |sql| {
-            crate::indexer::claim_plain_cursors(sql, &pool)?;
-            Ok(())
-        })
-        .await?;
-        db
-    } else {
-        match db::open().and_then(|conn| db::tune_for_writing(&conn).map(|_| conn)) {
-            Ok(conn) => {
-                // before any pass: what is there so far was saved by file name
-                if let Err(e) = crate::store::start_grouping(&paths::database()) {
-                    ui::warn(&format!("couldnt note where collections start: {e:#}"));
-                }
-                // before any pass: whose the plain cursors are (see claim_plain_cursors)
-                if let Err(e) = crate::indexer::claim_plain_cursors(&conn, &sched.ctx.pool) {
-                    ui::warn(&format!("couldnt record whose the group cursors are: {e:#}"));
-                }
-                shared_db(conn)
-            }
-            Err(e) => {
-                ui::error(&format!("couldnt open database: {e}"));
-                return Err(e.into());
-            }
-        }
-    };
-
-    // checkpoints off the writer's path, see db::checkpointer
-    let checkpoint_stop = Arc::new(AtomicBool::new(false));
-    let checkpointer = native.is_none().then(|| db::checkpointer(checkpoint_stop.clone()));
-
-    if native.is_some() {
-        crate::archive::set_inline_lookups(false);
-    } else {
-        crate::archive::sync_inline_lookups(config);
-    }
+    let db = runtime.db.clone();
+    let pool = sched.ctx.pool.clone();
+    crate::indexer::on_db(&db, move |sql| {
+        crate::indexer::claim_plain_cursors(sql, &pool)?;
+        Ok(())
+    })
+    .await?;
+    crate::archive::set_inline_lookups(false);
     let mut tasks = tokio::task::JoinSet::new();
     // when the stop was asked for: each task that ends past it says when (`named`)
     let stopping_since: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
@@ -1464,51 +1398,23 @@ async fn run_servers(
             named_task($name, stopping_since.clone(), $fut)
         };
     }
-    // before the stage: its step reads this file, and a missing one is an error it would spend attempts on
-    if native.is_none() && config.predb.enabled
-        && let Err(e) = crate::predb::db::create(&paths::predb_database())
-    {
-        eprintln!("predb: {e}");
-    }
-    if let Some(runtime)=native {
-        let s=sched.clone();
-        tasks.spawn(named!("native stage".into(),crate::postprocess::native::run(
-            runtime.owner.clone(),runtime.db.clone(),runtime.configured_headers(),config.clone(),sched.ctx.pool.clone(),move||s.stopping())));
-    } else if config.postprocess.enabled {
-        let stage = Stage::start(StageParams {
-            main: paths::database(),
-            db: db.clone(),
-            pool: sched.ctx.pool.clone(),
-            config: config.clone(),
-            steps: crate::postprocess::steps_to_run(),
-            handle: tokio::runtime::Handle::current(),
-        });
-        let _ = sched.stage.set(stage.clone());
-        let s = sched.clone();
-        tasks.spawn(named!("the stage".into(), crate::postprocess::run(stage, move || s.stopping())));
-    }
-    if native.is_none() && config.predb.enabled {
-        let started = crate::predb::Service::start(crate::predb::ServiceParams {
-            main: paths::database(),
-            config: config.predb.clone(),
-            stage: sched.stage.get().cloned(),
-            fetch: crate::predb::test_fetch(),
-        });
-        match started {
-            Ok(service) => {
-                let _ = sched.predb.set(service.clone());
-                let s = sched.clone();
-                // in `tasks`: no connection of its outlives this, soo a compaction's checkpoint never meets one
-                tasks.spawn(named!("predb".into(), crate::predb::run(service, move || s.stopping())));
-            }
-            Err(e) => eprintln!("predb: {e:#}"),
-        }
-    }
-    if native.is_none() && config.postprocess.enabled && config.media.any_provider() {
-        let s = sched.clone();
-        tasks
-            .spawn(named!("media".into(), crate::media::run(crate::media::shared(), db.clone(), move || s.stopping())));
-    }
+    let s = sched.clone();
+    tasks.spawn(named!(
+        "native stage".into(),
+        crate::postprocess::native::run(
+            runtime.owner.clone(),
+            runtime.db.clone(),
+            runtime.configured_headers(),
+            config.clone(),
+            sched.ctx.pool.clone(),
+            move || s.stopping()
+        )
+    ));
+    tasks.spawn(named!(
+        "native daily media counts".into(),
+        native_media_counts(sched.clone(), db.clone(), runtime.owner.clone(), runtime.configured_headers())
+    ));
+    tasks.spawn(named!("native media group priority".into(), follow_media(sched.clone(), db.clone())));
     for &(server, count) in &plan {
         for _ in 0..count {
             tasks.spawn(named!(
@@ -1517,50 +1423,6 @@ async fn run_servers(
             ));
         }
     }
-    // set once stopping: the long scans of every shard (`repair::reading_until`) give up instead of holding the stop
-    let scans_stop = Arc::new(AtomicBool::new(false));
-    // which groups the big releases come from, for the backfill to take first, and the live passes
-    if native.is_none() {
-        let s = sched.clone();
-        tasks.spawn(named!(
-            "the count of big releases".into(),
-            crate::repair::count_media_every(db.clone(), move || s.stopping(), scans_stop.clone()),
-        ));
-        tasks.spawn(named!("follow_media".into(), follow_media(sched.clone(), db.clone())));
-    }
-    // Spotnet spots of movies and TV, saved as releases (see `spotnet::ingest`)
-    if native.is_none() && config.spots.enabled {
-        let s = sched.clone();
-        let (pool, spots) = (sched.ctx.pool.clone(), config.spots.clone());
-        tasks.spawn(named!("spots".into(), crate::spotnet::ingest::run(pool, db.clone(), spots, move || s.stopping())));
-        // what's said about the spots kept, in a task of its own so a long spot pass doesn't hold it back
-        if config.spots.comments {
-            let s = sched.clone();
-            let (pool, spots) = (sched.ctx.pool.clone(), config.spots.clone());
-            tasks.spawn(named!(
-                "spot comments".into(),
-                crate::spotnet::ingest::run_comments(pool, db.clone(), spots, move || s.stopping())
-            ));
-        }
-    }
-    // parts one server's listing left out, read again from another (see `repair`)
-    if native.is_none() && sched.ctx.pool.indexing_servers().len() > 1 {
-        let s = sched.clone();
-        let settings = settings_of(config);
-        tasks.spawn(named!(
-            "repair".into(),
-            crate::repair::run(sched.ctx.clone(), settings, db.clone(), move || s.stopping(), scans_stop.clone()),
-        ));
-    }
-    // parts no listing showed, asked for on every server by the ids their files' other parts name (see `inferred`)
-    if native.is_none() && config.inferred_parts {
-        let s = sched.clone();
-        tasks.spawn(named!(
-            "inferred parts".into(),
-            crate::inferred::run(sched.ctx.clone(), db.clone(), move || s.stopping(), scans_stop.clone())
-        ));
-    }
-    // once stopping, the writers do no freezing: their queues of saves drain as fast as they did before it
     let s = sched.clone();
     let since = stopping_since.clone();
     tasks.spawn(async move {
@@ -1568,8 +1430,6 @@ async fn run_servers(
             nap(Duration::from_secs(1), || s.stopping()).await;
         }
         let _ = since.set(Instant::now());
-        scans_stop.store(true, Ordering::Relaxed);
-        crate::frozen::STOPPING.store(true, Ordering::Relaxed);
     });
     // uploads whose every article has a random subject, linked across groups from the header store's blocks
     // (`nxv_store::linker`), when the store is on
@@ -1582,7 +1442,7 @@ async fn run_servers(
     }
     tasks.spawn(named!("the config watcher".into(), watch_config(sched.clone(), servers)));
     tasks.spawn(named!("the status report".into(), report(sched.clone())));
-    if let Some(runtime) = native {
+    {
         let (db, s, owner) = (db.clone(), sched.clone(), runtime.owner.clone());
         tasks.spawn(named!("native storage health".into(), async move {
             while !s.stopping() {
@@ -1600,8 +1460,6 @@ async fn run_servers(
                 nap(Duration::from_secs(1), || s.stopping()).await;
             }
         }));
-    } else {
-        tasks.spawn(named!("the compaction timer".into(), compact_timer(sched.clone())));
     }
 
     // the workers and the config watcher all stop on `stopping()`
@@ -1622,86 +1480,19 @@ async fn run_servers(
     };
     stop_log("workers, the stage and the other tasks done");
 
-    // the last clone of the db waits for the writers (one may be sealing); the checkpointer goes on meanwhile
+    // Native admission and service tasks have drained before the final Db clone goes away.
     let _ = tokio::task::spawn_blocking(move || drop(db)).await;
-    stop_log("writers drained");
-    // its last checkpoints after the writers: with them still writing, each waited out its busy timeout
-    checkpoint_stop.store(true, Ordering::Relaxed);
-    if let Some(checkpointer) = checkpointer {
-        let _ = tokio::task::spawn_blocking(move || checkpointer.join()).await;
-    }
-    stop_log("checkpointer done");
-    if let Some(runtime) = native {
+    stop_log("native writers drained");
+    {
         if sched.fatal.load(Ordering::Relaxed) {
             runtime.owner.fail(crate::pg::outage::Failure::Fatal);
         }
         anyhow::ensure!(runtime.owner.failure().is_none(), "native PostgreSQL attempt ended");
     }
     anyhow::ensure!(!sched.fatal.load(Ordering::Relaxed), "indexer task or storage ownership failed");
-    Ok(sched.compact_due.load(Ordering::Relaxed))
+    Ok(())
 }
 
-/// How an auto compaction went, for what the indexer does next.
-enum Compacted {
-    /// done, failed or stopped: indexing goes on
-    Ran,
-    /// another compaction or a menu write held the lock, nothing was touched
-    Busy,
-    /// a shard is missing afterwards: the indexer stops
-    ShardMissing,
-}
-
-/// Compact every shard in this process (the indexer is wound down and its
-/// writers are gone, soo nothing else writes), then note the time. Noted on
-/// failure too, soo a failing compaction is tried again in 24 hours, not every
-/// minute. Not noted when it was stopped: that wasnt a failure, and it runs
-/// again on the next start. Nor when it couldnt take the lock: it's tried
-/// again after COMPACT_RETRY.
-async fn compact(config: &Config, stats: &Arc<Mutex<Stats>>, stop: &Arc<AtomicBool>) -> Compacted {
-    write_status(true, "compacting the database", &config.index_mode, false, "running", false, 0);
-    let main = paths::database();
-    let started = Instant::now();
-    let (path, flag) = (main.clone(), stop.clone());
-    let report = |msg: &str| println!("{msg}");
-    let result = tokio::task::spawn_blocking(move || crate::compact::run(&path, &report, &flag)).await;
-    let stopped = stop.load(Ordering::Relaxed);
-    match result {
-        Ok(Ok(_)) => println!("compacted in {}", crate::dashboard::human_time(started.elapsed().as_secs() as i64)),
-        Ok(Err(e)) if e.downcast_ref::<crate::compact::Busy>().is_some() => {
-            ui::warn(&format!("couldnt compact the database: {e}. trying again in {}m", COMPACT_RETRY.as_secs() / 60));
-            return Compacted::Busy;
-        }
-        Ok(Err(e)) if stopped => println!("compaction stopped, the shards left are as they were: {e:#}"),
-        Ok(Err(e)) => {
-            ui::error(&format!("auto compaction failed, the originals were kept: {e:#}"));
-            stats.lock().unwrap().error_count += 1;
-        }
-        Err(e) => {
-            ui::error(&format!("auto compaction stopped: {e}"));
-            stats.lock().unwrap().error_count += 1;
-        }
-    }
-
-    // a swap that was cut half way leaves its shard missing, and a writer
-    // would make an empty one there
-    let missing: Vec<String> =
-        crate::store::shard_paths(&main).iter().filter(|p| !p.exists()).map(|p| p.display().to_string()).collect();
-    if !missing.is_empty() {
-        ui::error(&format!(
-            "shards missing after compacting, stopping the indexer. restore from the .precompact.db / .compact.db files next to them: {}",
-            missing.join(", ")
-        ));
-        stats.lock().unwrap().error_count += 1;
-        return Compacted::ShardMissing;
-    }
-
-    if !stopped && let Ok(conn) = db::open_at(&main) {
-        let _ = crate::store::set_meta(&conn, "last_compact", chrono::Utc::now().timestamp());
-    }
-    Compacted::Ran
-}
-
-/// Only typed rejection before work may turn a preflight error into operator stop.
 fn native_preflight_exit(
     result: Result<anyhow::Result<()>, tokio::task::JoinError>,
     operator_stopped: bool,
@@ -1713,58 +1504,32 @@ fn native_preflight_exit(
     }
 }
 
-fn run_servers_error_exit(error: &anyhow::Error, native: Option<&NativeRuntime>, stop: &AtomicBool) -> i32 {
-    if native.is_some() && stop.load(Ordering::Acquire) && crate::pg::outage::is_attempt_ended(error) {
+fn run_servers_error_exit(error: &anyhow::Error, stop: &AtomicBool) -> i32 {
+    if stop.load(Ordering::Acquire) && crate::pg::outage::is_attempt_ended(error) {
         return 0;
     }
     ui::error(&format!("indexing stopped: {error}"));
-    if native.is_none() {
-        stop.store(true, Ordering::Relaxed);
-    }
     1
 }
 
-/// Index until stopping. Returns the exit code: not 0 when a compaction held
-/// the database at the start. `writing` is the hold on compaction taken
-/// before setting up the database, if there was one.
-async fn supervise(
-    stop: Arc<AtomicBool>,
-    stats: Arc<Mutex<Stats>>,
-    writing: Option<WriteGuard>,
-    native: Option<&NativeRuntime>,
-) -> i32 {
+/// Index until stopping, preserving the original native attempt and its failure classification.
+async fn supervise(stop: Arc<AtomicBool>, stats: Arc<Mutex<Stats>>, native: &NativeRuntime) -> i32 {
     let states = RunStates::default();
     let stopping = || {
-        stop.load(Ordering::Acquire)
-            || native
-                .is_some_and(|runtime| runtime.owner.stop.load(Ordering::Acquire) || runtime.owner.failure().is_some())
+        stop.load(Ordering::Acquire) || native.owner.stop.load(Ordering::Acquire) || native.owner.failure().is_some()
     };
-    let main = paths::database();
-    // a compaction that couldnt take the lock waits till then
-    let mut compact_after = None;
-    // indexing writes the shards: no compaction from elsewhere while it runs
-    // (its copy would miss what's written meanwhile). let go only for this
-    // indexer's own compaction, taken again after it
-    let mut writing = writing;
-    let mut started = false;
-
     while !stopping() {
         let Some(config) = load_config() else {
             let why = crate::config::file_problem().unwrap_or_else(|| "config.toml not found".into());
             ui::error(&format!("error with config, stopped: {why}"));
-            if native.is_some() {
-                return 1;
-            }
-            break;
+            return 1;
         };
 
-        if let Some(native) = native
-            && let Err(error) = native.profile.check_reload(&config)
-        {
+        if let Err(error) = native.profile.check_reload(&config) {
             ui::error(&format!("native indexing configuration refused: {error}"));
             return 1;
         }
-        if let Some(native) = native {
+        {
             let owner = native.owner.clone();
             let result = tokio::task::spawn_blocking(move || {
                 owner.with(|client| {
@@ -1785,28 +1550,8 @@ async fn supervise(
         let servers = usable_servers(&config);
         if servers.is_empty() {
             ui::error("config missing required fields");
-            if native.is_some() {
-                return 1;
-            }
-            break;
+            return 1;
         }
-
-        if native.is_none() && writing.is_none() {
-            match crate::compact::hold_off_compaction(&main) {
-                Ok(guard) => writing = Some(guard),
-                Err(e) if !started => {
-                    ui::error(&format!("not indexing: {e:#}"));
-                    write_status(false, "", &config.index_mode, false, "stopped", true, 1);
-                    return 1;
-                }
-                Err(e) => {
-                    ui::warn(&format!("cant index yet: {e:#}"));
-                    nap(Duration::from_secs(30), stopping).await;
-                    continue;
-                }
-            }
-        }
-        started = true;
 
         let pp = &config.postprocess;
         let pool = Arc::new(
@@ -1821,16 +1566,12 @@ async fn supervise(
         );
 
         // at least one server has to answer before spinning everything up
-        let connected = if let Some(native) = native {
-            match unless_stopped(&native.owner.stop, pool.connect()).await {
-                Some(result) => result,
-                None => {
-                    pool.close().await;
-                    return i32::from(!stop.load(Ordering::Acquire));
-                }
+        let connected = match unless_stopped(&native.owner.stop, pool.connect()).await {
+            Some(result) => result,
+            None => {
+                pool.close().await;
+                return i32::from(!stop.load(Ordering::Acquire));
             }
-        } else {
-            pool.connect().await
         };
         if let Err(e) = connected {
             ui::error(&format!("couldnt reach any usenet server: {e}"));
@@ -1847,31 +1588,12 @@ async fn supervise(
             continue;
         }
 
-        let result =
-            run_servers(&config, pool.clone(), states.clone(), stats.clone(), stop.clone(), compact_after, native)
-                .await;
+        let result = run_servers(&config, pool.clone(), states.clone(), stats.clone(), native).await;
         pool.close().await;
         // its last totals, and no connections while there's no pool
         crate::metrics::report_servers(&pool.server_stats());
-        let compact_due = match result {
-            Ok(compact_due) => compact_due,
-            Err(error) => {
-                return run_servers_error_exit(&error, native, &stop);
-            }
-        };
-
-        if compact_due && !stopping() {
-            writing = None;
-            // the shared catalog's publisher lets go of the shards first, and stays away till the compaction is done
-            let _making_way =
-                tokio::task::spawn_blocking(|| crate::shared_catalog::make_way_for_compaction(Duration::from_secs(30)))
-                    .await
-                    .ok();
-            match compact(&config, &stats, &stop).await {
-                Compacted::Ran => compact_after = None,
-                Compacted::Busy => compact_after = Some(SystemTime::now() + COMPACT_RETRY),
-                Compacted::ShardMissing => break,
-            }
+        if let Err(error) = result {
+            return run_servers_error_exit(&error, &stop);
         }
     }
     0
@@ -1880,9 +1602,12 @@ async fn supervise(
 pub fn run() -> i32 {
     // Resolve the selected file before environment credentials can produce a
     // usable Config. A parse/read failure is never a SQLite backend choice.
-    let storage=match crate::config::checked_storage_config() {
-        Ok(storage)=>storage,
-        Err(_)=>{ui::error("storage configuration unavailable");return 1;},
+    let storage = match crate::config::checked_storage_config() {
+        Ok(storage) => storage,
+        Err(_) => {
+            ui::error("storage configuration unavailable");
+            return 1;
+        }
     };
     let Some(config) = load_config().filter(|c| !c.servers.is_empty()) else {
         match crate::config::file_problem() {
@@ -1897,7 +1622,7 @@ pub fn run() -> i32 {
         return 1;
     }
 
-    if crate::config::checked_storage_config().ok().as_ref()!=Some(&storage) {
+    if crate::config::checked_storage_config().ok().as_ref() != Some(&storage) {
         ui::error("storage configuration changed or unavailable");
         return 1;
     }
@@ -1905,108 +1630,11 @@ pub fn run() -> i32 {
         ui::error("invalid storage configuration");
         return 1;
     }
-    if storage.is_postgres() {
-        return run_native(config, storage);
-    }
-    if let Err(e) = write_atomic(&paths::pid_file(), std::process::id().to_string()) {
-        ui::error(&format!("couldnt write pid file: {e}"));
-        return 1;
-    }
-
-    // compaction held off from before setting up: a shard it's swapping
-    // would look missing. kept for indexing
-    let writing = match db::create_db() {
-        Ok(Some(held)) => match crate::compact::refuse_unresolved_backups(&paths::database()) {
-            Ok(()) => held,
-            Err(e) => {
-                ui::error(&format!("not indexing: {e:#}"));
-                write_status(false, "", &config.index_mode, false, "stopped", true, 1);
-                return 1;
-            }
-        },
-        Ok(None) => {
-            ui::error("not indexing: the database is being compacted; try again later");
-            write_status(false, "", &config.index_mode, false, "stopped", true, 1);
-            return 1;
-        }
-        Err(e) => {
-            ui::error(&format!("couldnt open database: {e:#}"));
-            return 1;
-        }
-    };
-
-    // one time move of an older database into the shards, here and not in the
-    // menu because it takes a while on a big one. the menu shows the progress
-    let main = paths::database();
-    let report = |msg: &str| {
-        println!("{msg}");
-        write_status(true, msg, &config.index_mode, false, "running", false, 0);
-    };
-    let writing = match convert_at_start(&main, writing, &report) {
-        Ok(held) => held,
-        Err(e) => {
-            ui::error(&format!("not indexing: {e:#}"));
-            write_status(false, "", &config.index_mode, false, "stopped", true, 1);
-            return 1;
-        }
-    };
-    {
-        // forward backfill's first day, fixed once, in the main database it indexes into (after any conversion); a
-        // change in the config needs a restart
-        let now = chrono::Utc::now().timestamp();
-        match db::open_at(&main)
-            .map_err(anyhow::Error::from)
-            .and_then(|c| Ok(crate::chunks::set_forward_start(&c, config.backfill_start_days_back, now)?))
-        {
-            Ok(day) if day > 0 => ui::print(&format!("backfill reads forward from day {day} to live")),
-            Ok(_) => {}
-            Err(e) => ui::warn(&format!("couldnt set the forward backfill's start: {e:#}")),
-        }
-        // one indexer runs on a database (the pid file): day chunks its servers still hold claimed are a killed run's,
-        // which would hold their days, and the forward backfill's frontier, for `CLAIM_TIMEOUT`
-        let hosts = crate::nntp::server_keys(&usable_servers(&config));
-        match db::open_at(&main)
-            .map_err(anyhow::Error::from)
-            .and_then(|c| Ok(crate::chunks::release_left_over(&c, &hosts)?))
-        {
-            Ok(n) if n > 0 => ui::print(&format!("{n} day chunks left claimed by the last run given back")),
-            Ok(_) => {}
-            Err(e) => ui::warn(&format!("couldnt give back the day chunks the last run left claimed: {e:#}")),
-        }
-    }
-
-    let stop = Arc::new(AtomicBool::new(false));
-
-    #[cfg(unix)]
-    {
-        let _ = signal_hook::flag::register(signal_hook::consts::SIGTERM, stop.clone());
-        let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, stop.clone());
-    }
-
-    if let Err(e) = crate::nxv_store::live::spawn(&crate::config::header_store_config()) {
-        ui::error(&format!("not indexing: {e:#}"));
-        write_status(false, "", &config.index_mode, false, "stopped", true, 1);
-        return 1;
-    }
-    crate::metrics::start(&config, crate::metrics::Role::Indexer);
-    crate::sealed_store::spawn_offload(&config.sealed_log, stop.clone());
-    crate::blob_bytes::spawn(&config.sealed_log, stop.clone());
-    crate::shared_catalog::start(&config.shared_catalog, stop.clone());
-    crate::overview_archive::spawn(&config.overview_archive);
-    if config.metrics.enabled {
-        crate::metrics::catalog::spawn(Duration::from_secs(config.metrics.catalog_every_secs), stop.clone());
-    }
-
-    let code = index(config, stop, Some(writing), None);
-    // the batches still queued for the overview archive
-    crate::overview_archive::finish(Duration::from_secs(30));
-    // the header store's open slabs sealed and committed
-    crate::nxv_store::live::finish();
-    code
+    run_native(config, storage, Arc::new(AtomicBool::new(false)))
 }
 
 /// Start the explicitly limited native ingestion profile without opening SQLite.
-fn run_native(config: Config, storage: crate::pg::StorageConfig) -> i32 {
+fn run_native(config: Config, storage: crate::pg::StorageConfig, stop: Arc<AtomicBool>) -> i32 {
     use crate::pg::outage::{AttemptOutcome, Backoff, Failure, classify};
     let headers = crate::config::header_store_config();
     if NativeProfile::check(&config, &headers).is_err() || crate::pg::Pool::new(&storage).is_err() {
@@ -2017,7 +1645,6 @@ fn run_native(config: Config, storage: crate::pg::StorageConfig) -> i32 {
         ui::error("could not write the indexer PID");
         return 1;
     }
-    let stop = Arc::new(AtomicBool::new(false));
     #[cfg(unix)]
     {
         let _ = signal_hook::flag::register(signal_hook::consts::SIGTERM, stop.clone());
@@ -2037,7 +1664,7 @@ fn run_native(config: Config, storage: crate::pg::StorageConfig) -> i32 {
             ui::error("native PostgreSQL configuration unavailable");
             break 1;
         };
-        if crate::config::checked_storage_config().ok().as_ref()!=Some(&storage)
+        if crate::config::checked_storage_config().ok().as_ref() != Some(&storage)
             || crate::config::header_store_config() != headers
             || NativeProfile::check(&current, &headers).is_err()
         {
@@ -2063,22 +1690,22 @@ fn run_native(config: Config, storage: crate::pg::StorageConfig) -> i32 {
             break 0;
         }
         identity = Some(native.identity.clone());
-        let Some(epoch)=native.owner.epoch() else {
+        let Some(epoch) = native.owner.epoch() else {
             native.owner.close();
             ui::error("native catalog identity is unavailable");
             break 1;
         };
-        let current_catalog=*epoch.catalog().nonce();
-        if catalog.is_some_and(|expected|expected!=current_catalog) {
+        let current_catalog = *epoch.catalog().nonce();
+        if catalog.is_some_and(|expected| expected != current_catalog) {
             native.owner.close();
             ui::error("native catalog changed; restart with the intended catalog");
             break 1;
         }
-        catalog=Some(current_catalog);
+        catalog = Some(current_catalog);
         if !initialized {
-            let effective_headers=match native.header_config() {
-                Ok(headers)=>headers,
-                Err(_)=>{
+            let effective_headers = match native.header_config() {
+                Ok(headers) => headers,
+                Err(_) => {
                     ui::error("native catalog header root refused");
                     native.owner.close();
                     break 1;
@@ -2128,17 +1755,28 @@ fn run_native(config: Config, storage: crate::pg::StorageConfig) -> i32 {
         });
         // index owns and drops its Tokio runtime, joining detached blocking work
         // before returning. No old runtime or session is reused by the next run.
-        let keeper=crate::pg::stage_words::Keeper::start(&owner,headers.clone());
-        let result=match keeper {
-            Ok(keeper)=>{
-                let result=index(current.clone(),stop.clone(),None,Some(native));
-                if let Err(error)=keeper.finish() {owner.fail(classify(&error));}
+        let keeper = crate::pg::stage_words::Keeper::start(&owner, headers.clone());
+        let result = match keeper {
+            Ok(keeper) => {
+                let result = index(current.clone(), stop.clone(), native);
+                if let Err(error) = keeper.finish() {
+                    owner.fail(classify(&error));
+                }
                 result
-            },
-            Err(error) if crate::pg::outage::is_attempt_ended(&error)
-                && (stop.load(Ordering::Acquire)||owner.stop.load(Ordering::Acquire))
-                && owner.failure().is_none()=>{drop(native);0},
-            Err(error)=>{owner.fail(classify(&error));drop(native);1},
+            }
+            Err(error)
+                if crate::pg::outage::is_attempt_ended(&error)
+                    && (stop.load(Ordering::Acquire) || owner.stop.load(Ordering::Acquire))
+                    && owner.failure().is_none() =>
+            {
+                drop(native);
+                0
+            }
+            Err(error) => {
+                owner.fail(classify(&error));
+                drop(native);
+                1
+            }
         };
         monitor_done.store(true, Ordering::Release);
         if monitor.join().is_err() {
@@ -2169,7 +1807,9 @@ fn native_pause(config: &Config, stop: &AtomicBool, backoff: &mut crate::pg::out
     NATIVE_PAUSED.store(true, Ordering::Release);
     write_status(true, "PostgreSQL unavailable", &config.index_mode, true, "postgres_paused", false, 0);
     let until = Instant::now() + backoff.next();
-    let Ok(destination)=crate::config::checked_storage_config() else {return;};
+    let Ok(destination) = crate::config::checked_storage_config() else {
+        return;
+    };
     let headers = crate::config::header_store_config();
     let mut checked = Instant::now();
     while Instant::now() < until && !stop.load(Ordering::Acquire) {
@@ -2177,7 +1817,7 @@ fn native_pause(config: &Config, stop: &AtomicBool, backoff: &mut crate::pg::out
         if checked.elapsed() >= Duration::from_secs(1) {
             checked = Instant::now();
             if load_config().is_none_or(|current| NativeProfile::check(&current, &headers).is_err())
-                || crate::config::checked_storage_config().ok().as_ref()!=Some(&destination)
+                || crate::config::checked_storage_config().ok().as_ref() != Some(&destination)
                 || crate::config::header_store_config() != headers
             {
                 break;
@@ -2187,42 +1827,20 @@ fn native_pause(config: &Config, stop: &AtomicBool, backoff: &mut crate::pg::out
 }
 
 /// The one time move into the shards at start, if `main` needs it, with
-/// `setup` the hold taken for setting up. Returns the hold to index under.
-/// The conversion runs alone, under the exclusive lock (`convert::run_alone`):
-/// another indexer starting, or a `--convert`, mustnt convert alongside it.
-/// The setup hold is let go for it, and taken again after, setting up the
-/// converted database: refused if a compaction got in between.
-pub fn convert_at_start(
-    main: &std::path::Path,
-    setup: WriteGuard,
-    report: &dyn Fn(&str),
-) -> anyhow::Result<WriteGuard> {
-    use anyhow::Context as _;
-    if !crate::convert::needed(main) {
-        return Ok(setup);
-    }
-    drop(setup);
-    crate::convert::run_alone(main, report).context("couldnt convert the database, nothing was changed")?;
-    db::create_db_holding(main)?.ok_or_else(|| anyhow::anyhow!("the database is being compacted; try again later"))
-}
-
 /// The indexing loop from `run`, stopping once `stop` is set (tests set it
 /// directly, `run` wires it to SIGTERM / SIGINT).
 pub fn run_until(config: Config, stop: Arc<AtomicBool>) -> i32 {
-    index(config, stop, None, None)
+    let storage = match crate::config::checked_storage_config() {
+        Ok(storage) => storage,
+        Err(_) => {
+            ui::error("storage configuration unavailable");
+            return 1;
+        }
+    };
+    run_native(config, storage, stop)
 }
 
-fn index(config: Config, stop: Arc<AtomicBool>, writing: Option<WriteGuard>, native: Option<NativeRuntime>) -> i32 {
-    // start sabnzbd soo its ready when you wanna download. on its own thread
-    // soo indexing doesnt sit around for up to 90s waiting on it
-    if native.is_none() && sab::available() && !sab::is_running() {
-        thread::spawn(|| {
-            if sab::start() {
-                sab::wait_ready(Duration::from_secs(90));
-            }
-        });
-    }
-
+fn index(config: Config, stop: Arc<AtomicBool>, native: NativeRuntime) -> i32 {
     let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(10).max(8);
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(threads)
@@ -2237,17 +1855,35 @@ fn index(config: Config, stop: Arc<AtomicBool>, writing: Option<WriteGuard>, nat
         }
     };
 
-    if native.is_none() {
-        crate::media::details::start_backfill(stop.clone());
-        if let Ok(conn) = crate::db::open() {
-            crate::duplicates::forget_old_twins(&conn);
-        }
-    }
-
     let stats = Arc::new(Mutex::new(Stats::new()));
     write_status(true, &groups_label(&config.tracked_groups(), 0), &config.index_mode, false, "running", false, 0);
 
-    let code = runtime.block_on(supervise(stop, stats.clone(), writing, native.as_ref()));
+    let observer = if config.metrics.enabled {
+        let observed_stats = stats.clone();
+        match crate::pg::catalog_metrics::Observer::start(
+            &native.owner,
+            Duration::from_secs(config.metrics.catalog_every_secs),
+            move |bytes| {
+                observed_stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner).database_bytes = Some(bytes);
+            },
+        ) {
+            Ok(observer) => Some(observer),
+            Err(error) => {
+                native.owner.fail(crate::pg::outage::classify(&error));
+                ui::error("native catalog observer could not start");
+                return 1;
+            }
+        }
+    } else {
+        None
+    };
+    let mut code = runtime.block_on(supervise(stop, stats.clone(), &native));
+    if let Some(observer) = observer
+        && let Err(error) = observer.finish()
+    {
+        native.owner.fail(crate::pg::outage::classify(&error));
+        code = 1;
+    }
     write_status(false, "", &config.index_mode, false, "stopped", code != 0, u32::from(code != 0));
     stats.lock().unwrap().write("", "", false, false);
     code
@@ -2256,74 +1892,132 @@ fn index(config: Config, stop: Arc<AtomicBool>, writing: Option<WriteGuard>, nat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pg::sql::Sql;
+
+    fn native_fixture() -> Option<(crate::pg::testing::Schema, Db)> {
+        let schema = crate::pg::testing::Schema::native_writer()?;
+        let database: String = schema.pool.get().unwrap().query_one("select current_database()", &[]).unwrap().get(0);
+        let db = crate::indexer::shared_postgres_db(
+            &crate::pg::StorageConfig {
+                backend: crate::pg::Backend::Postgres,
+                url: schema.url.clone(),
+                schema: schema.name.clone(),
+                allow_plaintext: true,
+                ..Default::default()
+            },
+            &database,
+            crate::indexer::PgWriteLimits::default(),
+        )
+        .unwrap();
+        Some((schema, db))
+    }
 
     #[test]
     fn native_details_only_attempt_pins_reload_before_reconfiguration() {
-        let mut config=Config::default();
-        config.postprocess.enabled=false;config.predb.enabled=false;
-        config.media.tmdb.api_key="private-details-key".into();config.media.details_per_minute=1;
-        config.native_assets=Some(crate::config::NativeAssetsConfig {root:"/selected-assets".into(),manifest:"/selected-manifest".into(),whole_sha256:"01".repeat(32)});
+        let mut config = Config::default();
+        config.postprocess.enabled = false;
+        config.predb.enabled = false;
+        config.media.tmdb.api_key = "private-details-key".into();
+        config.media.details_per_minute = 1;
+        config.native_assets = Some(crate::config::NativeAssetsConfig {
+            root: "/selected-assets".into(),
+            manifest: "/selected-manifest".into(),
+            whole_sha256: "01".repeat(32),
+        });
         assert!(crate::media::details::native::Service::enabled(&config.media));
-        let pin=native_service_config_pin(true,&config,&[],&[]).expect("a native details-only attempt must pin its captured service settings");
-        assert!(pin.check(&config,&[],&[]).is_ok());
-        let edits:[fn(&mut Config);4]=[
-            |c|c.media.tmdb.api_key="replacement-secret".into(),
-            |c|c.media.details_per_minute+=1,
-            |c|c.native_assets.as_mut().unwrap().manifest="/replacement-manifest".into(),
-            |c|c.native_assets=None,
+        let pin = native_service_config_pin(true, &config, &[], &[])
+            .expect("a native details-only attempt must pin its captured service settings");
+        assert!(pin.check(&config, &[], &[]).is_ok());
+        let edits: [fn(&mut Config); 4] = [
+            |c| c.media.tmdb.api_key = "replacement-secret".into(),
+            |c| c.media.details_per_minute += 1,
+            |c| c.native_assets.as_mut().unwrap().manifest = "/replacement-manifest".into(),
+            |c| c.native_assets = None,
         ];
         for edit in edits {
-            let mut changed=config.clone();edit(&mut changed);
-            let error=pin.check(&changed,&[],&[]).unwrap_err();
+            let mut changed = config.clone();
+            edit(&mut changed);
+            let error = pin.check(&changed, &[], &[]).unwrap_err();
             assert!(error.to_string().contains("restart"));
-            for private in ["private-details-key","replacement-secret","selected-assets","replacement-manifest"] {
+            for private in ["private-details-key", "replacement-secret", "selected-assets", "replacement-manifest"] {
                 assert!(!error.to_string().contains(private));
             }
-            assert_eq!(crate::pg::outage::classify(&error),crate::pg::outage::Failure::Fatal);
+            assert_eq!(crate::pg::outage::classify(&error), crate::pg::outage::Failure::Fatal);
         }
-        let mut reader_change=config.clone();reader_change.api_port=Some(12345);
-        assert!(pin.check(&reader_change,&[],&[]).is_ok());
-        assert!(native_service_config_pin(false,&config,&[],&[]).is_none(),"legacy startup does not acquire a native service pin");
+        let mut reader_change = config.clone();
+        reader_change.api_port = Some(12345);
+        assert!(pin.check(&reader_change, &[], &[]).is_ok());
+        assert!(
+            native_service_config_pin(false, &config, &[], &[]).is_none(),
+            "legacy startup does not acquire a native service pin"
+        );
     }
 
     #[test]
     fn checked_background_startup_child() {
-        if std::env::var("ATLAS_BG_STARTUP_CHILD").as_deref()!=Ok("1") {return;}
-        assert_eq!(super::run(),1,"invalid selected configuration must refuse startup");
+        if std::env::var("ATLAS_BG_STARTUP_CHILD").as_deref() != Ok("1") {
+            return;
+        }
+        assert_eq!(super::run(), 1, "invalid selected configuration must refuse startup");
     }
 
-    fn refused_selected_startup(dangling:bool) {
-        let home=tempfile::tempdir().unwrap();
-        fs::write(home.path().join("config.json"),r#"{"storage":{"backend":"sqlite"}}"#).unwrap();
-        let toml=home.path().join("config.toml");
+    fn refused_selected_startup(dangling: bool) {
+        let home = tempfile::tempdir().unwrap();
+        fs::write(home.path().join("config.json"), r#"{"storage":{"backend":"sqlite"}}"#).unwrap();
+        let toml = home.path().join("config.toml");
         if dangling {
             #[cfg(unix)]
-            std::os::unix::fs::symlink(home.path().join("missing.toml"),&toml).unwrap();
+            std::os::unix::fs::symlink(home.path().join("missing.toml"), &toml).unwrap();
             #[cfg(not(unix))]
             return;
         } else {
-            fs::write(&toml,"[storage]\nbackend='postgres'\nurl='fixture-secret-sentinel'\n[broken").unwrap();
+            fs::write(&toml, "[storage]\nbackend='postgres'\nurl='fixture-secret-sentinel'\n[broken").unwrap();
         }
-        let provider=std::net::TcpListener::bind("127.0.0.1:0").unwrap();provider.set_nonblocking(true).unwrap();
-        let mut child=std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact","bg_indexer::tests::checked_background_startup_child","--nocapture","--test-threads=1"])
-            .env_clear().env("ATLAS_HOME",home.path()).env("ATLAS_BG_STARTUP_CHILD","1")
-            .env("ATLAS_NNTP_HOST","127.0.0.1").env("ATLAS_NNTP_PORT",provider.local_addr().unwrap().port().to_string())
-            .env("ATLAS_NNTP_USER","fixture").env("ATLAS_NNTP_PASS","fixture")
-            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
-        let deadline=Instant::now()+Duration::from_secs(3);
-        let status=loop {
-            if let Some(status)=child.try_wait().unwrap() {break Some(status);}
-            if Instant::now()>=deadline {child.kill().unwrap();break None;}
+        let provider = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        provider.set_nonblocking(true).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "bg_indexer::tests::checked_background_startup_child", "--nocapture", "--test-threads=1"])
+            .env_clear()
+            .env("ATLAS_HOME", home.path())
+            .env("ATLAS_BG_STARTUP_CHILD", "1")
+            .env("ATLAS_NNTP_HOST", "127.0.0.1")
+            .env("ATLAS_NNTP_PORT", provider.local_addr().unwrap().port().to_string())
+            .env("ATLAS_NNTP_USER", "fixture")
+            .env("ATLAS_NNTP_PASS", "fixture")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                break None;
+            }
             thread::sleep(Duration::from_millis(10));
         };
-        let output=child.wait_with_output().unwrap();
-        assert!(status.is_some_and(|status|status.success()),"selected-file refusal must finish before database/provider startup");
-        assert!(matches!(provider.accept(),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock),"no provider connection before selector refusal");
-        let names=fs::read_dir(home.path()).unwrap().map(|entry|entry.unwrap().file_name().to_string_lossy().into_owned()).collect::<Vec<_>>();
-        assert!(names.iter().all(|name|matches!(name.as_str(),"config.toml"|"config.json")),"no database, PID, status or NXV startup artifacts: {names:?}");
-        let log=String::from_utf8_lossy(&output.stdout).to_string()+&String::from_utf8_lossy(&output.stderr);
-        assert!(!log.contains("fixture-secret-sentinel"),"configuration failure must not print source values");
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            status.is_some_and(|status| status.success()),
+            "selected-file refusal must finish before database/provider startup"
+        );
+        assert!(
+            matches!(provider.accept(),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock),
+            "no provider connection before selector refusal"
+        );
+        let names = fs::read_dir(home.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            names.iter().all(|name| matches!(name.as_str(), "config.toml" | "config.json")),
+            "no database, PID, status or NXV startup artifacts: {names:?}"
+        );
+        let log = String::from_utf8_lossy(&output.stdout).to_string() + &String::from_utf8_lossy(&output.stderr);
+        assert!(!log.contains("fixture-secret-sentinel"), "configuration failure must not print source values");
     }
 
     #[test]
@@ -2379,11 +2073,8 @@ mod tests {
         let (_schema, config, native, provider) = native_cursor_fixture();
         let operator = Arc::new(AtomicBool::new(false));
         let pool = Arc::new(Pool::new(&config.servers));
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .max_blocking_threads(1)
-            .enable_all()
-            .build()
-            .unwrap();
+        let runtime =
+            tokio::runtime::Builder::new_current_thread().max_blocking_threads(1).enable_all().build().unwrap();
         let (entered, ready) = std::sync::mpsc::channel();
         let (release, proceed) = std::sync::mpsc::channel();
         struct Release(Option<std::sync::mpsc::Sender<()>>);
@@ -2401,15 +2092,8 @@ mod tests {
         });
         ready.recv_timeout(Duration::from_secs(2)).unwrap();
         let result = runtime.block_on(async {
-            let admission = run_servers(
-                &config,
-                pool,
-                RunStates::default(),
-                Arc::new(Mutex::new(Stats::new())),
-                operator.clone(),
-                None,
-                Some(&native),
-            );
+            let admission =
+                run_servers(&config, pool, RunStates::default(), Arc::new(Mutex::new(Stats::new())), &native);
             let mut admission = std::pin::pin!(admission);
             // run_servers has reached its first await: the actual on_db
             // claim_plain_cursors job is queued behind the occupied lane.
@@ -2429,7 +2113,7 @@ mod tests {
         });
         let error = result.unwrap_err();
         assert!(is_attempt_ended(&error), "expected typed queued rejection: {error:#}");
-        let code = run_servers_error_exit(&error, Some(&native), &operator);
+        let code = run_servers_error_exit(&error, &operator);
         assert_eq!(native.owner.failure(), failure, "a rejected callback did no storage work");
         match failure {
             Some(Failure::Fatal) => {
@@ -2443,8 +2127,10 @@ mod tests {
                 assert!(matches!(AttemptOutcome::from_exit(code, native.owner.failure()), AttemptOutcome::Stopped));
             }
         }
-        assert!(matches!(provider.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
-            "cursor admission contacted the provider");
+        assert!(
+            matches!(provider.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "cursor admission contacted the provider"
+        );
         native.owner.close();
     }
 
@@ -2480,20 +2166,20 @@ mod tests {
                 Arc::new(Pool::new(&config.servers)),
                 RunStates::default(),
                 Arc::new(Mutex::new(Stats::new())),
-                operator.clone(),
-                None,
-                Some(&native),
+                &native,
             ))
             .unwrap_err();
         assert!(!is_attempt_ended(&error), "unexpected SQL failure became cancellation");
         operator.store(true, Ordering::Release);
         native.owner.stop.store(true, Ordering::Release);
         assert_eq!(native.owner.failure(), Some(Failure::Fatal));
-        let code = run_servers_error_exit(&error, Some(&native), &operator);
+        let code = run_servers_error_exit(&error, &operator);
         assert_eq!(code, 1, "unrelated SQL errors must remain fatal after operator stop");
         assert!(matches!(AttemptOutcome::from_exit(code, native.owner.failure()), AttemptOutcome::Fatal));
-        assert!(matches!(provider.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
-            "cursor admission contacted the provider");
+        assert!(
+            matches!(provider.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "cursor admission contacted the provider"
+        );
         native.owner.close();
     }
 
@@ -2597,8 +2283,6 @@ mod tests {
             settings: RwLock::new(PassSettings { mode: "backfill".into(), ..PassSettings::default() }),
             groups: RwLock::new(groups),
             blocked: Mutex::new(Vec::new()),
-            stage: OnceLock::new(),
-            predb: OnceLock::new(),
             stage_shape: stage_shape(&Config::default()),
             plan: vec![],
             workers: 2,
@@ -2617,22 +2301,24 @@ mod tests {
             failed: Default::default(),
             stats: Arc::new(Mutex::new(Stats::new())),
             wind_down: AtomicBool::new(false),
-            compact_due: AtomicBool::new(false),
-            compact_after: None,
-            auto_compact: AtomicBool::new(false),
             passes: AtomicUsize::new(0),
         }
     }
 
     #[test]
     fn native_scheduler_failure_is_recorded_before_worker_cancellation() {
-        let Some(schema)=crate::pg::testing::Schema::new() else {return};
-        let runtime=crate::pg::stage_queue_tests::runtime(&schema);
-        let mut sched=scheduler(Pool::new(&[]),Vec::new());sched.native_owner=Some(runtime.owner.clone());
+        let Some(schema) = crate::pg::testing::Schema::new() else { return };
+        let runtime = crate::pg::stage_queue_tests::runtime(&schema);
+        let mut sched = scheduler(Pool::new(&[]), Vec::new());
+        sched.native_owner = Some(runtime.owner.clone());
         sched.fail();
-        assert_eq!(runtime.owner.failure(),Some(crate::pg::outage::Failure::Fatal));
-        assert!(runtime.owner.stop.load(Ordering::Acquire));assert!(sched.stopping());
-        assert!(matches!(crate::pg::outage::AttemptOutcome::from_exit(0,runtime.owner.failure()),crate::pg::outage::AttemptOutcome::Fatal));
+        assert_eq!(runtime.owner.failure(), Some(crate::pg::outage::Failure::Fatal));
+        assert!(runtime.owner.stop.load(Ordering::Acquire));
+        assert!(sched.stopping());
+        assert!(matches!(
+            crate::pg::outage::AttemptOutcome::from_exit(0, runtime.owner.failure()),
+            crate::pg::outage::AttemptOutcome::Fatal
+        ));
         runtime.owner.close();
     }
 
@@ -2925,19 +2611,16 @@ mod tests {
     /// a sweep due on a server comes before another group's day chunks
     #[test]
     fn a_due_sweep_comes_before_other_groups_chunks() {
-        let dir = tempfile::tempdir().unwrap();
-        let main = dir.path().join("atlas.db");
-        db::create_db_at(&main).unwrap();
+        let Some((schema, db)) = native_fixture() else { return };
         let pool = Pool::new(&[UsenetServer::new("a.test", "u", "p", 119), UsenetServer::new("b.test", "u", "p", 119)]);
         // "done" split with its chunks all done, "busy" with many to go
-        let conn = db::open_at(&main).unwrap();
+        let conn = crate::pg::sql::Pg::new(schema.pool.get().unwrap());
         crate::chunks::add(&conn, "done", 20_000, 19_990).unwrap();
-        conn.execute("update backfill_chunks set state = 2 where grp = 'done'", []).unwrap();
+        conn.execute("update backfill_chunks set state = 2 where grp = 'done'", &[]).unwrap();
         crate::chunks::add(&conn, "busy", 20_000, 10_000).unwrap();
         // the server that isnt done's home sweeps it
         let server = 1 - pool.pick_server("done");
         let sched = scheduler(pool, vec!["busy".into(), "done".into()]);
-        let db = shared_db(conn);
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
             assert_eq!(take_sweep(&sched, server, &db).await.as_deref(), Some("done"));
@@ -2951,9 +2634,7 @@ mod tests {
     /// and banned from every server the group isn't read at all
     #[test]
     fn a_config_ban_alone_keeps_a_group_off_a_server() {
-        let dir = tempfile::tempdir().unwrap();
-        let main = dir.path().join("atlas.db");
-        db::create_db_at(&main).unwrap();
+        let Some((schema, db)) = native_fixture() else { return };
         let ban = |hosts: &[&str]| crate::config::IndexingConfig {
             ban: vec![("g".into(), hosts.iter().map(|h| h.to_string()).collect())],
             ..Default::default()
@@ -2962,13 +2643,12 @@ mod tests {
         let home = Pool::new(&servers).pick_server("g");
         let pool = Pool::new(&servers).with_ranking(&ban(&[servers[home].host.as_str()]), None);
         assert!(!pool.ranks());
-        let conn = db::open_at(&main).unwrap();
+        let conn = crate::pg::sql::Pg::new(schema.pool.get().unwrap());
         crate::chunks::add(&conn, "g", 20_000, 10_000).unwrap();
         let mut sched = scheduler(pool, vec!["g".into()]);
         sched.plan = vec![(0, 1), (1, 1)];
         assert_eq!(sched.take_group(home), None, "not on the server it's banned from");
         assert_eq!(sched.take_group(1 - home).as_deref(), Some("g"));
-        let db = shared_db(conn);
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
             assert!(take_chunk(&sched, home, &db).await.is_none(), "none of its day chunks either");
@@ -2984,13 +2664,11 @@ mod tests {
     /// home groups that keep every worker busy dont hold a due sweep off
     #[test]
     fn a_due_sweep_runs_while_home_groups_keep_workers_busy() {
-        let dir = tempfile::tempdir().unwrap();
-        let main = dir.path().join("atlas.db");
-        db::create_db_at(&main).unwrap();
+        let Some((schema, db)) = native_fixture() else { return };
         let pool = Pool::new(&[UsenetServer::new("a.test", "u", "p", 119), UsenetServer::new("b.test", "u", "p", 119)]);
-        let conn = db::open_at(&main).unwrap();
+        let conn = crate::pg::sql::Pg::new(schema.pool.get().unwrap());
         crate::chunks::add(&conn, "done", 20_000, 19_990).unwrap();
-        conn.execute("update backfill_chunks set state = 2 where grp = 'done'", []).unwrap();
+        conn.execute("update backfill_chunks set state = 2 where grp = 'done'", &[]).unwrap();
         let server = 1 - pool.pick_server("done");
         // more home groups on that server than it has workers
         let homes: Vec<String> =
@@ -2998,7 +2676,6 @@ mod tests {
         let mut groups = homes.clone();
         groups.push("done".into());
         let sched = scheduler(pool, groups);
-        let db = shared_db(conn);
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
             assert!(matches!(next_work(&sched, server, &db, false, false).await, Some(Work::Sweep(g)) if g == "done"));
@@ -3012,11 +2689,9 @@ mod tests {
     /// groups, and that worker takes a due group of its own next
     #[test]
     fn one_worker_a_server_runs_a_day_chunk_ahead_of_due_groups() {
-        let dir = tempfile::tempdir().unwrap();
-        let main = dir.path().join("atlas.db");
-        db::create_db_at(&main).unwrap();
+        let Some((schema, db)) = native_fixture() else { return };
         let pool = Pool::new(&[UsenetServer::new("a.test", "u", "p", 119), UsenetServer::new("b.test", "u", "p", 119)]);
-        let conn = db::open_at(&main).unwrap();
+        let conn = crate::pg::sql::Pg::new(schema.pool.get().unwrap());
         crate::chunks::add(&conn, "split", 20_000, 19_990).unwrap();
         let server = pool.pick_server("split");
         let homes: Vec<String> =
@@ -3024,7 +2699,6 @@ mod tests {
         let mut groups = homes.clone();
         groups.push("split".into());
         let sched = scheduler(pool, groups);
-        let db = shared_db(conn);
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
             let first = next_work(&sched, server, &db, false, false).await;
@@ -3043,15 +2717,13 @@ mod tests {
     /// nothing due takes a chunk whatever the count
     #[test]
     fn day_chunk_workers_scale_with_a_servers_connections() {
-        let dir = tempfile::tempdir().unwrap();
-        let main = dir.path().join("atlas.db");
-        db::create_db_at(&main).unwrap();
+        let Some((schema, db)) = native_fixture() else { return };
         let mut servers = [UsenetServer::new("a.test", "u", "p", 119), UsenetServer::new("b.test", "u", "p", 119)];
         for s in &mut servers {
             s.connections = Some(64);
         }
         let pool = Pool::new(&servers);
-        let conn = db::open_at(&main).unwrap();
+        let conn = crate::pg::sql::Pg::new(schema.pool.get().unwrap());
         // big groups' frontier day, one chunk each
         let splits: Vec<String> = (0..40).map(|i| format!("big{i}")).collect();
         for g in &splits {
@@ -3066,7 +2738,6 @@ mod tests {
         sched.plan = vec![(0, 64), (1, 64)];
         assert_eq!(sched.chunk_share(server), 64 / crate::nntp::STREAM_SLICES);
         assert_eq!(sched.chunk_most(server), 32);
-        let db = shared_db(conn);
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
             let mut chunks = 0;
@@ -3114,17 +2785,14 @@ mod tests {
     /// a worker alone on its server alternates a due sweep with its home group
     #[test]
     fn a_lone_worker_alternates_a_due_sweep_with_its_home_group() {
-        let dir = tempfile::tempdir().unwrap();
-        let main = dir.path().join("atlas.db");
-        db::create_db_at(&main).unwrap();
+        let Some((schema, db)) = native_fixture() else { return };
         let pool = Pool::new(&[UsenetServer::new("a.test", "u", "p", 119), UsenetServer::new("b.test", "u", "p", 119)]);
-        let conn = db::open_at(&main).unwrap();
+        let conn = crate::pg::sql::Pg::new(schema.pool.get().unwrap());
         crate::chunks::add(&conn, "done", 20_000, 19_990).unwrap();
-        conn.execute("update backfill_chunks set state = 2 where grp = 'done'", []).unwrap();
+        conn.execute("update backfill_chunks set state = 2 where grp = 'done'", &[]).unwrap();
         let server = 1 - pool.pick_server("done");
         let home = (0..).map(|i| format!("home{i}")).find(|g| pool.pick_server(g) == server).unwrap();
         let sched = scheduler(pool, vec![home.clone(), "done".into()]);
-        let db = shared_db(conn);
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
             // the sweep first, as before
