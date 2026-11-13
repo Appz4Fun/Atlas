@@ -540,7 +540,7 @@ mod sparse_nzb_metadata_tests {
     fn only_accepted_none_filename_messages_keep_raw_envelope_and_cascade_with_the_segment() {
         let schema=crate::pg::testing::Schema::new().expect("explicit sparse fresh schema");let mut client=schema.pool.get().unwrap();
         let subject=format!("rare{}é&subject",char::from(0));let poster=format!("poster{}原",char::from(0));
-        let release=|name:&str,file:Option<&str>,mid:&str|crate::parser::Release {name:name.into(),poster:poster.clone(),date:"2020-01-01 00:00:00".into(),group:"alt.binaries.test".into(),
+        let release=|name:&str,file:Option<&str>,mid:&str|crate::parser::Release {name:name.into(),poster:poster.clone(),date:"Wed, 01 Jan 2020 00:00:00 +0000".into(),group:"alt.binaries.test".into(),
             articles:vec![crate::parser::Article {filename:file.map(str::to_owned),subject:subject.clone(),message_id:mid.into(),part:Some(1),total_parts:Some(1),bytes:17,..Default::default()}],..Default::default()};
         let mut rare=release("Rare.Meta.Example",None,"<rare@example.test>");
         rare.articles[0].total_parts=Some(3);rare.articles[0].file_index=Some(2);rare.articles[0].file_total=Some(7);
@@ -552,13 +552,13 @@ mod sparse_nzb_metadata_tests {
         assert_eq!(client.query_one("select count(*) from segment_nzb_metadata",&[]).unwrap().get::<_,i64>(0),1);
         let row=client.query_one("select m.subject,m.poster,m.posted_date,m.nzb_timestamp,m.expected,m.subject_file_index,m.subject_file_total from segment_nzb_metadata m join releases r on r.id=m.release_id where r.name='Rare.Meta.Example'",&[]).unwrap();
         assert_eq!(row.get::<_,Vec<u8>>(0),subject.as_bytes());assert_eq!(row.get::<_,Vec<u8>>(1),poster.as_bytes());
-        assert_eq!(row.get::<_,Vec<u8>>(2),b"2020-01-01 00:00:00");assert_eq!(row.get::<_,i64>(3),1577836800);assert_eq!(row.get::<_,Option<i64>>(4),Some(3));assert_eq!(row.get::<_,Option<i64>>(5),Some(2));assert_eq!(row.get::<_,Option<i64>>(6),Some(7));
+        assert_eq!(row.get::<_,Vec<u8>>(2),b"Wed, 01 Jan 2020 00:00:00 +0000");assert_eq!(row.get::<_,i64>(3),1577836800);assert_eq!(row.get::<_,Option<i64>>(4),Some(3));assert_eq!(row.get::<_,Option<i64>>(5),Some(2));assert_eq!(row.get::<_,Option<i64>>(6),Some(7));
         let mut replay=rare;replay.poster="changed poster".into();replay.date="2022-01-01 00:00:00".into();replay.articles[0].subject="changed subject".into();
         replay.articles[0].total_parts=Some(99);replay.articles[0].file_index=Some(98);replay.articles[0].file_total=Some(99);
         assert_eq!(save(&mut client,&[replay],2).unwrap().parts,0);
         let kept=client.query_one("select subject,poster,posted_date,nzb_timestamp,expected,subject_file_index,subject_file_total from segment_nzb_metadata",&[]).unwrap();
         assert_eq!(kept.get::<_,Vec<u8>>(0),subject.as_bytes());assert_eq!(kept.get::<_,Vec<u8>>(1),poster.as_bytes());
-        assert_eq!(kept.get::<_,Vec<u8>>(2),b"2020-01-01 00:00:00");assert_eq!(kept.get::<_,i64>(3),1577836800);
+        assert_eq!(kept.get::<_,Vec<u8>>(2),b"Wed, 01 Jan 2020 00:00:00 +0000");assert_eq!(kept.get::<_,i64>(3),1577836800);
         assert_eq!(kept.get::<_,Option<i64>>(4),Some(3));assert_eq!(kept.get::<_,Option<i64>>(5),Some(2));assert_eq!(kept.get::<_,Option<i64>>(6),Some(7));
         client.execute("delete from releases where name='Rare.Meta.Example'",&[]).unwrap();
         assert_eq!(client.query_one("select count(*) from segment_nzb_metadata",&[]).unwrap().get::<_,i64>(0),0);
