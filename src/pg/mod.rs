@@ -50,6 +50,13 @@ pub mod migrate;
 pub(crate) mod natural_cache;
 pub mod release_queue;
 pub mod release_reader;
+pub(crate) mod fresh_reader;
+mod fresh_files;
+pub(crate) mod fresh_processing;
+pub(crate) mod fresh_live;
+mod fresh_listing;
+pub(crate) mod fresh_nzb;
+pub(crate) mod fresh_words;
 pub mod release_writer;
 pub mod sql;
 #[cfg(test)]
@@ -57,7 +64,7 @@ pub mod testing;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
@@ -288,6 +295,42 @@ impl Pool {
                 self.forget_one();
                 Err(e)
             }
+        }
+    }
+
+    /// A non-retrying reader lease bounded even while every connection is in
+    /// use. Existing worker get/with_retry behavior is unchanged.
+    pub(crate) fn get_before(&self, deadline: Instant) -> Result<Conn<'_>> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        loop {
+            let remaining = deadline.checked_duration_since(Instant::now())
+                .filter(|duration| !duration.is_zero()).context("PostgreSQL reader connection deadline expired")?;
+            while let Some(client) = state.idle.pop() {
+                if client.is_closed() { state.open -= 1; continue; }
+                return Ok(Conn { pool: self, client: Some(client), reused: true });
+            }
+            if state.open < self.max { break; }
+            let waited = self.freed.wait_timeout(state, remaining).unwrap_or_else(|error| error.into_inner());
+            state = waited.0;
+            if waited.1.timed_out() { bail!("PostgreSQL reader connection admission expired"); }
+        }
+        state.open += 1;
+        drop(state);
+        let mut config = self.config.clone();
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            self.forget_one();
+            bail!("PostgreSQL reader connection deadline expired");
+        }
+        let connect = config.get_connect_timeout().copied().map_or(remaining, |limit| limit.min(remaining));
+        config.connect_timeout(connect);
+        let opened = config.connect(postgres::NoTls).and_then(|mut client| {
+            client.batch_execute(&format!("set search_path to \"{}\"", self.schema))?;
+            Ok(client)
+        });
+        match opened {
+            Ok(client) => Ok(Conn { pool: self, client: Some(client), reused: false }),
+            Err(error) => { self.forget_one(); Err(error.into()) }
         }
     }
 

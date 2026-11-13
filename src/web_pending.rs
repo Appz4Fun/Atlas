@@ -41,6 +41,68 @@ impl StepMeta {
     }
 }
 
+trait ViewStep {
+    fn view_id(&self) -> u8;
+    fn view_name(&self) -> &'static str;
+    fn view_net(&self) -> bool;
+}
+impl ViewStep for StepMeta {
+    fn view_id(&self) -> u8 { self.id }
+    fn view_name(&self) -> &'static str { self.name }
+    fn view_net(&self) -> bool { self.net }
+}
+impl ViewStep for crate::postprocess::steps::Descriptor {
+    fn view_id(&self) -> u8 { self.id.0 }
+    fn view_name(&self) -> &'static str { self.name }
+    fn view_net(&self) -> bool { self.needs != Needs::Database }
+}
+
+/// A checked live loader derives these predicates from the same pinned PG
+/// facts/config as the stage. They never call Media::shared/wants/looked_up.
+pub(crate) struct Applicability {
+    pub(crate) id: u8,
+    pub(crate) applies: bool,
+    pub(crate) skipped: Option<&'static str>,
+}
+
+/// The only cache-dependent reasons in the current step catalog. A checked
+/// loader derives title presence from the actual category/options/name target,
+/// and reads kept lookup/IMDb state in PG. This DTO is not read authority.
+pub(crate) enum MediaRuleFacts {
+    NoRelease,
+    NoTitle,
+    Tv { looked_up: bool },
+    Movie { looked_up: bool, imdb_known: bool },
+}
+
+pub(crate) fn applicability_from_media(facts: MediaRuleFacts) -> Vec<Applicability> {
+    // Every registered DB step currently inherits applies=true. Net steps
+    // short-circuit it in StepMeta. The catalog oracle guards that metadata;
+    // native semantic qualification must also cover future predicate changes.
+    crate::postprocess::steps::catalog().iter()
+        .filter(|step| step.id != crate::probe::body_crc::BODY_CRC_STEP)
+        .map(|step| {
+            let skipped = match (step.id.0, &facts) {
+                (33, MediaRuleFacts::NoTitle) => Some("no movie or TV title in its name to look up"),
+                (33, MediaRuleFacts::Tv { looked_up: true } | MediaRuleFacts::Movie { looked_up: true, .. }) =>
+                    Some("its title's IDs are already known, or it was looked up lately"),
+                (34, MediaRuleFacts::NoTitle) => Some("no movie title in its name to find an IMDb id for"),
+                (34, MediaRuleFacts::Tv { .. }) => Some("an episode: only a movie's NFO is read for its IMDb id"),
+                (34, MediaRuleFacts::Movie { imdb_known: true, .. }) => Some("its title's IMDb id is already known"),
+                _ => None,
+            };
+            Applicability { id: step.id.0, applies: true, skipped }
+        }).collect()
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ProcessingScope { Shard(usize), Native }
+impl ProcessingScope {
+    fn label(self) -> String {
+        match self { Self::Shard(shard) => format!("shard {shard}"), Self::Native => "the native stage".into() }
+    }
+}
+
 fn step_list() -> &'static [StepMeta] {
     static STEPS: OnceLock<Vec<StepMeta>> = OnceLock::new();
     STEPS.get_or_init(|| {
@@ -94,39 +156,39 @@ const fn bit(id: u8) -> i64 {
 
 /// A release's rows in the processing stage's tables.
 #[derive(Clone, Debug, Default)]
-struct State {
+pub(crate) struct State {
     /// as the steps see it; None: the release is gone
-    release: Option<ReleaseInfo>,
-    has_state: bool,
-    done: i64,
-    failed: i64,
-    net_wanted: bool,
+    pub(crate) release: Option<ReleaseInfo>,
+    pub(crate) has_state: bool,
+    pub(crate) done: i64,
+    pub(crate) failed: i64,
+    pub(crate) net_wanted: bool,
     /// the net steps left; None on rows written before it was kept
-    net_left: Option<i64>,
-    net_next_at: i64,
-    net_attempts: i64,
-    net_transient: i64,
-    db_attempts: i64,
-    net_rank: Option<i64>,
-    last_error: Option<String>,
+    pub(crate) net_left: Option<i64>,
+    pub(crate) net_next_at: i64,
+    pub(crate) net_attempts: i64,
+    pub(crate) net_transient: i64,
+    pub(crate) db_attempts: i64,
+    pub(crate) net_rank: Option<i64>,
+    pub(crate) last_error: Option<String>,
     /// its queue row's time
-    due_at: Option<i64>,
+    pub(crate) due_at: Option<i64>,
     /// the first walk that will get to it, in the order walks run
-    walk: Option<WalkCover>,
+    pub(crate) walk: Option<WalkCover>,
     /// the walks that will get to it and run steps again, done or not, in the order they run: (those steps,
     /// whether it's the walk in progress)
-    redo_walks: Vec<(i64, bool)>,
+    pub(crate) redo_walks: Vec<(i64, bool)>,
 }
 
 /// A walk that will visit a release (see `engine::walk_tick`).
 #[derive(Clone, Debug, Default, PartialEq)]
-struct WalkCover {
+pub(crate) struct WalkCover {
     /// it goes down the shard's ids from here
-    before: i64,
+    pub(crate) before: i64,
     /// only this group's releases
-    group: Option<String>,
+    pub(crate) group: Option<String>,
     /// it's the walk in progress: the others wait for it
-    active: bool,
+    pub(crate) active: bool,
 }
 
 fn read_state(conn: &Connection, s: usize, id: i64) -> rusqlite::Result<State> {
@@ -211,17 +273,17 @@ fn read_state(conn: &Connection, s: usize, id: i64) -> rusqlite::Result<State> {
 
 /// How fast a shard's lanes went, per minute, and whether the indexer is running at all.
 #[derive(Clone, Debug, Default, PartialEq)]
-struct Pace {
-    running: bool,
+pub(crate) struct Pace {
+    pub(crate) running: bool,
     /// the steps that are on; None when the indexer hasn't said
-    enabled: Option<i64>,
+    pub(crate) enabled: Option<i64>,
     /// seconds the rates are over; under `MIN_WINDOW_SECS` they're not used
-    window_secs: i64,
+    pub(crate) window_secs: i64,
     /// releases the net lane ran a step of, and the ones it was then done with
-    net_visits: f64,
-    net_finished: f64,
-    queue_taken: f64,
-    walk_rows: f64,
+    pub(crate) net_visits: f64,
+    pub(crate) net_finished: f64,
+    pub(crate) queue_taken: f64,
+    pub(crate) walk_rows: f64,
 }
 
 impl Pace {
@@ -248,7 +310,7 @@ fn pace_of(stats: &Value, shard: usize, now: f64) -> Pace {
 
 /// How long until a release's turn in a line, in minutes.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Wait {
+pub(crate) enum Wait {
     /// about this long, with this many ahead of it in the order that gets to it first
     About(f64, i64),
     /// at least this long: more than `AHEAD_CAP` are ahead in every order
@@ -264,12 +326,12 @@ enum Wait {
 
 /// One of the orders a lane takes turns between: its share of the lane's batches, and a count of the rows ahead of
 /// the release in it, up to a cap, saying whether it stopped there.
-type Order<'a> = (f64, &'a dyn Fn(i64) -> rusqlite::Result<(i64, bool)>);
+pub(crate) type Order<'a, E = rusqlite::Error> = (f64, &'a dyn Fn(i64) -> std::result::Result<(i64, bool), E>);
 
 /// The release's wait in a lane that gets through `per_minute` releases of the shard and takes turns between
 /// `orders`: its turn comes in whichever order reaches it first. The first order is the lane's main one, always
 /// counted; the others only as far as could beat the best so far, soo a page counts little.
-fn wait_in(per_minute: Option<f64>, orders: &[Order<'_>]) -> rusqlite::Result<Wait> {
+pub(crate) fn wait_in<E>(per_minute: Option<f64>, orders: &[Order<'_, E>]) -> std::result::Result<Wait, E> {
     let Some(rate) = per_minute.filter(|r| *r > 0.0) else {
         let main = match orders.first() {
             Some((_, count)) => Some(count(AHEAD_CAP)?),
@@ -423,14 +485,21 @@ enum Standing {
 
 /// What the stage's lanes have in store for a release.
 #[derive(Debug, Default)]
-struct Waits {
-    net: Option<Wait>,
-    queue: Option<Wait>,
-    walk: Option<Wait>,
+pub(crate) struct Waits {
+    pub(crate) net: Option<Wait>,
+    pub(crate) queue: Option<Wait>,
+    pub(crate) walk: Option<Wait>,
 }
 
 /// Each step's standing, by rank.
 fn standings(state: &State, pace: &Pace, waits: &Waits, now: i64) -> Vec<(&'static StepMeta, Standing)> {
+    standings_using(step_list(), state, pace, waits, now,
+        |step| step.applies(state.release.as_ref()),
+        |step| state.release.as_ref().and_then(|release| step.step.skip_reason(release)))
+}
+
+fn standings_using<'a, S: ViewStep>(steps: &'a [S], state: &State, pace: &Pace, waits: &Waits, now: i64,
+    applies: impl Fn(&S) -> bool, skipped: impl Fn(&S) -> Option<&'static str>) -> Vec<(&'a S, Standing)> {
     let enabled = pace.enabled.unwrap_or(-1);
     // a net step after the release's first goes a claim later: one claim of its shard by rank takes NET_BATCH releases
     let per_step = if pace.measured() && pace.net_visits > 0.0 {
@@ -441,23 +510,23 @@ fn standings(state: &State, pace: &Pace, waits: &Waits, now: i64) -> Vec<(&'stat
     let mut net_ahead = 0.0;
     let mut running_seen = false;
     let mut out = Vec::new();
-    for step in step_list() {
-        let b = bit(step.id);
-        let skipped = || Standing::Skipped(state.release.as_ref().and_then(|r| step.step.skip_reason(r)));
+    for step in steps {
+        let b = bit(step.view_id());
+        let why = || Standing::Skipped(skipped(step));
         // a reprocess asked for it again, done or not: the walk in progress gets there in its time, another after it
         let redo = state.redo_walks.iter().find(|(redo, _)| redo & b != 0).filter(|_| enabled & b != 0);
         let standing = if let Some((_, active)) = redo {
             let wait = if *active { waits.walk.unwrap_or(Wait::Unknown(None)) } else { Wait::Later };
-            Standing::Queued { wait, after: 0.0, next: !step.net, lane: "walk" }
+            Standing::Queued { wait, after: 0.0, next: !step.view_net(), lane: "walk" }
         } else if state.done & b != 0 {
             Standing::Done
         } else if state.failed & b != 0 {
             Standing::Failed
         } else if enabled & b == 0 {
             Standing::Off
-        } else if !step.applies(state.release.as_ref()) {
-            skipped()
-        } else if step.net {
+        } else if !applies(step) {
+            why()
+        } else if step.view_net() {
             let left = state.net_wanted && state.net_left.is_none_or(|m| m & b != 0);
             if !left {
                 // a release with no row yet gets its net steps once a visit has looked at it
@@ -472,7 +541,7 @@ fn standings(state: &State, pace: &Pace, waits: &Waits, now: i64) -> Vec<(&'stat
                     (None, Some(wait)) if !state.has_state => {
                         Standing::Queued { wait: *wait, after: 0.0, next: false, lane: "walk" }
                     }
-                    _ => skipped(),
+                    _ => why(),
                 }
             } else if state.net_next_at > now && began_moments_ago(state, now) {
                 // the run is the release's first net step left; the rest come after it
@@ -513,7 +582,7 @@ fn standings(state: &State, pace: &Pace, waits: &Waits, now: i64) -> Vec<(&'stat
                 }
                 (Some(_), Some(wait), _) => Standing::Queued { wait: *wait, after: 0.0, next: true, lane: "database" },
                 (None, _, Some(wait)) => Standing::Queued { wait: *wait, after: 0.0, next: true, lane: "walk" },
-                _ => skipped(),
+                _ => why(),
             }
         };
         out.push((step, standing));
@@ -547,11 +616,16 @@ fn clock(at: i64) -> String {
     chrono::DateTime::from_timestamp(at, 0).map_or(String::new(), |t| t.format("%Y-%m-%d %H:%M UTC").to_string())
 }
 
-fn when(wait: &Wait, after: f64, lane: &str, shard: usize) -> String {
+fn render(id: i64, state: &State, pace: &Pace, rows: &[(&'static StepMeta, Standing)], now: i64) -> String {
+    render_using(ProcessingScope::Shard(store::shard_of_id(id)), state, pace, rows, now)
+}
+
+fn when(wait: &Wait, after: f64, lane: &str, scope: ProcessingScope) -> String {
+    let shard = scope.label();
     let line = match lane {
-        "walk" => format!("rows the walk of shard {shard} still has to look at"),
-        "database" => format!("ahead in shard {shard}'s queue"),
-        _ => format!("ahead in shard {shard}'s net line"),
+        "walk" => format!("rows the walk of {shard} still has to look at"),
+        "database" => format!("ahead in {shard}'s queue"),
+        _ => format!("ahead in {shard}'s net line"),
     };
     match wait {
         Wait::About(minutes, ahead) => {
@@ -571,13 +645,12 @@ fn when(wait: &Wait, after: f64, lane: &str, shard: usize) -> String {
             format!("{over}{} {line}; too little has gone through lately to tell when", thousands(*ahead))
         }
         Wait::Unknown(None) => "too little has gone through lately to tell when".into(),
-        Wait::Later => format!("once the walk of shard {shard} in progress is done, by a later walk"),
+        Wait::Later => format!("once the walk of {shard} in progress is done, by a later walk"),
     }
 }
 
-fn render(id: i64, state: &State, pace: &Pace, rows: &[(&'static StepMeta, Standing)], now: i64) -> String {
-    let shard = store::shard_of_id(id);
-    let pending: Vec<&(&StepMeta, Standing)> = rows
+fn render_using<S: ViewStep>(scope: ProcessingScope, state: &State, pace: &Pace, rows: &[(&S, Standing)], now: i64) -> String {
+    let pending: Vec<_> = rows
         .iter()
         .filter(|(_, s)| {
             matches!(s, Standing::Queued { .. } | Standing::Until(..) | Standing::Running(_) | Standing::AfterRunning)
@@ -585,7 +658,7 @@ fn render(id: i64, state: &State, pace: &Pace, rows: &[(&'static StepMeta, Stand
         .collect();
     let mut table = String::new();
     for (step, standing) in rows {
-        let lane = if step.net { "network" } else { "database" };
+        let lane = if step.view_net() { "network" } else { "database" };
         let (state_tag, note) = match standing {
             Standing::Done => (tag("tag-ok", "DONE"), String::new()),
             Standing::Failed => (tag("tag-bad", "FAILED"), state.last_error.as_deref().map(escape).unwrap_or_default()),
@@ -604,7 +677,7 @@ fn render(id: i64, state: &State, pace: &Pace, rows: &[(&'static StepMeta, Stand
             Standing::Queued { wait, after, next, lane } => {
                 let chip = if *next { tag("tag-ref", "NEXT") } else { tag("tag-warn", "QUEUED") };
                 let at = if pace.running {
-                    when(wait, *after, lane, shard)
+                    when(wait, *after, lane, scope)
                 } else {
                     "on hold: the indexer isn't running".into()
                 };
@@ -614,7 +687,7 @@ fn render(id: i64, state: &State, pace: &Pace, rows: &[(&'static StepMeta, Stand
         let _ = write!(
             table,
             "<tr><td>{}</td><td class=\"pending-lane\">{lane}</td><td class=\"pending-state\">{state_tag}</td><td>{note}</td></tr>",
-            escape(label(step.name))
+            escape(label(step.view_name()))
         );
     }
     let summary = if pending.is_empty() {
@@ -627,7 +700,7 @@ fn render(id: i64, state: &State, pace: &Pace, rows: &[(&'static StepMeta, Stand
             format!("Nothing left to run: {done} steps done.")
         }
     } else {
-        let names: Vec<&str> = pending.iter().map(|(s, _)| label(s.name)).collect();
+        let names: Vec<&str> = pending.iter().map(|(s, _)| label(s.view_name())).collect();
         let soonest = pending
             .iter()
             .filter_map(|(_, s)| match s {
@@ -652,8 +725,9 @@ fn render(id: i64, state: &State, pace: &Pace, rows: &[(&'static StepMeta, Stand
     };
     let rates = if pace.measured() {
         format!(
-            "Shard {shard} lately: {:.0} releases a minute through the net line ({:.0} steps), {:.0} queue rows a minute. \
+            "{} lately: {:.0} releases a minute through the net line ({:.0} steps), {:.0} queue rows a minute. \
              Times are at that pace, if nothing new goes ahead.",
+            match scope { ProcessingScope::Shard(shard) => format!("Shard {shard}"), ProcessingScope::Native => "Native stage".into() },
             pace.net_finished, pace.net_visits, pace.queue_taken
         )
     } else if pace.running {
@@ -705,14 +779,38 @@ pub(crate) fn fragment(args: &HashMap<String, String>) -> ApiResponse {
     let id = args.get("id").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
     match read_all(id) {
         Ok((state, pace, waits, now)) => {
-            let rows = standings(&state, &pace, &waits, now);
-            html(200, render(id, &state, &pace, &rows, now))
+            html(200, render_from_facts(id, &state, &pace, &waits, now))
         }
         Err(e) => {
             eprintln!("web pending {id} failed: {e}");
             html(200, String::new())
         }
     }
+}
+
+fn render_from_facts(id: i64, state: &State, pace: &Pace, waits: &Waits, now: i64) -> String {
+    let rows = standings(state, pace, waits, now);
+    render(id, state, pace, &rows, now)
+}
+
+/// Native processing shares the actual standing/order/ETA renderer, without
+/// constructing legacy Step services. All rule predicates/reasons must have
+/// been derived by the checked PG loader under the same source watermark;
+/// missing rows cannot become Default applicability or an empty panel.
+pub(crate) fn native_from_facts(scope: ProcessingScope, state: &State, pace: &Pace, waits: &Waits,
+    rules: &[Applicability], now: i64) -> anyhow::Result<String> {
+    use anyhow::ensure;
+    let steps: Vec<_> = crate::postprocess::steps::catalog().iter()
+        .filter(|step| step.id != crate::probe::body_crc::BODY_CRC_STEP).copied().collect();
+    ensure!(rules.len() == steps.len() && rules.iter().zip(&steps).all(|(rule, step)| rule.id == step.id.0),
+        "native processing applicability is incomplete or reordered");
+    ensure!(pace.window_secs >= 0 && [pace.net_visits, pace.net_finished, pace.queue_taken, pace.walk_rows]
+        .into_iter().all(|rate| rate.is_finite() && rate >= 0.0), "native processing pace is invalid");
+    let rule = |step: &crate::postprocess::steps::Descriptor| &rules[steps.iter().position(|other| other.id == step.id).unwrap()];
+    let rows = standings_using(&steps, state, pace, waits, now,
+        |step| step.view_net() || state.release.is_none() || rule(step).applies,
+        |step| rule(step).skipped);
+    Ok(render_using(scope, state, pace, &rows, now))
 }
 
 /// When step `name` runs next on release `id`, in a few words for a line of the release page: "in about 4 min
@@ -754,6 +852,40 @@ mod tests {
     use rusqlite::params;
 
     use super::*;
+
+    #[test]
+    fn native_processing_keeps_standings_and_requires_every_rule_fact() {
+        let mut state = State { has_state: true, done: bit(8), failed: bit(16), net_wanted: true,
+            net_left: Some(bit(4)), last_error: Some("<failed>&".into()), ..Default::default() };
+        let rules: Vec<_> = crate::postprocess::steps::catalog().iter()
+            .filter(|step| step.id != crate::probe::body_crc::BODY_CRC_STEP)
+            .map(|step| Applicability { id: step.id.0, applies: true, skipped: None }).collect();
+        let pace = Pace { running: true, enabled: Some(-1), window_secs: 60, net_visits: 120.0,
+            net_finished: 30.0, queue_taken: 40.0, walk_rows: 10.0 };
+        let waits = Waits { net: Some(Wait::About(2.0, 60)), ..Default::default() };
+        let html = native_from_facts(ProcessingScope::Native, &state, &pace, &waits, &rules, 100).unwrap();
+        for text in ["Processing", "DONE", "FAILED", "&lt;failed&gt;&amp;", "ahead in the native stage's net line", "Native stage lately"] {
+            assert!(html.contains(text), "native actual standing {text}");
+        }
+        assert!(!html.contains("Shard ") && !html.contains("shard "));
+        assert!(native_from_facts(ProcessingScope::Native, &state, &pace, &waits, &rules[1..], 100).is_err());
+        state.redo_walks.push((bit(8), true));
+        let queued = native_from_facts(ProcessingScope::Native, &state, &pace, &Waits { walk: Some(Wait::Later), ..Default::default() }, &rules, 100).unwrap();
+        assert!(queued.contains("by a later walk"));
+    }
+
+    #[test]
+    fn native_media_reasons_use_kept_facts_and_preserve_absence() {
+        let why = |facts, id| applicability_from_media(facts).into_iter().find(|rule| rule.id == id).unwrap().skipped;
+        assert_eq!(why(MediaRuleFacts::NoRelease, 33), None);
+        assert_eq!(why(MediaRuleFacts::NoTitle, 33), Some("no movie or TV title in its name to look up"));
+        assert_eq!(why(MediaRuleFacts::Tv { looked_up: false }, 33), None);
+        assert_eq!(why(MediaRuleFacts::Tv { looked_up: true }, 33), Some("its title's IDs are already known, or it was looked up lately"));
+        assert_eq!(why(MediaRuleFacts::Tv { looked_up: false }, 34), Some("an episode: only a movie's NFO is read for its IMDb id"));
+        assert_eq!(why(MediaRuleFacts::Movie { looked_up: false, imdb_known: false }, 34), None);
+        assert_eq!(why(MediaRuleFacts::Movie { looked_up: false, imdb_known: true }, 34), Some("its title's IMDb id is already known"));
+        assert!(applicability_from_media(MediaRuleFacts::NoTitle).iter().all(|rule| rule.applies));
+    }
 
     fn counted(n: i64) -> impl Fn(i64) -> rusqlite::Result<(i64, bool)> {
         move |cap| Ok((n.min(cap), n > cap))

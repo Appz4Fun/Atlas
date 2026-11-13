@@ -27,6 +27,16 @@ pub enum Kind {
     Histogram,
 }
 
+/// Exact in-process values, before text formatting or reduction. Float bits
+/// preserve the registry's actual gauge/histogram sum without lossy JSON or a
+/// fabricated counter sample. This is data, never an epoch/readiness proof.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ObservedValue {
+    Counter(u64),
+    GaugeBits(u64),
+    Histogram { count: u64, sum_bits: u64 },
+}
+
 /// One series. A histogram's `buckets` line up with its family's bounds, each
 /// counting its own observations only: rendering adds them up.
 struct Series {
@@ -129,6 +139,31 @@ impl Family {
         series.iter().map(|(key, s)| (key.clone(), f64::from_bits(s.value.load(Relaxed)))).collect()
     }
 
+    /// Borrow one original label identity at a time. The fallible callback
+    /// admits/copies only its own bounded output and can end the visit early.
+    /// No registry-sized String/Vec, provider, file or HTTP reader is involved.
+    /// The callback must do bounded in-memory work: no blocking I/O while this
+    /// family's read guard is held. A failed/partial visit is not complete input.
+    fn visit<E>(&self, mut each: impl FnMut(&str, ObservedValue) -> Result<(), E>) -> Result<(), E> {
+        let series = self.series.read().unwrap();
+        for (key, value) in series.iter() {
+            let observed = match self.kind {
+                Kind::Counter => ObservedValue::Counter(value.value.load(Relaxed)),
+                Kind::Gauge => ObservedValue::GaugeBits(value.value.load(Relaxed)),
+                Kind::Histogram => {
+                    // Same count ordering as render_histogram: +Inf/count
+                    // cannot be below the buckets observed before it.
+                    let mut below = 0;
+                    for bucket in &value.buckets { below += bucket.load(Relaxed); }
+                    ObservedValue::Histogram { count: value.value.load(Relaxed).max(below),
+                        sum_bits: value.sum.load(Relaxed) }
+                }
+            };
+            each(key, observed)?;
+        }
+        Ok(())
+    }
+
     fn render(&self, out: &mut String) {
         let series = self.series.read().unwrap();
         if series.is_empty() {
@@ -178,6 +213,16 @@ pub fn render() -> String {
         family.render(&mut out);
     }
     out
+}
+
+/// For the canonical observation actor. The caller must bind the completed
+/// original-series inventory to its actual tracked operation/epoch manifest;
+/// invoking this visitor alone issues no observation or consumer capability.
+pub(crate) fn visit<E>(mut each: impl FnMut(&'static str, &str, ObservedValue) -> Result<(), E>) -> Result<(), E> {
+    for family in names::ALL {
+        family.visit(|labels, value| each(family.name, labels, value))?;
+    }
+    Ok(())
 }
 
 /// Times one call of `function` until dropped: how long it took, how many are
@@ -272,6 +317,26 @@ pub(crate) static STARTED_AT: AtomicI64 = AtomicI64::new(0);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fallible_observation_retains_original_identity_and_exact_values() {
+        let counter = Family::new("counter", "counter", Kind::Counter, &[]);
+        counter.set_total(&[("name", "a\"é")], u64::MAX - 1);
+        counter.set_total(&[("name", "b")], 7);
+        let mut seen = Vec::new();
+        counter.visit::<()>(|key, value| { seen.push((key.to_owned(), value)); Ok(()) }).unwrap();
+        assert_eq!(seen, vec![("name=\"a\\\"é\"".into(), ObservedValue::Counter(u64::MAX - 1)),
+            ("name=\"b\"".into(), ObservedValue::Counter(7))]);
+        let mut calls = 0;
+        assert_eq!(counter.visit(|_, _| { calls += 1; Err("budget") }), Err("budget"));
+        assert_eq!(calls, 1);
+        let gauge = Family::new("gauge", "gauge", Kind::Gauge, &[]);
+        gauge.set(&[], -0.0);
+        gauge.visit::<()>(|_, value| { assert_eq!(value, ObservedValue::GaugeBits((-0.0f64).to_bits())); Ok(()) }).unwrap();
+        let histogram = Family::new("histogram", "histogram", Kind::Histogram, &[1.0, 2.0]);
+        histogram.observe(&[], 0.5); histogram.observe(&[], 3.0);
+        histogram.visit::<()>(|_, value| { assert_eq!(value, ObservedValue::Histogram { count: 2, sum_bits: 3.5f64.to_bits() }); Ok(()) }).unwrap();
+    }
 
     const BOUNDS: &[f64] = &[1.0, 10.0];
 

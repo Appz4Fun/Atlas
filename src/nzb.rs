@@ -10,8 +10,7 @@ use crate::search::{ArticleRow, ReleaseRow, get_release};
 use crate::ui;
 
 pub fn nzb_filename(name: &str, release_id: Option<i64>) -> String {
-    let bad = "<>:\"/\\|?*";
-    let safe: String = name.chars().map(|c| if bad.contains(c) || (c as u32) < 32 { '_' } else { c }).collect();
+    let safe: String = name.chars().map(filename_char).collect();
     let safe = safe.trim_matches([' ', '.']);
     let safe = if safe.is_empty() { "release" } else { safe };
 
@@ -19,6 +18,11 @@ pub fn nzb_filename(name: &str, release_id: Option<i64>) -> String {
         Some(id) if id != 0 => format!("{safe}.{id}.nzb"),
         _ => format!("{safe}.nzb"),
     }
+}
+
+/// Shared by ordinary and streamed Content-Disposition filenames.
+pub(crate) fn filename_char(c: char) -> char {
+    if "<>:\"/\\|?*".contains(c) || (c as u32) < 32 || c == '\u{7f}' { '_' } else { c }
 }
 
 fn escape_text(s: &str) -> String {

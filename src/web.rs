@@ -22,6 +22,8 @@ use crate::search::{ReleaseRow, get_release};
 use crate::ui::{fmt_date, fmt_size};
 use crate::{release_info, release_tags, word_index};
 
+mod fresh;
+
 const HTMX: &str = include_str!("../assets/htmx-2.0.11.min.js");
 const CSS: &str = include_str!("../assets/web.css");
 const JS: &str = include_str!("../assets/web.js");
@@ -71,6 +73,13 @@ pub fn get(path: &str, query: &str, cookies: Option<&str>, base: &str, api_key: 
         resp.headers.extend(remember.clone());
         resp
     };
+    if signed_in && (matches!(path,"/"|"") || path.starts_with("/ui/")) {
+        match crate::config::checked_storage_config() {
+            Ok(storage) if storage.is_postgres()=>return fresh::get(path,&args,base,api_key,&storage).map(remembered),
+            Err(_)=>return Some(html(503,diag("caution","catalog unavailable","Storage configuration could not be read."))),
+            _=>{},
+        }
+    }
     Some(match path {
         "/static/htmx.min.js" => asset("text/javascript; charset=utf-8", HTMX),
         "/static/atlas.css" => asset("text/css; charset=utf-8", CSS),
@@ -130,6 +139,9 @@ pub fn post(
     api_key: &str,
 ) -> Option<ApiResponse> {
     let signed_in = signed_in(cookies, api_key);
+    if signed_in && path.starts_with("/ui/") && match crate::config::checked_storage_config() {Ok(storage)=>storage.is_postgres(),Err(_)=>true} {
+        return Some(html(503,diag("caution","native operation unavailable","Native mutation admission is awaiting qualification.")));
+    }
     match path {
         "/login" => {
             let args = parse_query(body);
@@ -204,7 +216,7 @@ fn cookie_header(value: &str, max_age: i64) -> (String, String) {
 
 fn redirect(mut headers: Vec<(String, String)>) -> ApiResponse {
     headers.push(("Location".into(), "/".into()));
-    ApiResponse { status: 303, content_type: None, body: String::new(), headers, bytes: None, failed: false }
+    ApiResponse { status: 303, content_type: None, body: String::new(), headers, bytes: None, spool: None, disposition: None, failed: false }
 }
 
 fn asset(content_type: &'static str, body: &str) -> ApiResponse {
@@ -218,6 +230,8 @@ fn asset(content_type: &'static str, body: &str) -> ApiResponse {
             ("X-Content-Type-Options".into(), "nosniff".into()),
         ],
         bytes: None,
+        spool: None,
+        disposition: None,
         failed: false,
     }
 }
@@ -233,6 +247,8 @@ pub(crate) fn html(status: u16, body: String) -> ApiResponse {
             ("X-Content-Type-Options".into(), "nosniff".into()),
         ],
         bytes: None,
+        spool: None,
+        disposition: None,
         failed: false,
     }
 }
@@ -1974,10 +1990,14 @@ pub(crate) fn tag(class: &str, text: &str) -> String {
 
 /// What a row's size is, for its tooltip.
 fn size_note(size: Option<i64>, recovery: Option<&release_info::RecoveryOnly>) -> String {
+    size_note_bytes(size, recovery.map(release_info::RecoveryOnly::repairs_bytes))
+}
+
+fn size_note_bytes(size: Option<i64>, recovery: Option<Option<i64>>) -> String {
     let bytes = format!("{} bytes", thousands(size.unwrap_or(0)));
     match recovery {
         None => bytes,
-        Some(recovery) => match recovery.repairs_bytes() {
+        Some(recovery) => match recovery {
             Some(whole) => {
                 format!("{bytes} of PAR2 recovery data only. The files it repairs are {}", fmt_size(Some(whole)))
             }
@@ -2164,7 +2184,11 @@ fn recovery_warning(recovery: &release_info::RecoveryOnly) -> String {
 
 /// Says a row is only PAR2 data, and what it repairs.
 fn recovery_tag(recovery: &release_info::RecoveryOnly) -> String {
-    let title = match recovery.repairs_bytes() {
+    recovery_tag_bytes(recovery.repairs_bytes())
+}
+
+fn recovery_tag_bytes(bytes: Option<i64>) -> String {
+    let title = match bytes {
         Some(whole) => format!(
             "Only PAR2 recovery data. The files it repairs ({}) were posted under other names",
             fmt_size(Some(whole))
@@ -2265,7 +2289,11 @@ fn shown_names(
     media: Option<&MediaAttrs>,
     details: Option<&crate::media::details::Details>,
 ) -> (String, Option<String>) {
-    match crate::trash_name::name(&r.name, category, &crate::trash_name::Known::of(media, details)) {
+    shown_names_known(r, category, &crate::trash_name::Known::of(media, details))
+}
+
+fn shown_names_known(r: &ReleaseRow, category: i64, known: &crate::trash_name::Known<'_>) -> (String, Option<String>) {
+    match crate::trash_name::name(&r.name, category, known) {
         Some(shown) if shown != r.name => (shown, Some(r.name.clone())),
         _ => (r.name.clone(), None),
     }
@@ -2283,32 +2311,89 @@ fn row(
     media: &HashMap<i64, MediaAttrs>,
     extras: &RowExtras,
 ) -> String {
-    let category_id = categories.get(&r.id).copied().unwrap_or(UNCATEGORIZED);
+    let details = extras.details.get(&r.id);
+    let post = extras.split.get(&r.id);
+    row_from_facts(r, ResultFacts {
+        category: categories.get(&r.id).copied().unwrap_or(UNCATEGORIZED),
+        password: passwords.get(&r.id), media: media.get(&r.id), details: details.map(ResultDetails::from),
+        poster: details.filter(|details| crate::media::details::poster_kept(details)).map(|details| (details.kind, details.tmdb_id)),
+        recovery: extras.recovery.get(&r.id).map(release_info::RecoveryOnly::repairs_bytes), copies: extras.copies.get(&r.id),
+        spot: extras.spots.get(&r.id).map(|spot| SpotBadge { poster: &spot.poster, title: &spot.title }),
+        whole: post.map(|post| WholePostBadge { groups: post.groups.len(), linked_rows: post.lead.map(|_| post.ids.len()) }),
+        repair: extras.repair.contains(&r.id),
+    })
+}
+
+/// Presentation-only whole-post facts. Native callers consume the safe
+/// purpose-qualified derivation; constructing an unsafe legacy SplitPost is
+/// neither necessary nor sufficient to render a badge.
+#[derive(Clone, Copy)]
+pub(crate) struct WholePostBadge { pub groups: usize, pub linked_rows: Option<usize> }
+
+#[derive(Clone, Copy)]
+pub(crate) struct SpotBadge<'a> { pub poster: &'a str, pub title: &'a str }
+
+#[derive(Clone, Copy)]
+pub(crate) struct ResultDetails<'a> {
+    pub title: Option<&'a str>, pub released: Option<&'a str>,
+    pub imdb_score: Option<i64>, pub tmdb_score: Option<i64>, pub trakt_score: Option<i64>,
+}
+impl<'a> From<&'a crate::media::details::Details> for ResultDetails<'a> {
+    fn from(details: &'a crate::media::details::Details) -> Self {
+        Self { title: details.title.as_deref(), released: details.released.as_deref(),
+            imdb_score: details.imdb_score, tmdb_score: details.tmdb_score, trakt_score: details.trakt_score }
+    }
+}
+
+/// All enrichment and kept-artwork decisions precede rendering. None of the
+/// optional values means "try a legacy/provider lookup"; a native loader must
+/// obtain covered present/absent facts in its authenticated snapshot.
+pub(crate) struct ResultFacts<'a> {
+    pub category: i64,
+    pub password: Option<&'a Password>,
+    pub media: Option<&'a MediaAttrs>,
+    pub details: Option<ResultDetails<'a>>,
+    pub poster: Option<(i64, i64)>,
+    pub recovery: Option<Option<i64>>,
+    pub copies: Option<&'a crate::duplicates::CopyCount>,
+    pub spot: Option<SpotBadge<'a>>,
+    pub whole: Option<WholePostBadge>,
+    pub repair: bool,
+}
+
+pub(crate) fn row_from_facts(r: &ReleaseRow, facts: ResultFacts<'_>) -> String {
+    let category_id = facts.category;
     let category = escape(&label(category_id).unwrap_or_default());
-    let (shown, raw) = shown_names(r, category_id, media.get(&r.id), extras.details.get(&r.id));
+    let mut known = crate::trash_name::Known::of(facts.media, None);
+    known.title = facts.details.and_then(|details| details.title);
+    known.released = facts.details.and_then(|details| details.released);
+    let (shown, raw) = shown_names_known(r, category_id, &known);
     let size = fmt_size(r.size);
     let posted = escape(&fmt_date(r.posted_date.as_deref()));
     let mut tags = String::new();
-    if let Some(text) = media.get(&r.id).and_then(media_label) {
+    if let Some(text) = facts.media.and_then(media_label) {
         tags.push_str(&tag("tag-ref", &text));
     }
     tags.push_str(&name_tags(&release_tags::parse(&r.name)));
-    let details = extras.details.get(&r.id);
-    if let Some(score) = details.and_then(best_score) {
+    let details = facts.details;
+    let score = details.and_then(|details| details.imdb_score.map(|score| format!("IMDB {score}"))
+        .or_else(|| details.tmdb_score.map(|score| format!("TMDB {score}")))
+        .or_else(|| details.trakt_score.map(|score| format!("TRAKT {score}"))));
+    if let Some(score) = score {
         tags.push_str(&tag("tag-ref", &score));
     }
-    let thumb = details.filter(|d| crate::media::details::poster_kept(d)).map_or(String::new(), |d| {
+    let thumb = facts.poster.map_or(String::new(), |(kind, tmdb_id)| {
         format!(
             "<img class=\"thumb\" src=\"/ui/poster?kind={}&amp;tmdb={}\" alt=\"\" loading=\"lazy\" width=\"32\" height=\"48\">",
-            d.kind, d.tmdb_id
+            kind, tmdb_id
         )
     });
-    let recovery = extras.recovery.get(&r.id);
+    let recovery = facts.recovery;
     if let Some(recovery) = recovery {
-        tags.push_str(&recovery_tag(recovery));
+        tags.push_str(&recovery_tag_bytes(recovery));
     }
     // a recovery volume is no copy of the others of its set, whatever the set's list makes them look like
-    if let Some(count) = extras.copies.get(&r.id).filter(|_| recovery.is_none()) {
+    if let Some(count) = facts.copies.filter(|_| recovery.is_none()) {
         if count.xposts > 0 {
             let plural = if count.xposts == 1 { "" } else { "S" };
             tags.push_str(&tag("tag-ref", &format!("{} XPOST{plural}", count.xposts)));
@@ -2320,21 +2405,21 @@ fn row(
             tags.push_str(&tag("tag-ref", &format!("{} ALT{}", count.alts, if count.alts == 1 { "" } else { "S" })));
         }
     }
-    if let Some(spot) = extras.spots.get(&r.id) {
+    if let Some(spot) = facts.spot {
         tags.push_str(&spot_tag(&spot.poster, &spot.title));
     }
-    if let Some(post) = extras.split.get(&r.id) {
-        if post.groups.len() > 1 {
-            tags.push_str(&tag("tag-ref", &format!("{} GROUPS", post.groups.len())));
+    if let Some(post) = facts.whole {
+        if post.groups > 1 {
+            tags.push_str(&tag("tag-ref", &format!("{} GROUPS", post.groups)));
         }
-        if post.lead.is_some() {
-            tags.push_str(&linked_tag(post.ids.len()));
+        if let Some(rows) = post.linked_rows {
+            tags.push_str(&linked_tag(rows));
         }
     }
-    tags.push_str(&password_tag(passwords.get(&r.id)));
+    tags.push_str(&password_tag(facts.password));
     if !r.complete {
         tags.push_str(&tag("tag-warn", "INCOMPLETE"));
-    } else if extras.repair.contains(&r.id) {
+    } else if facts.repair {
         tags.push_str(&repair_tag());
     }
     tags.push_str(&crate::web_meta::drawer_trigger(r.id));
@@ -2350,7 +2435,7 @@ fn row(
         raw = raw_name_html(raw.as_deref()),
         group = escape(&r.group_name),
         group_link = attr(&url_encode(&r.group_name)),
-        size_note = attr(&size_note(r.size, recovery)),
+        size_note = attr(&size_note_bytes(r.size, recovery)),
     )
 }
 
@@ -2571,6 +2656,10 @@ fn category_input(cat: &str, oob: &str) -> String {
 
 /// More things to search on, with the sort: part of the form, soo typing keeps them.
 fn scope_inputs(search: &Search, oob: &str) -> String {
+    scope_inputs_for(search,oob,true)
+}
+
+fn scope_inputs_for(search: &Search,oob:&str,include_frozen:bool)->String {
     let open = if search.fields.any() || search.deep { " open" } else { "" };
     let field = |name: &str, label: &str, value: &str| {
         format!(
@@ -2579,10 +2668,10 @@ fn scope_inputs(search: &Search, oob: &str) -> String {
         )
     };
     let hidden = |name: &str, value: &str| format!("<input type=\"hidden\" name=\"{name}\" value=\"{}\">", attr(value));
-    let deep = format!(
+    let deep = if include_frozen { format!(
         "<label class=\"deep-field\"><input class=\"scope-field\" type=\"checkbox\" name=\"{DEEP_ARG}\" value=\"1\"{}> Deep search: frozen releases too</label>",
         if search.deep { " checked" } else { "" }
-    );
+    ) } else {String::new()};
     format!(
         "<details id=\"scope\" class=\"more-fields\"{open}{oob}><summary>More fields</summary><div class=\"field-grid\">{}{}{}{}{}{}{}</div>{}{}{}{}{}{}</details>",
         field("group", "Usenet group", &search.fields.group),
@@ -2684,6 +2773,10 @@ pub(crate) fn masthead(signed_in: bool) -> String {
 
 fn search_page(args: &HashMap<String, String>, base: &str) -> String {
     let search = Search::from_args(args);
+    search_page_from_results(&search,base,&results_html(&search),false)
+}
+
+fn search_page_from_results(search:&Search,base:&str,results:&str,native:bool)->String {
     page(
         "Atlas",
         &format!(
@@ -2704,8 +2797,8 @@ fn search_page(args: &HashMap<String, String>, base: &str) -> String {
             q = q_input(&search.q),
             ask = ask_box(&gemini::load()),
             cat = category_input(&search.cat, ""),
-            scope = scope_inputs(&search, ""),
-            results = results_html(&search),
+            scope = scope_inputs_for(search, "", !native),
+            results = results,
             base = escape(base),
         ),
     )
@@ -2865,6 +2958,8 @@ fn thaw_release(body: &str) -> ApiResponse {
             body: String::new(),
             headers: vec![("Location".into(), format!("/ui/release?id={id}"))],
             bytes: None,
+            spool: None,
+            disposition: None,
             failed: false,
         },
         Ok(crate::frozen::Thawed::NameTaken) => release_problem(
@@ -3279,6 +3374,8 @@ fn filled_nzb(args: &HashMap<String, String>) -> ApiResponse {
                 body: content,
                 headers: vec![("Content-Disposition".into(), format!("attachment; filename=\"{filename}\""))],
                 bytes: None,
+                spool: None,
+                disposition: None,
                 failed: false,
             }
         }
@@ -4418,6 +4515,8 @@ fn image(args: &HashMap<String, String>) -> ApiResponse {
             ("Content-Security-Policy".into(), "default-src 'none'; img-src 'self'; sandbox".into()),
         ],
         bytes: Some(bytes),
+        spool: None,
+        disposition: None,
         failed: false,
     }
 }
@@ -4552,6 +4651,8 @@ fn still(args: &HashMap<String, String>) -> ApiResponse {
             ("X-Content-Type-Options".into(), "nosniff".into()),
         ],
         bytes: Some(bytes),
+        spool: None,
+        disposition: None,
         failed: false,
     }
 }
@@ -4576,6 +4677,8 @@ fn poster(args: &HashMap<String, String>) -> ApiResponse {
             ("X-Content-Type-Options".into(), "nosniff".into()),
         ],
         bytes: Some(bytes),
+        spool: None,
+        disposition: None,
         failed: false,
     }
 }
@@ -4686,6 +4789,8 @@ fn cover(args: &HashMap<String, String>) -> ApiResponse {
             ("X-Content-Type-Options".into(), "nosniff".into()),
         ],
         bytes: Some(bytes),
+        spool: None,
+        disposition: None,
         failed: false,
     }
 }
@@ -4886,6 +4991,8 @@ fn ask(body: &str, htmx: bool, hide_incomplete: bool) -> ApiResponse {
             body: String::new(),
             headers: vec![("Location".into(), to)],
             bytes: None,
+            spool: None,
+            disposition: None,
             failed: false,
         };
     }
