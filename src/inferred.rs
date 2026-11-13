@@ -5,24 +5,17 @@
 //! file and counts towards whole. An id no server has is asked again later, less and less often; a post with more
 //! missing parts than a round asks is asked over several rounds.
 
-pub(crate) mod template;
 #[cfg(unix)]
 mod head_journal;
 #[cfg(unix)]
 pub(crate) mod native;
+pub(crate) mod template;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension, params};
-
-use crate::indexer::{Db, PassContext, on_db};
-use crate::nntp::{BackgroundBody, BackgroundRead, Overview, Pool};
-use crate::pg::sql::{Sql, vals};
-use crate::search::{ArticleRow, ReleaseRow};
-use crate::store;
+use crate::nntp::Overview;
+use crate::search::ArticleRow;
 
 /// posts younger than this may still be arriving, by upload or by listing
 const SETTLED_SECS: i64 = 2 * 3600;
@@ -32,17 +25,11 @@ const EVERY: Duration = Duration::from_secs(300);
 const MIN_BYTES: i64 = 64 << 20;
 /// posted this recently: past it the parts a server lacks are rarely anywhere
 const DAYS: i64 = 7;
-/// releases looked at per shard per round, the latest posted first among those due. posted_date has no index: the
-/// query walks the shard's releases, under half a second for 1.6 million on prod, and row ids don't go by when a post
-/// was posted (the backfill saves old posts with new ids, and recent ones with ids from before)
-const CANDIDATES: i64 = 500;
 /// a post less whole than this (in thousandths) isn't one a few parts make whole, nor one whose ids prove much
 const MIN_PERMILLE: i64 = 500;
 /// ids asked for per round, and at once
 const PER_ROUND: usize = 3_000;
 const AT_ONCE: usize = 8;
-/// an article's headers, more than any real one has
-const HEAD_BYTES: usize = 64 << 10;
 /// a post with nothing to ask for is looked at again after this: more parts may have come and prove its ids
 const NOTHING_AGAIN: i64 = 86_400;
 /// an id no server had (or whose headers were no use): asked again after this, doubling with each try, up to `LONGEST`
@@ -50,11 +37,6 @@ const ABSENT_AGAIN: i64 = 6 * 3600;
 const LONGEST: i64 = 2 * 86_400;
 /// an id a server couldn't be asked for, or whose headers couldn't be saved
 const FAILED_AGAIN: i64 = 1800;
-
-const CREATE: &str =
-    "create table if not exists inferred_asked (release_id INTEGER PRIMARY KEY, next_at INTEGER NOT NULL);
-     create table if not exists inferred_ids (
-        message_id TEXT PRIMARY KEY, next_at INTEGER NOT NULL, tries INTEGER NOT NULL)";
 
 /// One part to ask for: its post (by the release it was found by), the group it's saved in unless its headers say
 /// another, and the row `nzb::inferred_segments` made for it.
@@ -72,17 +54,6 @@ impl Wanted {
     fn key(&self) -> String {
         self.row.message_id.trim().trim_matches(['<', '>']).to_string()
     }
-}
-
-/// A round's plan: the parts to ask for, in order; the rows of posts with nothing to ask; and posts whose every part
-/// was asked lately, each with when the first of them is due again.
-#[derive(Debug, Default)]
-pub struct Plan {
-    pub wanted: Vec<Wanted>,
-    pub nothing: Vec<i64>,
-    pub waiting: Vec<(Vec<i64>, i64)>,
-    /// the rows of posts whose every due id is in `wanted`: none is due again before `FAILED_AGAIN`
-    pub asked: Vec<i64>,
 }
 
 /// What became of one id.
@@ -111,325 +82,10 @@ impl Outcome {
     }
 }
 
-pub async fn run(ctx: PassContext, db: Db, stopping: impl Fn() -> bool, stop: Arc<AtomicBool>) {
-    if let Err(e) = crate::indexer::on_sqlite_db(&db, |conn| Ok(conn.execute_batch(CREATE)?)).await {
-        eprintln!("inferred: {e:#}");
-        return;
-    }
-    loop {
-        let deadline = Instant::now() + EVERY;
-        while !stopping() && Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-        if stopping() {
-            return;
-        }
-        if let Err(e) = round(&ctx.pool, &db, &stopping, &stop).await
-            && !stopping()
-        {
-            eprintln!("inferred: {e:#}");
-        }
-    }
-}
-
-async fn round(pool: &Arc<Pool>, db: &Db, stopping: &impl Fn() -> bool, stop: &Arc<AtomicBool>) -> anyhow::Result<()> {
-    let now = chrono::Utc::now().timestamp();
-    // the scan gives up once stopping, as `repair`'s does
-    let scan_stop = stop.clone();
-    let plan = tokio::task::spawn_blocking(move || {
-        crate::repair::reading_until(&scan_stop, |conn| {
-            let post = |row: &ReleaseRow| {
-                let (ids, size) = match crate::release_info::whole_post_with(conn, row)? {
-                    Some(post) => (post.ids, post.size),
-                    None => (vec![row.id], row.size.unwrap_or(0)),
-                };
-                let permille = crate::release_info::permille_of(conn, &ids)?;
-                Ok((ids, permille, size))
-            };
-            let articles = |row: &ReleaseRow| {
-                crate::nzb::inventory_with(conn, row).map(|(articles, groups, _)| (articles, groups))
-            };
-            plan(conn, now, PER_ROUND, post, articles)
-        })
-    })
-    .await??;
-    let Plan { wanted, nothing, mut waiting, asked } = plan;
-    waiting.push((asked, now + FAILED_AGAIN));
-    on_db(db, move |conn| Ok(mark_posts(conn, &nothing, &waiting, now)?)).await?;
-    if wanted.is_empty() {
-        return Ok(());
-    }
-    // asked a few at once, each across every server; an id whose read a stop drops is asked next time
-    let mut outcomes: Vec<(Wanted, Outcome)> = Vec::new();
-    let mut found: BTreeMap<String, Vec<(usize, Overview)>> = BTreeMap::new();
-    let mut set = tokio::task::JoinSet::new();
-    // whose read each task is, for one that panics
-    let mut whose: HashMap<tokio::task::Id, Wanted> = HashMap::new();
-    let mut queue = wanted.into_iter();
-    loop {
-        while set.len() < AT_ONCE && !stopping() {
-            let Some(w) = queue.next() else { break };
-            let pool = pool.clone();
-            let id = format!("<{}>", w.key());
-            let task = set.spawn(async move { pool.background_read(&id, HEAD_BYTES, BackgroundRead::Head).await });
-            whose.insert(task.id(), w);
-        }
-        let Some(Some(done)) = crate::nntp::unless_stopped(stop, set.join_next_with_id()).await else { break };
-        let (task, got) = match done {
-            Ok((task, got)) => (task, Ok(got)),
-            Err(e) => (e.id(), Err(())),
-        };
-        let Some(w) = whose.remove(&task) else { continue };
-        let outcome = match got {
-            Ok(Ok(BackgroundBody::Body(head))) => match overview_of(&head, &w) {
-                Some((group, o)) => {
-                    found.entry(group).or_default().push((outcomes.len(), o));
-                    Outcome::Found
-                }
-                None => Outcome::Unusable,
-            },
-            Ok(Ok(BackgroundBody::TooBig)) => Outcome::Unusable,
-            Ok(Ok(BackgroundBody::Missing)) => Outcome::Absent,
-            Ok(Err(_)) | Err(()) => Outcome::Failed,
-        };
-        outcomes.push((w, outcome));
-    }
-    // a stop drops the rest of the round, as `repair`'s does (saves run whole on the writers): what wasn't marked is
-    // asked again next time
-    crate::nntp::unless_stopped(stop, finish(pool, db, outcomes, found, now)).await.transpose()?;
-    Ok(())
-}
-
-/// Saves what was found and marks what each id came to.
-async fn finish(
-    pool: &Arc<Pool>,
-    db: &Db,
-    mut outcomes: Vec<(Wanted, Outcome)>,
-    found: BTreeMap<String, Vec<(usize, Overview)>>,
-    now: i64,
-) -> anyhow::Result<()> {
-    // what wasn't found is marked first, soo a stop during the saves keeps it
-    let missed: Vec<(String, Outcome)> =
-        outcomes.iter().filter(|(_, o)| *o != Outcome::Found).map(|(w, o)| (w.key(), *o)).collect();
-    on_db(db, move |conn| Ok(mark_ids(conn, &missed, now)?)).await?;
-    // saved like a listing's headers: each part joins its file by its subject, and is marked once its group is saved.
-    // A group that couldn't be saved has its ids asked again soon; the other groups are saved all the same
-    for (group, headers) in found {
-        let at: Vec<usize> = headers.iter().map(|(i, _)| *i).collect();
-        let headers: Vec<Overview> = headers.into_iter().map(|(_, o)| o).collect();
-        let unsaved = pool.reserve_unsaved_shard(store::shard_of(&group), headers.len() as u64).await;
-        let outcome = match crate::indexer::save_slice(pool, db, &group, headers, unsaved).await {
-            Ok(_) => Outcome::Found,
-            Err(e) => {
-                eprintln!("inferred: saving {group}: {e:#}");
-                Outcome::Failed
-            }
-        };
-        let marks: Vec<(String, Outcome)> = at
-            .iter()
-            .map(|&i| {
-                outcomes[i].1 = outcome;
-                (outcomes[i].0.key(), outcome)
-            })
-            .collect();
-        on_db(db, move |conn| Ok(mark_ids(conn, &marks, now)?)).await?;
-    }
-    let mut counts: BTreeMap<&str, u64> = BTreeMap::new();
-    let mut posts = HashSet::new();
-    for (w, o) in &outcomes {
-        *counts.entry(o.label()).or_default() += 1;
-        posts.insert(w.release_id);
-    }
-    for o in [Outcome::Found, Outcome::Absent, Outcome::Unusable, Outcome::Failed] {
-        crate::metrics::names::INFERRED_PARTS
-            .inc(&[("outcome", o.label())], counts.get(o.label()).copied().unwrap_or(0));
-    }
-    println!(
-        "[inferred] asked {} parts of {} posts: {} found, {} on no server, {} unusable, {} couldnt be asked or saved",
-        outcomes.len(),
-        posts.len(),
-        counts.get("found").unwrap_or(&0),
-        counts.get("absent").unwrap_or(&0),
-        counts.get("unusable").unwrap_or(&0),
-        counts.get("failed").unwrap_or(&0)
-    );
-    Ok(())
-}
-
-/// The parts worth asking for this round, most nearly whole posts first, `budget` ids at most: the ids of each post
-/// that aren't waiting after an earlier try, the last post taken only in part when the budget ends in it (the rest
-/// next round). And the posts with nothing to ask, and those whose every id waits. `conn` has the shards attached
-/// and the tables in main; `post` gives a release's post (its rows), how whole it is in thousandths and its size,
-/// `articles` the articles its NZB is made of and its groups. A stop (the reader interrupted) ends the plan with that
-/// error; a release another error keeps from being read has nothing to ask, for now.
-pub fn plan(
-    conn: &Connection,
-    now: i64,
-    budget: usize,
-    post: impl Fn(&ReleaseRow) -> rusqlite::Result<(Vec<i64>, i64, i64)>,
-    articles: impl Fn(&ReleaseRow) -> rusqlite::Result<(Vec<ArticleRow>, Vec<String>)>,
-) -> rusqlite::Result<Plan> {
-    let has_table = conn.prepare("select 1 from main.sqlite_master where name = 'inferred_ids'")?.exists([])?;
-    if !has_table {
-        return Ok(Plan::default());
-    }
-    let mut out = Plan::default();
-    let mut seen = HashSet::new();
-    // (permille, size, release, its post's rows)
-    let mut posts: Vec<(i64, i64, ReleaseRow, Vec<i64>)> = Vec::new();
-    for s in 0..store::SHARDS {
-        let sql = format!(
-            "select r.id, coalesce(r.display_name, r.name), r.group_name, r.poster, r.posted_date, r.size, r.complete,
-                    r.parts
-             from s{s}.releases r
-             where r.complete = 0 and r.size >= ?1
-               and r.posted_date >= datetime(?2, 'unixepoch') and r.posted_date < datetime(?3, 'unixepoch')
-               and not exists (select 1 from main.inferred_asked a where a.release_id = r.id and a.next_at > ?4)
-             order by r.posted_date desc limit ?5"
-        );
-        let rows = crate::repair::release_rows(
-            conn,
-            &sql,
-            params![MIN_BYTES, now - DAYS * 86_400, now - SETTLED_SECS, now, CANDIDATES],
-        )?;
-        for row in rows {
-            if !seen.insert(row.id) {
-                continue;
-            }
-            if crate::filters::group_blocked(&row.group_name) {
-                out.nothing.push(row.id);
-                continue;
-            }
-            let (mut ids, permille, size) = match post(&row) {
-                Ok(p) => p,
-                Err(e) if interrupted(&e) => return Err(e),
-                Err(e) => {
-                    eprintln!("inferred: release {}: {e}", row.id);
-                    out.nothing.push(row.id);
-                    continue;
-                }
-            };
-            if !ids.contains(&row.id) {
-                ids.push(row.id);
-            }
-            seen.extend(ids.iter().copied());
-            if (MIN_PERMILLE..1000).contains(&permille) {
-                posts.push((permille, size, row, ids));
-            } else {
-                out.nothing.extend(ids);
-            }
-        }
-    }
-    posts.sort_by_key(|(permille, size, _, _)| (std::cmp::Reverse(*permille), std::cmp::Reverse(*size)));
-    let mut waits = conn.prepare("select next_at from main.inferred_ids where message_id = ?1")?;
-    for (_, _, row, ids) in posts {
-        let room = budget.saturating_sub(out.wanted.len());
-        if room == 0 {
-            break;
-        }
-        let (articles, groups) = match articles(&row) {
-            Ok(a) => a,
-            Err(e) if interrupted(&e) => return Err(e),
-            Err(e) => {
-                eprintln!("inferred: release {}: {e}", row.id);
-                out.nothing.extend(ids);
-                continue;
-            }
-        };
-        let groups: Arc<[String]> = groups.into();
-        let rows: Vec<ArticleRow> = crate::nzb::inferred_segments(&articles).into_iter().flat_map(|f| f.rows).collect();
-        if rows.is_empty() {
-            out.nothing.extend(ids);
-            continue;
-        }
-        let mut due = Vec::new();
-        let mut first_due: Option<i64> = None;
-        for r in rows {
-            let w = Wanted { release_id: row.id, group: row.group_name.clone(), groups: groups.clone(), row: r };
-            match waits.query_row([w.key()], |r| r.get::<_, i64>(0)).optional()? {
-                Some(at) if at > now => first_due = Some(first_due.map_or(at, |f| f.min(at))),
-                _ => due.push(w),
-            }
-        }
-        match first_due {
-            Some(at) if due.is_empty() => out.waiting.push((ids, at)),
-            _ => {
-                if due.len() <= room {
-                    out.asked.extend(ids);
-                }
-                out.wanted.extend(due.into_iter().take(room));
-            }
-        }
-    }
-    Ok(out)
-}
-
-/// When an id is asked again after `tries` answers that it isn't to be had.
+/// The retry time for an answered MID; transient failures retain their own short delay.
 pub fn backoff(now: i64, tries: i64) -> i64 {
     let shift = tries.clamp(1, 16) - 1;
     now + (ABSENT_AGAIN << shift).min(LONGEST)
-}
-
-/// Posts with nothing to ask, looked at again after `NOTHING_AGAIN`; posts whose ids all wait, when the first is due.
-/// What was due longer ago than a post is looked at for goes: its post is past `DAYS`.
-fn mark_posts(db: &dyn Sql, nothing: &[i64], waiting: &[(Vec<i64>, i64)], now: i64) -> crate::pg::sql::Result<()> {
-    db.tx(|tx| {
-        let stale = now - DAYS * 86_400;
-        tx.execute("delete from inferred_asked where next_at < $1", vals![stale])?;
-        tx.execute("delete from inferred_ids where next_at < $1", vals![stale])?;
-        let put = |id: i64, at: i64| {
-            tx.execute(
-                "insert into inferred_asked (release_id, next_at) values ($1, $2)
-                 on conflict (release_id) do update set next_at = excluded.next_at",
-                vals![id, at],
-            )
-        };
-        for id in nothing {
-            put(*id, now + NOTHING_AGAIN)?;
-        }
-        for (ids, at) in waiting {
-            for id in ids {
-                put(*id, *at)?;
-            }
-        }
-        Ok(())
-    })
-}
-
-/// What each id asked came to: one found, or that no server has (or whose headers were no use), waits longer with each
-/// try; one that couldn't be asked or saved waits `FAILED_AGAIN`, its tries as they were.
-fn mark_ids(db: &dyn Sql, marks: &[(String, Outcome)], now: i64) -> crate::pg::sql::Result<()> {
-    // one statement each: an answer is one more try, its wait (`backoff`) from the tries it then has; a failure
-    // keeps them
-    let waits: String = (0..16).map(|t| format!(" when {t} then {}", backoff(0, t + 1))).collect();
-    let answered = format!(
-        "insert into inferred_ids (message_id, next_at, tries) values ($1, $2, 1)
-         on conflict (message_id) do update set
-            tries = inferred_ids.tries + 1, next_at = cast($3 as bigint) + case inferred_ids.tries{waits} else {} end",
-        backoff(0, 16)
-    );
-    db.tx(|tx| {
-        for (id, outcome) in marks {
-            match outcome {
-                Outcome::Found | Outcome::Absent | Outcome::Unusable => {
-                    tx.execute(&answered, vals![id, backoff(now, 1), now])?;
-                }
-                Outcome::Failed => {
-                    tx.execute(
-                        "insert into inferred_ids (message_id, next_at, tries) values ($1, $2, 0)
-                         on conflict (message_id) do update set next_at = excluded.next_at",
-                        vals![id, now + FAILED_AGAIN],
-                    )?;
-                }
-            }
-        }
-        Ok(())
-    })
-}
-
-/// Whether a read failed because a stop interrupted it.
-fn interrupted(e: &rusqlite::Error) -> bool {
-    e.sqlite_error_code() == Some(rusqlite::ErrorCode::OperationInterrupted)
 }
 
 /// The listing row a server's headers for `w` make, and the group to save it in: `w`'s, unless the headers' `Xref:`
@@ -558,158 +214,59 @@ Xref: news.example alt.binaries.movies:11666417361 alt.binaries.hdtv:42\r\n";
         assert_eq!(backoff(0, 3), 4 * ABSENT_AGAIN);
         assert_eq!(backoff(0, 9), LONGEST);
     }
-
+    #[cfg(unix)]
     #[test]
-    fn each_id_keeps_its_own_tries() {
-        crate::pg::testing::each(
-            |c| c.execute_batch(CREATE).unwrap(),
-            |db| {
-                let row = |id: &str| -> Option<(i64, i64)> {
-                    let r = db.row("select next_at, tries from inferred_ids where message_id = $1", vals![id]);
-                    r.unwrap().map(|r| (r.get(0).unwrap(), r.get(1).unwrap()))
-                };
-                let mark = |id: &str, o: Outcome, now: i64| mark_ids(db, &[(id.to_string(), o)], now).unwrap();
-                mark("a", Outcome::Absent, 100);
-                assert_eq!(row("a"), Some((100 + ABSENT_AGAIN, 1)));
-                // headers that can't be used are an answer too
-                mark("a", Outcome::Unusable, 200);
-                assert_eq!(row("a"), Some((200 + 2 * ABSENT_AGAIN, 2)));
-                // a server that couldn't be asked isn't a try
-                mark("a", Outcome::Failed, 300);
-                assert_eq!(row("a"), Some((300 + FAILED_AGAIN, 2)));
-                // found waits too: should it not have joined its file, it isn't asked every round
-                mark("a", Outcome::Found, 400);
-                assert_eq!(row("a"), Some((400 + 4 * ABSENT_AGAIN, 3)));
-                // and the wait stops growing at `LONGEST`
-                for t in 0..20 {
-                    mark("a", Outcome::Absent, 1000 + t);
-                }
-                assert_eq!(row("a"), Some((1019 + LONGEST, 23)));
-                mark("b", Outcome::Failed, 500);
-                assert_eq!(row("b"), Some((500 + FAILED_AGAIN, 0)));
-
-                mark_posts(db, &[1], &[(vec![2, 3], 900)], 600).unwrap();
-                let next = |id: i64| -> i64 {
-                    db.one("select next_at from inferred_asked where release_id = $1", vals![id]).unwrap()
-                };
-                assert_eq!((next(1), next(2), next(3)), (600 + NOTHING_AGAIN, 900, 900));
-                mark_posts(db, &[1], &[], 700).unwrap();
-                assert_eq!(next(1), 700 + NOTHING_AGAIN, "looked at again: its time moves");
-                // a week on, what was due long ago is gone
-                let later = 700 + NOTHING_AGAIN + DAYS * 86_400 + 1;
-                mark("a", Outcome::Failed, later - DAYS * 86_400 - FAILED_AGAIN - 1);
-                mark_posts(db, &[], &[], later).unwrap();
-                assert_eq!(row("b"), None);
-                assert_eq!(row("a"), None);
-                assert_eq!(db.one::<i64>("select count(*) from inferred_asked", vals![]).unwrap(), 0);
-            },
-        );
-    }
-
-    /// Every shard attached, `inferred_asked` in main, and releases (id, size, posted, complete) in shard 0.
-    fn shards(rows: &[(i64, i64, &str, bool)]) -> (tempfile::TempDir, Connection) {
-        let dir = tempfile::tempdir().unwrap();
-        let conn = Connection::open_in_memory().unwrap();
-        crate::filters::register_sql(&conn).unwrap();
-        for s in 0..store::SHARDS {
-            let path = dir.path().join(format!("atlas.s{s}.db"));
-            store::create_shard(&path).unwrap();
-            conn.execute(&format!("attach database ?1 as s{s}"), [path.to_string_lossy()]).unwrap();
-        }
-        conn.execute_batch(CREATE).unwrap();
-        for &(id, size, posted, complete) in rows {
-            conn.execute(
-                "insert into s0.releases (id, name, group_name, poster, posted_date, size, complete, parts)
-                 values (?1, 'r' || ?1, 'alt.binaries.movies', 'p', ?2, ?3, ?4, 1)",
-                params![id, posted, size, complete],
-            )
-            .unwrap();
-        }
-        (dir, conn)
-    }
-
-    fn pattern(total: i64, have: &[i64]) -> Vec<ArticleRow> {
-        have.iter()
-            .map(|&p| ArticleRow {
-                message_id: format!("<part{p}of{total}.tok@bzh29>"),
-                part: Some(p),
-                ..wanted("", "").row
-            })
-            .map(|mut r| {
-                r.total_parts = Some(total);
-                r
-            })
-            .collect()
-    }
-
-    #[test]
-    fn a_round_asks_the_most_nearly_whole_first_and_marks_the_rest() {
-        let now = chrono::Utc::now().timestamp();
-        let at =
-            |ago: i64| chrono::DateTime::from_timestamp(now - ago, 0).unwrap().format("%Y-%m-%d %H:%M:%S").to_string();
-        let recent = at(3 * 3600);
-        let fresh = at(600);
-        let old =
-            chrono::DateTime::from_timestamp(now - 30 * 86_400, 0).unwrap().format("%Y-%m-%d %H:%M:%S").to_string();
-        let big = 1 << 30;
-        let (_dir, conn) = shards(&[
-            (1, big, &recent, false), // 900: asked second
-            (2, big, &recent, false), // 990: asked first
-            (3, big, &recent, false), // 300: too little of it
-            (4, big, &recent, false), // 950, but no pattern
-            (5, big, &recent, true),  // complete
-            (6, 1, &recent, false),   // too small
-            (7, big, &old, false),    // too old
-            (8, big, &recent, false), // asked lately
-            (9, big, &fresh, false),  // may still be arriving
-        ]);
-        conn.execute("insert into inferred_asked values (8, ?1)", [now + 100]).unwrap();
-        let permille =
-            |id: i64| [(1, 900), (2, 990), (3, 300), (4, 950), (8, 999)].iter().find(|p| p.0 == id).unwrap().1;
-        let articles = |row: &ReleaseRow| {
-            let a = match row.id {
-                1 => pattern(6, &[1, 2, 4, 6]),
-                2 => pattern(4, &[1, 2, 3]),
-                4 => vec![wanted("<x@y>", "").row, wanted("<z@y>", "").row],
-                _ => return Err(rusqlite::Error::QueryReturnedNoRows),
-            };
-            Ok((a, vec!["alt.binaries.movies".to_string()]))
+    #[ignore = "explicit isolated PG/NXV and owned NNTP; actual native retry acceptance"]
+    fn native_each_id_keeps_answered_tries_and_transient_failure_waits() {
+        use native::{
+            Service,
+            tests::{fixture, net, peer, seed},
         };
-        // 1 and 11 are one post
-        let post = |r: &ReleaseRow| Ok((if r.id == 1 { vec![1, 11] } else { vec![r.id] }, permille(r.id), 1 << 30));
-        let p = plan(&conn, now, 100, post, articles).unwrap();
-        let asked: Vec<(i64, &str)> = p.wanted.iter().map(|w| (w.release_id, w.row.message_id.as_str())).collect();
-        assert_eq!(asked, [(2, "<part4of4.tok@bzh29>"), (1, "<part3of6.tok@bzh29>"), (1, "<part5of6.tok@bzh29>")]);
-        assert!(p.wanted.iter().all(|w| w.group == "alt.binaries.movies"));
-        assert!(p.waiting.is_empty());
-        let mut asked = p.asked.clone();
-        asked.sort();
-        assert_eq!(asked, [1, 2, 11]);
-        let mut nothing = p.nothing.clone();
-        nothing.sort();
-        assert_eq!(nothing, [3, 4]);
-
-        // the budget ends in 1: it's asked in part, the rest next round
-        let p = plan(&conn, now, 2, post, articles).unwrap();
-        let asked: Vec<&str> = p.wanted.iter().map(|w| w.row.message_id.as_str()).collect();
-        assert_eq!(asked, ["<part4of4.tok@bzh29>", "<part3of6.tok@bzh29>"]);
-        // 1 isn't asked whole: it isn't marked
-        assert_eq!(p.asked, [2]);
-
-        // ids asked lately wait: 1's part 3 is skipped, and once part 5 waits too, the post waits for the first of them
-        let conn = conn;
-        mark_ids(&conn, &[("part3of6.tok@bzh29".into(), Outcome::Absent)], now).unwrap();
-        let p = plan(&conn, now, 100, post, articles).unwrap();
-        let asked: Vec<&str> = p.wanted.iter().map(|w| w.row.message_id.as_str()).collect();
-        assert_eq!(asked, ["<part4of4.tok@bzh29>", "<part5of6.tok@bzh29>"]);
-        mark_ids(&conn, &[("part5of6.tok@bzh29".into(), Outcome::Failed)], now).unwrap();
-        let p = plan(&conn, now, 100, post, articles).unwrap();
-        assert_eq!(p.waiting, [(vec![1, 11], now + FAILED_AGAIN)]);
-
-        // a stop interrupting a read ends the plan, and marks nothing
-        let stopped = |_: &ReleaseRow| -> rusqlite::Result<(Vec<ArticleRow>, Vec<String>)> {
-            Err(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERRUPT), None))
+        let (schema, runtime, _root, store, headers) = fixture();
+        let now = 1_800_000_000;
+        seed(&runtime, now, &[1, 2, 4]);
+        let server = peer(now, true, None);
+        let net = net();
+        let pool =
+            Arc::new(crate::nntp::Pool::new(&[server.config.clone()]).with_body_tries(Duration::from_secs(1), 0));
+        let mut service = Service::new(&runtime.owner, &runtime.db, pool.clone(), store.clone(), &headers).unwrap();
+        let mut observer = schema.pool.get().unwrap();
+        let mut retry = || {
+            let row = observer
+                .query_one(
+                    "select next_at,tries from inferred_ids where message_id='part3of4.own@example.invalid'",
+                    &[],
+                )
+                .unwrap();
+            (row.get::<_, i64>(0), row.get::<_, i64>(1))
         };
-        assert!(plan(&conn, now, 100, post, stopped).is_err());
+        service.start_without_delay_for_test();
+        assert_eq!(service.tick(net.handle(), now).unwrap().unusable, 1);
+        assert_eq!(retry(), (now + ABSENT_AGAIN, 1));
+        service.start_without_delay_for_test();
+        assert_eq!(service.tick(net.handle(), now + 301).unwrap().requested, 0);
+        let second = now + ABSENT_AGAIN + 1;
+        service.start_without_delay_for_test();
+        assert_eq!(service.tick(net.handle(), second).unwrap().unusable, 1);
+        assert_eq!(retry(), (second + 2 * ABSENT_AGAIN, 2));
+        drop(service);
+        let failed_at = second + 2 * ABSENT_AGAIN + 1;
+        let mut unavailable =
+            Service::new(&runtime.owner, &runtime.db, Arc::new(crate::nntp::Pool::new(&[])), store.clone(), &headers)
+                .unwrap();
+        unavailable.start_without_delay_for_test();
+        assert_eq!(unavailable.tick(net.handle(), failed_at).unwrap().failed, 1);
+        assert_eq!(retry(), (failed_at + FAILED_AGAIN, 2), "a provider failure is not an answered try");
+        drop(unavailable);
+        let answered_at = failed_at + FAILED_AGAIN + 1;
+        let mut service = Service::new(&runtime.owner, &runtime.db, pool, store.clone(), &headers).unwrap();
+        service.start_without_delay_for_test();
+        assert_eq!(service.tick(net.handle(), answered_at).unwrap().unusable, 1);
+        assert_eq!(retry(), (answered_at + 4 * ABSENT_AGAIN, 3));
+        assert_eq!(server.hits.load(std::sync::atomic::Ordering::Acquire), 3);
+        assert_eq!(observer.query_one("select count(*) from segments", &[]).unwrap().get::<_, i64>(0), 3);
+        drop(service);
+        runtime.owner.close();
+        store.close().unwrap();
     }
 }
