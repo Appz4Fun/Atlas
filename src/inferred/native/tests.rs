@@ -1,5 +1,5 @@
 use super::*;
-fn fixture()->(crate::pg::testing::Schema,crate::pg::indexer_runtime::Runtime,tempfile::TempDir,Arc<crate::nxv_store::store::Store>,crate::config::HeaderStoreConfig) {
+pub(crate) fn fixture()->(crate::pg::testing::Schema,crate::pg::indexer_runtime::Runtime,tempfile::TempDir,Arc<crate::nxv_store::store::Store>,crate::config::HeaderStoreConfig) {
     let schema=crate::pg::testing::Schema::new().expect("explicit isolated PG required");let root=tempfile::tempdir().unwrap();
     let mut config=crate::config::Config::default();config.postprocess.enabled=false;config.predb.enabled=false;config.spots.enabled=false;config.inferred_parts=false;config.media.tvmaze.enabled=false;config.media.allocine.enabled=false;config.media.details_per_minute=0;
     let storage=crate::pg::StorageConfig {backend:crate::pg::Backend::Postgres,url:schema.url.clone(),schema:schema.name.clone(),max_connections:1,allow_plaintext:true};
@@ -9,7 +9,7 @@ fn fixture()->(crate::pg::testing::Schema,crate::pg::indexer_runtime::Runtime,te
     let (store,_)=crate::nxv_store::store::Store::open(crate::nxv_store::store::StoreConfig::new(actual.root()),crate::nxv_store::store::KeepSet::default()).unwrap();
     (schema,runtime,root,store,headers)
 }
-fn seed(runtime:&crate::pg::indexer_runtime::Runtime,now:i64,parts:&[i64]) {
+pub(crate) fn seed(runtime:&crate::pg::indexer_runtime::Runtime,now:i64,parts:&[i64]) {
     let date=chrono::DateTime::from_timestamp(now-3*3600,0).unwrap().to_rfc2822();
     let headers=parts.iter().map(|part|crate::nntp::Overview {number:*part as u64,subject:format!("Own.Release - \"own.bin\" yEnc ({part}/4)"),from:"original poster".into(),date:date.clone(),message_id:format!("<part{part}of4.own@example.invalid>"),bytes:40*1024*1024,..Default::default()}).collect();
     let mut releases:Vec<_>=crate::collections::group_articles("example.group",crate::nntp::headers_to_articles(headers)).into_values().collect();
@@ -38,9 +38,9 @@ fn native_inferred_source_fence_refuses_actual_writer_growth_before_any_result()
     drop(service);runtime.owner.close();store.close().unwrap();
 }
 
-struct Peer {config:crate::config::UsenetServer,hits:Arc<std::sync::atomic::AtomicUsize>,stop:Arc<std::sync::atomic::AtomicBool>,thread:Option<std::thread::JoinHandle<()>>}
+pub(crate) struct Peer {pub(crate) config:crate::config::UsenetServer,pub(crate) hits:Arc<std::sync::atomic::AtomicUsize>,stop:Arc<std::sync::atomic::AtomicBool>,thread:Option<std::thread::JoinHandle<()>>}
 impl Drop for Peer {fn drop(&mut self){self.stop.store(true,Ordering::Release);if let Some(thread)=self.thread.take(){thread.join().unwrap();}}}
-fn peer(now:i64,wrong_mid:bool,held:Option<(std::sync::mpsc::Sender<()>,std::sync::mpsc::Receiver<()>)>)->Peer {
+pub(crate) fn peer(now:i64,wrong_mid:bool,held:Option<(std::sync::mpsc::Sender<()>,std::sync::mpsc::Receiver<()>)>)->Peer {
     use std::{io::{BufRead,Write},sync::atomic::{AtomicBool,AtomicUsize},net::TcpListener};
     let listener=TcpListener::bind("127.0.0.1:0").unwrap();listener.set_nonblocking(true).unwrap();let port=listener.local_addr().unwrap().port();
     let mut config=crate::config::UsenetServer::new("127.0.0.1","","",port);config.ssl=Some(false);config.compress=Some(false);config.connections=Some(1);
@@ -62,7 +62,7 @@ fn peer(now:i64,wrong_mid:bool,held:Option<(std::sync::mpsc::Sender<()>,std::syn
         }
     });Peer {config,hits,stop,thread:Some(thread)}
 }
-fn net()->tokio::runtime::Runtime {tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap()}
+pub(crate) fn net()->tokio::runtime::Runtime {tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap()}
 #[test]
 #[ignore="requires real isolated PG/NXV and owned NNTP; explicit no-skip qualification"]
 fn native_inferred_real_head_is_durable_before_atomic_missing_part_acceptance() {

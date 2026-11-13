@@ -295,6 +295,8 @@ impl Runtime {
         Ok(Self { db, profile: Profile { storage, headers }, owner, identity })
     }
 
+    pub(crate) fn configured_headers(&self)->HeaderStoreConfig {self.profile.headers.clone()}
+
     pub(crate) fn header_config(&self)->Result<HeaderStoreConfig> {
         self.owner.epoch().context("native owner epoch is unavailable")?.catalog().header_config(&self.profile.headers)
     }

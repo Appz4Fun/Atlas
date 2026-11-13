@@ -15,6 +15,11 @@ do $$ declare relation text; occupied boolean; begin
  end loop;
 end $$;
 
+-- Indexed own-file proof and bounded retry expiration; no old-catalog backfill.
+create index native_segments_file_message on segments(file_id,message_key);
+create index native_inferred_ids_next on inferred_ids(next_at,message_id);
+create index native_inferred_asked_next on inferred_asked(next_at,release_id);
+
 -- Spotnet originals are bytes: display-safe text never replaces XML/body evidence.
 alter table spots add column native_original_xml bytea;
 alter table spot_comments add column native_original_body bytea;

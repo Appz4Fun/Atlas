@@ -3,7 +3,7 @@ use super::*;
 use std::{sync::{Mutex,mpsc},time::{Duration,Instant}};
 
 fn fixture(runtime:&crate::pg::indexer_runtime::Runtime,handle:tokio::runtime::Handle,step:Arc<dyn Step>)->Arc<Runner> {
-    let mut config=crate::config::Config::default();config.predb.enabled=false;config.spots.enabled=false;
+    let mut config=crate::config::Config::default();config.predb.enabled=false;config.spots.enabled=false;config.inferred_parts=false;
     let mut runner=Runner::new(&runtime.owner,&config,Arc::new(crate::nntp::Pool::new(&[])),handle).unwrap();
     let bit=mask(step.id());let id=step.id().0;let stamp=step.config_stamp() as i64;
     runner.steps=Steps {ordered:vec![step],enabled:bit,database:bit,network:0,on_growth:0,stamps:vec![(id,bit,stamp)]};
@@ -19,7 +19,7 @@ pub(crate) fn run_category_loop(runtime:&crate::pg::indexer_runtime::Runtime) {
     crate::pg::stage_queue_tests::push(runtime);
     let handle=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     let runner=fixture(runtime,handle.handle().clone(),Arc::new(crate::category::CategoryStep::new()));let bit=runner.steps.enabled;
-    let stage=workers::Workers::start_runner(runner,runtime.db.clone()).unwrap();
+    let stage=workers::Workers::start_runner(runner,runtime.db.clone(),runtime.configured_headers()).unwrap();
     let deadline=Instant::now()+Duration::from_secs(5);
     loop {
         if runtime.owner.with(|client|Ok(client.query_one("select exists(select 1 from pp_state where done & $1<>0)",&[&bit])?.get::<_,bool>(0))).unwrap() {break}
@@ -51,7 +51,7 @@ pub(crate) fn run_held_drain(runtime:&crate::pg::indexer_runtime::Runtime) {
     let handle=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     let (entered_tx,entered_rx)=mpsc::channel();let (release_tx,release_rx)=mpsc::channel();
     let runner=fixture(runtime,handle.handle().clone(),Arc::new(HeldStep {entered:entered_tx,release:Mutex::new(release_rx)}));
-    let stage=workers::Workers::start_runner(runner,runtime.db.clone()).unwrap();entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let stage=workers::Workers::start_runner(runner,runtime.db.clone(),runtime.configured_headers()).unwrap();entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     let (done_tx,done_rx)=mpsc::channel();let owner=runtime.owner.clone();
     let finish=std::thread::spawn(move|| {let answer=stage.finish();done_tx.send(answer).unwrap();});
     let deadline=Instant::now()+Duration::from_secs(5);while !owner.stop.load(std::sync::atomic::Ordering::Acquire) {assert!(Instant::now()<deadline);std::thread::yield_now();}
@@ -89,13 +89,13 @@ fn native_predb_worker_runs_with_postprocess_off_without_creating_step_state() {
 
 pub(crate) fn run_predb_only(runtime:&crate::pg::indexer_runtime::Runtime) {
     let mut config=crate::config::Config::default();config.postprocess.enabled=false;
-    config.spots.enabled=false;
+    config.spots.enabled=false;config.inferred_parts=false;
     config.predb.enabled=true;config.predb.sources.clear();
     let ending=Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let end=ending.clone();let owner=runtime.owner.clone();let db=runtime.db.clone();
+    let end=ending.clone();let owner=runtime.owner.clone();let db=runtime.db.clone();let headers=runtime.configured_headers();
     let worker=std::thread::spawn(move|| {
         let handle=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        handle.block_on(workers::run(owner,db,config,Arc::new(crate::nntp::Pool::new(&[])),move||end.load(std::sync::atomic::Ordering::Acquire)));
+        handle.block_on(workers::run(owner,db,headers,config,Arc::new(crate::nntp::Pool::new(&[])),move||end.load(std::sync::atomic::Ordering::Acquire)));
     });
     let deadline=Instant::now()+Duration::from_secs(5);
     loop {
@@ -130,7 +130,7 @@ pub(crate) fn run_held_feed(runtime:&crate::pg::indexer_runtime::Runtime) {
     let mut runner=fixture(runtime,handle.handle().clone(),Arc::new(crate::category::CategoryStep::new()));
     let config=&mut Arc::get_mut(&mut runner).unwrap().config;
     config.predb.enabled=true;config.predb.sources=vec!["predb_club".into()];
-    let stage=workers::Workers::start_runner(runner,runtime.db.clone()).unwrap();
+    let stage=workers::Workers::start_runner(runner,runtime.db.clone(),runtime.configured_headers()).unwrap();
     entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     // Create the obligation AFTER the actual feed Fetch has entered. Finishing
     // it proves maintenance did not merely run once before the blocking call.
@@ -192,14 +192,14 @@ fn native_header_only_attempt_observes_real_registry_and_joins_without_step_or_p
 
 pub(crate) fn run_header_only(runtime:&crate::pg::indexer_runtime::Runtime) {
     let mut config=crate::config::Config::default();config.postprocess.enabled=false;config.predb.enabled=false;
-    config.spots.enabled=false;
+    config.spots.enabled=false;config.inferred_parts=false;
     // A genuine process counter, observed through the existing producer; no
     // fabricated Stage lane or manually inserted telemetry completion row.
     crate::metrics::names::API_REQUESTS.inc(&[("endpoint","native-header-control"),("status","200")],7);
-    let ending=Arc::new(std::sync::atomic::AtomicBool::new(false));let end=ending.clone();let owner=runtime.owner.clone();let db=runtime.db.clone();
+    let ending=Arc::new(std::sync::atomic::AtomicBool::new(false));let end=ending.clone();let owner=runtime.owner.clone();let db=runtime.db.clone();let headers=runtime.configured_headers();
     let worker=std::thread::spawn(move|| {
         let handle=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        handle.block_on(workers::run(owner,db,config,Arc::new(crate::nntp::Pool::new(&[])),move||end.load(std::sync::atomic::Ordering::Acquire)));
+        handle.block_on(workers::run(owner,db,headers,config,Arc::new(crate::nntp::Pool::new(&[])),move||end.load(std::sync::atomic::Ordering::Acquire)));
     });
     let deadline=Instant::now()+Duration::from_secs(5);
     loop {
