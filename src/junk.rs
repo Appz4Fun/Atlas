@@ -1,35 +1,7 @@
 //! Releases nobody here wants, gone for good: anything that carries a program
 //! (an installer, a script, a `.mkv.exe`, or one inside an archive) and what
-//! the categories call PC. A removed release leaves its name and group in
-//! `junk_releases`, soo the articles still to come for it are never saved again.
-
-use rusqlite::{Connection, OptionalExtension, Result, params};
-
-use crate::postprocess::schema::ShardTable;
-
-pub const JUNK_RELEASES: ShardTable = ShardTable {
-    name: "junk_releases",
-    create: "create table if not exists junk_releases (
-        name       TEXT NOT NULL,
-        group_name TEXT NOT NULL,
-        reason     TEXT NOT NULL,
-        at         INTEGER NOT NULL,
-        primary key (name, group_name)
-    ) without rowid",
-    indexes: &[],
-    release_key: None,
-    added: &[],
-};
-
-/// The collection keys of removed posts (`collections.rs`): a post's later slices can carry another name, and find
-/// their release by its key, which a removed release no longer answers to.
-pub const JUNK_COLLECTIONS: ShardTable = ShardTable {
-    name: "junk_collections",
-    create: "create table if not exists junk_collections (key INTEGER PRIMARY KEY) without rowid",
-    indexes: &[],
-    release_key: None,
-    added: &[],
-};
+//! the categories call PC. Native writers retain the removed release's identity
+//! fence so later articles and collection slices cannot save it again.
 
 pub const EXECUTABLE: &str = "executable";
 pub const EXECUTABLE_INSIDE: &str = "executable_inside";
@@ -104,163 +76,15 @@ pub fn is_pc(category: i64) -> bool {
     crate::category::root_of(category) == 4000
 }
 
-/// Whether a save must leave this release alone.
-pub fn is_junk(conn: &Connection, name: &str, group: &str) -> Result<bool> {
-    conn.prepare_cached("select 1 from junk_releases where name = ?1 and group_name = ?2")?.exists(params![name, group])
-}
-
-/// Whether a save must leave this collection alone.
-pub fn is_junk_collection(conn: &Connection, key: i64) -> Result<bool> {
-    conn.prepare_cached("select 1 from junk_collections where key = ?1")?.exists([key])
-}
-
-pub fn remember_collection(conn: &Connection, key: i64) -> Result<()> {
-    conn.prepare_cached("insert or ignore into junk_collections (key) values (?1)")?.execute([key])?;
-    Ok(())
-}
-
-/// Whether the release has a video file now, as its stored files say.
-pub fn has_video(conn: &Connection, release_id: i64) -> Result<bool> {
-    let mut stmt = conn.prepare_cached("select filename from files where release_id = ?")?;
-    let mut rows = stmt.query([release_id])?;
-    while let Some(r) = rows.next()? {
-        if is_video(r.get_ref(0)?.as_str()?) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-/// A PC category row left on a release that has video: there is no PC any more, see the category step.
-pub fn stale_pc(conn: &Connection, release_id: i64, has_video: bool) -> Result<bool> {
-    if !has_video {
-        return Ok(false);
-    }
-    let category: Option<i64> = conn
-        .prepare_cached("select category from release_category where release_id = ?")?
-        .query_row([release_id], |r| r.get(0))
-        .optional()?;
-    Ok(category.is_some_and(is_pc))
-}
-
-pub const DROP_CATEGORY: &str = "delete from release_category where release_id = ?1";
-
 /// Whether a PC match keeps its release: only one with a video file.
 pub fn pc_is_junk(filenames: impl IntoIterator<Item = impl AsRef<str>>) -> bool {
     !filenames.into_iter().any(|f| is_video(f.as_ref()))
-}
-
-/// Why a stored release is junk, from what is stored about it: its posted
-/// files, the names inside its archives and PAR2 sets, and its category.
-pub fn stored_reason(conn: &Connection, release_id: i64) -> Result<Option<&'static str>> {
-    let names: Vec<String> = conn
-        .prepare_cached("select filename from files where release_id = ?")?
-        .query_map([release_id], |r| r.get(0))?
-        .collect::<Result<_>>()?;
-    if names.iter().any(|n| is_executable(n)) {
-        return Ok(Some(EXECUTABLE));
-    }
-    inner_or_pc(conn, release_id, names.iter().any(|n| is_video(n)))
-}
-
-/// The part of `stored_reason` past the posted files, for a caller that has read those.
-pub fn inner_or_pc(conn: &Connection, release_id: i64, has_video: bool) -> Result<Option<&'static str>> {
-    // what archives list, and what a PAR2 set describes: past the names quota only the set's rows are kept
-    for sql in [
-        "select name from archive_inner_files where release_id = ?",
-        "select name from par2_files where release_id = ?",
-    ] {
-        let mut inner = conn.prepare_cached(sql)?;
-        let mut rows = inner.query([release_id])?;
-        while let Some(r) = rows.next()? {
-            if is_executable(r.get_ref(0)?.as_str()?) {
-                return Ok(Some(EXECUTABLE_INSIDE));
-            }
-        }
-    }
-    let category: Option<i64> = conn
-        .prepare_cached("select category from release_category where release_id = ?")?
-        .query_row([release_id], |r| r.get(0))
-        .optional()?;
-    if category.is_some_and(is_pc) && !has_video {
-        return Ok(Some(PC));
-    }
-    Ok(None)
-}
-
-/// The releases a shard's stored facts already call junk, without reading `files`: a PC category, or a program among
-/// the names inside archives and PAR2 sets. For queueing; each visit decides again.
-pub fn known_junk(conn: &Connection) -> Result<Vec<i64>> {
-    let mut ids: Vec<i64> = conn
-        .prepare("select release_id from release_category where category between 4000 and 4999")?
-        .query_map([], |r| r.get(0))?
-        .collect::<Result<_>>()?;
-    for sql in ["select release_id, name from archive_inner_files", "select release_id, name from par2_files"] {
-        let mut stmt = conn.prepare(sql)?;
-        let mut rows = stmt.query([])?;
-        while let Some(r) = rows.next()? {
-            if is_executable(r.get_ref(1)?.as_str()?) {
-                ids.push(r.get(0)?);
-            }
-        }
-    }
-    ids.sort_unstable();
-    ids.dedup();
-    Ok(ids)
-}
-
-/// Note `name` in `group` as junk, in the caller's transaction.
-pub fn remember(conn: &Connection, name: &str, group: &str, reason: &str, now: i64) -> Result<()> {
-    conn.prepare_cached("insert or ignore into junk_releases (name, group_name, reason, at) values (?1, ?2, ?3, ?4)")?
-        .execute(params![name, group, reason, now])?;
-    Ok(())
-}
-
-/// A release and everything of its gone, its key kept as junk, in the caller's
-/// transaction. False: no such release.
-pub fn remove(conn: &Connection, release_id: i64, reason: &str, now: i64) -> Result<bool> {
-    let key: Option<(String, String)> = conn
-        .prepare_cached("select name, group_name from releases where id = ?")?
-        .query_row([release_id], |r| Ok((r.get(0)?, r.get(1)?)))
-        .optional()?;
-    let Some((name, group)) = key else { return Ok(false) };
-    // a PC verdict rests on there being no video, and one may have come since the step looked
-    if reason == PC && has_video(conn, release_id)? {
-        return Ok(false);
-    }
-    remember(conn, &name, &group, reason, now)?;
-    conn.prepare_cached(
-        "insert or ignore into junk_collections (key) select key from collections where release_id = ?",
-    )?
-    .execute([release_id])?;
-    let deleted = crate::store::delete_release(conn, release_id)?;
-    let mut less = conn.prepare_cached("update meta set value = max(value - ?, 0) where key = ?")?;
-    less.execute(params![deleted.articles, "articles"])?;
-    less.execute(params![1, "releases"])?;
-    crate::metrics::names::JUNK_REMOVED.inc(&[("reason", reason)], 1);
-    Ok(true)
-}
-
-/// `name` in `group` as junk, and its row gone if there is one.
-pub fn remove_by_key(conn: &Connection, name: &str, group: &str, reason: &str, now: i64) -> Result<()> {
-    let id: Option<i64> = conn
-        .prepare_cached("select id from releases where name = ?1 and group_name = ?2")?
-        .query_row(params![name, group], |r| r.get(0))
-        .optional()?;
-    match id {
-        Some(id) => {
-            remove(conn, id, reason, now)?;
-        }
-        None => remember(conn, name, group, reason, now)?,
-    }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::parser::{Article, Release};
-    use crate::{db, store};
 
     const G: &str = "alt.binaries.t";
 
@@ -281,98 +105,191 @@ mod tests {
         Release { name: release.into(), group: G.into(), articles, ..Default::default() }
     }
 
-    fn shard() -> (tempfile::TempDir, std::path::PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
-        let main = dir.path().join("atlas.db");
-        db::create_db_at(&main).unwrap();
-        (dir, main)
+    fn settled_at() -> i64 {
+        let delay = crate::catalog_facts::SETTLE_SECS
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .max(crate::catalog_facts::COMPLETE_SETTLE_SECS.load(std::sync::atomic::Ordering::Relaxed))
+            .max(1);
+        1i64.saturating_sub(delay)
     }
 
-    fn open(main: &std::path::Path) -> Connection {
-        db::open_shard(&store::shard_path(main, store::shard_of(G))).unwrap()
+    fn schema() -> Option<crate::pg::testing::Schema> {
+        let schema = crate::pg::testing::Schema::native_writer();
+        if schema.is_none() {
+            eprintln!("requires explicit ATLAS_PG_TEST_URL for native junk assertions");
+        }
+        schema
     }
 
-    fn counts(conn: &Connection) -> (i64, i64, i64) {
-        let meta = |k: &str| conn.query_row("select value from meta where key = ?", [k], |r| r.get(0)).unwrap();
-        let rows = conn.query_row("select count(*) from releases", [], |r| r.get(0)).unwrap();
-        (rows, meta("releases"), meta("articles"))
+    fn counts(client: &mut postgres::Client) -> (i64, i64, i64) {
+        let row = client
+            .query_one(
+                "select (select count(*) from releases), (select count(*) from files), (select count(*) from segments)",
+                &[],
+            )
+            .unwrap();
+        (row.get(0), row.get(1), row.get(2))
     }
 
     #[test]
     fn a_post_with_a_program_is_never_saved_and_nothing_after_it_is() {
-        let (_dir, main) = shard();
-        store::save(&main, &[post("Free.Movie.2024", &["Free.Movie.2024.mkv.exe", "Free.Movie.2024.nfo"])]).unwrap();
-        let conn = open(&main);
-        assert_eq!(counts(&conn), (0, 0, 0));
-        assert!(is_junk(&conn, "Free.Movie.2024", G).unwrap());
-        drop(conn);
-        store::save(&main, &[post("Free.Movie.2024", &["Free.Movie.2024.part01.rar"])]).unwrap();
-        assert_eq!(counts(&open(&main)), (0, 0, 0), "what comes later for it is left out too");
-        store::save(&main, &[post("Real.Movie.2024", &["Real.Movie.2024.mkv"])]).unwrap();
-        assert_eq!(counts(&open(&main)), (1, 1, 1));
+        let Some(schema) = schema() else { return };
+        let mut client = schema.pool.get().unwrap();
+        crate::pg::release_writer::save(
+            &mut client,
+            &[post("Free.Movie.2024", &["Free.Movie.2024.mkv.exe", "Free.Movie.2024.nfo"])],
+            1,
+        )
+        .unwrap();
+        assert_eq!(counts(&mut client), (0, 0, 0));
+        assert_eq!(client.query_one("select count(*) from release_writer_junk", &[]).unwrap().get::<_, i64>(0), 1);
+        crate::pg::release_writer::save(&mut client, &[post("Free.Movie.2024", &["Free.Movie.2024.part01.rar"])], 2)
+            .unwrap();
+        assert_eq!(counts(&mut client), (0, 0, 0), "later fragments stay fenced");
+        crate::pg::release_writer::save(&mut client, &[post("Real.Movie.2024", &["Real.Movie.2024.mkv"])], 3).unwrap();
+        assert_eq!(counts(&mut client), (1, 1, 1));
     }
 
     #[test]
     fn a_program_arriving_late_takes_the_release_and_its_counts() {
-        let (_dir, main) = shard();
-        store::save(&main, &[post("Some.Thing", &["a.part01.rar", "a.part02.rar"])]).unwrap();
-        store::save(&main, &[post("Other.Thing", &["b.mkv"])]).unwrap();
-        assert_eq!(counts(&open(&main)), (2, 2, 3));
-        store::save(&main, &[post("Some.Thing", &["setup.exe"])]).unwrap();
-        let conn = open(&main);
-        assert_eq!(counts(&conn), (1, 1, 1));
-        let reason: String = conn.query_row("select reason from junk_releases", [], |r| r.get(0)).unwrap();
-        assert_eq!(reason, EXECUTABLE);
+        let Some(schema) = schema() else { return };
+        let mut client = schema.pool.get().unwrap();
+        crate::pg::release_writer::save(
+            &mut client,
+            &[post("Some.Thing", &["a.part01.rar", "a.part02.rar"]), post("Other.Thing", &["b.mkv"])],
+            1,
+        )
+        .unwrap();
+        assert_eq!(counts(&mut client), (2, 3, 3));
+        crate::pg::release_writer::save(&mut client, &[post("Some.Thing", &["setup.exe"])], 2).unwrap();
+        assert_eq!(counts(&mut client), (1, 1, 1));
+        assert_eq!(client.query_one("select name from releases", &[]).unwrap().get::<_, String>(0), "Other.Thing");
+        crate::pg::release_writer::save(&mut client, &[post("Some.Thing", &["a.part03.rar"])], 3).unwrap();
+        assert_eq!(counts(&mut client), (1, 1, 1));
     }
 
     #[test]
     fn what_is_stored_tells_a_release_is_junk() {
-        let (_dir, main) = shard();
-        store::save(&main, &[post("Packed", &["x.part01.rar"]), post("Film", &["Film.2024.mkv"])]).unwrap();
-        let conn = open(&main);
-        let id =
-            |n: &str| -> i64 { conn.query_row("select id from releases where name = ?", [n], |r| r.get(0)).unwrap() };
-        let (packed, film) = (id("Packed"), id("Film"));
-        assert_eq!(stored_reason(&conn, packed).unwrap(), None);
-        conn.execute("insert into release_category (release_id, category) values (?, 4010)", [packed]).unwrap();
-        conn.execute("insert into release_category (release_id, category) values (?, 4010)", [film]).unwrap();
-        assert_eq!(stored_reason(&conn, packed).unwrap(), Some(PC));
-        assert_eq!(stored_reason(&conn, film).unwrap(), None, "a PC match with video stays");
-        conn.execute(
-            "insert into archive_inner_files (release_id, seq, name, size, source) values (?, 0, 'bin/Crack.exe', 1, 1)",
-            [film],
-        )
-        .unwrap();
-        assert_eq!(stored_reason(&conn, film).unwrap(), Some(EXECUTABLE_INSIDE));
-        assert_eq!(known_junk(&conn).unwrap(), {
-            let mut both = vec![packed, film];
-            both.sort_unstable();
-            both
-        });
-        assert!(stale_pc(&conn, film, true).unwrap());
-        assert!(!stale_pc(&conn, packed, false).unwrap());
-        assert!(!remove(&conn, film, PC, 5).unwrap(), "video that came since the step looked keeps it");
-        conn.execute("insert into collections (key, release_id) values (77, ?)", [film]).unwrap();
-        assert!(remove(&conn, film, EXECUTABLE_INSIDE, 5).unwrap());
-        assert!(is_junk_collection(&conn, 77).unwrap(), "its later slices find it by key");
-        assert!(!remove(&conn, film, EXECUTABLE_INSIDE, 5).unwrap());
-        assert_eq!(counts(&conn), (1, 1, 1));
-        let inner: i64 = conn.query_row("select count(*) from archive_inner_files", [], |r| r.get(0)).unwrap();
-        assert_eq!(inner, 0, "its rows go with it");
-        assert!(is_junk(&conn, "Film", G).unwrap());
+        use crate::pg::stage_queue::{Queue, Settlement, Visit};
+        let Some(schema) = crate::pg::testing::Schema::new() else {
+            eprintln!("requires explicit ATLAS_PG_TEST_URL for native junk inventory/settlement");
+            return;
+        };
+        let runtime = crate::pg::stage_queue_tests::runtime(&schema);
+        let (packed, film) = runtime
+            .owner
+            .with(|client| {
+                let mut film = post("Film", &["Film.2024.mkv"]);
+                film.collection = Some("film-collection".into());
+                crate::pg::release_writer::save(client, &[post("Packed", &["x.part01.rar"]), film], settled_at())?;
+                let id = |client: &mut postgres::Client, name: &str| -> i64 {
+                    client.query_one("select id from releases where name=$1", &[&name]).unwrap().get(0)
+                };
+                Ok((id(client, "Packed"), id(client, "Film")))
+            })
+            .unwrap();
+        let reads = crate::pg::stage_reads::StepReads::for_owner(&runtime.owner).unwrap();
+        assert_eq!(reads.inner_junk(packed, false).unwrap(), None);
+        runtime
+            .owner
+            .with(|client| {
+                client.execute(
+                    "insert into release_category(release_id,category) values($1,4010),($2,4010)",
+                    &[&packed, &film],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(reads.inner_junk(packed, false).unwrap(), Some(PC));
+        assert_eq!(reads.inner_junk(film, true).unwrap(), None, "a PC match with video stays");
+        assert!(reads.stale_pc(film, true).unwrap());
+        assert!(!reads.stale_pc(packed, false).unwrap());
+        runtime
+            .owner
+            .with(|client| {
+                client.execute(
+                    "insert into archive_inner_files(release_id,seq,name,size,source) values($1,0,'bin/Crack.exe',1,1)",
+                    &[&film],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(reads.inner_junk(film, true).unwrap(), Some(EXECUTABLE_INSIDE));
+        let queue = Queue::for_owner(&runtime.owner).unwrap();
+        let claims = queue.claim(10, 10, 60).unwrap();
+        let claim = claims.iter().find(|claim| claim.release_id() == film).unwrap();
+        let applied = crate::postprocess::apply::Applied {
+            release_id: film,
+            junk: Some(EXECUTABLE_INSIDE),
+            ..Default::default()
+        };
+        assert_eq!(
+            queue.settle(claim, Visit::prepare(claim, applied, [1; 32]).unwrap(), 11).unwrap(),
+            Settlement::Applied
+        );
+        runtime
+            .owner
+            .with(|client| {
+                assert_eq!(counts(client), (1, 1, 1));
+                assert_eq!(
+                    client
+                        .query_one("select count(*) from archive_inner_files where release_id=$1", &[&film])?
+                        .get::<_, i64>(0),
+                    0
+                );
+                let mut renamed = post("Renamed.Film", &["later.part01.rar"]);
+                renamed.collection = Some("film-collection".into());
+                crate::pg::release_writer::save(client, &[renamed], 12)?;
+                assert_eq!(
+                    counts(client),
+                    (1, 1, 1),
+                    "later collection slices keep the original fence under another name"
+                );
+                Ok(())
+            })
+            .unwrap();
+        runtime.owner.close();
     }
 
-    /// Removing a release finds its collection keys by an index: a scan of
-    /// `collections` for each (millions of rows a shard) held prod's writers
-    /// for minutes on a batch of junk.
     #[test]
-    fn a_removed_release_finds_its_collection_keys_by_index() {
-        let (_dir, main) = shard();
-        let conn = open(&main);
-        let plan: String = conn
-            .query_row("explain query plan select key from collections where release_id = 1", [], |r| r.get(3))
-            .unwrap();
-        assert!(plan.contains("collections_release"), "{plan}");
+    fn native_junk_retraction_finds_collection_identity_by_index() {
+        let Some(schema) = schema() else { return };
+        let mut client = schema.pool.get().unwrap();
+        let mut release = post("Collection", &["video.mkv"]);
+        release.collection = Some("collection-key".into());
+        let (_, key) = crate::pg::release_writer::identity(&release);
+        crate::pg::release_writer::save(&mut client, &[release], 1).unwrap();
+        let mut tx = client.transaction().unwrap();
+        tx.batch_execute("set local enable_seqscan=off").unwrap();
+        let plan = tx
+            .query(
+                "explain select id from releases where group_name=$1 and is_collection=true and identity_key=$2",
+                &[&G, &&key[..]],
+            )
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(plan.contains("Index") && plan.contains("identity_key") && !plan.contains("Seq Scan"), "{plan}");
+        tx.rollback().unwrap();
+    }
+
+    #[test]
+    fn a_program_a_par2_set_describes_is_junk() {
+        let Some(schema) = crate::pg::testing::Schema::new() else {
+            eprintln!("requires explicit ATLAS_PG_TEST_URL for native PAR2 junk inventory");
+            return;
+        };
+        let runtime = crate::pg::stage_queue_tests::runtime(&schema);
+        crate::pg::stage_queue_tests::push(&runtime);
+        let id=runtime.owner.with(|client| {
+            let id:i64=client.query_one("select id from releases",&[])?.get(0);
+            client.execute("insert into par2_files(release_id,file_id,set_id,md5,md5_16k,size,name) values($1,$2,$3,$4,$5,5,'Keygen.EXE')", &[&id,&vec![1u8;16],&vec![2u8;16],&vec![3u8;16],&vec![4u8;16]])?;Ok(id)
+        }).unwrap();
+        let reads = crate::pg::stage_reads::StepReads::for_owner(&runtime.owner).unwrap();
+        assert_eq!(reads.inner_junk(id, false).unwrap(), Some(EXECUTABLE_INSIDE));
+        runtime.owner.close();
     }
 
     #[test]
@@ -413,24 +330,24 @@ mod tests {
     }
 
     #[test]
-    fn a_program_a_par2_set_describes_is_junk() {
-        let (_dir, main) = shard();
-        store::save(&main, &[post("Hidden", &["a1b2c3.part01.rar", "a1b2c3.par2"])]).unwrap();
-        let conn = open(&main);
-        let id: i64 = conn.query_row("select id from releases", [], |r| r.get(0)).unwrap();
-        conn.execute(
-            "insert into par2_files (release_id, file_id, set_id, md5, md5_16k, size, name)
-             values (?, x'01', x'02', x'03', x'04', 5, 'Keygen.EXE')",
-            [id],
-        )
-        .unwrap();
-        assert_eq!(stored_reason(&conn, id).unwrap(), Some(EXECUTABLE_INSIDE));
-    }
-
-    #[test]
     fn a_pc_match_with_a_video_stays() {
         assert!(pc_is_junk(["setup.rar", "x.nfo"]));
         assert!(!pc_is_junk(["Film.2024.mkv", "x.nfo"]));
         assert!(pc_is_junk(Vec::<String>::new()));
+    }
+    #[test]
+    fn pc_and_video_classification_keep_their_boundaries() {
+        for category in [4000, 4010, 4999] {
+            assert!(is_pc(category), "{category}");
+        }
+        for category in [-1, 0, 3999, 5000, 8000] {
+            assert!(!is_pc(category), "{category}");
+        }
+        for name in ["film.MKV", "video.m2ts", "clip.webm", "disc.vob\""] {
+            assert!(is_video(name), "{name}");
+        }
+        for name in ["film.mkv.exe", "disc.iso", "video.mkv.part", "video"] {
+            assert!(!is_video(name), "{name}");
+        }
     }
 }
