@@ -7,7 +7,6 @@ pub mod judge;
 pub mod obfuscation;
 pub mod regexes;
 pub mod steps;
-pub(crate) mod walk;
 
 pub use clean::{
     basename, clean_candidate, has_collision_suffix, identity_key, parent_dir, strip_file_suffixes,

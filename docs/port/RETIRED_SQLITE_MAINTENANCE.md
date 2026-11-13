@@ -9,8 +9,7 @@ succeeds without doing its work. This is retirement of old product commands, not
 native maintenance parity or authorization to delete old data.
 
 The source retirement in this checkpoint removes `naming::{mojibake,recount,
-reflag,unname}` and `repair_counts`; the remaining walk/field-search CLI edge is a
-separate closure. `repost_split` retains every pure `Copy`/`Keep`/`Verdict` classifier,
+reflag,unname}` and `repair_counts`; the walk/field-search CLI edge is retired with the same commands. `repost_split` retains every pure `Copy`/`Keep`/`Verdict` classifier,
 constant, `decide`, `looks_reposted`, bounded provider-date lookup, and all ten pure
 classification tests. Its SQLite selection/mutation and CLI are removed.
 
