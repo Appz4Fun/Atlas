@@ -4,7 +4,6 @@ use crate::config::Config;
 use crate::naming::{
     Grade, NameSource, best_from_paths, clean_candidate, current_name, is_image_name, judge, renames_pack_to_episode,
 };
-use crate::postprocess::schema::ShardTable;
 use crate::postprocess::step::{
     NameChange, Needs, Outcome, ReleaseInfo, Reruns, Step, StepCtx, StepError, StepId, StepMask, StepMutation,
     StepWrite,
@@ -13,35 +12,7 @@ use crate::postprocess::step::{
 use super::keys::{hash_key, name_key};
 use super::matcher::Evidence;
 
-pub const MATCH: ShardTable = ShardTable {
-    name: "predb_match",
-    create: "create table if not exists predb_match (
-        release_id INTEGER PRIMARY KEY,
-        title_id   INTEGER NOT NULL,
-        kind       INTEGER NOT NULL,
-        category   TEXT,
-        pre_at     INTEGER,
-        nuked      INTEGER NOT NULL DEFAULT 0,
-        matched_at INTEGER NOT NULL
-    )",
-    indexes: &[],
-    release_key: Some("release_id"),
-    added: &[],
-};
 
-/// Names inner files suggest, for releases with no match yet: how a late title finds them.
-pub const INNER_KEY: ShardTable = ShardTable {
-    name: "predb_inner_key",
-    create: "create table if not exists predb_inner_key (
-        key INTEGER NOT NULL, release_id INTEGER NOT NULL, primary key (key, release_id)
-    ) without rowid",
-    indexes: &[(
-        "predb_inner_key_release",
-        "create index if not exists predb_inner_key_release on predb_inner_key(release_id)",
-    )],
-    release_key: Some("release_id"),
-    added: &[],
-};
 
 const KEYS_KEPT: usize = 4;
 

@@ -8,7 +8,6 @@ use crate::archive::select::nfo_sources;
 use crate::catalog_facts::SegmentPick;
 use crate::category::{self, Decision};
 use crate::config::Config;
-use crate::postprocess::schema::ShardTable;
 use crate::postprocess::step::{
     BodyRequest, Got, Needs, Outcome, ReleaseInfo, Reruns, Step, StepCtx, StepError, StepId, StepMutation, StepWrite,
 };
@@ -22,83 +21,7 @@ use super::query::MAX_TITLE;
 use super::resolve::{Ids, Resolved, TitleQuery, Trouble};
 use super::title::{Kind, normalize, split_country, title_key};
 
-pub const MEDIA_RELEASE: ShardTable = ShardTable {
-    name: "media_release",
-    create: "create table if not exists media_release (
-        release_id    INTEGER PRIMARY KEY,
-        kind          INTEGER NOT NULL,
-        title_key     INTEGER NOT NULL,
-        season        INTEGER,
-        episode       INTEGER,
-        episode_last  INTEGER,
-        air_date      INTEGER,
-        year          INTEGER,
-        quality       INTEGER NOT NULL,
-        tvdb_id       INTEGER,
-        tvmaze_id     INTEGER,
-        trakt_id      INTEGER,
-        tmdb_id       INTEGER,
-        imdb_id       INTEGER,
-        tvrage_id     INTEGER,
-        imdb_from_nfo INTEGER NOT NULL DEFAULT 0
-    )",
-    indexes: &[
-        (
-            "media_release_title",
-            "create index if not exists media_release_title on media_release(title_key, release_id)",
-        ),
-        (
-            "media_release_tvdb",
-            "create index if not exists media_release_tvdb on media_release(tvdb_id, release_id, season, episode, episode_last, kind) where tvdb_id is not null",
-        ),
-        (
-            "media_release_tvmaze",
-            "create index if not exists media_release_tvmaze on media_release(tvmaze_id, release_id, season, episode, episode_last, kind) where tvmaze_id is not null",
-        ),
-        (
-            "media_release_trakt",
-            "create index if not exists media_release_trakt on media_release(trakt_id, release_id, season, episode, episode_last, kind) where trakt_id is not null",
-        ),
-        (
-            "media_release_tmdb",
-            "create index if not exists media_release_tmdb on media_release(tmdb_id, release_id, season, episode, episode_last, kind) where tmdb_id is not null",
-        ),
-        (
-            "media_release_imdb",
-            "create index if not exists media_release_imdb on media_release(imdb_id, release_id, season, episode, episode_last, kind) where imdb_id is not null",
-        ),
-        (
-            "media_release_rage",
-            "create index if not exists media_release_rage on media_release(tvrage_id, release_id, season, episode, episode_last, kind) where tvrage_id is not null",
-        ),
-    ],
-    release_key: Some("release_id"),
-    // a TMDB or TVDB id a file's own tags gave (`probe::media::TitleIds`): kept against what a lookup by name finds,
-    // as an NFO's IMDb id is (`imdb_from_nfo`)
-    added: &[("tmdb_from_tag", "INTEGER NOT NULL DEFAULT 0"), ("tvdb_from_tag", "INTEGER NOT NULL DEFAULT 0")],
-};
 
-/// The same title keeps IDs already on the row, soo a late article cant lose them. A new title starts clean.
-pub(crate) const UPSERT: &str = "insert into media_release (release_id, kind, title_key, season, episode, episode_last, air_date, year, quality,
-                           tvdb_id, tvmaze_id, trakt_id, tmdb_id, imdb_id, tvrage_id)
-values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
-on conflict(release_id) do update set
-    tvdb_id   = iif(media_release.title_key = excluded.title_key, iif(media_release.tvdb_from_tag = 1, media_release.tvdb_id, coalesce(excluded.tvdb_id, media_release.tvdb_id)), excluded.tvdb_id),
-    tvmaze_id = iif(media_release.title_key = excluded.title_key, coalesce(excluded.tvmaze_id, media_release.tvmaze_id), excluded.tvmaze_id),
-    trakt_id  = iif(media_release.title_key = excluded.title_key, coalesce(excluded.trakt_id,  media_release.trakt_id),  excluded.trakt_id),
-    tmdb_id   = iif(media_release.title_key = excluded.title_key, iif(media_release.tmdb_from_tag = 1, media_release.tmdb_id, coalesce(excluded.tmdb_id, media_release.tmdb_id)), excluded.tmdb_id),
-    tvrage_id = iif(media_release.title_key = excluded.title_key, coalesce(excluded.tvrage_id, media_release.tvrage_id), excluded.tvrage_id),
-    imdb_id   = iif(media_release.title_key = excluded.title_key, iif(media_release.imdb_from_nfo = 1, media_release.imdb_id, coalesce(excluded.imdb_id, media_release.imdb_id)), excluded.imdb_id),
-    imdb_from_nfo = iif(media_release.title_key = excluded.title_key, media_release.imdb_from_nfo, 0),
-    tmdb_from_tag = iif(media_release.title_key = excluded.title_key, media_release.tmdb_from_tag, 0),
-    tvdb_from_tag = iif(media_release.title_key = excluded.title_key, media_release.tvdb_from_tag, 0),
-    kind = excluded.kind, title_key = excluded.title_key, season = excluded.season, episode = excluded.episode,
-    episode_last = excluded.episode_last, air_date = excluded.air_date, year = excluded.year, quality = excluded.quality";
-/// only while it's still this title: a rename while the lookup ran mustn't take the old title's IDs
-pub(crate) const FOUND: &str = "update media_release
-    set tvdb_id = iif(tvdb_from_tag = 1, tvdb_id, ?3), tvmaze_id = ?4, trakt_id = ?5, tmdb_id = iif(tmdb_from_tag = 1, tmdb_id, ?6),
-        imdb_id = iif(imdb_from_nfo = 1, imdb_id, ?7), tvrage_id = ?8
-    where release_id = ?1 and title_key = ?2";
 pub const NFO_READ: usize = 65_536;
 
 static IMDB_IN_NFO: LazyLock<regex::bytes::Regex> =

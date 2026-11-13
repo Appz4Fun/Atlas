@@ -1,6 +1,5 @@
 //! Native PreDB feed formats, title evidence and configured test fetch injection.
 
-pub mod db;
 pub mod feeds;
 pub mod file_import;
 pub mod import;
