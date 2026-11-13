@@ -341,7 +341,8 @@ fn copy_external(c:&mut Client,main:&Path,schema:&str,apply:bool,source:KeepSour
             if s.ext.starts_with("ext_raw_") {
                 preserve_variants(&mut tx,s.ext,&keep_export::quoted(s.ext),
                     &cols.iter().map(|column|column.name.clone()).collect::<Vec<_>>(),
-                    &format!("sqlite:{}:{}:{}",s.ext,tally.rows,tally.hex()))?;
+                    &format!("sqlite:{}:{}:{}",s.ext,tally.rows,tally.hex()),
+                    (s.ext=="ext_raw_nfo_passwords").then_some(crate::raw_store::nfo_key::PREFIX))?;
             }
             if let Some(name) = keep_schema
                 && let Some(k) = keep_name(s.ext)
@@ -398,18 +399,21 @@ fn copy_external(c:&mut Client,main:&Path,schema:&str,apply:bool,source:KeepSour
 /// spelling retains every byte, signed bigint/NULL/text retain their types via
 /// the descriptor. No aggregate of payloads is materialized on the client.
 fn preserve_variants(
-    tx:&mut postgres::Transaction<'_>,family:&str,relation:&str,columns:&[String],origin:&str,
+    tx:&mut postgres::Transaction<'_>,family:&str,relation:&str,columns:&[String],origin:&str,name_codec:Option<&str>,
 ) -> Result<u64> {
     ensure!(family.starts_with("ext_raw_") && sources().iter().any(|source|source.ext==family),"unowned cache preservation family");
     ensure!(columns.len()<=64,"cache preservation column budget");
     let list=columns.iter().map(|column|keep_export::quoted(column)).collect::<Vec<_>>().join(",");
     let statement=tx.prepare(&format!("select {list} from {relation} limit 0"))?;
-    let schema=serde_json::to_string(&statement.columns().iter().map(|column|(column.name(),column.type_().name())).collect::<Vec<_>>())?;
+    let shape=statement.columns().iter().map(|column|(column.name(),column.type_().name())).collect::<Vec<_>>();
+    let schema=if family=="ext_raw_nfo_passwords" {
+        serde_json::to_string(&serde_json::json!({"columns":shape,"key_codecs":name_codec.map(|codec|serde_json::json!({"name":codec})).unwrap_or_else(||serde_json::json!({}))}))?
+    } else {serde_json::to_string(&shape)?};
     let name=if family=="ext_raw_archive_inner_files" {"release_name"} else {"name"};
     let content=if columns.iter().any(|column|column=="content_id") {"content_id"} else {"null::bytea"};
     Ok(tx.execute(&format!("insert into ext_preserved_cache_rows
       (family,source_digest,row_digest,name,group_name,content_id,schema_descriptor,row_format,row_bytes)
-      select $1,sha256(convert_to($2,'UTF8')),sha256(convert_to('atlas.cache-row-json.v1:'||row_json,'UTF8')),
+      select $1,sha256(convert_to($2,'UTF8')),sha256(convert_to('atlas.cache-row-json.v1:'||$3||':'||row_json,'UTF8')),
              {name},group_name,{content},$3,1,convert_to(row_json,'UTF8')
       from (select q.*,to_jsonb(q)::text as row_json from (select {list} from {relation}) q) preserved
       on conflict do nothing"),&[&family,&origin,&schema])?)
@@ -447,12 +451,13 @@ fn top_up(tx: &mut postgres::Transaction<'_>, schema: &str, ext: &str, keep: &st
     let both: Vec<&Column> = cols.iter().filter(|c| there.contains(&c.name)).collect();
     let list = both.iter().map(|c| keep_export::quoted(&c.name)).collect::<Vec<_>>().join(", ");
     let namespace = keep_export::quoted(schema);
+    let nfo_encoded=ext=="ext_raw_nfo_passwords" && keep_export::keep_nfo_encoded(tx,schema)?;
     if ext.starts_with("ext_raw_") {
         let relation=format!("{namespace}.{}",keep_export::quoted(keep));
         // Save every original variant BEFORE natural-key top-up skips a key
         // occupied by a different/newer sidecar value. Never activate an old
         // variant merely because its preservation record exists.
-        preserve_variants(tx,ext,&relation,&there,&format!("keep:{schema}:{keep}"))?;
+        preserve_variants(tx,ext,&relation,&there,&format!("keep:{schema}:{keep}"),nfo_encoded.then_some(crate::raw_store::nfo_key::PREFIX))?;
     }
     let total: i64 =
         tx.query_one(&format!("select count(*) from {namespace}.{}", keep_export::quoted(keep)), &[])?.get(0);
@@ -516,9 +521,14 @@ fn top_up(tx: &mut postgres::Transaction<'_>, schema: &str, ext: &str, keep: &st
             &[],
         )?
     } else {
+        let selected=both.iter().map(|column|{
+            if ext=="ext_raw_nfo_passwords" && column.name=="name" && !nfo_encoded {
+                format!("case when \"name\" is null then null else '{}' || encode(convert_to(\"name\",'UTF8'),'hex') end",crate::raw_store::nfo_key::PREFIX)
+            } else {keep_export::quoted(&column.name)}
+        }).collect::<Vec<_>>().join(",");
         tx.execute(
             &format!(
-                "insert into {ext} ({list}) select {list} from {namespace}.{} on conflict do nothing",
+                "insert into {ext} ({list}) select {selected} from {namespace}.{} on conflict do nothing",
                 keep_export::quoted(keep)
             ),
             &[],
@@ -1503,6 +1513,23 @@ mod tests {
         let second:serde_json::Value=serde_json::from_slice(&rows[1].get::<_,Vec<u8>>(0)).unwrap();
         assert_eq!(first["password"],"");assert_eq!(second["password"],"old-secret");
         assert_eq!(rows[0].get::<_,Vec<u8>>(1),[1]);assert_eq!(rows[1].get::<_,Vec<u8>>(1),[2]);
+    }
+
+    #[test]
+    fn fresh_nfo_import_preserves_nested_zero_byte_names_and_literal_prefix_names() {
+        let Some(target)=super::super::testing::Schema::empty() else {return};
+        let root=tempfile::tempdir().unwrap();let main=sqlite_files(root.path());
+        let raw=Connection::open(crate::raw_store::path_for(&main)).unwrap();
+        let names=["Kept","Kept\0nzb","atlas.nfo-name.v1:4b657074","kept","é\0nzb"];
+        for name in names {raw.execute("insert into raw_nfo_passwords(name,group_name,content_id,password) values(?1,'g',x'01','')",[name]).unwrap();}
+        drop(raw);let mut client=target.pool.get().unwrap();
+        let moved=copy_caches_for_fresh_catalog(&mut client,&main,&target.name,true,KeepSource::Disabled).unwrap();
+        assert_eq!(moved.copied.iter().find(|table|table.table=="ext_raw_nfo_passwords").unwrap().tally.rows,names.len() as u64);
+        let mut actual=client.query("select name,password from ext_raw_nfo_passwords",&[]).unwrap().into_iter().map(|row|{
+            assert_eq!(row.get::<_,String>(1),"");crate::raw_store::nfo_key::decode(&row.get::<_,String>(0)).unwrap()
+        }).collect::<Vec<_>>();actual.sort();let mut expected=names.map(str::to_owned).to_vec();expected.sort();assert_eq!(actual,expected);
+        let raw=Connection::open_with_flags(crate::raw_store::path_for(&main),rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert!(raw.prepare("select 1 from raw_nfo_passwords where name=?1").unwrap().exists(["Kept\0nzb"]).unwrap());
     }
 
     /// SQLite files made with the providers' own schemas, a row or two each, moved, dumped, emptied and restored.

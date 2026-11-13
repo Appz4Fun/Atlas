@@ -1,6 +1,16 @@
 -- Costly, natural-key cache facts survive a fresh release/header catalog.
 -- Preserve original values/NULLs/opaque versions; importing bytes never makes
 -- them eligible for reuse without the existing content/provenance checks.
+-- The NFO natural name includes a valid legacy NUL suffix for nested NZBs.
+-- ALL names use the bijective atlas.nfo-name.v1:<lower UTF8 hex> encoding.
+-- This static layout marker is checked by native dispatch; an older plain-name
+-- schema10 is refused rather than treated as a cache miss or auto-upgraded.
+create table atlas_cache_key_formats (
+ table_name text not null,column_name text not null,codec text not null,
+ primary key(table_name,column_name)
+);
+insert into atlas_cache_key_formats values('ext_raw_nfo_passwords','name','atlas.nfo-name.v1:');
+revoke all on atlas_cache_key_formats from public;
 create table ext_raw_probes (
  natural_name_key bytea not null default ''::bytea check(octet_length(natural_name_key)=32),
  natural_group_key bytea not null default ''::bytea check(octet_length(natural_group_key)=32),
@@ -61,7 +71,8 @@ create table ext_raw_nfo_passwords (
  natural_name_key bytea not null default ''::bytea check(octet_length(natural_name_key)=32),
  natural_group_key bytea not null default ''::bytea check(octet_length(natural_group_key)=32),
  name text collate "C" not null,group_name text collate "C" not null,content_id bytea,
- password text not null,primary key(natural_name_key,natural_group_key)
+ password text not null,primary key(natural_name_key,natural_group_key),
+ check(name ~ '^atlas[.]nfo-name[.]v1:([0-9a-f]{2})*$')
 );
 create table ext_raw_stills (
  natural_name_key bytea not null default ''::bytea check(octet_length(natural_name_key)=32),
