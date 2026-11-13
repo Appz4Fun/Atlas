@@ -15,6 +15,9 @@ pub(crate) use workers::run;
 mod settings;
 pub(crate) use settings::ConfigPin;
 #[cfg(test)]
+#[path="native_pc_cleanup_tests.rs"]
+mod pc_cleanup_tests;
+#[cfg(test)]
 #[path="native_provider_tests.rs"]
 mod provider_tests;
 #[cfg(all(test,unix))]
