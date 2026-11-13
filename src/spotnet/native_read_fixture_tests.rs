@@ -25,3 +25,10 @@ pub(crate) fn fixture()->(crate::pg::testing::Schema,crate::pg::indexer_runtime:
     storage.settle_comments(&[("real.8.one.two@spot.net".into(),comments::Outcome::Read(comments::body_text(&vec![0xe9;comments::MAX_BODY])))]).unwrap();
     drop(permit);(schema,runtime,dir,id)
 }
+
+// This module is cfg(test) under spotnet, where the real Store stays private.
+pub(crate) fn replace_comment_and_note_disposal(runtime:&crate::pg::indexer_runtime::Runtime) {
+    let storage=crate::spotnet::native_store::Store::new(&runtime.owner).unwrap();
+    storage.settle_comments(&[("real.8.one.two@spot.net".into(),comments::Outcome::Read("New supplied text".into()))]).unwrap();
+    storage.with(|tx|Ok(store::note_disposals(&crate::pg::sql::Pg::new(tx),&[store::Disposal {message_id:"real@spot.net".into(),spotter:String::new(),at:2}])?)).unwrap();
+}

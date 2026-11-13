@@ -95,7 +95,7 @@ impl ReadView<'_> {
         ensure!(extents.len()<=self.budget.rows,"native Spotnet comments exceed read row admission");
         let mut expected=Vec::<[Option<i32>;4]>::with_capacity(extents.len());let mut owned=8192u64;
         for row in extents {
-            let values=[row.try_get(0)?,row.try_get(1)?,row.try_get(2)?,row.try_get(3)?];
+            let values:[Option<i32>;4]=[row.try_get(0)?,row.try_get(1)?,row.try_get(2)?,row.try_get(3)?];
             if row.try_get::<_,i64>(4)?==comments::READ {ensure!(values[3].is_some(),"read comment has no original body");}
             for (at,value) in values.into_iter().enumerate() {
                 let bytes=length(value)?;if at>=2 {ensure!(bytes<=(if at==2 {3}else{2})*comments::MAX_BODY as u64,"native comment exceeds original decoding envelope");}
