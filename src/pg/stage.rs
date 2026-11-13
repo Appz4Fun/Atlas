@@ -4,7 +4,7 @@ use anyhow::{Context,Result,ensure};
 use postgres::GenericClient;
 use sha2::{Digest,Sha256};
 
-#[derive(Clone)]
+#[derive(Clone,PartialEq,Eq)]
 pub(crate) struct CatalogIdentity { nonce:[u8;32],header_root:String }
 impl CatalogIdentity {
     pub(crate) fn read_in(client:&mut impl GenericClient)->Result<Self> {

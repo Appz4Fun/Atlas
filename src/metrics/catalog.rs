@@ -1,74 +1,22 @@
-//! Numbers about what is stored, not about what happened since the start: how
-//! many releases, in which categories, groups and sizes, and what the PreDB
-//! matched. Only a walk over every release knows them, soo one thread walks
-//! the shards every `metrics.catalog_every_secs`, in short reads that pin no
-//! WAL. A walk reads every release page off the disk, tens of GB, soo the rest
-//! after one is also at least `REST_PER_WALK` times as long as it took. The last
-//! result is saved and read back, soo a restart doesnt blank the dashboards
-//! until the next walk is through.
+//! Storage-independent detailed catalog tally and metric labels. PostgreSQL
+//! paging, admission and identity checks live in `pg::catalog_metrics`.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-use std::thread;
-use std::time::{Duration, Instant};
-
-use rusqlite::{Connection, params};
+use std::time::Duration;
 
 use super::names::*;
-use super::{Family, OTHER, label_key};
+use super::{OTHER, label_key};
 use crate::category::{self, UNCATEGORIZED};
-use crate::db;
 use crate::naming::{Grade, NameSource, judge};
-use crate::paths;
-use crate::store;
 
-/// rows per read: a read this short leaves the WAL free to start over
-const BATCH: i64 = 20_000;
-/// breathing room between reads, for the writers
-const NAP: Duration = Duration::from_millis(2);
-/// how often the cheap numbers are read
-const QUICK_EVERY: Duration = Duration::from_secs(30);
-/// the rest after a walk is at least this many times as long as the walk: past 100M releases one
-/// takes 20 minutes, and with a short `catalog_every_secs` they went back to back, reading the disk nonstop
-const REST_PER_WALK: u32 = 4;
-/// and at most this long for the walk's sake, whatever a damaged save says it took
-const LONGEST_REST: Duration = Duration::from_secs(24 * 60 * 60);
-/// a walk that failed (a compaction swapped a file away) goes again after this long
-const RETRY: Duration = Duration::from_secs(5 * 60);
 /// series for groups and release groups: the rest are summed into `(other)`
 const TOP_GROUPS: usize = 100;
 const TOP_RELEASE_GROUPS: usize = 150;
 /// PreDB categories published, and kept during a walk: feeds and imports can bring any number
 const TOP_PREDB_CATEGORIES: usize = 200;
 const MAX_PREDB_CATEGORIES: usize = 10_000;
-/// titles held during a walk before asking the PreDB file for their feeds
-const MAX_TITLES: usize = 100_000;
 /// release group names kept during a walk; past this the ones seen once go
 const MAX_RELEASE_GROUPS: usize = 200_000;
-
-/// what the walk publishes, and what is saved of it
-const SAVED: &[&Family] = &[
-    &CATALOG_RELEASES,
-    &CATALOG_BYTES,
-    &CATALOG_NAME_SOURCE,
-    &CATALOG_CATEGORY,
-    &CATALOG_CATEGORY_BYTES,
-    &CATALOG_GROUP,
-    &CATALOG_GROUP_BYTES,
-    &CATALOG_RELEASE_GROUP,
-    &CATALOG_VIDEO,
-    &CATALOG_SIZE,
-    &CATALOG_SIZE_SUM,
-    &CATALOG_SIZE_COUNT,
-    &CATALOG_PREDB_KIND,
-    &CATALOG_PREDB_CATEGORY,
-    &CATALOG_PREDB_FEED,
-    &CATALOG_PREDB_ROOT,
-    &CATALOG_SCAN_AT,
-    &CATALOG_SCAN_SECONDS,
-];
 
 fn name_source_label(source: Option<i64>) -> &'static str {
     match source {
@@ -206,6 +154,40 @@ pub struct Row<'a> {
 }
 
 impl Tally {
+    /// Admit retained native dimensions before adding a row. These limits are
+    /// independent of page ownership; a million short pages cannot grow an
+    /// unbounded group/feed/category map. A rejected walk is never published.
+    pub(crate) fn add_native(&mut self, row: &Row<'_>, feed: Option<&str>) -> anyhow::Result<()> {
+        use anyhow::ensure;
+        ensure!(row.group.len() <= crate::filters::MAX_GROUP_NAME, "native catalog group exceeds admission");
+        ensure!(self.groups.contains_key(row.group) || self.groups.len() < 10_000,
+            "native catalog group cardinality exceeds admission");
+        let category = row.category.unwrap_or(UNCATEGORIZED);
+        ensure!(self.categories.contains_key(&category) || self.categories.len() < 10_000,
+            "native catalog category cardinality exceeds admission");
+        if let Some((_, Some(category), _)) = row.predb {
+            ensure!(category.len() <= 512, "native PreDB category exceeds admission");
+        }
+        if row.predb.is_some() {
+            let feed = feed.unwrap_or("unknown");
+            ensure!(feed.len() <= 512 && (self.feeds.contains_key(feed) || self.feeds.len() < 1000),
+                "native PreDB feed exceeds admission");
+        }
+        let size = row.size.max(0) as u64;
+        ensure!(self.bytes.checked_add(size).is_some()
+            && self.groups.get(row.group).is_none_or(|group| group.bytes.checked_add(size).is_some())
+            && self.categories.get(&category).is_none_or(|(_, bytes)| bytes.checked_add(size).is_some()),
+            "native catalog byte total overflow");
+        self.add(row);
+        // Native pages join the retained PreDB feed directly in their RR
+        // snapshot, so no title IDs escape the page or await a SQLite lookup.
+        self.predb_titles.clear();
+        if !crate::filters::group_blocked(row.group) && row.predb.is_some() {
+            *self.feeds.entry(feed.unwrap_or("unknown").to_owned()).or_default() += 1;
+        }
+        Ok(())
+    }
+
     pub fn add(&mut self, row: &Row<'_>) {
         self.rows += 1;
         let group = match self.groups.get_mut(row.group) {
@@ -300,19 +282,9 @@ impl Tally {
         self.release_groups.insert(found.to_string(), 1);
     }
 
-    /// Put the totals into their metrics.
+    /// Publish a completed detailed walk. Native Stage owns the quick total and byte gauges.
     pub fn publish(&self, took: Duration) {
         let one = |name: &str, value: &str| label_key(&[(name, value)]);
-        let states = [
-            ("total", self.total),
-            ("complete", self.complete),
-            ("nzb_ready", self.nzb_ready),
-            ("named", self.named),
-            ("still_obfuscated", self.still_obfuscated),
-            ("predb_matched", self.predb_matched),
-        ];
-        CATALOG_RELEASES.replace(states.map(|(state, n)| (one("state", state), n as f64)));
-        CATALOG_BYTES.replace([(String::new(), self.bytes as f64)]);
         CATALOG_NAME_SOURCE.replace(self.name_sources.iter().map(|(s, n)| (one("source", s), *n as f64)));
 
         let category_key = |id: i64| {
@@ -378,45 +350,10 @@ impl Tally {
 
         CATALOG_SCAN_AT.replace([(String::new(), chrono::Utc::now().timestamp() as f64)]);
         CATALOG_SCAN_SECONDS.replace([(String::new(), took.as_secs_f64())]);
+        CATALOG_SCAN_ROWS.replace([(label_key(&[("state", "last")]),self.rows as f64)]);
     }
 
-    /// Which feed brought the titles matched, from the PreDB file next to the database.
-    fn read_feeds(&mut self, main: &Path) {
-        let path = main.with_file_name(format!(
-            "{}.predb.db",
-            main.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "atlas".into())
-        ));
-        let titles = std::mem::take(&mut self.predb_titles);
-        if !path.exists() || titles.is_empty() {
-            return;
-        }
-        let read = || -> rusqlite::Result<BTreeMap<String, u64>> {
-            let conn = crate::predb::db::open_reader(&path)?;
-            let mut stmt = conn.prepare_cached(
-                "select coalesce(f.key, t.source) from titles t left join feeds f on f.source = t.source where t.id = ?1",
-            )?;
-            let mut feeds = BTreeMap::new();
-            for (title, n) in &titles {
-                let found: rusqlite::Result<String> = stmt.query_row([title], |r| {
-                    r.get_ref(0).map(|v| match v.as_str() {
-                        Ok(key) => key.to_string(),
-                        Err(_) => "unknown".to_string(),
-                    })
-                });
-                let feed = found.unwrap_or_else(|_| "unknown".into());
-                *feeds.entry(feed).or_default() += n;
-            }
-            Ok(feeds)
-        };
-        match read() {
-            Ok(feeds) => {
-                for (feed, n) in feeds {
-                    *self.feeds.entry(feed).or_default() += n;
-                }
-            }
-            Err(e) => println!("metrics: couldnt read the predb feeds: {e}"),
-        }
-    }
+
 }
 
 /// The `limit` biggest, and the rest summed as `(other)`.
@@ -432,382 +369,33 @@ fn top_with_other(counts: &BTreeMap<String, u64>, limit: usize) -> Vec<(String, 
     out
 }
 
-fn has_table(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
-    conn.query_row("select exists (select 1 from sqlite_master where type = 'table' and name = ?1)", [table], |r| {
-        r.get(0)
-    })
-}
-
-/// A shard's rows after `after`, all counted: where the walk has got to, None past the last.
-fn read_batch(conn: &Connection, after: i64, limit: i64, tally: &mut Tally) -> rusqlite::Result<Option<i64>> {
-    // a shard from before the stage ran has neither
-    let category = if has_table(conn, "release_category")? {
-        ("c.category", "left join release_category c on c.release_id = r.id")
-    } else {
-        ("null", "")
-    };
-    let predb = if has_table(conn, "predb_match")? {
-        ("p.kind, p.category, p.title_id", "left join predb_match p on p.release_id = r.id")
-    } else {
-        ("null, null, null", "")
-    };
-    let sql = format!(
-        "select r.id, r.group_name, coalesce(r.size, 0), coalesce(r.complete, 0), coalesce(r.parts, 0),
-                coalesce(r.is_obfuscated, 0), r.display_name is not null, r.name_source,
-                coalesce(r.display_name, r.name), {}, {}
-         from releases r {} {} where r.id > ?1 order by r.id limit ?2",
-        category.0, predb.0, category.1, predb.1
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let mut rows = stmt.query(params![after, limit])?;
-    let (mut last, mut seen) = (after, 0);
-    while let Some(r) = rows.next()? {
-        last = r.get(0)?;
-        seen += 1;
-        let kind: Option<i64> = r.get(10)?;
-        let predb = match kind {
-            Some(kind) => Some((kind, r.get_ref(11)?.as_str_or_null()?, r.get::<_, Option<i64>>(12)?.unwrap_or(0))),
-            None => None,
-        };
-        tally.add(&Row {
-            group: r.get_ref(1)?.as_str_or_null()?.unwrap_or(""),
-            size: r.get(2)?,
-            complete: r.get::<_, i64>(3)? != 0,
-            parts: r.get(4)?,
-            obfuscated: r.get::<_, i64>(5)? != 0,
-            named: r.get::<_, i64>(6)? != 0,
-            name_source: r.get(7)?,
-            name: r.get_ref(8)?.as_str_or_null()?.unwrap_or(""),
-            category: r.get(9)?,
-            predb,
-        });
-    }
-    Ok((seen == limit).then_some(last))
-}
-
-/// One walk over every shard. None: stopped part way.
-pub fn scan(main: &Path, stop: &AtomicBool) -> rusqlite::Result<Option<Tally>> {
-    let mut tally = Tally::default();
-    for path in &store::shard_paths(main) {
-        let mut after = i64::MIN;
-        loop {
-            if stop.load(Relaxed) {
-                return Ok(None);
-            }
-            // a compaction has it out of the way for now: totals without it are wrong, soo no totals
-            if !path.exists() {
-                return Err(rusqlite::Error::InvalidPath(path.clone()));
-            }
-            // a connection per read holds nothing open for a compaction to wait out
-            let conn = db::open_shard(path)?;
-            conn.execute_batch("pragma query_only = on")?;
-            let next = read_batch(&conn, after, BATCH, &mut tally)?;
-            drop(conn);
-            if tally.predb_titles.len() >= MAX_TITLES {
-                tally.read_feeds(main);
-            }
-            CATALOG_SCAN_ROWS.set(&[("state", "running")], tally.rows as f64);
-            match next {
-                Some(last) => after = last,
-                None => break,
-            }
-            thread::sleep(NAP);
-        }
-    }
-    tally.read_feeds(main);
-    Ok(Some(tally))
-}
-
-/// Save what the walk published.
-fn save(path: &Path) -> anyhow::Result<()> {
-    let rows: BTreeMap<&str, Vec<(String, f64)>> = SAVED.iter().map(|f| (f.name, f.rows())).collect();
-    crate::atomic::write_atomic(path, serde_json::to_string(&rows)?)?;
-    Ok(())
-}
-
-/// Bring back a saved walk. When it finished and how long it took, if there was one.
-fn restore(path: &Path) -> Option<(i64, Duration)> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let mut rows: BTreeMap<String, Vec<(String, f64)>> = serde_json::from_str(&text).ok()?;
-    for family in SAVED {
-        if let Some(found) = rows.remove(family.name) {
-            family.replace(found);
-        }
-    }
-    let took = CATALOG_SCAN_SECONDS.rows().first().map(|(_, s)| Duration::try_from_secs_f64(*s).unwrap_or_default());
-    CATALOG_SCAN_AT.rows().first().map(|(_, at)| (*at as i64, took.unwrap_or_default()))
-}
-
-/// The rest after a walk that took `took`.
-fn rest_after(every: Duration, took: Duration) -> Duration {
-    every.max(took.saturating_mul(REST_PER_WALK).min(LONGEST_REST))
-}
-
-/// The numbers that take no walk.
-fn read_quick(main: &Path) {
-    let stem = main.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "atlas".into());
-    let named = |name: String| main.with_file_name(format!("{stem}.{name}.db"));
-    let mut files: Vec<(String, PathBuf)> = vec![("main".into(), main.to_path_buf())];
-    files.extend(store::shard_paths(main).into_iter().enumerate().map(|(i, p)| (format!("s{i}"), p)));
-    files.push(("predb".into(), named("predb".into())));
-    files.push(("media".into(), named("media".into())));
-    for (file, path) in &files {
-        let wal = PathBuf::from(format!("{}-wal", path.display()));
-        for (kind, path) in [("db", path), ("wal", &wal)] {
-            let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-            DB_BYTES.set(&[("file", file), ("kind", kind)], bytes as f64);
-        }
-    }
-
-    let read = || -> rusqlite::Result<()> {
-        let conn = db::open()?;
-        conn.execute_batch("pragma query_only = on")?;
-        let (releases, articles) = store::totals(&conn)?;
-        DB_TOTALS.set(&[("kind", "releases")], releases as f64);
-        DB_TOTALS.set(&[("kind", "articles")], articles as f64);
-        if has_table(&conn, "backfill_chunks")? {
-            let hour_ago = chrono::Utc::now().timestamp() - 3600;
-            let (done, total, recent): (i64, i64, i64) = conn.query_row(
-                "select coalesce(sum(state = 2), 0), count(*), coalesce(sum(state = 2 and done_at > ?1), 0) from backfill_chunks",
-                [hour_ago],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )?;
-            BACKFILL_CHUNKS.set(&[("state", "done")], done as f64);
-            BACKFILL_CHUNKS.set(&[("state", "total")], total as f64);
-            BACKFILL_CHUNKS.set(&[("state", "done_last_hour")], recent as f64);
-            let (groups, splitting): (i64, i64) = conn.query_row(
-                "select count(*), coalesce(sum(pending > 0), 0) from
-                 (select grp, sum(state != 2) as pending from backfill_chunks group by grp)",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?;
-            BACKFILL_GROUPS.set(&[("state", "all")], groups as f64);
-            BACKFILL_GROUPS.set(&[("state", "splitting")], splitting as f64);
-        }
-        if freeze_due() {
-            read_freeze_queues(main);
-        }
-        if has_table(&conn, "groups")? {
-            report_groups(&db::group_progress(&conn)?, &crate::chunks::per_group(&conn)?);
-        }
-        Ok(())
-    };
-    if let Err(e) = read() {
-        println!("metrics: couldnt read the database totals: {e}");
-    }
-}
-
-/// how often the freeze queues are counted: a count is a scan of millions of rows, about 2 s of disk a shard on prod
-const FREEZE_EVERY: Duration = Duration::from_secs(300);
-
-/// Whether the freeze queues are due a count, and if soo, the next one waits `FREEZE_EVERY`.
-fn freeze_due() -> bool {
-    static LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
-    let mut last = LAST.lock().unwrap();
-    if last.is_some_and(|t| t.elapsed() < FREEZE_EVERY) {
-        return false;
-    }
-    *last = Some(Instant::now());
-    true
-}
-
-/// Each shard's freeze queue: how many are queued, how many have waited `wait_hours`, and the oldest. Read only, a
-/// connection a shard; a shard that can't be read keeps its last reading.
-fn read_freeze_queues(main: &Path) {
-    let now = chrono::Utc::now().timestamp();
-    let ready = now - crate::frozen::WAIT_SECS.load(Relaxed);
-    for (i, path) in store::shard_paths(main).iter().enumerate() {
-        let shard = i.to_string();
-        let read = || -> rusqlite::Result<(i64, i64, Option<i64>)> {
-            let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-            if !has_table(&conn, "freeze_pending")? {
-                return Ok((0, 0, None));
-            }
-            conn.query_row(
-                "select count(*), (select count(*) from freeze_pending where at <= ?1), min(at) from freeze_pending",
-                [ready],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-        };
-        match read() {
-            Ok((queued, due, oldest)) => {
-                FREEZE_PENDING.set(&[("shard", &shard), ("state", "queued")], queued as f64);
-                FREEZE_PENDING.set(&[("shard", &shard), ("state", "ready")], due as f64);
-                match oldest {
-                    Some(at) => FREEZE_PENDING_OLDEST.set(&[("shard", &shard)], at as f64),
-                    None => FREEZE_PENDING_OLDEST.replace(
-                        FREEZE_PENDING_OLDEST.rows().into_iter().filter(|(k, _)| *k != label_key(&[("shard", &shard)])),
-                    ),
-                }
-            }
-            Err(e) => println!("metrics: couldnt count shard {i}'s freeze queue: {e}"),
-        }
-    }
-}
-
-/// Each group's backfill and live progress, as whole readings: a group gone from the database goes from them too.
-fn report_groups(progress: &[db::GroupProgress], chunks: &BTreeMap<String, crate::chunks::GroupChunks>) {
-    let counts: BTreeMap<String, (i64, i64)> = chunks.iter().map(|(g, c)| (g.clone(), (c.done, c.total))).collect();
-    let (mut articles, mut backfill, mut posted) = (Vec::new(), Vec::new(), Vec::new());
-    for (group, (total, covered, row)) in db::best_progress(progress, &counts) {
-        let key = |name: &str, value: &str| label_key(&[("group", &group), (name, value)]);
-        let marks = [("first", row.first), ("last", row.last)]
-            .into_iter()
-            .chain([("backfill_cursor", Some(row.backfill_cursor)), ("live_cursor", Some(row.live_cursor))]);
-        for (mark, n) in marks {
-            if let Some(n) = n {
-                articles.push((key("mark", mark), n as f64));
-            }
-        }
-        backfill.push((key("state", "total"), total as f64));
-        backfill.push((key("state", "covered"), covered as f64));
-        for (end, dated) in [("oldest", row.low), ("newest", row.high)] {
-            if let Some((_, at)) = dated {
-                posted.push((key("end", end), at as f64));
-            }
-        }
-    }
-    let (mut chunk_counts, mut days) = (Vec::new(), Vec::new());
-    for (group, c) in chunks {
-        let key = |name: &str, value: &str| label_key(&[("group", group), (name, value)]);
-        chunk_counts.push((key("state", "done"), c.done as f64));
-        chunk_counts.push((key("state", "total"), c.total as f64));
-        let day = |d: i64| (d * 86_400) as f64;
-        days.push((key("day", "oldest"), day(c.oldest_day)));
-        days.push((key("day", "newest"), day(c.newest_day)));
-        if let Some(d) = c.oldest_done_day {
-            days.push((key("day", "oldest_done"), day(d)));
-        }
-    }
-    GROUP_ARTICLE.replace(articles);
-    GROUP_BACKFILL.replace(backfill);
-    GROUP_POSTED.replace(posted);
-    GROUP_CHUNKS.replace(chunk_counts);
-    GROUP_CHUNK_DAYS.replace(days);
-}
-
-fn nap(how_long: Duration, stop: &AtomicBool) {
-    let until = Instant::now() + how_long;
-    while !stop.load(Relaxed) && Instant::now() < until {
-        thread::sleep(Duration::from_millis(250).min(until - Instant::now()));
-    }
-}
-
-fn cache_path() -> PathBuf {
-    paths::app_dir().join("metrics_catalog.json")
-}
-
-/// The two threads, for as long as `stop` isnt set.
-pub fn spawn(every: Duration, stop: Arc<AtomicBool>) {
-    let main = paths::database();
-    let (quick_main, quick_stop) = (main.clone(), stop.clone());
-    let _ = thread::Builder::new().name("atlas-metrics-quick".into()).spawn(move || {
-        while !quick_stop.load(Relaxed) {
-            read_quick(&quick_main);
-            nap(QUICK_EVERY, &quick_stop);
-        }
-    });
-    let _ =
-        thread::Builder::new().name("atlas-metrics-catalog".into()).spawn(move || walk_forever(&main, every, &stop));
-}
-
-fn walk_forever(main: &Path, every: Duration, stop: &AtomicBool) {
-    // no sooner than its rest after the last one, however often atlas restarts
-    let first = restore(&cache_path()).map_or(Duration::ZERO, |(at, took)| {
-        let age = Duration::from_secs((chrono::Utc::now().timestamp() - at).max(0) as u64);
-        rest_after(every, took).saturating_sub(age)
-    });
-    nap(first, stop);
-    while !stop.load(Relaxed) {
-        let started = Instant::now();
-        let span = super::span("metrics.catalog_scan");
-        let wait = match scan(main, stop) {
-            Ok(Some(tally)) => {
-                let took = started.elapsed();
-                tally.publish(took);
-                CATALOG_SCAN_ROWS.set(&[("state", "last")], tally.rows as f64);
-                if let Err(e) = save(&cache_path()) {
-                    println!("metrics: couldnt save the catalog numbers: {e:#}");
-                }
-                rest_after(every, took)
-            }
-            Ok(None) => return,
-            Err(e) => {
-                span.failed();
-                println!("metrics: catalog walk stopped, trying again in {}m: {e}", RETRY.as_secs() / 60);
-                RETRY
-            }
-        };
-        drop(span);
-        nap(wait, stop);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn freeze_queues_are_counted_per_shard_with_those_past_the_wait() {
-        let dir = tempfile::tempdir().unwrap();
-        let main = dir.path().join("atlas.db");
-        let s0 = Connection::open(&store::shard_paths(&main)[0]).unwrap();
-        s0.execute_batch("create table freeze_pending (release_id integer primary key, reason text, at integer)")
-            .unwrap();
-        let now = chrono::Utc::now().timestamp();
-        let wait = crate::frozen::WAIT_SECS.load(Relaxed);
-        for (id, at) in [(1, now - wait - 10), (2, now - wait - 5), (3, now)] {
-            s0.execute("insert into freeze_pending values (?1, 'not_tv_movies', ?2)", params![id, at]).unwrap();
-        }
-        read_freeze_queues(&main);
-        let rows: BTreeMap<String, f64> = FREEZE_PENDING.rows().into_iter().collect();
-        assert_eq!(rows[r#"shard="0",state="queued""#], 3.0);
-        assert_eq!(rows[r#"shard="0",state="ready""#], 2.0);
-        let oldest: BTreeMap<String, f64> = FREEZE_PENDING_OLDEST.rows().into_iter().collect();
-        assert_eq!(oldest[r#"shard="0""#], (now - wait - 10) as f64);
-        assert!(!rows.contains_key(r#"shard="1",state="queued""#), "a shard that cant be opened is left out");
+    fn native_feed_labels_and_category_sizes_follow_admitted_rows() {
+        let mut tally = Tally::default();
+        let row = Row { group:"alt.binaries.test", size:17, complete:true, parts:1,
+            obfuscated:false, named:false, name_source:None,
+            name:"Some.Movie.2024.1080p-GROUP", category:Some(2000),
+            predb:Some((1,Some("Movies"),9)) };
+        tally.add_native(&row,Some("feed-seven")).unwrap();
+        assert_eq!(tally.rows,1);assert_eq!(tally.categories[&2000],(1,17));
+        assert_eq!(tally.feeds["feed-seven"],1);assert!(tally.predb_titles.is_empty());
+        let oversized="x".repeat(4097);
+        assert!(tally.add_native(&row,Some(&oversized)).is_err());
+        assert_eq!(tally.rows,1,"failed admission must not add a partial row");
     }
 
     #[test]
-    fn groups_report_the_row_furthest_along_and_split_groups_by_their_chunks() {
-        let row = |key: &str, live, backfill, low: Option<(i64, i64)>| db::GroupProgress {
-            key: key.into(),
-            live_cursor: live,
-            backfill_cursor: backfill,
-            first: Some(1),
-            last: Some(1000),
-            low,
-            high: Some((live, 1_790_000_000)),
-        };
-        let progress = [
-            row("a.b.one@news.x", 1000, 900, Some((901, 1_780_000_000))),
-            row("a.b.one@news.y", 1000, 500, Some((501, 1_770_000_000))),
-            row("a.b.split", 990, 990, None),
-        ];
-        let split = crate::chunks::GroupChunks {
-            done: 1,
-            total: 4,
-            oldest_day: 20_000,
-            newest_day: 20_003,
-            oldest_done_day: Some(20_003),
-        };
-        report_groups(&progress, &BTreeMap::from([("a.b.split".to_string(), split)]));
-        let rows: BTreeMap<String, f64> = GROUP_BACKFILL.rows().into_iter().collect();
-        assert_eq!(rows[r#"group="a.b.one",state="covered""#], 500.0, "news.y is further along");
-        assert_eq!(rows[r#"group="a.b.one",state="total""#], 1000.0);
-        assert_eq!(rows[r#"group="a.b.split",state="covered""#], 250.0, "one of four days");
-        let articles: BTreeMap<String, f64> = GROUP_ARTICLE.rows().into_iter().collect();
-        assert_eq!(articles[r#"group="a.b.one",mark="backfill_cursor""#], 500.0);
-        assert_eq!(articles[r#"group="a.b.split",mark="last""#], 1000.0);
-        let posted: BTreeMap<String, f64> = GROUP_POSTED.rows().into_iter().collect();
-        assert_eq!(posted[r#"group="a.b.one",end="oldest""#], 1_770_000_000.0);
-        assert!(!posted.contains_key(r#"group="a.b.split",end="oldest""#), "no dated end, no reading");
-        let days: BTreeMap<String, f64> = GROUP_CHUNK_DAYS.rows().into_iter().collect();
-        assert_eq!(days[r#"group="a.b.split",day="oldest_done""#], 20_003.0 * 86_400.0);
-
-        report_groups(&progress[..1], &BTreeMap::new());
-        assert!(GROUP_BACKFILL.rows().iter().all(|(k, _)| !k.contains("a.b.split")), "gone groups go");
-        assert!(GROUP_CHUNKS.rows().is_empty());
+    fn native_byte_overflow_rejects_the_row_before_mutating_the_tally() {
+        let mut tally = Tally::default();
+        let row = Row {group:"alt.binaries.test",size:i64::MAX,complete:false,parts:0,
+            obfuscated:false,named:false,name_source:None,name:"Example",category:None,predb:None};
+        tally.add_native(&row,None).unwrap();tally.add_native(&row,None).unwrap();
+        assert!(tally.add_native(&row,None).is_err());assert_eq!(tally.rows,2);
+        assert_eq!(tally.bytes,18_446_744_073_709_551_614);
     }
 
     #[test]
@@ -869,33 +457,6 @@ mod tests {
         tally.add(&row("abcdef0123456789", false));
         assert_eq!(tally.name_sources["inline_body"], 1);
         assert_eq!(tally.name_sources["posted"], 1);
-    }
-
-    #[test]
-    fn a_saved_walk_comes_back() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("saved.json");
-        CATALOG_GROUP.replace([(label_key(&[("group", "a.b.c")]), 7.0)]);
-        CATALOG_SCAN_AT.replace([(String::new(), 1234.0)]);
-        CATALOG_SCAN_SECONDS.replace([(String::new(), 90.5)]);
-        save(&path).unwrap();
-        CATALOG_GROUP.replace([]);
-        CATALOG_SCAN_AT.replace([]);
-        CATALOG_SCAN_SECONDS.replace([]);
-        assert_eq!(restore(&path), Some((1234, Duration::from_secs_f64(90.5))));
-        assert_eq!(CATALOG_GROUP.rows(), vec![(label_key(&[("group", "a.b.c")]), 7.0)]);
-        assert_eq!(restore(&dir.path().join("missing.json")), None);
-        std::fs::write(&path, "not json").unwrap();
-        assert_eq!(restore(&path), None, "a damaged file is no file");
-    }
-
-    #[test]
-    fn a_long_walk_rests_longer_than_its_interval() {
-        let minutes = |m: u64| Duration::from_secs(m * 60);
-        assert_eq!(rest_after(minutes(30), minutes(2)), minutes(30), "a short walk keeps to the interval");
-        assert_eq!(rest_after(Duration::from_secs(60), minutes(20)), minutes(80), "a long one rests 4 times as long");
-        assert_eq!(rest_after(minutes(30), Duration::ZERO), minutes(30));
-        assert_eq!(rest_after(minutes(30), Duration::MAX), LONGEST_REST, "a damaged save rests a day at most");
     }
 
     #[test]
