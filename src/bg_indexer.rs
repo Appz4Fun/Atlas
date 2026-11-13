@@ -1994,6 +1994,7 @@ fn run_native(config: Config, storage: crate::pg::StorageConfig) -> i32 {
     }
     let final_stop = Arc::new(AtomicBool::new(false));
     let mut identity = None;
+    let mut catalog = None;
     let mut initialized = false;
     let mut backoff = Backoff::default();
     let mut paused = false;
@@ -2031,8 +2032,28 @@ fn run_native(config: Config, storage: crate::pg::StorageConfig) -> i32 {
             break 0;
         }
         identity = Some(native.identity.clone());
+        let Some(epoch)=native.owner.epoch() else {
+            native.owner.close();
+            ui::error("native catalog identity is unavailable");
+            break 1;
+        };
+        let current_catalog=*epoch.catalog().nonce();
+        if catalog.is_some_and(|expected|expected!=current_catalog) {
+            native.owner.close();
+            ui::error("native catalog changed; restart with the intended catalog");
+            break 1;
+        }
+        catalog=Some(current_catalog);
         if !initialized {
-            if crate::nxv_store::live::spawn_bounded(&headers).is_err() {
+            let effective_headers=match native.header_config() {
+                Ok(headers)=>headers,
+                Err(_)=>{
+                    ui::error("native catalog header root refused");
+                    native.owner.close();
+                    break 1;
+                }
+            };
+            if crate::nxv_store::live::spawn_bounded(&effective_headers).is_err() {
                 ui::error("could not start the durable NXV header store");
                 native.owner.close();
                 break 1;
