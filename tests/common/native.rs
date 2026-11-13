@@ -1,7 +1,7 @@
 //! Test-only adapter to the original native runtime; no alternate database API.
 
 use std::fs::{File, OpenOptions};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::Ordering;
@@ -79,6 +79,11 @@ fn required_url() -> String {
 /// Child output stays private even on failure: PostgreSQL errors may contain
 /// connection information, so no captured child output enters assertion debug.
 pub fn run_child(case: &str) {
+    run_child_on(case, CHILD_TEST);
+}
+
+/// Dedicated sibling contracts retain their own exact child registry selector.
+pub fn run_child_on(case: &str, child_test: &str) {
     let url = required_url();
     // The parent owns schema cleanup even when a timed-out child must be killed.
     let schema = ParentSchema::open(&url);
@@ -94,7 +99,7 @@ pub fn run_child(case: &str) {
     let log = options.open(log_path).expect("private native fixture log");
     let mut child = ChildGuard(
         Command::new(std::env::current_exe().expect("native test executable"))
-            .args(["--exact", CHILD_TEST, "--ignored", "--test-threads=1", "--nocapture"])
+            .args(["--exact", child_test, "--ignored", "--test-threads=1", "--nocapture"])
             .env_clear()
             .env("ATLAS_HOME", home.path())
             .env("ATLAS_NO_KEYRING", "1")
@@ -127,6 +132,22 @@ pub fn run_child(case: &str) {
     }
 }
 
+pub struct NativeRelease {
+    pub id: i64,
+    pub name: String,
+    pub poster: String,
+    pub parts: i64,
+    pub file_total: Option<i64>,
+    pub complete: bool,
+    pub files: i64,
+}
+
+pub struct NativeCursor {
+    pub key: String,
+    pub live: Option<i64>,
+    pub backfill: Option<i64>,
+}
+
 pub struct Harness {
     observer: crate::pg::Pool,
     runtime: Runtime,
@@ -134,6 +155,8 @@ pub struct Harness {
     home: PathBuf,
     headers: PathBuf,
     finished: bool,
+    schema: String,
+    words: Option<crate::pg::stage_words::Keeper>,
 }
 
 impl Harness {
@@ -157,13 +180,38 @@ impl Harness {
         };
         let observer = crate::pg::Pool::new(&storage).unwrap_or_else(|_| panic!("native fixture observer pool"));
         let headers = HeaderStoreConfig { enabled: true, dir: home.join("headers").to_string_lossy().into_owned() };
+        // Normal API/cache readers recheck the selected destination and header
+        // configuration. The fixture never consults an ambient real config.
+        let selected = serde_json::json!({
+            "storage":{"backend":"postgres","url":&storage.url,"schema":&storage.schema,
+                "max_connections":storage.max_connections,"allow_plaintext":storage.allow_plaintext},
+            "header_store":{"enabled":true,"dir":&headers.dir},
+            "postprocess":{"enabled":false},"predb":{"enabled":false},"spots":{"enabled":false},
+            "inferred_parts":false,"metrics":{"enabled":false},
+            "media":{"tvmaze":{"enabled":false},"allocine":{"enabled":false},"details_per_minute":0}
+        });
+        let text = toml_edit::ser::to_string_pretty(&selected)
+            .unwrap_or_else(|_| panic!("serialize private selected fixture configuration"));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options
+            .open(home.join("config.toml"))
+            .expect("private selected fixture configuration")
+            .write_all(text.as_bytes())
+            .expect("write private selected fixture configuration");
+        let schema = storage.schema.clone();
         let hosts = crate::nntp::server_keys(&config.servers);
         let runtime = Runtime::open(&config, storage, headers, &hosts, &mut None)
             .unwrap_or_else(|_| panic!("open original native fixture owner"));
         let effective = runtime.header_config().unwrap_or_else(|_| panic!("check original native header root"));
         crate::nxv_store::live::spawn_bounded(&effective).unwrap_or_else(|_| panic!("start original bounded live NXV"));
         crate::archive::sync_inline_lookups(&config);
-        Self { observer, runtime, config, home, headers: effective.root(), finished: false }
+        Self { observer, runtime, config, home, headers: effective.root(), finished: false, schema, words: None }
     }
 
     pub fn indexer(&self, mode: &str) -> Indexer {
@@ -184,6 +232,89 @@ impl Harness {
 
     pub fn db(&self) -> Db {
         self.runtime.db.clone()
+    }
+
+    /// The real original-owner delivery lane builds and ACKs Tantivy input.
+    /// Tests observe actual search results instead of writing a ready flag.
+    pub fn start_words(&mut self) {
+        assert!(self.words.is_none(), "one actual word keeper per fixture");
+        self.words = Some(
+            crate::pg::stage_words::Keeper::start(&self.runtime.owner, self.runtime.configured_headers())
+                .expect("start original native word keeper"),
+        );
+    }
+
+    pub fn with_reader<T>(
+        &self,
+        read: impl FnOnce(&crate::pg::fresh_reader::ReadView<'_>) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let mut connection = self.observer.get()?;
+        let view = crate::pg::fresh_reader::ReadView::open(
+            &mut connection,
+            &self.schema,
+            crate::pg::fresh_reader::Budget { rows: 100, bytes: 8 * 1024 * 1024 },
+            Instant::now() + Duration::from_secs(10),
+        )?;
+        read(&view)
+    }
+
+    /// Closed, bounded fixture observation of genuine ingestion results.
+    /// Collection tests require poster and file-total identity as well as IDs.
+    pub fn release_rows(&self) -> Vec<NativeRelease> {
+        self.runtime
+            .owner
+            .with(|client| {
+                let mut tx = client
+                    .build_transaction()
+                    .isolation_level(postgres::IsolationLevel::RepeatableRead)
+                    .read_only(true)
+                    .start()?;
+                tx.batch_execute("set local statement_timeout='10s';set local lock_timeout='1s'")?;
+                let rows = tx.query(
+                    "select r.id,r.name,r.poster,r.parts,r.file_total,r.complete,
+                (select count(*) from files f where f.release_id=r.id) from releases r order by r.id limit 257",
+                    &[],
+                )?;
+                anyhow::ensure!(rows.len() <= 256, "native fixture release snapshot exceeds admission");
+                let rows = rows
+                    .into_iter()
+                    .map(|row| NativeRelease {
+                        id: row.get(0),
+                        name: row.get(1),
+                        poster: row.get(2),
+                        parts: row.get(3),
+                        file_total: row.get(4),
+                        complete: row.get(5),
+                        files: row.get(6),
+                    })
+                    .collect();
+                tx.commit()?;
+                Ok(rows)
+            })
+            .expect("observe original-owner native release snapshot")
+    }
+
+    pub fn cursors(&self) -> Vec<NativeCursor> {
+        self.runtime
+            .owner
+            .with(|client| {
+                let mut tx = client
+                    .build_transaction()
+                    .isolation_level(postgres::IsolationLevel::RepeatableRead)
+                    .read_only(true)
+                    .start()?;
+                tx.batch_execute("set local statement_timeout='10s';set local lock_timeout='1s'")?;
+                let rows =
+                    tx.query("select name,live_cursor,backfill_cursor from groups order by name limit 257", &[])?;
+                anyhow::ensure!(rows.len() <= 256, "native fixture cursor snapshot exceeds admission");
+                let rows = rows
+                    .into_iter()
+                    .map(|row| NativeCursor { key: row.get(0), live: row.get(1), backfill: row.get(2) })
+                    .collect();
+                tx.commit()?;
+                Ok(rows)
+            })
+            .expect("observe actual native cursor snapshot")
     }
 
     pub fn articles(&mut self) -> i64 {
@@ -207,6 +338,9 @@ impl Harness {
     /// The real BlockingPool runtime drains before sealing NXV or closing the
     /// original owner. Reopen and verify the actual committed NXV blocks.
     pub fn finish(&mut self, indexer: Indexer, minimum_rows: u64) {
+        if let Some(words) = self.words.take() {
+            words.finish().expect("drain original native word keeper");
+        }
         self.runtime.owner.stop.store(true, Ordering::Release);
         indexer.client.disconnect();
         drop(indexer);
@@ -248,6 +382,9 @@ impl Harness {
 impl Drop for Harness {
     fn drop(&mut self) {
         if !self.finished {
+            if let Some(words) = self.words.take() {
+                let _ = words.finish();
+            }
             self.runtime.owner.stop.store(true, Ordering::Release);
             crate::nxv_store::live::finish();
             self.runtime.owner.close();
