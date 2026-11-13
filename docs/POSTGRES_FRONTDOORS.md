@@ -58,16 +58,21 @@ converter/maintenance source remains recoverable in the frozen pre-cutover Git
 history. Current native CRC/key/file associations retain their algorithms and typed steps;
 retiring the standalone report does not retire those pipeline behaviors.
 
-## Remaining build-graph closure
+## Build and qualification status
 
-This finite stage removes product selection and command dispatch only. The indexer,
-post-processing interfaces, generic SQL adapters, cache modules, conversion helpers,
-SQLite-based tests, `rusqlite`, and its transitive dependencies still require their
-separate cleanup. Native ownership, digest, lease/claim/ack, cause propagation,
-NXV durability, schema migrations and costly-cache preservation must survive it.
-A complete SQLite-free graph requires normal BIN/LIB, every supported feature and
-target, actual native tests, and runtime no-fallback qualification. This change does
-not claim that closure.
+The production source now removes the SQLite indexer/storage engines, connection
+adapters and legacy cache/read/command halves, retaining their native or pure
+successors. The direct `rusqlite` manifest dependency is removed. Root separately
+refreshes the lockfile and performs the first normal BIN/non-test LIB build;
+source checks alone do not establish a SQLite-free compiled artifact.
+
+Retained integration/support targets are still being ported to actual PostgreSQL
+or pure fixtures. No `autotests` override, backend feature or SQLite development
+dependency hides that open test graph. Native ownership, digest, lease/claim/ack,
+cause propagation, NXV durability, schema migrations and costly-cache preservation
+remain qualification requirements. Full supported-target builds, actual native
+worker/Web tests, preservation and runtime no-fallback checks remain separate.
+This source checkpoint is not service activation or deployment evidence.
 
 Focused new verification selectors are `--test pg_only_frontdoors`,
 `app::native_cli_boundary_tests`, `app::presentation::tests`,
