@@ -1,4 +1,4 @@
-//! Startup fencing for the native ingestion profile while auxiliary services are ported.
+//! Native startup admission; ownership and destination fencing remain in Runtime.
 
 use super::outage::{AttemptEnded, Failure, SessionUnavailable, classify};
 use anyhow::{Context, Result, ensure};
@@ -19,23 +19,12 @@ pub(crate) struct Profile {
 impl Profile {
     pub(crate) fn check(config: &Config, headers: &HeaderStoreConfig) -> Result<()> {
         ensure!(headers.enabled, "native ingestion requires the NXV header store");
-        ensure!(!config.postprocess.enabled, "native ingestion requires postprocessing to be disabled");
-        ensure!(!config.predb.enabled, "native ingestion requires the PreDB worker to be disabled");
-        ensure!(!config.spots.enabled, "native ingestion requires Spotnet workers to be disabled");
-        ensure!(!config.inferred_parts, "native ingestion requires inferred-part repair to be disabled");
-        ensure!(
-            !config.media.any_provider()
-                && !config.media.allocine.enabled
-                && config.media.omdb.api_key.is_empty()
-                && config.media.opensubtitles.api_key.is_empty()
-                && config.media.details_per_minute == 0,
-            "native ingestion requires metadata providers and cache workers to be disabled"
-        );
+        crate::postprocess::native::ConfigPin::validate(config)?;
         ensure!(!config.auto_run_compact, "native ingestion requires SQLite compaction to be disabled");
         ensure!(!config.shared_catalog.enabled, "native ingestion cannot publish the SQLite catalog mirror");
         ensure!(
             !config.overview_archive.enabled,
-            "native ingestion requires the SQLite overview archive to be disabled"
+            "native ingestion does not run the retired raw overview archive; use the canonical NXV header store"
         );
         ensure!(
             config.sealed_log.addr.is_empty(),
