@@ -1015,6 +1015,16 @@ fn housekeeping(
 }
 
 impl Db {
+    pub(crate) fn check_native_owner(&self,owner:&Arc<crate::pg::indexer_runtime::Owner>)->Result<()> {
+        anyhow::ensure!(matches!(&*self.conn,MainConnection::OwnedPostgres(actual) if Arc::ptr_eq(actual,owner)),"native service requires its original Db owner");
+        self.native.as_ref().ok_or_else(||anyhow!("native service requires native writer admission"))?.check_native_owner(owner)
+    }
+
+    pub(crate) async fn reserve_native_for_owner(&self,owner:&Arc<crate::pg::indexer_runtime::Owner>)->Result<crate::pg::ingest::NativeSavePermit> {
+        self.check_native_owner(owner)?;
+        self.native.as_ref().ok_or_else(||anyhow!("native service requires native writer admission"))?.reserve_native_for_owner(owner).await
+    }
+
     pub(crate) fn is_native(&self) -> bool {
         self.native.is_some()
     }
