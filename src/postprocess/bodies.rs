@@ -79,6 +79,10 @@ impl BodyFetcher {
         *self.config.write().unwrap() = config.clone();
     }
 
+    pub(super) fn service_io(&self)->(Arc<Pool>,tokio::runtime::Handle) {
+        (self.pool.clone(),self.handle.clone())
+    }
+
     /// `bodies_per_release`: what one release's run may fetch
     pub(crate) fn per_release(&self) -> i64 {
         self.config.read().unwrap().bodies_per_release

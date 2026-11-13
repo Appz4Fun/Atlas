@@ -67,6 +67,7 @@ fn require_pristine_catalog(client:&mut impl GenericClient)->Result<()> {
     const EMPTY:&[&str]=&["releases","files","segments","segment_nzb_metadata","file_parts","header_blocks","pp_queue","pp_state","pp_walks",
         "predb_name_keys","predb_name_pending","predb_late_scan","predb_late_matches",
         "native_group_captures","native_group_capture_rows","native_group_capture_current",
+        "native_metric_catalog_groups","native_metric_chunk_groups","native_metric_chunk_touched",
         "groups","backfill_chunks","backfill_deepest","backfill_media","backfill_speculative","backfill_sweep_gen",
         "backfill_sweeps","backfill_wanted","spot_comments","spot_disposals","spot_reports","spots_seen",
         "inferred_asked","inferred_ids","repair_tried","repair_older","archive_inner_files","sidecars","archive_release",

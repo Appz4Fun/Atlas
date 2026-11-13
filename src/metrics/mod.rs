@@ -64,7 +64,7 @@ fn escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
 }
 
-fn label_key(labels: &[(&str, &str)]) -> String {
+pub(crate) fn label_key(labels: &[(&str, &str)]) -> String {
     let mut key = String::new();
     for (i, (name, value)) in labels.iter().enumerate() {
         if i > 0 {

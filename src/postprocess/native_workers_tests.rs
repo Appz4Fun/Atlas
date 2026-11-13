@@ -181,3 +181,36 @@ pub(crate) fn run_fanout_fence(runtime:&crate::pg::indexer_runtime::Runtime) {
     assert_eq!(queue.settle(&current,Visit::prepare(&current,result(),[2;32]).unwrap(),13).unwrap(),Settlement::Applied);
     assert_eq!(runtime.owner.failure(),None);runtime.owner.close();
 }
+
+
+#[test]
+fn native_header_only_attempt_observes_real_registry_and_joins_without_step_or_predb_state() {
+    crate::raw_store::native_pg_opensubtitles_cache_tests::native_worker_parent(
+        crate::raw_store::native_pg_opensubtitles_cache_tests::WorkerCase::HeaderOnly);
+}
+
+pub(crate) fn run_header_only(runtime:&crate::pg::indexer_runtime::Runtime) {
+    let mut config=crate::config::Config::default();config.postprocess.enabled=false;config.predb.enabled=false;
+    // A genuine process counter, observed through the existing producer; no
+    // fabricated Stage lane or manually inserted telemetry completion row.
+    crate::metrics::names::API_REQUESTS.inc(&[("endpoint","native-header-control"),("status","200")],7);
+    let ending=Arc::new(std::sync::atomic::AtomicBool::new(false));let end=ending.clone();let owner=runtime.owner.clone();
+    let worker=std::thread::spawn(move|| {
+        let handle=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        handle.block_on(workers::run(owner,config,Arc::new(crate::nntp::Pool::new(&[])),move||end.load(std::sync::atomic::Ordering::Acquire)));
+    });
+    let deadline=Instant::now()+Duration::from_secs(5);
+    loop {
+        let ready=runtime.owner.with(|client|Ok(client.query_one("select exists(select 1 from native_runtime_observation_current h join native_runtime_observations o using(observation_id) join native_metric_samples s using(observation_id) where not o.stage_running and o.stage_instance_nonce is null and o.enabled_mask is null and s.family='atlas_api_requests_total' and s.labels like '%native-header-control%' and s.counter_bits=7)",&[])?.get::<_,bool>(0))).unwrap();
+        if ready {break}
+        if Instant::now()>=deadline {ending.store(true,std::sync::atomic::Ordering::Release);worker.join().unwrap();panic!("header-only attempt never published its actual completed observation")}
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    runtime.owner.with(|client| {
+        for table in ["pp_state","pp_walks","ext_predb_key_meta","native_operations"] {
+            assert_eq!(client.query_one(&format!("select count(*) from {table}"),&[])?.get::<_,i64>(0),0,"disabled factory created state in {table}");
+        }Ok(())
+    }).unwrap();
+    ending.store(true,std::sync::atomic::Ordering::Release);worker.join().unwrap();
+    assert!(runtime.owner.stop.load(std::sync::atomic::Ordering::Acquire));assert_eq!(runtime.owner.failure(),None);runtime.owner.close();
+}

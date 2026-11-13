@@ -1466,7 +1466,7 @@ async fn run_servers(
     {
         eprintln!("predb: {e}");
     }
-    if (config.postprocess.enabled || config.predb.enabled) && let Some(runtime)=native {
+    if let Some(runtime)=native {
         let s=sched.clone();
         tasks.spawn(named!("native stage".into(),crate::postprocess::native::run(
             runtime.owner.clone(),config.clone(),sched.ctx.pool.clone(),move||s.stopping())));

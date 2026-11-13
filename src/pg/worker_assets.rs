@@ -1,15 +1,16 @@
 //! Attempt-bound cover reuse. Configuration selects a physical namespace; only
 //! real owner-session associations plus verified bytes produce a frame hold.
 use anyhow::{Result,Context,ensure};
-use sha2::{Digest,Sha256};
 use std::{io::Read,cell::RefCell,sync::{Arc,Weak},marker::PhantomData,rc::Rc};
 use super::{indexer_runtime::Owner,fresh_assets::{AssetManifest,AssetRequest,AssetKind},natural_cache::{self,Key,Budget}};
 const COVER_BYTES:u64=crate::probe::media::MAX_COVER as u64;
 
 pub(crate) struct Grant {
     owner:Weak<Owner>,epoch:[u8;32],catalog:[u8;32],manifest:Arc<AssetManifest>,source:[u8;32],
-    pool:Arc<crate::nzb_spool::Pool>,_scratch:tempfile::TempDir,
+    pool:Arc<crate::nzb_spool::Pool>,art_pool:Arc<crate::nzb_spool::Pool>,_scratch:tempfile::TempDir,
 }
+#[derive(Debug,PartialEq,Eq)]
+pub(crate) enum ArtworkStatus {Kept,Missing,Unavailable,Changed}
 pub(crate) enum CoverStatus {Verified(CoverHold),Changed,Missing}
 pub(crate) struct CoverHold {
     grant:Arc<Grant>,release:i64,_revision:i64,mime:String,name:String,
@@ -34,11 +35,15 @@ impl Grant {
         owner.with(|_|Ok(()))?;
         let epoch=owner.epoch().context("worker assets require the canonical owner")?;
         let manifest=Arc::new(AssetManifest::from_selection(selection)?);
-        let mut source=Sha256::new();source.update(b"atlas.native-cover-writer.v1\0");source.update(manifest.namespace()?);source.update(epoch.catalog().nonce());
+        let source=manifest.native_source(AssetKind::Covers,epoch.catalog())?;
         let scratch=tempfile::Builder::new().prefix("atlas-worker-assets-").tempdir()?;
         let pool=crate::nzb_spool::Pool::new(scratch.path().into(),crate::nzb_spool::Limits {requests:32,per_request_bytes:COVER_BYTES,total_bytes:32*COVER_BYTES,free_bytes:16*1024*1024})?;
-        Ok(Some(Arc::new(Self {owner:Arc::downgrade(owner),epoch:*epoch.id(),catalog:*epoch.catalog().nonce(),manifest,source:source.finalize().into(),pool,_scratch:scratch})))
+        let art_pool=crate::nzb_spool::Pool::new(scratch.path().into(),crate::nzb_spool::Limits {requests:1,per_request_bytes:8<<20,total_bytes:8<<20,free_bytes:16<<20})?;
+        Ok(Some(Arc::new(Self {owner:Arc::downgrade(owner),epoch:*epoch.id(),catalog:*epoch.catalog().nonce(),manifest,source,pool,art_pool,_scratch:scratch})))
     }
+    /// Service factories must bind the grant to their exact original attempt
+    /// before constructing any cache/provider clients or performing work.
+    pub(crate) fn require_owner(&self,owner:&Arc<Owner>)->Result<()> {self.check_owner(owner)}
     fn check_owner(&self,owner:&Arc<Owner>)->Result<()> {
         ensure!(self.owner.upgrade().is_some_and(|bound|Arc::ptr_eq(&bound,owner)),"worker asset owner changed");
         ensure!(owner.epoch().is_some_and(|epoch|epoch.id()==&self.epoch&&epoch.catalog().nonce()==&self.catalog),"worker asset epoch/catalog changed");
@@ -107,6 +112,46 @@ impl Grant {
         })?;
         self.check_owner(&owner)?;Ok(CoverHold {grant:self.clone(),release,_revision:revision,mime:cover.mime.into(),name,spool})
     }
+    fn poster_request(&self,path:&str)->Result<AssetRequest> {
+        ensure!(path.len()<=16384,"native artwork path exceeds admission");
+        let name=crate::media::details::kept_image_name(path).context("invalid native artwork filename")?;
+        super::cache_assets::filename(&name)?;
+        Ok(AssetRequest {kind:AssetKind::Posters,name,digest:None,bytes:None,content_type:"image/jpeg"})
+    }
+    pub(crate) fn poster_available(&self,kind:i64,id:i64,path:&str)->Result<ArtworkStatus> {
+        let owner=self.owner()?;let request=self.poster_request(path)?;
+        let association=owner.with(|client| {
+            let mut tx=client.build_transaction().isolation_level(postgres::IsolationLevel::RepeatableRead).read_only(true).start()?;
+            let same=tx.query_opt("select poster is not distinct from $3::text from ext_media_details where kind=$1 and tmdb_id=$2",&[&kind,&id,&path])?.map(|row|row.try_get::<_,bool>(0)).transpose()?.unwrap_or(false);
+            if !same {return Ok(None)}
+            let receipt=super::fresh_assets::receipt_in(&mut tx,&request)?;tx.commit()?;Ok(Some(receipt))
+        })?;
+        let Some(receipt)=association else{return Ok(ArtworkStatus::Changed)};
+        let expected=self.manifest.has_entry(&request)?||receipt.is_some();
+        let result=self.manifest.read_associated(&request,&self.art_pool,owner.epoch().context("artwork owner epoch missing")?.catalog(),receipt.as_ref())?;
+        owner.with(|_|Ok(()))?;
+        Ok(if result.is_some(){ArtworkStatus::Kept}else if expected{ArtworkStatus::Unavailable}else{ArtworkStatus::Missing})
+    }
+    /// Called with actual bounded bytes returned by the configured image client.
+    /// The current metadata path is checked before I/O and before its receipt.
+    pub(crate) fn produce_poster(&self,kind:i64,id:i64,path:&str,bytes:&[u8])->Result<ArtworkStatus> {
+        let owner=self.owner()?;let request=self.poster_request(path)?;
+        let same=owner.with(|client|Ok(client.query_opt("select poster is not distinct from $3::text from ext_media_details where kind=$1 and tmdb_id=$2",&[&kind,&id,&path])?.map(|row|row.try_get::<_,bool>(0)).transpose()?.unwrap_or(false)))?;
+        if !same {return Ok(ArtworkStatus::Changed)}
+        let digest=self.manifest.store_poster(&request.name,bytes)?;
+        let checked=AssetRequest {digest:Some(digest),bytes:Some(bytes.len() as u64),..request};
+        let _verified=self.manifest.read_recorded(&checked,&self.art_pool)?.context("native produced poster disappeared")?;
+        let source=self.manifest.native_source(AssetKind::Posters,owner.epoch().context("artwork owner epoch missing")?.catalog())?;
+        let stored=owner.with(|client| {
+            let mut tx=client.transaction()?;super::history_gate::native(&mut tx)?;
+            let same=tx.query_opt("select poster is not distinct from $3::text from ext_media_details where kind=$1 and tmdb_id=$2 for update",&[&kind,&id,&path])?.map(|row|row.try_get::<_,bool>(0)).transpose()?.unwrap_or(false);
+            if !same {return Ok(false)}
+            let rows=tx.execute("insert into ext_asset_files as old(kind,name,byte_length,digest,source_digest) values('posters',$1,$2,$3,$4) on conflict(kind,name) do update set name=excluded.name where old.byte_length=excluded.byte_length and old.digest=excluded.digest and old.source_digest=excluded.source_digest",&[&checked.name,&(bytes.len() as i64),&digest.as_slice(),&source.as_slice()])?;
+            ensure!(rows==1,"native artwork descriptor conflicts with preserved original");tx.commit()?;Ok(true)
+        })?;
+        Ok(if stored{ArtworkStatus::Kept}else{ArtworkStatus::Changed})
+    }
+
 }
 thread_local! {static CURRENT:RefCell<Option<(Weak<Owner>,Option<Arc<Grant>>)>>=const{RefCell::new(None)};}
 pub(crate) struct Scope {previous:Option<(Weak<Owner>,Option<Arc<Grant>>)>,_thread:PhantomData<Rc<()>>}

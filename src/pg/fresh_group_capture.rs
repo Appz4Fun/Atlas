@@ -16,6 +16,12 @@ pub(crate) fn store(owner:&Arc<Owner>,capture:Capture)->Result<i64> {
         tx.batch_execute("set local statement_timeout='60s';set local lock_timeout='5s'")?;
         let scope=if capture.pattern().is_some(){"pattern"}else{"full"};let key=scope_key(capture.pattern());
         let input=i64::try_from(capture.input_rows())?;let accepted=i64::try_from(capture.rows().len())?;
+        ensure!(input<=2_000_000&&accepted<=input,"LIST retained extent exceeds admission");
+        let previous=tx.query_opt("select h.capture_id,c.accepted_rows from native_group_capture_current h join native_group_captures c
+            on(c.id,c.provider_binding,c.scope,c.pattern_key)=(h.capture_id,h.provider_binding,h.scope,h.pattern_key)
+            where h.provider_binding=$1 and h.scope=$2 and h.pattern_key=$3 for update of h",
+            &[&&capture.provider_binding()[..],&scope,&&key[..]])?.map(|row|Ok::<_,postgres::Error>((row.try_get::<_,i64>(0)?,row.try_get::<_,i64>(1)?))).transpose()?;
+        ensure!(previous.is_none_or(|(_,rows)|(0..=2_000_000).contains(&rows)),"prior LIST retained extent exceeds admission");
         let id:i64=tx.query_one("insert into native_group_captures(provider_binding,scope,requested_pattern,pattern_key,captured_at,input_rows,accepted_rows,source_digest)
             values($1,$2,$3,$4,$5,$6,$7,$8) returning id",
             &[&&capture.provider_binding()[..],&scope,&capture.pattern(),&&key[..],&capture.captured_at(),&input,&accepted,&&capture.source_digest()[..]])?.try_get(0)?;
@@ -32,6 +38,10 @@ pub(crate) fn store(owner:&Arc<Owner>,capture:Capture)->Result<i64> {
         tx.execute("insert into native_group_capture_current(provider_binding,scope,pattern_key,capture_id) values($1,$2,$3,$4)
             on conflict(provider_binding,scope,pattern_key) do update set capture_id=excluded.capture_id",
             &[&&capture.provider_binding()[..],&scope,&&key[..],&id])?;
+        // Exact prior account/scope only; its indexed cascade streams server-
+        // side under the existing statement deadline. Rollback retains both
+        // prior data and head. No old capture is materialized in this process.
+        if let Some((previous,_))=previous {tx.execute("delete from native_group_captures where id=$1",&[&previous])?;}
         if owner.stop.load(Ordering::Acquire){return Err(super::outage::AttemptEnded.into());}
         tx.commit()?;Ok(id)
     })

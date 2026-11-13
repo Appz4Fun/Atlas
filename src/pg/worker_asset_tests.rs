@@ -1,5 +1,6 @@
 //! Source-first worker asset controls; execute only under the isolated PG/resource harness.
 use super::*;
+use sha2::{Digest,Sha256};
 use std::io::Read;
 
 fn selected(bytes:&[u8])->(tempfile::TempDir,tempfile::TempDir,crate::config::NativeAssetsConfig,String) {
@@ -117,4 +118,26 @@ fn worker_cover_producer_requires_real_source_and_never_overwrites_conflicting_b
     assert!(grant.produce_cover(id,&cover).is_err());
     assert_eq!(std::fs::read(root.path().join("covers").join(&sha)).unwrap(),b"preserved conflicting original");
     runtime.owner.with(|client| {assert_eq!(client.query_one("select count(*) from ext_asset_files where name=$1",&[&sha])?.try_get::<_,i64>(0)?,0);Ok(())}).unwrap();
+}
+
+#[test]
+fn native_generated_poster_is_available_through_same_pg_bound_manifest_family() {
+    let schema=crate::pg::testing::Schema::new().expect("explicit isolated PG required");let runtime=crate::pg::stage_queue_tests::runtime(&schema);
+    let (_root,_evidence,selection,_)=selected(&jpeg());let grant=Grant::open(&runtime.owner,Some(&selection)).unwrap().unwrap();
+    let metadata=crate::media::details::Details {kind:2,tmdb_id:42,poster:Some("/native-poster.jpg".into()),fetched_at:1,..Default::default()};
+    runtime.owner.with(|client|crate::pg::service_cache::details::put_in(client,&metadata)).unwrap();
+    assert_eq!(grant.poster_available(2,42,"/native-poster.jpg").unwrap(),ArtworkStatus::Missing);
+    assert_eq!(grant.produce_poster(2,42,"/native-poster.jpg",&jpeg()).unwrap(),ArtworkStatus::Kept);
+    assert_eq!(grant.poster_available(2,42,"/native-poster.jpg").unwrap(),ArtworkStatus::Kept);
+    assert_eq!(grant.poster_available(2,42,"/wrong.jpg").unwrap(),ArtworkStatus::Changed);
+    // A genuine writer receipt whose file later disappeared is unavailable,
+    // not a fresh absence authorizing a periodic provider replacement.
+
+    let manifest=crate::pg::fresh_assets::AssetManifest::from_selection(&selection).unwrap();let storage=runtime.owner.cache_destination().unwrap().storage.clone();let mut client=schema.pool.get().unwrap();
+    let view=crate::pg::fresh_reader::ReadView::open(&mut client,&storage.schema,crate::pg::fresh_reader::Budget::default(),std::time::Instant::now()+std::time::Duration::from_secs(10)).unwrap();
+    let request=view.asset_request("/ui/poster",&std::collections::HashMap::from([("kind".into(),"2".into()),("tmdb".into(),"42".into())])).unwrap().unwrap();
+    let scratch=tempfile::tempdir().unwrap();let pool=crate::nzb_spool::Pool::new(scratch.path().into(),crate::nzb_spool::Limits {requests:1,per_request_bytes:8<<20,total_bytes:8<<20,free_bytes:0}).unwrap();
+    let mut body=view.read_asset(&manifest,&request,&pool).unwrap().unwrap();let mut bytes=Vec::new();body.read_to_end(&mut bytes).unwrap();assert_eq!(bytes,jpeg());
+    std::fs::remove_file(_root.path().join("posters").join("native-poster.jpg")).unwrap();
+    assert_eq!(grant.poster_available(2,42,"/native-poster.jpg").unwrap(),ArtworkStatus::Unavailable);
 }

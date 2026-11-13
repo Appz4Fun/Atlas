@@ -8,6 +8,8 @@ use std::sync::{Arc,LazyLock};
 
 // A completed inventory remains charged until it is consumed or dropped.
 // Sharing this slot across pools bounds retained capture memory process-wide.
+pub(crate) const REFRESH_TTL:Duration=Duration::from_secs(600);
+
 static ADMISSION:LazyLock<Arc<tokio::sync::Semaphore>>=LazyLock::new(||Arc::new(tokio::sync::Semaphore::new(1)));
 
 #[derive(Clone,Copy)]
@@ -17,7 +19,7 @@ impl Default for Limits {
 }
 impl Limits {
     fn check(self)->Result<()> {
-        if !(1..=2_000_000).contains(&self.rows)||!(1..=512*1024*1024).contains(&self.bytes)||!(1..=4096).contains(&self.line_bytes)
+        if !(1..=2_000_000).contains(&self.rows)||!(64*1024..=512*1024*1024).contains(&self.bytes)||!(1..=4096).contains(&self.line_bytes)
             ||self.deadline.is_zero()||self.deadline>Duration::from_secs(300) {return Err(invalid("invalid LIST capture admission"));}Ok(())
     }
 }
@@ -65,10 +67,21 @@ impl Pool {
     /// Explicit capture only. GET readers never call this method. It borrows
     /// the existing provider permit and preserves its connection lifecycle.
     pub(crate) async fn capture_active_groups(&self,pattern:Option<&str>,limits:Limits)->Result<Capture> {
+        self.capture_groups_on(self.active_index(),pattern,limits).await
+    }
+    pub(crate) fn capture_index_bindings(&self)->Result<Vec<(usize,[u8;32])>> {
+        if self.servers.len()>256 {return Err(invalid("LIST provider inventory exceeds admission"));}
+        self.servers.iter().enumerate().filter(|(_,server)|server.cfg.indexes()).map(|(index,server)|Ok((index,provider_binding(&server.cfg)?))).collect()
+    }
+    /// The selected account is explicit; no global active-provider switch or
+    /// independent connection pool participates in background refresh.
+    pub(crate) async fn capture_groups_on(&self,index:usize,pattern:Option<&str>,limits:Limits)->Result<Capture> {
         limits.check()?;check_pattern(pattern)?;
+        if pattern.is_some()&&limits.bytes<64*1024+4*1024*1024 {return Err(invalid("LIST matcher exceeds ownership admission"));}
+        if index>=self.servers.len() {return Err(invalid("LIST provider index is unavailable"));}
         let pending=async {
             let admission=ADMISSION.clone().acquire_owned().await.map_err(|_|invalid("LIST capture admission closed"))?;
-            let mut lease=self.lease_for_with_status_bound(self.active_index(),None,false,Some(512)).await?;
+            let mut lease=self.lease_for_with_status_bound(index,None,false,Some(512)).await?;
             let binding=provider_binding(&lease.server.cfg)?;
             let result=lease.begin().capture_active_groups_in(binding,pattern,limits,admission).await;
             lease.check(result)
@@ -80,6 +93,11 @@ impl Pool {
 }
 impl Conn {
     async fn capture_active_groups_in(&mut self,provider:[u8;32],pattern:Option<&str>,limits:Limits,admission:tokio::sync::OwnedSemaphorePermit)->Result<Capture> {
+        // Reserve connection/COPY scratch plus bounded regex state before
+        // parsing names. Per-row charge also covers old+new Vec allocations
+        // during growth, String ownership and allocator metadata.
+        let mut owned=64*1024u64+if pattern.is_some(){4*1024*1024}else{0};
+        if owned>limits.bytes {return Err(invalid("LIST scratch exceeds ownership admission"));}
         let argument=pattern.map_or_else(||"ACTIVE".into(),|pattern|format!("ACTIVE {pattern}"));
         let(code,message)=self.command("LIST",Some(&argument)).await?;
         let(pattern,message)=if code!=215&&pattern.is_some() {
@@ -93,10 +111,10 @@ impl Conn {
             .map_err(|_|invalid("LIST capture clock overflow"))?;
         // Same literal * / ? semantics as legacy wildmatch, without retaining
         // arbitrary request patterns in that helper's process-global cache.
-        let matcher=pattern.map(|pattern|regex::Regex::new(&format!("^(?is:{})$",regex::escape(pattern).replace(r"\*",".*").replace(r"\?","."))))
+        let matcher=pattern.map(|pattern|regex::RegexBuilder::new(&format!("^(?is:{})$",regex::escape(pattern).replace(r"\*",".*").replace(r"\?","."))).size_limit(1<<20).dfa_size_limit(1<<20).build())
             .transpose().map_err(|_|invalid("LIST capture pattern exceeds matcher admission"))?;
         let mut digest=Sha256::new();digest.update(b"atlas.native.group.list.v1\0");digest.update(provider);digest.update(scope_key(pattern));
-        digest.update(captured_at.to_le_bytes());let wire=self.wire;let mut input_rows=0u64;let mut owned=0u64;let mut rows=Vec::new();
+        digest.update(captured_at.to_le_bytes());let wire=self.wire;let mut input_rows=0u64;let mut rows=Vec::new();
         loop {
             let Some(mut line)=self.read_line_capped(limits.line_bytes).await? else{return Err(invalid("LIST line exceeds capture admission"));};
             if line.len()>limits.line_bytes||self.wire.checked_sub(wire).is_none_or(|bytes|bytes>limits.bytes) {return Err(invalid("LIST input exceeds capture admission"));}
@@ -105,13 +123,13 @@ impl Conn {
             input_rows=input_rows.checked_add(1).ok_or_else(||invalid("LIST row count overflow"))?;
             if input_rows>limits.rows {return Err(invalid("LIST row count exceeds capture admission"));}
             field(&mut digest,&line);
-            let text=String::from_utf8_lossy(&line);let mut parts=text.split_whitespace();
+            let text=std::str::from_utf8(&line).map_err(|_|invalid("LIST group line is not UTF-8"))?;let mut parts=text.split_whitespace();
             let(Some(name),Some(high),Some(low))=(parts.next(),parts.next(),parts.next())else{continue;};
             let(Ok(high),Ok(low))=(high.parse::<i64>(),low.parse::<i64>())else{continue;};
             if i128::from(high)-i128::from(low)<=0 {continue;}
             if matcher.as_ref().is_some_and(|matcher|!matcher.is_match(name)) {continue;}
             if name.len()>512||name.chars().any(char::is_control) {return Err(invalid("LIST group name exceeds capture admission"));}
-            owned=owned.checked_add(name.len() as u64*2+128).ok_or_else(||invalid("LIST ownership overflow"))?;
+            owned=owned.checked_add(name.len() as u64*2+256).ok_or_else(||invalid("LIST ownership overflow"))?;
             if owned>limits.bytes {return Err(invalid("LIST ownership exceeds capture admission"));}
             rows.push(Row {ordinal:i64::try_from(input_rows).map_err(|_|invalid("LIST ordinal overflow"))?,name:name.into(),high,low});
         }
@@ -123,6 +141,28 @@ impl Conn {
 mod tests {
     use super::*;
     use tokio::io::{AsyncBufReadExt,AsyncWriteExt,BufReader};
+
+    #[test]
+    #[ignore="requires explicit owned loopback aggregate LIST ownership admission"]
+    fn short_list_rows_admit_aggregate_owned_shape_before_retention_and_release_the_permit() {
+        super::super::Runtime::new().unwrap().block_on(async {
+            let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let address=listener.local_addr().unwrap();
+            let mut cfg=crate::config::UsenetServer::new("127.0.0.1","","",address.port());cfg.ssl=Some(false);cfg.compress=Some(false);cfg.connections=Some(1);
+            let body="alt.binaries.short 40 10 y\r\n".repeat(256)+".\r\n";assert!(body.len()<8192);
+            let task=tokio::spawn(async move {
+                for _ in 0..2 {
+                    let(socket,_)=listener.accept().await.unwrap();let mut socket=BufReader::new(socket);
+                    socket.get_mut().write_all(b"200 fixture\r\n").await.unwrap();let mut line=String::new();socket.read_line(&mut line).await.unwrap();assert_eq!(line,"LIST ACTIVE\r\n");
+                    let _=socket.get_mut().write_all(format!("215 follows\r\n{body}").as_bytes()).await;
+                }
+            });
+            let pool=super::super::Pool::new(std::slice::from_ref(&cfg));
+            let rejected=pool.capture_active_groups(None,Limits {rows:1024,bytes:96*1024,deadline:Duration::from_secs(2),..Limits::default()}).await;
+            assert!(matches!(rejected,Err(NntpError::Protocol(_))),"small wire input can still exceed aggregate retained Row/String/Vec ownership");
+            let admitted=pool.capture_active_groups(None,Limits {deadline:Duration::from_secs(2),..Limits::default()}).await.unwrap();
+            assert_eq!(admitted.input_rows(),256);assert_eq!(admitted.rows().len(),256);task.await.unwrap();
+        });
+    }
 
     async fn provider(body:&'static [u8],fallback:bool)->(crate::config::UsenetServer,tokio::task::JoinHandle<Vec<String>>) {
         let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -206,6 +246,7 @@ mod tests {
     fn incomplete_or_over_admission_list_cannot_become_a_completed_capture() {
         super::super::Runtime::new().unwrap().block_on(async {
             for (body,limit) in [(b"alt.binaries.films 30 10 y\r\n".as_slice(),Limits::default()),
+                (b"alt.binaries.\xff 30 10 y\r\n.\r\n".as_slice(),Limits::default()),
                 (b"alt.binaries.films 30 10 y\r\nalt.binaries.other 20 10 y\r\n.\r\n".as_slice(),Limits {rows:1,..Limits::default()}),
                 (b"alt.binaries.films 30 10 y\r\n.\r\n".as_slice(),Limits {line_bytes:16,..Limits::default()})] {
                 let(cfg,task)=provider(body,false).await;let pool=super::super::Pool::new(std::slice::from_ref(&cfg));

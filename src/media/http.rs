@@ -251,6 +251,23 @@ impl Client {
         page
     }
 
+    /// Checked, paced image bytes. Unlike JSON responses these are committed
+    /// by the caller's genuine asset writer, never coerced into a text cache.
+    pub(crate) fn get_image(&self,url:&str)->Result<Option<Vec<u8>>,Trouble> {
+        use std::io::Read;
+        const MAX:u64=8<<20;
+        self.backend.check().map_err(Trouble::Cache)?;self.ready()?;self.backend.check().map_err(Trouble::Cache)?;
+        let span=crate::metrics::span("media.request");let sent=self.agent.get(url).call();let outage=is_outage(&sent);
+        let image=self.answered(sent,|response| {
+            let mut bytes=Vec::new();response.body_mut().as_reader().take(MAX+1).read_to_end(&mut bytes)
+                .map_err(|_|Trouble::Bad("media artwork body could not be read".into()))?;
+            if bytes.len() as u64>MAX {return Err(Trouble::Bad("media artwork exceeds byte admission".into()))}
+            Ok(bytes)
+        });
+        let counted=match &image {Ok(Some(_))=>Ok(Reply::Json(Value::Null)),Ok(None)=>Ok(Reply::NotFound),Err(error)=>Err(error.clone())};
+        let _=self.counted(&span,outage,counted);self.backend.check().map_err(Trouble::Cache)?;image
+    }
+
     pub(crate) fn cached(&self,source:&str,url:&str)->Result<Option<(u16,String)>,Trouble> {self.backend.get(source,url).map_err(Trouble::Cache)}
     pub(crate) fn keep(&self,source:&str,url:&str,status:u16,body:&str)->Result<(),Trouble> {self.backend.put(source,url,status,body).map_err(Trouble::Cache)}
 
