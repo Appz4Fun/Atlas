@@ -3091,6 +3091,21 @@ mod tests {
 
     use super::*;
 
+    fn presentation_get(path: &str, query: &str, cookies: Option<&str>, base: &str, key: &str) -> Option<ApiResponse> {
+        super::get_with_storage(path, query, cookies, base, key, &crate::pg::StorageConfig::default())
+    }
+    fn presentation_post(
+        path: &str,
+        body: &str,
+        cookies: Option<&str>,
+        htmx: bool,
+        csrf: Option<&str>,
+        base: &str,
+        key: &str,
+    ) -> Option<ApiResponse> {
+        super::post_with_storage(path, body, cookies, htmx, csrf, base, key, &crate::pg::StorageConfig::default())
+    }
+
     const KEY: &str = "secret-key";
 
     fn cookie() -> String {
@@ -3103,36 +3118,37 @@ mod tests {
 
     #[test]
     fn signing_in_takes_the_key_and_the_cookie_is_not_the_key() {
-        let wrong = post("/login", "key=nope", None, false, None, "http://x", KEY).unwrap();
+        let wrong = presentation_post("/login", "key=nope", None, false, None, "http://x", KEY).unwrap();
         assert_eq!(wrong.status, 401);
         assert!(header(&wrong, "Set-Cookie").is_none());
         assert!(wrong.body.contains("not the API key"));
 
-        let right = post("/login", &format!("key={KEY}"), None, false, None, "http://x", KEY).unwrap();
+        let right = presentation_post("/login", &format!("key={KEY}"), None, false, None, "http://x", KEY).unwrap();
         assert_eq!(right.status, 303);
         assert_eq!(header(&right, "Location"), Some("/"));
         let set = header(&right, "Set-Cookie").unwrap();
         assert!(set.contains("HttpOnly") && set.contains("SameSite=Strict"), "{set}");
         assert!(!set.contains(KEY), "{set}");
 
-        let out = post("/logout", "", None, false, None, "http://x", KEY).unwrap();
+        let out = presentation_post("/logout", "", None, false, None, "http://x", KEY).unwrap();
         assert!(header(&out, "Set-Cookie").unwrap().contains("Max-Age=0"));
-        assert!(post("/api", "", None, false, None, "http://x", KEY).is_none());
+        assert!(presentation_post("/api", "", None, false, None, "http://x", KEY).is_none());
     }
 
     #[test]
     fn the_settings_pages_need_signing_in_and_a_csrf_token() {
         let base = "http://127.0.0.1:9090";
-        let page = get("/ui/settings", "", Some(&cookie()), base, KEY).unwrap();
+        let page = presentation_get("/ui/settings", "", Some(&cookie()), base, KEY).unwrap();
         assert_eq!(page.status, 200);
         for want in ["id=\"servers\"", "id=\"indexing\"", "id=\"api\"", "id=\"gemini\"", "name=\"_csrf\""] {
             assert!(page.body.contains(want), "missing {want:?} in {}", page.body);
         }
         for path in ["/ui/settings", "/ui/settings/groups/search"] {
-            assert_ne!(get(path, "", None, base, KEY).unwrap().status, 200, "{path} needs signing in");
+            assert_ne!(presentation_get(path, "", None, base, KEY).unwrap().status, 200, "{path} needs signing in");
         }
         assert!(crate::web_settings::takes_post("/ui/settings/servers"));
-        let forged = post("/ui/settings/servers", "host=x", Some(&cookie()), false, None, base, KEY).unwrap();
+        let forged =
+            presentation_post("/ui/settings/servers", "host=x", Some(&cookie()), false, None, base, KEY).unwrap();
         assert_ne!(forged.status, 200, "{}", forged.body);
     }
 
@@ -3213,17 +3229,25 @@ mod tests {
     fn only_the_right_cookie_gets_in() {
         for bad in [None, Some("atlas_session=nope"), Some("x=1"), Some("atlas_session"), Some(KEY)] {
             assert!(!signed_in(bad, KEY), "{bad:?}");
-            let results = get("/ui/results", "", bad, "http://x", KEY).unwrap();
+            let results = presentation_get("/ui/results", "", bad, "http://x", KEY).unwrap();
             assert_eq!(results.status, 401, "{bad:?}");
             assert_eq!(header(&results, "HX-Redirect"), Some("/"));
-            assert_eq!(get("/ui/details", "id=1", bad, "http://x", KEY).unwrap().status, 401, "{bad:?}");
-            assert_eq!(get("/ui/poster", "kind=2&tmdb=1", bad, "http://x", KEY).unwrap().status, 401, "{bad:?}");
-            assert_eq!(get("/ui/still", "id=1&at=50", bad, "http://x", KEY).unwrap().status, 401, "{bad:?}");
-            assert_eq!(get("/ui/samefilm", "id=1", bad, "http://x", KEY).unwrap().status, 401, "{bad:?}");
-            let nzb = get("/ui/nzb", "id=1", bad, "http://x", KEY).unwrap();
+            assert_eq!(presentation_get("/ui/details", "id=1", bad, "http://x", KEY).unwrap().status, 401, "{bad:?}");
+            assert_eq!(
+                presentation_get("/ui/poster", "kind=2&tmdb=1", bad, "http://x", KEY).unwrap().status,
+                401,
+                "{bad:?}"
+            );
+            assert_eq!(
+                presentation_get("/ui/still", "id=1&at=50", bad, "http://x", KEY).unwrap().status,
+                401,
+                "{bad:?}"
+            );
+            assert_eq!(presentation_get("/ui/samefilm", "id=1", bad, "http://x", KEY).unwrap().status, 401, "{bad:?}");
+            let nzb = presentation_get("/ui/nzb", "id=1", bad, "http://x", KEY).unwrap();
             assert_eq!(nzb.status, 303, "{bad:?}");
-            assert_eq!(get("/ui/release", "id=1", bad, "http://x", KEY).unwrap().status, 303, "{bad:?}");
-            let root = get("/", "", bad, "http://x", KEY).unwrap();
+            assert_eq!(presentation_get("/ui/release", "id=1", bad, "http://x", KEY).unwrap().status, 303, "{bad:?}");
+            let root = presentation_get("/", "", bad, "http://x", KEY).unwrap();
             assert!(root.body.contains("action=\"/login\""), "{bad:?}");
         }
         assert!(signed_in(Some(&cookie()), KEY));
@@ -3232,7 +3256,7 @@ mod tests {
 
     #[test]
     fn the_sign_in_page_says_how_to_set_up_a_client_without_the_key() {
-        let root = get("/", "", None, "http://192.168.1.172:9091", KEY).unwrap();
+        let root = presentation_get("/", "", None, "http://192.168.1.172:9091", KEY).unwrap();
         assert_eq!(root.status, 200);
         assert!(root.body.contains("http://192.168.1.172:9091/api?t=caps"));
         assert!(!root.body.contains(KEY));
@@ -3240,21 +3264,21 @@ mod tests {
 
     #[test]
     fn a_hostile_host_header_is_escaped() {
-        let root = get("/", "", None, "http://<script>alert(1)</script>", KEY).unwrap();
+        let root = presentation_get("/", "", None, "http://<script>alert(1)</script>", KEY).unwrap();
         assert!(!root.body.contains("<script>alert"), "{}", root.body);
     }
 
     #[test]
     fn htmx_and_css_are_served_without_signing_in() {
-        let js = get("/static/htmx.min.js", "", None, "http://x", KEY).unwrap();
+        let js = presentation_get("/static/htmx.min.js", "", None, "http://x", KEY).unwrap();
         assert_eq!(js.status, 200);
         assert!(js.body.contains("htmx"));
         assert!(js.content_type.unwrap().starts_with("text/javascript"));
-        assert_eq!(get("/static/atlas.css", "", None, "http://x", KEY).unwrap().status, 200);
-        assert_eq!(get("/static/atlas.js", "", None, "http://x", KEY).unwrap().status, 200);
-        assert_eq!(get("/static/atlas.svg", "", None, "http://x", KEY).unwrap().status, 200);
-        assert!(get("/static/nope", "", None, "http://x", KEY).is_none());
-        assert!(get("/api", "t=caps", None, "http://x", KEY).is_none());
+        assert_eq!(presentation_get("/static/atlas.css", "", None, "http://x", KEY).unwrap().status, 200);
+        assert_eq!(presentation_get("/static/atlas.js", "", None, "http://x", KEY).unwrap().status, 200);
+        assert_eq!(presentation_get("/static/atlas.svg", "", None, "http://x", KEY).unwrap().status, 200);
+        assert!(presentation_get("/static/nope", "", None, "http://x", KEY).is_none());
+        assert!(presentation_get("/api", "t=caps", None, "http://x", KEY).is_none());
     }
 
     #[test]
@@ -3826,8 +3850,9 @@ mod tests {
 
     #[test]
     fn every_page_has_the_persistent_build_footer() {
-        let sign_in = get("/", "", None, "http://127.0.0.1:9090", KEY).unwrap().body;
-        let settings = get("/ui/settings", "", Some(&cookie()), "http://127.0.0.1:9090", KEY).unwrap().body;
+        let sign_in = presentation_get("/", "", None, "http://127.0.0.1:9090", KEY).unwrap().body;
+        let settings =
+            presentation_get("/ui/settings", "", Some(&cookie()), "http://127.0.0.1:9090", KEY).unwrap().body;
         for html in [&sign_in, &settings] {
             assert!(html.contains("class=\"site-footer\""), "{html}");
             assert!(html.contains("Atlas - Rust Edition."), "{html}");
