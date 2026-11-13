@@ -13,8 +13,8 @@ pub(crate) fn runtime(schema:&super::testing::Schema)->super::indexer_runtime::R
 pub(crate) fn push(runtime:&super::indexer_runtime::Runtime) {
     // These lease tests use a fixed clock of 10. The genuine writer's settle
     // delay still applies; place the input early enough without global resets.
-    let settle=crate::store::SETTLE_SECS.load(std::sync::atomic::Ordering::Relaxed)
-        .max(crate::store::COMPLETE_SETTLE_SECS.load(std::sync::atomic::Ordering::Relaxed)).max(1);
+    let settle=crate::catalog_facts::SETTLE_SECS.load(std::sync::atomic::Ordering::Relaxed)
+        .max(crate::catalog_facts::COMPLETE_SETTLE_SECS.load(std::sync::atomic::Ordering::Relaxed)).max(1);
     let posted_at=1i64.saturating_sub(settle);
     runtime.owner.with(|client|super::release_writer::save(client,&[crate::parser::Release {name:"Example.Release".into(),group:"example.group".into(),articles:vec![crate::parser::Article {filename:Some("sample.bin".into()),message_id:"<part@example.test>".into(),part:Some(1),total_parts:Some(1),bytes:1,..Default::default()}],..Default::default()}],posted_at).map(|_|())).unwrap();
 }
@@ -57,8 +57,8 @@ fn native_pc_junk_refuses_a_real_video_and_preserves_the_row() {
 fn native_database_claim_turns_preserve_latest_three_and_oldest_one_fairness() {
     let Some(schema)=super::testing::Schema::new() else {return};let runtime=runtime(&schema);
     let oldest_first=runtime.owner.with(|client| {
-        let settle=crate::store::SETTLE_SECS.load(std::sync::atomic::Ordering::Relaxed)
-            .max(crate::store::COMPLETE_SETTLE_SECS.load(std::sync::atomic::Ordering::Relaxed)).max(1);
+        let settle=crate::catalog_facts::SETTLE_SECS.load(std::sync::atomic::Ordering::Relaxed)
+            .max(crate::catalog_facts::COMPLETE_SETTLE_SECS.load(std::sync::atomic::Ordering::Relaxed)).max(1);
         for n in 0..5 {
             super::release_writer::save(client,&[crate::parser::Release {name:format!("Fairness.Example.{n}"),group:"example.group".into(),articles:vec![crate::parser::Article {filename:Some("sample.bin".into()),message_id:format!("<fairness-{n}@example.test>"),part:Some(1),total_parts:Some(1),bytes:1,..Default::default()}],..Default::default()}],(-10i64).saturating_sub(settle)+n)?;
         }

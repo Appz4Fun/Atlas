@@ -7,7 +7,7 @@ use postgres::fallible_iterator::FallibleIterator;
 use postgres::{Client, IsolationLevel};
 
 use crate::search::{ArticleRow, ReleaseRow};
-use crate::store::{FileInfo, SegmentRef};
+use crate::catalog_facts::{FileInfo, SegmentRef};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Inventory {

@@ -55,7 +55,7 @@ pub(crate) fn read(client:&mut impl GenericClient,release:i64,stop:&AtomicBool)-
                 for part in parts {
                     let part:i64=part.try_get(0)?;
                     ensure!((0..=crate::parser::MAX_PARTS).contains(&part),"native part bitmap contains an unsupported part");
-                    crate::store::insert_part(&mut seen,part);part_after=Some(part);
+                    crate::catalog_facts::insert_part(&mut seen,part);part_after=Some(part);
                 }
             }
             crate::raw_store::hash_file_fields_into(&mut hash,std::str::from_utf8(&filename)?,std::str::from_utf8(&first)?,row.try_get(3)?,&seen);

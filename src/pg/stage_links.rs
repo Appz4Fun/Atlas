@@ -67,7 +67,7 @@ fn key(lookup:&Lookup,kind:Kind)->Option<(&'static str,&'static str,i64)> {
     };value.map(|n|("release_keys",column,n))
 }
 fn donors(tx:&mut postgres::Transaction<'_>,own:i64,lookup:&Lookup,kind:Kind,stills:bool,deadline:Instant,stop:&std::sync::atomic::AtomicBool)->Result<Vec<i64>> {
-    let mut after:Option<i64>=None;let mut found=Vec::new();let mut buckets=[0u8;crate::store::SHARDS];let mut scanned=0usize;
+    let mut after:Option<i64>=None;let mut found=Vec::new();let mut buckets=[0u8;crate::catalog_facts::SHARDS];let mut scanned=0usize;
     // Preserve the original 16 candidates per group bucket for still reuse.
     // The bucket is not a PostgreSQL ID encoding or a physical SQLite shard.
     loop {
@@ -98,7 +98,7 @@ fn donors(tx:&mut postgres::Transaction<'_>,own:i64,lookup:&Lookup,kind:Kind,sti
             scanned+=1;let id:i64=row.try_get(0)?;after=Some(id);let group:String=row.try_get(1)?;
             if crate::filters::group_blocked(&group) {continue;}
             if !stills {return Ok(vec![id]);}
-            let bucket=crate::store::shard_of(&group);
+            let bucket=crate::catalog_facts::shard_of(&group);
             if buckets[bucket]<16 {buckets[bucket]+=1;found.push(id);}
         }
         if last || buckets.iter().all(|n|*n==16) {return Ok(found);}
