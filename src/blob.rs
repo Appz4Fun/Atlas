@@ -123,10 +123,10 @@ pub fn remap_blob(blob: &[u8], base: i64, map: &std::collections::HashMap<i64, i
     Ok(encode(&segs))
 }
 
-/// The blob itself, fetched when what's stored is its place in the sealed log.
+/// Inline historical bytes only. Resolving a remote locator requires an explicitly admitted consumer.
 fn resolved(blob: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>> {
     match sealed_log::Locator::from_ref(blob) {
-        Some(at) => crate::sealed_store::fetch(at).map(std::borrow::Cow::Owned),
+        Some(_) => Err(Error::new(ErrorKind::Unsupported, "remote sealed blob requires explicit resolution")),
         None => Ok(std::borrow::Cow::Borrowed(blob)),
     }
 }
@@ -283,6 +283,22 @@ mod tests {
     #[test]
     fn garbage_is_an_error() {
         assert!(decode(b"not zstd").is_err());
+    }
+
+    #[test]
+    fn remote_references_require_explicit_resolution_without_io_or_allocation() {
+        let mut place = sealed_log::REF_TAG.to_vec();
+        place.resize(sealed_log::REF_BYTES, 7);
+        assert!(sealed_log::Locator::from_ref(&place).is_some());
+        for reference in [place.clone(), shifted(&place, i64::MIN)] {
+            assert!(is_remote(&reference));
+            assert_eq!(decode(&reference).unwrap_err().kind(), ErrorKind::Unsupported);
+            assert_eq!(decode_capped(&reference, 1).unwrap_err().kind(), ErrorKind::Unsupported);
+            assert_eq!(count(&reference).unwrap_err().kind(), ErrorKind::Unsupported);
+        }
+        // Corruption is still an error, rather than an attempted service fetch or an empty inventory.
+        assert!(decode(&place[..place.len() - 1]).is_err());
+        assert!(decode_capped(&place[..place.len() - 1], 1).is_err());
     }
 
     #[test]
