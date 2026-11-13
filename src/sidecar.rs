@@ -601,3 +601,7 @@ Format                                   : Matroska
         }
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "sidecar/native_tests.rs"]
+mod native_tests;
