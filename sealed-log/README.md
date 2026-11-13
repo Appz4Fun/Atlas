@@ -53,6 +53,4 @@ Older immutable records are CRC-checked when read; startup is not an archive-wid
 health scan. Empty values and valid historical SLG1/locator bytes remain readable.
 
 The synthetic TLS identities under `tests/fixtures` are PUBLIC test-only data.
-Never deploy their keys or CAs. The focused integrity and transport test sources
-have not been executed as part of this source-only change. Root owns lock refresh,
-compilation, isolated protocol tests, operational migration and deployment.
+Never deploy their keys or CAs. Use the dedicated integrity and TLS tests when qualifying a compatible release.
