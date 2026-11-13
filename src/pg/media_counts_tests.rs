@@ -36,7 +36,7 @@ fn native_media_counts_publish_complete_pages_and_preserve_literal_scheduler_pol
         release("alt.binaries.plain","Movie.1080p",0,4<<30),release("alt.binaries.display","Plain.Movie",0,4<<30),release("alt.binaries.overridden","Movie.2160p",0,4<<30)]);
     for n in 0..PAGE_ROWS {input.push(release("alt.binaries.filler","Plain.File",n,1));}
     runtime.owner.with(|client| {
-        assert_eq!(pg::release_writer::save(client,&input,1)?.releases,input.len());
+        assert_eq!(pg::release_writer::save(client,&input,1)?.releases,input.len() as u64);
         assert_eq!(pg::release_writer::save(client,&input,2)?.parts,0,"actual MID replay cannot inflate a release count");
         client.execute("update releases set display_name='Presented.REMUX' where group_name='alt.binaries.display'",&[])?;
         client.execute("update releases set display_name='Presented.Plain' where group_name='alt.binaries.overridden'",&[])?;
@@ -44,14 +44,18 @@ fn native_media_counts_publish_complete_pages_and_preserve_literal_scheduler_pol
     }).unwrap();
     let mut service=Service::new(&runtime.owner,runtime.db.clone(),&headers).unwrap();let clock=Instant::now();
     assert!(matches!(service.tick_at(clock).unwrap(),Tick::Progress));
-    runtime.owner.with(|client| {assert_eq!(observed(client),vec![("previous.completed".into(),99)]);Ok(())}).unwrap();
+    runtime.owner.with(|client| {assert_eq!(observed(client),vec![("previous.completed".into(),99)]);
+        pg::release_writer::save(client,&[release("alt.binaries.later","Movie.2160p",0,4<<30)],3)?;Ok(())}).unwrap();
     finish(&mut service,clock);
     runtime.owner.with(|client| {
         assert_eq!(observed(client),vec![("alt.binaries.display".into(),1),("alt.binaries.dv".into(),1),("alt.binaries.few".into(),19),("alt.binaries.remux".into(),22),("alt.binaries.uhd".into(),20)]);
         let sql=pg::sql::Pg::new(client);assert_eq!(crate::chunks::media_groups(&sql)?,vec!["alt.binaries.remux","alt.binaries.uhd"]);Ok(())
     }).unwrap();
     assert!(matches!(service.tick_at(clock+Duration::from_secs(86399)).unwrap(),Tick::Idle));
-    finish(&mut service,clock+Duration::from_secs(86400));
+    finish(&mut service,clock+Duration::from_secs(86401));
+    runtime.owner.with(|client| {
+        assert_eq!(observed(client),vec![("alt.binaries.display".into(),1),("alt.binaries.dv".into(),1),("alt.binaries.few".into(),19),("alt.binaries.later".into(),1),("alt.binaries.remux".into(),22),("alt.binaries.uhd".into(),20)]);Ok(())
+    }).unwrap();
     assert_eq!(runtime.owner.failure(),None);runtime.owner.close();
 }
 
@@ -88,4 +92,33 @@ fn native_media_count_empty_catalog_replaces_prior_tally_and_old_owner_cannot_pu
     let mut service=Service::new(&runtime.owner,runtime.db.clone(),&headers).unwrap();assert!(matches!(service.tick().unwrap(),Tick::Stored));
     runtime.owner.with(|client| {assert!(observed(client).is_empty());Ok(())}).unwrap();runtime.owner.close();
     assert!(service.tick().is_err(),"closed original owner is never successful empty");
+}
+
+#[test]
+#[ignore="requires explicit isolated PostgreSQL; terminates only the fixture's real canonical owner backend"]
+fn native_media_count_owner_loss_during_final_replace_rolls_back_and_stays_unavailable() {
+    let schema=pg::testing::Schema::new().expect("explicit isolated PostgreSQL required");let (runtime,headers,_root)=runtime(&schema);
+    let pid=runtime.owner.with(|client| {pg::release_writer::save(client,&[release("alt.binaries.uhd","Movie.2160p",0,4<<30)],1)?;
+        client.execute("insert into backfill_media(grp,releases) values('prior',42)",&[])?;Ok(client.query_one("select pg_backend_pid()",&[])?.get::<_,i32>(0))}).unwrap();
+    let mut observer=schema.pool.get().unwrap();let mut held=observer.transaction().unwrap();held.batch_execute("lock table backfill_media in access exclusive mode").unwrap();
+    let mut service=Service::new(&runtime.owner,runtime.db.clone(),&headers).unwrap();let worker=std::thread::spawn(move||service.tick());
+    let until=Instant::now()+Duration::from_secs(3);
+    loop {
+        held.query_one("select pg_stat_clear_snapshot()",&[]).unwrap();
+        if held.query_one("select exists(select 1 from pg_stat_activity where pid=$1 and wait_event_type='Lock')",&[&pid]).unwrap().get::<_,bool>(0) {break}
+        assert!(Instant::now()<until,"actual media replacement never waited on its table lock");std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(held.query_one("select pg_terminate_backend($1)",&[&pid]).unwrap().get::<_,bool>(0));held.rollback().unwrap();
+    let error=worker.join().unwrap().err().expect("lost original backend cannot report successful completion");
+    assert!(error.chain().any(|cause|cause.downcast_ref::<postgres::Error>().is_some()));assert_eq!(pg::outage::classify(&error),pg::outage::Failure::Unavailable);
+    assert_eq!(runtime.owner.failure(),Some(pg::outage::Failure::Unavailable));assert_eq!(observed(&mut *observer),vec![("prior".into(),42)]);runtime.owner.close();
+}
+
+#[test]
+#[ignore="requires explicit isolated owned PostgreSQL; original Db and header-root admission"]
+fn native_media_count_refuses_a_different_header_root_before_counting() {
+    let schema=pg::testing::Schema::new().expect("explicit isolated PostgreSQL required");let (runtime,headers,_root)=runtime(&schema);
+    let mut changed=headers.clone();changed.dir.push_str("-different");
+    assert!(Service::new(&runtime.owner,runtime.db.clone(),&changed).is_err());
+    runtime.owner.with(|client| {assert!(observed(client).is_empty());Ok(())}).unwrap();runtime.owner.close();
 }
