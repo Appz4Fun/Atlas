@@ -68,8 +68,10 @@ pub(crate) fn read(client:&mut impl GenericClient,release:i64,stop:&AtomicBool)-
 #[cfg(test)]
 mod tests {
     #[test]
+    #[ignore = "requires an explicit isolated ATLAS_PG_TEST_URL"]
     fn native_content_identity_matches_the_legacy_cache_encoding() {
-        let Some(schema)=crate::pg::testing::Schema::native_writer() else {return};
+        use sha2::Digest;
+        let schema=crate::pg::testing::Schema::native_writer().expect("explicit isolated ATLAS_PG_TEST_URL required");
         let release=crate::parser::Release {name:"Example.Release".into(),group:"example.group".into(),
             articles:vec![
                 crate::parser::Article {filename:Some("a\0.bin".into()),message_id:"<one@example.test>".into(),
@@ -80,11 +82,10 @@ mod tests {
         let mut client=schema.pool.get().unwrap();
         crate::pg::release_writer::save(&mut client,&[release],1).unwrap();
         let id:i64=client.query_one("select id from releases",&[]).unwrap().get(0);
-        let sqlite=rusqlite::Connection::open_in_memory().unwrap();
-        sqlite.execute_batch("create table files(id integer primary key,release_id integer,filename text,subject_mid text,expected integer,seen blob,blob blob);").unwrap();
-        sqlite.execute("insert into files values(99,77,?1,?2,2,?3,NULL)",
-            rusqlite::params!["a\0.bin","<one@example.test>",vec![6u8]]).unwrap();
-        let expected=crate::raw_store::release_content_id_in(&sqlite,"main",77).unwrap();
+        // Literal historical cache framing: filename length+bytes, exact first MID,
+        // expected count, bitmap length+bytes. Database row IDs never participate.
+        let encoded=b"\x06\0\0\0\0\0\0\0a\0.bin\x12\0\0\0\0\0\0\0<one@example.test>\x02\0\0\0\0\0\0\0\x01\0\0\0\0\0\0\0\x06";
+        let expected=sha2::Sha256::digest(encoded).to_vec();
         let mut tx=client.build_transaction().isolation_level(postgres::IsolationLevel::RepeatableRead).read_only(true).start().unwrap();
         assert_eq!(super::read(&mut tx,id,&std::sync::atomic::AtomicBool::new(false)).unwrap(),Some(expected));
     }

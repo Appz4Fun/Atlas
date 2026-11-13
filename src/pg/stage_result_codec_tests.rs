@@ -29,14 +29,14 @@ fn full_visit_preserves_literal_v1_result_digest() {
     assert_ne!(visit.result,Visit::prepare(&claim(),changed,[5;32]).unwrap().result);
 }
 
-// Catches hashing/admitting caller-controlled fields before validating the closed mutation.
+// Closed payload changes are bound to the digest; a result cannot grant another target.
+// SQL shadows and deferred legacy callbacks no longer exist in StepWrite's public API.
 #[test]
-fn full_visit_refuses_changed_shadow_wrong_target_and_legacy_callback() {
-    let mut changed=applied();changed.writes[0].1.sql="select 1";
-    assert!(Visit::prepare(&claim(),changed,[5;32]).is_err());
+fn full_visit_refuses_wrong_target_and_binds_closed_mutation_payload() {
+    let original=Visit::prepare(&claim(),applied(),[5;32]).unwrap();
+    let mut changed=applied();
+    changed.writes[0].1=StepWrite::for_mutation(7,StepMutation::SetCategory {category:2046});
+    assert_ne!(original.result,Visit::prepare(&claim(),changed,[5;32]).unwrap().result);
     let mut wrong=applied();wrong.writes[0].1=StepWrite::for_mutation(8,StepMutation::ClearCategory);
     assert!(Visit::prepare(&claim(),wrong,[5;32]).is_err());
-    let mut late=applied();late.writes[0].1=StepWrite::for_mutation(7,StepMutation::ClearCategory)
-        .with_late_params(Box::new(||panic!("legacy callback executed in native Visit")));
-    assert!(Visit::prepare(&claim(),late,[5;32]).is_err());
 }

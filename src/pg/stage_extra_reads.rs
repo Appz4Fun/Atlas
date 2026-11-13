@@ -200,9 +200,18 @@ mod tests {
 
     #[test]
     fn native_posted_dates_match_the_sqlite_age_oracle() {
-        let oracle=rusqlite::Connection::open_in_memory().unwrap();let now=1_800_000_000.0;
-        for value in ["2026-11-13","2026-11-13 12:34:56","2026-11-13T12:34:56.125Z","2026-11-13T14:34:56+02:00","12:34:56","2451544.5","invalid"] {
-            let expected:Option<f64>=oracle.query_row("select (julianday(?1)-2440587.5)*86400",[value],|row|row.get(0)).unwrap();
+        let now=1_800_000_000.0;
+        // Fixed UTC seconds preserve the previous age-oracle cases independently
+        // of the native date parser and without retaining a SQLite dependency.
+        for (value,expected) in [
+            ("2026-11-13",Some(1794528000.0)),
+            ("2026-11-13 12:34:56",Some(1794573296.0)),
+            ("2026-11-13T12:34:56.125Z",Some(1794573296.125)),
+            ("2026-11-13T14:34:56+02:00",Some(1794573296.0)),
+            ("12:34:56",Some(946730096.0)),
+            ("2451544.5",Some(946684800.0)),
+            ("invalid",None),
+        ] {
             let actual=posted_epoch(value,now);
             match (expected,actual) {(Some(a),Some(b))=>assert!((a-b).abs()<0.001,"{value}: {a} != {b}"),(None,None)=>{},other=>panic!("{value}: {other:?}")}
         }
