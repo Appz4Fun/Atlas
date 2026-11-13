@@ -224,3 +224,20 @@ fn prefix_keeps_a_fitting_final_whole_line_without_claiming_completion() {
         server.await.unwrap();
     });
 }
+
+#[test]
+fn compressed_raw_reader_uses_the_same_before_growth_line_boundary() {
+    use std::io::Write;
+    run(async {
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::none());
+        encoder.write_all(&[b'x'; 80]).unwrap();
+        encoder.write_all(b"\r\n.\r\n").unwrap();
+        let mut wire = b"221 [COMPRESS=GZIP]\r\n".to_vec();
+        wire.extend(encoder.finish().unwrap());
+        let (mut conn, server) = response(wire).await;
+        assert_eq!(conn.head("<owned@test>", 32).await.unwrap(), None);
+        assert!(conn.poisoned);
+        drop(conn);
+        server.await.unwrap();
+    });
+}
