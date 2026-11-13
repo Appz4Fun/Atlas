@@ -58,6 +58,25 @@ impl Source {
     }
 }
 
+/// Admission from the original Native's shared memory/slot limits. This is
+/// resource ownership only; the original Owner still validates every PG write.
+/// Keep it through the caller's commit/rollback, reusing it only after dropping
+/// each previously checked batch before allocating the next one.
+pub(crate) struct NativeSavePermit {
+    owner:Arc<super::indexer_runtime::Owner>,
+    max_job_bytes:usize,
+    _memory:tokio::sync::OwnedSemaphorePermit,
+    _slot:tokio::sync::OwnedSemaphorePermit,
+}
+impl NativeSavePermit {
+    pub(crate) fn max_job_bytes(&self)->usize {self.max_job_bytes}
+    pub(crate) fn check_batch(&self,releases:&Vec<Release>)->Result<()> {
+        if self.owner.stop.load(std::sync::atomic::Ordering::Acquire) {return Err(super::outage::AttemptEnded.into());}
+        ensure!(payload_bytes(releases,releases.capacity())<=self.max_job_bytes,"native reserved batch exceeds max_job_bytes");
+        Ok(())
+    }
+}
+
 impl Native {
     pub fn new(pool: Arc<super::Pool>, limits: PgWriteLimits) -> Result<Self> {
         Self::from_source(Source::Pool(pool), limits)
@@ -75,6 +94,39 @@ impl Native {
             slots: Arc::new(Semaphore::new(usize::from(limits.concurrent_saves))),
             limits,
         })
+    }
+
+    pub(crate) fn check_native_owner(&self,owner:&Arc<super::indexer_runtime::Owner>)->Result<()> {
+        ensure!(matches!(&self.source,Source::Owner(actual) if Arc::ptr_eq(actual,owner)),"native save requires its original owner backend");
+        if owner.stop.load(std::sync::atomic::Ordering::Acquire) {return Err(super::outage::AttemptEnded.into());}
+        Ok(())
+    }
+
+    /// Reserve before expanding input into Articles. Both permits come from
+    /// this same Native, in ordinary save_job's memory-then-slot order.
+    pub(crate) async fn reserve_native_for_owner(&self,owner:&Arc<super::indexer_runtime::Owner>)->Result<NativeSavePermit> {
+        self.check_native_owner(owner)?;
+        let memory_wait=self.memory.clone().acquire_many_owned(self.limits.max_job_bytes);
+        tokio::pin!(memory_wait);
+        let memory=loop {
+            self.check_native_owner(owner)?;
+            tokio::select! {
+                result=&mut memory_wait=>break result?,
+                _=tokio::time::sleep(std::time::Duration::from_millis(25))=>{},
+            }
+        };
+        self.check_native_owner(owner)?;
+        let slot_wait=self.slots.clone().acquire_owned();
+        tokio::pin!(slot_wait);
+        let slot=loop {
+            self.check_native_owner(owner)?;
+            tokio::select! {
+                result=&mut slot_wait=>break result?,
+                _=tokio::time::sleep(std::time::Duration::from_millis(25))=>{},
+            }
+        };
+        self.check_native_owner(owner)?;
+        Ok(NativeSavePermit {owner:owner.clone(),max_job_bytes:self.limits.max_job_bytes as usize,_memory:memory,_slot:slot})
     }
 
     pub(crate) async fn save_at(&self, releases: Vec<Release>, logical_now: i64) -> Result<()> {
@@ -242,6 +294,59 @@ fn payload_bytes(releases: &[Release], capacity: usize) -> usize {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    #[ignore="requires isolated PostgreSQL for original native resource ownership"]
+    fn owner_save_permit_rejects_foreign_or_pooled_backend_and_checks_actual_capacity() {
+        let schema=crate::pg::testing::Schema::new().expect("explicit isolated PostgreSQL required");
+        let runtime=crate::pg::stage_queue_tests::runtime(&schema);
+        runtime.db.check_native_owner(&runtime.owner).unwrap();
+        let foreign=Arc::new(super::super::indexer_runtime::Owner::new(postgres::Client::connect(&schema.url,postgres::NoTls).unwrap()));
+        assert!(runtime.db.check_native_owner(&foreign).is_err());
+        let pooled=Native::new(Arc::new(crate::pg::Pool::new(&crate::pg::StorageConfig {
+            backend:crate::pg::Backend::Postgres,url:schema.url.clone(),schema:schema.name.clone(),allow_plaintext:true,..Default::default()
+        }).unwrap()),PgWriteLimits::default()).unwrap();
+        assert!(pooled.check_native_owner(&runtime.owner).is_err());
+        let rt=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let permit=rt.block_on(runtime.db.reserve_native_for_owner(&runtime.owner)).unwrap();
+        let valid=release("permit.example",'a');permit.check_batch(&valid).unwrap();
+        let oversized=Vec::<Release>::with_capacity(permit.max_job_bytes()/std::mem::size_of::<Release>()+1);
+        assert!(oversized.is_empty());assert!(permit.check_batch(&oversized).is_err(),"empty capacity still owns memory");
+        permit.check_batch(&valid).unwrap();
+        assert_eq!(runtime.owner.failure(),None);
+        runtime.owner.with(|client| {let count:i64=client.query_one("select count(*) from releases",&[])?.get(0);assert_eq!(count,0);Ok(())}).unwrap();
+        drop(permit);foreign.close();runtime.owner.close();
+    }
+
+    #[test]
+    #[ignore="requires isolated PostgreSQL for shared native admission and stop"]
+    fn owner_save_permit_shares_writer_slots_and_returns_partial_admission_on_cancel_or_stop() {
+        use std::sync::atomic::Ordering;
+        let schema=crate::pg::testing::Schema::new().expect("explicit isolated PostgreSQL required");
+        let runtime=crate::pg::stage_queue_tests::runtime(&schema);
+        let limits=PgWriteLimits {max_pending_bytes:8192,max_job_bytes:4096,concurrent_saves:1};
+        let native=Native::with_owner(runtime.owner.clone(),limits).unwrap();let clone=native.clone();
+        let rt=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let held=native.reserve_native_for_owner(&runtime.owner).await.unwrap();
+            assert_eq!(native.memory.available_permits(),4096);assert_eq!(native.slots.available_permits(),0);
+            let mut ordinary=Box::pin(clone.save_job(release("shared.example",'b'),None));
+            assert!(tokio::time::timeout(Duration::from_millis(50),&mut ordinary).await.is_err(),"ordinary writer must wait on the same held slot");
+            assert!(native.memory.available_permits()<4096);drop(ordinary);assert_eq!(native.memory.available_permits(),4096);
+            let mut canceled=Box::pin(clone.reserve_native_for_owner(&runtime.owner));
+            assert!(tokio::time::timeout(Duration::from_millis(50),&mut canceled).await.is_err());
+            assert_eq!(native.memory.available_permits(),0);drop(canceled);assert_eq!(native.memory.available_permits(),4096);
+            let mut stopped=Box::pin(clone.reserve_native_for_owner(&runtime.owner));
+            assert!(tokio::time::timeout(Duration::from_millis(50),&mut stopped).await.is_err());
+            runtime.owner.stop.store(true,Ordering::Release);
+            let error=match tokio::time::timeout(Duration::from_secs(1),stopped).await.unwrap() {Ok(_)=>panic!("stopped owner must not gain admission"),Err(error)=>error};
+            assert!(crate::pg::outage::is_attempt_ended(&error));assert_eq!(native.memory.available_permits(),4096);
+            assert!(held.check_batch(&release("stopped.example",'c')).is_err());
+            assert_eq!(runtime.owner.failure(),None);drop(held);
+            assert_eq!(native.memory.available_permits(),8192);assert_eq!(native.slots.available_permits(),1);
+        });
+        runtime.owner.close();
+    }
 
     #[test]
     fn a_large_upload_is_saved_in_bounded_jobs_and_retries_do_not_requeue_it() {

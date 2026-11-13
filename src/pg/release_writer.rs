@@ -70,7 +70,27 @@ pub fn save(client: &mut Client, releases: &[Release], now: i64) -> Result<SaveS
 
     // A group writer that waited on the advisory lock must see the preceding commit.
     let mut tx = client.build_transaction().isolation_level(IsolationLevel::ReadCommitted).start()?;
-    super::history_gate::native(&mut tx)?;
+    let stats=save_grouped(&mut tx,groups,now)?;
+    tx.commit()?;
+    Ok(stats)
+}
+
+/// The repair service checks its observed source and commits header/results on
+/// its original owner transaction. This entry neither commits nor retries.
+/// The same RC/history gate and exact COPY/winner SQL as ordinary saves apply.
+pub(crate) fn save_in(tx:&mut Transaction<'_>,releases:&[Release],now:i64)->Result<SaveStats> {
+    let mut groups=BTreeMap::<&str,Vec<&Release>>::new();
+    for release in releases {
+        if !crate::filters::group_blocked(&release.group) {
+            ensure!(!release.group.as_bytes().contains(&0),"release group contains a NUL byte");
+            groups.entry(&release.group).or_default().push(release);
+        }
+    }
+    save_grouped(tx,groups,now)
+}
+
+fn save_grouped(tx:&mut Transaction<'_>,groups:BTreeMap<&str,Vec<&Release>>,now:i64)->Result<SaveStats> {
+    super::history_gate::native(tx)?;
     tx.batch_execute(CREATE_STAGE)?;
     let mut stats = SaveStats::default();
     for (group, releases) in groups {
@@ -109,7 +129,7 @@ pub fn save(client: &mut Client, releases: &[Release], now: i64) -> Result<SaveS
                 let row = Incoming { release, release_key: key.1, original_name_key, posted_at, posted_clock, article };
                 let size = row.approx_bytes();
                 if batch.len() == MAX_BATCH_ROWS || (!batch.is_empty() && bytes + size > MAX_BATCH_BYTES) {
-                    flush(&mut tx, group, &batch, now, &mut stats)?;
+                    flush(tx, group, &batch, now, &mut stats)?;
                     batch.clear();
                     bytes = 0;
                 }
@@ -118,10 +138,9 @@ pub fn save(client: &mut Client, releases: &[Release], now: i64) -> Result<SaveS
             }
         }
         if !batch.is_empty() {
-            flush(&mut tx, group, &batch, now, &mut stats)?;
+            flush(tx, group, &batch, now, &mut stats)?;
         }
     }
-    tx.commit()?;
     Ok(stats)
 }
 
@@ -666,3 +685,7 @@ mod posted_at_tests {
         assert_eq!(read(&mut client),("third".into(),"Fri, 03 Jan 2020 00:00:00 +0000".into(),1578009600));
     }
 }
+
+#[cfg(test)]
+#[path="release_writer_inferred_tests.rs"]
+mod inferred_tests;

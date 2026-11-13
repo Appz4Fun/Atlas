@@ -3081,6 +3081,10 @@ impl Pool {
         self.background_read(message_id, max_bytes, BackgroundRead::Prefix).await
     }
 
+    pub(crate) fn provider_binding_on(&self,index:usize)->Result<[u8;32]> {
+        let server=self.servers.get(index).ok_or_else(Self::no_servers)?;
+        group_capture::provider_binding(&server.cfg)
+    }
     pub async fn background_read(
         &self,
         message_id: &str,
