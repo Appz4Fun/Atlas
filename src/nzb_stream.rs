@@ -106,6 +106,7 @@ enum Phase {
     File,
     Segments,
     Finished,
+    Failed,
 }
 
 /// XML is written directly into a bounded writer or private request spool.
@@ -127,13 +128,17 @@ impl<W: Write> XmlWriter<W> {
 
     pub fn meta(&mut self, inferred: bool, text: impl Read) -> io::Result<()> {
         self.require(Phase::Head)?;
+        self.phase = Phase::Failed;
         self.output.write_all(if inferred { b"    <meta type=\"x-atlas-inferred\">" } else { b"    <meta type=\"x-atlas-incomplete\">" })?;
         escaped(&mut self.output, text, false)?;
-        self.output.write_all(b"</meta>\n")
+        self.output.write_all(b"</meta>\n")?;
+        self.phase = Phase::Head;
+        Ok(())
     }
 
     pub fn end_head(&mut self) -> io::Result<()> {
         self.require(Phase::Head)?;
+        self.phase = Phase::Failed;
         self.output.write_all(b"  </head>\n")?;
         self.phase = Phase::Files;
         Ok(())
@@ -141,6 +146,7 @@ impl<W: Write> XmlWriter<W> {
 
     pub fn file(&mut self, poster: impl Read, timestamp: i64, subject: impl Read) -> io::Result<()> {
         self.require(Phase::Files)?;
+        self.phase = Phase::Failed;
         self.output.write_all(b"  <file poster=\"")?;
         escaped(&mut self.output, poster, true)?;
         write!(self.output, "\" date=\"{timestamp}\" subject=\"")?;
@@ -152,13 +158,17 @@ impl<W: Write> XmlWriter<W> {
 
     pub fn group(&mut self, group: impl Read) -> io::Result<()> {
         self.require(Phase::File)?;
+        self.phase = Phase::Failed;
         self.output.write_all(b"      <group>")?;
         escaped(&mut self.output, group, false)?;
-        self.output.write_all(b"</group>\n")
+        self.output.write_all(b"</group>\n")?;
+        self.phase = Phase::File;
+        Ok(())
     }
 
     pub fn segments(&mut self) -> io::Result<()> {
         self.require(Phase::File)?;
+        self.phase = Phase::Failed;
         self.output.write_all(b"    </groups>\n    <segments>\n")?;
         self.phase = Phase::Segments;
         Ok(())
@@ -168,6 +178,7 @@ impl<W: Write> XmlWriter<W> {
     /// the ID stream, exactly as the legacy renderer's trim_matches does.
     pub fn segment(&mut self, bytes: i64, part: Option<i64>, message_id: impl Read) -> io::Result<()> {
         self.require(Phase::Segments)?;
+        self.phase = Phase::Failed;
         write!(self.output, "      <segment bytes=\"{bytes}\" number=\"")?;
         match part {
             Some(part) => write!(self.output, "{part}")?,
@@ -175,11 +186,14 @@ impl<W: Write> XmlWriter<W> {
         }
         self.output.write_all(b"\">")?;
         escaped(&mut self.output, message_id, false)?;
-        self.output.write_all(b"</segment>\n")
+        self.output.write_all(b"</segment>\n")?;
+        self.phase = Phase::Segments;
+        Ok(())
     }
 
     pub fn end_file(&mut self) -> io::Result<()> {
         self.require(Phase::Segments)?;
+        self.phase = Phase::Failed;
         self.output.write_all(b"    </segments>\n  </file>\n")?;
         self.phase = Phase::Files;
         Ok(())
@@ -187,6 +201,7 @@ impl<W: Write> XmlWriter<W> {
 
     pub fn finish(mut self) -> io::Result<W> {
         self.require(Phase::Files)?;
+        self.phase = Phase::Failed;
         self.output.write_all(b"</nzb>")?;
         self.output.flush()?;
         self.phase = Phase::Finished;
@@ -416,6 +431,40 @@ mod tests {
                 _ => unreachable!(),
             }
             assert!(xml.finish().is_err(), "ignored {phase} error must poison publication");
+        }
+    }
+
+    #[test]
+    fn one_shot_output_failures_never_allow_later_publication() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        struct OneShot { fail:Rc<Cell<bool>>, writes:Rc<Cell<usize>> }
+        impl Write for OneShot {
+            fn write(&mut self,bytes:&[u8])->io::Result<usize> {
+                self.writes.set(self.writes.get()+1);
+                if self.fail.replace(false) {Err(io::Error::other("one-shot output failure"))}else{Ok(bytes.len())}
+            }
+            fn flush(&mut self)->io::Result<()> {Ok(())}
+        }
+        for operation in ["meta","end_head","file","group","segments","segment","end_file"] {
+            let fail=Rc::new(Cell::new(false));let writes=Rc::new(Cell::new(0));
+            let mut xml=XmlWriter::new(OneShot {fail:fail.clone(),writes:writes.clone()},io::empty()).unwrap();
+            if !matches!(operation,"meta"|"end_head") {xml.end_head().unwrap();}
+            if matches!(operation,"group"|"segments"|"segment"|"end_file") {xml.file(io::empty(),0,io::empty()).unwrap();}
+            if matches!(operation,"segment"|"end_file") {xml.segments().unwrap();}
+            fail.set(true);
+            let failed=match operation {
+                "meta"=>xml.meta(false,io::empty()),"end_head"=>xml.end_head(),"file"=>xml.file(io::empty(),0,io::empty()),
+                "group"=>xml.group(io::empty()),"segments"=>xml.segments(),"segment"=>xml.segment(17,Some(1),io::empty()),
+                "end_file"=>xml.end_file(),_=>unreachable!(),
+            };
+            assert!(failed.is_err(),"{operation} must encounter the one-shot failure");
+            assert!(!fail.get(),"the sink recovers immediately");
+            let stopped_at=writes.get();
+            let _=xml.meta(false,io::empty());let _=xml.end_head();let _=xml.file(io::empty(),0,io::empty());
+            let _=xml.group(io::empty());let _=xml.segments();let _=xml.segment(17,Some(1),io::empty());let _=xml.end_file();
+            assert!(xml.finish().is_err(),"ignored {operation} failure cannot be published");
+            assert_eq!(writes.get(),stopped_at,"{operation}: poisoned writer must not append any bytes");
         }
     }
 
