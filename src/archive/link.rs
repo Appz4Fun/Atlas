@@ -1146,7 +1146,7 @@ mod tests {
             creators: vec![(a.set_id, "ParPar v0.4.1 x64 [https://github.com/animetosho/parpar]".into())],
         };
         for w in super::super::store::par2_file_writes(8, &inventory) {
-            write(&conn, w.sql, w.params);
+            write(&conn, w.sql, w.params.into_iter().map(Into::into).collect());
         }
         let back = super::super::store::par2_inventory(&conn, "main", 8).expect("read back");
         assert_eq!(back.files, vec![a.clone(), b, c]);
@@ -1159,7 +1159,7 @@ mod tests {
         // a set read only in part isn't read back: the next run reads the rest
         let partial = par2::Inventory { complete: false, ..inventory };
         for w in super::super::store::par2_file_writes(16, &partial) {
-            write(&conn, w.sql, w.params);
+            write(&conn, w.sql, w.params.into_iter().map(Into::into).collect());
         }
         assert!(super::super::store::par2_inventory(&conn, "main", 16).is_none());
     }

@@ -1,6 +1,6 @@
 //! Closed release-local result data. A mutation carries no release reference or write authority.
 
-use rusqlite::types::Value;
+use super::result_value::Value;
 
 use crate::probe::opensubtitles::Feature;
 
@@ -53,7 +53,7 @@ pub struct ImageRecord {
 }
 
 impl ImageRecord {
-    pub(crate) fn sqlite_values(&self) -> Vec<Value> {
+    pub(crate) fn v1_values(&self) -> Vec<Value> {
         vec![self.file.clone().into(),self.sha256.clone().into(),self.format.clone().into(),
             i64::from(self.width).into(),i64::from(self.height).into(),self.bytes.into(),
             self.meta.clone().into(),self.exif_id.clone().into(),self.document_id.clone().into()]
@@ -149,8 +149,9 @@ impl StepMutation {
             | Self::RerunPointedList { .. } | Self::RerunPointedProbe { .. } | Self::SetPointedPassword { .. })
     }
 
-    /// Preserve the ordered legacy writer representation. This never executes native SQL.
-    pub(crate) fn sqlite_statement(&self, release_id: i64) -> (&'static str, Vec<Value>) {
+    /// Frozen v1 tag and neutral ordered fields, also rendered by the legacy adapter.
+    /// The tag spelling is receipt identity, not native SQL execution authority.
+    pub(crate) fn v1_fields(&self, release_id: i64) -> (&'static str, Vec<Value>) {
         match self {
             Self::OpenSubtitlesMatch { moviehash, feature, checked_at } => {
                 let f = feature.clone().unwrap_or_default();
@@ -253,7 +254,7 @@ impl StepMutation {
             Self::ClearImages => ("delete from release_images where release_id=?1",vec![release_id.into()]),
             Self::KeepImage { position, image } => {
                 let mut params = vec![release_id.into(),(*position).into()];
-                params.extend(image.sqlite_values());
+                params.extend(image.v1_values());
                 ("insert or replace into release_images(release_id,position,file,sha256,format,width,height,bytes,meta,exif_id,document_id)
                   values(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params)
             }
@@ -317,7 +318,7 @@ impl StepMutation {
     #[cfg(test)]
     fn apply_sqlite(&self, conn: &rusqlite::Connection, release_id: i64) -> rusqlite::Result<usize> {
         if matches!(self,Self::ParseMedia {..}|Self::PredbRead {..}|Self::XrefRead {..}|Self::XrefTried {..}) {return Err(rusqlite::Error::InvalidQuery);}
-        let (sql, params) = self.sqlite_statement(release_id);
+        let (sql, params) = self.v1_fields(release_id);
         conn.execute(sql, rusqlite::params_from_iter(params))
     }
 }

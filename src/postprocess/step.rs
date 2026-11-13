@@ -3,7 +3,11 @@
 use std::time::Instant;
 
 use rusqlite::Connection;
-use rusqlite::types::Value;
+use super::result_value::Value;
+
+#[cfg(test)]
+#[path = "result_envelope_tests.rs"]
+mod result_envelope_tests;
 
 use crate::config::Config;
 use crate::nntp::BackgroundRead;
@@ -346,16 +350,21 @@ pub struct Outcome {
 pub struct StepWrite {
     pub sql: &'static str,
     pub params: Vec<Value>,
-    /// Called on the shard's writer just before this write, in place of `params`, for a
-    /// value that must be current then and not when the step ran. It must be quick.
+    /// Legacy writer-time callback. Never admitted by the native envelope.
     pub late_params: Option<Box<dyn FnOnce() -> Vec<Value> + Send>>,
-    /// Closed result data is independent of its legacy SQL representation.
-    mutation: Option<(i64, StepMutation)>,
+    /// Public fields are compatibility shadows; only this private closed value
+    /// supplies native mutation data, after the shadows have been checked.
+    native: Option<NativeEnvelope>,
+}
+
+struct NativeEnvelope {
+    release_id: i64,
+    mutation: StepMutation,
 }
 
 impl StepWrite {
     pub fn new(sql: &'static str, params: Vec<Value>) -> StepWrite {
-        StepWrite { sql, params, late_params: None, mutation: None }
+        StepWrite { sql, params, late_params: None, native: None }
     }
 
     pub fn with_late_params(mut self, late: Box<dyn FnOnce() -> Vec<Value> + Send>) -> Self {
@@ -366,47 +375,58 @@ impl StepWrite {
     /// Keeps legacy late-cache timing without admitting that cache or callback to the native writer.
     pub fn for_deferred_legacy(release_id: i64, mutation: DeferredLegacyStepMutation) -> Self {
         let sql = mutation.sqlite_sql();
-        Self { sql,params: Vec::new(),late_params: Some(Box::new(move || mutation.sqlite_parameters(release_id))),mutation: None }
+        Self { sql,params: Vec::new(),late_params: Some(Box::new(move || mutation.sqlite_parameters(release_id))),native: None }
     }
 
     pub fn for_mutation(release_id: i64, mutation: StepMutation) -> Self {
-        let (sql, params) = mutation.sqlite_statement(release_id);
-        Self { sql, params, late_params: None, mutation: Some((release_id, mutation)) }
+        let (sql, params) = mutation.v1_fields(release_id);
+        Self { sql, params, late_params: None, native: Some(NativeEnvelope {release_id, mutation}) }
     }
 
     pub(crate) fn legacy_allowed(&self)->bool {
-        !matches!(self.mutation,Some((_,StepMutation::ParseMedia {..}|StepMutation::PredbRead {..})))
+        !self.native.as_ref().is_some_and(|envelope|matches!(envelope.mutation,StepMutation::ParseMedia {..}|StepMutation::PredbRead {..}))
+    }
+
+    fn checked_envelope(&self)->Result<&NativeEnvelope,StepError> {
+        let envelope=self.native.as_ref().ok_or_else(||StepError::Retry("Step mutation is not ported to native storage".into()))?;
+        let (tag,values)=envelope.mutation.v1_fields(envelope.release_id);
+        if self.sql!=tag || self.params!=values || self.late_params.is_some() {
+            return Err(StepError::Retry("Step mutation representation changed".into()));
+        }
+        Ok(envelope)
     }
 
     /// The queue actor checks the retained target as well as the closed
     /// representation. A result for another release cannot borrow its lease.
     pub(crate) fn native_mutation_for(&self, release_id:i64)->Result<&StepMutation,StepError> {
-        if self.mutation.as_ref().is_none_or(|(id,_)|*id!=release_id) {
+        if self.native.as_ref().is_none_or(|envelope|envelope.release_id!=release_id) {
             return Err(StepError::Retry("native Step result targets another release".into()));
         }
         self.native_mutation()
     }
     pub(crate) fn native_observed_for(&self,release_id:i64,targets:&crate::pg::stage_queue::participants::Observed)->Result<&StepMutation,StepError> {
-        let (id,mutation)=self.mutation.as_ref().ok_or_else(||StepError::Retry("Step mutation is not ported to native storage".into()))?;
-        if *id!=release_id || !targets.permits(release_id,mutation) {return Err(StepError::Retry("native result has no observed target".into()))}
-        let (sql,params)=mutation.sqlite_statement(*id);
-        if self.sql!=sql || self.params!=params || self.late_params.is_some() {return Err(StepError::Retry("Step mutation representation changed".into()))}
-        Ok(mutation)
+        let envelope=self.checked_envelope()?;
+        if envelope.release_id!=release_id || !targets.permits(release_id,&envelope.mutation) {
+            return Err(StepError::Retry("native result has no observed target".into()));
+        }
+        Ok(&envelope.mutation)
     }
 
-    /// Legacy SQL cannot be submitted as a native mutation. The retained legacy ID is not native authority;
-    /// native application still requires a reference from the future reviewed resolver and its live epoch gate.
+    /// Caller SQL and numeric targets alone cannot supply native authority.
     pub fn native_mutation(&self) -> Result<&StepMutation, StepError> {
-        let (legacy_id, mutation) = self.mutation.as_ref()
-            .ok_or_else(|| StepError::Retry("Step mutation is not ported to native storage".into()))?;
-        if mutation.requires_target_resolution() {
+        let envelope=self.checked_envelope()?;
+        if envelope.mutation.requires_target_resolution() {
             return Err(StepError::Retry("Step targets require the native resolver".into()));
         }
-        let (sql, params) = mutation.sqlite_statement(*legacy_id);
-        if self.sql != sql || self.params != params || self.late_params.is_some() {
-            return Err(StepError::Retry("Step mutation representation changed".into()));
-        }
-        Ok(mutation)
+        Ok(&envelope.mutation)
+    }
+
+    /// Encoding is data, never a lease. Visit still validates its Claim and
+    /// Observed participants before this call and again at actual settlement.
+    pub(crate) fn encode_native_v1(&self,step:StepMask,bytes:&mut usize,sink:&mut impl FnMut(&[u8]))->anyhow::Result<()> {
+        let envelope=self.checked_envelope().map_err(|_|anyhow::anyhow!("native result is not a closed mutation"))?;
+        let (tag,values)=envelope.mutation.v1_fields(envelope.release_id);
+        super::result_value::encode_write_v1(step,tag,&values,bytes,sink)
     }
 }
 

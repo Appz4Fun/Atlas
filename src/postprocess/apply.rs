@@ -1,6 +1,6 @@
 //! What a run of a release's steps comes to, written in one go on the shard's writer.
 
-use rusqlite::types::Value;
+use super::result_value::Value;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::step::{NameChange, StepMask, StepWrite};
