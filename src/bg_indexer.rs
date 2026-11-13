@@ -1352,6 +1352,10 @@ async fn report(sched: Arc<Scheduler>) {
     }
 }
 
+fn native_service_config_pin(native:bool,config:&Config,servers:&[UsenetServer],plan:&[(usize,usize)]) -> Option<crate::postprocess::native::ConfigPin> {
+    (native && (config.postprocess.enabled || config.predb.enabled)).then(||crate::postprocess::native::ConfigPin::capture(config,servers,plan))
+}
+
 /// Index with this set of servers until stopping, the config needs a rebuild
 /// or a compaction is due (true), not before `compact_after`.
 async fn run_servers(
@@ -1380,7 +1384,7 @@ async fn run_servers(
     let sched = Arc::new(Scheduler {
         native: native.map(|runtime| runtime.profile.clone()),
         native_owner: native.map(|runtime|runtime.owner.clone()),
-        native_workers: (native.is_some() && (config.postprocess.enabled || config.predb.enabled)).then(||crate::postprocess::native::ConfigPin::capture(config,&servers,&plan)),
+        native_workers: native_service_config_pin(native.is_some(),config,&servers,&plan),
         fatal: AtomicBool::new(false),
         ctx: PassContext { pool, states, stop, verbose: false },
         settings: RwLock::new(settings_of(config)),
@@ -2252,6 +2256,35 @@ fn index(config: Config, stop: Arc<AtomicBool>, writing: Option<WriteGuard>, nat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_details_only_attempt_pins_reload_before_reconfiguration() {
+        let mut config=Config::default();
+        config.postprocess.enabled=false;config.predb.enabled=false;
+        config.media.tmdb.api_key="private-details-key".into();config.media.details_per_minute=1;
+        config.native_assets=Some(crate::config::NativeAssetsConfig {root:"/selected-assets".into(),manifest:"/selected-manifest".into(),whole_sha256:"01".repeat(32)});
+        assert!(crate::media::details::native::Service::enabled(&config.media));
+        let pin=native_service_config_pin(true,&config,&[],&[]).expect("a native details-only attempt must pin its captured service settings");
+        assert!(pin.check(&config,&[],&[]).is_ok());
+        let edits:[fn(&mut Config);4]=[
+            |c|c.media.tmdb.api_key="replacement-secret".into(),
+            |c|c.media.details_per_minute+=1,
+            |c|c.native_assets.as_mut().unwrap().manifest="/replacement-manifest".into(),
+            |c|c.native_assets=None,
+        ];
+        for edit in edits {
+            let mut changed=config.clone();edit(&mut changed);
+            let error=pin.check(&changed,&[],&[]).unwrap_err();
+            assert!(error.to_string().contains("restart"));
+            for private in ["private-details-key","replacement-secret","selected-assets","replacement-manifest"] {
+                assert!(!error.to_string().contains(private));
+            }
+            assert_eq!(crate::pg::outage::classify(&error),crate::pg::outage::Failure::Fatal);
+        }
+        let mut reader_change=config.clone();reader_change.api_port=Some(12345);
+        assert!(pin.check(&reader_change,&[],&[]).is_ok());
+        assert!(native_service_config_pin(false,&config,&[],&[]).is_none(),"legacy startup does not acquire a native service pin");
+    }
 
     #[test]
     fn checked_background_startup_child() {
