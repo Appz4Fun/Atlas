@@ -43,6 +43,7 @@ fn run(home: &std::path::Path, args: &[&str]) -> Output {
 #[test]
 fn retired_storage_commands_refuse_before_any_configuration_or_storage() {
     for command in [
+        "--crc-links",
         "--purge",
         "--reprocess",
         "--predb-import",
@@ -130,19 +131,6 @@ fn selected_toml_failure_cannot_fall_back_to_valid_postgres_json() {
         assert_eq!(std::fs::read_to_string(home.path().join("config.json")).unwrap(), json);
         assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 2);
     }
-}
-
-#[test]
-fn crc_report_is_refused_without_opening_the_old_catalog() {
-    let home = tempfile::tempdir().unwrap();
-    for command in ["--crc-links"] {
-        let output = run(home.path(), &[command, "--apply"]);
-        assert_eq!(output.status.code(), Some(1));
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains("requires a native PostgreSQL maintenance implementation")
-        );
-    }
-    assert!(std::fs::read_dir(home.path()).unwrap().next().is_none());
 }
 
 #[test]
