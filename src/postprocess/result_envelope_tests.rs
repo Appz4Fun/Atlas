@@ -63,6 +63,7 @@ fn native_envelope_does_not_turn_numeric_sidecar_targets_into_authority() {
     let write = StepWrite::for_mutation(7, StepMutation::KeepNfoForLegacyTarget {
         target_id: 8, file: "a.nfo".into(), text: "retained".into(),
     });
+    assert!(matches!(write.mutation(),StepMutation::KeepNfoForLegacyTarget {target_id:8,..}));
     assert!(write.native_mutation_for(7).is_err());
     assert!(write.native_mutation_for(8).is_err());
 }
