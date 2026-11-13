@@ -12,6 +12,9 @@ pub(crate) use workers::run;
 mod settings;
 pub(crate) use settings::ConfigPin;
 #[cfg(test)]
+#[path="native_provider_tests.rs"]
+mod provider_tests;
+#[cfg(test)]
 #[path="native_workers_tests.rs"]
 pub(crate) mod worker_tests;
 #[cfg(test)]
