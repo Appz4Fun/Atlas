@@ -49,12 +49,12 @@ fn dispatch_with_assets(view:&ReadView<'_>,path:&str,args:&HashMap<String,String
             let mut search=Search::from_args(args);search.deep=false;
             let (rows,total)=query(view,&search)?;
             if path=="/ui/total" {return Ok(html(200,if total.exact{exact_html(usize::try_from(total.count)?)}else{format!("<strong class=\"total\">{}</strong>",escape(&total.describe()))}));}
-            let ids:Vec<_>=rows.iter().map(|row|row.id).collect();let mut facts=view.listing_facts(&ids)?;
+            let ids:Vec<_>=rows.iter().map(|row|row.id).collect();let mut facts=view.listing_facts(&ids)?;let spots=view.spot_tags(&ids)?;
             let mut body=String::new();
             for row in &rows {
                 let facts=facts.remove(&row.id).context("native result facts disappeared")?;
                 body.push_str(&row_from_facts(row,ResultFacts {category:facts.category,password:facts.password.as_ref(),media:facts.media.as_ref(),
-                    details:facts.details.as_ref().map(ResultDetails::from),poster:None,recovery:facts.recovery.as_ref().map(release_info::RecoveryOnly::repairs_bytes),copies:None,spot:None,whole:None,repair:false}));
+                    details:facts.details.as_ref().map(ResultDetails::from),poster:None,recovery:facts.recovery.as_ref().map(release_info::RecoveryOnly::repairs_bytes),copies:None,spot:spots.get(&row.id).map(|spot|SpotBadge {poster:&spot.poster,title:&spot.title}),whole:None,repair:false}));
             }
             let next=search.offset.checked_add(PAGE_SIZE).context("native result page offset overflow")?;
             if next<total.count {body.push_str(&search.load_more());}
@@ -212,6 +212,8 @@ fn own_release_page(view:&ReadView<'_>,id:i64,key:&str)->Result<String> {
     let groups=[release_info::GroupPosting {id,group:row.group_name.clone(),articles:row.parts.unwrap_or(0)}];
     // An own row's completion is the native writer's verdict. Unqualified
     // cross-row/PAR2 relationships never turn it into repaired/lent payload.
+    // Original Spotnet values stay in this same bounded RR snapshot.
+    let spot=view.spot_view(id)?;
     let found=view.probe(id)?.map(|probe|seven_z_first_file(probe,&inner,&contents));
     let kept_nfo=if found.as_ref().is_some_and(|probe|probe.nfo.is_some()){None}else{view.own_nfo_text(id)?};
     let nfo_text=found.as_ref().and_then(|probe|probe.nfo.as_deref()).or(kept_nfo.as_deref());
@@ -221,7 +223,7 @@ fn own_release_page(view:&ReadView<'_>,id:i64,key:&str)->Result<String> {
     let password=view.own_password_hint(id,&names,&inner,nfo_text)?.as_ref().map(|hint|password_fact(&inner,hint)).unwrap_or_default();
     let recovery=listing.recovery.as_ref();
     let (shown,raw,tags,facts)=release_header_from_facts(&row,&inner,listing.media.as_ref(),Some(&names),&contents,recovery,
-        ReleaseHeaderFacts {category:listing.category,details:listing.details.as_ref(),spot:None,spot_removed:false,repair:false,groups:&groups,password:&password});
+        ReleaseHeaderFacts {category:listing.category,details:listing.details.as_ref(),spot:spot.as_ref().map(|(detail,_,_)|SpotBadge {poster:&detail.spot.poster,title:&detail.spot.title}),spot_removed:spot.as_ref().is_some_and(|(detail,_,_)|detail.removed.is_some()),repair:false,groups:&groups,password:&password});
     let subtitles=view.own_subtitles(id)?;let salt=view.own_key_salt()?;
     let probe=found.as_ref().map(|probe|probe_html(probe,subtitles.as_ref(),None,salt)).unwrap_or_default();
     // Full-page relationship/asset qualification is deliberately separate
@@ -239,8 +241,9 @@ fn own_release_page(view:&ReadView<'_>,id:i64,key:&str)->Result<String> {
     }
     let nzb_files=nzb_files_html_with(id,&contents,&states,&crate::web_settings::csrf_token(key),native_picture_state_html);
     let files=inner_files_html(&inner,recovery.is_some());
+    let spot=spot.map(|(detail,comments,reports)|spot_html(&detail,&SpotSaid {comments,reports})).unwrap_or_default();
     Ok(release_page_from_facts(&row,&shown,raw.as_deref(),&tags,&facts,listing.category,
-        ReleaseSections {fill:String::new(),warning,spot:String::new(),nfo,images:images_html(id,&pictures.images),stills:stills_html(id,&pictures.stills,None),copies:String::new(),meta,probe,nzb_files,files}))
+        ReleaseSections {fill:String::new(),warning,spot,nfo,images:images_html(id,&pictures.images),stills:stills_html(id,&pictures.stills,None),copies:String::new(),meta,probe,nzb_files,files}))
 }
 
 fn query(view:&ReadView<'_>,search:&Search)->Result<(Vec<ReleaseRow>,crate::field_search::Total)> {
@@ -678,7 +681,13 @@ mod advanced_native_query_tests {
         client.execute("insert into ext_media_details(kind,tmdb_id,imdb_score,fetched_at) values(1,-108,100,1),(1,-107,60,1)",&[]).unwrap();
         client.execute("update media_release set kind=1,tvdb_id=107,tmdb_id=999 where release_id=$1",&[&ids[7]]).unwrap();
         for (at,mid) in [(4usize,"active-spot@example.invalid"),(5,"removed-spot@example.invalid")] {
-            client.execute("insert into spots(release_id,message_id,kind,title,poster,spotter_id,created) values($1,$2,'movie','Spot title','spotter','account',1)",&[&ids[at],&mid]).unwrap();
+            // The row renderer now requires the same preserved original as
+            // production. Derive each display column from fixed valid XML.
+            let original=crate::spotnet::native_read_fixture_tests::XML;
+            let spot=crate::spotnet::full::parse(original).unwrap();
+            client.execute("insert into spots(release_id,message_id,kind,title,poster,tag,spotter_id,category,subcats,size,imdb_id,created,xml,native_original_xml) values($1,$2,$3,$4,$5,$6,'account',$7,$8,$9,$10,$11,$12,$13)",
+                &[&ids[at],&mid,&spot.kind().unwrap().as_str(),&spot.title.replace('\0',"\u{fffd}"),&spot.poster.replace('\0',"\u{fffd}"),&spot.tag.replace('\0',"\u{fffd}"),
+                    &i64::from(spot.category),&spot.subcats.spotweb(),&(spot.size as i64),&spot.imdb_id(),&spot.created,&original.replace('\0',"\u{fffd}"),&original.as_bytes()]).unwrap();
         }
         client.execute("insert into spot_disposals(message_id,spotter,at) values('removed-spot@example.invalid','',2)",&[]).unwrap();
         let mut args=HashMap::from([("q".into(),"Movie".into()),("poster".into(),"shared".into()),("filters".into(),"1080p,Hide spots".into()),
@@ -1052,5 +1061,52 @@ mod native_own_enrichment_tests {
         assert!(page(&mut client,&schema.name,exact).is_err(),"overflow cannot be rendered as a falsely exact saturated recovery total");
         client.execute("update archive_inner_files set size=-1 where release_id=$1 and seq=1",&[&exact]).unwrap();
         assert!(page(&mut client,&schema.name,exact).is_err(),"invalid own set sizes refuse rather than fabricate a total");
+    }
+}
+
+#[cfg(test)]
+mod native_spot_callers_tests {
+    use super::*;
+    fn view<'a>(client:&'a mut postgres::Client,schema:&str,bytes:u64)->ReadView<'a> {
+        ReadView::open(client,schema,pg::fresh_reader::Budget {rows:100,bytes},Instant::now()+Duration::from_secs(10)).unwrap()
+    }
+    fn rss(view:&ReadView<'_>)->Result<ApiResponse> {
+        crate::api::fresh::dispatch(view,&HashMap::from([("t".into(),"search".into()),("q".into(),String::new()),("incomplete".into(),"1".into())]),"http://example.invalid","fixture-key")
+    }
+    #[test]
+    #[ignore="explicit isolated PG; genuine Spotnet publish and literal native Web/API callers"]
+    fn original_spot_reaches_results_release_comments_and_rss_without_display_fallback() {
+        let (schema,runtime,_dir,id)=crate::spotnet::native_read_fixture_tests::fixture();let mut client=schema.pool.get().unwrap();
+        let snapshot=view(&mut client,&schema.name,4*1024*1024);
+        let results=dispatch(&snapshot,"/ui/results",&HashMap::new(),"http://example.invalid","fixture-key").unwrap();
+        assert!(results.body.contains(">SPOT</span>")&&results.body.contains("Original poster"),"{}",results.body);
+        let release=dispatch(&snapshot,"/ui/release",&HashMap::from([("id".into(),id.to_string())]),"http://example.invalid","fixture-key").unwrap();
+        for expected in ["<h2>Spot</h2>","Real.Spot\0Original","Keep password alpha\0beta unchanged","Actual reader","8.0 / 10 from 1 comment"] {assert!(release.body.contains(expected),"missing {expected}: {}",release.body);}
+        assert!(release.body.contains(&"é".repeat(crate::spotnet::comments::MAX_BODY)),"Latin1-expanded original comment must not be truncated");
+        assert!(!release.body.contains("alpha\u{fffd}beta"),"sanitized display XML is not the description authority");
+        let feed=rss(&snapshot).unwrap();assert!(feed.body.contains("name=\"tag\" value=\"spot\"")&&feed.body.contains("name=\"spotter\" value=\"actual\""),"{}",feed.body);
+        drop(snapshot);
+        runtime.owner.with(|tx|{tx.execute("insert into spot_disposals(message_id,spotter,at) values('real@spot.net','',2)",&[])?;Ok(())}).unwrap();
+        let snapshot=view(&mut client,&schema.name,4*1024*1024);
+        let results=dispatch(&snapshot,"/ui/results",&HashMap::new(),"http://example.invalid","fixture-key").unwrap();assert!(!results.body.contains(">SPOT</span>"));
+        let release=dispatch(&snapshot,"/ui/release",&HashMap::from([("id".into(),id.to_string())]),"http://example.invalid","fixture-key").unwrap();
+        assert!(release.body.contains("SPOT REMOVED")&&release.body.contains("A Spotnet moderator removed this spot")&&release.body.contains("alpha\0beta"));
+        assert!(!rss(&snapshot).unwrap().body.contains("name=\"tag\" value=\"spot\""));drop(snapshot);runtime.owner.close();
+    }
+    #[test]
+    #[ignore="explicit isolated PG; original corruption and PG failure must refuse literal native callers"]
+    fn native_spot_callers_refuse_missing_malformed_mixed_and_oversized_originals() {
+        for mutation in ["update spots set native_original_xml=null","update spots set native_original_xml=decode('ff','hex')",
+            "update spots set xml='a display-only substitute'","update spots set native_original_xml=decode(repeat('78',51201),'hex')"] {
+            let (schema,runtime,_dir,id)=crate::spotnet::native_read_fixture_tests::fixture();runtime.owner.with(|tx|{tx.batch_execute(mutation)?;Ok(())}).unwrap();
+            let mut client=schema.pool.get().unwrap();let snapshot=view(&mut client,&schema.name,4*1024*1024);
+            assert!(dispatch(&snapshot,"/ui/results",&HashMap::new(),"http://example.invalid","fixture-key").is_err(),"{mutation}");
+            assert!(dispatch(&snapshot,"/ui/release",&HashMap::from([("id".into(),id.to_string())]),"http://example.invalid","fixture-key").is_err(),"{mutation}");
+            assert!(rss(&snapshot).is_err(),"{mutation}");drop(snapshot);runtime.owner.close();
+        }
+        let (schema,runtime,_dir,id)=crate::spotnet::native_read_fixture_tests::fixture();let mut client=schema.pool.get().unwrap();
+        let snapshot=view(&mut client,&schema.name,131072);assert!(dispatch(&snapshot,"/ui/release",&HashMap::from([("id".into(),id.to_string())]),"http://example.invalid","fixture-key").is_err(),"original comment/decoder workspace must fit request admission");drop(snapshot);
+        runtime.owner.with(|tx|{tx.batch_execute("alter table spots rename to unavailable_spot_reads")?;Ok(())}).unwrap();
+        let snapshot=view(&mut client,&schema.name,4*1024*1024);assert!(rss(&snapshot).is_err(),"PG errors never become tag absence");drop(snapshot);runtime.owner.close();
     }
 }
