@@ -3,17 +3,16 @@
 use std::sync::{Arc, LazyLock};
 
 use regex::bytes::RegexBuilder;
-use rusqlite::Connection;
 
 use crate::archive::select::nfo_sources;
+use crate::catalog_facts::SegmentPick;
 use crate::category::{self, Decision};
 use crate::config::Config;
 use crate::postprocess::schema::ShardTable;
 use crate::postprocess::step::{
-    BodyRequest, DeferredLegacyStepMutation, Got, Needs, Outcome, ReleaseInfo, Reruns, Step, StepCtx, StepError, StepId, StepMutation, StepWrite,
+    BodyRequest, Got, Needs, Outcome, ReleaseInfo, Reruns, Step, StepCtx, StepError, StepId, StepMutation, StepWrite,
 };
 use crate::probe::nfo_store;
-use crate::store::SegmentPick;
 
 use super::Media;
 use super::allocine::allocine_id;
@@ -185,38 +184,13 @@ impl Step for MediaParse {
             return Ok(Outcome { writes, ..Outcome::default() });
         };
         let key = key_of(kind, &p);
-        let write = if self.0.is_native() {
-            StepWrite::for_mutation(id,StepMutation::ParseMedia {kind,title_key:key,parsed:p})
-        } else {StepWrite::for_deferred_legacy(id,DeferredLegacyStepMutation::MediaParse {media:self.0.clone(),kind,title_key:key,parsed:p})};
+        let write = StepWrite::for_mutation(id, StepMutation::ParseMedia { kind, title_key: key, parsed: p });
         let mut writes = vec![write];
         // the title a probed file's own tags name, put on the row as it's made: a release named only after its probe
         // ran had no row for the probe to pin them on, and the probe isn't run again for a rename
         writes.extend(crate::probe::step::title_writes(id, ctx.data().saved_probe_media(id)?.as_ref()));
         Ok(Outcome { matched: true, writes, ..Outcome::default() })
     }
-}
-
-/// The media facts of the release's saved probe, when it has one that decodes.
-pub(crate) fn saved_media(conn: &Connection, id: i64) -> Option<crate::probe::media::MediaInfo> {
-    let info: String = conn
-        .prepare_cached("select info from release_probe where release_id = ?1")
-        .ok()?
-        .query_row([id], |r| r.get(0))
-        .ok()?;
-    serde_json::from_str::<crate::probe::ProbeInfo>(&info).ok()?.media
-}
-
-/// Whether rows of this title in this shard hold IDs. The newest few are enough: a fan-out reaches them all alike.
-pub(crate) fn stale_ids(conn: &Connection, key: i64) -> rusqlite::Result<bool> {
-    conn.prepare_cached(
-        "select 1 from (select tvdb_id, tvmaze_id, trakt_id, tmdb_id, imdb_id, tvrage_id, imdb_from_nfo, tmdb_from_tag, tvdb_from_tag
-           from media_release indexed by media_release_title where title_key = ?1 order by release_id desc limit 100)
-         where (tvdb_id is not null and tvdb_from_tag = 0) or tvmaze_id is not null or trakt_id is not null
-            or (tmdb_id is not null and tmdb_from_tag = 0)
-            or tvrage_id is not null or (imdb_id is not null and imdb_from_nfo = 0)
-         limit 1",
-    )?
-    .exists([key])
 }
 
 fn found_write(id: i64, key: i64, ids: &Ids) -> StepWrite {
@@ -249,15 +223,12 @@ impl Step for MediaLookup {
         u64::from(self.0.provider_bits())
     }
     fn applies(&self, r: &ReleaseInfo) -> bool {
-        target_of(&self.0, r).is_some_and(|(kind, p)| self.0.is_native() || self.0.wants(kind, key_of(kind, &p), r.id, now_secs()))
+        target_of(&self.0, r).is_some()
     }
     /// Without `wants`, which claims a title for the release that asks: the page mustn't.
     fn skip_reason(&self, r: &ReleaseInfo) -> Option<&'static str> {
         match target_of(&self.0, r) {
             None => Some("no movie or TV title in its name to look up"),
-            Some((kind, p)) if !self.0.is_native() && self.0.looked_up(kind, key_of(kind, &p), now_secs()) => {
-                Some("its title's IDs are already known, or it was looked up lately")
-            }
             Some(_) => None,
         }
     }
@@ -269,12 +240,10 @@ impl Step for MediaLookup {
         let Some((kind, p)) = target_of(&self.0, ctx.release()) else { return Ok(Outcome::default()) };
         let key = key_of(kind, &p);
         let (title, country) = split_country(&p.title);
-        let _claim=if self.0.is_native() {
-            match self.0.claim_native(key,id,now_secs()) {
-                Some(claim)=>Some(claim),
-                None=>return Ok(Outcome {wait_until:Some(now_secs()+1),..Outcome::default()}),
-            }
-        } else {None};
+        let _claim = match self.0.claim_native(key, id, now_secs()) {
+            Some(claim) => claim,
+            None => return Ok(Outcome { wait_until: Some(now_secs() + 1), ..Outcome::default() }),
+        };
         // `AC31594` is AlloCiné's: what it is, by name and by whatever ids Wikidata has, before any provider
         let decoded = match (allocine_id(title), self.0.allocine()) {
             (Some(ac), Some(allocine)) => match allocine.decode(kind, ac) {
@@ -288,7 +257,7 @@ impl Step for MediaLookup {
                     self.0.clear_claim(key);
                     return Err(StepError::Retry(e));
                 }
-                Err(Trouble::Cache(error))=>return Err(StepError::from_cache(error.into_error())),
+                Err(Trouble::Cache(error)) => return Err(StepError::from_cache(error.into_error())),
             },
             _ => None,
         };
@@ -302,7 +271,10 @@ impl Step for MediaLookup {
             self.0.resolve_seeded_checked(&q, key, now_secs(), &|| ctx_ref.stopping(), seed)
         };
         let reindex = || decoded.as_ref().map(|_| StepWrite::for_mutation(id, StepMutation::ReindexWords));
-        match resolved.map_err(|error|match error {super::resolve::ResolveFailure::Cache(error)=>self.0.cache_step_error(error),super::resolve::ResolveFailure::Provider(error)=>StepError::Retry(error)})? {
+        match resolved.map_err(|error| match error {
+            super::resolve::ResolveFailure::Cache(error) => self.0.cache_step_error(error),
+            super::resolve::ResolveFailure::Provider(error) => StepError::Retry(error),
+        })? {
             Resolved::Found(ids) => {
                 let writes = std::iter::once(found_write(id, key, &ids)).chain(reindex()).collect();
                 Ok(Outcome { matched: true, writes, ..Outcome::default() })
@@ -312,7 +284,7 @@ impl Step for MediaLookup {
                 // and a title decoded from an AlloCiné id: its other releases are found by it too, once fan-out
                 // queues them for the word index
                 if decoded.is_some() || ctx.data().stale_media_ids(key)? {
-                    self.0.fan_out_again_checked(key).map_err(|error|self.0.cache_step_error(error))?;
+                    self.0.fan_out_again_checked(key).map_err(|error| self.0.cache_step_error(error))?;
                 }
                 Ok(Outcome { writes: reindex().into_iter().collect(), ..Outcome::default() })
             }
@@ -345,27 +317,27 @@ impl Step for MediaNfo {
         Reruns { on_rename: true, on_growth: true }
     }
     fn applies(&self, r: &ReleaseInfo) -> bool {
-        target_of(&self.0, r).is_some_and(|(kind, p)| kind == Kind::Movie && (self.0.is_native() || !self.0.imdb_known(key_of(kind, &p))))
+        target_of(&self.0, r).is_some_and(|(kind, _)| kind == Kind::Movie)
     }
     fn skip_reason(&self, r: &ReleaseInfo) -> Option<&'static str> {
         match target_of(&self.0, r) {
             None => Some("no movie title in its name to find an IMDb id for"),
             Some((Kind::Tv, _)) => Some("an episode: only a movie's NFO is read for its IMDb id"),
-            Some((kind, p)) if !self.0.is_native() && self.0.imdb_known(key_of(kind, &p)) => Some("its title's IMDb id is already known"),
             Some(_) => None,
         }
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
-        let retry = |e: rusqlite::Error| self.0.cache_step_error(anyhow::Error::new(e));
         let id = ctx.release().id;
-        if self.0.is_native() && let Some((kind,parsed))=target_of(&self.0,ctx.release()) {
-            if self.0.imdb_known_checked(key_of(kind,&parsed)).map_err(StepError::from_cache)? {return Ok(Outcome::default())}
+        if let Some((kind, parsed)) = target_of(&self.0, ctx.release()) {
+            if self.0.imdb_known_checked(key_of(kind, &parsed)).map_err(StepError::from_cache)? {
+                return Ok(Outcome::default());
+            }
         }
         let current = ctx.data().media_imdb_marker(id)?;
         if !matches!(current, Some(None)) {
             return Ok(Outcome::default());
         }
-        let files = ctx.files().map_err(retry)?;
+        let files = ctx.files().map_err(StepError::from_inventory)?;
         let Some(file) = nfo_sources(&files).into_iter().next() else { return Ok(Outcome::default()) };
         let par2_names = ctx.data().par2_names(id, &files)?;
         let par2_name = par2_names.get(&file.filename).map(String::as_str);
@@ -375,7 +347,8 @@ impl Step for MediaNfo {
             let write = StepWrite::for_mutation(id, StepMutation::PinNfoMovieImdb { imdb_id: imdb });
             return Ok(Outcome { matched: true, writes: vec![write], ..Outcome::default() });
         }
-        let segment = ctx.segments(file.id, &SegmentPick::First(1)).map_err(retry)?.into_iter().next();
+        let segment =
+            ctx.segments(file.id, &SegmentPick::First(1)).map_err(StepError::from_inventory)?.into_iter().next();
         let Some(segment) = segment.filter(|s| s.part.is_none_or(|p| p <= 1)) else { return Ok(Outcome::default()) };
         let wanted =
             [BodyRequest { message_id: segment.message_id, file: file.filename.clone(), max_bytes: Some(NFO_READ) }];
@@ -395,12 +368,13 @@ impl Step for MediaNfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     #[test]
     fn a_spots_kind_gives_its_title_to_look_up() {
         // a name the category rules don't read as a movie: the spot says it is one
-        let media = Media::new(Path::new("/nowhere/atlas.db"));
+        let Some(schema) = crate::pg::testing::Schema::new() else { return };
+        let runtime = crate::pg::stage_queue_tests::runtime(&schema);
+        let media = super::super::native_service(&runtime.owner, &Config::default()).unwrap();
         let r = ReleaseInfo {
             name: "01. The Matrix (1999) 4k UHD Rife 60fps AI-Enhanced Dolby True-HD Atmos".into(),
             group: "alt.binaries.boneless".into(),
@@ -416,61 +390,22 @@ mod tests {
 
     #[test]
     fn each_step_has_its_lane() {
-        let media = Media::new(Path::new("/nowhere/atlas.db"));
+        let Some(schema) = crate::pg::testing::Schema::new() else { return };
+        let runtime = crate::pg::stage_queue_tests::runtime(&schema);
+        let media = super::super::native_service(&runtime.owner, &Config::default()).unwrap();
         assert_eq!(MediaParse(media.clone()).needs(), Needs::Database);
         assert_eq!(MediaLookup(media.clone()).needs(), Needs::External);
         assert_eq!(MediaNfo(media).needs(), Needs::Bodies);
     }
 
     #[test]
-    fn a_files_own_tags_pin_its_ids_against_a_lookup_by_name() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(MEDIA_RELEASE.create).unwrap();
-        for (col, decl) in MEDIA_RELEASE.added {
-            conn.execute_batch(&format!("alter table media_release add column {col} {decl}")).unwrap();
-        }
-        let row = |kind: i64| {
-            conn.execute(
-                "insert or replace into media_release (release_id, kind, title_key, quality) values (1, ?1, 77, 0)",
-                [kind],
-            )
-            .unwrap();
-        };
-        let run = |writes: Vec<crate::postprocess::step::StepWrite>| {
-            for w in writes {
-                conn.execute(w.sql, rusqlite::params_from_iter(w.params)).unwrap();
-            }
-        };
-        let media = crate::probe::media::MediaInfo {
-            tags: [("IMDB", "tt0133093"), ("TMDB", "movie/603"), ("TVDB", "81189")]
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
-            ..Default::default()
-        };
-        row(Kind::Movie as i64);
-        run(crate::probe::step::title_writes(1, Some(&media)));
-        let ids = || -> (Option<i64>, Option<i64>, Option<i64>) {
-            conn.query_row("select imdb_id, tmdb_id, tvdb_id from media_release where release_id = 1", [], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-            })
-            .unwrap()
-        };
-        assert_eq!(ids(), (Some(133_093), Some(603), None), "a TVDB id is a show's: not on a movie");
-        // the lookup by name finds another title: the tags' ids stay
-        conn.execute(FOUND, rusqlite::params![1, 77, 5, 6, 7, 999, 888, 4]).unwrap();
-        assert_eq!(ids(), (Some(133_093), Some(603), Some(5)));
-        // a show's row takes neither the movie's TMDB nor its IMDb id
-        row(Kind::Tv as i64);
-        run(crate::probe::step::title_writes(1, Some(&media)));
-        assert_eq!(ids(), (None, None, Some(81_189)));
-    }
-
-    #[test]
     fn the_saved_probes_tags_reach_a_row_made_later() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("create table release_probe (release_id INTEGER PRIMARY KEY, info TEXT)").unwrap();
-        assert!(saved_media(&conn, 1).is_none(), "no probe");
+        let Some(schema) = crate::pg::testing::Schema::new() else { return };
+        let runtime = crate::pg::stage_queue_tests::runtime(&schema);
+        crate::pg::stage_queue_tests::push(&runtime);
+        let reads = crate::pg::stage_reads::StepReads::for_owner(&runtime.owner).unwrap();
+        let id = runtime.owner.with(|c| Ok(c.query_one("select id from releases", &[])?.get::<_, i64>(0))).unwrap();
+        assert!(reads.saved_probe_media(id).unwrap().is_none());
         let probe = crate::probe::ProbeInfo {
             media: Some(crate::probe::media::MediaInfo {
                 tags: [("IMDB".to_string(), "tt0133093".to_string())].into_iter().collect(),
@@ -478,11 +413,18 @@ mod tests {
             }),
             ..Default::default()
         };
-        conn.execute("insert into release_probe values (1, ?1)", [serde_json::to_string(&probe).unwrap()]).unwrap();
-        conn.execute("insert into release_probe values (2, 'not json')", []).unwrap();
-        let media = saved_media(&conn, 1).expect("the saved media");
+        let json = serde_json::to_string(&probe).unwrap();
+        runtime
+            .owner
+            .with(|c| Ok(c.execute("insert into release_probe(release_id,info) values($1,$2)", &[&id, &json])?))
+            .unwrap();
+        let media = reads.saved_probe_media(id).unwrap().expect("saved native media");
         assert_eq!(media.title_ids().imdb, Some(133_093));
-        assert_eq!(crate::probe::step::title_writes(1, Some(&media)).len(), 1);
-        assert!(saved_media(&conn, 2).is_none(), "a probe that doesn't decode gives nothing");
+        assert_eq!(crate::probe::step::title_writes(id, Some(&media)).len(), 1);
+        runtime
+            .owner
+            .with(|c| Ok(c.execute("update release_probe set info='not json' where release_id=$1", &[&id])?))
+            .unwrap();
+        assert!(reads.saved_probe_media(id).is_err(), "malformed native storage remains a typed failure");
     }
 }

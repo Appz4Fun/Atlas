@@ -3,13 +3,12 @@ use super::*;
 use crate::pg::service_cache::details as pg_details;
 
 #[test]
-#[ignore="requires explicit isolated PostgreSQL for native detail codec parity"]
-fn native_detail_rows_match_existing_sqlite_oracle_with_nulls_and_negative_tvdb_keys() {
+#[ignore="requires explicit isolated PostgreSQL for native detail codec controls"]
+fn native_detail_rows_round_trip_fixed_nulls_and_negative_tvdb_keys() {
     let schema=crate::pg::testing::Schema::new().expect("explicit isolated PG required");let mut pg=schema.pool.get().unwrap();
-    let sqlite=rusqlite::Connection::open_in_memory().unwrap();sqlite.execute_batch(SCHEMA).unwrap();sqlite.execute_batch("alter table details add column backdrop text").unwrap();
-    for row in [from_tmdb(Kind::Movie as i64,42,&serde_json::json!({"title":"Original","overview":"é <raw>","vote_average":7.1}),123),from_tvdb(7,&serde_json::json!({"name":"Fallback"}),"https://images.invalid",125)] {
-        write(&sqlite,&row).unwrap();pg_details::put_in(&mut *pg,&row).unwrap();
-        assert_eq!(pg_details::read_in(&mut *pg,row.kind,row.tmdb_id).unwrap(),read(&sqlite,row.kind,row.tmdb_id).unwrap());
+    for row in [Details {kind:1,tmdb_id:42,title:Some("Original".into()),overview:Some("é <raw>".into()),fetched_at:123,..Default::default()},Details {kind:2,tmdb_id:-7,title:Some("Fallback".into()),fetched_at:125,..Default::default()}] {
+        pg_details::put_in(&mut *pg,&row).unwrap();
+        assert_eq!(pg_details::read_in(&mut *pg,row.kind,row.tmdb_id).unwrap(),Some(row));
     }
     let key=lookup_key(2,&Ids {tvdb:Some(7),..Default::default()});
     pg_details::put_lookup_in(&mut *pg,&key,None,123).unwrap();

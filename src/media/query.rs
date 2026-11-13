@@ -1,16 +1,11 @@
 //! Searches by ID, and what results say of a release's IDs.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-use rusqlite::{Connection, OptionalExtension, params};
-
-use crate::category::CatFilter;
 use crate::config::{self, MediaConfig};
-use crate::db;
-use crate::search::{self, Bounds, MAX_FILTER_OFFSET, ReleaseRow};
-use crate::store;
+use crate::search::ReleaseRow;
 
 use super::resolve::Ids;
 use super::title::Kind;
@@ -186,131 +181,6 @@ pub struct IdPage {
     pub scanned: usize,
 }
 
-#[doc(hidden)]
-pub fn episode_sql(s: usize, col: &str) -> String {
-    format!(
-        "select release_id from (select release_id, kind, season, episode, episode_last from s{s}.media_release
-          where {col} = ?1 order by release_id desc limit ?5)
-         where kind = ?2 and season = ?3 and episode <= ?4 and coalesce(episode_last, episode) >= ?4 limit ?6"
-    )
-}
-
-#[doc(hidden)]
-pub fn season_sql(s: usize, col: &str) -> String {
-    format!(
-        "select release_id from (select release_id, kind, season from s{s}.media_release
-          where {col} = ?1 order by release_id desc limit ?4)
-         where kind = ?2 and season = ?3 limit ?5"
-    )
-}
-
-#[doc(hidden)]
-pub fn id_sql(s: usize, col: &str) -> String {
-    format!(
-        "select release_id from (select release_id, kind from s{s}.media_release
-          where {col} = ?1 order by release_id desc limit ?3)
-         where kind = ?2 limit ?4"
-    )
-}
-
-/// Every matching id, newest first, within `scan` index rows and `id_rows` matches per shard and ID.
-fn gather(conn: &Connection, q: &IdQuery, scan: i64, id_rows: i64) -> db::Result<Vec<i64>> {
-    let kind = q.kind as i64;
-    let mut ids = Vec::new();
-    for s in 0..store::SHARDS {
-        for (column, value) in &q.ids {
-            let col = column.column();
-            let found: Vec<i64> = match (q.season, q.episode) {
-                (Some(season), Some(episode)) => conn
-                    .prepare_cached(&episode_sql(s, col))?
-                    .query_map(params![value, kind, season, episode, scan, id_rows], |r| r.get(0))?
-                    .collect::<db::Result<_>>()?,
-                (Some(season), None) => conn
-                    .prepare_cached(&season_sql(s, col))?
-                    .query_map(params![value, kind, season, scan, id_rows], |r| r.get(0))?
-                    .collect::<db::Result<_>>()?,
-                _ => conn
-                    .prepare_cached(&id_sql(s, col))?
-                    .query_map(params![value, kind, scan, id_rows], |r| r.get(0))?
-                    .collect::<db::Result<_>>()?,
-            };
-            ids.extend(found);
-        }
-    }
-    ids.sort_unstable_by(|a, b| b.cmp(a));
-    ids.dedup();
-    Ok(ids)
-}
-
-fn passes(conn: &Connection, filter: &CatFilter, id: i64) -> db::Result<bool> {
-    let s = store::shard_of_id(id);
-    let category: Option<i64> = conn
-        .prepare_cached(&format!("select category from s{s}.release_category where release_id = ?1"))?
-        .query_row([id], |r| r.get(0))
-        .optional()?;
-    Ok(match category {
-        Some(c) => filter.leaves.contains(&c),
-        None => filter.uncategorized,
-    })
-}
-
-#[doc(hidden)]
-#[allow(clippy::too_many_arguments)]
-pub fn find_bounded(
-    conn: &Connection,
-    q: &IdQuery,
-    cats: Option<&CatFilter>,
-    offset: i64,
-    limit: i64,
-    bounds: &Bounds,
-    id_rows: i64,
-    id_scan: i64,
-) -> db::Result<IdPage> {
-    if offset > MAX_FILTER_OFFSET {
-        return Ok(IdPage { rows: Vec::new(), scanned: 0 });
-    }
-    let (mut rows, mut seen, mut scanned, mut rejected) = (Vec::new(), 0i64, 0usize, 0usize);
-    for id in gather(conn, q, id_scan, id_rows)? {
-        scanned += 1;
-        let hit = if cats.is_none_or(|f| passes(conn, f, id).unwrap_or(false)) {
-            search::visible_release(conn, id)?
-        } else {
-            None
-        };
-        let Some(hit) = hit else {
-            rejected += 1;
-            if rejected > bounds.rejects {
-                break;
-            }
-            continue;
-        };
-        seen += 1;
-        if seen > offset {
-            rows.push(hit);
-            if rows.len() as i64 == limit {
-                break;
-            }
-        }
-    }
-    Ok(IdPage { rows, scanned })
-}
-
-pub fn find_with(
-    conn: &Connection,
-    q: &IdQuery,
-    cats: Option<&CatFilter>,
-    offset: i64,
-    limit: i64,
-    bounds: &Bounds,
-    id_rows: i64,
-) -> db::Result<IdPage> {
-    find_bounded(conn, q, cats, offset, limit, bounds, id_rows, ID_SCAN)
-}
-
-pub fn find(q: &IdQuery, cats: Option<&CatFilter>, offset: i64, limit: i64) -> db::Result<Vec<ReleaseRow>> {
-    Ok(find_with(&db::open()?, q, cats, offset, limit, &Bounds::DEFAULT, ID_ROWS)?.rows)
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MediaAttrs {
     pub kind: i64,
@@ -319,54 +189,6 @@ pub struct MediaAttrs {
     pub air_date: Option<i64>,
     pub year: Option<i64>,
     pub ids: Ids,
-}
-
-pub fn attrs_of(ids: &[i64]) -> db::Result<HashMap<i64, MediaAttrs>> {
-    if ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-    db::with_reader(|conn| attrs_with(conn, ids))
-}
-
-pub fn attrs_with(conn: &Connection, ids: &[i64]) -> db::Result<HashMap<i64, MediaAttrs>> {
-    let mut by_shard: BTreeMap<usize, Vec<String>> = BTreeMap::new();
-    for id in ids {
-        by_shard.entry(store::shard_of_id(*id)).or_default().push(id.to_string());
-    }
-    let mut out = HashMap::with_capacity(ids.len());
-    for (shard, list) in by_shard {
-        let sql = format!(
-            "select release_id, kind, season, episode, air_date, year, tvdb_id, tvmaze_id, trakt_id, tmdb_id, imdb_id, tvrage_id
-             from s{shard}.media_release where release_id in ({})",
-            list.join(",")
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                MediaAttrs {
-                    kind: r.get(1)?,
-                    season: r.get(2)?,
-                    episode: r.get(3)?,
-                    air_date: r.get(4)?,
-                    year: r.get(5)?,
-                    ids: Ids {
-                        tvdb: r.get(6)?,
-                        tvmaze: r.get(7)?,
-                        trakt: r.get(8)?,
-                        tmdb: r.get(9)?,
-                        imdb: r.get(10)?,
-                        tvrage: r.get(11)?,
-                    },
-                },
-            ))
-        })?;
-        for row in rows {
-            let (id, attrs) = row?;
-            out.insert(id, attrs);
-        }
-    }
-    Ok(out)
 }
 
 fn attr(out: &mut String, name: &str, value: impl std::fmt::Display) {
