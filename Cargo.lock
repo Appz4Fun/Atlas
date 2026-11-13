@@ -2367,7 +2367,7 @@ dependencies = [
 [[package]]
 name = "par-rs"
 version = "0.2.0"
-source = "git+https://github.com/xbmc4lyfe/par-rs?branch=main#7e93ac5e38029426cc5e4b9bd9a445a118e6b156"
+source = "git+https://github.com/xbmc4lyfe/par-rs?rev=fb13bd33ca741d4b73ae37d28442d9e2401da4b4#fb13bd33ca741d4b73ae37d28442d9e2401da4b4"
 dependencies = [
  "crc32fast",
  "md-5 0.10.6",
@@ -3818,7 +3818,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -5101,23 +5101,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "zip-container"
+version = "0.1.0"
+source = "git+https://github.com/xbmc4lyfe/zipfast?rev=7c681b66a603d36b9ed603ed49f0630a37f9617b#7c681b66a603d36b9ed603ed49f0630a37f9617b"
+
+[[package]]
 name = "zipfast"
 version = "0.1.0"
-source = "git+https://github.com/xbmc4lyfe/zipfast?rev=f0274b2e7fb4b024b25afdfa31878fd135e12849#f0274b2e7fb4b024b25afdfa31878fd135e12849"
+source = "git+https://github.com/xbmc4lyfe/zipfast?rev=7c681b66a603d36b9ed603ed49f0630a37f9617b#7c681b66a603d36b9ed603ed49f0630a37f9617b"
 dependencies = [
  "bzip2",
  "crc32fast",
  "flate2",
+ "getrandom 0.4.3",
+ "libc",
  "liblzma",
+ "subtle",
+ "tempfile",
+ "zip-container",
  "zstd 0.14.3",
 ]
 
 [[package]]
 name = "zipview"
 version = "0.1.0"
-source = "git+https://github.com/xbmc4lyfe/zipview?rev=2c3d73a06b29987cea1510e903e437a482076745#2c3d73a06b29987cea1510e903e437a482076745"
+source = "git+https://github.com/xbmc4lyfe/zipfast?rev=7c681b66a603d36b9ed603ed49f0630a37f9617b#7c681b66a603d36b9ed603ed49f0630a37f9617b"
 dependencies = [
  "flate2",
+ "subtle",
+ "zip-container",
 ]
 
 [[package]]
