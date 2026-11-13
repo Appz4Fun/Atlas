@@ -573,3 +573,22 @@ begin
 end $$;
 create trigger native_archive_names_delete before delete on releases
  for each row execute function atlas_native_archive_names_delete();
+
+-- Only accepted nameless messages retain their original NZB envelope here.
+-- Named files keep the ordinary winning representative; reads stream bytea
+-- ranges rather than materializing large subjects or guessing absent metadata.
+create table segment_nzb_metadata (
+ release_id bigint not null,
+ message_key bytea not null,
+ subject bytea not null,
+ poster bytea not null,
+ posted_date bytea not null,
+ nzb_timestamp bigint not null,
+ expected bigint,
+ subject_file_index bigint,
+ subject_file_total bigint,
+ primary key(release_id,message_key),
+ foreign key(release_id,message_key) references segments(release_id,message_key) on delete cascade
+);
+create trigger atlas_history_write_gate before insert or update or delete or truncate on segment_nzb_metadata
+ for each statement execute function atlas_native_write_trigger();

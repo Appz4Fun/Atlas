@@ -64,7 +64,7 @@ fn resolved_header_base(path:&std::path::Path)->Result<std::path::PathBuf> {
 fn require_pristine_catalog(client:&mut impl GenericClient)->Result<()> {
     // Closed canonical table names, never request-supplied identifiers. Cache
     // ext_* tables deliberately do not participate in this fresh-data test.
-    const EMPTY:&[&str]=&["releases","files","segments","file_parts","header_blocks","pp_queue","pp_state","pp_walks",
+    const EMPTY:&[&str]=&["releases","files","segments","segment_nzb_metadata","file_parts","header_blocks","pp_queue","pp_state","pp_walks",
         "groups","backfill_chunks","backfill_deepest","backfill_media","backfill_speculative","backfill_sweep_gen",
         "backfill_sweeps","backfill_wanted","spot_comments","spot_disposals","spot_reports","spots_seen",
         "inferred_asked","inferred_ids","repair_tried","repair_older","archive_inner_files","sidecars","archive_release",
