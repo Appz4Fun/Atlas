@@ -113,12 +113,8 @@ mod tests {
         1i64.saturating_sub(delay)
     }
 
-    fn schema() -> Option<crate::pg::testing::Schema> {
-        let schema = crate::pg::testing::Schema::native_writer();
-        if schema.is_none() {
-            eprintln!("requires explicit ATLAS_PG_TEST_URL for native junk assertions");
-        }
-        schema
+    fn schema() -> crate::pg::testing::Schema {
+        crate::pg::testing::Schema::native_writer().expect("explicit isolated PostgreSQL required")
     }
 
     fn counts(client: &mut postgres::Client) -> (i64, i64, i64) {
@@ -132,8 +128,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires explicit isolated PostgreSQL for native junk assertions"]
     fn a_post_with_a_program_is_never_saved_and_nothing_after_it_is() {
-        let Some(schema) = schema() else { return };
+        let schema = schema();
         let mut client = schema.pool.get().unwrap();
         crate::pg::release_writer::save(
             &mut client,
@@ -151,8 +148,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires explicit isolated PostgreSQL for native junk assertions"]
     fn a_program_arriving_late_takes_the_release_and_its_counts() {
-        let Some(schema) = schema() else { return };
+        let schema = schema();
         let mut client = schema.pool.get().unwrap();
         crate::pg::release_writer::save(
             &mut client,
@@ -169,12 +167,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires explicit isolated PostgreSQL for native junk assertions"]
     fn what_is_stored_tells_a_release_is_junk() {
         use crate::pg::stage_queue::{Queue, Settlement, Visit};
-        let Some(schema) = crate::pg::testing::Schema::new() else {
-            eprintln!("requires explicit ATLAS_PG_TEST_URL for native junk inventory/settlement");
-            return;
-        };
+        let schema = crate::pg::testing::Schema::new().expect("explicit isolated PostgreSQL required");
         let runtime = crate::pg::stage_queue_tests::runtime(&schema);
         let (packed, film) = runtime
             .owner
@@ -252,8 +248,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires explicit isolated PostgreSQL for native junk assertions"]
     fn native_junk_retraction_finds_collection_identity_by_index() {
-        let Some(schema) = schema() else { return };
+        let schema = schema();
         let mut client = schema.pool.get().unwrap();
         let mut release = post("Collection", &["video.mkv"]);
         release.collection = Some("collection-key".into());
@@ -276,11 +273,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires explicit isolated PostgreSQL for native junk assertions"]
     fn a_program_a_par2_set_describes_is_junk() {
-        let Some(schema) = crate::pg::testing::Schema::new() else {
-            eprintln!("requires explicit ATLAS_PG_TEST_URL for native PAR2 junk inventory");
-            return;
-        };
+        let schema = crate::pg::testing::Schema::new().expect("explicit isolated PostgreSQL required");
         let runtime = crate::pg::stage_queue_tests::runtime(&schema);
         crate::pg::stage_queue_tests::push(&runtime);
         let id=runtime.owner.with(|client| {

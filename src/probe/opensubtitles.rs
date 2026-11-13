@@ -264,12 +264,8 @@ mod tests {
         assert!(!is_hash("8e245d9679d31e1&"));
     }
 
-    fn schema() -> Option<crate::pg::testing::Schema> {
-        let schema = crate::pg::testing::Schema::new();
-        if schema.is_none() {
-            eprintln!("requires explicit ATLAS_PG_TEST_URL for owned OpenSubtitles step assertions");
-        }
-        schema
+    fn schema() -> crate::pg::testing::Schema {
+        crate::pg::testing::Schema::new().expect("explicit isolated PostgreSQL required")
     }
 
     fn run_step(runtime: &crate::pg::indexer_runtime::Runtime, id: i64, hash: &str) -> Result<Outcome, StepError> {
@@ -316,8 +312,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires explicit isolated PostgreSQL for owned OpenSubtitles assertions"]
     fn missing_native_owner_is_fatal_without_fetching_or_cache_fallback() {
-        let Some(schema) = schema() else { return };
+        let schema = schema();
         let runtime = crate::pg::stage_queue_tests::runtime(&schema);
         let id = release_id(&runtime);
         // The actual inventory is available. Only the cache attempt scope is
@@ -340,8 +337,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires explicit isolated PostgreSQL for owned OpenSubtitles assertions"]
     fn owned_cache_positive_and_negative_matches_produce_closed_results_without_provider() {
-        let Some(schema) = schema() else { return };
+        let schema = schema();
         let runtime = crate::pg::stage_queue_tests::runtime(&schema);
         let id = release_id(&runtime);
         let scope = runtime.db.bind_native_cache_scope().unwrap().expect("genuine owned cache scope");
@@ -392,7 +390,7 @@ mod tests {
     fn owned_pg_loss_preserves_actual_step_unavailability_without_fetching() {
         use crate::pg::outage::{AttemptOutcome, Failure, SessionUnavailable};
         use std::time::{Duration, Instant};
-        let schema = schema().expect("explicit isolated PostgreSQL required");
+        let schema = schema();
         let runtime = crate::pg::stage_queue_tests::runtime(&schema);
         let id = release_id(&runtime);
         let scope = runtime.db.bind_native_cache_scope().unwrap().expect("genuine owned cache scope");
