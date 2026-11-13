@@ -3096,6 +3096,8 @@ version = "0.1.0"
 dependencies = [
  "crc32fast",
  "libc",
+ "rustls",
+ "sha2 0.10.9",
 ]
 
 [[package]]
