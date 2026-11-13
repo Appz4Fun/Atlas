@@ -1087,11 +1087,10 @@ fn read_tail_tags(
     if !wants || info.archive.is_some() || !info.layers.is_empty() {
         return Ok(true);
     }
-    let segment = info.segment_size.filter(|s| *s > 0);
-    let (Some(segment), Some(size)) = (segment, info.yenc.as_ref().and_then(|y| y.file_size)) else {
-        return Ok(false);
+    let size = info.yenc.as_ref().and_then(|y| y.file_size);
+    let Some(at) = media::matroska_tags_past(front).into_iter().find(|at| size.is_none_or(|size| *at < size)) else {
+        return Ok(true);
     };
-    let Some(at) = media::matroska_tags_past(front).into_iter().find(|at| *at < size) else { return Ok(true) };
     let whole = |b: &[u8]| media::element_len(b).and_then(|n| usize::try_from(n).ok()).is_some_and(|n| n <= b.len());
     // past the first Cluster but inside what was read
     let read = usize::try_from(at).ok().and_then(|at| front.get(at..)).filter(|b| whole(b));
@@ -1099,6 +1098,8 @@ fn read_tail_tags(
     let tags = match read {
         Some(read) => read,
         None => {
+            let segment = info.segment_size.filter(|s| *s > 0);
+            let (Some(segment), Some(size)) = (segment, size) else { return Ok(false) };
             let first = at / segment + 1;
             let skip = usize::try_from(at - (first - 1) * segment).unwrap_or(usize::MAX);
             for part in first..=size.div_ceil(segment).min(first + TAIL_TAGS_PARTS - 1) {
@@ -1321,6 +1322,9 @@ fn inspect(body: &[u8], password: Option<&str>, info: &mut ProbeInfo) {
     }
     info.layers = nest.layers;
 }
+
+#[cfg(test)]
+mod buffered_tags_tests;
 
 #[cfg(test)]
 mod tests {
