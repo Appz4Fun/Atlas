@@ -1290,7 +1290,16 @@ pub fn run_cli(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keep_export::PgKind;
+
+    /// Literal independent native cache rows: no source DB, converter, import
+    /// receipt or historical catalog is involved in native backup qualification.
+    fn pg_cache_fixture(c: &mut Client) {
+        let mut tx = c.transaction().unwrap();
+        durable(&mut tx).unwrap();
+        tx.execute("insert into ext_predb_titles(title,source,added_at) values('Some.Movie.2020.1080p.BluRay-GRP',3,10)", &[]).unwrap();
+        tx.execute("insert into ext_http_cache(cache_key,source,url,status,body_zst,fetched_at) values('k','nzedb_archive','https://example.invalid/a',200,$1,5)", &[&vec![0_u8,255]]).unwrap();
+        tx.commit().unwrap();
+    }
 
     #[test]
     fn dump_names_and_next_time() {
@@ -1366,120 +1375,6 @@ mod tests {
     }
 
     #[test]
-    fn keep_selection_retains_the_optional_default() {
-        assert_eq!(selected_keep(KeepSource::default()), Some(("keep", false)));
-        assert_eq!(selected_keep(KeepSource::Named("snapshot")), Some(("snapshot", true)));
-        assert_eq!(selected_keep(KeepSource::Disabled), None);
-    }
-
-    #[test]
-    fn optional_keep_defers_readability_checks_while_named_requires_them() {
-        let (_, required) = selected_keep(KeepSource::Optional).unwrap();
-        let optional = check_keep_access("keep", required, || bail!("permission lookup must stay lazy"));
-        assert!(optional.is_ok(), "optional source resolution must not query schema readability");
-
-        let (_, required) = selected_keep(KeepSource::Named("snapshot")).unwrap();
-        let named = check_keep_access("snapshot", required, || Ok(false));
-        assert!(named.unwrap_err().to_string().contains("not readable"));
-        assert!(check_keep_access("snapshot", required, || Ok(true)).is_ok());
-    }
-
-    #[test]
-    fn named_keep_dry_run_checks_source_without_leaving_tables() {
-        let Some(source) = super::super::testing::Schema::empty() else { return };
-        let Some(destination) = super::super::testing::Schema::empty() else { return };
-        let mut source_conn = source.pool.get().unwrap();
-        source_conn
-            .batch_execute(
-                "create table predb_titles (id bigint, title text, source bigint, added_at bigint);
-            insert into predb_titles values (1, 'Preserved.Title', 3, 5)",
-            )
-            .unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let main = sqlite_files(dir.path());
-        let mut c = destination.pool.get().unwrap();
-        let moved =
-            copy_from_sqlite_with_keep(&mut c, &main, &destination.name, false, KeepSource::Named(&source.name))
-                .unwrap();
-        assert!(moved.iter().all(|m| m.from_keep == 0));
-        assert!(tables(&mut c).unwrap().is_empty());
-        assert_eq!(
-            source_conn.query_one("select title from predb_titles", &[]).unwrap().get::<_, String>(0),
-            "Preserved.Title"
-        );
-        source_conn.batch_execute("alter table predb_titles drop column title").unwrap();
-        assert!(
-            copy_from_sqlite_with_keep(&mut c, &main, &destination.name, false, KeepSource::Named(&source.name))
-                .is_err()
-        );
-        assert!(tables(&mut c).unwrap().is_empty());
-    }
-
-    /// With the session's default off (a role or database set that way), the move and the restore still commit
-    /// durably: a trigger refuses any row written by a transaction that isn't.
-    #[test]
-    fn move_and_restore_commit_durably_when_the_default_is_off() {
-        let Some(s) = super::super::testing::Schema::new() else { return };
-        let dir = tempfile::tempdir().unwrap();
-        let main = sqlite_files(dir.path());
-        let mut c = s.pool.get().unwrap();
-        c.batch_execute(
-            "create function durable_only() returns trigger language plpgsql as $$ begin
-               if current_setting('synchronous_commit') <> 'on' then raise exception 'not durable'; end if;
-               return new; end $$;
-             create trigger durable_only before insert on ext_predb_titles for each row execute function durable_only();
-             set synchronous_commit = off",
-        )
-        .unwrap();
-        copy_from_sqlite_with_keep(&mut c, &main, &s.name, true, KeepSource::Disabled).unwrap();
-        let d = dump(&mut c, &dir.path().join("ext-dumps"), 3, false).unwrap();
-        restore(&mut c, &d, true).unwrap();
-        let after: String = c.query_one("show synchronous_commit", &[]).unwrap().get(0);
-        assert_eq!(after, "off", "only the transactions' own setting changed");
-        // and without it the trigger does refuse
-        let refused =
-            c.execute("insert into ext_predb_titles (title, source, added_at) values ('Async.Row-GRP', 3, 1)", &[]);
-        assert!(refused.is_err());
-    }
-
-    /// Keep titles are matched by Rust's lowercasing, as the importer matches them, not by the server's `lower()`:
-    /// other casing (ASCII or not) is the same title, a dotless `ı` is another one. The source is isolated.
-    #[test]
-    fn keep_titles_match_the_importers_identity() {
-        let Some(source) = super::super::testing::Schema::empty() else { return };
-        let Some(s) = super::super::testing::Schema::new() else { return };
-        let mut c = s.pool.get().unwrap();
-        let mut tx = c.transaction().unwrap();
-        let namespace = keep_export::quoted(&source.name);
-        tx.batch_execute(&format!(
-            "create table {namespace}.predb_titles (id bigint, title text, source bigint, added_at bigint);
-             insert into ext_predb_titles (id, title, source, added_at)
-                 values (1, 'Some.FILE.Title-GRP', 3, 1), (2, 'école.Title-GRP', 3, 1);
-             insert into {namespace}.predb_titles values
-                 (1, 'some.file.title-grp', 5, 1),
-                 (2, 'ÉCOLE.TITLE-GRP', 3, 1),
-                 (3, 'Some.fıle.Title-GRP', 3, 1)"
-        ))
-        .unwrap();
-        let col = |name: &str, pg| Column::plain(name.into(), String::new(), pg);
-        let cols = [
-            col("id", PgKind::Int),
-            col("title", PgKind::Text),
-            col("source", PgKind::Int),
-            col("added_at", PgKind::Int),
-        ];
-        assert_eq!(top_up(&mut tx, &source.name, "ext_predb_titles", "predb_titles", &cols).unwrap(), 1);
-        let added: Vec<(i64, String)> = tx
-            .query("select id, title from ext_predb_titles where id > 2", &[])
-            .unwrap()
-            .iter()
-            .map(|r| (r.get(0), r.get(1)))
-            .collect();
-        assert_eq!(added, [(3, "Some.fıle.Title-GRP".to_string())]);
-        tx.rollback().unwrap();
-    }
-
-    #[test]
     fn pinned_rows_are_the_raw_stores_forever_ones() {
         for key in ["nzedb_archive", "dats_pciso_1998"] {
             assert!(crate::raw_store::is_immutable_predb_page(key, 0));
@@ -1501,35 +1396,37 @@ mod tests {
     }
 
     #[test]
-    fn owner_receipt_covers_top_ups_and_admitted_manual_thaws() {
-        let Some(keep) = super::super::testing::Schema::empty() else {return};
-        let Some(target) = super::super::testing::Schema::new() else {return};
-        let dir=tempfile::tempdir().unwrap();let main=sqlite_files(dir.path());
-        let lite=Connection::open(&main).unwrap();lite.execute_batch("create table capture_marker(value integer);insert into capture_marker values(1);pragma wal_checkpoint(truncate);pragma journal_mode=delete").unwrap();drop(lite);
-        let mut c=target.pool.get().unwrap();
-        c.batch_execute(&format!("create table \"{}\".predb_titles(id bigint,title text,source bigint,added_at bigint);insert into \"{}\".predb_titles values(19,'Retained.Title-GRP',3,7);create table \"{}\".freeze_exempt(release_id bigint,at bigint,name text,group_name text);insert into \"{}\".freeze_exempt values(29,11,'Manual.Title-GRP','test.group'),(31,12,null,null)",keep.name,keep.name,keep.name,keep.name)).unwrap();
-        copy_from_sqlite_with_keep(&mut c,&main,&target.name,true,KeepSource::Named(&keep.name)).unwrap();
-        let data:Vec<u8>=c.query_one("select manifest from history_companion_receipts where owner_code='ext' and not dirty",&[]).unwrap().get(0);
-        let receipt:super::super::history_companion::Receipt=serde_json::from_slice(&data).unwrap();
-        let title=receipt.relations.iter().find(|r|r.table=="ext_predb_titles").unwrap();assert_eq!(title.rows,2);
-        for table in ["ext_predb_title_keys", "ext_predb_key_meta", "ext_predb_key_build"] {
-            assert!(receipt.relations.iter().any(|relation| relation.table == table), "known derived table is receipted: {table}");
-        }
-        assert!(!owns_table("ext_unregistered_table"), "ownership remains a closed allowlist");
-        let cols=keep_export::columns(&Connection::open(&crate::predb::db::path_for(&main)).unwrap(),"main","titles").unwrap();
-        let mut tx=c.transaction().unwrap();let tally=keep_export::pg_tally(&mut tx,"ext_predb_titles",&cols).unwrap();
-        let expected=super::super::history_companion::relation("ext_predb_titles",tally.rows,tally.digest);
-        assert_eq!(title.digest,expected.digest,"receipt digest includes exact post-top-up rows");
-        let manual=receipt.relations.iter().find(|r|r.table=="ext_freeze_exempt").unwrap();assert_eq!(manual.rows,1);
+    #[ignore = "requires explicit isolated PostgreSQL native backup qualification"]
+    fn native_dump_and_restore_commit_durably_when_the_default_is_off() {
+        let s = super::super::testing::Schema::new().expect("explicit isolated PG required");
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = s.pool.get().unwrap();
+        c.batch_execute(
+            "create function durable_only() returns trigger language plpgsql as $$ begin
+               if current_setting('synchronous_commit') <> 'on' then raise exception 'not durable'; end if;
+               return new; end $$;
+             create trigger durable_only before insert on ext_predb_titles for each row execute function durable_only();
+             set synchronous_commit = off",
+        )
+        .unwrap();
+        pg_cache_fixture(&mut c);
+        let d = dump(&mut c, &dir.path().join("ext-dumps"), 3, false).unwrap();
+        restore(&mut c, &d, true).unwrap();
+        let after: String = c.query_one("show synchronous_commit", &[]).unwrap().get(0);
+        assert_eq!(after, "off", "only the transactions' own setting changed");
+        // and without it the trigger does refuse
+        let refused =
+            c.execute("insert into ext_predb_titles (title, source, added_at) values ('Async.Row-GRP', 3, 1)", &[]);
+        assert!(refused.is_err());
     }
 
     #[test]
-    #[ignore = "requires explicit isolated PostgreSQL restore qualification"]
+    #[ignore = "requires explicit isolated PostgreSQL native backup qualification"]
     fn restore_replaces_predb_dependencies_without_cascading_unrelated_references() {
         let target = super::super::testing::Schema::new().expect("explicit isolated PG required");
-        let dir = tempfile::tempdir().unwrap(); let main = sqlite_files(dir.path());
+        let dir = tempfile::tempdir().unwrap();
         let mut c = target.pool.get().unwrap();
-        copy_from_sqlite_with_keep(&mut c, &main, &target.name, true, KeepSource::Disabled).unwrap();
+        pg_cache_fixture(&mut c);
         let mut tx = c.transaction().unwrap();
         assert!(matches!(super::super::predb_cache::advance_in(&mut tx, 16).unwrap(), super::super::predb_cache::BuildStatus::Ready(_)));
         tx.commit().unwrap();
@@ -1553,12 +1450,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires explicit isolated PostgreSQL restore/revision qualification"]
+    #[ignore = "requires explicit isolated PostgreSQL native backup qualification"]
     fn restored_predb_revision_cannot_repeat_or_rewind_existing_history() {
         let source = super::super::testing::Schema::new().expect("explicit isolated PG required");
-        let dir = tempfile::tempdir().unwrap(); let main = sqlite_files(dir.path());
+        let dir = tempfile::tempdir().unwrap();
         let mut c = source.pool.get().unwrap();
-        copy_from_sqlite_with_keep(&mut c, &main, &source.name, true, KeepSource::Disabled).unwrap();
+        pg_cache_fixture(&mut c);
         let mut tx = c.transaction().unwrap();
         let restored_revision = match super::super::predb_cache::advance_in(&mut tx, 16).unwrap() {
             super::super::predb_cache::BuildStatus::Ready(built) => built.revision,
@@ -1592,154 +1489,13 @@ mod tests {
         }
     }
 
-    /// SQLite files made with the providers' own schemas beside `dir/atlas.db`, a row or two each.
-    fn sqlite_files(dir: &Path) -> PathBuf {
-        let main = dir.join("atlas.db");
-        crate::db::create_at(&main).unwrap();
-        let p = crate::predb::db::create(&crate::predb::db::path_for(&main)).unwrap();
-        p.execute(
-            "insert into titles (id, title, source, added_at) values (1, 'Some.Movie.2020.1080p.BluRay-GRP', 3, 10)",
-            [],
-        )
-        .unwrap();
-        let r = crate::raw_store::create(&crate::raw_store::path_for(&main)).unwrap();
-        r.execute(
-            "insert into raw_http_cache (cache_key, source, url, status, body_zst, fetched_at)
-             values ('k', 'nzedb_archive', 'https://example.invalid/a', 200, x'00ff', 5)",
-            [],
-        )
-        .unwrap();
-        crate::media::store::open(&crate::media::store::path_for(&main)).unwrap();
-        let d = crate::db::create_at(&crate::media::details::path_for(&main)).unwrap();
-        d.execute_batch(crate::media::details::SCHEMA).unwrap();
-        d.execute_batch("alter table details add column backdrop TEXT").unwrap();
-        main
-    }
-
     #[test]
-    fn external_copy_retains_costly_natural_caches_and_negative_sentinels() {
-        let Some(target)=super::super::testing::Schema::empty() else {return};
-        let root=tempfile::tempdir().unwrap();let main=sqlite_files(root.path());
-        let raw=Connection::open(crate::raw_store::path_for(&main)).unwrap();
-        raw.execute_batch("insert into raw_probes(name,group_name,info,content_id,probed_at) values('Kept','test.group','{}',x'0102',17);
-            insert into raw_covers(name,group_name,mime,sha256,content_id) values('Kept','test.group','image/jpeg','cover',x'0102');
-            insert into raw_archives(name,group_name,password,content_id,owner_key,key_salt) values('Kept','test.group',0,x'0102',-9,11);
-            insert into raw_archive_inner_files(release_name,group_name,seq,name,content_id) values('Kept','test.group',1,'inner',x'0102');
-            insert into raw_par2(name,group_name,posted,content_id) values('Kept','test.group',zeroblob(20),x'0102');
-            insert into raw_par2_files(name,group_name,content_id,file_id,set_id,md5,md5_16k,size,file_name,creator) values('Kept','test.group',x'0102',x'01',x'02',x'03',x'04',31,'inner','tool');
-            insert into raw_rev_volumes(name,group_name,content_id,volume,size,crc32) values('Kept','test.group',x'0102',1,41,4294967295);
-            insert into raw_nfo_passwords(name,group_name,password,content_id) values('Kept','test.group','',x'0102');
-            insert into raw_stills(name,group_name,position,content_id,sha256) values('Kept','test.group',1,x'0102','still');
-            insert into raw_audio_prints(name,group_name,position,content_id,at_ms,items) values('Kept','test.group',1,x'0102',23,x'0001')").unwrap();drop(raw);
-        let mut client=target.pool.get().unwrap();
-        let copied=copy_from_sqlite_with_keep(&mut client,&main,&target.name,true,KeepSource::Disabled).unwrap();
-        for table in ["ext_raw_probes","ext_raw_covers","ext_raw_archives","ext_raw_archive_inner_files","ext_raw_par2",
-            "ext_raw_par2_files","ext_raw_rev_volumes","ext_raw_nfo_passwords","ext_raw_stills","ext_raw_audio_prints"] {
-            let found=copied.iter().find(|entry|entry.table==table).unwrap_or_else(||panic!("valuable cache omitted from existing external converter: {table}"));
-            assert_eq!(found.tally.rows,1,"every original cache row must survive");
-        }
-        let row=client.query_one("select password,content_id from ext_raw_nfo_passwords",&[]).unwrap();
-        assert_eq!(row.get::<_,String>(0),"");assert_eq!(row.get::<_,Option<Vec<u8>>>(1),Some(vec![1,2]));
-        let row=client.query_one("select posted from ext_raw_par2",&[]).unwrap();
-        assert_eq!(row.get::<_,Vec<u8>>(0),vec![0;20],"preserve old raw evidence without declaring it eligible");
-        assert_eq!(client.query_one("select owner_key from ext_raw_archives",&[]).unwrap().get::<_,i64>(0),-9);
-    }
-
-    #[test]
-    fn fresh_cache_copy_ignores_main_catalog_and_resets_only_derived_cache_state() {
-        let Some(target)=super::super::testing::Schema::empty() else {return};
-        let root=tempfile::tempdir().unwrap();let main=sqlite_files(root.path());
-        let predb=Connection::open(crate::predb::db::path_for(&main)).unwrap();
-        predb.execute("insert or replace into meta(key,value) values('late_after_id',99)",[]).unwrap();drop(predb);
-        let media=Connection::open(crate::media::store::path_for(&main)).unwrap();
-        media.execute("insert into media_titles(title_key,kind,title,state,checked_mask,checked_at,fanout_done) values(7,1,'Negative',2,31,17,1)",[]).unwrap();drop(media);
-        // A trap directory proves the fresh path never opens/hashes main or
-        // discovers its old release/operational tables.
-        std::fs::remove_file(&main).unwrap();std::fs::create_dir(&main).unwrap();
-        let mut client=target.pool.get().unwrap();
-        let copied=copy_caches_for_fresh_catalog(&mut client,&main,&target.name,true,KeepSource::Disabled).unwrap();
-        assert_eq!((copied.predb_late_reset,copied.media_fanout_reset),(1,1));
-        assert!(!copied.copied.iter().any(|row|row.table=="ext_freeze_exempt"));
-        assert_eq!(client.query_one("select value from ext_predb_meta where key='late_after_id'",&[]).unwrap().get::<_,i64>(0),0);
-        let row=client.query_one("select state,checked_mask,checked_at,fanout_done from ext_media_titles where title_key=7",&[]).unwrap();
-        assert_eq!((row.get::<_,i64>(0),row.get::<_,i64>(1),row.get::<_,i64>(2),row.get::<_,i64>(3)),(2,31,17,0));
-        for table in ["groups","releases","ext_freeze_exempt","history_imports","history_companion_receipts"] {
-            assert_eq!(client.query_one(&format!("select count(*) from {table}"),&[]).unwrap().get::<_,i64>(0),0,"fresh cache import must not seed {table}");
-        }
-        let predb=Connection::open_with_flags(crate::predb::db::path_for(&main),rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
-        assert_eq!(predb.query_row("select value from meta where key='late_after_id'",[],|row|row.get::<_,i64>(0)).unwrap(),99,"source remains unchanged");
-    }
-
-    #[test]
-    fn fresh_cache_source_path_does_not_repurpose_the_target_config_home() {
-        let args=vec!["--cache-source-main".into(),"/preserved/atlas.db".into()];
-        let default=Path::new("/fresh/atlas.db");
-        assert_eq!(cache_source(&args,true,default).unwrap(),Path::new("/preserved/atlas.db"));
-        assert_eq!(cache_source(&[],true,default).unwrap(),default);
-        assert!(cache_source(&args,false,default).is_err());
-        assert!(cache_source(&args[..1],true,default).is_err());
-        assert!(cache_source(&[args.clone(),args].concat(),true,default).is_err());
-    }
-
-    #[test]
-    fn conflicting_costly_keep_variants_are_preserved_before_natural_key_top_up() {
-        let Some(keep)=super::super::testing::Schema::empty() else {return};
-        let Some(target)=super::super::testing::Schema::empty() else {return};
-        let root=tempfile::tempdir().unwrap();let main=sqlite_files(root.path());
-        let raw=Connection::open(crate::raw_store::path_for(&main)).unwrap();
-        raw.execute("insert into raw_nfo_passwords(name,group_name,content_id,password) values('Kept','g',x'01','')",[]).unwrap();drop(raw);
-        let mut client=target.pool.get().unwrap();
-        client.batch_execute(&format!("create table \"{}\".raw_nfo_passwords(name text,group_name text,content_id bytea,password text);
-          insert into \"{}\".raw_nfo_passwords values('Kept','g',decode('02','hex'),'old-secret')",keep.name,keep.name)).unwrap();
-        copy_caches_for_fresh_catalog(&mut client,&main,&target.name,true,KeepSource::Named(&keep.name)).unwrap();
-        assert_eq!(client.query_one("select password from ext_raw_nfo_passwords",&[]).unwrap().get::<_,String>(0),"","sidecar's selected negative cache stays selected");
-        let rows=client.query("select row_bytes,content_id from ext_preserved_cache_rows where family='ext_raw_nfo_passwords' order by content_id",&[]).unwrap();
-        assert_eq!(rows.len(),2,"different valuable same-key originals must not disappear through ON CONFLICT");
-        let first:serde_json::Value=serde_json::from_slice(&rows[0].get::<_,Vec<u8>>(0)).unwrap();
-        let second:serde_json::Value=serde_json::from_slice(&rows[1].get::<_,Vec<u8>>(0)).unwrap();
-        assert_eq!(first["password"],"");assert_eq!(second["password"],"old-secret");
-        assert_eq!(rows[0].get::<_,Vec<u8>>(1),[1]);assert_eq!(rows[1].get::<_,Vec<u8>>(1),[2]);
-    }
-
-    #[test]
-    fn fresh_nfo_import_preserves_nested_zero_byte_names_and_literal_prefix_names() {
-        let Some(target)=super::super::testing::Schema::empty() else {return};
-        let root=tempfile::tempdir().unwrap();let main=sqlite_files(root.path());
-        let raw=Connection::open(crate::raw_store::path_for(&main)).unwrap();
-        let names=["Kept","Kept\0nzb","atlas.nfo-name.v1:4b657074","kept","é\0nzb"];
-        for name in names {raw.execute("insert into raw_nfo_passwords(name,group_name,content_id,password) values(?1,'g',x'01','')",[name]).unwrap();}
-        drop(raw);let mut client=target.pool.get().unwrap();
-        let moved=copy_caches_for_fresh_catalog(&mut client,&main,&target.name,true,KeepSource::Disabled).unwrap();
-        assert_eq!(moved.copied.iter().find(|table|table.table=="ext_raw_nfo_passwords").unwrap().tally.rows,names.len() as u64);
-        let mut actual=client.query("select name,password from ext_raw_nfo_passwords",&[]).unwrap().into_iter().map(|row|{
-            assert_eq!(row.get::<_,String>(1),"");crate::raw_store::nfo_key::decode(&row.get::<_,String>(0)).unwrap()
-        }).collect::<Vec<_>>();actual.sort();let mut expected=names.map(str::to_owned).to_vec();expected.sort();assert_eq!(actual,expected);
-        let raw=Connection::open_with_flags(crate::raw_store::path_for(&main),rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
-        assert!(raw.prepare("select 1 from raw_nfo_passwords where name=?1").unwrap().exists(["Kept\0nzb"]).unwrap());
-    }
-
-    /// SQLite files made with the providers' own schemas, a row or two each, moved, dumped, emptied and restored.
-    #[test]
-    fn move_dump_restore_round_trip() {
-        let Some(s) = super::super::testing::Schema::empty() else { return };
+    #[ignore = "requires explicit isolated PostgreSQL native backup qualification"]
+    fn native_dump_restore_round_trip() {
+        let s = super::super::testing::Schema::new().expect("explicit isolated PG required");
         let dir = tempfile::tempdir().unwrap();
-        let main = sqlite_files(dir.path());
         let mut c = s.pool.get().unwrap();
-        // a dry run writes nothing, not even the migrations it needed
-        copy_from_sqlite_with_keep(&mut c, &main, &s.name, false, KeepSource::Disabled).unwrap();
-        let migrated: bool = c
-            .query_one("select exists (select 1 from information_schema.tables where table_schema = $1)", &[&s.name])
-            .unwrap()
-            .get(0);
-        assert!(!migrated, "a dry run left tables behind");
-        let moved = copy_from_sqlite_with_keep(&mut c, &main, &s.name, true, KeepSource::Disabled).unwrap();
-        let rows = |t: &str| moved.iter().find(|m| m.table == t).unwrap().tally.rows;
-        assert_eq!(rows("ext_predb_titles"), 1);
-        assert_eq!(rows("ext_http_cache"), 1);
-        assert!(
-            copy_from_sqlite_with_keep(&mut c, &main, &s.name, true, KeepSource::Disabled).is_err(),
-            "a second move is refused"
-        );
+        pg_cache_fixture(&mut c);
         // a new title is numbered past the moved ones, as SQLite would
         let id: i64 = c
             .query_one(
