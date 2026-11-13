@@ -17,15 +17,10 @@ const DIFFERENT_CASE: &str = "ABCDEF0123456789";
 const ABSENT: &str = "abcdef012345678b";
 const RAW_SENTINEL: &[u8] = b"SQLite must not be opened by this native cache fixture";
 
-// These adapters observe the real public API before and after its checked
-// Result transition. Legacy Option/void has no way to report a storage error.
+// These adapters require the checked public API. An Option/void return cannot
+// satisfy the native error contract or compile through this fixture.
 trait CheckedRead {
     fn checked(self) -> Result<Option<Option<Feature>>, ()>;
-}
-impl CheckedRead for Option<Option<Feature>> {
-    fn checked(self) -> Result<Option<Option<Feature>>, ()> {
-        Ok(self)
-    }
 }
 impl<E> CheckedRead for Result<Option<Option<Feature>>, E> {
     fn checked(self) -> Result<Option<Option<Feature>>, ()> {
@@ -35,11 +30,6 @@ impl<E> CheckedRead for Result<Option<Option<Feature>>, E> {
 trait CheckedWrite {
     fn checked(self) -> Result<(), ()>;
 }
-impl CheckedWrite for () {
-    fn checked(self) -> Result<(), ()> {
-        Ok(())
-    }
-}
 impl<E> CheckedWrite for Result<(), E> {
     fn checked(self) -> Result<(), ()> {
         self.map_err(|_| ())
@@ -48,11 +38,6 @@ impl<E> CheckedWrite for Result<(), E> {
 
 trait ErrorText {
     fn error_text(&self) -> Option<String>;
-}
-impl ErrorText for Option<Option<Feature>> {
-    fn error_text(&self) -> Option<String> {
-        None
-    }
 }
 impl<T, E: std::fmt::Display> ErrorText for Result<T, E> {
     fn error_text(&self) -> Option<String> {
@@ -83,33 +68,20 @@ struct CacheRow {
 
 const ROW_COLUMNS: &str = "moviehash,imdb_id,tmdb_id,kind,title,year,season,episode,release_name,raw_json_zst,checked_at";
 
-fn sqlite_seed(path: &Path) {
-    let conn = atlas::raw_store::create(path).unwrap();
-    let f = feature();
-    conn.execute(
-        "insert into raw_opensubtitles
-         (moviehash,imdb_id,tmdb_id,kind,title,year,release_name,raw_json_zst,checked_at)
-         values (?1,?2,?3,?4,?5,?6,?7,?8,1)",
-        rusqlite::params![POSITIVE, f.imdb_id, f.tmdb_id, f.kind, f.title, f.year, f.release_name, b"preserved raw fixture".as_slice()],
-    ).unwrap();
-    conn.execute("insert into raw_opensubtitles (moviehash,checked_at) values (?1,1)", [NEGATIVE]).unwrap();
-    conn.execute(
-        "insert into raw_opensubtitles (moviehash,imdb_id,title,checked_at) values (?1,303,'Case distinct',1)",
-        [DIFFERENT_CASE],
-    ).unwrap();
-}
-
-fn sqlite_rows(path: &Path) -> Vec<CacheRow> {
-    let conn = rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
-    let mut statement = conn.prepare(&format!("select {ROW_COLUMNS} from raw_opensubtitles order by moviehash")).unwrap();
-    statement.query_map([], |row| Ok(CacheRow {
-        key: row.get(0)?,
-        feature: Feature {
-            imdb_id: row.get(1)?, tmdb_id: row.get(2)?, kind: row.get(3)?, title: row.get(4)?, year: row.get(5)?,
-            season: row.get(6)?, episode: row.get(7)?, release_name: row.get(8)?,
-        },
-        raw: row.get(9)?, checked_at: row.get(10)?,
-    })).unwrap().collect::<Result<_, _>>().unwrap()
+// Independent seed/upsert vectors retain the former field/null/key contract
+// without compiling a second database engine into the native test graph.
+fn refreshed_rows() -> Vec<CacheRow> {
+    let mut positive = feature();
+    positive.tmdb_id = Some(404);
+    let mut rows = vec![
+        CacheRow { key: POSITIVE.into(), feature: positive, raw: None, checked_at: 0 },
+        CacheRow { key: NEGATIVE.into(), feature: Feature::default(), raw: None, checked_at: 1 },
+        CacheRow { key: DIFFERENT_CASE.into(), feature: Feature {
+            imdb_id: Some(303), title: Some("Case distinct".into()), ..Feature::default()
+        }, raw: None, checked_at: 1 },
+    ];
+    rows.sort_by(|left, right| left.key.cmp(&right.key));
+    rows
 }
 
 struct Schema {
@@ -204,23 +176,11 @@ fn write_config(home: &Path, url: &str, schema: &str, http_port: u16) {
 }
 
 fn child(url: &str, schema: &str, action: &str) -> tempfile::TempDir {
-    child_with_backend(url, schema, action, false)
-}
-
-fn child_with_backend(url: &str, schema: &str, action: &str, sqlite_oracle: bool) -> tempfile::TempDir {
     let home = tempfile::tempdir().unwrap();
     let http = TcpListener::bind("127.0.0.1:0").unwrap();
     http.set_nonblocking(true).unwrap();
     write_config(home.path(), url, schema, http.local_addr().unwrap().port());
-    if sqlite_oracle {
-        let path = home.path().join("config.toml");
-        let mut config: toml_edit::DocumentMut = std::fs::read_to_string(&path).unwrap().parse().unwrap();
-        config["storage"]["backend"] = toml_edit::value("sqlite");
-        std::fs::write(path, config.to_string()).unwrap();
-        sqlite_seed(&home.path().join("atlas.raw.db"));
-    } else {
-        std::fs::write(home.path().join("atlas.raw.db"), RAW_SENTINEL).unwrap();
-    }
+    std::fs::write(home.path().join("atlas.raw.db"), RAW_SENTINEL).unwrap();
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args(["--ignored", "--exact", "raw_store::native_pg_opensubtitles_cache_tests::configured_cache_child", "--nocapture"])
         .env("ATLAS_HOME", home.path())
@@ -258,15 +218,12 @@ fn child_with_backend(url: &str, schema: &str, action: &str, sqlite_oracle: bool
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    if !sqlite_oracle {
-        assert_eq!(std::fs::read(home.path().join("atlas.raw.db")).unwrap(), RAW_SENTINEL);
-    }
+    assert_eq!(std::fs::read(home.path().join("atlas.raw.db")).unwrap(), RAW_SENTINEL);
     assert!(matches!(http.accept(), Err(error) if error.kind() == ErrorKind::WouldBlock), "cache called HTTP");
     for entry in std::fs::read_dir(home.path()).unwrap() {
         let name = entry.unwrap().file_name().into_string().unwrap();
         assert!(
-            matches!(name.as_str(), "config.toml" | "atlas.raw.db")
-                || (sqlite_oracle && matches!(name.as_str(), "atlas.raw.db-wal" | "atlas.raw.db-shm")),
+            matches!(name.as_str(), "config.toml" | "atlas.raw.db"),
             "cache created unexpected files: {name}"
         );
     }
@@ -340,20 +297,17 @@ fn configured_postgres_upserts_preserve_fields_and_apply_raw_json_contract() {
 }
 
 #[test]
-fn paired_sqlite_oracle_matches_native_cache_fields_nulls_keys_and_refresh_time() {
+fn native_cache_matches_fixed_fields_nulls_keys_and_refresh_time() {
     let Some(mut schema) = Schema::new() else { return };
     schema.seed();
     let began = chrono::Utc::now().timestamp();
-    let sqlite = child_with_backend(&schema.url, &schema.name, "write", true);
     child(&schema.url, &schema.name, "write");
-    let mut expected = sqlite_rows(&sqlite.path().join("atlas.raw.db"));
+    let expected = refreshed_rows();
     let mut actual = schema.rows();
     let finished = chrono::Utc::now().timestamp();
-    for rows in [&mut expected, &mut actual] {
-        let updated = rows.iter_mut().find(|row| row.key == POSITIVE).unwrap();
-        assert!((began..=finished).contains(&updated.checked_at));
-        updated.checked_at = 0;
-    }
+    let updated = actual.iter_mut().find(|row| row.key == POSITIVE).unwrap();
+    assert!((began..=finished).contains(&updated.checked_at));
+    updated.checked_at = 0;
     assert_eq!(actual, expected);
 }
 
@@ -547,13 +501,7 @@ pub(crate) fn open_test_native_owner() -> anyhow::Result<crate::pg::indexer_runt
     crate::pg::indexer_runtime::Runtime::open(&config, storage, headers, &[], &mut None)
 }
 
-fn bind_test_raw_store() {
-    let home = std::path::PathBuf::from(std::env::var_os("ATLAS_HOME").expect("owned child home"));
-    atlas::raw_store::set_test_raw_path(Some(home.join("atlas.raw.db")));
-}
-
 fn assert_cached_positive() {
-    bind_test_raw_store();
     assert_eq!(atlas::raw_store::get_opensubtitles(POSITIVE).checked().unwrap(), Some(Some(feature())));
 }
 
@@ -565,7 +513,6 @@ fn assert_cache_error() {
 #[test]
 #[ignore = "only the fixture parent may execute this isolated configured API child"]
 fn configured_cache_child() {
-    bind_test_raw_store();
     let action = std::env::var("ATLAS_CACHE_TEST_ACTION").unwrap();
     let native = if !matches!(action.as_str(), "unavailable" | "config-initial")
         && crate::config::checked_storage_config().unwrap().is_postgres() {
