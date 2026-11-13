@@ -1,71 +1,19 @@
-//! Sidecars: posts of nothing but what describes a release, an NFO or a mediainfo dump and the like, carrying none of
-//! its data (`frozen::rules::SIDECAR`). They aren't releases of their own: the freeze rule takes them out of search.
-//! Before it does, this step reads the text and keeps it here, with the name of the release it describes and, for a
-//! mediainfo dump, the file's Matroska Segment UID, by which it can be matched to that release exactly.
-//!
-//! Kept by the sidecar's own release id but not with its row: a frozen release takes its rows with it, and these are
-//! what's looked up when the release it describes is found.
+//! Sidecar parsing and native Step results for NFO/mediainfo/image-only posts.
+//! PostgreSQL owns storage and quota settlement. Retained names and Segment
+//! UIDs associate a sidecar with the release it describes after its own post
+//! leaves the visible catalog.
 
 use crate::config::Config;
 use crate::frozen::rules::{SIDECAR_BYTES, SIDECAR_FILES, SIDECAR_IMAGES};
-use crate::postprocess::schema::ShardTable;
-use crate::postprocess::step::{Needs, Outcome, ReleaseInfo, Reruns, SidecarRecord, Step, StepCtx, StepError, StepId, StepMutation, StepWrite};
+use crate::postprocess::step::{
+    Needs, Outcome, ReleaseInfo, Reruns, SidecarRecord, Step, StepCtx, StepError, StepId, StepMutation, StepWrite,
+};
 use crate::store::FileInfo;
 
 pub const SIDECAR_STEP: StepId = StepId(11);
 pub const SIDECAR_IMAGE_STEP: StepId = StepId(12);
 
-pub const SIDECARS: ShardTable = ShardTable {
-    name: "sidecars",
-    create: "create table if not exists sidecars (
-        release_id   INTEGER PRIMARY KEY,
-        name         TEXT NOT NULL,
-        group_name   TEXT NOT NULL,
-        file         TEXT,
-        kind         TEXT NOT NULL,
-        release_name TEXT,
-        segment_uid  TEXT,
-        text         TEXT,
-        at           INTEGER NOT NULL
-    );
-    -- what the texts hold in all, for `MAX_TOTAL_TEXT`
-    create trigger if not exists sidecars_text_in after insert on sidecars begin
-        insert into meta (key, value) values ('sidecar_text_bytes', coalesce(length(cast(new.text as blob)), 0))
-            on conflict(key) do update set value = value + excluded.value;
-    end;
-    create trigger if not exists sidecars_text_out after delete on sidecars begin
-        update meta set value = max(0, value - coalesce(length(cast(old.text as blob)), 0))
-            where key = 'sidecar_text_bytes';
-    end;
-    create trigger if not exists sidecars_text_changed after update of text on sidecars begin
-        update meta set value = max(0, value - coalesce(length(cast(old.text as blob)), 0)
-            + coalesce(length(cast(new.text as blob)), 0)) where key = 'sidecar_text_bytes';
-    end",
-    indexes: &[
-        (
-            "sidecars_release_name",
-            "create index if not exists sidecars_release_name on sidecars(release_name) where release_name is not null",
-        ),
-        // a mediainfo dump's file name is often in lower case, and the release's isn't
-        (
-            "sidecars_release_name_nocase",
-            "create index if not exists sidecars_release_name_nocase on sidecars(release_name collate nocase)
-                where release_name is not null",
-        ),
-        (
-            "sidecars_text_at",
-            "create index if not exists sidecars_text_at on sidecars(at, release_id) where text is not null",
-        ),
-        (
-            "sidecars_segment_uid",
-            "create index if not exists sidecars_segment_uid on sidecars(segment_uid) where segment_uid is not null",
-        ),
-    ],
-    // not the release's: a frozen release takes its rows along, and this one is looked up after it's gone
-    release_key: None,
-    added: &[],
-};
-
+/// Frozen v1 result-digest compatibility label; never executed in this module.
 /// A rerun that couldn't read anything (`unread`) leaves what an earlier read found.
 pub(crate) const SET: &str = "insert into sidecars
     (release_id, name, group_name, file, kind, release_name, segment_uid, text, at)
@@ -77,6 +25,7 @@ pub(crate) const SET: &str = "insert into sidecars
         segment_uid = case when excluded.kind = 'unread' then sidecars.segment_uid else excluded.segment_uid end,
         text = coalesce(excluded.text, sidecars.text), at = excluded.at";
 
+/// Frozen v1 result-digest compatibility label, not a storage entrypoint.
 /// After `SET` for release ?1: while the shard's texts hold more than ?2 bytes, the oldest texts but ?1's go, just
 /// enough of them; their names and UIDs stay. Soo the newest sidecars always have their text, and the total holds.
 pub(crate) const EVICT: &str = "update sidecars set text = null where release_id in (
@@ -100,76 +49,6 @@ pub struct Found {
     /// how it was matched: `segment_uid` (the same MKV, exactly) or `name`
     pub by: &'static str,
     pub text: Option<String>,
-}
-
-/// Sidecars that describe a release: by the Segment UID its probe read, then by its names, in every shard; at most
-/// `limit`, and never the release itself. `conn` has the shards attached as `s0`..`s7`; a shard without the table yet
-/// gives none.
-pub fn describing(
-    conn: &rusqlite::Connection,
-    own: i64,
-    names: &[&str],
-    segment_uid: Option<&str>,
-    limit: usize,
-) -> Vec<Found> {
-    let mut out: Vec<Found> = Vec::new();
-    let mut seen: Vec<(usize, i64)> = Vec::new();
-    let mut look = |column: &str, value: &str, by: &'static str| {
-        for shard in 0..crate::store::SHARDS {
-            if out.len() >= limit {
-                return;
-            }
-            let collate = if column == "release_name" { " collate nocase" } else { "" };
-            let sql = format!(
-                "select release_id, name, group_name, file, kind, text from s{shard}.sidecars
-                 where {column} = ?1{collate} and release_id != ?2 order by at desc limit ?3"
-            );
-            let rows = conn.prepare(&sql).and_then(|mut stmt| {
-                stmt.query_map(rusqlite::params![value, own, limit as i64], |r| {
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        Found {
-                            name: r.get(1)?,
-                            group: r.get(2)?,
-                            file: r.get(3)?,
-                            kind: r.get(4)?,
-                            by,
-                            text: r.get(5)?,
-                        },
-                    ))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()
-            });
-            for (id, found) in rows.unwrap_or_default() {
-                if out.len() < limit && !seen.contains(&(shard, id)) {
-                    seen.push((shard, id));
-                    out.push(found);
-                }
-            }
-        }
-    };
-    if let Some(uid) = segment_uid.filter(|u| !u.is_empty()) {
-        look("segment_uid", &uid.to_ascii_lowercase(), "segment_uid");
-    }
-    for name in names.iter().filter(|n| !n.is_empty()) {
-        look("release_name", name, "name");
-    }
-    out
-}
-
-/// What the shard's sidecar texts hold now. A failed read counts as nothing: the eviction is then left to the next.
-pub(crate) fn text_bytes(conn: &rusqlite::Connection) -> i64 {
-    conn.query_row("select value from meta where key = 'sidecar_text_bytes'", [], |r| r.get(0)).unwrap_or(0)
-}
-
-/// The shard's `sidecar_text_bytes` counted again from what `sidecars` holds, as after a compaction's copy.
-pub fn recount(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
-    conn.execute(
-        "insert or replace into meta (key, value)
-         select 'sidecar_text_bytes', coalesce(sum(length(cast(text as blob))), 0) from sidecars",
-        [],
-    )?;
-    Ok(())
 }
 
 /// At most `MAX_NAME` bytes of a name, cut on a character. Empty: none.
@@ -339,9 +218,14 @@ impl Step for SidecarStep {
         let stored = text.as_ref().map_or(0, String::len);
         let kind = read.as_ref().map_or("unread", |r| r.kind);
         let record = SidecarRecord {
-            name: r.name.clone(),group: r.group.clone(),file: picked.map(|f| f.filename.clone()),kind: kind.to_string(),
+            name: r.name.clone(),
+            group: r.group.clone(),
+            file: picked.map(|f| f.filename.clone()),
+            kind: kind.to_string(),
             release_name: read.as_ref().and_then(|r| r.release_name.clone()),
-            segment_uid: read.as_ref().and_then(|r| r.segment_uid.clone()),text,at: chrono::Utc::now().timestamp(),
+            segment_uid: read.as_ref().and_then(|r| r.segment_uid.clone()),
+            text,
+            at: chrono::Utc::now().timestamp(),
         };
         let mut writes = vec![StepWrite::for_mutation(r.id, StepMutation::KeepSidecar(record))];
         // the oldest texts are looked at only when this one takes the shard past its total: below it, nothing scans
@@ -384,10 +268,20 @@ impl Step for SidecarImageStep {
         }
         let name = image_release_name(&r.name).or_else(|| files.first().and_then(|f| image_release_name(&f.filename)));
         let record = SidecarRecord {
-            name: r.name.clone(),group: r.group.clone(),file: files.first().map(|f| f.filename.clone()),kind: "image".into(),
-            release_name: name,segment_uid: None,text: None,at: chrono::Utc::now().timestamp(),
+            name: r.name.clone(),
+            group: r.group.clone(),
+            file: files.first().map(|f| f.filename.clone()),
+            kind: "image".into(),
+            release_name: name,
+            segment_uid: None,
+            text: None,
+            at: chrono::Utc::now().timestamp(),
         };
-        Ok(Outcome { matched: true, writes: vec![StepWrite::for_mutation(r.id, StepMutation::KeepSidecar(record))], ..Outcome::default() })
+        Ok(Outcome {
+            matched: true,
+            writes: vec![StepWrite::for_mutation(r.id, StepMutation::KeepSidecar(record))],
+            ..Outcome::default()
+        })
     }
 }
 
@@ -455,108 +349,6 @@ Format                                   : Matroska
         let nfo = b"\xdb\xdb Some.Movie.2024.1080p.BluRay.x264-GRP \xdb\xdb\n";
         assert!(text_of(nfo).starts_with("\u{2588}\u{2588} Some.Movie"));
         assert_eq!(read("x.nfo", nfo).release_name.as_deref(), Some("Some.Movie.2024.1080p.BluRay.x264-GRP"));
-    }
-
-    #[test]
-    fn the_oldest_sidecar_texts_go_past_the_shards_total_and_their_names_stay() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch("create table meta (key TEXT PRIMARY KEY, value INTEGER);").unwrap();
-        conn.execute_batch(SIDECARS.create).unwrap();
-        for (_, index) in SIDECARS.indexes {
-            conn.execute_batch(index).unwrap();
-        }
-        let write = |id: i64, kind: &str, text: Option<&str>, at: i64, cap: i64| {
-            let p: Vec<rusqlite::types::Value> = vec![
-                id.into(),
-                "n".to_string().into(),
-                "g".to_string().into(),
-                None::<String>.into(),
-                kind.to_string().into(),
-                (kind != "unread").then(|| format!("Name.{id}")).into(),
-                None::<String>.into(),
-                text.map(str::to_string).into(),
-                at.into(),
-            ];
-            conn.execute(SET, rusqlite::params_from_iter(p)).unwrap();
-            conn.execute(EVICT, rusqlite::params![id, cap]).unwrap();
-        };
-        let put = |id: i64, text: &str, at: i64| write(id, "nfo", Some(text), at, 10);
-        let total = || {
-            conn.query_row("select value from meta where key = 'sidecar_text_bytes'", [], |r| r.get::<_, i64>(0))
-                .unwrap()
-        };
-        let row = |id: i64| -> (String, Option<String>) {
-            conn.query_row("select release_name, text from sidecars where release_id = ?1", [id], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
-            .unwrap()
-        };
-        let mut stmt = conn.prepare(&format!("explain query plan {EVICT}")).unwrap();
-        let plan: Vec<String> =
-            stmt.query_map(rusqlite::params![0, 0], |r| r.get::<_, String>(3)).unwrap().map(Result::unwrap).collect();
-        drop(stmt);
-        let plan = plan.join(" | ");
-        assert!(plan.contains("sidecars_text_at") && !plan.contains("TEMP B-TREE"), "{plan}");
-        put(1, "aaaa", 1);
-        put(2, "bbbb", 2);
-        assert_eq!(total(), 8);
-        put(3, "cccccc", 3);
-        // 14 past 10: the oldest goes, just enough
-        assert_eq!(row(1), ("Name.1".into(), None), "its name stays");
-        assert_eq!(row(2).1.as_deref(), Some("bbbb"));
-        assert_eq!(row(3).1.as_deref(), Some("cccccc"), "the newest keeps its text");
-        assert_eq!(total(), 10);
-        // the quota comes back: a new sidecar still gets its text
-        put(4, "dddddddd", 4);
-        assert_eq!(row(4).1.as_deref(), Some("dddddddd"));
-        assert!(total() <= 10);
-        // a rerun that read nothing keeps what was found
-        write(4, "unread", None, 5, 10);
-        let kind: String = conn.query_row("select kind from sidecars where release_id = 4", [], |r| r.get(0)).unwrap();
-        assert_eq!((kind.as_str(), row(4)), ("nfo", ("Name.4".into(), Some("dddddddd".into()))));
-        conn.execute("update meta set value = 999 where key = 'sidecar_text_bytes'", []).unwrap();
-        recount(&conn).unwrap();
-        assert_eq!(total(), 8, "counted again from the rows, as after a compaction");
-    }
-
-    #[test]
-    fn a_release_finds_the_sidecars_that_describe_it_by_segment_uid_then_name() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        for shard in 0..crate::store::SHARDS {
-            conn.execute_batch(&format!("attach ':memory:' as s{shard}")).unwrap();
-        }
-        // the table as the shard has it, without its counter's triggers
-        conn.execute_batch(
-            "create table s0.sidecars (release_id INTEGER PRIMARY KEY, name TEXT NOT NULL, group_name TEXT NOT NULL,
-                file TEXT, kind TEXT NOT NULL, release_name TEXT, segment_uid TEXT, text TEXT, at INTEGER NOT NULL)",
-        )
-        .unwrap();
-        conn.execute_batch(
-            "insert into s0.sidecars values (11, 'mediainfo', 'g', 'mediainfo.txt', 'mediainfo', 'Some.Film.2024', '55f84b6aa194d59703ccab394da26cde', 'General', 1);
-             insert into s0.sidecars values (19, 'grp.nfo', 'g', 'grp.nfo', 'nfo', 'Some.Film.2024', null, 'NFO', 2);
-             insert into s0.sidecars values (27, 'other', 'g', 'x.nfo', 'nfo', 'Other.Film', null, 'x', 3);",
-        )
-        .unwrap();
-        conn.execute_batch(
-            "create index s0.sidecars_release_name_nocase on sidecars(release_name collate nocase) where release_name is not null",
-        )
-        .unwrap();
-        let mut stmt = conn
-            .prepare("explain query plan select release_id from s0.sidecars where release_name = ?1 collate nocase and release_id != ?2")
-            .unwrap();
-        let plan: Vec<String> =
-            stmt.query_map(rusqlite::params!["x", 0], |r| r.get::<_, String>(3)).unwrap().map(Result::unwrap).collect();
-        drop(stmt);
-        assert!(plan.join(" ").contains("sidecars_release_name_nocase"), "{plan:?}");
-        let found = describing(&conn, 100, &["some.film.2024"], Some("55F84B6AA194D59703CCAB394DA26CDE"), 5);
-        let got: Vec<(&str, &str)> = found.iter().map(|f| (f.name.as_str(), f.by)).collect();
-        assert_eq!(
-            got,
-            [("mediainfo", "segment_uid"), ("grp.nfo", "name")],
-            "the UID match first, and once, names in any case"
-        );
-        assert!(describing(&conn, 11, &[], Some("55f84b6aa194d59703ccab394da26cde"), 5).is_empty(), "not itself");
-        assert!(describing(&conn, 100, &["No.Such.Name"], None, 5).is_empty());
     }
 
     #[test]
