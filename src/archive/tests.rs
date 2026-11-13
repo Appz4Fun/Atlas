@@ -937,80 +937,7 @@ mod select_tests {
     }
 
     #[test]
-    fn par2_name_map_matches_actual_shard_schema() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::store::build_shard(&conn).unwrap();
-        let rel_id = 42i64;
-        conn.execute(
-            "insert into files (id, release_id, filename, expected, seen) values (1, ?1, 'a.part01.rar', 50, x'01')",
-            [rel_id],
-        )
-        .unwrap();
-        conn.execute(
-            "insert into files (id, release_id, filename, expected, seen) values (2, ?1, 'obf_nfo_999', 1, x'01')",
-            [rel_id],
-        )
-        .unwrap();
-        conn.execute(
-            "insert into files (id, release_id, filename, expected, seen) values (3, ?1, 'obf_nzb_888', 1, x'01')",
-            [rel_id],
-        )
-        .unwrap();
-        conn.execute("insert into segments (file_id, local, domain, part, bytes) values (2, x'01', 1, 1, 900)", [])
-            .unwrap();
-        conn.execute("insert into segments (file_id, local, domain, part, bytes) values (3, x'02', 1, 1, 42000)", [])
-            .unwrap();
-        conn.execute(
-            super::store::INSERT_PAR2_FILE,
-            rusqlite::params![
-                rel_id,
-                vec![1u8; 16],
-                vec![9u8; 16],
-                vec![0u8; 16],
-                vec![0u8; 16],
-                50_000_000i64,
-                "a.part01.rar",
-                None::<i64>,
-                1i64,
-                0i64,
-                1i64
-            ],
-        )
-        .unwrap();
-        conn.execute(
-            super::store::INSERT_PAR2_FILE,
-            rusqlite::params![
-                rel_id,
-                vec![2u8; 16],
-                vec![9u8; 16],
-                vec![0u8; 16],
-                vec![0u8; 16],
-                850i64,
-                "secret.nfo",
-                None::<i64>,
-                1i64,
-                0i64,
-                1i64
-            ],
-        )
-        .unwrap();
-        conn.execute(
-            super::store::INSERT_PAR2_FILE,
-            rusqlite::params![
-                rel_id,
-                vec![3u8; 16],
-                vec![9u8; 16],
-                vec![0u8; 16],
-                vec![0u8; 16],
-                40_000i64,
-                "pointer-{{pw}}.nzb",
-                None::<i64>,
-                1i64,
-                0i64,
-                1i64
-            ],
-        )
-        .unwrap();
+    fn par2_name_map_keeps_verified_names_and_bounded_wire_size_matching() {
         let files = vec![
             FileInfo {
                 id: 1,
@@ -1046,54 +973,27 @@ mod select_tests {
                 sealed: false,
             },
         ];
-        let map = select::par2_name_map(&conn, rel_id, &files);
+        let mut out = std::collections::HashMap::new();
+        let rows = vec![
+            ("a.part01.rar".to_string(), 50_000_000),
+            ("secret.nfo".to_string(), 850),
+            ("pointer-{{pw}}.nzb".to_string(), 40_000),
+        ];
+        let (unmatched_files, unmatched_par2) = select::prepare_par2_names(&mut out, &files, rows);
+        let wire_sizes = [(2, 900), (3, 42_000)].into_iter().collect();
+        let map = select::finish_par2_names(out, unmatched_files, unmatched_par2, &wire_sizes);
         assert_eq!(map.get("obf_nfo_999").map(String::as_str), Some("secret.nfo"));
         assert_eq!(map.get("obf_nzb_888").map(String::as_str), Some("pointer-{{pw}}.nzb"));
-        let all_names = select::par2_file_names(&conn, rel_id);
-        assert!(all_names.iter().any(|n| n == "pointer-{{pw}}.nzb"));
+        assert_eq!(select::nfo_sources_with_par2(&files, &map)[0].filename, "obf_nfo_999");
+        assert_eq!(select::nzb_sources_with_par2(&files, &map)[0].filename, "obf_nzb_888");
     }
+
 }
 
-#[test]
-fn par2_reruns_go_to_incomplete_movies_and_tv_with_par2_files_and_no_set() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    crate::store::build_shard(&conn).unwrap();
-    let par2_done = crate::postprocess::step::mask(steps::PAR2_STEP);
-    // id, complete, category, a PAR2 file, a set read
-    for (id, complete, category, par2, set) in [
-        (1, 0, 5040, true, false),
-        (2, 1, 5040, true, false),
-        (3, 0, 7020, true, false),
-        (4, 0, 2040, false, false),
-        (5, 0, 2040, true, true),
-        (6, 0, 2040, true, false),
-    ] {
-        conn.execute("insert into releases (id, name, group_name, complete) values (?1, ?1, 'g', ?2)", [id, complete])
-            .unwrap();
-        conn.execute("insert into release_category (release_id, category) values (?1, ?2)", [id, category]).unwrap();
-        conn.execute("insert into pp_state (release_id, done) values (?1, ?2)", [id, par2_done]).unwrap();
-        let file = if par2 { "x.vol00+01.par2" } else { "x.mkv" };
-        conn.execute(
-            "insert into files (release_id, filename, seen) values (?1, ?2, x'02')",
-            rusqlite::params![id, file],
-        )
-        .unwrap();
-        if set {
-            conn.execute(
-                "insert into par2_files (release_id, file_id, set_id, md5, md5_16k, size, name) values (?1, x'01', x'01', x'00', x'00', 1, 'x.mkv')",
-                [id],
-            )
-            .unwrap();
-        }
-    }
-    let ids = steps::par2_without_set(&conn).unwrap();
-    assert_eq!(ids, [1, 6]);
-    steps::rerun_par2(&conn, &ids, 100).unwrap();
-    let done: i64 = conn.query_row("select done from pp_state where release_id = 1", [], |r| r.get(0)).unwrap();
-    assert_eq!(done & par2_done, 0, "the step is asked for again");
-    let due: i64 = conn.query_row("select due_at from pp_queue where release_id = 6", [], |r| r.get(0)).unwrap();
-    assert_eq!(due, 100);
-}
+// The former par2_reruns_go_to_incomplete_movies_and_tv_with_par2_files_and_no_set fixture
+// exercised the one-time pp_par2_from_volumes SQLite upgrade repair, retired for fresh native catalogs.
+// Current volume fallback/inventory remain in Par2Step; native queue redo and receipt assertions remain
+// in pg::stage_queue::walk_tests and archive::link::native_shipping_tests.
 
 // ---------------------------------------------------------------- header facts
 

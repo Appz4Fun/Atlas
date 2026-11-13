@@ -3,8 +3,6 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use crate::postprocess::result_value::Value;
-
 use crate::duplicates;
 
 use crate::config::{ArchiveConfig, Config};
@@ -13,7 +11,7 @@ use crate::par2;
 use crate::postprocess::step::{
     BodyRequest, Got, NameChange, Needs, Outcome, ReleaseInfo, Reruns, Step, StepCtx, StepError, StepId, StepMutation, StepWrite,
 };
-use crate::store::{self, FileInfo, SegmentPick, SegmentRef};
+use crate::catalog_facts::{FileInfo, SegmentPick, SegmentRef};
 
 use super::names::{best_name, collapse_volumes, looks_random, stem};
 use super::ranged::Posted;
@@ -23,10 +21,6 @@ use super::{
     ARTICLE_CAP, Format, InnerFile, Listing, NAME_SOURCE_INNER, NAME_SOURCE_PAR2, PROBE_PREFIX, RERUN_ON_INNER_FILES,
     follow, identify, nzb, rar, sevenz, zip,
 };
-
-fn retry(e: impl std::fmt::Display) -> StepError {
-    StepError::Retry(e.to_string())
-}
 
 /// a release named as an image keeps its file's name, soo these steps leave it be
 fn named_as_an_image(release: &ReleaseInfo) -> bool {
@@ -63,7 +57,7 @@ fn xref_heads<'a>(
     let name = ctx.release().name.clone();
     let id=ctx.release().id;
     let tried = ctx.data().xref_tried(id,&name)?;
-    if matches!(ctx.data(),crate::postprocess::data::StepData::Native(_)) && let Some((_,generation))=tried {
+    if let Some((_,generation))=tried {
         ctx.crcs.push(StepWrite::for_mutation(id,StepMutation::XrefRead {generation}));
     }
     let (heads, left) = xref_order(&volumes, tried.map_or(0, |(n, _)| n.max(0) as usize), |f| {
@@ -444,9 +438,8 @@ fn add_pointed_password_writes(ctx: &StepCtx<'_>, writes: &mut Vec<StepWrite>, p
     }
     let target_names: Vec<String> = writes
         .iter()
-        .filter(|w| w.sql == archive_store::MARK_POINTED)
-        .filter_map(|w| match w.params.first() {
-            Some(Value::Text(s)) => Some(s.clone()),
+        .filter_map(|write| match write.mutation() {
+            StepMutation::MarkPointed { name } => Some(name.clone()),
             _ => None,
         })
         .collect();
@@ -654,7 +647,7 @@ fn finish_full(
     let old = ctx.data().archive_source_name_bytes(id, source)?;
     let used = ctx.data().archive_total_name_bytes()?;
     let total_quota_bytes = limits.max_names_mb.saturating_mul(1 << 20);
-    let quota = total_quota_bytes / store::SHARDS as i64;
+    let quota = total_quota_bytes / crate::catalog_facts::SHARDS as i64;
     let mut stored = false;
     // what this release already holds comes back when it's replaced
     if rows.is_empty() || used.saturating_sub(old) < quota {
@@ -872,7 +865,7 @@ fn restore_par2(
     )?;
     let id = ctx.release().id;
     if !covers_all {
-        outcome.writes.retain(|write| write.sql != duplicates::SET_CONTENT);
+        outcome.writes.retain(|write| !matches!(write.mutation(), StepMutation::SetContentFingerprint { .. }));
         outcome.writes.push(StepWrite::for_mutation(id, StepMutation::ClearPostedFingerprint));
     }
     if let Some(m) = meta {
@@ -898,31 +891,6 @@ macro_rules! limits_from_enabled {
             cfg.archive.enabled
         }
     };
-}
-
-/// Reads a PAR2 set's file list.
-/// The incomplete movie and TV releases the PAR2 step read no set for though they have PAR2 files: before it tried
-/// a volume when the first file it picked was missing the articles holding the list, or picked a sample's set.
-/// Through the category index, as `store::movie_tv_whole_again`. Reads every candidate's file names: a minute on a
-/// big shard, soo off its writer (`postprocess::engine::par2_from_volumes`).
-pub(crate) fn par2_without_set(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<i64>> {
-    conn.prepare(
-        "select r.id from release_category c join releases r on r.id = c.release_id
-         join pp_state p on p.release_id = r.id
-         where (c.category between 2000 and 2999 or c.category between 5000 and 5999) and r.complete = 0
-           and not exists (select 1 from par2_files x where x.release_id = r.id) and p.done & ?1 != 0
-           and exists (select 1 from files f where f.release_id = r.id and f.filename like '%.par2')",
-    )?
-    .query_map([crate::postprocess::step::mask(PAR2_STEP)], |r| r.get(0))?
-    .collect()
-}
-
-/// Asks for the PAR2 step again on these releases.
-pub(crate) fn rerun_par2(conn: &rusqlite::Connection, ids: &[i64], now: i64) -> rusqlite::Result<()> {
-    for id in ids {
-        crate::postprocess::rerun_on(conn, *id, crate::postprocess::step::mask(PAR2_STEP), now)?;
-    }
-    Ok(())
 }
 
 /// The most PAR2 files the step reads a set from before it gives up on the release.
@@ -1096,7 +1064,7 @@ impl Par2Step {
         outcome.writes.extend(kept);
         // one set's files are only some of the release's, soo they don't say what the release holds
         if !covers_all {
-            outcome.writes.retain(|write| write.sql != duplicates::SET_CONTENT);
+            outcome.writes.retain(|write| !matches!(write.mutation(), StepMutation::SetContentFingerprint { .. }));
             let id = ctx.release().id;
             outcome.writes.push(StepWrite::for_mutation(id, StepMutation::ClearPostedFingerprint));
         }
@@ -1428,9 +1396,9 @@ impl Step for ListStep {
                     matches!(identify(b), Format::Rar4 | Format::Rar5 | Format::Zip | Format::SevenZip)
                 });
                 if !is_start && let Some((before, generation)) = xref_tried {
-                    if matches!(ctx.data(),crate::postprocess::data::StepData::Native(_)) {
-                        ctx.crcs.push(StepWrite::for_mutation(ctx.release().id,StepMutation::XrefTried {generation,count:before+k as i64+1}));
-                    } else {crate::xref::tried_through(&rel_name, generation, before + k as i64 + 1);}
+                    ctx.crcs.push(StepWrite::for_mutation(ctx.release().id, StepMutation::XrefTried {
+                        generation, count: before + k as i64 + 1,
+                    }));
                 }
                 got
             } else if head.probe {
@@ -1581,7 +1549,7 @@ impl Step for ListStep {
                         .count();
                     if data_files != listed {
                         let id = ctx.release().id;
-                        for write in outcome.writes.iter_mut().filter(|w| w.sql == duplicates::SET_CONTENT) {
+                        for write in outcome.writes.iter_mut().filter(|w| matches!(w.mutation(), StepMutation::SetContentFingerprint { .. })) {
                             *write = StepWrite::for_mutation(id, StepMutation::ClearContentFingerprint);
                         }
                     }

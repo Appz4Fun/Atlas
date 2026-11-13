@@ -7,7 +7,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use crate::nfo;
-use crate::store::FileInfo;
+use crate::catalog_facts::FileInfo;
 
 use super::PROBE_MIN_PARTS;
 use super::names::strip_volume_suffix;
@@ -201,35 +201,6 @@ pub fn par2_sources(files: &[FileInfo]) -> Vec<&FileInfo> {
     ranked.into_iter().map(|(_, f)| f).collect()
 }
 
-/// All filenames stored in `par2_files` for `release_id` (and any upload linked via `upload_link`).
-pub fn par2_file_names(conn: &rusqlite::Connection, release_id: i64) -> Vec<String> {
-    let mut names = Vec::new();
-    if let Ok(mut stmt) = conn.prepare_cached("select name from par2_files where release_id = ?1")
-        && let Ok(rows) = stmt.query_map([release_id], |r| r.get::<_, String>(0))
-    {
-        for name in rows.flatten() {
-            if !names.contains(&name) {
-                names.push(name);
-            }
-        }
-    }
-    if let Ok(mut stmt) = conn.prepare_cached(
-        "select pf.name
-         from upload_link ul
-         join upload_link rec on rec.lead_id = ul.lead_id
-         join par2_files pf on pf.release_id = rec.release_id
-         where ul.release_id = ?1",
-    ) && let Ok(rows) = stmt.query_map([release_id], |r| r.get::<_, String>(0))
-    {
-        for name in rows.flatten() {
-            if !names.contains(&name) {
-                names.push(name);
-            }
-        }
-    }
-    names
-}
-
 fn file_fits_par2(parts: i64, wire_bytes: u64, pf_size: u64) -> bool {
     if parts <= 0 {
         return false;
@@ -245,56 +216,6 @@ fn file_fits_par2(parts: i64, wire_bytes: u64, pf_size: u64) -> bool {
     } else {
         pf_size > super::ARTICLE_CAP as u64 / 2
     }
-}
-
-/// Map from posted `FileInfo.filename` to `par2_files.name` for a release, derived from `upload_link` and `par2_files`.
-pub fn par2_name_map(
-    conn: &rusqlite::Connection,
-    release_id: i64,
-    files: &[FileInfo],
-) -> std::collections::HashMap<String, String> {
-    let mut out = std::collections::HashMap::new();
-    if let Ok(mut stmt) = conn.prepare_cached(
-        "select f.filename, pf.name
-         from upload_link ul
-         join files f on f.release_id = ul.release_id
-         join par2_files pf on pf.file_id = ul.par2_file
-         where ul.release_id = ?1 and ul.par2_file is not null",
-    ) && let Ok(rows) = stmt.query_map([release_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-    {
-        for (posted, par2_name) in rows.flatten() {
-            out.insert(posted, par2_name);
-        }
-    }
-    let Ok(mut stmt) = conn.prepare_cached("select name, size from par2_files where release_id = ?1") else {
-        return out;
-    };
-    let Ok(rows) = stmt.query_map([release_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))) else {
-        return out;
-    };
-    let (unmatched_files,unmatched_par2)=prepare_par2_names(&mut out,files,rows.flatten().collect());
-    if unmatched_files.is_empty() || unmatched_par2.is_empty() {return out;}
-    let mut wire_sizes: std::collections::HashMap<i64, u64> = std::collections::HashMap::new();
-    if let Ok(mut wstmt) = conn.prepare_cached(
-        "select id, coalesce((select sum(bytes) from segments where file_id = files.id), 0), blob
-         from files where release_id = ?1",
-    ) && let Ok(wrows) = wstmt.query_map([release_id], |r| {
-        Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<Vec<u8>>>(2)?))
-    }) {
-        for (fid, seg_bytes, blob) in wrows.flatten() {
-            let bytes = if seg_bytes > 0 {
-                seg_bytes as u64
-            } else if let Some(b) = blob.filter(|b| !crate::blob::is_remote(b)) {
-                crate::blob::decode(&b)
-                    .map(|segs| segs.iter().map(|s| s.bytes.max(0) as u64).sum())
-                    .unwrap_or(0)
-            } else {
-                0
-            };
-            wire_sizes.insert(fid, bytes);
-        }
-    }
-    finish_par2_names(out,unmatched_files,unmatched_par2,&wire_sizes)
 }
 
 /// Posted NZBs to read: at most 2, fewest parts first, and only one whose every article is indexed and few enough
