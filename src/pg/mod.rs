@@ -666,3 +666,5 @@ pub(crate) mod fresh_group_capture;
 pub(crate) mod fresh_statistics;
 
 pub(crate) mod fresh_visual_related;
+
+pub(crate) mod fresh_pictures;

@@ -834,6 +834,19 @@ pub(crate) fn native_from_facts(scope: ProcessingScope, state: &State, pace: &Pa
     Ok(render_using(scope, state, pace, &rows, now))
 }
 
+/// The same network-step standings and ETA words used by the pending panel.
+/// Database applicability cannot affect network order; no legacy service or
+/// cache/provider predicate is constructed to render a picture request.
+pub(crate) fn native_network_eta(state:&State,pace:&NativePace,waits:&Waits,now:i64,name:&str)->anyhow::Result<Option<String>> {
+    let pace=pace.presentation();
+    anyhow::ensure!(pace.window_secs>=0&&[pace.net_visits,pace.net_finished,pace.queue_taken,pace.walk_rows].into_iter().all(|rate|rate.is_finite()&&rate>=0.0),"invalid native network pace");
+    let steps:Vec<_>=crate::postprocess::steps::catalog().iter().filter(|step|step.view_net()&&step.id!=crate::probe::body_crc::BODY_CRC_STEP).copied().collect();
+    let standings=standings_using(&steps,state,&pace,waits,now,|_|true,|_|None);
+    let Some((_,standing))=standings.iter().find(|(step,_)|step.name==name) else{return Ok(None)};
+    let eta=eta_words(standing,&pace,now);
+    Ok(if eta.is_some()&&!pace.running{Some("on hold: native processing isn't running".into())}else{eta})
+}
+
 /// When step `name` runs next on release `id`, in a few words for a line of the release page: "in about 4 min
 /// (around 21:40 UTC)". None when it isn't lined up (done, or it doesn't apply).
 pub(crate) fn step_eta(id: i64, name: &str) -> Option<String> {
@@ -873,6 +886,19 @@ mod tests {
     use rusqlite::params;
 
     use super::*;
+
+    #[test]
+    fn native_picture_eta_preserves_stopped_unknown_measured_and_finished_states() {
+        let image=bit(crate::images::step::IMAGES_STEP.0);
+        let mut state=State {has_state:true,done:!image,net_wanted:true,net_left:Some(image),..State::default()};
+        let waits=Waits {net:Some(Wait::About(2.0,0)),..Default::default()};
+        assert_eq!(native_network_eta(&state,&NativePace::Stopped {enabled:None},&waits,1000,"images").unwrap().as_deref(),Some("on hold: native processing isn't running"));
+        let unknown=Waits {net:Some(Wait::Unknown(None)),..Default::default()};
+        assert!(native_network_eta(&state,&NativePace::Warming {enabled:-1},&unknown,1000,"images").unwrap().unwrap().contains("too little has gone through"));
+        let measured=NativePace::Measured(Pace {running:true,enabled:Some(-1),window_secs:120,net_visits:120.0,net_finished:60.0,queue_taken:120.0,walk_rows:10.0});
+        assert!(native_network_eta(&state,&measured,&waits,1000,"images").unwrap().unwrap().contains("in about 2 min"));
+        state.done|=image;assert!(native_network_eta(&state,&measured,&waits,1000,"images").unwrap().is_none());
+    }
 
     #[test]
     fn native_processing_keeps_standings_and_requires_every_rule_fact() {
