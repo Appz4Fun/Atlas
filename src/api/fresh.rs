@@ -81,7 +81,7 @@ pub(crate) fn dispatch(view:&ReadView<'_>,args:&HashMap<String,String>,base:&str
             // it must never become a plausible but fabricated empty answer.
             ensure!(view.count()?==0,"native search index reader is not yet connected");
             let offset=args.get("offset").and_then(|value|value.trim().parse::<i64>().ok()).unwrap_or(0).max(0);
-            Ok(rss(base,key,offset,&[],&HashMap::new(),&HashMap::new(),&HashMap::new(),&crate::media::query::cached_id_params()))
+            Ok(rss_document(base,offset,0,""))
         }
         _=>Err(anyhow::anyhow!("native API operation changed")),
     }

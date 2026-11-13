@@ -664,6 +664,11 @@ fn rss_listed(
         })
         .collect();
 
+    rss_document(base,offset,total,&items)
+}
+
+/// Rendering only: all storage and relationship loading precedes this call.
+fn rss_document(base:&str,offset:i64,total:i64,items:&str)->ApiResponse {
     let xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0"
