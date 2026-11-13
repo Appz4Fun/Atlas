@@ -114,7 +114,7 @@ Original full-source SHA-256: `18a21a8db832c4adc98b26c5d2d42669fe51351ae710399ef
 
 **REFLAG:** One-off --reflag-obfuscated command counters, legacy flag rewrites, samples, cursor/WAL resumption, locks, and command help are retired; current classifier policy remains.
 
-Pure golden vectors: `naming_reflag::current_classifier_vectors_survive_reflag_retirement`; existing `naming::obfuscation::tests::{flags_random_shapes,leaves_real_names_alone,everything_the_old_rule_flagged_stays_flagged}`. Naming precedence remains `naming::decide::tests::a_subjects_scene_name_doesnt_beat_a_better_source`. These are classifier/precedence oracles, not command or native visibility equivalence.
+Pure golden vectors (collision suffix normalized by the current public `naming::without_collision_suffix` boundary before raw classification): `naming_reflag::current_classifier_vectors_survive_reflag_retirement`; existing `naming::obfuscation::tests::{flags_random_shapes,leaves_real_names_alone,everything_the_old_rule_flagged_stays_flagged}`. Naming precedence remains `naming::decide::tests::a_subjects_scene_name_doesnt_beat_a_better_source`. These are classifier/precedence oracles, not command or native visibility equivalence.
 
 | Original selector | Original function SHA-256 | Disposition |
 | --- | --- | --- |
@@ -136,7 +136,7 @@ Original full-source SHA-256: `5e417b9b1a62a863a2e88d4ea43f8b4d02fb64d66b8f95005
 
 **UNNAME:** One-off --unname/--reprocess command selection, clear-source filters, opt-in cleanup, FTS repair, resume/lock state and help are retired; current naming worker semantics remain.
 
-Pure golden vectors: `naming_unname::current_classifier_vectors_survive_unname_retirement`; naming `current_name/effective_source` and the existing `naming::decide` source-precedence tests remain unchanged. Mixed rerun-bit behavior is preserved explicitly below.
+Pure golden vectors (collision suffix normalized by the current public `naming::without_collision_suffix` boundary before raw classification): `naming_unname::current_classifier_vectors_survive_unname_retirement`; naming `current_name/effective_source` and the existing `naming::decide` source-precedence tests remain unchanged. Mixed rerun-bit behavior is preserved explicitly below.
 
 | Original selector | Original function SHA-256 | Disposition |
 | --- | --- | --- |
