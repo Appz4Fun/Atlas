@@ -295,6 +295,14 @@ pub(crate) fn native_worker_parent(case:WorkerCase) {
     }
 }
 
+pub(crate) fn native_details_parent() {
+    let mut schema=Schema::new().expect("explicit isolated PostgreSQL required for details lifecycle");
+    schema.seed();let kept=schema.rows();child(&schema.url,&schema.name,"worker-details-held");
+    assert_eq!(schema.rows(),kept);
+    assert_eq!(schema.client.query_one("select count(*) from ext_media_details",&[]).unwrap().get::<_,i64>(0),0);
+    assert_eq!(schema.client.query_one("select count(*) from pp_state",&[]).unwrap().get::<_,i64>(0),0);
+}
+
 #[test]
 fn configured_postgres_cache_reads_positive_negative_missing_and_case_distinct_keys() {
     let Some(mut schema) = Schema::new() else { return };
@@ -595,6 +603,7 @@ fn configured_cache_child() {
             costly_errors();
         }
         action @ ("worker-asset-reuse"|"worker-asset-stale"|"worker-asset-drain"|"worker-asset-missing"|"worker-asset-unselected"|"worker-asset-corrupt"|"worker-asset-wait-missing"|"worker-asset-wait-unselected")=>crate::postprocess::native::asset_tests::run(native.as_ref().unwrap(),action),
+        "worker-details-held"=>crate::postprocess::native::worker_tests::run_details_held(native.as_ref().unwrap()),
         "worker-header-only"=>crate::postprocess::native::worker_tests::run_header_only(native.as_ref().unwrap()),
         "worker-loop"=>crate::postprocess::native::worker_tests::run_category_loop(native.as_ref().unwrap()),
         "worker-fanout-fence"=>crate::postprocess::native::worker_tests::run_fanout_fence(native.as_ref().unwrap()),
