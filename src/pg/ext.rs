@@ -683,9 +683,22 @@ fn freeze_exempt(
 
 /// `atlas --move-ext [--fresh-catalog] [--apply] [--keep-schema NAME]`: `copy_from_sqlite` into the `[storage]` Postgres (migrated first, and only
 /// committed with `--apply`).
+/// Fresh mode can read sidecars beside `--cache-source-main PATH` while keeping
+/// the target config in a separate home. It never opens that main/header file.
+fn cache_source(args:&[String],fresh:bool,default:&Path)->Result<PathBuf> {
+    let positions=args.iter().enumerate().filter(|(_,argument)|argument.as_str()=="--cache-source-main").map(|(index,_)|index).collect::<Vec<_>>();
+    ensure!(positions.len()<=1,"--cache-source-main supplied more than once");
+    let Some(&index)=positions.first() else {return Ok(default.to_owned())};
+    ensure!(fresh,"--cache-source-main requires --fresh-catalog");
+    let path=args.get(index+1).filter(|path|!path.starts_with("--") && !path.is_empty()).context("--cache-source-main requires PATH")?;
+    Ok(PathBuf::from(path))
+}
+
 pub fn run_move(args: &[String]) -> i32 {
     let apply = args.iter().any(|a| a == "--apply");
     let go = || -> Result<()> {
+        let fresh=args.iter().any(|arg|arg=="--fresh-catalog");
+        let main=cache_source(args,fresh,&crate::paths::database())?;
         let mut source = KeepSource::Optional;
         for (i, arg) in args.iter().enumerate() {
             if arg == "--keep-schema" {
@@ -704,13 +717,11 @@ pub fn run_move(args: &[String]) -> i32 {
         }
         let pool = super::Pool::new(&storage)?;
         let mut c = pool.get()?;
-        let main = crate::paths::database();
         println!(
             "{} external data from beside {}",
             if apply { "moving" } else { "checking (dry run)" },
             main.display()
         );
-        let fresh=args.iter().any(|arg|arg=="--fresh-catalog");
         if fresh {
             let imported=copy_caches_for_fresh_catalog(&mut c,&main,pool.schema(),apply,source)?;
             println!("fresh cache import: {} tables; derived PreDB rows reset {}, media fanout rows reset {}",imported.copied.len(),imported.predb_late_reset,imported.media_fanout_reset);
@@ -1461,6 +1472,17 @@ mod tests {
         }
         let predb=Connection::open_with_flags(crate::predb::db::path_for(&main),rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
         assert_eq!(predb.query_row("select value from meta where key='late_after_id'",[],|row|row.get::<_,i64>(0)).unwrap(),99,"source remains unchanged");
+    }
+
+    #[test]
+    fn fresh_cache_source_path_does_not_repurpose_the_target_config_home() {
+        let args=vec!["--cache-source-main".into(),"/preserved/atlas.db".into()];
+        let default=Path::new("/fresh/atlas.db");
+        assert_eq!(cache_source(&args,true,default).unwrap(),Path::new("/preserved/atlas.db"));
+        assert_eq!(cache_source(&[],true,default).unwrap(),default);
+        assert!(cache_source(&args,false,default).is_err());
+        assert!(cache_source(&args[..1],true,default).is_err());
+        assert!(cache_source(&[args.clone(),args].concat(),true,default).is_err());
     }
 
     #[test]
