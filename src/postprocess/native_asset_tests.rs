@@ -51,13 +51,14 @@ pub(crate) fn run(runtime:&crate::pg::indexer_runtime::Runtime,action:&str) {
     // sentinel. This function has no direct SQLite path or replacement owner.
     crate::pg::stage_queue_tests::push(runtime);
     let (probe,bytes)=saved_media();let json=serde_json::to_string(&probe).unwrap();
+    let hex=|bytes:&[u8]|bytes.iter().map(|byte|format!("{byte:02x}")).collect::<String>();
     let root=tempfile::tempdir().unwrap();let evidence=tempfile::tempdir().unwrap();
     std::fs::create_dir(root.path().join("covers")).unwrap();
-    let sha=hex::encode(Sha256::digest(&bytes));
+    let sha=hex(&Sha256::digest(&bytes));
     let file=root.path().join("covers").join(&sha);std::fs::write(&file,&bytes).unwrap();
     let manifest=evidence.path().join("assets.jsonl");
     crate::pg::testing::capture_asset_manifest(root.path(),&manifest,crate::pg::testing::AssetCaptureLimits {min_files:1,max_files:16,max_file_bytes:1<<20,max_total_bytes:16<<20,read_bytes_per_second:32<<20}).unwrap();
-    let selection=crate::config::NativeAssetsConfig {root:root.path().canonicalize().unwrap().to_str().unwrap().into(),manifest:manifest.canonicalize().unwrap().to_str().unwrap().into(),whole_sha256:hex::encode(Sha256::digest(std::fs::read(&manifest).unwrap()))};
+    let selection=crate::config::NativeAssetsConfig {root:root.path().canonicalize().unwrap().to_str().unwrap().into(),manifest:manifest.canonicalize().unwrap().to_str().unwrap().into(),whole_sha256:hex(&Sha256::digest(std::fs::read(&manifest).unwrap()))};
     let step:Arc<dyn Step>=Arc::new(crate::probe::step::ProbeStep::default());let bit=mask(step.id());let stamp=step.config_stamp();
     let id=runtime.owner.with(|client| {
         let row=client.query_one("select id,original_name,group_name,parts,complete from releases",&[])?;
