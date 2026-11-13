@@ -266,11 +266,14 @@ fn native_spotnet_lanes_cancel_actual_body_and_join_before_owner_close() {
     let mut config=crate::config::SpotsConfig::default();config.blacklist_url.clear();
     let service=Arc::new(crate::spotnet::native::Service::new(&runtime.owner,runtime.db.clone(),config,
         Arc::new(crate::nntp::Pool::new(&[peer.server.clone()])),handle.handle().clone()).unwrap());
-    let mut handles=Vec::new();workers::start_spotnet(&runtime.owner,service,&mut handles).unwrap();
-    assert_eq!(handles.len(),2,"both actual configured lanes are retained");peer.wait_body();
+    struct Drain<'a> {owner:&'a Arc<crate::pg::indexer_runtime::Owner>,handles:Option<Vec<super::Worker>>}
+    impl Drop for Drain<'_> {fn drop(&mut self) {if let Some(handles)=self.handles.take() {let _=join_workers(self.owner,handles);}}}
+    let mut drain=Drain {owner:&runtime.owner,handles:Some(Vec::new())};
+    workers::start_spotnet(&runtime.owner,service,drain.handles.as_mut().unwrap()).unwrap();
+    assert_eq!(drain.handles.as_ref().unwrap().len(),2,"both actual configured lanes are retained");peer.wait_body();
     runtime.owner.with(|client| {assert_eq!(client.query_one("select count(*) from releases",&[])?.get::<_,i64>(0),0);Ok(())}).unwrap();
     let before=peer.count("BODY");let started=Instant::now();
-    let joined=join_workers(&runtime.owner,handles).unwrap();assert!(joined.for_owner(&runtime.owner));
+    let joined=join_workers(&runtime.owner,drain.handles.take().unwrap()).unwrap();assert!(joined.for_owner(&runtime.owner));
     assert!(started.elapsed()<Duration::from_secs(5),"actual cancellation must join both lanes without waiting for a poll or held provider");
     assert_eq!(peer.count("BODY"),before);assert_eq!(runtime.owner.failure(),None);
     let mut observer=schema.pool.get().unwrap();
