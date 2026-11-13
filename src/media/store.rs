@@ -22,4 +22,3 @@ pub struct TitleRow {
     pub misses: i64,
     pub fanout_done: bool,
 }
-
