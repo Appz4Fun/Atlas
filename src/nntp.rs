@@ -24,6 +24,7 @@ use crate::nxv_store::live::Fetch as HeaderFetch;
 use crate::parser::Article;
 
 pub(crate) mod group_capture;
+mod body_wire;
 #[cfg(test)]
 mod inferred_tests;
 #[cfg(test)]
@@ -1011,72 +1012,6 @@ impl Conn {
         Ok(chunk)
     }
 
-    /// Body of a `[COMPRESS=GZIP]` multi-line response: a zlib (or gzip)
-    /// stream holding the usual dot terminated, dot stuffed lines, handed to
-    /// `line` one at a time (see `each_line`).
-    async fn each_compressed_line(&mut self, mut line: impl FnMut(Vec<u8>) -> bool) -> Result<bool> {
-        let mut inflater = Inflater::default();
-        // inflated text not handed out yet: lines go as soon as they are
-        // whole, soo it holds about one read's worth
-        let mut text = Vec::new();
-        let mut terminated = false;
-
-        loop {
-            if !terminated {
-                let mut scanned = 0;
-                while let Some(nl) = text[scanned..].iter().position(|b| *b == b'\n') {
-                    let mut l = text[scanned..scanned + nl].to_vec();
-                    scanned += nl + 1;
-
-                    if l.last() == Some(&b'\r') {
-                        l.pop();
-                    }
-
-                    if l == b"." {
-                        terminated = true;
-                        break;
-                    }
-
-                    if l.starts_with(b"..") {
-                        l.remove(0);
-                    }
-
-                    self.text += l.len() as u64 + 2;
-                    if !line(l) {
-                        return Ok(false);
-                    }
-                }
-                text.drain(..scanned);
-            }
-
-            // done once the terminator showed up and the compressed stream is fully read,
-            // soo no stray trailer bytes are left for the next command to trip over
-            if terminated && inflater.finished() {
-                return Ok(true);
-            }
-
-            let chunk = if terminated {
-                // all lines are in, only the end of the compressed stream is missing.
-                // a server that never closes the stream properly sends nothing more
-                match self.read_chunk(STREAM_END_WAIT).await {
-                    Err(NntpError::Io(e)) if e.kind() == io::ErrorKind::TimedOut => {
-                        self.poisoned = true;
-                        return Ok(true);
-                    }
-                    r => r?,
-                }
-            } else {
-                self.read_chunk(self.timeout).await?
-            };
-            let plain = inflater.feed(&chunk, &mut text)?;
-
-            // TERMINATOR style servers send ".\r\n" uncompressed after the stream
-            if !terminated {
-                text.extend_from_slice(&plain);
-            }
-        }
-    }
-
     async fn send_line(&mut self, line: &str) -> Result<()> {
         if line.contains(['\r', '\n']) {
             return Err(NntpError::Protocol("newline in command".into()));
@@ -1095,23 +1030,6 @@ impl Conn {
         .await
     }
 
-    async fn read_raw_line(&mut self) -> Result<Vec<u8>> {
-        let mut buf = Vec::new();
-        let n = with_timeout(self.timeout, self.io.read_until(b'\n', &mut buf)).await?;
-        self.rate_limiter.acquire(n).await;
-        self.wire += n as u64;
-        self.text += n as u64;
-
-        if n == 0 {
-            return Err(NntpError::Io(io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed")));
-        }
-
-        while buf.last().is_some_and(|b| *b == b'\n' || *b == b'\r') {
-            buf.pop();
-        }
-
-        Ok(buf)
-    }
 
     async fn read_status(&mut self) -> Result<(u16, String)> {
         let line = if let Some(limit)=self.status_limit {
@@ -1165,28 +1083,17 @@ impl Conn {
         if code != 222 {
             return Err(NntpError::Reply { code, message });
         }
-        // only listings get compressed, and a compressed one cant be bounded by its lines
-        if message.contains("[COMPRESS=GZIP]") {
+        if message.to_ascii_uppercase().contains("COMPRESS=GZIP") {
+            self.poisoned = true;
             return Ok(None);
         }
-        let (mut lines, mut read) = (Vec::new(), 0usize);
-        loop {
-            let Some(mut l) = self.read_line_capped(max_bytes).await? else { return Ok(None) };
-            if l == b"." {
-                break;
-            }
-            if l.starts_with(b"..") {
-                l.remove(0);
-            }
-            read += l.len();
-            lines.push(l);
-            if read > max_bytes || lines.len() > max_bytes / 16 + 1 {
-                return Ok(None);
-            }
+        match self.decoded_body(&message, max_bytes, false).await {
+            Ok((body, true)) => Ok(Some(body)),
+            Ok((_, false)) => Ok(None),
+            Err(error) if body_wire::is_limit(&error) => Ok(None),
+            Err(error) => Err(error),
         }
-        Ok(Some(yenc_decode(&lines).unwrap_or_else(|| lines.join(&b'\n'))))
     }
-
     /// ARTICLE, undecoded: headers, a blank line, then the body, lines ending in `\n`. None: past `max_bytes`,
     /// with the rest left unread.
     pub async fn article_raw(&mut self, message_id: &str, max_bytes: usize) -> Result<Option<Vec<u8>>> {
@@ -1194,23 +1101,13 @@ impl Conn {
         if code != 220 {
             return Err(NntpError::Reply { code, message });
         }
-        let mut out = Vec::new();
-        loop {
-            let Some(mut l) = self.read_line_capped(max_bytes).await? else { return Ok(None) };
-            if l == b"." {
-                return Ok(Some(out));
-            }
-            if l.starts_with(b"..") {
-                l.remove(0);
-            }
-            out.extend_from_slice(&l);
-            out.push(b'\n');
-            if out.len() > max_bytes {
-                return Ok(None);
-            }
+        match self.raw_body(&message, max_bytes, false).await {
+            Ok((body, true)) => Ok(Some(body)),
+            Ok((_, false)) => Ok(None),
+            Err(error) if body_wire::is_limit(&error) => Ok(None),
+            Err(error) => Err(error),
         }
     }
-
     /// `article_raw`'s first `max_bytes` or so, in whole lines. False: the rest is left unread, soo the connection
     /// cant take another request.
     pub async fn article_raw_prefix(&mut self, message_id: &str, max_bytes: usize) -> Result<(Vec<u8>, bool)> {
@@ -1218,21 +1115,8 @@ impl Conn {
         if code != 220 {
             return Err(NntpError::Reply { code, message });
         }
-        let mut out = Vec::new();
-        while out.len() < max_bytes {
-            let Some(mut l) = self.read_line_capped(max_bytes).await? else { break };
-            if l == b"." {
-                return Ok((out, true));
-            }
-            if l.starts_with(b"..") {
-                l.remove(0);
-            }
-            out.extend_from_slice(&l);
-            out.push(b'\n');
-        }
-        Ok((out, false))
+        self.raw_body(&message, max_bytes, true).await
     }
-
     /// HEAD: the headers, lines ending in `\n`, and nothing of the body. None: past `max_bytes`, with the rest left
     /// unread.
     pub async fn head(&mut self, message_id: &str, max_bytes: usize) -> Result<Option<Vec<u8>>> {
@@ -1240,23 +1124,13 @@ impl Conn {
         if code != 221 {
             return Err(NntpError::Reply { code, message });
         }
-        let mut out = Vec::new();
-        loop {
-            let Some(mut l) = self.read_line_capped(max_bytes).await? else { return Ok(None) };
-            if l == b"." {
-                return Ok(Some(out));
-            }
-            if l.starts_with(b"..") {
-                l.remove(0);
-            }
-            out.extend_from_slice(&l);
-            out.push(b'\n');
-            if out.len() > max_bytes {
-                return Ok(None);
-            }
+        match self.raw_body(&message, max_bytes, false).await {
+            Ok((body, true)) => Ok(Some(body)),
+            Ok((_, false)) => Ok(None),
+            Err(error) if body_wire::is_limit(&error) => Ok(None),
+            Err(error) => Err(error),
         }
     }
-
     /// Whether a server has the article, with nothing transferred.
     pub async fn stat(&mut self, message_id: &str) -> Result<()> {
         let (code, message) = self.command("STAT", Some(message_id)).await?;
@@ -1278,45 +1152,12 @@ impl Conn {
         if code != 222 {
             return Err(NntpError::Reply { code, message });
         }
-        if message.contains("[COMPRESS=GZIP]") {
+        if message.to_ascii_uppercase().contains("COMPRESS=GZIP") {
+            self.poisoned = true;
             return Ok((Vec::new(), false));
         }
-        let (mut lines, mut read, mut whole) = (Vec::new(), 0usize, false);
-        while read < max_bytes {
-            let Some(mut l) = self.read_line_capped(max_bytes).await? else { break };
-            if l == b"." {
-                whole = true;
-                break;
-            }
-            if l.starts_with(b"..") {
-                l.remove(0);
-            }
-            read += l.len() + 2;
-            lines.push(l);
-        }
-        Ok((yenc_decode(&lines).unwrap_or_else(|| lines.join(&b'\n')), whole))
+        self.decoded_body(&message, max_bytes, true).await
     }
-
-    /// A plain multi-line response, handed to `line` one at a time with
-    /// dot-stuffing removed (see `each_line`).
-    async fn each_plain_line(&mut self, mut line: impl FnMut(Vec<u8>) -> bool) -> Result<bool> {
-        loop {
-            let mut l = self.read_raw_line().await?;
-
-            if l == b"." {
-                return Ok(true);
-            }
-
-            if l.starts_with(b"..") {
-                l.remove(0);
-            }
-
-            if !line(l) {
-                return Ok(false);
-            }
-        }
-    }
-
     pub async fn command(&mut self, verb: &str, args: Option<&str>) -> Result<(u16, String)> {
         match args {
             Some(a) if !a.is_empty() => self.send_line(&format!("{verb} {a}")).await?,
@@ -1499,15 +1340,15 @@ impl Conn {
 
     async fn body_unmeasured(&mut self, message_id: &str) -> Result<Vec<u8>> {
         let (code, message) = self.command("BODY", Some(message_id)).await?;
-
         if code != 222 {
             return Err(NntpError::Reply { code, message });
         }
-
-        let lines = self.read_response_body(&message).await?;
-        Ok(yenc_decode(&lines).unwrap_or_else(|| lines.join(&b'\n')))
+        let (body, whole) = self.decoded_body(&message, body_wire::default_limit(), false).await?;
+        if !whole {
+            return Err(body_wire::limit_error());
+        }
+        Ok(body)
     }
-
     async fn read_overview_body(&mut self,status:&str,start:u64,end:u64)->Result<Vec<Vec<u8>>> {
         let result=self.read_overview_body_in(status,start,end,None).await;
         if result.is_err() {self.poisoned=true;}result
@@ -1558,26 +1399,28 @@ impl Conn {
     /// on the status line.
     async fn read_response_body(&mut self, status_message: &str) -> Result<Vec<Vec<u8>>> {
         let mut lines = Vec::new();
-        self.each_line(status_message, |l| {
-            lines.push(l);
-            true
-        })
-        .await?;
+        let mut owned = 0usize;
+        let max = body_wire::default_limit();
+        let whole = self
+            .body_lines(status_message, max, max / 16 + 1, |line| {
+                let Some(next) = line.len().checked_mul(4).and_then(|n| owned.checked_add(n)).and_then(|n| {
+                    n.checked_add(4 * std::mem::size_of::<Vec<u8>>() + 2 * std::mem::size_of::<(String, u64)>())
+                }) else {
+                    return false;
+                };
+                if next > max {
+                    return false;
+                }
+                owned = next;
+                lines.push(line.to_vec());
+                true
+            })
+            .await?;
+        if !whole {
+            return Err(body_wire::limit_error());
+        }
         Ok(lines)
     }
-
-    /// The lines of a multi-line response handed to `line` one at a time
-    /// until it returns false. True when the response was read to its end;
-    /// false when `line` stopped it: the rest is left unread, soo the
-    /// connection cant take another request.
-    async fn each_line(&mut self, status_message: &str, line: impl FnMut(Vec<u8>) -> bool) -> Result<bool> {
-        if status_message.to_ascii_uppercase().contains("COMPRESS=GZIP") {
-            self.each_compressed_line(line).await
-        } else {
-            self.each_plain_line(line).await
-        }
-    }
-
     /// XOVER `start..=end` read for its first and last article with a post
     /// date, `rows` rows at most: a listing longer than that is left unread
     /// past them (`Ends::whole` is false) and the connection cant take
@@ -1629,40 +1472,46 @@ impl Conn {
     }
 
     async fn list_groups_unmeasured(&mut self, pattern: Option<&str>) -> Result<Vec<(String, u64)>> {
+        if pattern.is_some_and(|p| p.len() > 4096) {
+            return Err(body_wire::limit_error());
+        }
+        let matcher = pattern
+            .map(|p| {
+                regex::RegexBuilder::new(&format!(
+                    "^(?is:{})$",
+                    regex::escape(p).replace(r"\*", ".*").replace(r"\?", ".")
+                ))
+                .size_limit(1 << 20)
+                .dfa_size_limit(1 << 20)
+                .build()
+            })
+            .transpose()
+            .map_err(|_| body_wire::limit_error())?;
         let lines = match self.list_active(pattern).await {
             Ok(lines) => lines,
             Err(NntpError::Reply { .. }) if pattern.is_some() => self.list_active(None).await?,
-            Err(e) => return Err(e),
+            Err(error) => return Err(error),
         };
-
-        let mut groups = Vec::new();
-
+        let mut groups = Vec::with_capacity(lines.len());
         for line in lines {
-            let line = String::from_utf8_lossy(&line);
-            let parts: Vec<&str> = line.split_whitespace().collect();
-
-            if parts.len() < 3 {
-                continue;
-            }
-
-            let (Ok(high), Ok(low)) = (parts[1].parse::<i64>(), parts[2].parse::<i64>()) else {
+            let text = String::from_utf8_lossy(&line);
+            let mut parts = text.split_whitespace();
+            let (Some(name), Some(high), Some(low)) = (parts.next(), parts.next(), parts.next()) else {
                 continue;
             };
-
-            if high - low <= 0 {
+            let (Ok(high), Ok(low)) = (high.parse::<i64>(), low.parse::<i64>()) else {
+                continue;
+            };
+            let count = i128::from(high) - i128::from(low);
+            if count <= 0 {
                 continue;
             }
-
-            if let Some(p) = pattern
-                && !wildmatch(parts[0], p)
-            {
+            if matcher.as_ref().is_some_and(|matcher| !matcher.is_match(name)) {
                 continue;
             }
-
-            groups.push((parts[0].to_string(), (high - low) as u64));
+            groups.push((name.to_owned(), count as u64));
         }
-
-        groups.sort_by_key(|g| std::cmp::Reverse(g.1));
+        groups.sort_by_key(|group| std::cmp::Reverse(group.1));
         Ok(groups)
     }
 }
@@ -4307,53 +4156,36 @@ impl Pool {
         rx
     }
 
-    /// XOVER `start..=end` of `group` on the active server, split into slices
-    /// fetched in parallel over its connections. Slices with no articles
+    /// Compatibility collector for `start..=end`, with one bounded leaf
+    /// retained beside its admitted aggregate. Streaming indexing stays
+    /// parallel in stream_headers. Slices with no articles
     /// (423/420) come back empty; any other failure fails the whole range.
     pub async fn fetch_headers(self: &Arc<Self>, group: &str, start: u64, end: u64) -> Result<Vec<Overview>> {
         if end < start {
             return Ok(Vec::new());
         }
-
-        let i = self.active_index();
-        let total = end - start + 1;
+        let total = end.checked_sub(start).and_then(|n| n.checked_add(1)).ok_or_else(overview_budget)?;
         let chunk = total.div_ceil(self.concurrency().max(1) as u64).max(MIN_CHUNK);
-
-        let mut tasks = JoinSet::new();
-        let mut slices = 0;
+        let i = self.active_index();
+        let mut out = Vec::new();
+        let mut owned = 0usize;
         let mut a = start;
-
-        while a <= end {
-            let b = end.min(a + chunk - 1);
-            let pool = self.clone();
-            let group = group.to_string();
-            let idx = slices;
-            tasks.spawn(async move { (idx, pool.xover_on(i, &group, a, b).await) });
-            slices += 1;
+        // This compatibility collector has no live indexer caller: streaming
+        // indexing remains parallel. Retain only one bounded leaf alongside
+        // the admitted final result, rather than every parallel task's leaf.
+        loop {
+            let b = end.min(a.saturating_add(chunk - 1));
+            match self.xover_on(i, group, a, b).await {
+                Ok(rows) => body_wire::append_headers(&mut out, rows, &mut owned)?,
+                Err(error) if error.is_empty_range() => {}
+                Err(error) => return Err(error),
+            }
+            if b == end {
+                return Ok(out);
+            }
             a = b + 1;
         }
-
-        let mut parts: Vec<Vec<Overview>> = vec![Vec::new(); slices];
-        let mut failure = None;
-
-        // let every slice finish, an aborted one would return a half read connection to the pool
-        while let Some(joined) = tasks.join_next().await {
-            let (idx, result) = joined.map_err(|e| NntpError::Protocol(format!("xover task failed: {e}")))?;
-            match result {
-                Ok(rows) => parts[idx] = rows,
-                Err(e) if e.is_empty_range() => {}
-                Err(e) => {
-                    failure.get_or_insert(e);
-                }
-            }
-        }
-
-        match failure {
-            Some(e) => Err(e),
-            None => Ok(parts.into_iter().flatten().collect()),
-        }
     }
-
     /// How busy server `i` is: requests on it and waiting for it, per connection.
     /// a server's health now, see `Health`
     pub fn health(&self, i: usize) -> f64 {
@@ -4472,32 +4304,71 @@ pub struct HeaderSlice {
 }
 
 /// For each job, fetch its message-ids in order until `extract` gives a
-/// name. Jobs run concurrently, limited by each server's connections.
-pub async fn first_names(pool: Arc<Pool>, jobs: Vec<Vec<(String, Extract)>>) -> Vec<Option<String>> {
-    let mut names = vec![None; jobs.len()];
-    let mut tasks = JoinSet::new();
-
-    for (idx, job) in jobs.into_iter().enumerate().filter(|(_, j)| !j.is_empty()) {
-        let pool = pool.clone();
-        tasks.spawn(async move {
-            for (message_id, extract) in job {
-                if let Ok(body) = pool.fetch_body(&message_id).await
-                    && let Some(name) = extract(&body)
-                {
-                    return (idx, Some(name));
-                }
-            }
-            (idx, None)
-        });
-    }
-
-    while let Some(joined) = tasks.join_next().await {
-        if let Ok((idx, name)) = joined {
-            names[idx] = name;
+/// name. A shared article workspace bounds BODY/extractor concurrency; an
+/// unavailable or over-budget lookup fails the batch before its caller saves.
+pub async fn first_names(pool: Arc<Pool>, jobs: Vec<Vec<(String, Extract)>>) -> Result<Vec<Option<String>>> {
+    // Encoded line plus decoded output each fit the 4 MiB name article
+    // policy. Share the existing 16 MiB default BODY payload budget across
+    // all simultaneous inline lookups, preserving least-busy server spread.
+    static WORKSPACE: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
+        Arc::new(Semaphore::new((body_wire::default_limit() / (2 * crate::archive::ARTICLE_CAP)).max(1)))
+    });
+    let max = body_wire::default_limit();
+    let mut owned =
+        jobs.len().checked_mul(2048 + 2 * std::mem::size_of::<Option<String>>()).ok_or_else(body_wire::limit_error)?;
+    for job in &jobs {
+        owned = owned
+            .checked_add(
+                job.capacity()
+                    .checked_mul(std::mem::size_of::<(String, Extract)>())
+                    .ok_or_else(body_wire::limit_error)?,
+            )
+            .ok_or_else(body_wire::limit_error)?;
+        for (id, _) in job {
+            owned = owned.checked_add(id.capacity()).ok_or_else(body_wire::limit_error)?;
         }
     }
-
-    names
+    if owned > max {
+        return Err(body_wire::limit_error());
+    }
+    let mut names = vec![None; jobs.len()];
+    let mut tasks = JoinSet::new();
+    for (idx, job) in jobs.into_iter().enumerate().filter(|(_, job)| !job.is_empty()) {
+        let pool = pool.clone();
+        let admission = WORKSPACE.clone();
+        tasks.spawn(async move {
+            let _workspace = admission.acquire_owned().await.map_err(|_| body_wire::limit_error())?;
+            for (message_id, extract) in job {
+                let body = match pool.fetch_body_capped(&message_id, crate::archive::ARTICLE_CAP).await {
+                    Ok(Some(body)) => body,
+                    Ok(None) => return Err(body_wire::limit_error()),
+                    Err(error)
+                        if matches!(error, NntpError::Reply { code: 423 | 430, .. }) && !error.failed_forwarding() =>
+                    {
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                let name = extract(&body);
+                drop(body);
+                if let Some(name) = name {
+                    return Ok((idx, Some(name)));
+                }
+            }
+            Ok((idx, None))
+        });
+    }
+    while let Some(joined) = tasks.join_next().await {
+        let (idx, name) = joined.map_err(|error| NntpError::Protocol(format!("name BODY task failed: {error}")))??;
+        if let Some(value) = &name {
+            owned = owned.checked_add(value.capacity()).ok_or_else(body_wire::limit_error)?;
+            if owned > max {
+                return Err(body_wire::limit_error());
+            }
+        }
+        names[idx] = name;
+    }
+    Ok(names)
 }
 
 /// The pool driven from sync code on its own tokio runtime.
@@ -4580,7 +4451,7 @@ impl BlockingPool {
     }
 
     /// Real names for each job, see [`first_names`].
-    pub fn first_names(&self, jobs: Vec<Vec<(String, Extract)>>) -> Vec<Option<String>> {
+    pub fn first_names(&self, jobs: Vec<Vec<(String, Extract)>>) -> Result<Vec<Option<String>>> {
         self.rt.block_on(first_names(self.pool.clone(), jobs))
     }
 

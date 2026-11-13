@@ -2478,7 +2478,7 @@ async fn parse_and_save(
     // once the stage has a body budget it reads them, not the save path
     let names = if crate::archive::inline_lookups() {
         let _span = crate::metrics::span("indexer.first_names");
-        first_names(pool.clone(), releases.iter().map(name_sources).collect()).await
+        first_names(pool.clone(), releases.iter().map(name_sources).collect()).await?
     } else {
         Vec::new()
     };
