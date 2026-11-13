@@ -27,6 +27,7 @@ pub mod stage_reads;
 #[path="../spotnet/native_reads.rs"]
 pub(crate) mod fresh_spots;
 pub(crate) mod stage_telemetry;
+pub(crate) mod catalog_metrics;
 pub(crate) mod stage_group_refresh;
 #[cfg(test)]
 mod stage_catalog_observation_tests;
