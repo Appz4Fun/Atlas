@@ -167,3 +167,16 @@ fn joined_unmarked_session_and_storage_errors_retain_storage_in_both_orders() {
         assert_eq!(crate::pg::outage::classify(&error),Failure::Fatal);
     }
 }
+
+#[test]
+fn joined_secondary_cancellation_does_not_replace_the_original_unavailable_cause() {
+    for reverse in [false,true] {
+        let canceled=anyhow::Error::new(crate::pg::outage::AttemptEnded);
+        let original=anyhow::Error::new(crate::pg::outage::SessionUnavailable).context("original unavailable source");
+        let errors=if reverse {vec![original,canceled]}else{vec![canceled,original]};let mut failure=None;
+        for error in errors {crate::spotnet::native::prefer_failure(&mut failure,error);}
+        let error=provider_pass::<()>(Err(failure.unwrap())).unwrap_err();
+        assert!(!crate::pg::outage::is_attempt_ended(&error));assert!(error.to_string().contains("original unavailable source"));
+        assert_eq!(crate::pg::outage::classify(&error),Failure::Unavailable);
+    }
+}
