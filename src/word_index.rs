@@ -547,8 +547,13 @@ impl WordIndex {
 
     /// `query`, where a word is matched from its start only while the words it starts hold fewer than `cap` postings.
     fn query_with(&self, words: &str, filter: Option<&CatFilter>, tags: &[&str], cap: u64) -> Box<dyn Query> {
+        self.query_in(&self.reader.searcher(),words,filter,tags,cap)
+    }
+
+    /// Build prefix/scoring decisions against the same committed searcher
+    /// that will evaluate them, including a multi-batch native PG scan.
+    fn query_in(&self,searcher:&Searcher,words:&str,filter:Option<&CatFilter>,tags:&[&str],cap:u64)->Box<dyn Query> {
         let f = &self.fields;
-        let searcher = self.reader.searcher();
         let mut must: Vec<(Occur, Box<dyn Query>)> = Vec::new();
         let mut tokens = Vec::new();
         let mut analyzer = analyzer();
@@ -568,7 +573,7 @@ impl WordIndex {
         for token in tokens {
             let exact = TermQuery::new(Term::from_field_text(f.words, &token), IndexRecordOption::WithFreqs);
             let pattern = format!("{}.*", regex_escape(&token));
-            let prefix = (prefix_postings(&searcher, f.words, &token, cap) < cap)
+            let prefix = (prefix_postings(searcher, f.words, &token, cap) < cap)
                 .then(|| RegexQuery::from_pattern(&pattern, f.words).ok())
                 .flatten();
             let either: Box<dyn Query> = match prefix {
@@ -1121,6 +1126,28 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn native_membership_pins_one_committed_searcher_across_reload_between_batches() {
+        let f=fixture();
+        f.add("Alpha.Movie.2020.1080p-X","alt.binaries.a",10,Some(HD));
+        f.add("Alpha.Movie.2021.1080p-X","alt.binaries.b",11,Some(HD));
+        let conn=f.conn();let mut source=NativeFixtureSource::from_legacy(&conn);
+        let index=WordIndex::open_native(&f.dir.path().join("native.words"),[7;32]).unwrap();
+        assert!(index.build_native(&mut source,native::Budget::default(),||true).unwrap().complete);
+        let first=source.rows[0].id;let second=source.rows[1].id;
+        let pinned=index.native_membership(&mut source,"alph",None,&["1080p"],None,native::Budget::default()).unwrap();
+        assert_eq!(pinned.matching_ids(&[first]).unwrap(),[first]);
+        source.rows[1].name="Unrelated.Movie.2021.2160p-X".into();
+        source.releases.iter_mut().find(|row|row.id==second).unwrap().name=source.rows[1].name.clone();
+        source.queued.push(native::Changed {id:second,version:1});
+        assert_eq!(index.drain_native(&mut source,native::Budget::default()).unwrap(),1);
+        assert_eq!(index.count_native(&mut source,"alph",None,&["1080p"]).unwrap(),1,"new committed reader really changed");
+        assert_eq!(pinned.matching_ids(&[second]).unwrap(),[second],"later batch retains the original committed membership");
+        let fresh=index.native_membership(&mut source,"alph",None,&["1080p"],None,native::Budget::default()).unwrap();
+        assert!(fresh.matching_ids(&[second]).unwrap().is_empty());
+        assert_eq!(fresh.matching_ids(&[first]).unwrap(),[first]);
     }
 
     #[test]

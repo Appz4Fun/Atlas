@@ -1,7 +1,7 @@
 //! Fresh API query pages use the same Tantivy matcher and actual native media
 //! IDs. SQL handles newest/category/ID lookup, never a replacement tsquery.
 use super::{fresh_reader::ReadView,fresh_words};
-use crate::{search::ReleaseRow,media::query::{IdQuery,IdColumn},category::CatFilter,word_index::{self,native::{self,SearchSource}}};
+use crate::{search::ReleaseRow,media::query::{IdQuery,IdColumn},category::CatFilter,word_index::{self,native::SearchSource}};
 use anyhow::{Result,ensure,Context};
 
 pub(crate) struct QueryPage {pub rows:Vec<ReleaseRow>,pub total:Option<u64>}
@@ -14,8 +14,8 @@ impl ReadView<'_> {
         if !term.trim().is_empty() {
             let mut source=fresh_words::Search::open(self)?;let stamp=source.stamp()?;
             let index=word_index::WordIndex::read_native(&self.word_index_root(&crate::config::header_store_config())?,stamp)?;
-            let found=index.search_native(&mut source,term,cats,&[],word_index::By::Relevance,true,usize::try_from(offset)?,limit,
-                native::Budget {rows:self.budget.rows,bytes:self.budget.bytes,commit_bytes:self.budget.bytes})?;
+            let offset=usize::try_from(offset)?;let budget=self.word_page_budget(&index,offset,limit)?;
+            let found=index.search_native(&mut source,term,cats,&[],word_index::By::Relevance,true,offset,limit,budget)?;
             return Ok(QueryPage {rows:found.rows,total:Some(u64::try_from(found.total)?)});
         }
         self.api_newest(cats,offset,limit)

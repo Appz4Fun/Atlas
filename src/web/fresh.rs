@@ -2,7 +2,7 @@
 //! outer path; signed-in reads never fall through to a legacy SQLite loader.
 use super::*;
 use anyhow::{Result,ensure,Context};
-use crate::{pg::{self,fresh_reader::ReadView},word_index::native::{self,SearchSource}};
+use crate::{pg::{self,fresh_reader::ReadView},word_index::native::SearchSource};
 
 pub(super) fn get(path:&str,args:&HashMap<String,String>,base:&str,key:&str,storage:&pg::StorageConfig)->Option<ApiResponse> {
     get_with_assets(path,args,base,key,storage,None)
@@ -48,7 +48,7 @@ fn dispatch_with_assets(view:&ReadView<'_>,path:&str,args:&HashMap<String,String
         "/"|""|"/ui/results"|"/ui/total"=>{
             let mut search=Search::from_args(args);search.deep=false;
             let (rows,total)=query(view,&search)?;
-            if path=="/ui/total" {return Ok(html(200,exact_html(usize::try_from(total)?)));}
+            if path=="/ui/total" {return Ok(html(200,if total.exact{exact_html(usize::try_from(total.count)?)}else{format!("<strong class=\"total\">{}</strong>",escape(&total.describe()))}));}
             let ids:Vec<_>=rows.iter().map(|row|row.id).collect();let mut facts=view.listing_facts(&ids)?;
             let mut body=String::new();
             for row in &rows {
@@ -57,9 +57,12 @@ fn dispatch_with_assets(view:&ReadView<'_>,path:&str,args:&HashMap<String,String
                     details:facts.details.as_ref().map(ResultDetails::from),poster:None,recovery:None,copies:None,spot:None,whole:None,repair:false}));
             }
             let next=search.offset.checked_add(PAGE_SIZE).context("native result page offset overflow")?;
-            if u64::try_from(next)?<total {body.push_str(&search.load_more());}
+            if next<total.count {body.push_str(&search.load_more());}
+            if !total.exact && next>=total.count {
+                body.push_str(&format!("<tr><td colspan=\"{COLUMNS}\" class=\"note dim\">Results beyond this search window have not been counted. Narrow the search to see further.</td></tr>"));
+            }
             let rows_html=if body.is_empty(){"<p class=\"note dim\">No releases match.</p>".to_owned()}else{table(&search,&body)};
-            let content=format!("{}<p class=\"results-summary\">{} releases</p>{rows_html}",search.filter_links(),thousands(i64::try_from(total)?));
+            let content=format!("{}<p class=\"results-summary\">{}</p>{rows_html}",search.filter_links(),escape(&total.describe()));
             if matches!(path,"/"|""){return Ok(html(200,search_page_from_results(&search,base,&content,true)));}
             if search.offset>0 {return Ok(html(200,body));}
             let content=format!("{content}{}{}{}{}",category_nav(&search," hx-swap-oob=\"true\""),category_input(&search.cat," hx-swap-oob=\"true\""),scope_inputs_for(&search," hx-swap-oob=\"true\"",false),ask_note(""," hx-swap-oob=\"true\""));
@@ -186,27 +189,49 @@ fn own_release_page(view:&ReadView<'_>,id:i64,key:&str)->Result<String> {
         ReleaseSections {fill:String::new(),warning,spot:String::new(),nfo,images:String::new(),stills:String::new(),copies:String::new(),meta,probe,nzb_files,files}))
 }
 
-fn query(view:&ReadView<'_>,search:&Search)->Result<(Vec<ReleaseRow>,u64)> {
-    if view.count()?==0{return Ok((Vec::new(),0));}
-    ensure!(search.min_score.is_none() && !search.hide_incomplete && !search.hides_spots() && !search.filters.contains(&HIDE_COPIES),
-        "fresh native advanced filtering is not yet connected");
-    if search.fields.any() && search.fields!=(Fields {group:search.fields.group.clone(),..Fields::default()}) {
-        ensure!(search.filters.is_empty()&&search.sort.is_none(),"native field tag/sort window is not yet connected");
-        return view.field_search(&search.fields,&search.q,parse_filter(&search.cat).as_ref(),search.offset,PAGE_SIZE as usize);
-    }
-    if search.q.is_empty() && search.fields.group.is_empty() && search.filters.is_empty() && search.cat.is_empty() && search.sort.is_none() {
-        return Ok((view.recent(search.offset,PAGE_SIZE as usize)?,view.visible_count()?));
+fn query(view:&ReadView<'_>,search:&Search)->Result<(Vec<ReleaseRow>,crate::field_search::Total)> {
+    query_using_headers(view,search,&crate::config::header_store_config())
+}
+fn query_using_headers(view:&ReadView<'_>,search:&Search,headers:&crate::config::HeaderStoreConfig)->Result<(Vec<ReleaseRow>,crate::field_search::Total)> {
+    let counted=|rows,total|->Result<_>{Ok((rows,crate::field_search::Total {count:i64::try_from(total)?,exact:true}))};
+    if view.count()?==0{return counted(Vec::new(),0u64);}
+    ensure!(!search.filters.contains(&HIDE_COPIES),"native copy filtering requires verified relationship facts");
+    let tags=search.tag_filters();let categories=parse_filter(&search.cat);
+    let fielded=search.fields.any()&&search.fields!=(Fields {group:search.fields.group.clone(),..Fields::default()});
+    if fielded || (search.q.trim().is_empty()&&tags.is_empty()) {
+        let (rows,total)=view.field_search_with(&search.fields,&search.q,categories.as_ref(),search.offset,PAGE_SIZE as usize,
+            &tags,search.sort,search.descending,search.hide_incomplete,search.hides_spots(),search.min_score)?;
+        return counted(rows,total);
     }
     let mut source=pg::fresh_words::Search::open(view)?;let stamp=source.stamp()?;
-    let directory=view.word_index_root(&crate::config::header_store_config())?;
+    let directory=view.word_index_root(headers)?;
     let index=word_index::WordIndex::read_native(&directory,stamp)?;
+    if let Some(sort @ (SortBy::Name|SortBy::Group|SortBy::Posted))=search.sort {
+        let group=(!search.fields.group.is_empty()).then_some(search.fields.group.as_str());
+        let (rows,total)=view.sorted_word_search(&index,&mut source,&search.q,categories.as_ref(),&tags,group,search.offset,PAGE_SIZE as usize,
+            sort,search.descending,search.hide_incomplete,search.hides_spots(),search.min_score)?;
+        return counted(rows,total);
+    }
+    let rating=search.sort==Some(SortBy::Rating);
     let by=match search.sort {Some(SortBy::Name)=>word_index::By::Name,Some(SortBy::Category)=>word_index::By::Category,
         Some(SortBy::Size)=>word_index::By::Size,Some(SortBy::Posted)=>word_index::By::Posted,Some(SortBy::Group)=>word_index::By::Group,
-        Some(SortBy::Rating)=>anyhow::bail!("fresh native rating order is not connected"),None if search.q.is_empty()=>word_index::By::Newest,None=>word_index::By::Relevance};
+        Some(SortBy::Rating)|None if search.q.is_empty()=>word_index::By::Newest,Some(SortBy::Rating)|None=>word_index::By::Relevance};
     let group=(!search.fields.group.is_empty()).then_some(search.fields.group.as_str());
-    let found=index.search_native_in_group(&mut source,&search.q,parse_filter(&search.cat).as_ref(),&search.tag_filters(),group,by,search.descending,
-        usize::try_from(search.offset)?,PAGE_SIZE as usize,native::Budget {rows:100,..native::Budget::default()})?;
-    Ok((found.rows,u64::try_from(found.total)?))
+    if search.min_score.is_none()&&!search.hide_incomplete&&!search.hides_spots()&&!rating {
+        let offset=usize::try_from(search.offset)?;let budget=view.word_page_budget(&index,offset,PAGE_SIZE as usize)?;
+        let found=index.search_native_in_group(&mut source,&search.q,categories.as_ref(),&tags,group,by,search.descending,
+            offset,PAGE_SIZE as usize,budget)?;
+        return counted(found.rows,u64::try_from(found.total)?);
+    }
+    // Preserve the existing bounded rating/ranked windows. Candidate IDs and
+    // PG argument/selection workspace are admitted before Tantivy allocates;
+    // unexamined matches never become a fabricated exact filtered total.
+    let maximum=if search.min_score.is_some(){GROW_WITH_RATING}else if rating{SORT_WINDOW.max(search.offset.checked_add(PAGE_SIZE+1).context("native rating offset overflow")?).min(MAX_WINDOW)}else{MAX_WINDOW};
+    let (window,budget)=view.ranked_search_window(&index,usize::try_from(maximum)?)?;
+    let (ids,all)=index.ranked_native_ids_in_group(&mut source,&search.q,categories.as_ref(),&tags,group,by,search.descending,0,window,budget)?;
+    let exact=ids.len()>=all;
+    let (rows,total)=view.filter_ranked_search(&ids,search.offset,PAGE_SIZE as usize,rating,search.descending,search.hide_incomplete,search.hides_spots(),search.min_score)?;
+    Ok((rows,crate::field_search::Total {count:i64::try_from(total)?,exact}))
 }
 
 #[cfg(test)]
@@ -565,5 +590,176 @@ mod kept_details_tests {
         client.execute("update ext_media_details set overview=repeat('x',200000) where kind=2 and tmdb_id=456",&[]).unwrap();
         let view=ReadView::open(&mut client,&schema.name,pg::fresh_reader::Budget {bytes:131_072,..Default::default()},Instant::now()+Duration::from_secs(10)).unwrap();
         assert!(view.listing_facts(&[ids[1]]).is_err(),"mapped details must retain the existing pre-decode byte admission");
+    }
+}
+
+
+#[cfg(test)]
+mod advanced_native_query_tests {
+    use super::*;
+    use crate::parser::{Article,Release};
+    use std::time::{Instant,Duration};
+    #[test]
+    #[ignore="requires explicit isolated native PostgreSQL and bounded handler admission"]
+    fn actual_field_tag_rating_and_visibility_filters_page_the_same_kept_facts_the_row_shows() {
+        let schema=pg::testing::Schema::new().expect("explicit isolated native schema");let mut client=schema.pool.get().unwrap();
+        let inputs=[("Alpha.Movie.2020.1080p.WEB-DL-GRP","shared",17,1,Some(80i64)),("Beta.Movie.2021.2160p.BluRay-GRP","shared",23,1,Some(90)),
+            ("Gamma.Movie.2022.1080p.WEB-DL-GRP","shared",29,3,Some(95)),("Delta.Movie.2023.1080p.WEB-DL-GRP","other",31,1,Some(100)),
+            ("Spot.Movie.2024.1080p.WEB-DL-GRP","shared",37,1,Some(97)),("Removed.Movie.2025.1080p.WEB-DL-GRP","shared",41,1,Some(85)),
+            ("Unrated.Movie.2026.1080p.WEB-DL-GRP","shared",43,1,None),("Lower.Movie.2027.1080p.WEB-DL-GRP","shared",47,1,Some(60))];
+        let mut ids=Vec::new();
+        for (n,(name,poster,bytes,total,score)) in inputs.iter().enumerate() {
+            let saved=pg::release_writer::save(&mut client,&[Release {name:(*name).into(),poster:(*poster).into(),group:"alt.binaries.test".into(),
+                date:"Wed, 01 Jan 2020 00:00:00 +0000".into(),articles:vec![Article {filename:Some("video.mkv".into()),subject:"video.mkv yEnc (1/1)".into(),
+                    message_id:format!("<advanced-{n}@example.invalid>"),part:Some(1),total_parts:Some(*total),bytes:*bytes,..Default::default()}],..Default::default()}],1).unwrap();
+            assert_eq!((saved.releases,saved.files,saved.parts),(1,1,1));
+            let id=client.query_one("select id from releases where name=$1",&[name]).unwrap().get::<_,i64>(0);ids.push(id);
+            let tmdb=n as i64+1;
+            client.execute("insert into media_release(release_id,kind,title_key,quality,tmdb_id) values($1,2,$1,0,$2)",&[&id,&tmdb]).unwrap();
+            client.execute("insert into ext_media_details(kind,tmdb_id,imdb_score,fetched_at) values(2,$1,$2,1)",&[&tmdb,score]).unwrap();
+        }
+        client.execute("update media_release set tmdb_id=null,imdb_id=506 where release_id=$1",&[&ids[5]]).unwrap();
+        client.execute("insert into ext_media_details_lookups(lookup,tmdb_id,checked_at) values('2:Some(506):None',6,1)",&[]).unwrap();
+        client.execute("update media_release set kind=1,tvdb_id=108 where release_id=$1",&[&ids[6]]).unwrap();
+        client.execute("update ext_media_details set kind=1 where kind=2 and tmdb_id=7",&[]).unwrap();
+        client.execute("insert into ext_media_details(kind,tmdb_id,imdb_score,fetched_at) values(1,-108,100,1),(1,-107,60,1)",&[]).unwrap();
+        client.execute("update media_release set kind=1,tvdb_id=107,tmdb_id=999 where release_id=$1",&[&ids[7]]).unwrap();
+        for (at,mid) in [(4usize,"active-spot@example.invalid"),(5,"removed-spot@example.invalid")] {
+            client.execute("insert into spots(release_id,message_id,kind,title,poster,spotter_id,created) values($1,$2,'movie','Spot title','spotter','account',1)",&[&ids[at],&mid]).unwrap();
+        }
+        client.execute("insert into spot_disposals(message_id,spotter,at) values('removed-spot@example.invalid','',2)",&[]).unwrap();
+        let mut args=HashMap::from([("q".into(),"Movie".into()),("poster".into(),"shared".into()),("filters".into(),"1080p,Hide spots".into()),
+            ("incomplete".into(),"hide".into()),("rated".into(),"70".into()),("sort".into(),"rating".into()),("dir".into(),"desc".into())]);
+        for (direction,offset,wanted) in [("desc",0usize,vec![5usize,0]),("asc",0,vec![0,5])] {
+            args.insert("dir".into(),direction.into());args.insert("offset".into(),offset.to_string());
+            let view=ReadView::open(&mut client,&schema.name,pg::fresh_reader::Budget {rows:100,..Default::default()},Instant::now()+Duration::from_secs(10)).unwrap();
+            let response=dispatch(&view,"/ui/results",&args,"http://example.invalid","fixture-key").unwrap();assert_eq!(response.status,200);
+            for (n,(name,..)) in inputs.iter().enumerate(){assert_eq!(response.body.contains(name),wanted.contains(&n),"{direction} offset{offset} {name}: {}",response.body);}
+            let positions=wanted.iter().map(|at|response.body.find(inputs[*at].0).unwrap()).collect::<Vec<_>>();assert!(positions.windows(2).all(|p|p[0]<p[1]));
+            let total=dispatch(&view,"/ui/total",&args,"http://example.invalid","fixture-key").unwrap();assert!(total.body.contains("2 releases"),"{}",total.body);
+        }
+        {
+            let search=Search::from_args(&args);
+            let view=ReadView::open(&mut client,&schema.name,pg::fresh_reader::Budget {rows:100,..Default::default()},Instant::now()+Duration::from_secs(10)).unwrap();
+            let (rows,total)=view.field_search_with(&search.fields,&search.q,None,1,50,&search.tag_filters(),Some(SortBy::Rating),true,true,true,Some(70)).unwrap();
+            assert_eq!(rows.iter().map(|row|row.id).collect::<Vec<_>>(),[ids[0]]);assert_eq!(total,2);
+        }
+        args.remove("rated");args.remove("incomplete");args.insert("filters".into(),"1080p".into());args.insert("sort".into(),"size".into());args.insert("dir".into(),"asc".into());args.remove("offset");
+        let view=ReadView::open(&mut client,&schema.name,pg::fresh_reader::Budget {rows:100,..Default::default()},Instant::now()+Duration::from_secs(10)).unwrap();
+        let response=dispatch(&view,"/ui/results",&args,"http://example.invalid","fixture-key").unwrap();
+        let positions=[0usize,2,4,5,6,7].map(|at|response.body.find(inputs[at].0).unwrap());assert!(positions.windows(2).all(|p|p[0]<p[1]),"{}",response.body);
+        assert!(!response.body.contains(inputs[1].0)&&!response.body.contains(inputs[3].0));
+        drop(view);
+        for n in 0..51 {
+            let name=format!("Paged{n:02}.Movie.2020.1080p.WEB-DL");
+            pg::release_writer::save(&mut client,&[Release {name:name.clone(),poster:"shared".into(),group:"alt.binaries.test".into(),
+                date:"Wed, 01 Jan 2020 00:00:00 +0000".into(),articles:vec![Article {filename:Some("video.mkv".into()),subject:"video.mkv yEnc (1/1)".into(),
+                    message_id:format!("<paged-facet-{n}@example.invalid>"),part:Some(1),total_parts:Some(1),bytes:17,..Default::default()}],..Default::default()}],1).unwrap();
+            let id:i64=client.query_one("select id from releases where name=$1",&[&name]).unwrap().get(0);
+            client.execute("insert into media_release(release_id,kind,title_key,quality,tmdb_id) values($1,2,$1,0,1)",&[&id]).unwrap();
+        }
+        client.execute("update ext_media_details set imdb_score=90 where kind=2 and tmdb_id=1",&[]).unwrap();
+        args.insert("rated".into(),"70".into());args.insert("incomplete".into(),"hide".into());args.insert("filters".into(),"1080p,Hide spots".into());
+        args.insert("sort".into(),"rating".into());args.insert("dir".into(),"desc".into());args.insert("offset".into(),"50".into());
+        let view=ReadView::open(&mut client,&schema.name,pg::fresh_reader::Budget {rows:100,..Default::default()},Instant::now()+Duration::from_secs(10)).unwrap();
+        let response=dispatch(&view,"/ui/results",&args,"http://example.invalid","fixture-key").unwrap();
+        assert!(response.body.contains("Paged00.Movie.")&&response.body.contains(inputs[0].0)&&response.body.contains(inputs[5].0),"{}",response.body);
+        for n in 1..51 {assert!(!response.body.contains(&format!("Paged{n:02}.Movie.")));}
+        assert!(!response.body.contains("Load more"));
+    }
+}
+
+#[cfg(test)]
+mod advanced_native_word_tests {
+    use super::*;
+    use crate::{parser::{Article,Release},pg::{self,Backend,StorageConfig},word_index::{WordIndex,native::Budget as WordBudget}};
+    use std::time::{Instant,Duration};
+    #[test]
+    #[ignore="requires isolated PostgreSQL, real native catalog namespace and owned Tantivy index"]
+    fn filtered_word_search_retains_prefix_and_tag_matching_before_pg_row_hydration() {
+        let schema=pg::testing::Schema::new().expect("explicit isolated native schema");let mut client=schema.pool.get().unwrap();
+        client.query_one("select pg_advisory_lock(hashtext('atlas.indexer'),hashtext($1))",&[&schema.name]).unwrap();
+        let root=tempfile::tempdir().unwrap();let headers=crate::config::HeaderStoreConfig {enabled:true,dir:root.path().to_str().unwrap().into()};
+        let storage=StorageConfig {backend:Backend::Postgres,url:schema.url.clone(),schema:schema.name.clone(),max_connections:4,allow_plaintext:true};
+        let version=pg::migrate::version(&mut client,&schema.name).unwrap();let epoch=pg::stage::open_epoch(&mut client,&storage,&headers,version).unwrap();
+        let inputs=[("Alpha.Movie.2020.1080p.WEB-DL",1,80i64),("Alphabet.Movie.2021.1080p.WEB-DL",3,95),
+            ("AlphaBeta.Movie.2022.2160p.BluRay",1,90),("Unrelated.Movie.2023.1080p.WEB-DL",1,100)];
+        let mut ids=Vec::new();
+        for (n,(name,total,score)) in inputs.iter().enumerate() {
+            assert_eq!(pg::release_writer::save(&mut client,&[Release {name:(*name).into(),poster:"poster".into(),group:"alt.binaries.test".into(),
+                date:"Wed, 01 Jan 2020 00:00:00 +0000".into(),articles:vec![Article {filename:Some("video.mkv".into()),subject:"video.mkv yEnc (1/1)".into(),
+                    message_id:format!("<word-facet-{n}@example.invalid>"),part:Some(1),total_parts:Some(*total),bytes:17,..Default::default()}],..Default::default()}],1).unwrap().parts,1);
+            let id=client.query_one("select id from releases where name=$1",&[name]).unwrap().get::<_,i64>(0);ids.push(id);
+            let tmdb=n as i64+1;client.execute("insert into media_release(release_id,kind,title_key,quality,tmdb_id) values($1,2,$1,0,$2)",&[&id,&tmdb]).unwrap();
+            client.execute("insert into ext_media_details(kind,tmdb_id,imdb_score,fetched_at) values(2,$1,$2,1)",&[&tmdb,score]).unwrap();
+        }
+        let directory=epoch.catalog().word_index_root(&headers).unwrap();
+        let view=ReadView::open(&mut client,&schema.name,pg::fresh_reader::Budget {rows:100,..Default::default()},Instant::now()+Duration::from_secs(15)).unwrap();
+        let mut source=pg::fresh_words::Search::open(&view).unwrap();let stamp=source.stamp().unwrap();let writer=WordIndex::open_native(&directory,stamp).unwrap();
+        assert_eq!(writer.build_native(&mut source,WordBudget::default(),||true).unwrap().documents,4);drop(writer);
+        let mut args=HashMap::from([("q".into(),"alph".into()),("filters".into(),"1080p".into()),("rated".into(),"70".into()),
+            ("incomplete".into(),"hide".into()),("sort".into(),"rating".into()),("dir".into(),"desc".into())]);
+        let (rows,total)=query_using_headers(&view,&Search::from_args(&args),&headers).unwrap();
+        assert_eq!(rows.iter().map(|row|row.id).collect::<Vec<_>>(),[ids[0]]);assert_eq!((total.count,total.exact),(1,true));
+        args.remove("rated");args.remove("incomplete");
+        let (rows,total)=query_using_headers(&view,&Search::from_args(&args),&headers).unwrap();
+        assert_eq!(rows.iter().map(|row|row.id).collect::<Vec<_>>(),[ids[1],ids[0]]);assert_eq!((total.count,total.exact),(2,true));
+        args.insert("filters".into(),"2160p".into());
+        let (rows,total)=query_using_headers(&view,&Search::from_args(&args),&headers).unwrap();
+        assert_eq!(rows.iter().map(|row|row.id).collect::<Vec<_>>(),[ids[2]]);assert_eq!((total.count,total.exact),(1,true));
+        drop(source);drop(view);
+        args.remove("filters");args.insert("rated".into(),"70".into());args.insert("incomplete".into(),"hide".into());
+        let index=WordIndex::read_native(&directory,stamp).unwrap();let (_,collector)=index.ranked_capacity(2,u64::MAX).unwrap();
+        let view=ReadView::open(&mut client,&schema.name,pg::fresh_reader::Budget {rows:100,bytes:1024*1024+collector+80},Instant::now()+Duration::from_secs(10)).unwrap();
+        let (rows,total)=query_using_headers(&view,&Search::from_args(&args),&headers).unwrap();
+        assert!(!total.exact,"unexamined ranked matches cannot become an exact filtered total");
+        assert!(rows.len()<=2&&total.count<=2);assert!(total.describe().contains("At least")||total.describe().contains("newest releases"));
+    }
+}
+
+#[cfg(test)]
+mod bounded_native_string_sort_tests {
+    use super::*;
+    use crate::{parser::{Article,Release},pg::{self,Backend,StorageConfig},word_index::{WordIndex,native::Budget as WordBudget}};
+    use std::time::{Instant,Duration};
+    #[test]
+    #[ignore="requires explicit isolated PG, owned Tantivy build and bounded long-name resource qualification"]
+    fn string_sorts_match_actual_words_without_collecting_discarded_long_names() {
+        let schema=pg::testing::Schema::new().expect("explicit isolated native schema");let mut client=schema.pool.get().unwrap();
+        client.query_one("select pg_advisory_lock(hashtext('atlas.indexer'),hashtext($1))",&[&schema.name]).unwrap();
+        let root=tempfile::tempdir().unwrap();let headers=crate::config::HeaderStoreConfig {enabled:true,dir:root.path().to_str().unwrap().into()};
+        let storage=StorageConfig {backend:Backend::Postgres,url:schema.url.clone(),schema:schema.name.clone(),max_connections:4,allow_plaintext:true};
+        let version=pg::migrate::version(&mut client,&schema.name).unwrap();let epoch=pg::stage::open_epoch(&mut client,&storage,&headers,version).unwrap();
+        for n in 0..192 {
+            let name=if n<128{format!("ZZ.Bounded.{}.1080p.WEB-DL.{n}","x".repeat(65536))}else{format!("Bounded{:02}.Movie.2020.1080p.WEB-DL",n-128)};
+            let total=if n<128{3}else{1};
+            let saved=pg::release_writer::save(&mut client,&[Release {name,poster:"poster".into(),group:"alt.binaries.test".into(),date:"Wed, 01 Jan 2020 00:00:00 +0000".into(),
+                articles:vec![Article {filename:Some("video.mkv".into()),subject:"video.mkv yEnc (1/1)".into(),message_id:format!("<bounded-sort-{n}@example.invalid>"),part:Some(1),total_parts:Some(total),bytes:17,..Default::default()}],..Default::default()}],1).unwrap();
+            assert_eq!((saved.releases,saved.files,saved.parts),(1,1,1));
+        }
+        let directory=epoch.catalog().word_index_root(&headers).unwrap();
+        {
+            let view=ReadView::open(&mut client,&schema.name,pg::fresh_reader::Budget {rows:8,..Default::default()},Instant::now()+Duration::from_secs(60)).unwrap();
+            let mut source=pg::fresh_words::Search::open(&view).unwrap();let stamp=source.stamp().unwrap();let index=WordIndex::open_native(&directory,stamp).unwrap();
+            assert_eq!(index.build_native(&mut source,WordBudget {rows:8,..Default::default()},||true).unwrap().documents,192);
+        }
+        let mut args=HashMap::from([("q".into(),"bound".into()),("filters".into(),"1080p".into()),("incomplete".into(),"hide".into()),("sort".into(),"name".into()),("dir".into(),"asc".into())]);
+        for (direction,offset,wanted) in [("asc",0,(0..50).collect::<Vec<_>>()),("asc",50,(50..64).collect()),("desc",0,(14..64).rev().collect())] {
+            args.insert("dir".into(),direction.into());args.insert("offset".into(),offset.to_string());
+            let view=ReadView::open(&mut client,&schema.name,pg::fresh_reader::Budget {rows:100,..Default::default()},Instant::now()+Duration::from_secs(15)).unwrap();
+            let (rows,total)=query_using_headers(&view,&Search::from_args(&args),&headers).unwrap();
+            assert_eq!(rows.iter().map(|row|row.name.clone()).collect::<Vec<_>>(),wanted.iter().map(|n|format!("Bounded{n:02}.Movie.2020.1080p.WEB-DL")).collect::<Vec<_>>());
+            assert_eq!((total.count,total.exact),(64,true));assert!(rows.iter().all(|row|row.name.len()<128));
+        }
+        for sort in ["group","posted"] {
+            args.insert("sort".into(),sort.into());args.insert("dir".into(),"desc".into());args.remove("offset");
+            let view=ReadView::open(&mut client,&schema.name,pg::fresh_reader::Budget {rows:100,..Default::default()},Instant::now()+Duration::from_secs(15)).unwrap();
+            let (rows,total)=query_using_headers(&view,&Search::from_args(&args),&headers).unwrap();
+            assert_eq!(rows.len(),50);assert_eq!((total.count,total.exact),(64,true));
+            assert_eq!(rows[0].name,"Bounded63.Movie.2020.1080p.WEB-DL");
+        }
+        args.insert("q".into(),"bound missing".into());
+        let view=ReadView::open(&mut client,&schema.name,pg::fresh_reader::Budget {rows:100,..Default::default()},Instant::now()+Duration::from_secs(15)).unwrap();
+        let (rows,total)=query_using_headers(&view,&Search::from_args(&args),&headers).unwrap();assert!(rows.is_empty());assert_eq!((total.count,total.exact),(0,true));
     }
 }

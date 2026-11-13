@@ -352,7 +352,7 @@ const MAX_WINDOW: i64 = 100_000;
 const ROWS_KEPT: usize = 500_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum SortBy {
+pub(crate) enum SortBy {
     Name,
     Category,
     Size,
@@ -455,7 +455,7 @@ fn spot_ids(ids: &[i64]) -> HashSet<i64> {
 const TAG_SLICE: usize = 128;
 
 /// Whether a name's tags say what a filter asks. Tags, not words, soo "DV" leaves DVDRip out.
-fn filter_matches(filter: &str, tags: &release_tags::Tags) -> bool {
+pub(crate) fn filter_matches(filter: &str, tags: &release_tags::Tags) -> bool {
     let quality = tags.quality.as_deref().unwrap_or_default();
     match filter {
         "2160p" | "1080p" => tags.resolution.as_deref() == Some(filter),
