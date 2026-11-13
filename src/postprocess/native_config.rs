@@ -27,6 +27,21 @@ impl ConfigPin {
 mod tests {
     use super::*;
     #[test]
+    fn native_reload_pins_both_spotnet_lanes_before_legacy_reconfiguration() {
+        let config=Config::default();let pin=ConfigPin::capture(&config,&[],&[]);
+        let edits:[fn(&mut Config);5]=[
+            |c|c.spots.enabled=!c.spots.enabled,|c|c.spots.comments=!c.spots.comments,
+            |c|c.spots.concurrency+=1,|c|c.spots.comments_per_pass+=1,
+            |c|c.spots.blacklist_url="https://private.invalid/changed-policy".into(),
+        ];
+        for edit in edits {
+            let mut changed=config.clone();edit(&mut changed);let error=pin.check(&changed,&[],&[]).unwrap_err();
+            assert!(error.to_string().contains("restart"));assert!(!error.to_string().contains("private.invalid"));
+        }
+        assert!(pin.check(&config,&[],&[]).is_ok());
+    }
+
+    #[test]
     fn native_reload_refuses_changed_captured_step_and_provider_settings_without_values() {
         let config=Config::default();let pin=ConfigPin::capture(&config,&[],&[]);
         let edits:[fn(&mut Config);6]=[
