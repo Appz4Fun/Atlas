@@ -385,7 +385,7 @@ pub(crate) struct UnionFiles {
     conflict: bool,
     /// two releases have a part of a file both agree on, its subject carrying the file's size: a post whose poster
     /// sent each article to some of its groups, soo a part can be in more than one row
-    overlap: bool,
+    pub(super) overlap: bool,
     /// the parts every row holds, added up: more than `distinct_parts` where rows share parts
     parts_held: i64,
     /// whether any file carries a 0-indexed `[0/N]` or `[00/N]` counter
