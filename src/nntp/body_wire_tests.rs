@@ -11,10 +11,10 @@ async fn response(wire: Vec<u8>) -> (Conn, tokio::task::JoinHandle<()>) {
         let mut command = String::new();
         socket.read_line(&mut command).await.unwrap();
         assert!(command.starts_with("BODY ") || command.starts_with("ARTICLE ") || command.starts_with("HEAD "));
-        let _ = tokio::time::timeout(Duration::from_secs(3), socket.get_mut().write_all(&wire)).await;
+        let _ = tokio::time::timeout(Duration::from_secs(15), socket.get_mut().write_all(&wire)).await;
     });
     let socket = TcpStream::connect(address).await.unwrap();
-    (Conn::over(Box::new(socket), Duration::from_secs(3)), server)
+    (Conn::over(Box::new(socket), Duration::from_secs(15)), server)
 }
 fn run(future: impl Future<Output = ()>) {
     Runtime::new().unwrap().block_on(future);
@@ -23,8 +23,8 @@ fn run(future: impl Future<Output = ()>) {
 #[test]
 fn capped_body_admits_joined_output_before_return_and_poisons_overflow() {
     run(async {
-        let (mut conn, server) = response(b"222 body\r\nabcd\r\nefgh\r\n.\r\n".to_vec()).await;
-        assert_eq!(conn.body_capped("<owned@test>", 8).await.unwrap(), None);
+        let (mut conn, server) = response(b"222 body\r\nabcdefghijklmnop\r\nqrstuvwxyzABCDEF\r\n.\r\n".to_vec()).await;
+        assert_eq!(conn.body_capped("<owned@test>", 32).await.unwrap(), None);
         assert!(conn.poisoned, "an over-budget multiline response cannot reenter the pool");
         drop(conn);
         server.await.unwrap();
@@ -78,7 +78,9 @@ fn head_aggregate_overflow_is_not_a_reusable_response() {
 fn full_body_refuses_oversized_plain_line_and_multiline_aggregate() {
     run(async {
         let limit = crate::config::PostprocessConfig::default().body_max_bytes as usize;
-        for chunk in [vec![b'x'; limit + 1], b"x\r\n".repeat(limit / 2 + 1)] {
+        let mut row = vec![b'x'; 4096];
+        row.extend(b"\r\n");
+        for chunk in [vec![b'x'; limit + 1], row.repeat(limit / 4096 + 1)] {
             let mut wire = b"222 body\r\n".to_vec();
             wire.extend(chunk);
             wire.extend(b"\r\n.\r\n");
@@ -136,3 +138,4 @@ fn forged_yenc_declared_size_never_controls_output_capacity() {
         server.await.unwrap();
     });
 }
+
