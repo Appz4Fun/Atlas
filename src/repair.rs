@@ -4,22 +4,12 @@
 //! it was posted in read again, in each of its groups, from servers that don't index that group, and what turns up
 //! is saved like any other header: the missing parts join their rows by name. Nothing here is about one release.
 
-use std::collections::{BTreeMap, HashSet};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::collections::HashSet;
+use std::time::Duration;
 
-use rusqlite::{Connection, params};
+// The original-owner overview service is supplied by the selected native core.
+pub(crate) mod native;
 
-use crate::db;
-use crate::indexer::{Db, PassContext, PassSettings, on_db, reread_window};
-use crate::search::ReleaseRow;
-use crate::store;
-
-/// how often the big releases of each group are counted again (`count_media`)
-const COUNT_EVERY: Duration = Duration::from_secs(24 * 3600);
-/// a release this big is what the indexer is after, when its name says so (`media_counts`)
-const MEDIA_BYTES: i64 = 4 << 30;
 /// how often a round looks for posts to repair
 const EVERY: Duration = Duration::from_secs(600);
 /// what is worth the reads: media, not small posts. A post's rows can each be a part of it, soo a row needs less
@@ -49,10 +39,6 @@ const MAX_ARTICLES: u64 = 3_000_000;
 const OLDER_SCAN: i64 = 50_000;
 /// of them, the posts looked at per shard per round
 const OLDER_CANDIDATES: i64 = 100;
-
-const CREATE: &str =
-    "create table if not exists repair_tried (release_id INTEGER PRIMARY KEY, at INTEGER NOT NULL, permille INTEGER);
-     create table if not exists repair_older (shard INTEGER PRIMARY KEY, before INTEGER)";
 
 /// One group's window to read again, for the rows of one post.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -109,147 +95,6 @@ impl Found {
     }
 }
 
-/// `stop` cuts a round's search of the shards short.
-pub async fn run(ctx: PassContext, settings: PassSettings, db: Db, stopping: impl Fn() -> bool, stop: Arc<AtomicBool>) {
-    if let Err(e) = crate::indexer::on_sqlite_db(&db, |conn| Ok(conn.execute_batch(CREATE)?)).await {
-        eprintln!("repair: {e:#}");
-        return;
-    }
-    loop {
-        let deadline = Instant::now() + EVERY;
-        while !stopping() && Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-        if stopping() {
-            return;
-        }
-        // a stop drops the round where it is, mid read: its date searches and window reads dont look at the stop, and
-        // a stop on prod waited 208 s for them. Safe, like a dropped pass: saves run whole on the writers, no cursor
-        // moves, and a post not marked yet is read again next round
-        match crate::nntp::unless_stopped(&stop, round(&ctx, &settings, &db, &stopping, &stop)).await {
-            Some(Err(e)) if !stop.load(Ordering::Relaxed) => eprintln!("repair: {e:#}"),
-            _ => {}
-        }
-    }
-}
-
-async fn round(
-    ctx: &PassContext,
-    settings: &PassSettings,
-    db: &Db,
-    stopping: &impl Fn() -> bool,
-    stop: &Arc<AtomicBool>,
-) -> anyhow::Result<()> {
-    let now = chrono::Utc::now().timestamp();
-    let stop = stop.clone();
-    let found = tokio::task::spawn_blocking(move || reading_until(&stop, |conn| find(conn, now))).await??;
-    let pool = &ctx.pool;
-    let (to_read, looked) = plan(&found.posts, PER_ROUND);
-    // a post with nothing to read was looked at; one with windows is marked once all of them were read, right then:
-    // a round can take an hour, and one cut short by a restart had marked nothing, soo the next did it all again
-    let posts = &found.posts;
-    let tried: Vec<(i64, i64)> = looked
-        .iter()
-        .flat_map(|&i| {
-            let post = &posts[i];
-            post.ids.iter().map(move |id| (*id, post.permille))
-        })
-        .collect();
-    let days: Vec<(String, i64)> = found.posts.iter().flat_map(|p| p.days.iter().cloned()).collect();
-    // an older sweep moves past a post to read only once it was read: a round cut short finds it again
-    let sweeps = |done: &HashSet<usize>| -> Vec<(usize, Option<i64>)> {
-        found.older.iter().map(|o| (o.shard, o.next(done))).collect()
-    };
-    let mut done: HashSet<usize> = looked.iter().copied().collect();
-    mark(db, now, days, tried, sweeps(&done)).await?;
-    for post in to_read.iter().map(|&i| &posts[i]) {
-        if stopping() {
-            break;
-        }
-        // every backend that doesnt share another's overview is asked, one after another, until the post is whole:
-        // only an incomplete post gets these reads, and none past the one that completes it
-        'windows: for w in &post.windows {
-            let indexing: HashSet<String> = {
-                let g = w.group.clone();
-                on_db(db, move |conn| Ok(indexed_from(conn, &g)?)).await?
-            };
-            // one provider's accounts share its overview: the group's own, and each one read, rule out their machine
-            let mut seen: HashSet<String> = indexing.iter().map(|h| machine(h)).collect();
-            // and so do two providers that resell one backend (eweka and newshosting), told apart by their numbers
-            let mut spools = Vec::new();
-            for server in pool.indexing_servers() {
-                if indexing.iter().any(|h| machine(h) == machine(&pool.host(server)))
-                    && let Ok((_, first, last, _)) = pool.group_on(server, &w.group).await
-                {
-                    spools.push((server, (first, last)));
-                }
-            }
-            for server in pool.indexing_servers() {
-                let host = pool.host(server);
-                if !seen.insert(machine(&host)) {
-                    continue;
-                }
-                let spool = match pool.group_on(server, &w.group).await {
-                    Ok((_, first, last, _)) => (first, last),
-                    Err(e) => {
-                        println!("[repair] {} on {host}: {e:#}", w.group);
-                        continue;
-                    }
-                };
-                let mut shared = false;
-                for &(other, numbers) in &spools {
-                    if same_spool(numbers, spool)
-                        && same_ids(pool, other, server, &w.group, numbers.1.min(spool.1)).await
-                    {
-                        shared = true;
-                        break;
-                    }
-                }
-                if shared {
-                    continue;
-                }
-                match reread_window(ctx, settings, db, &w.group, server, (w.from, w.to), MAX_ARTICLES).await {
-                    Ok(p) => {
-                        spools.push((server, spool));
-                        println!("[repair] {} {}..{} on {host}: {} headers", w.group, w.from, w.to, p.articles);
-                        if p.articles > 0 && whole(&post.ids).await {
-                            println!("[repair] {} is whole now", w.group);
-                            break 'windows;
-                        }
-                    }
-                    // a failure leaves its share to the next server
-                    Err(e) => println!("[repair] {} {}..{} on {host}: {e:#}", w.group, w.from, w.to),
-                }
-            }
-        }
-        mark(db, now, Vec::new(), post.ids.iter().map(|id| (*id, post.permille)).collect(), Vec::new()).await?;
-    }
-    if !stopping() {
-        done.extend(to_read.iter().copied());
-        mark(db, now, Vec::new(), Vec::new(), sweeps(&done)).await?;
-    }
-    Ok(())
-}
-
-/// Whether the post of these rows is whole now: every file, each with every part (`release_info::whole_of`).
-async fn whole(ids: &[i64]) -> bool {
-    let ids = ids.to_vec();
-    let whole = tokio::task::spawn_blocking(move || db::with_reader(|conn| crate::release_info::whole_of(conn, &ids)));
-    matches!(whole.await, Ok(Ok(true)))
-}
-
-/// Asks for `days` of their groups' backfill first, marks the releases in `tried` as looked at (with the share their
-/// post had), and moves each shard's older sweep on to where `older` says.
-async fn mark(
-    db: &Db,
-    now: i64,
-    days: Vec<(String, i64)>,
-    tried: Vec<(i64, i64)>,
-    older: Vec<(usize, Option<i64>)>,
-) -> anyhow::Result<()> {
-    on_db(db, move |conn| Ok(mark_in(conn, now, &days, &tried, &older)?)).await
-}
-
 /// `mark`'s writes, in one transaction.
 fn mark_in(
     db: &dyn crate::pg::sql::Sql,
@@ -281,73 +126,6 @@ fn mark_in(
     })
 }
 
-/// `f` on a reader that gives up (SQLITE_INTERRUPT) once `stop` is set: a scan of every shard's releases runs for
-/// minutes, and a stop waited for it to end. On prod the count of big releases per group, run at every start, held a
-/// stop 12 minutes.
-pub fn reading_until<T>(
-    stop: &Arc<AtomicBool>,
-    f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
-) -> rusqlite::Result<T> {
-    db::with_reader(|conn| interruptible(conn, stop, f))
-}
-
-/// `f` on `conn`, interrupted once `stop` is set, the handler gone again after.
-fn interruptible<T>(
-    conn: &Connection,
-    stop: &Arc<AtomicBool>,
-    f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
-) -> rusqlite::Result<T> {
-    let flag = stop.clone();
-    conn.progress_handler(10_000, Some(move || flag.load(Ordering::Relaxed)))?;
-    let out = f(conn);
-    // a reader is kept for others: without the handler
-    conn.progress_handler(10_000, None::<fn() -> bool>)?;
-    out
-}
-
-/// Counts each group's big video releases now and then, for the backfill to take those groups first
-/// (`chunks::MEDIA_GROUPS`). With one server or many: it doesn't read from any. `stop` cuts a count short.
-pub async fn count_media_every(db: Db, stopping: impl Fn() -> bool, stop: Arc<AtomicBool>) {
-    while !stopping() {
-        if let Err(e) = count_media(&db, &stop).await
-            && !stop.load(Ordering::Relaxed)
-        {
-            eprintln!("counting big releases per group: {e:#}");
-        }
-        let next = Instant::now() + COUNT_EVERY;
-        while !stopping() && Instant::now() < next {
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-    }
-}
-
-/// Notes how many big video releases each group holds.
-async fn count_media(db: &Db, stop: &Arc<AtomicBool>) -> anyhow::Result<()> {
-    let stop = stop.clone();
-    let counts = tokio::task::spawn_blocking(move || reading_until(&stop, media_counts)).await??;
-    on_db(db, move |conn| Ok(crate::chunks::set_media(conn, &counts)?)).await
-}
-
-/// Each group's releases of `MEDIA_BYTES` or more whose name says 2160p, remux or Dolby Vision.
-pub fn media_counts(conn: &Connection) -> rusqlite::Result<Vec<(String, i64)>> {
-    let mut counts = Vec::new();
-    for s in 0..store::SHARDS {
-        let sql = format!(
-            "select r.group_name, count(*) from s{s}.releases r
-             where r.size >= ?1 and r.group_name is not null and (
-                 lower(coalesce(r.display_name, r.name)) like '%2160p%'
-                 or lower(coalesce(r.display_name, r.name)) like '%remux%'
-                 or lower(coalesce(r.display_name, r.name)) like '%.dv.%'
-                 or lower(coalesce(r.display_name, r.name)) like '%dovi%')
-             group by r.group_name"
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map([MEDIA_BYTES], |r| Ok((r.get(0)?, r.get(1)?)))?;
-        counts.extend(rows.collect::<rusqlite::Result<Vec<(String, i64)>>>()?);
-    }
-    Ok(counts)
-}
-
 /// The machine behind a server's name: host and port, without an explicit `#key`, in lower case. Two accounts at one
 /// provider have the same.
 fn machine(host: &str) -> String {
@@ -359,17 +137,6 @@ fn machine(host: &str) -> String {
 /// it as long as their retention, so it takes `same_ids` to say.
 fn same_spool(a: (u64, u64), b: (u64, u64)) -> bool {
     a.1.abs_diff(b.1) <= (a.1.max(b.1) / 100_000).max(1_000)
-}
-
-/// Whether servers `a` and `b` list the same Message-IDs under the same numbers just below `last`: GROUP numbers
-/// alike only say two backends may be one. False when either can't say.
-async fn same_ids(pool: &crate::nntp::Pool, a: usize, b: usize, group: &str, last: u64) -> bool {
-    let start = last.saturating_sub(SAME_IDS_LOOK);
-    let (Ok(ours), Ok(theirs)) = (pool.ids_on(a, group, start, last).await, pool.ids_on(b, group, start, last).await)
-    else {
-        return false;
-    };
-    ids_agree(&ours, &theirs)
 }
 
 /// At least one number with the same Message-ID on both, and none with two different ones.
@@ -430,122 +197,6 @@ fn by_worth(posts: &mut [Looked]) {
     posts.sort_by_key(|p| (!p.media, std::cmp::Reverse(p.size)));
 }
 
-/// The posts worth a second read, on a reader with every shard attached and `repair_tried` in main. A post is all
-/// its rows (`release_info::whole_post_with`), and each of its groups gets one window around its rows' articles.
-pub fn find(conn: &Connection, now: i64) -> rusqlite::Result<Found> {
-    let has_table = conn.prepare("select 1 from main.sqlite_master where name = 'repair_tried'")?.exists([])?;
-    if !has_table {
-        return Ok(Found::default());
-    }
-    let mut found = Found::default();
-    let mut seen: HashSet<i64> = HashSet::new();
-    for s in 0..store::SHARDS {
-        let sql = format!(
-            "select r.id, coalesce(r.display_name, r.name), r.group_name, r.poster, r.posted_date, r.size, r.complete,
-                    r.parts
-             from s{s}.releases r
-             where r.complete = 0 and r.size >= ?1
-               and r.posted_date >= datetime(?2, 'unixepoch') and r.posted_date < datetime(?3, 'unixepoch')
-               and not exists (select 1 from main.repair_tried t where t.release_id = r.id)
-             order by r.id desc limit ?4"
-        );
-        let rows =
-            release_rows(conn, &sql, params![MIN_ROW_BYTES, now - DAYS * 86_400, now - SETTLED_SECS, CANDIDATES])?;
-        for row in rows {
-            if seen.contains(&row.id) {
-                continue;
-            }
-            found.posts.push(look(conn, &row, true, &mut seen)?);
-        }
-    }
-    by_worth(&mut found.posts);
-    for s in 0..store::SHARDS {
-        let first = found.posts.len();
-        let (rows, end) = older_rows(conn, s, now)?;
-        let mut keys = Vec::new();
-        for row in rows {
-            if seen.contains(&row.id) {
-                continue;
-            }
-            keys.push(row.id);
-            found.posts.push(look(conn, &row, false, &mut seen)?);
-        }
-        found.older.push(Older { shard: s, first, keys, end });
-    }
-    Ok(found)
-}
-
-/// `row`'s post, with what it wants read. `days`: and the days of its groups' backfill to take first, when it's
-/// further from whole (an older post's days aren't asked for: they are what the backfill reads anyway, in its order).
-fn look(conn: &Connection, row: &ReleaseRow, days: bool, seen: &mut HashSet<i64>) -> rusqlite::Result<Looked> {
-    let (ids, size) = match crate::release_info::whole_post_with(conn, row) {
-        Ok(Some(post)) => (post.ids, post.size),
-        _ => (vec![row.id], row.size.unwrap_or(0)),
-    };
-    seen.extend(ids.iter().copied());
-    let permille = crate::release_info::permille_of(conn, &ids).unwrap_or(0);
-    let worth = size >= MIN_BYTES && (MIN_PERMILLE..1000).contains(&permille);
-    let windows = if worth { windows_of(conn, &ids)? } else { Vec::new() };
-    // further from whole, what's missing is more likely in days of its groups the backfill hasn't read
-    let days = if days && size >= MIN_BYTES && permille < MIN_PERMILLE {
-        days_of(&windows_of(conn, &ids)?)
-    } else {
-        Vec::new()
-    };
-    Ok(Looked { ids, permille, windows, days, media: is_media(&row.name), size })
-}
-
-/// The release rows `sql` selects, its columns those of `find`'s query.
-pub(crate) fn release_rows(
-    conn: &Connection,
-    sql: &str,
-    params: impl rusqlite::Params,
-) -> rusqlite::Result<Vec<ReleaseRow>> {
-    conn.prepare(sql)?
-        .query_map(params, |r| {
-            Ok(ReleaseRow {
-                id: r.get(0)?,
-                name: r.get(1)?,
-                group_name: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                poster: r.get(3)?,
-                posted_date: r.get(4)?,
-                size: r.get(5)?,
-                complete: r.get::<_, i64>(6)? != 0,
-                parts: r.get(7)?,
-            })
-        })?
-        .collect()
-}
-
-/// Shard `s`'s older sweep this round: the rows, newest first, of the next `OLDER_SCAN` below where it got to, that
-/// were posted before `DAYS` and are worth a look like `find`'s (at most `OLDER_CANDIDATES`), and where it goes on
-/// once they are done: below the last of them when that many came, else below the rows read, or from the newest
-/// again (`None`) when none were left.
-fn older_rows(conn: &Connection, s: usize, now: i64) -> rusqlite::Result<(Vec<ReleaseRow>, Option<i64>)> {
-    let before: i64 = conn
-        .query_row("select before from main.repair_older where shard = ?1", [s as i64], |r| r.get::<_, Option<i64>>(0))
-        .ok()
-        .flatten()
-        .unwrap_or(i64::MAX);
-    let window = format!("select id from s{s}.releases where id < ?1 order by id desc limit {OLDER_SCAN}");
-    let lowest: Option<i64> = conn.query_row(&format!("select min(id) from ({window})"), [before], |r| r.get(0))?;
-    let Some(lowest) = lowest else { return Ok((Vec::new(), None)) };
-    let sql = format!(
-        "select r.id, coalesce(r.display_name, r.name), r.group_name, r.poster, r.posted_date, r.size, r.complete,
-                r.parts
-         from s{s}.releases r
-         where r.id in ({window}) and r.complete = 0 and r.size >= ?2 and r.posted_date < datetime(?3, 'unixepoch')
-           and not exists (select 1 from main.repair_tried t where t.release_id = r.id)
-         order by r.id desc limit ?4"
-    );
-    let rows = release_rows(conn, &sql, params![before, MIN_ROW_BYTES, now - DAYS * 86_400, OLDER_CANDIDATES])?;
-    let end = match rows.last() {
-        Some(last) if rows.len() as i64 == OLDER_CANDIDATES => last.id,
-        _ => lowest,
-    };
-    Ok((rows, Some(end)))
-}
-
 /// The days the whole post spans, from its first article in any group to its last, in each of its groups. None for
 /// one spread over more than `MAX_SPAN_DAYS`: a post takes hours, and a date that far off is wrong.
 fn days_of(windows: &[Window]) -> Vec<(String, i64)> {
@@ -557,30 +208,6 @@ fn days_of(windows: &[Window]) -> Vec<(String, i64)> {
     }
     let days = crate::chunks::unix_day(from)..=crate::chunks::unix_day(to);
     windows.iter().flat_map(|w| days.clone().map(move |d| (w.group.clone(), d))).collect()
-}
-
-/// Each group's span of these rows' articles, with a margin.
-fn windows_of(conn: &Connection, ids: &[i64]) -> rusqlite::Result<Vec<Window>> {
-    let mut by_group: BTreeMap<String, (i64, i64)> = BTreeMap::new();
-    for id in ids {
-        let s = store::shard_of_id(*id);
-        let span: Option<(String, Option<i64>, Option<i64>)> = conn
-            .prepare_cached(&format!(
-                "select r.group_name, min(t.first_date), max(t.last_date) from s{s}.releases r
-                 left join s{s}.file_timing t on t.release_id = r.id where r.id = ?1 group by r.id"
-            ))?
-            .query_row([id], |r| Ok((r.get::<_, Option<String>>(0)?.unwrap_or_default(), r.get(1)?, r.get(2)?)))
-            .ok();
-        let Some((group, Some(first), Some(last))) = span else { continue };
-        let entry = by_group.entry(group).or_insert((first, last));
-        entry.0 = entry.0.min(first);
-        entry.1 = entry.1.max(last);
-    }
-    Ok(by_group
-        .into_iter()
-        .filter(|(group, _)| !group.is_empty())
-        .map(|(group, (first, last))| Window { group, from: first - MARGIN, to: last + MARGIN })
-        .collect())
 }
 
 #[cfg(test)]
@@ -657,23 +284,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_scan_gives_up_once_stopping_and_the_reader_reads_on_after() {
-        let conn = Connection::open_in_memory().unwrap();
-        let long = |c: &Connection| {
-            c.query_row(
-                "with recursive n(i) as (select 1 union all select i + 1 from n where i < 5000000) select count(*) from n",
-                [],
-                |r| r.get::<_, i64>(0),
-            )
-        };
-        let stop = Arc::new(AtomicBool::new(true));
-        let e = interruptible(&conn, &stop, long).unwrap_err();
-        assert_eq!(e.sqlite_error_code(), Some(rusqlite::ErrorCode::OperationInterrupted), "{e}");
-        assert_eq!(long(&conn).unwrap(), 5_000_000, "no handler left on the connection");
-        assert_eq!(interruptible(&conn, &Arc::new(AtomicBool::new(false)), long).unwrap(), 5_000_000);
-    }
-
     fn looked(windows: usize, media: bool, size: i64) -> Looked {
         let window = Window { group: "g".into(), from: 0, to: 1 };
         Looked { ids: vec![size], windows: vec![window; windows], media, size, ..Default::default() }
@@ -698,66 +308,6 @@ mod tests {
         assert_eq!(o.next(&done(&[])), Some(91));
         let swept = Older { shard: 3, first: 0, keys: vec![], end: None };
         assert_eq!(swept.next(&done(&[])), None, "nothing left: from the newest again");
-    }
-
-    #[test]
-    fn an_older_sweep_reads_old_incomplete_rows_below_where_it_got_to() {
-        let dir = tempfile::tempdir().unwrap();
-        let main = dir.path().join("atlas.db");
-        db::create_db_at(&main).unwrap();
-        let group = "alt.binaries.a";
-        let s = store::shard_of(group);
-        let now = 2_000_000_000;
-        let old = "2033-01-01 00:00:00"; // a year before now
-        let recent = "2033-05-18 00:00:00"; // a few hours before
-        let release = |name: &str, posted: &str, size: i64, complete: bool| -> i64 {
-            let article = crate::parser::Article {
-                message_id: format!("<{name}@x>"),
-                subject: format!("\"{name}\" yEnc (1/2)"),
-                author: "p <p@x>".into(),
-                filename: Some(format!("{name}.mkv")),
-                part: Some(1),
-                total_parts: Some(2),
-                bytes: 10,
-                ..Default::default()
-            };
-            let r = crate::parser::Release {
-                name: name.into(),
-                group: group.into(),
-                articles: vec![article],
-                ..Default::default()
-            };
-            store::save(&main, &[r]).unwrap();
-            let shard = db::open_shard(&store::shard_path(&main, s)).unwrap();
-            shard
-                .execute(
-                    "update releases set size = ?2, posted_date = ?3, complete = ?4 where name = ?1",
-                    rusqlite::params![name, size, posted, complete],
-                )
-                .unwrap();
-            shard.query_row("select id from releases where name = ?1", [name], |r| r.get(0)).unwrap()
-        };
-        let a = release("Old.Film.A.2020.1080p-X", old, 2 << 30, false);
-        let _small = release("Old.Small.2020-X", old, 1 << 20, false);
-        let _whole = release("Old.Whole.2020.1080p-X", old, 2 << 30, true);
-        let b = release("Old.Film.B.2021.1080p-X", old, 2 << 30, false);
-        let _new = release("New.Film.2026.1080p-X", recent, 2 << 30, false);
-        let tried = release("Old.Tried.2019.1080p-X", old, 2 << 30, false);
-        let conn = db::open_with_shards(&main).unwrap();
-        conn.execute_batch(CREATE).unwrap();
-        conn.execute("insert into repair_tried (release_id, at, permille) values (?1, 0, 0)", [tried]).unwrap();
-        let ids = |rows: &[ReleaseRow]| rows.iter().map(|r| r.id).collect::<Vec<_>>();
-        let (rows, end) = older_rows(&conn, s, now).unwrap();
-        assert_eq!(ids(&rows), [b, a], "old, big enough, incomplete and not tried, newest first");
-        let lowest: i64 = conn.query_row(&format!("select min(id) from s{s}.releases"), [], |r| r.get(0)).unwrap();
-        assert_eq!(end, Some(lowest), "fewer than a round's worth: on below every row read");
-        conn.execute("insert into repair_older (shard, before) values (?1, ?2)", rusqlite::params![s as i64, b])
-            .unwrap();
-        assert_eq!(ids(&older_rows(&conn, s, now).unwrap().0), [a], "below where it got to");
-        conn.execute("update repair_older set before = ?1", [lowest]).unwrap();
-        assert_eq!(older_rows(&conn, s, now).unwrap(), (vec![], None), "swept: from the newest again");
-        conn.execute("update repair_older set before = null", []).unwrap();
-        assert_eq!(ids(&older_rows(&conn, s, now).unwrap().0), [b, a]);
     }
 
     #[test]
