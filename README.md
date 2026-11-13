@@ -1108,7 +1108,6 @@ CI (`.github/workflows/ci.yml`) checks formatting, runs clippy, and runs the tes
 | `examples/probe_connections.rs` | Connection limit probe. |
 | `examples/bench_collections.rs` | What collection grouping costs against grouping by file name. |
 | `examples/bench_filters.rs` | What the ingest filters cost per article and per call. |
-| `examples/bench_writes.rs` | Database write benchmark. Run it on a copy of a real database, for example an APFS clone made with `cp -c`. |
 
 ## Limitations
 
