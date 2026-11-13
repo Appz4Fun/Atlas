@@ -15,7 +15,14 @@ do $$ declare relation text; occupied boolean; begin
  foreach relation in array array['groups','meta','backfill_chunks','backfill_deepest','backfill_media',
    'backfill_speculative','backfill_sweep_gen','backfill_sweeps','backfill_wanted','spot_comments',
    'spot_disposals','spot_reports','spots_seen','inferred_asked','inferred_ids','repair_tried','repair_older'] loop
-   execute format('select exists(select 1 from %I)',relation) into occupied;
+   if relation='meta' then
+     -- Migration 1's untouched allocator seed is not indexed/worker state.
+     -- DISTINCT checks reject NULL, nondefault values and stale text too.
+     select exists(select 1 from meta where key is distinct from 'next_seq'
+       or value is distinct from 1 or text_value is not null) into occupied;
+   else
+     execute format('select exists(select 1 from %I)',relation) into occupied;
+   end if;
    if occupied then
      raise exception 'native Stage requires fresh cursor and worker tables' using errcode='55000';
    end if;

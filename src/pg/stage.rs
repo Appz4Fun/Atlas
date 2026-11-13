@@ -69,7 +69,10 @@ fn require_pristine_catalog(client:&mut impl GenericClient)->Result<()> {
         "file_timing","release_indexed","upload_routes","release_keys","junk_releases","junk_collections","freeze_pending",
         "freeze_exempt","spots","nzb_pointed","release_nfo_password","word_queue","native_operations","native_runtime_epochs"];
     let mut checks=EMPTY.iter().map(|name|format!("exists(select 1 from \"{name}\")")).collect::<Vec<_>>();
-    checks.push("exists(select 1 from meta where key not in ('archive_name_bytes','archive_names_over_quota','sidecar_text_bytes') or value is distinct from 0 or text_value is not null)".into());
+    checks.push("exists(select 1 from meta where text_value is not null or case
+        when key='next_seq' then value is distinct from 1
+        when key in ('archive_name_bytes','archive_names_over_quota','sidecar_text_bytes') then value is distinct from 0
+        else true end)".into());
     let occupied:bool=client.query_one(&format!("select {}",checks.join(" or ")),&[])?.try_get(0)?;
     ensure!(!occupied,"native catalog bootstrap refuses preexisting releases, headers, cursors or worker state");Ok(())
 }
