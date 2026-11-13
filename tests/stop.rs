@@ -47,7 +47,7 @@ fn stop_when_stalled(server: Arc<Server>, stop: Arc<AtomicBool>) -> std::thread:
 #[ignore = "requires explicit isolated ATLAS_PG_TEST_URL and actual Atlas BIN"]
 fn stop_does_not_wait_for_a_stuck_request() {
     // Mandatory admission precedes even this test's provider-only control.
-    let mut harness = native_background::Harness::new();
+    let mut harness = native_background::Harness::new(None);
     let state = stalling_server(1);
     let port = spawn_server(state.clone());
     let pool = BlockingPool::from_pool(Pool::new(&[mock(port, "secret", 2, 1)]).with_timeout(Duration::from_secs(5)));
