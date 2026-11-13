@@ -294,6 +294,36 @@ impl Harness {
             .expect("observe original-owner native release snapshot")
     }
 
+    /// A finite unique-row observation for BODY-derived ingestion names.
+    pub fn display_name(&self, raw_name: &str) -> Option<String> {
+        self.runtime
+            .owner
+            .with(|client| {
+                anyhow::ensure!(raw_name.len() <= 4096, "native fixture raw-name lookup exceeds admission");
+                let mut tx = client
+                    .build_transaction()
+                    .isolation_level(postgres::IsolationLevel::RepeatableRead)
+                    .read_only(true)
+                    .start()?;
+                tx.batch_execute("set local statement_timeout='10s';set local lock_timeout='1s'")?;
+                let rows = tx.query(
+                    "select case when octet_length(display_name)<=1048576 then display_name end,
+                octet_length(display_name) from releases where name=$1 limit 2",
+                    &[&raw_name],
+                )?;
+                anyhow::ensure!(rows.len() == 1, "native fixture raw name is missing or ambiguous");
+                let bytes: Option<i32> = rows[0].try_get(1)?;
+                anyhow::ensure!(
+                    bytes.is_none_or(|n| (0..=1048576).contains(&n)),
+                    "native fixture display-name extent exceeds admission"
+                );
+                let name = rows[0].try_get(0)?;
+                tx.commit()?;
+                Ok(name)
+            })
+            .expect("observe actual BODY-derived native display name")
+    }
+
     pub fn cursors(&self) -> Vec<NativeCursor> {
         self.runtime
             .owner
