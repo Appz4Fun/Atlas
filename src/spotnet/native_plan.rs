@@ -16,13 +16,17 @@ impl<'a> Plan<'a> {
     pub(super) fn new(spot:&'a FullSpot,nzb:&'a Parsed)->Result<Option<Self>> {
         if !nzb.complete || nzb.damaged || nzb.left_out>0 || nzb.files.is_empty()
             || nzb.files.iter().any(|file|release::allowed(file).is_none()
-                || file.segments.len()!=file.articles || file.segments.iter().any(|segment|segment.message_id.is_empty())) {
+                || file.segments.len()!=file.articles || file.segments.iter().any(|segment|!payload_mid_usable(&segment.message_id))) {
             return Ok(None)
         }
         let segments=nzb.files.iter().try_fold(0usize,|n,file|n.checked_add(file.segments.len()));
         if segments.is_none_or(|count|count==0 || count>release::MAX_SEGMENTS) {return Ok(None)}
         let Some(title)=release::clean_title(&spot.title) else {return Ok(None)};
         let group=release::allowed(&nzb.files[0]).expect("all groups checked").clone();
+        // One native release has one group. Every file must name that same
+        // allowed group; actual payload HEADs still have to corroborate it.
+        if !valid_group(&group) || crate::filters::group_blocked(&group)
+            || nzb.files.iter().any(|file|!file.groups.iter().any(|g|g.eq_ignore_ascii_case(&group))) {return Ok(None)}
         let total=i64::try_from(nzb.files.len())?;let mut files=Vec::with_capacity(nzb.files.len());let mut size=0i64;
         for (at,file) in nzb.files.iter().enumerate() {
             let subject=parse_subject(&file.subject);
@@ -88,6 +92,55 @@ impl<'a> Plan<'a> {
         }
         Ok((!batch.articles.is_empty()).then_some(batch))
     }
+}
+
+fn payload_mid_usable(id:&str)->bool {
+    super::valid_message_id(id) && id.bytes().all(|b|b.is_ascii_graphic())
+        && id.split_once('@').is_some_and(|(left,right)|!left.is_empty()&&!right.is_empty()&&!right.contains('@'))
+}
+fn valid_group(group:&str)->bool {
+    !group.is_empty() && group.len()<=crate::filters::MAX_GROUP_NAME
+        && group.split('.').all(|part|!part.is_empty())
+        && group.bytes().all(|b|b.is_ascii_alphanumeric()||matches!(b,b'.'|b'+'|b'-'|b'_'))
+}
+
+/// Pure matching only. The service supplies bytes from a completed actual
+/// Pool HEAD reply; this function cannot mint provider or publication authority.
+pub(super) fn payload_head_matches(group:&str,mid:&str,head:&[u8])->bool {
+    if !valid_group(group)||crate::filters::group_blocked(group)||!payload_mid_usable(mid)||head.len()>64*1024 {return false}
+    let text=String::from_utf8_lossy(head);
+    let(mut ids,mut news,mut xrefs)=(0usize,0usize,0usize);
+    for line in text.lines().take_while(|line|!line.trim_end_matches('\r').is_empty()) {
+        if line.starts_with([' ','\t']) {continue}
+        let Some((name,_))=line.split_once(':') else{continue};
+        if name.eq_ignore_ascii_case("Message-ID") {ids+=1;}
+        if name.eq_ignore_ascii_case("Newsgroups") {news+=1;}
+        if name.eq_ignore_ascii_case("Xref") {xrefs+=1;}
+    }
+    if ids!=1||news>1||xrefs>1||news+xrefs==0 {return false}
+    if super::header::header_value(head,"Message-ID").is_none_or(|value|value.trim()!=format!("<{mid}>")) {return false}
+    if news==1 {
+        let Some(value)=super::header::header_value(head,"Newsgroups") else{return false};
+        let mut matched=false;
+        for actual in value.split(',').map(str::trim) {
+            if !valid_group(actual) {return false}
+            matched|=actual.eq_ignore_ascii_case(group);
+        }
+        if !matched {return false}
+    }
+    if xrefs==1 {
+        let Some(value)=super::header::header_value(head,"Xref") else{return false};
+        let mut fields=value.split_whitespace();
+        if fields.next().is_none() {return false}
+        let mut matched=false;
+        for field in fields {
+            let Some((actual,number))=field.rsplit_once(':') else{return false};
+            if !valid_group(actual)||number.parse::<u64>().ok().is_none_or(|n|n==0) {return false}
+            matched|=actual.eq_ignore_ascii_case(group);
+        }
+        if !matched {return false}
+    }
+    true
 }
 fn release_heap(release:&Release)->usize {
     std::mem::size_of::<Release>()+[&release.name,&release.group,&release.poster,&release.date].into_iter()
