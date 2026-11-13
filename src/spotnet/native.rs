@@ -28,7 +28,8 @@ impl std::fmt::Display for ProviderFailure {
 fn provider_error(error:crate::nntp::NntpError)->anyhow::Error {
     match error {
         crate::nntp::NntpError::HeaderStore(_)=>error.into(),
-        _=>anyhow::Error::new(error).context(ProviderFailure),
+        crate::nntp::NntpError::Io(_)|crate::nntp::NntpError::Reply {..}
+        |crate::nntp::NntpError::Protocol(_)|crate::nntp::NntpError::Decompress(_)=>anyhow::Error::new(error).context(ProviderFailure),
     }
 }
 fn is_provider_failure(error:&anyhow::Error)->bool {error.downcast_ref::<ProviderFailure>().is_some()}

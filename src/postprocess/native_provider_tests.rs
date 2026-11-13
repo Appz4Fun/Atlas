@@ -12,6 +12,11 @@ fn fixture()->(crate::pg::testing::Schema,Runtime,tokio::runtime::Runtime,Arc<Se
         Arc::new(crate::nntp::Pool::new(&[])),handle.handle().clone()).unwrap());
     (schema,runtime,handle,service)
 }
+struct Drain {owner:Arc<Owner>,worker:Option<super::Worker>}
+impl Drain {
+    fn finish(&mut self)->Result<super::JoinedWorkers> {join_workers(&self.owner,vec![self.worker.take().expect("one retained provider control worker")])}
+}
+impl Drop for Drain {fn drop(&mut self) {if let Some(worker)=self.worker.take() {let _=join_workers(&self.owner,vec![worker]);}}}
 #[derive(Clone,Copy,Debug)]
 enum End {Live,Stop,Unavailable,Fatal}
 fn end(owner:&Owner,kind:End) {
@@ -47,8 +52,9 @@ fn ready_reply_and_io_never_upgrade_stop_or_unavailable_at_either_interleaving()
                     assert_eq!(owner.failure(),expected(kind));done_tx.send(()).unwrap();
                     terminal?;Ok(None)
                 }).unwrap();
+                let mut drain=Drain {owner:runtime.owner.clone(),worker:Some(worker)};
                 done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-                join_workers(&runtime.owner,vec![worker]).unwrap();assert_eq!(runtime.owner.failure(),expected(kind));
+                drain.finish().unwrap();assert_eq!(runtime.owner.failure(),expected(kind));
                 if matches!(kind,End::Fatal) {assert!(matches!(crate::pg::outage::AttemptOutcome::from_exit(0,runtime.owner.failure()),crate::pg::outage::AttemptOutcome::Fatal));}
                 no_effects(&schema);runtime.owner.close();
             }
@@ -64,8 +70,9 @@ fn quiet_pending_provider_stop_joins_without_acceptance_or_recorded_failure() {
         assert!(crate::pg::outage::is_attempt_ended(result.as_ref().unwrap_err()));
         provider_pass(result)?;Ok(None)
     }).unwrap();
+    let mut drain=Drain {owner:runtime.owner.clone(),worker:Some(worker)};
     entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    join_workers(&runtime.owner,vec![worker]).unwrap();assert_eq!(runtime.owner.failure(),None);
+    drain.finish().unwrap();assert_eq!(runtime.owner.failure(),None);
     no_effects(&schema);runtime.owner.close();
 }
 #[test]
@@ -75,14 +82,15 @@ fn stopped_header_storage_sql_and_invariant_errors_remain_fatal_with_their_cause
         let (schema,runtime,_handle,service)=fixture();let owner=runtime.owner.clone();let (done_tx,done_rx)=mpsc::channel();
         let worker=workers::spawn(&runtime.owner,"native-fatal-provider-control".into(),move|| {
             let result:Result<()>=match kind {
-                0=>service.network_for_test(async {owner.stop.store(true,Ordering::Release);Err(NntpError::HeaderStore("owned storage failure".into()))}),
+                0=>service.network_for_test(async {owner.fail(Failure::Unavailable);Err(NntpError::HeaderStore("owned storage failure".into()))}),
                 1=>{owner.stop.store(true,Ordering::Release);Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,"owned local storage failure").into())},
                 2=>owner.with(|client|{client.batch_execute("select 1/0")?;Ok(())}),
                 _=>{owner.stop.store(true,Ordering::Release);Err(anyhow::anyhow!("native Spotnet provider failure"))},
             };
             let terminal=provider_pass(result);assert!(terminal.is_err());done_tx.send(()).unwrap();terminal?;Ok(None)
         }).unwrap();
-        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();let error=match join_workers(&runtime.owner,vec![worker]) {Ok(_)=>panic!("fatal cause must not become provider retry"),Err(error)=>error};
+        let mut drain=Drain {owner:runtime.owner.clone(),worker:Some(worker)};
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();let error=match drain.finish() {Ok(_)=>panic!("fatal cause must not become provider retry"),Err(error)=>error};
         assert_eq!(runtime.owner.failure(),Some(Failure::Fatal));
         match kind {
             0=>assert!(matches!(error.downcast_ref::<NntpError>(),Some(NntpError::HeaderStore(_)))),
