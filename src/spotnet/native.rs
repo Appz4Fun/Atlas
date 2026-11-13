@@ -42,8 +42,9 @@ pub(crate) fn prefer_failure(current:&mut Option<anyhow::Error>,incoming:anyhow:
         match (is_provider_failure(prior),is_provider_failure(&incoming)) {
             (true,false)=>true,
             (false,true)|(true,true)=>false,
-            (false,false)=>crate::pg::outage::classify(prior)==crate::pg::outage::Failure::Unavailable
-                && crate::pg::outage::classify(&incoming)==crate::pg::outage::Failure::Fatal,
+            (false,false)=>(crate::pg::outage::is_attempt_ended(prior) && !crate::pg::outage::is_attempt_ended(&incoming))
+                || (crate::pg::outage::classify(prior)==crate::pg::outage::Failure::Unavailable
+                    && crate::pg::outage::classify(&incoming)==crate::pg::outage::Failure::Fatal),
         }
     });
     if replace {*current=Some(incoming);}
