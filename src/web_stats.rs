@@ -1,56 +1,20 @@
-//! The stats page, `/ui/stats`: how each part of the indexer is keeping up, what the shards hold, and what came in
-//! over the last day. The live numbers are the ones Grafana graphs, read off the indexer's own `/metrics` listener
-//! (`metrics.indexer_port`), sampled every `SAMPLE_EVERY` while someone looks, soo rates are over the same kind of
-//! window as a `rate(...[5m])`. The net lane's per-shard rates come from the indexer's `stats.json`, which the
-//! release page's Processing panel reads too. What only the shards know (the last day by category, the latest PreDB
-//! matches) is read with indexed queries, each shard on its own thread: the matches are kept for `STORED_TTL`, the
-//! day for `DAY_TTL`, and a busy shard's day is broken down from a sample (`DAY_SAMPLE`).
+//! Statistics presentation over bounded PostgreSQL catalog reads and completed
+//! native metric observations. Rate reduction and formatting are pure; this
+//! module has no database opener, HTTP sampler, or stats-file fallback.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt::Write as _;
-use std::path::Path;
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
 
-use rusqlite::{Connection, OptionalExtension};
-use serde_json::Value;
+use crate::api::escape;
+use crate::web::{tag, thousands};
 
-use crate::api::{ApiResponse, escape};
-use crate::web::{html, tag, thousands};
-
-/// How often the indexer's metrics are read while the page is being looked at.
-const SAMPLE_EVERY: Duration = Duration::from_secs(15);
-/// Rates are over about this long, like Grafana's `[5m]`.
+/// Rates use the same five-minute horizon as the native observation reader.
 const RATE_WINDOW_SECS: f64 = 300.0;
-/// Under this, a rate isn't shown yet.
+/// A series needs a completed observation window before displaying a rate.
 const MIN_WINDOW_SECS: f64 = 30.0;
-/// Samples older than this are dropped.
-const KEEP_SECS: f64 = RATE_WINDOW_SECS + 120.0;
-/// The sampler stops when nobody has looked for this long, and starts again on the next look.
-const IDLE_STOP: Duration = Duration::from_secs(30 * 60);
-/// Reading `/metrics` gives up after this long.
-const SCRAPE_TIMEOUT: Duration = Duration::from_secs(5);
-/// The latest PreDB matches are read again after this long.
-const STORED_TTL: Duration = Duration::from_secs(60);
-/// The last day's breakdown, after this long: on a busy shard millions of releases were posted in a day.
-const DAY_TTL: Duration = Duration::from_secs(5 * 60);
-/// Releases per shard the breakdown looks at; past it, it looks at every nth (by id) and scales up. The total is
-/// always exact: it comes from the posted-date index alone.
-const DAY_SAMPLE: i64 = 20_000;
-/// stats.json older than this: the indexer isn't running.
-const STALE_SECS: f64 = 120.0;
-/// Latest PreDB matches listed.
-const PREDB_RECENT: usize = 25;
-/// The browser asks for the live part again this often.
 const REFRESH_SECS: u32 = 30;
-
-fn now() -> f64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
-}
-
-// ---------------------------------------------------------------------------------------------------------------
-// reading /metrics
+const STORED_REFRESH_SECS: u64 = 60;
 
 pub(crate) type Labels = Vec<(String, String)>;
 
@@ -211,7 +175,9 @@ impl Window {
     /// series counts only between reads that both have it.
     fn rate_where(&self, name: &str, keep: impl Fn(&Labels) -> bool) -> Option<f64> {
         if let Some(window) = &self.computed {
-            return ((window.to - window.from?) >= MIN_WINDOW_SECS).then(|| window.rates.sum_where(name, keep)).flatten();
+            return ((window.to - window.from?) >= MIN_WINDOW_SECS)
+                .then(|| window.rates.sum_where(name, keep))
+                .flatten();
         }
         let (now, then) = (self.now.as_ref()?, self.then.as_ref()?);
         let secs = now.at - then.at;
@@ -242,7 +208,9 @@ impl Window {
     /// A gauge's change per second over the window (`deriv`, from two points).
     fn change(&self, name: &str) -> Option<f64> {
         if let Some(window) = &self.computed {
-            return ((window.to - window.from?) >= MIN_WINDOW_SECS).then(|| window.changes.get(name).copied()).flatten();
+            return ((window.to - window.from?) >= MIN_WINDOW_SECS)
+                .then(|| window.changes.get(name).copied())
+                .flatten();
         }
         let (now, then) = (self.now.as_ref()?, self.then.as_ref()?);
         let secs = now.at - then.at;
@@ -257,92 +225,6 @@ impl Window {
     }
 }
 
-struct Sampler {
-    samples: VecDeque<Arc<Scrape>>,
-    last_error: Option<String>,
-    running: bool,
-    last_view: Option<Instant>,
-}
-
-static SAMPLER: Mutex<Sampler> =
-    Mutex::new(Sampler { samples: VecDeque::new(), last_error: None, running: false, last_view: None });
-
-/// Where the indexer serves its metrics, or why it doesn't.
-fn metrics_url() -> Result<String, String> {
-    let m = crate::config::metrics_config();
-    if !m.enabled {
-        return Err("metrics are off: set `enabled = true` under `[metrics]` in config.toml".into());
-    }
-    let host = match m.host.as_str() {
-        "" | "0.0.0.0" | "::" | "[::]" => "127.0.0.1".to_string(),
-        h if h.contains(':') && !h.starts_with('[') => format!("[{h}]"),
-        h => h.to_string(),
-    };
-    Ok(format!("http://{host}:{}/metrics", m.indexer_port))
-}
-
-fn scrape(url: &str) -> Result<Scrape, String> {
-    let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(SCRAPE_TIMEOUT)).build().into();
-    let mut response = agent.get(url).call().map_err(|e| e.to_string())?;
-    let text = response.body_mut().with_config().limit(64 * 1024 * 1024).read_to_string().map_err(|e| e.to_string())?;
-    Ok(parse(&text, now()))
-}
-
-fn sample_once() {
-    let read = metrics_url().and_then(|url| scrape(&url));
-    let mut s = SAMPLER.lock().unwrap();
-    match read {
-        Ok(scrape) => {
-            let at = scrape.at;
-            s.samples.push_back(Arc::new(scrape));
-            while s.samples.front().is_some_and(|f| at - f.at > KEEP_SECS) {
-                s.samples.pop_front();
-            }
-            s.last_error = None;
-        }
-        Err(e) => s.last_error = Some(e),
-    }
-}
-
-/// The samples so far, starting the sampler if it isn't running, and reading once right away when it has nothing.
-fn window() -> (Window, Option<String>) {
-    let start = {
-        let mut s = SAMPLER.lock().unwrap();
-        s.last_view = Some(Instant::now());
-        let start = !s.running;
-        s.running = true;
-        start
-    };
-    if start {
-        let fresh = SAMPLER.lock().unwrap().samples.back().is_none_or(|b| now() - b.at > SAMPLE_EVERY.as_secs_f64());
-        if fresh {
-            sample_once();
-        }
-        let spawned = thread::Builder::new().name("atlas-web-stats".into()).spawn(|| {
-            loop {
-                thread::sleep(SAMPLE_EVERY);
-                {
-                    let mut s = SAMPLER.lock().unwrap();
-                    if s.last_view.is_none_or(|v| v.elapsed() > IDLE_STOP) {
-                        s.running = false;
-                        return;
-                    }
-                }
-                sample_once();
-            }
-        });
-        if spawned.is_err() {
-            SAMPLER.lock().unwrap().running = false;
-        }
-    }
-    let s = SAMPLER.lock().unwrap();
-    (Window::of(&s.samples), s.last_error.clone())
-}
-
-// ---------------------------------------------------------------------------------------------------------------
-// what the shards hold
-
-/// Releases of one category posted in the last day.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct DayRow {
     pub(crate) count: i64,
@@ -384,211 +266,6 @@ pub(crate) struct Stored {
     pub(crate) errors: Vec<String>,
 }
 
-static STORED: Mutex<Option<(Instant, Arc<Stored>)>> = Mutex::new(None);
-/// held while the shards are being read, soo two looks at once read them once
-static READING: Mutex<()> = Mutex::new(());
-
-fn has_table(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
-    conn.query_row("select 1 from sqlite_master where type = 'table' and name = ?1", [table], |_| Ok(()))
-        .optional()
-        .map(|f| f.is_some())
-}
-
-fn has_index(conn: &Connection, index: &str) -> rusqlite::Result<bool> {
-    conn.query_row("select 1 from sqlite_master where type = 'index' and name = ?1", [index], |_| Ok(()))
-        .optional()
-        .map(|f| f.is_some())
-}
-
-/// One shard's releases posted since a time: the exact total, and by category from every `every`th of them.
-#[derive(Debug, Default, PartialEq)]
-struct Day {
-    total: i64,
-    every: i64,
-    /// scaled up to the total
-    rows: BTreeMap<i64, DayRow>,
-}
-
-/// One shard's last day. None when the shard has no index on `posted_date`: without it the count would read every
-/// release. The total is counted off the index alone; the breakdown needs each release's row and category, soo on a
-/// busy shard it looks at one release in `every` (by id, which says nothing of category or size) and scales up.
-fn day_of(conn: &Connection, since: &str, sample: i64) -> rusqlite::Result<Option<Day>> {
-    if !has_index(conn, crate::field_search::POSTED_INDEX)? {
-        return Ok(None);
-    }
-    let total: i64 = conn.query_row(
-        "select count(*) from releases indexed by idx_release_posted where posted_date >= ?1",
-        [since],
-        |r| r.get(0),
-    )?;
-    let sample = sample.max(1);
-    let every = ((total + sample - 1) / sample).max(1);
-    let shards = crate::store::SHARDS as i64;
-    let categorized = has_table(conn, "release_category")?;
-    let sql = if categorized {
-        format!(
-            "select c.category, count(*), coalesce(sum(r.complete = 1), 0), coalesce(sum(r.size), 0)
-             from releases r indexed by idx_release_posted left join release_category c on c.release_id = r.id
-             where r.posted_date >= ?1 and (r.id / {shards}) % ?2 = 0 group by 1"
-        )
-    } else {
-        format!(
-            "select null, count(*), coalesce(sum(complete = 1), 0), coalesce(sum(size), 0)
-             from releases indexed by idx_release_posted where posted_date >= ?1 and (id / {shards}) % ?2 = 0"
-        )
-    };
-    let mut sampled = BTreeMap::new();
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params![since, every], |r| {
-        Ok((r.get::<_, Option<i64>>(0)?, DayRow { count: r.get(1)?, complete: r.get(2)?, bytes: r.get(3)? }))
-    })?;
-    for row in rows {
-        let (category, day) = row?;
-        if day.count == 0 {
-            continue;
-        }
-        let entry: &mut DayRow = sampled.entry(category.unwrap_or(crate::category::UNCATEGORIZED)).or_default();
-        entry.count += day.count;
-        entry.complete += day.complete;
-        entry.bytes += day.bytes;
-    }
-    let seen: i64 = sampled.values().map(|r: &DayRow| r.count).sum();
-    let scale = if seen > 0 { total as f64 / seen as f64 } else { 0.0 };
-    let up = |n: i64| (n as f64 * scale).round() as i64;
-    let rows = sampled
-        .into_iter()
-        .map(|(c, r)| (c, DayRow { count: up(r.count), complete: up(r.complete), bytes: up(r.bytes) }))
-        .collect();
-    Ok(Some(Day { total, every, rows }))
-}
-
-/// One shard's latest PreDB matches. `predb_match` is small (one row per matched release), soo it is read whole;
-/// the newest are picked before the join, which the planner would otherwise drive from a scan of `releases`.
-fn predb_of(conn: &Connection, limit: usize) -> rusqlite::Result<Vec<PredbRow>> {
-    if !has_table(conn, "predb_match")? {
-        return Ok(Vec::new());
-    }
-    let category = if has_table(conn, "release_category")? {
-        "(select category from release_category where release_id = m.release_id)"
-    } else {
-        "null"
-    };
-    let sql = format!(
-        "select m.release_id, coalesce(r.display_name, r.name), m.kind, m.category, m.matched_at, m.pre_at, r.size,
-                r.complete, {category}
-         from (select * from predb_match order by matched_at desc, release_id desc limit ?1) m
-         join releases r on r.id = m.release_id
-         order by m.matched_at desc, m.release_id desc"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([limit as i64], |r| {
-        Ok(PredbRow {
-            id: r.get(0)?,
-            name: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
-            kind: r.get(2)?,
-            category: r.get(3)?,
-            matched_at: r.get(4)?,
-            pre_at: r.get(5)?,
-            size: r.get(6)?,
-            complete: r.get::<_, Option<i64>>(7)? == Some(1),
-            atlas_category: r.get::<_, Option<i64>>(8)?.unwrap_or(crate::category::UNCATEGORIZED),
-        })
-    })?;
-    rows.collect()
-}
-
-/// One shard's last day (outer None: not asked for; inner None: no posted-date index) and its latest PreDB matches.
-type ShardRead = (Option<Option<Day>>, Vec<PredbRow>);
-
-fn read_shard(path: &Path, since: Option<&str>) -> Result<ShardRead, String> {
-    let conn = crate::db::open_at(path).map_err(|e| e.to_string())?;
-    let _ = conn.pragma_update(None, "query_only", true);
-    let day = since.map(|since| day_of(&conn, since, DAY_SAMPLE)).transpose().map_err(|e| e.to_string())?;
-    let predb = predb_of(&conn, PREDB_RECENT).map_err(|e| e.to_string())?;
-    Ok((day, predb))
-}
-
-/// Reads the shards. The last day is taken from `previous` while it is younger than `DAY_TTL`.
-fn read_stored(main: &Path, at: f64, previous: Option<&Stored>) -> Stored {
-    let started = Instant::now();
-    let mut stored = Stored { at, ..Default::default() };
-    let keep_day = previous.filter(|p| p.day_at > 0.0 && at - p.day_at < DAY_TTL.as_secs_f64());
-    if let Some(p) = keep_day {
-        stored.day = p.day.clone();
-        stored.day_total = p.day_total;
-        stored.day_every = p.day_every;
-        stored.day_at = p.day_at;
-        stored.day_secs = p.day_secs;
-        stored.day_unindexed = p.day_unindexed;
-    }
-    let since = chrono::DateTime::from_timestamp(at as i64 - 86_400, 0)
-        .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
-        .filter(|_| keep_day.is_none());
-    let paths: Vec<_> = crate::store::shard_paths(main).into_iter().filter(|p| p.exists()).collect();
-    let results: Vec<_> = thread::scope(|scope| {
-        let handles: Vec<_> = paths.iter().map(|p| scope.spawn(|| read_shard(p, since.as_deref()))).collect();
-        handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("the read panicked".into()))).collect()
-    });
-    if since.is_some() {
-        stored.day_at = at;
-        stored.day_every = 1;
-    }
-    for (path, result) in paths.iter().zip(results) {
-        match result {
-            Ok((day, predb)) => {
-                match day {
-                    Some(Some(day)) => {
-                        stored.day_total += day.total;
-                        stored.day_every = stored.day_every.max(day.every);
-                        for (category, row) in day.rows {
-                            let entry = stored.day.entry(category).or_default();
-                            entry.count += row.count;
-                            entry.complete += row.complete;
-                            entry.bytes += row.bytes;
-                        }
-                    }
-                    Some(None) => stored.day_unindexed += 1,
-                    None => {}
-                }
-                stored.predb.extend(predb);
-            }
-            Err(e) => {
-                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                eprintln!("web stats: reading {name} failed: {e}");
-                stored.errors.push(format!("{name}: {e}"));
-            }
-        }
-    }
-    stored.predb.sort_by(|a, b| b.matched_at.cmp(&a.matched_at).then(b.id.cmp(&a.id)));
-    stored.predb.truncate(PREDB_RECENT);
-    stored.secs = started.elapsed().as_secs_f64();
-    if since.is_some() {
-        stored.day_secs = stored.secs;
-    }
-    stored
-}
-
-fn stored() -> Arc<Stored> {
-    let fresh = |slot: &Option<(Instant, Arc<Stored>)>| {
-        slot.as_ref().filter(|(at, _)| at.elapsed() < STORED_TTL).map(|(_, s)| s.clone())
-    };
-    if let Some(s) = fresh(&STORED.lock().unwrap()) {
-        return s;
-    }
-    let _reading = READING.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(s) = fresh(&STORED.lock().unwrap()) {
-        return s;
-    }
-    let previous = STORED.lock().unwrap().as_ref().map(|(_, s)| s.clone());
-    let s = Arc::new(read_stored(&crate::paths::database(), now(), previous.as_deref()));
-    *STORED.lock().unwrap() = Some((Instant::now(), s.clone()));
-    s
-}
-
-// ---------------------------------------------------------------------------------------------------------------
-// writing numbers
-
-/// 1234 -> "1,234"; 12_345_678 -> "12.3M"
 fn short(n: f64) -> String {
     if !n.is_finite() {
         return "–".into();
@@ -679,13 +356,6 @@ fn tile(label: &str, value: &str, note: &str) -> String {
 // ---------------------------------------------------------------------------------------------------------------
 // the live part
 
-fn stats_json() -> Value {
-    std::fs::read_to_string(crate::paths::stats_file())
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or(Value::Null)
-}
-
 /// One line of the pipeline table.
 struct Lane {
     name: String,
@@ -749,11 +419,7 @@ fn step_names() -> Vec<(&'static str, bool)> {
     crate::postprocess::steps::catalog().iter().map(|s| (s.name, s.needs != Needs::Database)).collect()
 }
 
-fn pipelines(w: &Window, stats: &Value) -> String {
-    pipelines_with_pace(w,Some(stats),None)
-}
-
-fn pipelines_with_pace(w:&Window,stats:Option<&Value>,native:Option<&crate::web_pending::NativePace>)->String {
+fn pipelines_with_pace(w: &Window, native: &crate::web_pending::NativePace) -> String {
     let n = w.now.as_deref();
     let get = |name: &str| n.and_then(|n| n.sum(name));
     let with = |name: &str, key: &str, value: &str| n.and_then(|n| n.with(name, key, value));
@@ -813,22 +479,17 @@ fn pipelines_with_pace(w:&Window,stats:Option<&Value>,native:Option<&crate::web_
     net.waiting = with("atlas_stage_queue", "state", "net_wanted");
     net.running = in_progress(w, "stage.fetch_body");
     net.per_minute = w.per_minute("atlas_stage_bodies_total", |_| true);
-    let lane = stats.map(|stats|&stats["postprocess"]["lanes"]);
-    let sum = |key: &str| lane.and_then(|lane|lane[key].as_array()).map(|v| v.iter().filter_map(Value::as_f64).sum::<f64>());
-    if let Some(native)=native {
-        net.note=match native {
-            crate::web_pending::NativePace::Measured(pace)=>format!("{} releases visited and {} finished a minute, measured from the native counter instance",short(pace.net_visits),short(pace.net_finished)),
-            crate::web_pending::NativePace::Warming {..}=>"Native processing is running; its rate window is warming up.".into(),
-            crate::web_pending::NativePace::Stopped {..}=>"Native processing is on hold.".into(),
-        };
-    }
-    if let (Some(visits), Some(finished)) = (sum("net_visits"), sum("net_finished")) {
-        net.note = format!(
-            "per minute: bodies fetched; {} releases visited and {} finished a minute",
-            short(visits),
-            short(finished)
-        );
-    }
+    net.note = match native {
+        crate::web_pending::NativePace::Measured(pace) => format!(
+            "{} releases visited and {} finished a minute, measured from the native counter instance",
+            short(pace.net_visits),
+            short(pace.net_finished)
+        ),
+        crate::web_pending::NativePace::Warming { .. } => {
+            "Native processing is running; its rate window is warming up.".into()
+        }
+        crate::web_pending::NativePace::Stopped { .. } => "Native processing is on hold.".into(),
+    };
     lanes.push(net);
 
     let rows: String = lanes.iter().map(Lane::row).collect();
@@ -858,80 +519,19 @@ fn pipelines_with_pace(w:&Window,stats:Option<&Value>,native:Option<&crate::web_
     )
 }
 
-/// Each shard's lanes: from `atlas_stage_lane_total` and `atlas_stage_net_claims` when the indexer exports them,
-/// else from stats.json's ten-minute rates.
-fn net_shards(w: &Window, stats: &Value) -> String {
-    let lane = &stats["postprocess"]["lanes"];
-    let n = w.now.as_deref();
-    let exported = n.is_some_and(|n| !n.rows("atlas_stage_lane_total").is_empty());
-    let shards = if exported {
-        n.map_or(0, |n| {
-            n.rows("atlas_stage_lane_total")
-                .iter()
-                .filter_map(|(l, _)| label(l, "shard")?.parse::<usize>().ok())
-                .max()
-                .map_or(0, |m| m + 1)
-        })
-    } else {
-        lane["net_visits"].as_array().map_or(0, Vec::len)
-    };
-    if shards == 0 {
-        return String::new();
-    }
-    let rate = |key: &str, i: usize| {
-        if exported {
-            let shard = i.to_string();
-            w.per_minute("atlas_stage_lane_total", |l| {
-                label(l, "shard") == Some(shard.as_str()) && label(l, "lane") == Some(key)
-            })
-        } else {
-            lane[key].get(i).and_then(Value::as_f64)
-        }
-    };
-    let limit = n.and_then(|n| n.sum("atlas_stage_net_claims_limit"));
-    let claims = |i: usize| n.and_then(|n| n.with("atlas_stage_net_claims", "shard", &i.to_string()));
-    let rows: String = (0..shards)
-        .map(|i| {
-            let held = match (claims(i), limit) {
-                (Some(c), Some(l)) if l > 0.0 => format!(
-                    "{} of {}{}",
-                    thousands(c as i64),
-                    thousands(l as i64),
-                    bar(c / l, if c >= l { "warn" } else { "ok" }, &format!("{c} of {l} claims held"))
-                ),
-                (Some(c), _) => thousands(c as i64),
-                _ => "–".into(),
-            };
-            format!(
-                "<tr><td>s{i}</td><td class=\"num\">{held}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
-                opt(rate("net_visits", i)),
-                opt(rate("net_finished", i)),
-                opt(rate("queue_taken", i)),
-            )
-        })
-        .collect();
-    let source = if exported {
-        "From the indexer's metrics, over the same window as the rates above.".to_string()
-    } else {
-        let window = lane["window_secs"].as_f64().map(|s| format!(" over the last {}", span(s))).unwrap_or_default();
-        format!("From the indexer's stats.json{window}.")
-    };
-    format!(
-        "<h2>Lanes per shard</h2><div class=\"table-wrap\"><table><thead><tr><th>Shard</th><th class=\"num\">Net claims</th><th class=\"num\">Net visits a minute</th><th class=\"num\">Net finished a minute</th><th class=\"num\">Queue taken a minute</th></tr></thead><tbody>{rows}</tbody></table></div><p class=\"sort\">{source}</p>"
-    )
-}
-
 /// Groups furthest behind the server, from `atlas_group_article_number` and `atlas_group_posted_timestamp_seconds`.
 fn lag(w: &Window, now: f64) -> String {
-    if let Some(facts) = w.computed.as_ref().and_then(|window|window.lag.as_ref()) {
-        return lag_from_facts(facts,now);
+    if let Some(facts) = w.computed.as_ref().and_then(|window| window.lag.as_ref()) {
+        return lag_from_facts(facts, now);
     }
     const SHOWN: usize = 15;
     const LATE_SECS: f64 = 30.0 * 60.0;
     let Some(n) = w.now.as_deref() else { return String::new() };
     let numbers = n.rows("atlas_group_article_number");
     let newest = n.rows("atlas_group_posted_timestamp_seconds");
-    if numbers.is_empty() && newest.is_empty() { return String::new(); }
+    if numbers.is_empty() && newest.is_empty() {
+        return String::new();
+    }
     // per group: the server's last article, the live cursor, the newest article indexed
     type Marks = (Option<f64>, Option<f64>, Option<f64>);
     let mut groups: HashMap<&str, Marks> = HashMap::new();
@@ -946,22 +546,31 @@ fn lag(w: &Window, now: f64) -> String {
     }
     for (l, v) in newest {
         if let Some(g) = label(l, "group") {
-            let entry=groups.entry(g).or_default();
-            if label(l,"end")==Some("newest") {entry.2=Some(*v);}
+            let entry = groups.entry(g).or_default();
+            if label(l, "end") == Some("newest") {
+                entry.2 = Some(*v);
+            }
         }
     }
-    let incomplete=groups.values().filter(|(last,live,_)|last.is_none()||live.is_none()).count();
-    let untimed=groups.values().filter(|(_,_,newest)|newest.is_none()).count();
+    let incomplete = groups.values().filter(|(last, live, _)| last.is_none() || live.is_none()).count();
+    let untimed = groups.values().filter(|(_, _, newest)| newest.is_none()).count();
     let mut rows: Vec<(&str, f64, Option<f64>)> = groups
         .iter()
         .filter_map(|(g, (last, live, newest))| Some((*g, ((*last)? - (*live)?).max(0.0), *newest)))
         .collect();
     let behind = rows.iter().filter(|r| r.1 > 0.0).count();
-    let late = groups.values().filter(|(_,_,newest)|newest.is_some_and(|at|now-at>LATE_SECS)).count();
+    let late = groups.values().filter(|(_, _, newest)| newest.is_some_and(|at| now - at > LATE_SECS)).count();
     let total_lag: f64 = rows.iter().map(|r| r.1).sum();
     rows.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(b.0)));
-    let facts = LagFacts { groups: groups.len(), incomplete,untimed,behind, late, articles: total_lag,
-        rows: rows.into_iter().take(SHOWN).map(|(group, lag, newest)| (group.to_owned(), lag, newest)).collect() };
+    let facts = LagFacts {
+        groups: groups.len(),
+        incomplete,
+        untimed,
+        behind,
+        late,
+        articles: total_lag,
+        rows: rows.into_iter().take(SHOWN).map(|(group, lag, newest)| (group.to_owned(), lag, newest)).collect(),
+    };
     lag_from_facts(&facts, now)
 }
 
@@ -980,23 +589,52 @@ fn lag_from_facts(facts: &LagFacts, now: f64) -> String {
             )
         })
         .collect();
-    let known=facts.groups.saturating_sub(facts.incomplete);
-    let articles=if known==0&&facts.incomplete>0{"unavailable".into()}else if facts.incomplete>0{format!("{} known",short(facts.articles))}else{short(facts.articles)};
-    let behind=if known==0&&facts.incomplete>0{"unavailable".into()}else if facts.incomplete>0{format!("{} known",thousands(facts.behind as i64))}else{thousands(facts.behind as i64)};
-    let quiet=if facts.untimed==facts.groups&&facts.untimed>0{"unavailable".into()}else if facts.untimed>0{format!("{} known",thousands(facts.late as i64))}else{thousands(facts.late as i64)};
+    let known = facts.groups.saturating_sub(facts.incomplete);
+    let articles = if known == 0 && facts.incomplete > 0 {
+        "unavailable".into()
+    } else if facts.incomplete > 0 {
+        format!("{} known", short(facts.articles))
+    } else {
+        short(facts.articles)
+    };
+    let behind = if known == 0 && facts.incomplete > 0 {
+        "unavailable".into()
+    } else if facts.incomplete > 0 {
+        format!("{} known", thousands(facts.behind as i64))
+    } else {
+        thousands(facts.behind as i64)
+    };
+    let quiet = if facts.untimed == facts.groups && facts.untimed > 0 {
+        "unavailable".into()
+    } else if facts.untimed > 0 {
+        format!("{} known", thousands(facts.late as i64))
+    } else {
+        thousands(facts.late as i64)
+    };
     let tiles = [
         tile("Articles behind", &articles, "server's last article minus the live cursor, over measured groups"),
         tile("Groups behind", &behind, &format!("of {} observed groups", thousands(facts.groups as i64))),
         tile("Quiet over 30 minutes", &quiet, "newest article indexed is older than that, over timed groups"),
     ];
-    let mut unavailable=String::new();
-    for (count,message) in [(facts.incomplete,"Progress"),(facts.untimed,"Newest-article time")] {
-        if count>0 {let _=write!(unavailable,"<p class=\"note\">{message} is unavailable for {} group{}.</p>",thousands(count as i64),if count==1{""}else{"s"});}
+    let mut unavailable = String::new();
+    for (count, message) in [(facts.incomplete, "Progress"), (facts.untimed, "Newest-article time")] {
+        if count > 0 {
+            let _ = write!(
+                unavailable,
+                "<p class=\"note\">{message} is unavailable for {} group{}.</p>",
+                thousands(count as i64),
+                if count == 1 { "" } else { "s" }
+            );
+        }
     }
     let table = if table.is_empty() {
-        if facts.incomplete==0 {"<p class=\"sort\">Every group is caught up with its server.</p>".to_string()}
-        else if known>0 {"<p class=\"sort\">Known groups are caught up with their servers.</p>".to_string()}
-        else {String::new()}
+        if facts.incomplete == 0 {
+            "<p class=\"sort\">Every group is caught up with its server.</p>".to_string()
+        } else if known > 0 {
+            "<p class=\"sort\">Known groups are caught up with their servers.</p>".to_string()
+        } else {
+            String::new()
+        }
     } else {
         format!(
             "<div class=\"table-wrap\"><table><thead><tr><th>Furthest behind</th><th class=\"num\">Articles</th><th class=\"num\">Newest indexed</th></tr></thead><tbody>{table}</tbody></table></div>"
@@ -1005,35 +643,10 @@ fn lag_from_facts(facts: &LagFacts, now: f64) -> String {
     format!("<h2>Realtime</h2><div class=\"stat-grid\">{}</div>{unavailable}{table}", tiles.concat())
 }
 
-/// `answering`: the newest read of the metrics is recent and the last try didn't fail. A gauge kept from an older
-/// read says nothing of whether the indexer is up now.
-fn headline(w: &Window, stats: &Value, now: f64, answering: bool) -> String {
+fn headline_from_state(w: &Window, state: String) -> String {
     let n = w.now.as_deref();
     let get = |name: &str| n.and_then(|n| n.sum(name));
-    // the indexer writes stats.json every second: a listener that still answers while that has gone quiet is
-    // a process that stopped moving
-    let wrote = stats["load"]["at"].as_f64().filter(|at| *at > 0.0);
-    let fresh = wrote.is_some_and(|at| now - at < STALE_SECS);
-    let up = answering && get("atlas_indexer_up").is_some_and(|u| u > 0.0);
-    let start = get("atlas_process_start_time_seconds");
-    let state = match (fresh, up, wrote) {
-        (true, _, _) => format!("{} up {}", tag("tag-ok", "RUNNING"), start.map(|s| span(now - s)).unwrap_or_default()),
-        (false, true, Some(at)) => format!(
-            "{} its metrics still answer, but it last wrote stats.json {}; the counters below aren't moving",
-            tag("tag-warn", "NOT MOVING"),
-            ago(at, now)
-        ),
-        (false, true, None) => {
-            format!("{} up {}", tag("tag-ok", "RUNNING"), start.map(|s| span(now - s)).unwrap_or_default())
-        }
-        (false, false, _) => tag("tag-bad", "STOPPED"),
-    };
-    headline_from_state(w,state)
-}
-
-fn headline_from_state(w:&Window,state:String)->String {
-    let n=w.now.as_deref();let get=|name:&str|n.and_then(|n|n.sum(name));
-    let with=|name:&str,key:&str,value:&str|n.and_then(|n|n.with(name,key,value));
+    let with = |name: &str, key: &str, value: &str| n.and_then(|n| n.with(name, key, value));
     let wire = w.rate_where("atlas_nntp_traffic_bytes_total", |l| label(l, "kind") == Some("wire"));
     let articles = w.rate_where("atlas_articles_total", |_| true);
     let failures = w.per_minute("atlas_nntp_failures_total", |l| {
@@ -1061,37 +674,6 @@ fn headline_from_state(w:&Window,state:String)->String {
         ),
     ];
     format!("<p class=\"sort\">{state}</p><div class=\"stat-grid\">{}</div>", tiles.concat())
-}
-
-fn catalog(w: &Window, now: f64) -> String {
-    let n = w.now.as_deref();
-    let state = |s: &str| n.and_then(|n| n.with("atlas_catalog_releases", "state", s));
-    let total = state("total");
-    let live = n.and_then(|n| n.with("atlas_db_rows", "kind", "releases"));
-    let complete = state("complete");
-    let share = |part: Option<f64>| match (part, total) {
-        (Some(p), Some(t)) => percent(p, t).map(|p| format!("{p:.1}% of the catalog")).unwrap_or_default(),
-        _ => String::new(),
-    };
-    let walked = n.and_then(|n| n.sum("atlas_catalog_scan_timestamp_seconds")).filter(|t| *t > 0.0);
-    let size = n.and_then(|n| n.sum("atlas_catalog_bytes"));
-    let tiles = [
-        tile("Releases stored", &count(live), "every shard, now"),
-        tile("Complete releases", &count(complete), &share(complete)),
-        tile("Named", &count(state("named")), &share(state("named"))),
-        tile("Matched to the PreDB", &count(state("predb_matched")), &share(state("predb_matched"))),
-        tile("Still obfuscated", &count(state("still_obfuscated")), &share(state("still_obfuscated"))),
-        tile("Catalog size", &size.map_or_else(|| "–".into(), bytes), ""),
-    ];
-    let when = match walked {
-        Some(t) => format!(
-            "Counted by the catalog walk {} (it took {}). Releases stored is the shards' running total.",
-            ago(t, now),
-            n.and_then(|n| n.sum("atlas_catalog_scan_duration_seconds")).map(span).unwrap_or_else(|| "–".into())
-        ),
-        None => "The catalog walk hasn't finished one walk yet.".into(),
-    };
-    format!("<h2>Releases</h2><div class=\"stat-grid\">{}</div><p class=\"sort\">{when}</p>", tiles.concat())
 }
 
 fn backfill(w: &Window) -> String {
@@ -1124,71 +706,6 @@ fn backfill(w: &Window) -> String {
         bar(share, "ok", &format!("{:.2}% done", share * 100.0)),
         count(hour),
         count(groups),
-    )
-}
-
-fn predb_feeds(w: &Window, stats: &Value, now: f64) -> String {
-    let n = w.now.as_deref();
-    let titles = n.and_then(|n| n.sum("atlas_predb_titles"));
-    let behind = n.and_then(|n| n.sum("atlas_predb_late_behind"));
-    let matched = w.per_minute("atlas_predb_matches_total", |_| true).map(|m| m * 60.0);
-    let mut failing = String::new();
-    for feed in stats["predb"]["sources"].as_array().into_iter().flatten() {
-        let failures = feed["failures"].as_i64().unwrap_or(0);
-        if failures == 0 {
-            continue;
-        }
-        let last = feed["last_ok_at"].as_f64().map(|t| ago(t, now)).unwrap_or_else(|| "never".into());
-        let _ = write!(
-            failing,
-            "<tr><td>{}</td><td class=\"num\">{failures}</td><td class=\"dim\">{last}</td><td class=\"name dim\">{}</td></tr>",
-            escape(feed["key"].as_str().unwrap_or("")),
-            escape(feed["last_error"].as_str().unwrap_or("")),
-        );
-    }
-    if titles.is_none() && failing.is_empty() {
-        return String::new();
-    }
-    let tiles = [
-        tile("PreDB titles", &count(titles), ""),
-        tile("Matched an hour", &opt(matched), "releases matched to a title"),
-        tile("Titles to look at", &count(behind), "the late matcher's backlog"),
-    ];
-    let failing = if failing.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "<div class=\"table-wrap\"><table><thead><tr><th>Feed failing</th><th class=\"num\">In a row</th><th>Last answered</th><th>Error</th></tr></thead><tbody>{failing}</tbody></table></div>"
-        )
-    };
-    format!("<h2>PreDB</h2><div class=\"stat-grid\">{}</div>{failing}", tiles.concat())
-}
-
-/// The part that refreshes itself: everything but the shard reads.
-pub(crate) fn live_html(w: &Window, error: Option<&str>, stats: &Value, now: f64) -> String {
-    let problem = match (w.now.as_ref(), error) {
-        (None, Some(e)) => crate::web::diag("note", "the indexer's metrics could not be read", e),
-        (Some(s), Some(e)) => {
-            crate::web::diag("note", &format!("these numbers are from {}: the last read failed", ago(s.at, now)), e)
-        }
-        _ => String::new(),
-    };
-    let answering = error.is_none()
-        && w.now.as_ref().is_some_and(|s| now - s.at < (2 * SAMPLE_EVERY + SCRAPE_TIMEOUT).as_secs_f64());
-    let measured = match (w.secs(), w.now.as_ref()) {
-        (Some(secs), Some(s)) => format!("Read {}; rates over the last {}.", ago(s.at, now), span(secs)),
-        (None, Some(s)) => format!("Read {}; rates show once a second read is in, within a minute.", ago(s.at, now)),
-        _ => String::new(),
-    };
-    format!(
-        "<div id=\"stats-live\" hx-get=\"/ui/stats/live\" hx-trigger=\"every {REFRESH_SECS}s\" hx-swap=\"outerHTML\">{problem}{}{}{}{}{}{}{}<p class=\"sort\">{measured} Refreshes every {REFRESH_SECS} seconds.</p></div>",
-        headline(w, stats, now, answering),
-        pipelines(w, stats),
-        net_shards(w, stats),
-        lag(w, now),
-        backfill(w),
-        catalog(w, now),
-        predb_feeds(w, stats, now),
     )
 }
 
@@ -1343,7 +860,7 @@ pub(crate) fn stored_html(s: &Stored, now: f64) -> String {
     };
     format!(
         "<div id=\"stats-stored\" hx-get=\"/ui/stats/stored\" hx-trigger=\"every {}s\" hx-swap=\"outerHTML\">{errors}{}{}<p class=\"sort\">PreDB matches read {}; again after a minute.</p></div>",
-        STORED_TTL.as_secs(),
+        STORED_REFRESH_SECS,
         day_html(s),
         predb_html(s, now),
         ago(s.at, now),
@@ -1353,84 +870,147 @@ pub(crate) fn stored_html(s: &Stored, now: f64) -> String {
 // ---------------------------------------------------------------------------------------------------------------
 // the routes
 
-pub fn page() -> ApiResponse {
-    let (w, error) = window();
-    html(200, page_from_facts(&w, error.as_deref(), &stats_json(), now()))
-}
-
-pub(crate) fn page_from_facts(w: &Window, error: Option<&str>, stats: &Value, now: f64) -> String {
-    let content = format!(
-        "{masthead}<div class=\"release stats\"><main><h1>Stats</h1>{live}<div id=\"stats-stored\" hx-get=\"/ui/stats/stored\" hx-trigger=\"load\" hx-swap=\"outerHTML\"><h2>Last 24 hours</h2><p class=\"sort\">Reading the shards…</p></div></main></div>",
-        masthead = crate::web::masthead(true),
-        live = live_html(w, error, stats, now),
-    );
-    crate::web::page("Stats · Atlas", &content)
-}
-
 /// Presentation of actual fresh-catalog SQL and completed registry facts.
 /// It never synthesizes the retired eight-shard stats.json representation.
-pub(crate) struct NativeCatalog {pub total:i64,pub complete:i64,pub named:i64,pub matched:i64,pub obfuscated:i64,pub bytes:i64}
-pub(crate) struct NativeFeed {pub key:String,pub failures:i64,pub last_ok:Option<i64>,pub error:Option<String>}
-pub(crate) struct NativePredb {pub titles:i64,pub behind:Option<i64>,pub feeds:Vec<NativeFeed>}
+pub(crate) struct NativeCatalog {
+    pub total: i64,
+    pub complete: i64,
+    pub named: i64,
+    pub matched: i64,
+    pub obfuscated: i64,
+    pub bytes: i64,
+}
+pub(crate) struct NativeFeed {
+    pub key: String,
+    pub failures: i64,
+    pub last_ok: Option<i64>,
+    pub error: Option<String>,
+}
+pub(crate) struct NativePredb {
+    pub titles: i64,
+    pub behind: Option<i64>,
+    pub feeds: Vec<NativeFeed>,
+}
 
-pub(crate) fn native_live_from_facts(facts:&crate::pg::fresh_statistics::NativeStatistics)->String {
-    let w=&facts.window;let now=facts.now;let n=w.now.as_deref();
-    let up=n.and_then(|sample|sample.sum("atlas_indexer_up"));
-    let state=match up {
-        Some(up) if up>0.0=>tag("tag-ok","RUNNING"),
-        Some(0.0)=>tag("tag-warn","ON HOLD"),
-        _=>tag("tag-warn","ACTIVITY NOT REPORTED"),
+pub(crate) fn native_live_from_facts(facts: &crate::pg::fresh_statistics::NativeStatistics) -> String {
+    let w = &facts.window;
+    let now = facts.now;
+    let n = w.now.as_deref();
+    let up = n.and_then(|sample| sample.sum("atlas_indexer_up"));
+    let state = match up {
+        Some(up) if up > 0.0 => tag("tag-ok", "RUNNING"),
+        Some(0.0) => tag("tag-warn", "ON HOLD"),
+        _ => tag("tag-warn", "ACTIVITY NOT REPORTED"),
     };
-    let catalog=&facts.catalog;
-    let catalog=format!("<h2>Releases</h2><div class=\"stat-grid\">{}</div><p class=\"sort\">Read from PostgreSQL. Native releases remain in this catalog.</p>",[
-        tile("Releases stored",&thousands(catalog.total),"PostgreSQL catalog"),tile("Complete releases",&thousands(catalog.complete),""),
-        tile("Named",&thousands(catalog.named),""),tile("Matched to the PreDB",&thousands(catalog.matched),""),
-        tile("Still obfuscated",&thousands(catalog.obfuscated),""),tile("Catalog size",&bytes(catalog.bytes as f64),"")].concat());
-    let mut feeds=String::new();
+    let catalog = &facts.catalog;
+    let catalog = format!(
+        "<h2>Releases</h2><div class=\"stat-grid\">{}</div><p class=\"sort\">Read from PostgreSQL. Native releases remain in this catalog.</p>",
+        [
+            tile("Releases stored", &thousands(catalog.total), "PostgreSQL catalog"),
+            tile("Complete releases", &thousands(catalog.complete), ""),
+            tile("Named", &thousands(catalog.named), ""),
+            tile("Matched to the PreDB", &thousands(catalog.matched), ""),
+            tile("Still obfuscated", &thousands(catalog.obfuscated), ""),
+            tile("Catalog size", &bytes(catalog.bytes as f64), "")
+        ]
+        .concat()
+    );
+    let mut feeds = String::new();
     for feed in &facts.predb.feeds {
-        let _=write!(feeds,"<tr><td>{}</td><td class=\"num\">{}</td><td>{}</td><td class=\"name dim\">{}</td></tr>",escape(&feed.key),feed.failures,
-            feed.last_ok.map(|at|ago(at as f64,now)).unwrap_or_else(||"never".into()),escape(feed.error.as_deref().unwrap_or("")));
+        let _ = write!(
+            feeds,
+            "<tr><td>{}</td><td class=\"num\">{}</td><td>{}</td><td class=\"name dim\">{}</td></tr>",
+            escape(&feed.key),
+            feed.failures,
+            feed.last_ok.map(|at| ago(at as f64, now)).unwrap_or_else(|| "never".into()),
+            escape(feed.error.as_deref().unwrap_or(""))
+        );
     }
-    let feed_table=if feeds.is_empty(){String::new()}else{format!("<div class=\"table-wrap\"><table><thead><tr><th>Feed failing</th><th>In a row</th><th>Last answered</th><th>Error</th></tr></thead><tbody>{feeds}</tbody></table></div>")};
-    let predb=format!("<h2>PreDB</h2><div class=\"stat-grid\">{}{}{}</div>{feed_table}",tile("PreDB titles",&thousands(facts.predb.titles),"retained PostgreSQL cache"),
-        tile("Matched an hour",&opt(w.per_minute("atlas_predb_matches_total", |_|true).map(|rate|rate*60.0)),"releases matched to a title"),
-        tile("Titles to look at",&facts.predb.behind.map(|n|thousands(n)).unwrap_or_else(||"–".into()),"the recorded late matcher's backlog"));
-    let measured=if w.computed.as_ref().is_some_and(|window|!window.rates.series.is_empty()){"Original-series rates use their completed 30–300 second observation windows."}else{"Rates are unavailable until an original series has a completed observation window of at least 30 seconds."};
-    format!("<div id=\"stats-live\" hx-get=\"/ui/stats/live\" hx-trigger=\"every {REFRESH_SECS}s\" hx-swap=\"outerHTML\">{}{}{}{}{}{predb}<p class=\"sort\">Read {}; {measured}</p></div>",
-        headline_from_state(w,state),pipelines_with_pace(w,None,Some(&facts.pace)),lag(w,now),backfill(w),catalog,
-        w.now.as_ref().map(|sample|ago(sample.at,now)).unwrap_or_else(||"unavailable".into()))
+    let feed_table = if feeds.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<div class=\"table-wrap\"><table><thead><tr><th>Feed failing</th><th>In a row</th><th>Last answered</th><th>Error</th></tr></thead><tbody>{feeds}</tbody></table></div>"
+        )
+    };
+    let predb = format!(
+        "<h2>PreDB</h2><div class=\"stat-grid\">{}{}{}</div>{feed_table}",
+        tile("PreDB titles", &thousands(facts.predb.titles), "retained PostgreSQL cache"),
+        tile(
+            "Matched an hour",
+            &opt(w.per_minute("atlas_predb_matches_total", |_| true).map(|rate| rate * 60.0)),
+            "releases matched to a title"
+        ),
+        tile(
+            "Titles to look at",
+            &facts.predb.behind.map(|n| thousands(n)).unwrap_or_else(|| "–".into()),
+            "the recorded late matcher's backlog"
+        )
+    );
+    let measured = if w.computed.as_ref().is_some_and(|window| !window.rates.series.is_empty()) {
+        "Original-series rates use their completed 30–300 second observation windows."
+    } else {
+        "Rates are unavailable until an original series has a completed observation window of at least 30 seconds."
+    };
+    format!(
+        "<div id=\"stats-live\" hx-get=\"/ui/stats/live\" hx-trigger=\"every {REFRESH_SECS}s\" hx-swap=\"outerHTML\">{}{}{}{}{}{predb}<p class=\"sort\">Read {}; {measured}</p></div>",
+        headline_from_state(w, state),
+        pipelines_with_pace(w, &facts.pace),
+        lag(w, now),
+        backfill(w),
+        catalog,
+        w.now.as_ref().map(|sample| ago(sample.at, now)).unwrap_or_else(|| "unavailable".into())
+    )
 }
 
-pub(crate) fn native_page_from_facts(facts:&crate::pg::fresh_statistics::NativeStatistics)->String {
-    let content=format!("{}<div class=\"release stats\"><main><h1>Stats</h1>{}<div id=\"stats-stored\" hx-get=\"/ui/stats/stored\" hx-trigger=\"load\" hx-swap=\"outerHTML\"><h2>Last 24 hours</h2><p class=\"sort\">Reading PostgreSQL…</p></div></main></div>",crate::web::masthead(true),native_live_from_facts(facts));
-    crate::web::page("Stats · Atlas",&content)
-}
-
-pub fn live() -> ApiResponse {
-    let (w, error) = window();
-    html(200, live_html(&w, error.as_deref(), &stats_json(), now()))
-}
-
-pub fn stored_fragment() -> ApiResponse {
-    html(200, stored_html(&stored(), now()))
+pub(crate) fn native_page_from_facts(facts: &crate::pg::fresh_statistics::NativeStatistics) -> String {
+    let content = format!(
+        "{}<div class=\"release stats\"><main><h1>Stats</h1>{}<div id=\"stats-stored\" hx-get=\"/ui/stats/stored\" hx-trigger=\"load\" hx-swap=\"outerHTML\"><h2>Last 24 hours</h2><p class=\"sort\">Reading PostgreSQL…</p></div></main></div>",
+        crate::web::masthead(true),
+        native_live_from_facts(facts)
+    );
+    crate::web::page("Stats · Atlas", &content)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::params;
 
     #[test]
     fn native_rate_and_lag_facts_keep_reset_semantics_without_fake_samples() {
-        let then = Arc::new(parse("atlas_articles_total{group=\"a\"} 100\natlas_articles_total{group=\"b\"} 500\n", 0.0));
-        let now = Arc::new(parse("atlas_articles_total{group=\"a\"} 160\natlas_articles_total{group=\"b\"} 30\natlas_articles_total{group=\"new\"} 9999\natlas_group_article_number{group=\"a\",mark=\"last\"} 100\natlas_group_article_number{group=\"a\",mark=\"live_cursor\"} 50\natlas_group_article_number{group=\"b\",mark=\"last\"} 10\natlas_group_article_number{group=\"b\",mark=\"live_cursor\"} 10\natlas_group_article_number{group=\"c\",mark=\"last\"} 50\natlas_group_article_number{group=\"c\",mark=\"live_cursor\"} 25\natlas_group_posted_timestamp_seconds{group=\"a\",end=\"newest\"} 1\natlas_group_posted_timestamp_seconds{group=\"b\",end=\"newest\"} 1900\natlas_group_posted_timestamp_seconds{group=\"c\",end=\"newest\"} 1990\n", 60.0));
+        let then =
+            Arc::new(parse("atlas_articles_total{group=\"a\"} 100\natlas_articles_total{group=\"b\"} 500\n", 0.0));
+        let now = Arc::new(parse(
+            "atlas_articles_total{group=\"a\"} 160\natlas_articles_total{group=\"b\"} 30\natlas_articles_total{group=\"new\"} 9999\natlas_group_article_number{group=\"a\",mark=\"last\"} 100\natlas_group_article_number{group=\"a\",mark=\"live_cursor\"} 50\natlas_group_article_number{group=\"b\",mark=\"last\"} 10\natlas_group_article_number{group=\"b\",mark=\"live_cursor\"} 10\natlas_group_article_number{group=\"c\",mark=\"last\"} 50\natlas_group_article_number{group=\"c\",mark=\"live_cursor\"} 25\natlas_group_posted_timestamp_seconds{group=\"a\",end=\"newest\"} 1\natlas_group_posted_timestamp_seconds{group=\"b\",end=\"newest\"} 1900\natlas_group_posted_timestamp_seconds{group=\"c\",end=\"newest\"} 1990\n",
+            60.0,
+        ));
         let original = Window { then: Some(then), now: Some(now.clone()), ..Default::default() };
-        let native = Window { now: Some(now), computed: Some(ComputedWindow {
-            from: Some(0.0), to: 60.0,
-            rates: Arc::new(Scrape { at: 60.0, series: HashMap::from([("atlas_articles_total".into(), vec![(Vec::new(), 1.5)])]) }),
-            changes: HashMap::new(), lag: Some(LagFacts { groups: 3,incomplete:0,untimed:0, behind: 2, late: 1, articles: 75.0,
-                rows: vec![("a".into(), 50.0, Some(1.0)), ("c".into(), 25.0, Some(1990.0)), ("b".into(), 0.0, Some(1900.0))] }),
-        }), ..Default::default() };
+        let native = Window {
+            now: Some(now),
+            computed: Some(ComputedWindow {
+                from: Some(0.0),
+                to: 60.0,
+                rates: Arc::new(Scrape {
+                    at: 60.0,
+                    series: HashMap::from([("atlas_articles_total".into(), vec![(Vec::new(), 1.5)])]),
+                }),
+                changes: HashMap::new(),
+                lag: Some(LagFacts {
+                    groups: 3,
+                    incomplete: 0,
+                    untimed: 0,
+                    behind: 2,
+                    late: 1,
+                    articles: 75.0,
+                    rows: vec![
+                        ("a".into(), 50.0, Some(1.0)),
+                        ("c".into(), 25.0, Some(1990.0)),
+                        ("b".into(), 0.0, Some(1900.0)),
+                    ],
+                }),
+            }),
+            ..Default::default()
+        };
         // +60 on a, +30 after b reset; a new series contributes no rate.
         assert_eq!(original.rate_where("atlas_articles_total", |_| true), Some(1.5));
         assert_eq!(native.rate_where("atlas_articles_total", |_| true), Some(1.5));
@@ -1496,6 +1076,38 @@ atlas_indexer_up 1
     }
 
     #[test]
+    fn native_stored_facts_render_categories_and_recent_predb_matches() {
+        let at = 1_800_000_000.0;
+        let facts = Stored {
+            at,
+            day_at: at,
+            day_total: 4,
+            day_every: 1,
+            day: BTreeMap::from([
+                (2040, DayRow { count: 2, complete: 2, bytes: 2000 }),
+                (crate::category::UNCATEGORIZED, DayRow { count: 2, complete: 0, bytes: 2000 }),
+            ]),
+            predb: vec![PredbRow {
+                id: 8,
+                name: "Rel.1.0".into(),
+                kind: crate::predb::matcher::Kind::Exact as i64,
+                category: Some("X264".into()),
+                matched_at: at as i64 - 60,
+                pre_at: None,
+                size: Some(1000),
+                complete: true,
+                atlas_category: 2040,
+            }],
+            ..Default::default()
+        };
+        let html = stored_html(&facts, at);
+        assert!(html.contains("Posted in the last 24 hours") && html.contains("Uncategorized"), "{html}");
+        assert!(html.contains("/ui/release?id=8") && html.contains("X264 · exact"), "{html}");
+        assert!(!html.contains("no index on the posted date"), "{html}");
+        assert!(html.contains("hx-get=\"/ui/stats/stored\" hx-trigger=\"every 60s\""), "{html}");
+    }
+
+    #[test]
     fn numbers_read_short() {
         assert_eq!(short(12_345_678.0), "12.3M");
         assert_eq!(short(1234.0), "1,234");
@@ -1504,176 +1116,72 @@ atlas_indexer_up 1
         assert_eq!(bytes(1536.0), "1.5 KB");
         assert_eq!(span(3.0 * 3600.0 + 120.0), "3h 2m");
     }
-
-    #[test]
-    fn the_live_part_shows_pipelines_and_says_when_rates_are_coming() {
-        let w = Window { now: Some(Arc::new(parse(TEXT, 1000.0))), ..Default::default() };
-        let stats = serde_json::json!({"load": {"at": 1000.0}, "postprocess": {"lanes": {"window_secs": 600,
-            "net_visits": [1.0, 2.0], "net_finished": [0.5, 0.5], "queue_taken": [3.0, 4.0]}}});
-        let out = live_html(&w, None, &stats, 1001.0);
-        assert!(out.contains("RUNNING"));
-        assert!(out.contains("7,500,000"), "unsaved headers as the parse lane's waiting line");
-        assert!(out.contains("rates show once"));
-        assert!(out.contains("Lanes per shard") && out.contains("<td>s1</td>"));
-        assert!(out.contains("hx-trigger=\"every 30s\""));
-        // stats.json went quiet: NOT MOVING while the metrics still answer, STOPPED once they don't
-        let later = 1000.0 + STALE_SECS + 5.0;
-        let fresh = Window { now: Some(Arc::new(parse(TEXT, later - 5.0))), ..Default::default() };
-        let quiet = live_html(&fresh, None, &stats, later);
-        assert!(quiet.contains("NOT MOVING") && !quiet.contains("RUNNING"), "metrics answer, stats.json went quiet");
-        let gone = live_html(&fresh, Some("connection refused"), &stats, later);
-        assert!(gone.contains("STOPPED") && !gone.contains("NOT MOVING"), "the listener is gone too");
-        let old = live_html(&w, None, &stats, later);
-        assert!(old.contains("STOPPED"), "a read from minutes ago isn't an answer now");
-        let failed = live_html(&Window::default(), Some("connection refused"), &Value::Null, 1001.0);
-        assert!(failed.contains("could not be read") && failed.contains("connection refused"));
-    }
-
-    #[test]
-    fn a_busy_shards_day_is_counted_exactly_and_broken_down_from_a_sample() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.db");
-        let conn = crate::db::create_at(&path).unwrap();
-        crate::store::build_shard(&conn).unwrap();
-        conn.execute_batch(&format!(
-            "create index {} on releases(posted_date);
-             create table if not exists release_category (release_id INTEGER PRIMARY KEY, category INTEGER NOT NULL);",
-            crate::field_search::POSTED_INDEX
-        ))
-        .unwrap();
-        // 1,000 fresh releases, a seventh of them TV and complete, and one old
-        for n in 0..1_000i64 {
-            let id = n * crate::store::SHARDS as i64;
-            conn.execute(
-                "insert into releases (id, name, group_name, posted_date, size, complete) values (?, ?, 'g', '2026-11-05 10:00:00', 10, ?)",
-                params![id, format!("r{n}"), (n % 7 == 3) as i64],
-            )
-            .unwrap();
-            if n % 7 == 3 {
-                conn.execute("insert into release_category values (?, 5040)", [id]).unwrap();
-            }
-        }
-        conn.execute("insert into releases (id, name, group_name, posted_date) values (99999992, 'old', 'g', '2026-11-01 00:00:00')", []).unwrap();
-        let day = day_of(&conn, "2026-11-04 12:00:00", 100).unwrap().unwrap();
-        assert_eq!((day.total, day.every), (1_000, 10));
-        let tv = &day.rows[&5040];
-        assert_eq!(tv.count, tv.complete);
-        assert!((100..=190).contains(&tv.count), "about a seventh: {}", tv.count);
-        let all = day_of(&conn, "2026-11-04 12:00:00", 20_000).unwrap().unwrap();
-        assert_eq!(
-            (all.every, all.rows[&5040].count, all.rows[&crate::category::UNCATEGORIZED].bytes),
-            (1, 143, 8_570)
-        );
-    }
-
-    #[test]
-    fn the_shards_give_the_last_day_and_the_latest_predb_matches() {
-        let dir = tempfile::tempdir().unwrap();
-        let main = dir.path().join("atlas.db");
-        crate::db::create_db_at(&main).unwrap();
-        let shards = crate::store::shard_paths(&main);
-        let at = 1_800_000_000.0;
-        let fmt =
-            |t: f64| chrono::DateTime::from_timestamp(t as i64, 0).unwrap().format("%Y-%m-%d %H:%M:%S").to_string();
-        // two shards' worth, or both in one when there is one
-        for i in 0..2 {
-            let conn = crate::db::open_at(&shards[i % shards.len()]).unwrap();
-            conn.execute_batch(&format!(
-                "create index if not exists {} on releases(posted_date);
-                 create table if not exists release_category (release_id INTEGER PRIMARY KEY, category INTEGER NOT NULL);
-                 create table if not exists predb_match (release_id INTEGER PRIMARY KEY, title_id INTEGER NOT NULL,
-                    kind INTEGER NOT NULL, category TEXT, pre_at INTEGER, nuked INTEGER NOT NULL DEFAULT 0,
-                    matched_at INTEGER NOT NULL);",
-                crate::field_search::POSTED_INDEX
-            ))
-            .unwrap();
-            let base = i as i64;
-            // fresh movie (complete), fresh uncategorized, and one from two days ago
-            for (n, posted, complete, cat) in
-                [(1, at - 3600.0, 1, Some(2040)), (2, at - 7200.0, 0, None), (3, at - 2.0 * 86_400.0, 1, Some(2040))]
-            {
-                let id = n * 8 + base;
-                conn.execute(
-                    "insert into releases (id, name, group_name, posted_date, size, complete) values (?, ?, 'g', ?, 1000, ?)",
-                    params![id, format!("Rel.{n}.{i}"), fmt(posted), complete],
-                )
-                .unwrap();
-                if let Some(cat) = cat {
-                    conn.execute("insert into release_category values (?, ?)", params![id, cat]).unwrap();
-                }
-            }
-            conn.execute(
-                "insert into predb_match (release_id, title_id, kind, category, matched_at) values (?, 1, 1, 'X264', ?)",
-                params![8 + base, at as i64 - 60 * (base + 1)],
-            )
-            .unwrap();
-        }
-        let s = read_stored(&main, at, None);
-        assert!(s.errors.is_empty(), "{:?}", s.errors);
-        assert_eq!(
-            s.day_unindexed,
-            shards.len().saturating_sub(2),
-            "shards without the index are left out, not scanned"
-        );
-        assert_eq!(s.day[&2040], DayRow { count: 2, complete: 2, bytes: 2000 });
-        assert_eq!(s.day[&crate::category::UNCATEGORIZED].count, 2);
-        assert_eq!((s.day_total, s.day_every, s.day_at), (4, 1, at));
-        // a minute later the matches are read again, the day is kept
-        let later = read_stored(&main, at + 60.0, Some(&s));
-        assert_eq!((later.day_total, later.day_at), (4, at));
-        assert_eq!(later.predb.len(), 2);
-        assert_eq!(s.predb.iter().map(|r| r.id).collect::<Vec<_>>(), vec![8, 9], "newest match first");
-        assert_eq!(s.predb[0].atlas_category, 2040);
-        let out = stored_html(&s, at);
-        assert!(out.contains("Posted in the last 24 hours") && out.contains("Uncategorized"));
-        assert!(out.contains("/ui/release?id=8") && out.contains("X264 · exact"));
-        assert_eq!(out.contains("no index on the posted date"), shards.len() > 2, "said only for shards without it");
-        assert!(out.contains("hx-get=\"/ui/stats/stored\" hx-trigger=\"every 60s\""), "it keeps refreshing");
-    }
 }
-
 
 #[cfg(test)]
 mod native_lag_evidence_tests {
     use super::*;
-    fn native(text:&str)->Window {Window {now:Some(Arc::new(parse(text,2000.0))),computed:Some(ComputedWindow {from:None,to:0.0,rates:Arc::new(Scrape::default()),changes:HashMap::new(),lag:None}),..Default::default()}}
+    fn native(text: &str) -> Window {
+        Window {
+            now: Some(Arc::new(parse(text, 2000.0))),
+            computed: Some(ComputedWindow {
+                from: None,
+                to: 0.0,
+                rates: Arc::new(Scrape::default()),
+                changes: HashMap::new(),
+                lag: None,
+            }),
+            ..Default::default()
+        }
+    }
     #[test]
     fn missing_last_or_live_marks_never_claim_every_group_is_caught_up() {
-        for text in ["atlas_group_article_number{group=\"unknown\",mark=\"live_cursor\"} 50\n",
-            "atlas_group_article_number{group=\"unknown\",mark=\"last\"} 100\n"] {
-            let body=lag(&native(text),2000.0);
-            assert!(!body.contains("Every group is caught up"),"{body}");
-            assert!(body.contains("Progress is unavailable for 1 group"),"{body}");
+        for text in [
+            "atlas_group_article_number{group=\"unknown\",mark=\"live_cursor\"} 50\n",
+            "atlas_group_article_number{group=\"unknown\",mark=\"last\"} 100\n",
+        ] {
+            let body = lag(&native(text), 2000.0);
+            assert!(!body.contains("Every group is caught up"), "{body}");
+            assert!(body.contains("Progress is unavailable for 1 group"), "{body}");
         }
     }
     #[test]
     fn mixed_unknown_and_known_progress_retains_both_evidence_states() {
-        let zero="atlas_group_article_number{group=\"known\",mark=\"last\"} 100\natlas_group_article_number{group=\"known\",mark=\"live_cursor\"} 100\n";
-        let unknown="atlas_group_article_number{group=\"unknown\",mark=\"live_cursor\"} 20\n";
-        let body=lag(&native(&format!("{zero}{unknown}")),2000.0);
-        assert!(!body.contains("Every group is caught up"));assert!(body.contains("Known groups are caught up")&&body.contains("Progress is unavailable for 1 group"),"{body}");
-        assert!(body.contains("of 2"),"the incomplete group must remain in the denominator: {body}");
-        let behind=zero.replace("live_cursor\"} 100","live_cursor\"} 50");
-        let body=lag(&native(&format!("{behind}{unknown}")),2000.0);
-        assert!(body.contains("Progress is unavailable for 1 group")&&body.contains("?group=known"),"{body}");
+        let zero = "atlas_group_article_number{group=\"known\",mark=\"last\"} 100\natlas_group_article_number{group=\"known\",mark=\"live_cursor\"} 100\n";
+        let unknown = "atlas_group_article_number{group=\"unknown\",mark=\"live_cursor\"} 20\n";
+        let body = lag(&native(&format!("{zero}{unknown}")), 2000.0);
+        assert!(!body.contains("Every group is caught up"));
+        assert!(
+            body.contains("Known groups are caught up") && body.contains("Progress is unavailable for 1 group"),
+            "{body}"
+        );
+        assert!(body.contains("of 2"), "the incomplete group must remain in the denominator: {body}");
+        let behind = zero.replace("live_cursor\"} 100", "live_cursor\"} 50");
+        let body = lag(&native(&format!("{behind}{unknown}")), 2000.0);
+        assert!(body.contains("Progress is unavailable for 1 group") && body.contains("?group=known"), "{body}");
     }
     #[test]
     fn timestamp_only_groups_keep_unknown_progress_and_newest_time_explicit() {
-        for (end,missing_newest) in [("oldest",true),("newest",false)] {
-            let text=format!("atlas_group_posted_timestamp_seconds{{group=\"timestamp-only\",end=\"{end}\"}} 1990\n");
-            let body=lag(&native(&text),2000.0);
-            assert!(!body.contains("Every group is caught up"),"{body}");
-            assert!(body.contains("Progress is unavailable for 1 group"),"{body}");
-            assert!(body.contains("of 1 observed groups"),"the timestamp-only group must remain observed: {body}");
-            assert_eq!(body.contains("Newest-article time is unavailable for 1 group"),missing_newest,"{body}");
+        for (end, missing_newest) in [("oldest", true), ("newest", false)] {
+            let text = format!("atlas_group_posted_timestamp_seconds{{group=\"timestamp-only\",end=\"{end}\"}} 1990\n");
+            let body = lag(&native(&text), 2000.0);
+            assert!(!body.contains("Every group is caught up"), "{body}");
+            assert!(body.contains("Progress is unavailable for 1 group"), "{body}");
+            assert!(body.contains("of 1 observed groups"), "the timestamp-only group must remain observed: {body}");
+            assert_eq!(body.contains("Newest-article time is unavailable for 1 group"), missing_newest, "{body}");
         }
     }
     #[test]
     fn complete_zero_progress_can_claim_caught_up_but_unknown_age_is_explicit() {
-        let text="atlas_group_article_number{group=\"known\",mark=\"last\"} 100\natlas_group_article_number{group=\"known\",mark=\"live_cursor\"} 100\n";
-        let body=lag(&native(text),2000.0);assert!(body.contains("Every group is caught up"));
-        assert!(body.contains("Newest-article time is unavailable for 1 group"),"{body}");
-        let body=lag(&native(&format!("{text}atlas_group_posted_timestamp_seconds{{group=\"known\",end=\"newest\"}} 1990\n")),2000.0);
-        assert!(body.contains("Every group is caught up"));assert!(!body.contains("unavailable"),"{body}");
+        let text = "atlas_group_article_number{group=\"known\",mark=\"last\"} 100\natlas_group_article_number{group=\"known\",mark=\"live_cursor\"} 100\n";
+        let body = lag(&native(text), 2000.0);
+        assert!(body.contains("Every group is caught up"));
+        assert!(body.contains("Newest-article time is unavailable for 1 group"), "{body}");
+        let body = lag(
+            &native(&format!("{text}atlas_group_posted_timestamp_seconds{{group=\"known\",end=\"newest\"}} 1990\n")),
+            2000.0,
+        );
+        assert!(body.contains("Every group is caught up"));
+        assert!(!body.contains("unavailable"), "{body}");
     }
 }
