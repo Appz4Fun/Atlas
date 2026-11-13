@@ -169,7 +169,7 @@ impl Service {
     }
     fn mark_posts(&self,plan:&Plan,_now:i64)->Result<()> {
         self.owner.with(|client| {
-            let mut tx=client.transaction()?;crate::pg::history_gate::native(&mut tx)?;
+            let mut tx=client.transaction()?;crate::pg::guard_native_transaction(&mut tx)?;
             let mut marks=plan.marks.iter().collect::<Vec<_>>();marks.sort_by_key(|mark|mark.source.id);
             for mark in marks {
                 self.stopped()?;self.binding(&mark.source)?;
@@ -183,7 +183,7 @@ impl Service {
     }
     fn prune(&self,now:i64)->Result<()> {
         self.owner.with(|client| {
-            let mut tx=client.transaction()?;crate::pg::history_gate::native(&mut tx)?;let stale=now-super::DAYS*86400;
+            let mut tx=client.transaction()?;crate::pg::guard_native_transaction(&mut tx)?;let stale=now-super::DAYS*86400;
             tx.execute("delete from inferred_ids where message_id in(select message_id from inferred_ids where next_at<$1 order by next_at,message_id limit 256)",&[&stale])?;
             tx.execute("delete from inferred_asked where release_id in(select release_id from inferred_asked where next_at<$1 order by next_at,release_id limit 256)",&[&stale])?;
             self.stopped()?;tx.commit()?;Ok(())
@@ -219,7 +219,7 @@ impl Service {
     }
     fn accept(&self,request:&Request,revision:i64,outcome:Outcome,releases:Option<&[crate::parser::Release]>,now:i64)->Result<Acceptance> {
         self.binding(&request.source)?;self.owner.with(|client| {
-            let mut tx=client.transaction()?;crate::pg::history_gate::native(&mut tx)?;
+            let mut tx=client.transaction()?;crate::pg::guard_native_transaction(&mut tx)?;
             // Same order as the ordinary native writer: group before release.
             tx.query_one("select pg_advisory_xact_lock(hashtextextended(current_schema() || ':' || $1,7936))",&[&request.source.group])?;
             tx.query_opt("select id from releases where id=$1 for update",&[&request.source.id])?;
