@@ -1581,3 +1581,7 @@ mod native_asset_selection_tests {
         assert!(!root.path().join("posters/missing.jsonl").exists());
     }
 }
+
+#[cfg(all(test,unix))]
+#[path="api/native_asset_http_tests.rs"]
+mod native_asset_http_tests;

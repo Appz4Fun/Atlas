@@ -1,8 +1,11 @@
 use super::*;
+#[cfg(unix)]
 use std::io::{Read,Write};
+#[cfg(unix)]
 use sha2::{Digest,Sha256};
 
 #[test]
+#[cfg(unix)]
 fn admitted_asset_reads_check_manifest_content_and_refuse_unlisted_or_replaced_files() {
     let home=tempfile::tempdir().unwrap();let evidence=tempfile::tempdir().unwrap();
     std::fs::create_dir(home.path().join("covers")).unwrap();
