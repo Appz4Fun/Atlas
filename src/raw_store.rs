@@ -11,6 +11,8 @@
 //!   `(name, group_name)`, and `raw_backfill_deepest` / `raw_group_bounds`) so shard resets never require
 //!   re-querying OpenSubtitles or re-downloading probed Usenet article bodies, video stills or audio windows.
 
+pub(crate) mod nfo_key;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 #[cfg(not(test))]
