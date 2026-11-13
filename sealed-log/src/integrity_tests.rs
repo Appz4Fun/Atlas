@@ -165,7 +165,8 @@ fn reject_without_rewriting(fixture: &Fixture) {
     let before = fixture.bytes(0);
     for _ in 0..2 {
         let result = fixture.open();
-        assert!(result.is_err(), "ambiguous or corrupt bytes must not become a writable tail");
+        let error = result.err().expect("ambiguous or corrupt bytes must not become a writable tail");
+        assert_eq!(error.kind(), ErrorKind::InvalidData, "recovery must identify invalid source bytes");
         assert_eq!(fixture.bytes(0), before, "failed reopen must preserve the complete segment");
     }
 }
@@ -255,7 +256,8 @@ fn reject_before_payload_allocation(fixture: &Fixture, at: Locator) {
     let scope = test_io::Scope::enter(&fixture.dir, None);
     let result = catch_unwind(AssertUnwindSafe(|| log.read(at)));
     assert!(result.is_ok(), "untrusted locator arithmetic must not panic: {at:?}");
-    assert!(result.unwrap().is_err(), "invalid locator must be rejected: {at:?}");
+    let error = result.unwrap().unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidData, "invalid locator must fail bounds/header admission: {at:?}");
     assert!(scope.allocations().is_empty(), "rejection reached payload allocation: {:?}", scope.allocations());
 }
 
