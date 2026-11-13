@@ -68,20 +68,22 @@ impl ReadView<'_> {
         self.before_query()?;
         let mut tx=self.tx.borrow_mut();
         let mut rows=tx.query_raw("with inventory as(
-            select f.id,f.filename,count(s.message_key) articles,coalesce(sum(s.bytes),0)::bigint bytes,null::bigint singleton_part,null::bytea singleton_mid
+            select f.id,f.filename,count(s.message_key) articles,coalesce(sum(s.bytes),0)::bigint bytes,null::bigint singleton_part,null::bytea singleton_mid,true sparse_present
             from files f join segments s on s.file_id=f.id and s.release_id=f.release_id
             where f.release_id=$1 and f.filename<>'' group by f.id
             union all
-            select f.id,f.filename,1::bigint,s.bytes,s.part,s.message_id
+            select f.id,f.filename,1::bigint,s.bytes,s.part,s.message_id,m.message_key is not null
             from files f join segments s on s.file_id=f.id and s.release_id=f.release_id
+            left join segment_nzb_metadata m on m.release_id=s.release_id and m.message_key=s.message_key
             where f.release_id=$1 and f.filename='')
-            select id,octet_length(filename)::bigint,articles,bytes from inventory
+            select id,octet_length(filename)::bigint,articles,bytes,sparse_present from inventory
             order by filename collate \"C\",id,singleton_part nulls first,singleton_mid",[&id])?;
         let mut count=0u64;
         while let Some(row)=rows.next()? {
             self.check_deadline()?;
             let values:[i64;4]=[row.try_get(0)?,row.try_get(1)?,row.try_get(2)?,row.try_get(3)?];
             ensure!(values[0]>0 && values[1]>=0 && values[2]>0,"invalid native file inventory");
+            ensure!(row.try_get::<_,bool>(4)?,"native original unnamed file metadata unavailable");
             for value in values {descriptors.write_all(&value.to_le_bytes())?;}
             count=count.checked_add(1).context("native file count overflow")?;
         }
