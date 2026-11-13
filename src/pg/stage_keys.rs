@@ -130,7 +130,7 @@ mod tests {
         let (id,file)=runtime.owner.with(|client| {
             let row=client.query_one("select release_id,id from files",&[])?;let id:i64=row.get(0);let file:i64=row.get(1);
             client.execute("insert into release_probe(release_id,info,moviehash) values($1,$2,'')",&[&id,&info])?;
-            client.execute("insert into file_timing(file_id,lines,articles) values($1,7,1)",&[&file])?;
+            client.execute("insert into file_timing(file_id,release_id,lines,articles) values($1,$2,7,1)",&[&file,&id])?;
             client.execute("insert into release_keys(release_id,account,video) values($1,-1,99)",&[&id])?;
             client.execute("insert into archive_inner_files(release_id,seq,name,size,crc32,source) values($1,0,'excluded',2097152,1,1),($1,1,'kept',2097152,4294967295,2)",&[&id])?;
             client.execute("insert into segment_crc(release_id,message_id,decoded,crc32) values($1,$2,2097152,4294967295)",&[&id,&b"<part@example.test>".as_slice()])?;

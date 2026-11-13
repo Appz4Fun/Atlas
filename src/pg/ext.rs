@@ -66,7 +66,8 @@ fn sources() -> Vec<Source> {
 }
 
 pub(crate) fn owns_table(table: &str) -> bool {
-    ["ext_freeze_exempt","ext_preserved_cache_rows","ext_cache_identity_keys","ext_segment_crc_cache","ext_cached_images","ext_asset_files"].contains(&table)
+    ["ext_freeze_exempt","ext_preserved_cache_rows","ext_cache_identity_keys","ext_segment_crc_cache","ext_cached_images","ext_asset_files",
+     "ext_predb_title_keys","ext_predb_key_meta","ext_predb_key_build"].contains(&table)
         || sources().iter().any(|source| source.ext == table)
 }
 
@@ -572,6 +573,17 @@ fn advance_counters(tx: &mut postgres::Transaction<'_>) -> Result<()> {
             ),
             &[&tq, &c],
         )?;
+    }
+    let matcher_revision_installed: bool = tx.query_one(
+        "select exists(select 1 from pg_sequences where schemaname=current_schema() and sequencename='ext_predb_key_revision')", &[]
+    )?.get(0);
+    if matcher_revision_installed {
+        // A restored completed matcher revision is a stale-result fence, not
+        // an identity column. Its next certificate must exceed that revision
+        // AND any sequence history already observed in this destination.
+        // Do not consume a fresh sequence when no completion was restored.
+        tx.query_opt("select setval('ext_predb_key_revision', greatest((select last_value from ext_predb_key_revision),revision),true)
+            from ext_predb_key_meta where singleton=1", &[])?;
     }
     Ok(())
 }
@@ -1103,6 +1115,9 @@ pub fn restore(c: &mut Client, from: &Path, replace: bool) -> Result<Manifest> {
             missing.join(", ")
         ));
     }
+    // Validate the entire replacement before changing anything. PostgreSQL
+    // requires referencing tables in the SAME TRUNCATE, even when empty.
+    let mut truncate = Vec::new();
     for t in &m.tables {
         let plain = |n: &str| n.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
         if !t.table.starts_with("ext_") || !plain(&t.table) || t.file != format!("{}.copy.zst", t.table) {
@@ -1114,8 +1129,32 @@ pub fn restore(c: &mut Client, from: &Path, replace: bool) -> Result<Manifest> {
             if !replace {
                 bail!("{} has rows: refused (--replace to empty it first)", t.table);
             }
-            tx.batch_execute(&format!("truncate {q}"))?;
         }
+        truncate.push(t.table.clone());
+    }
+    if truncate.iter().any(|table| table == "ext_predb_titles") {
+        // Only these derived matcher/scan relations depend on replaced title
+        // identities. Unrelated foreign keys must still refuse the restore.
+        for table in ["ext_predb_title_keys", "ext_predb_key_meta", "ext_predb_key_build", "predb_late_scan", "predb_late_matches"] {
+            let exists: bool = tx.query_one("select exists(select 1 from information_schema.tables where table_schema=current_schema() and table_name=$1 and table_type='BASE TABLE')", &[&table])?.get(0);
+            if exists && !truncate.iter().any(|name| name == table) { truncate.push(table.into()); }
+        }
+    }
+    if !truncate.is_empty() {
+        tx.batch_execute(&format!("truncate {}", truncate.iter().map(|name| keep_export::quoted(name)).collect::<Vec<_>>().join(", ")))?;
+    }
+    // Source/key writes invalidate completion metadata. Restore the snapshot
+    // in dependency order so later triggers cannot erase verified earlier rows.
+    let mut ordered = m.tables.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|table| match table.table.as_str() {
+        "ext_predb_titles" => 0,
+        "ext_predb_title_keys" => 1,
+        "ext_predb_key_build" => 3,
+        "ext_predb_key_meta" => 4,
+        _ => 2,
+    });
+    for t in ordered {
+        let q = keep_export::quoted(&t.table);
         let Some(want) = &t.sha256 else {
             bail!("{}: the dump has no checksum (made before they were recorded), so it can't be verified", t.table);
         };
@@ -1473,11 +1512,84 @@ mod tests {
         let data:Vec<u8>=c.query_one("select manifest from history_companion_receipts where owner_code='ext' and not dirty",&[]).unwrap().get(0);
         let receipt:super::super::history_companion::Receipt=serde_json::from_slice(&data).unwrap();
         let title=receipt.relations.iter().find(|r|r.table=="ext_predb_titles").unwrap();assert_eq!(title.rows,2);
+        for table in ["ext_predb_title_keys", "ext_predb_key_meta", "ext_predb_key_build"] {
+            assert!(receipt.relations.iter().any(|relation| relation.table == table), "known derived table is receipted: {table}");
+        }
+        assert!(!owns_table("ext_unregistered_table"), "ownership remains a closed allowlist");
         let cols=keep_export::columns(&Connection::open(&crate::predb::db::path_for(&main)).unwrap(),"main","titles").unwrap();
         let mut tx=c.transaction().unwrap();let tally=keep_export::pg_tally(&mut tx,"ext_predb_titles",&cols).unwrap();
         let expected=super::super::history_companion::relation("ext_predb_titles",tally.rows,tally.digest);
         assert_eq!(title.digest,expected.digest,"receipt digest includes exact post-top-up rows");
         let manual=receipt.relations.iter().find(|r|r.table=="ext_freeze_exempt").unwrap();assert_eq!(manual.rows,1);
+    }
+
+    #[test]
+    #[ignore = "requires explicit isolated PostgreSQL restore qualification"]
+    fn restore_replaces_predb_dependencies_without_cascading_unrelated_references() {
+        let target = super::super::testing::Schema::new().expect("explicit isolated PG required");
+        let dir = tempfile::tempdir().unwrap(); let main = sqlite_files(dir.path());
+        let mut c = target.pool.get().unwrap();
+        copy_from_sqlite_with_keep(&mut c, &main, &target.name, true, KeepSource::Disabled).unwrap();
+        let mut tx = c.transaction().unwrap();
+        assert!(matches!(super::super::predb_cache::advance_in(&mut tx, 16).unwrap(), super::super::predb_cache::BuildStatus::Ready(_)));
+        tx.commit().unwrap();
+        let original: (i64,i64) = { let row = c.query_one("select revision,key_rows from ext_predb_key_meta", &[]).unwrap(); (row.get(0),row.get(1)) };
+        assert!(original.1 > 0);
+        let dump = dump(&mut c, &dir.path().join("dumps"), 3, false).unwrap();
+        c.batch_execute("insert into predb_late_scan(singleton,title_id,title_revision,names_revision) values(true,1,1,1);
+            create table unrelated_reference(title_id bigint references ext_predb_titles(id)); insert into unrelated_reference values(1)").unwrap();
+        assert!(restore(&mut c, &dump, true).is_err(), "unrelated FK remains a blocker, never CASCADE");
+        assert_eq!(c.query_one("select count(*) from predb_late_scan", &[]).unwrap().get::<_,i64>(0), 1, "failed restore rolls back derived-state reset");
+        assert_eq!(c.query_one("select count(*) from unrelated_reference", &[]).unwrap().get::<_,i64>(0), 1);
+        c.batch_execute("drop table unrelated_reference").unwrap();
+        assert!(restore(&mut c, &dump, false).is_err(), "replacement still requires explicit admission");
+        c.execute("update ext_predb_titles set title='Changed-GRP' where id=1", &[]).unwrap();
+        restore(&mut c, &dump, true).unwrap();
+        assert_eq!(c.query_one("select title from ext_predb_titles where id=1", &[]).unwrap().get::<_,String>(0), "Some.Movie.2020.1080p.BluRay-GRP");
+        assert_eq!(c.query_one("select count(*) from predb_late_scan", &[]).unwrap().get::<_,i64>(0), 0);
+        let row = c.query_one("select revision,key_rows from ext_predb_key_meta", &[]).unwrap();
+        assert_eq!((row.get::<_,i64>(0),row.get::<_,i64>(1)), original, "restore invalidation triggers cannot erase the restored completion record");
+        assert_eq!(c.query_one("select count(*) from ext_predb_title_keys", &[]).unwrap().get::<_,i64>(0), original.1);
+    }
+
+    #[test]
+    #[ignore = "requires explicit isolated PostgreSQL restore/revision qualification"]
+    fn restored_predb_revision_cannot_repeat_or_rewind_existing_history() {
+        let source = super::super::testing::Schema::new().expect("explicit isolated PG required");
+        let dir = tempfile::tempdir().unwrap(); let main = sqlite_files(dir.path());
+        let mut c = source.pool.get().unwrap();
+        copy_from_sqlite_with_keep(&mut c, &main, &source.name, true, KeepSource::Disabled).unwrap();
+        let mut tx = c.transaction().unwrap();
+        let restored_revision = match super::super::predb_cache::advance_in(&mut tx, 16).unwrap() {
+            super::super::predb_cache::BuildStatus::Ready(built) => built.revision,
+            _ => panic!("tiny source index must reach actual EOF"),
+        };
+        tx.commit().unwrap();
+        let dump = dump(&mut c, &dir.path().join("dumps"), 3, false).unwrap();
+        for prior_calls in [0_i64, 32] {
+            let target = super::super::testing::Schema::new().expect("explicit isolated PG required");
+            let mut c = target.pool.get().unwrap();
+            // Exercise both a fresh uncalled sequence and genuine higher
+            // sequence history, never a hand-inserted completion record.
+            let prior = c.query("select nextval('ext_predb_key_revision') from generate_series(1::bigint,$1::bigint)", &[&prior_calls]).unwrap();
+            let prior_revision = prior.last().map(|row| row.get::<_,i64>(0)).unwrap_or(0);
+            restore(&mut c, &dump, false).unwrap();
+            let mut tx = c.transaction().unwrap();
+            super::super::predb_cache::verify_read_in(&mut tx, restored_revision).unwrap();
+            tx.commit().unwrap();
+            c.execute("update ext_predb_titles set title='Different.Title.2021-GRP' where id=1", &[]).unwrap();
+            let mut tx = c.transaction().unwrap();
+            let changed_revision = match super::super::predb_cache::advance_in(&mut tx, 16).unwrap() {
+                super::super::predb_cache::BuildStatus::Ready(built) => built.revision,
+                _ => panic!("tiny changed index must reach actual EOF"),
+            };
+            tx.commit().unwrap();
+            assert!(changed_revision > restored_revision && changed_revision > prior_revision, "completed change cannot reuse restored or prior revision");
+            let mut tx = c.transaction().unwrap();
+            let stale = super::super::predb_cache::verify_read_in(&mut tx, restored_revision).unwrap_err();
+            assert!(stale.downcast_ref::<super::super::predb_cache::StaleRead>().is_some(), "stale lookup is rejected with the typed settlement refusal");
+            tx.rollback().unwrap();
+        }
     }
 
     /// SQLite files made with the providers' own schemas beside `dir/atlas.db`, a row or two each.
@@ -1641,7 +1753,7 @@ mod tests {
         let dumps = dir.path().join("ext-dumps");
         let d = dump(&mut c, &dumps, 3, false).unwrap();
         let all = tables(&mut c).unwrap().join(", ");
-        c.batch_execute(&format!("truncate {all}")).unwrap();
+        c.batch_execute(&format!("truncate {all}, predb_late_scan, predb_late_matches")).unwrap();
         let m = restore(&mut c, &d, false).unwrap();
         assert_eq!(m.tables.iter().find(|t| t.table == "ext_predb_titles").unwrap().rows, 2);
         let title: String = c.query_one("select title from ext_predb_titles where id = 1", &[]).unwrap().get(0);
