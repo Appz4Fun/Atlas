@@ -184,9 +184,12 @@ fn with_symphonia(track: &AudioTrack, codec: Codec, frames: &[&[u8]], max_ms: i6
 #[cfg(feature = "ac3")]
 /// AC-3 and E-AC-3: each block holds whole syncframes, E-AC-3's dependent substreams among them (they decode to no
 /// channels and add nothing). A block's samples are those of all its syncframes in turn, up to any bytes after them
-/// that don't start one; a block with a syncframe that doesn't decode keeps none, as another codec's frame that
-/// doesn't decode.
+/// that don't start one; a block with a needed syncframe that doesn't decode keeps none, as another codec's frame
+/// that doesn't decode. Only the needed prefix is mixed; a satisfied budget leaves later syncframes unread.
 fn ac3(frames: &[&[u8]], max_ms: i64) -> Option<(u32, Vec<Vec<i16>>)> {
+    if max_ms <= 0 {
+        return None;
+    }
     let mut decoder = filmcraft_ac3::Decoder::new();
     let mut rate = None;
     let mut out = Vec::with_capacity(frames.len());
@@ -203,6 +206,9 @@ fn ac3(frames: &[&[u8]], max_ms: i64) -> Option<(u32, Vec<Vec<i16>>)> {
         }
         // padding after the last syncframe is no syncframe: what was decoded before it stands
         while rest.starts_with(&[0x0B, 0x77]) {
+            if rate.is_some_and(|r| kept.saturating_add(mono.len() as u64) >= samples_in(max_ms, r)) {
+                break;
+            }
             let Some((header, syncframe)) = filmcraft_ac3::parse_header(rest)
                 .ok()
                 .and_then(|h| rest.get(..h.frame_bytes).filter(|_| h.frame_bytes > 0).map(|f| (h, f)))
@@ -225,7 +231,16 @@ fn ac3(frames: &[&[u8]], max_ms: i64) -> Option<(u32, Vec<Vec<i16>>)> {
             if *rate.get_or_insert(header.sample_rate) != header.sample_rate {
                 break 'blocks;
             }
-            mono.extend(downmix(&decoded.channels, header.acmod, header.lfeon));
+            // Filmcraft decodes a whole bounded syncframe (at most1536 samples
+            // per channel). Admit the prefix BEFORE allocating its mono mix.
+            let remaining = samples_in(max_ms, header.sample_rate)
+                .saturating_sub(kept.saturating_add(mono.len() as u64));
+            mono.extend(downmix(
+                &decoded.channels,
+                header.acmod,
+                header.lfeon,
+                usize::try_from(remaining).unwrap_or(usize::MAX),
+            ));
         }
         kept += mono.len() as u64;
         out.push(mono);
@@ -238,7 +253,7 @@ fn ac3(frames: &[&[u8]], max_ms: i64) -> Option<(u32, Vec<Vec<i16>>)> {
 /// downmix averaged to mono has, as `mix` hears a stereo track: Lo = L + 0.707 C + 0.707 Ls (a lone surround at
 /// 0.707 in both), Ro alike, and (Lo + Ro) / 2; LFE left out. Soo a 5.1 AC-3 track and a stereo AAC encode of it
 /// print alike, dialogue in the centre at the same level against the music.
-fn downmix(channels: &[Vec<f32>], acmod: u8, lfeon: bool) -> Vec<i16> {
+fn downmix(channels: &[Vec<f32>], acmod: u8, lfeon: bool, max_samples: usize) -> Vec<i16> {
     const C: f32 = std::f32::consts::FRAC_1_SQRT_2;
     // by acmod (Table 5.8), in WAV order before and after the LFE: 1+1, C, L R, L R C, L R | S, L R C | S,
     // L R | Ls Rs, L R C | Ls Rs
@@ -255,7 +270,7 @@ fn downmix(channels: &[Vec<f32>], acmod: u8, lfeon: bool) -> Vec<i16> {
     let lfe: &[f32] = if lfeon { &[0.0] } else { &[] };
     let weights: Vec<f32> = fronts.iter().chain(lfe).chain(surrounds).copied().collect();
     let Some(len) = channels.iter().map(Vec::len).min() else { return Vec::new() };
-    (0..len)
+    (0..len.min(max_samples))
         .map(|i| {
             let sum: f32 = channels.iter().zip(&weights).map(|(c, w)| c[i] * w).filter(|v| v.is_finite()).sum();
             (sum.clamp(-1.0, 1.0) * 32767.0).round() as i16
@@ -325,6 +340,9 @@ fn pcm(track: &AudioTrack, codec: Codec, frames: &[&[u8]], max_ms: i64) -> Optio
     }
     Some((rate, out))
 }
+
+#[cfg(all(test, feature = "ac3"))]
+mod ac3_budget_tests;
 
 #[cfg(test)]
 mod tests {
@@ -435,14 +453,14 @@ mod tests {
         let c = std::f32::consts::FRAC_1_SQRT_2;
         // 3/2 with LFE: L R C LFE Ls Rs. The LFE adds nothing, the centre counts as a stereo downmix's mono does
         let six = [ch(0.0), ch(0.0), ch(0.5), ch(1.0), ch(0.0), ch(0.0)];
-        assert_eq!(downmix(&six, 7, true), vec![level(0.5 * c); 4]);
+        assert_eq!(downmix(&six, 7, true, usize::MAX), vec![level(0.5 * c); 4]);
         let surround = [ch(0.0), ch(0.0), ch(0.0), ch(0.0), ch(0.5), ch(0.5)];
-        assert_eq!(downmix(&surround, 7, true), vec![level(0.5 * c); 4]);
+        assert_eq!(downmix(&surround, 7, true, usize::MAX), vec![level(0.5 * c); 4]);
         // 2/1 without LFE: L R S
-        assert_eq!(downmix(&[ch(0.4), ch(0.4), ch(0.5)], 4, false), vec![level(0.4 + 0.5 * c); 4]);
+        assert_eq!(downmix(&[ch(0.4), ch(0.4), ch(0.5)], 4, false, usize::MAX), vec![level(0.4 + 0.5 * c); 4]);
         // stereo is a plain average, mono itself
-        assert_eq!(downmix(&[ch(0.5), ch(-0.5)], 2, false), vec![0; 4]);
-        assert_eq!(downmix(&[ch(0.5)], 1, false), vec![16384; 4]);
+        assert_eq!(downmix(&[ch(0.5), ch(-0.5)], 2, false, usize::MAX), vec![0; 4]);
+        assert_eq!(downmix(&[ch(0.5)], 1, false, usize::MAX), vec![16384; 4]);
     }
 
     #[test]
