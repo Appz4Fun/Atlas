@@ -311,6 +311,100 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires explicit isolated PostgreSQL and the selected native repair candidate hook"]
+    fn an_older_sweep_reads_old_incomplete_rows_below_where_it_got_to() {
+        let schema = crate::pg::testing::Schema::new().expect("explicit isolated PostgreSQL required");
+        let root = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config::default();
+        config.postprocess.enabled = false;
+        config.predb.enabled = false;
+        config.spots.enabled = false;
+        config.inferred_parts = false;
+        config.media.tvmaze.enabled = false;
+        config.media.allocine.enabled = false;
+        config.media.details_per_minute = 0;
+        let headers = crate::config::HeaderStoreConfig { enabled: true, dir: root.path().to_str().unwrap().into() };
+        let storage = crate::pg::StorageConfig {
+            backend: crate::pg::Backend::Postgres,
+            url: schema.url.clone(),
+            schema: schema.name.clone(),
+            max_connections: 1,
+            allow_plaintext: true,
+        };
+        let runtime = crate::pg::indexer_runtime::Runtime::open(&config, storage, headers, &[], &mut None).unwrap();
+        let group = "alt.binaries.a";
+        let now = 2_000_000_000;
+        let old = "2033-01-01 00:00:00";
+        let recent = "2033-05-18 00:00:00";
+        let release = |name: &str, date: &str, bytes: i64, complete: bool| -> i64 {
+            let count = if complete { 2 } else { 1 };
+            let row = crate::parser::Release {
+                name: name.into(),
+                group: group.into(),
+                date: date.into(),
+                articles: (1..=count)
+                    .map(|part| crate::parser::Article {
+                        message_id: format!("<{name}.{part}@x>"),
+                        filename: Some(format!("{name}.mkv")),
+                        part: Some(part),
+                        total_parts: Some(2),
+                        file_total: Some(1),
+                        bytes: bytes / count,
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            };
+            runtime
+                .owner
+                .with(|client| {
+                    crate::pg::release_writer::save(client, &[row], 1)?;
+                    let r = client
+                        .query_one("select id,size,complete,posted_clock from releases where name=$1", &[&name])?;
+                    assert_eq!(r.get::<_, i64>(1), bytes);
+                    assert_eq!(r.get::<_, bool>(2), complete);
+                    assert_eq!(r.get::<_, Option<i64>>(3), crate::dates::naive_timestamp(date));
+                    Ok(r.get(0))
+                })
+                .unwrap()
+        };
+        let a = release("Old.Film.A.2020.1080p-X", old, 2 << 30, false);
+        let _small = release("Old.Small.2020-X", old, 1 << 20, false);
+        let _whole = release("Old.Whole.2020.1080p-X", old, 2 << 30, true);
+        let b = release("Old.Film.B.2021.1080p-X", old, 2 << 30, false);
+        let _new = release("New.Film.2026.1080p-X", recent, 2 << 30, false);
+        let tried = release("Old.Tried.2019.1080p-X", old, 2 << 30, false);
+        let lowest = runtime
+            .owner
+            .with(|client| {
+                {
+                    let pg = crate::pg::sql::Pg::new(&mut *client);
+                    mark_in(&pg, 0, &[], &[(tried, 0)], &[])?;
+                }
+                Ok(client.query_one("select min(id) from releases", &[])?.get::<_, i64>(0))
+            })
+            .unwrap();
+        let selected = || native::selected_older_for_test(&runtime.owner, now).unwrap();
+        assert_eq!(selected(), (vec![b, a], Some(lowest)), "old, big enough, incomplete, not tried; newest first");
+        let before = |value: Option<i64>| {
+            runtime
+                .owner
+                .with(|client| {
+                    mark_in(&crate::pg::sql::Pg::new(client), 1, &[], &[], &[(0, value)])?;
+                    Ok(())
+                })
+                .unwrap()
+        };
+        before(Some(b));
+        assert_eq!(selected().0, [a], "below where it got to");
+        before(Some(lowest));
+        assert_eq!(selected(), (Vec::new(), None), "swept: from newest again");
+        before(None);
+        assert_eq!(selected().0, [b, a]);
+        runtime.owner.close();
+    }
+
+    #[test]
     fn media_names_are_what_a_round_reads_first() {
         assert!(is_media("Resident.Evil.2026.DV.2160p.WEB.H265-SLOT"));
         assert!(is_media("Film.2007.1080p.BluRay.REMUX.AVC-X"));
