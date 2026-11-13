@@ -14,6 +14,8 @@ mod keys;
 mod inventory;
 #[path="stage_xref.rs"]
 pub(crate) mod xref;
+#[path="../spotnet/native_step_reads.rs"]
+mod spotnet;
 #[path="stage_extra_reads.rs"]
 mod extra;
 
@@ -86,14 +88,9 @@ impl StepReads {
         self.read(|tx|Ok(tx.query_one("select exists(select 1 from release_category where release_id=$1)",&[&id])?.try_get(0)?))
     }
     pub(crate) fn category_spot(&self,id:i64)->Result<Option<(crate::spotnet::Kind,crate::spotnet::Subcats)>> {
-        self.read(|tx| {
-            let Some(row)=tx.query_opt("select kind,case when octet_length(subcats)<=65536 then subcats end,octet_length(subcats) from spots where release_id=$1",&[&id])? else {return Ok(None)};
-            ensure!(row.try_get::<_,Option<i32>>(2)?.is_none_or(|n|n<=65536),"native spot subcategories exceed read admission");
-            let kind=match row.try_get::<_,String>(0)?.as_str() {"movie"=>crate::spotnet::Kind::Movie,"series"=>crate::spotnet::Kind::Series,_=>return Ok(None)};
-            let cats:Option<String>=row.try_get(1)?;
-            Ok(Some((kind,crate::spotnet::header::subcats(cats.as_deref().unwrap_or("")))))
-        })
+        Ok(self.spot_detail(id)?.and_then(|detail|detail.spot.kind().map(|kind|(kind,detail.spot.subcats))))
     }
+
     pub(crate) fn explicit_rerun(&self,id:i64,step:crate::postprocess::step::StepId)->Result<bool> {
         self.read(|tx|Ok(tx.query_one("select coalesce((select rerun_mask from pp_state where release_id=$1),0)&$2<>0",&[&id,&crate::postprocess::step::mask(step)])?.try_get(0)?))
     }
@@ -106,14 +103,15 @@ impl StepReads {
             ensure!(metadata.try_get::<_,i64>(0)?<=64*1024*1024,"native release exceeds snapshot admission");
             let row=tx.query_one("select r.original_name,r.display_name,r.group_name,r.poster,r.posted_date,coalesce(r.size,0),r.complete,coalesce(r.parts,0),r.file_total,r.is_obfuscated,r.name_source,
                 s.release_id is not null,coalesce(s.done,0),coalesce(s.failed,0),coalesce(s.db_attempts,0),coalesce(s.net_attempts,0),coalesce(s.parts_seen,0),coalesce(s.rerun_gen,0),coalesce(s.net_transient,0),
-                (select kind from spots where release_id=r.id),s.net_left from releases r left join pp_state s on s.release_id=r.id where r.id=$1",&[&id])?;
+                s.net_left from releases r left join pp_state s on s.release_id=r.id where r.id=$1",&[&id])?;
+            let original_kind=self.original_spot_in(tx,id)?.and_then(|detail|detail.spot.kind());
             let group:String=row.try_get(2)?;
             let info=crate::postprocess::step::ReleaseInfo {id,
                 // Existing step data includes a group fairness bucket. It is
                 // never a SQLite attachment or an encoding of this PG row ID.
                 shard:crate::store::shard_of(&group),name:String::from_utf8(row.try_get(0)?)?,display_name:row.try_get(1)?,group,
                 poster:row.try_get(3)?,posted_date:row.try_get::<_,Option<String>>(4)?.map(|value|crate::dates::to_iso_date(&value)),size:row.try_get(5)?,complete:row.try_get(6)?,parts:row.try_get(7)?,file_total:row.try_get(8)?,is_obfuscated:row.try_get(9)?,name_source:row.try_get(10)?,
-                spot_kind:crate::spotnet::Kind::parse(row.try_get::<_,Option<String>>(19)?.as_deref())};
+                spot_kind:original_kind};
             let mut summary=crate::postprocess::rules::FileSummary {all_par2:true,all_images:true,..Default::default()};
             let mut after=None;
             loop {
@@ -142,7 +140,7 @@ impl StepReads {
                     after=Some(file.try_get::<_,i64>(0)?);
                 }
             }
-            let mut snapshot=StepSnapshot {info,summary,has_state:row.try_get(11)?,done:row.try_get(12)?,failed:row.try_get(13)?,db_attempts:row.try_get(14)?,net_attempts:row.try_get(15)?,parts_seen:row.try_get(16)?,rerun_gen:row.try_get(17)?,net_transient:row.try_get(18)?,net_left:row.try_get(20)?,input:[0;32]};
+            let mut snapshot=StepSnapshot {info,summary,has_state:row.try_get(11)?,done:row.try_get(12)?,failed:row.try_get(13)?,db_attempts:row.try_get(14)?,net_attempts:row.try_get(15)?,parts_seen:row.try_get(16)?,rerun_gen:row.try_get(17)?,net_transient:row.try_get(18)?,net_left:row.try_get(19)?,input:[0;32]};
             use sha2::{Digest,Sha256};
             // Fixed tuple encoding retains NULL versus empty, exact original
             // strings and every value used by the actual rule/Step visit.

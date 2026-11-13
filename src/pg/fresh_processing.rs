@@ -21,13 +21,13 @@ impl ReadView<'_> {
         self.before_query()?;
         let row=self.tx.borrow_mut().query_one("select name,display_name,group_name,poster,posted_date,size,complete,parts,file_total,is_obfuscated,name_source,
             (select kind from spots where release_id=r.id) from releases r where id=$1",&[&id])?;
-        let spot:Option<String>=row.try_get(11)?;
+        let spot=self.spot_detail(id)?.and_then(|detail|detail.spot.kind());
         let release=ReleaseInfo {id,
             // Presentation adapter only. ProcessingScope::Native never uses
             // this legacy field to select a shard, resolve an ID or open data.
             shard:0,name:row.try_get(0)?,display_name:row.try_get(1)?,group:row.try_get(2)?,poster:row.try_get(3)?,posted_date:row.try_get(4)?,
             size:row.try_get(5)?,complete:row.try_get(6)?,parts:row.try_get(7)?,file_total:row.try_get(8)?,is_obfuscated:row.try_get(9)?,name_source:row.try_get(10)?,
-            spot_kind:crate::spotnet::Kind::parse(spot.as_deref())};
+            spot_kind:spot};
         self.before_query()?;
         let row=self.tx.borrow_mut().query_opt("select done,failed,coalesce(net_wanted,false),net_left,net_next_at,net_attempts,
             coalesce(net_transient,0),db_attempts,net_rank,last_error from pp_state where release_id=$1",&[&id])?;
