@@ -14,9 +14,8 @@
 use sha2::Digest;
 
 use crate::config::Config;
-use crate::postprocess::schema::ShardTable;
 use crate::postprocess::step::{ImageRecord, Needs, Outcome, Reruns, Step, StepCtx, StepError, StepId, StepMutation, StepWrite};
-use crate::store::{self, FileInfo};
+use crate::catalog_facts::{FileInfo, SegmentPick};
 
 use super::{is_image_name, jpeg, sniff};
 
@@ -39,58 +38,6 @@ const MAX_CONTAINER_PARTS: usize = 10;
 /// Past this, the oldest pictures go from the folder.
 const MAX_IMAGE_CACHE: u64 = 2 << 30;
 const TRIM_EVERY: u64 = 64;
-
-pub const IMAGES: ShardTable = ShardTable {
-    name: "release_images",
-    create: "create table if not exists release_images (
-        release_id  INTEGER NOT NULL,
-        position    INTEGER NOT NULL,
-        file        TEXT NOT NULL,
-        sha256      TEXT NOT NULL,
-        format      TEXT NOT NULL,
-        width       INTEGER NOT NULL,
-        height      INTEGER NOT NULL,
-        bytes       INTEGER NOT NULL,
-        meta        TEXT,
-        exif_id     TEXT,
-        document_id TEXT,
-        PRIMARY KEY (release_id, position)
-    )",
-    indexes: &[
-        (
-            "release_images_sha256",
-            "create index if not exists release_images_sha256 on release_images(sha256, release_id)",
-        ),
-        (
-            "release_images_exif_id",
-            "create index if not exists release_images_exif_id on release_images(exif_id, release_id) where exif_id is not null",
-        ),
-        (
-            "release_images_document_id",
-            "create index if not exists release_images_document_id on release_images(document_id, release_id)
-                where document_id is not null",
-        ),
-    ],
-    release_key: Some("release_id"),
-    added: &[],
-};
-
-/// Pictures asked for on the release page, by the file's name, and how the read went. A request stays once answered:
-/// the picture is read again (from the folder, while it's there) whenever the step runs again on the release.
-pub const PICTURE_REQUESTS: ShardTable = ShardTable {
-    name: "picture_requests",
-    create: "create table if not exists picture_requests (
-        release_id   INTEGER NOT NULL,
-        file         TEXT NOT NULL,
-        requested_at INTEGER NOT NULL,
-        done_at      INTEGER,
-        outcome      TEXT,
-        PRIMARY KEY (release_id, file)
-    ) without rowid",
-    indexes: &[],
-    release_key: Some("release_id"),
-    added: &[],
-};
 
 fn image_dir() -> std::path::PathBuf {
     crate::paths::app_dir().join("images")
@@ -133,44 +80,6 @@ pub struct Image {
     pub jpeg: Option<jpeg::JpegInfo>,
 }
 
-/// A release's pictures, in the order they were read.
-pub fn images(conn: &rusqlite::Connection, release_id: i64) -> Vec<Image> {
-    let s = store::shard_of_id(release_id);
-    let sql = format!(
-        "select position, file, sha256, format, width, height, bytes, meta from s{s}.release_images
-         where release_id = ?1 order by position"
-    );
-    let Ok(mut q) = conn.prepare(&sql) else { return Vec::new() };
-    q.query_map([release_id], |r| {
-        let meta: Option<String> = r.get(7)?;
-        Ok(Image {
-            position: r.get(0)?,
-            file: r.get(1)?,
-            sha256: r.get(2)?,
-            format: r.get(3)?,
-            width: r.get(4)?,
-            height: r.get(5)?,
-            bytes: r.get(6)?,
-            jpeg: meta.and_then(|m| serde_json::from_str(&m).ok()),
-        })
-    })
-    .map(|rows| rows.filter_map(Result::ok).collect())
-    .unwrap_or_default()
-}
-
-/// One picture's bytes and format, while the folder still has it.
-pub fn image(conn: &rusqlite::Connection, release_id: i64, position: i64) -> Option<(Vec<u8>, String)> {
-    let s = store::shard_of_id(release_id);
-    let (sha256, format): (String, String) = conn
-        .query_row(
-            &format!("select sha256, format from s{s}.release_images where release_id = ?1 and position = ?2"),
-            rusqlite::params![release_id, position],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .ok()?;
-    Some((std::fs::read(image_file(&sha256)?).ok()?, format))
-}
-
 /// How another release is tied to one of this one's pictures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tie {
@@ -190,57 +99,6 @@ impl Tie {
             Tie::DocumentId => "the same XMP document id",
         }
     }
-}
-
-/// Other releases, in every shard, that carry one of this release's pictures: (release id, its picture's position
-/// here, how they're tied), the strongest tie first, at most `limit`.
-pub fn same_pictures(conn: &rusqlite::Connection, release_id: i64, limit: usize) -> Vec<(i64, i64, Tie)> {
-    let own = images_keys(conn, release_id);
-    let mut found: Vec<(i64, i64, Tie)> = Vec::new();
-    for (position, sha256, exif_id, document_id) in own {
-        let keys = [
-            (Tie::Same, "sha256", Some(sha256)),
-            (Tie::ExifId, "exif_id", exif_id),
-            (Tie::DocumentId, "document_id", document_id),
-        ];
-        for (tie, column, value) in keys {
-            let Some(value) = value else { continue };
-            for s in 0..store::SHARDS {
-                let sql = format!(
-                    "select distinct release_id from s{s}.release_images where {column} = ?1 and release_id != ?2
-                     order by release_id desc limit ?3"
-                );
-                let Ok(mut q) = conn.prepare(&sql) else { continue };
-                let ids: Vec<i64> = q
-                    .query_map(rusqlite::params![value, release_id, limit as i64], |r| r.get(0))
-                    .map(|rows| rows.filter_map(Result::ok).collect())
-                    .unwrap_or_default();
-                for id in ids {
-                    match found.iter_mut().find(|(other, _, _)| *other == id) {
-                        // found again by a stronger tie: shown by that one
-                        Some(seen) if (tie as u8) < (seen.2 as u8) => *seen = (id, position, tie),
-                        Some(_) => {}
-                        None => found.push((id, position, tie)),
-                    }
-                }
-            }
-        }
-    }
-    // the strongest tie first, each kept in the order found
-    found.sort_by_key(|&(_, _, tie)| tie as u8);
-    found.truncate(limit);
-    found
-}
-
-fn images_keys(conn: &rusqlite::Connection, release_id: i64) -> Vec<(i64, String, Option<String>, Option<String>)> {
-    let s = store::shard_of_id(release_id);
-    let sql = format!(
-        "select position, sha256, exif_id, document_id from s{s}.release_images where release_id = ?1 order by position"
-    );
-    let Ok(mut q) = conn.prepare(&sql) else { return Vec::new() };
-    q.query_map([release_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
-        .map(|rows| rows.filter_map(Result::ok).collect())
-        .unwrap_or_default()
 }
 
 /// Whether a picture's name says it's the one that stands for the release: a thumbnail, cover or poster.
@@ -335,63 +193,6 @@ pub struct Request {
     pub passed_over: bool,
 }
 
-/// The pictures asked for of the releases `ids`, on a connection with their shards attached.
-pub fn requests(conn: &rusqlite::Connection, ids: &[i64]) -> Vec<Request> {
-    let mut out = Vec::new();
-    for &id in ids {
-        let s = store::shard_of_id(id);
-        let sql = format!(
-            "select q.file, q.requested_at, q.done_at, q.outcome,
-                    (p.release_id is not null and coalesce(p.net_left, 0) & ?2 = 0)
-             from s{s}.picture_requests q left join s{s}.pp_state p on p.release_id = q.release_id
-             where q.release_id = ?1 order by q.file"
-        );
-        let bit = crate::postprocess::step::mask(IMAGES_STEP);
-        // a shard without the table yet has been asked nothing
-        let Ok(mut q) = conn.prepare(&sql) else { continue };
-        let rows = q.query_map(rusqlite::params![id, bit], |r| {
-            Ok(Request {
-                release_id: id,
-                file: r.get(0)?,
-                requested_at: r.get(1)?,
-                done_at: r.get(2)?,
-                outcome: r.get(3)?,
-                passed_over: r.get(4)?,
-            })
-        });
-        out.extend(rows.into_iter().flatten().filter_map(Result::ok));
-    }
-    out
-}
-
-/// Asks for a picture of release `id` on a connection with its shard attached: the request, and the pictures step to
-/// run again on the release first thing in its shard's net lane. Not through the database lane's queue: a visit there
-/// works the release's net rank out again, which would put it back in its old place.
-pub fn ask(conn: &rusqlite::Connection, id: i64, file: &str, now: i64) -> rusqlite::Result<()> {
-    let s = store::shard_of_id(id);
-    let bit = crate::postprocess::step::mask(IMAGES_STEP);
-    let tx = conn.unchecked_transaction()?;
-    tx.execute(
-        &format!(
-            "insert into s{s}.picture_requests (release_id, file, requested_at) values (?1, ?2, ?3)
-             on conflict(release_id, file) do update set requested_at = excluded.requested_at, done_at = null,
-                 outcome = null"
-        ),
-        rusqlite::params![id, file, now],
-    )?;
-    tx.execute(
-        &format!(
-            "insert into s{s}.pp_state (release_id, net_wanted, rerun_gen, rerun_mask, net_left, net_rank)
-                 values (?1, 1, 1, ?2, ?2, ?3)
-             on conflict(release_id) do update set done = done & ~?2, failed = failed & ~?2, net_wanted = 1,
-                 net_left = coalesce(net_left, 0) | ?2, net_next_at = 0, rerun_gen = rerun_gen + 1,
-                 rerun_mask = rerun_mask | ?2, net_rank = max(coalesce(net_rank, 0), ?3)"
-        ),
-        rusqlite::params![id, bit, ASKED_RANK],
-    )?;
-    tx.commit()
-}
-
 /// The pictures a release's run reads: the ones read without asking, then the ones asked for (`asked`, by name) up to
 /// `max_parts` articles each.
 fn wanted<'a>(
@@ -413,65 +214,17 @@ fn wanted<'a>(
 }
 
 /// A file's posted bytes, from its articles' sizes: an upper bound on what it decodes to.
-fn posted_bytes(ctx: &StepCtx<'_>, file: &FileInfo) -> rusqlite::Result<i64> {
+fn posted_bytes(ctx: &StepCtx<'_>, file: &FileInfo) -> anyhow::Result<i64> {
     let parts = parts_of(file);
     if !(1..=MAX_PARTS as i64).contains(&parts) {
         return Ok(i64::MAX / 4);
     }
     let mut by_part: std::collections::BTreeMap<i64, i64> = std::collections::BTreeMap::new();
-    for seg in ctx.segments(file.id, &store::SegmentPick::Parts((1..=parts).collect()))? {
+    for seg in ctx.segments(file.id, &SegmentPick::Parts((1..=parts).collect()))? {
         by_part.entry(seg.part.unwrap_or(1)).or_insert(seg.bytes);
     }
     Ok(by_part.values().sum::<i64>().max(1))
 }
-
-/// The pictures a release kept on its last run, by file: read from the folder again rather than fetched.
-pub(crate) fn kept_before(
-    conn: &rusqlite::Connection,
-    release_id: i64,
-) -> rusqlite::Result<std::collections::HashMap<String, String>> {
-    conn.prepare_cached("select file, sha256 from release_images where release_id = ?1")?
-        .query_map([release_id], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect()
-}
-
-/// The files of the rows linked into the upload `lead` leads, its own left out, and of the small files found beside
-/// it, up to 50 a row.
-pub(crate) fn linked_files(conn: &rusqlite::Connection, lead: i64) -> rusqlite::Result<Vec<FileInfo>> {
-    let members: Vec<i64> = conn
-        .prepare_cached("select release_id from upload_link where lead_id = ?1 and release_id != ?1 limit 16")?
-        .query_map([lead], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    let mut files = Vec::new();
-    // and the small files found beside it
-    // this shard's own table, by its bare name: a step's connection has no other shard attached
-    let beside: Vec<i64> = conn
-        .prepare_cached("select row_id from beside_files where release_id = ?1 limit 16")?
-        .query_map([lead], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    for member in members.into_iter().chain(beside) {
-        files.extend(store::release_files(conn, member, 50)?);
-    }
-    Ok(files)
-}
-
-/// File `name` of a row linked into the upload `lead` leads, or found beside it.
-pub(crate) fn asked_linked_file(conn: &rusqlite::Connection, lead: i64, name: &str) -> rusqlite::Result<Option<FileInfo>> {
-    let row: Option<i64> = rusqlite::OptionalExtension::optional(
-        conn.prepare_cached(
-            "select f.release_id from files f
-         where f.release_id in (select release_id from upload_link where lead_id = ?1
-                                union select row_id from beside_files where release_id = ?1)
-           and f.filename = ?2 limit 1",
-        )?
-        .query_row(rusqlite::params![lead, name], |r| r.get(0)),
-    )?;
-    let Some(row) = row else { return Ok(None) };
-    Ok(store::release_files(conn, row, LINKED_ROW_FILES)?.into_iter().find(|f| f.filename == name))
-}
-
-/// Files of one linked row looked through for one asked for by name.
-const LINKED_ROW_FILES: usize = 4_096;
 
 /// Books and comics small enough to read whole for the pictures inside them, at most two.
 pub fn containers(files: &[FileInfo]) -> Vec<&FileInfo> {
@@ -499,11 +252,6 @@ fn is_telling_document_id(id: &str) -> bool {
     bare.chars().filter(char::is_ascii_alphanumeric).count() >= 16
         && bare.chars().any(|c| c.is_ascii_alphanumeric() && c != '0')
         && !SHARED_DOCUMENT_IDS.contains(&bare)
-}
-
-/// What's kept of one picture read: its row's values after the release id and position.
-pub fn row_values(file: &str, bytes: &[u8], sha256: &str) -> Option<Vec<rusqlite::types::Value>> {
-    image_record(file,bytes,sha256).map(|record| record.sqlite_values())
 }
 
 fn image_record(file: &str, bytes: &[u8], sha256: &str) -> Option<ImageRecord> {
@@ -556,13 +304,6 @@ impl Step for ImagesStep {
     }
     fn applies(&self, r: &crate::postprocess::step::ReleaseInfo) -> bool {
         r.size > 0
-    }
-    // a picture asked for on the page is read whatever the release is: a post of pictures alone, the case the page's
-    // Fetch is most for, is outside the body gate
-    fn asked_for(&self, conn: &rusqlite::Connection, release_id: i64) -> bool {
-        conn.prepare_cached("select exists (select 1 from picture_requests where release_id = ?1 and done_at is null)")
-            .and_then(|mut q| q.query_row([release_id], |r| r.get(0)))
-            .unwrap_or(false)
     }
     // a picture can come after the rest of the post; one linked into it later asks for a run itself (`archive::link`)
     fn reruns(&self) -> Reruns {
@@ -761,20 +502,97 @@ mod tests {
         assert_eq!(auto.len(), 3);
     }
 
+    // Port of the legacy asked_for fixture: native body-gate scheduling reads this exact owner interface.
     #[test]
+    #[ignore = "explicit isolated PG; actual pending image request body-gate interface"]
     fn an_open_request_lets_the_step_past_the_body_gate_and_an_answered_one_doesnt() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("atlas.s0.db");
-        crate::store::create_shard(&path).unwrap();
-        let conn = crate::db::open_shard(&path).unwrap();
-        crate::postprocess::schema::migrate(&conn).unwrap();
-        let step = ImagesStep::default();
-        assert!(!step.asked_for(&conn, 7));
-        conn.execute("insert into picture_requests (release_id, file, requested_at) values (7, 'a.jpg', 1)", [])
+        use crate::postprocess::{
+            data::StepData,
+            rules::{BodyGate, RowFacts, Rules},
+        };
+        let schema = crate::pg::testing::Schema::new().expect("explicit isolated PG required");
+        let runtime = crate::pg::stage_queue_tests::runtime(&schema);
+        let id = runtime
+            .owner
+            .with(|client| {
+                crate::pg::release_writer::save(
+                    client,
+                    &[crate::parser::Release {
+                        name: "Picture.Set".into(),
+                        group: "example.pictures".into(),
+                        size: 43,
+                        articles: vec![crate::parser::Article {
+                            filename: Some("a.gif".into()),
+                            message_id: "<picture-gate@fixture.test>".into(),
+                            part: Some(1),
+                            total_parts: Some(1),
+                            bytes: 43,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                    -100_000,
+                )?;
+                Ok(client.query_one("select id from releases", &[])?.get(0))
+            })
             .unwrap();
-        assert!(step.asked_for(&conn, 7));
-        conn.execute("update picture_requests set done_at = 2, outcome = 'unreadable'", []).unwrap();
-        assert!(!step.asked_for(&conn, 7), "answered: nothing owed");
+        let reads = crate::pg::stage_reads::StepReads::for_owner(&runtime.owner).unwrap();
+        let data = StepData::Native(&reads);
+        let snapshot = reads.snapshot(id).unwrap().unwrap();
+        let row = RowFacts {
+            group: &snapshot.info.group,
+            name: &snapshot.info.name,
+            size: snapshot.info.size,
+            parts: snapshot.info.parts,
+            complete: snapshot.info.complete,
+            file_total: snapshot.info.file_total,
+        };
+        assert_eq!(
+            crate::postprocess::rules::body_gate(&Rules::new(&Config::default().postprocess), &row, &snapshot.summary),
+            BodyGate::Outside
+        );
+        assert!(!reads.pending_picture_request(id).unwrap());
+        assert!(data.image_requests(id).unwrap().is_empty());
+        runtime
+            .owner
+            .with(|client| {
+                client.execute(
+                    "insert into picture_requests(release_id,file,requested_at) values($1,'a.gif',1)",
+                    &[&id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(reads.pending_picture_request(id).unwrap());
+        assert_eq!(data.image_requests(id).unwrap(), ["a.gif"]);
+        runtime
+            .owner
+            .with(|client| {
+                client.execute(
+                    "update picture_requests set done_at=2,outcome='unreadable' where release_id=$1",
+                    &[&id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(!reads.pending_picture_request(id).unwrap(), "answered: no body-gate bypass remains");
+        assert!(data.image_requests(id).unwrap().is_empty());
+        runtime
+            .owner
+            .with(|client| {
+                client.execute("update picture_requests set outcome='shown' where release_id=$1", &[&id])?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(!reads.pending_picture_request(id).unwrap(), "shown pictures do not reopen the body gate");
+        assert_eq!(
+            data.image_requests(id).unwrap(),
+            ["a.gif"],
+            "a previously shown picture remains eligible for cache reuse"
+        );
+        runtime.owner.close();
+        assert!(reads.pending_picture_request(id).is_err());
+        assert!(matches!(data.image_requests(id), Err(StepError::Native(_))));
     }
 
     #[test]
@@ -820,14 +638,17 @@ mod tests {
         let y = vec![200u8; 16 * 16];
         let c = vec![128u8; 64];
         let bytes = crate::video::jpeg::encode(&y, &c, &c, 16, 16, 90);
-        let values = row_values("00-thumbnail.jpg", &bytes, "ab").unwrap();
-        assert_eq!(values[2], "jpeg".to_string().into());
-        assert_eq!(values[3], 16i64.into());
-        let rusqlite::types::Value::Text(meta) = &values[6] else { panic!("meta") };
-        let info: jpeg::JpegInfo = serde_json::from_str(meta).unwrap();
+        // The old SQLite value-vector fixture now asserts the actual typed native result.
+        let record = image_record("00-thumbnail.jpg", &bytes, "ab").unwrap();
+        assert_eq!(record.format, "jpeg");
+        assert_eq!((record.width, record.height), (16, 16));
+        assert_eq!(record.file, "00-thumbnail.jpg");
+        assert_eq!(record.sha256, "ab");
+        assert_eq!(record.bytes, bytes.len() as i64);
+        let info: jpeg::JpegInfo = serde_json::from_str(record.meta.as_deref().expect("meta")).unwrap();
         assert_eq!(info.quality, Some(90));
-        assert_eq!(values[7], rusqlite::types::Value::Null, "no EXIF id");
-        assert!(row_values("x.jpg", b"not a picture", "ab").is_none());
+        assert_eq!(record.exif_id, None, "no EXIF id");
+        assert!(image_record("x.jpg", b"not a picture", "ab").is_none());
     }
 }
 
