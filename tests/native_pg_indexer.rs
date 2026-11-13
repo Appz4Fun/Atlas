@@ -1,4 +1,6 @@
 //! The actual NNTP pass saves its catalog and cursor without creating SQLite files.
+use atlas as atlas_api;
+#[path = "common/nntp.rs"]
 mod common;
 
 use std::sync::Arc;

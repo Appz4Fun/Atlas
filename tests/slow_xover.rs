@@ -1,5 +1,7 @@
 //! A server that takes longer than the read timeout to answer a wide XOVER: the range is asked for in halves.
 
+use atlas as atlas_api;
+#[path = "common/nntp.rs"]
 mod common;
 
 use std::sync::Arc;
