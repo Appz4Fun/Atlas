@@ -556,7 +556,7 @@ mod tests {
         assert!(Pool::new(&c).is_err());
         c.allow_plaintext = true;
         assert!(Pool::new(&c).is_ok());
-        c.url = "host=192.168.1.93 port=5434 dbname=atlas".into();
+        c.url = "host=192.0.2.93 port=5434 dbname=atlas".into();
         c.allow_plaintext = false;
         assert!(Pool::new(&c).is_ok());
         c.url = "host=localhost hostaddr=203.0.113.5 dbname=atlas".into();

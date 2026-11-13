@@ -3256,9 +3256,9 @@ mod tests {
 
     #[test]
     fn the_sign_in_page_says_how_to_set_up_a_client_without_the_key() {
-        let root = presentation_get("/", "", None, "http://192.168.1.172:9091", KEY).unwrap();
+        let root = presentation_get("/", "", None, "http://192.0.2.172:9091", KEY).unwrap();
         assert_eq!(root.status, 200);
-        assert!(root.body.contains("http://192.168.1.172:9091/api?t=caps"));
+        assert!(root.body.contains("http://192.0.2.172:9091/api?t=caps"));
         assert!(!root.body.contains(KEY));
     }
 

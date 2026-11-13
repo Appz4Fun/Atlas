@@ -1189,31 +1189,49 @@ async fn native_media_counts(
     headers: crate::config::HeaderStoreConfig,
 ) {
     let observed_owner = owner.clone();
-    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let mut service = crate::pg::media_counts::Service::new(&owner, db.clone(), &headers)?;
-        while !sched.stopping() {
-            match service.tick()? {
-                crate::pg::media_counts::Tick::Stored => {
-                    let groups = crate::indexer::on_native_db_sync(&db, |client| {
-                        Ok(crate::chunks::media_groups(&crate::pg::sql::Pg::new(client))?)
-                    })?;
-                    *sched.media.write().unwrap() = groups;
-                }
-                crate::pg::media_counts::Tick::Progress => std::thread::yield_now(),
-                crate::pg::media_counts::Tick::Idle => std::thread::sleep(Duration::from_millis(50)),
-            }
+    let cancelled = Arc::new(AtomicBool::new(false));
+    struct StopCounts(Arc<AtomicBool>);
+    impl Drop for StopCounts {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
         }
-        Ok(())
+    }
+    let _stop_on_drop = StopCounts(cancelled.clone());
+    // Tokio blocking workers still have an entered runtime. Only the retained
+    // scoped standard thread constructs/ticks the guarded native service.
+    // Cancelling this async bridge stops admission; the blocking scope joins
+    // the real thread and drains its already admitted original-owner work.
+    let result = tokio::task::spawn_blocking(move || {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(move || -> anyhow::Result<()> {
+                    let mut service = crate::pg::media_counts::Service::new(&owner, db.clone(), &headers)?;
+                    while !cancelled.load(Ordering::Acquire) && !sched.stopping() {
+                        match service.tick()? {
+                            crate::pg::media_counts::Tick::Stored => {
+                                let groups = crate::indexer::on_native_db_sync(&db, |client| {
+                                    Ok(crate::chunks::media_groups(&crate::pg::sql::Pg::new(client))?)
+                                })?;
+                                *sched.media.write().unwrap() = groups;
+                            }
+                            crate::pg::media_counts::Tick::Progress => std::thread::yield_now(),
+                            crate::pg::media_counts::Tick::Idle => std::thread::sleep(Duration::from_millis(50)),
+                        }
+                    }
+                    Ok(())
+                })
+                .join()
+        })
     })
     .await;
     match result {
-        Ok(Ok(())) => {}
-        Ok(Err(error))
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(error)))
             if crate::pg::outage::is_attempt_ended(&error)
                 && observed_owner.stop.load(Ordering::Acquire)
                 && observed_owner.failure().is_none() => {}
-        Ok(Err(error)) => observed_owner.fail(crate::pg::outage::classify(&error)),
-        Err(_) => observed_owner.fail(crate::pg::outage::Failure::Fatal),
+        Ok(Ok(Err(error))) => observed_owner.fail(crate::pg::outage::classify(&error)),
+        Ok(Err(_)) | Err(_) => observed_owner.fail(crate::pg::outage::Failure::Fatal),
     }
 }
 
@@ -1893,6 +1911,91 @@ fn index(config: Config, stop: Arc<AtomicBool>, native: NativeRuntime) -> i32 {
 mod tests {
     use super::*;
     use crate::pg::sql::Sql;
+
+    #[test]
+    #[ignore = "requires an explicit isolated ATLAS_PG_TEST_URL"]
+    fn background_media_counts_use_a_real_standard_lane_and_drain_without_failing_owner() {
+        let schema = crate::pg::testing::Schema::new().expect("explicit isolated ATLAS_PG_TEST_URL required");
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.postprocess.enabled = false;
+        config.predb.enabled = false;
+        config.spots.enabled = false;
+        config.inferred_parts = false;
+        config.media.tvmaze.enabled = false;
+        config.media.allocine.enabled = false;
+        config.media.details_per_minute = 0;
+        let headers = crate::config::HeaderStoreConfig { enabled: true, dir: root.path().to_str().unwrap().into() };
+        let native = NativeRuntime::open(
+            &config,
+            crate::pg::StorageConfig {
+                backend: crate::pg::Backend::Postgres,
+                url: schema.url.clone(),
+                schema: schema.name.clone(),
+                max_connections: 1,
+                allow_plaintext: true,
+            },
+            headers.clone(),
+            &[],
+            &mut None,
+        )
+        .unwrap();
+        native
+            .owner
+            .with(|client| {
+                crate::pg::release_writer::save(
+                    client,
+                    &[crate::parser::Release {
+                        name: "Background.2160p".into(),
+                        group: "example.media".into(),
+                        articles: vec![crate::parser::Article {
+                            filename: Some("video.mkv".into()),
+                            subject: "video.mkv yEnc (1/1)".into(),
+                            message_id: "<standard-count@example.test>".into(),
+                            part: Some(1),
+                            total_parts: Some(1),
+                            bytes: 4 << 30,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                    1,
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let mut sched = scheduler(Pool::new(&[]), Vec::new());
+        sched.native = Some(native.profile.clone());
+        sched.native_owner = Some(native.owner.clone());
+        sched.ctx.stop = native.owner.stop.clone();
+        let sched = Arc::new(sched);
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        rt.block_on(async {
+            let task =
+                tokio::spawn(native_media_counts(sched.clone(), native.db.clone(), native.owner.clone(), headers));
+            let until = Instant::now() + Duration::from_secs(10);
+            loop {
+                assert!(native.owner.failure().is_none(), "healthy standard count startup must not fail the owner");
+                let count = crate::indexer::on_native_db(&native.db, |client| {
+                    Ok(client
+                        .query_opt("select releases from backfill_media where grp='example.media'", &[])?
+                        .map(|row| row.get::<_, i64>(0)))
+                })
+                .await
+                .unwrap();
+                if count == Some(1) {
+                    break;
+                }
+                assert!(Instant::now() < until, "native background count did not publish");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(native.owner.failure().is_none());
+            native.owner.stop.store(true, Ordering::Release);
+            tokio::time::timeout(Duration::from_secs(10), task).await.unwrap().unwrap();
+        });
+        assert!(native.owner.failure().is_none(), "normal service stop must preserve the original outcome");
+        native.owner.close();
+    }
 
     fn native_fixture() -> (crate::pg::testing::Schema, Db) {
         let schema = crate::pg::testing::Schema::native_writer().expect("explicit isolated ATLAS_PG_TEST_URL required");
