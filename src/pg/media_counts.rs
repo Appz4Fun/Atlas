@@ -36,7 +36,7 @@ impl Service {
         ensure!(tokio::runtime::Handle::try_current().is_err(),"native media count requires a standard lane");
         db.check_native_owner(owner)?;
         owner.epoch().context("native media count requires its original epoch")?.catalog().header_config(headers)?;
-        let mut nonce=[0u8;16];getrandom::fill(&mut nonce).context("native media tally identity")?;
+        let mut nonce=[0u8;16];getrandom::fill(&mut nonce).map_err(|_|anyhow::anyhow!("native media tally identity unavailable"))?;
         let suffix=nonce.iter().map(|byte|format!("{byte:02x}")).collect::<String>();
         Ok(Self {owner:owner.clone(),db,headers:headers.clone(),table:format!("atlas_media_count_{suffix}"),initialized:false,scan:None,next:Instant::now()})
     }
