@@ -85,3 +85,11 @@ fn conflicting_provider_identities_are_not_merged_or_overwritten() {
     let mut tv=source(10,Ids {trakt:Some(900),..base});tv.kind=2;
     assert_eq!(merge_sources(vec![source(20,base),tv]).len(),2);
 }
+
+#[test]
+fn cross_page_trakt_admission_is_fill_only_and_ambiguity_defers_before_freshness() {
+    use crate::pg::service_cache::details::TraktIdentity;
+    let ids=identity();assert_eq!(bind_trakt(ids,TraktIdentity::Unique(900)).unwrap().trakt,Some(900));
+    assert_eq!(bind_trakt(ids,TraktIdentity::Absent).unwrap(),ids);
+    assert!(matches!(bind_trakt(ids,TraktIdentity::Ambiguous),Err(Trouble::Bad(_))));
+}
