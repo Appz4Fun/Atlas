@@ -83,12 +83,20 @@ fn read_in_group(
     read_scoped(client,family,key,budget,exact,"")
 }
 
+// This is a static schema-format check, not cache readiness. An older schema10
+// with plain NFO names cannot be interpreted as an empty encoded cache.
+fn nfo_format(client:&mut impl GenericClient)->Result<()> {
+    let row=client.query_one("select exists(select 1 from atlas_cache_key_formats where table_name='ext_raw_nfo_passwords' and column_name='name' and codec=$1)",&[&crate::raw_store::nfo_key::PREFIX])?;
+    ensure!(row.try_get::<_,bool>(0)?,"native NFO cache requires the canonical name codec");Ok(())
+}
+
 fn read_scoped(
     client:&mut impl GenericClient,family:Family,key:Key<'_>,budget:Budget,exact:bool,scope:&str,
 ) -> Result<Option<Facts>> {
     let (byte_limit,row_limit,limit)=budget.checked()?;
     let encoded_name;
     let key = if matches!(family,Family::NfoPassword) {
+        nfo_format(client)?;
         ensure!(key.name.len()<=budget.bytes.saturating_sub(crate::raw_store::nfo_key::PREFIX.len())/2,"NFO natural name exceeds byte budget");
         encoded_name=crate::raw_store::nfo_key::encode(key.name);
         Key {name:&encoded_name,..key}
@@ -288,11 +296,6 @@ pub(crate) fn archive(client:&mut impl GenericClient,key:Key<'_>,parts:i64,compl
 // They neither acquire a connection nor commit/retry a partial result. The
 // canonical native owner/operation actor wraps this transaction and settles it.
 fn archive_current(tx:&mut postgres::Transaction<'_>,family:Family,key:Key<'_>)->Result<()> {
-    let encoded_name;
-    let key = if matches!(family,Family::NfoPassword) {
-        encoded_name=crate::raw_store::nfo_key::encode(key.name);
-        Key {name:&encoded_name,..key}
-    } else {key};
     let (table,name,_,_)=family.shape();
     let statement=tx.prepare(&format!("select * from {table} limit 0"))?;
     let descriptor=serde_json::to_string(&statement.columns().iter().map(|column|(column.name(),column.type_().name())).collect::<Vec<_>>())?;
@@ -351,11 +354,13 @@ pub(crate) fn put_probe(tx:&mut postgres::Transaction<'_>,record:&crate::raw_sto
 }
 
 pub(crate) fn put_nfo_password(tx:&mut postgres::Transaction<'_>,key:Key<'_>,password:&str,budget:Budget)->Result<()> {
+    budget.checked()?;
     ensure!(key.name.len()<=budget.bytes.saturating_sub(crate::raw_store::nfo_key::PREFIX.len())/2,"NFO natural name exceeds byte budget");
     let encoded_name=crate::raw_store::nfo_key::encode(key.name);
-    write_budget(Key {name:&encoded_name,..key},password.len(),1,budget)?;
-    archive_current(tx,Family::NfoPassword,key)?;
     let key=Key {name:&encoded_name,..key};
+    write_budget(key,password.len(),1,budget)?;
+    nfo_format(tx)?;
+    archive_current(tx,Family::NfoPassword,key)?;
     let n=tx.execute("insert into ext_raw_nfo_passwords(name,group_name,content_id,password) values($1,$2,$3,$4)
       on conflict(natural_name_key,natural_group_key) do update set content_id=excluded.content_id,password=excluded.password
       where ext_raw_nfo_passwords.name=excluded.name and ext_raw_nfo_passwords.group_name=excluded.group_name",
@@ -531,6 +536,18 @@ mod tests {
         }
         assert_eq!(client.query_one("select count(*) from ext_raw_nfo_passwords",&[]).unwrap().get::<_,i64>(0),names.len() as i64);
         assert_eq!(client.query_one("select count(*) from ext_preserved_cache_rows where family='ext_raw_nfo_passwords'",&[]).unwrap().get::<_,i64>(0),names.len() as i64);
+    }
+
+    #[test]
+    fn natural_nfo_codec_refuses_unmarked_schema_without_hiding_or_changing_rows() {
+        let Some(schema)=crate::pg::testing::Schema::new() else {return};
+        let mut client=schema.pool.get().unwrap();let key=Key {name:"Kept",group:"g",content_id:&[1]};
+        let mut tx=client.transaction().unwrap();put_nfo_password(&mut tx,key,"original",BUDGET).unwrap();tx.commit().unwrap();
+        client.execute("delete from atlas_cache_key_formats where table_name='ext_raw_nfo_passwords' and column_name='name'",&[]).unwrap();
+        assert!(nfo_password(&mut *client,key,BUDGET).is_err(),"unknown encoding is not a miss");
+        let mut tx=client.transaction().unwrap();assert!(put_nfo_password(&mut tx,key,"replacement",BUDGET).is_err());tx.rollback().unwrap();
+        assert_eq!(client.query_one("select password from ext_raw_nfo_passwords",&[]).unwrap().get::<_,String>(0),"original");
+        assert_eq!(client.query_one("select count(*) from ext_preserved_cache_rows where family='ext_raw_nfo_passwords'",&[]).unwrap().get::<_,i64>(0),0);
     }
 
     #[test]
