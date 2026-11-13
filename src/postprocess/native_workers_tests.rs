@@ -214,3 +214,44 @@ pub(crate) fn run_header_only(runtime:&crate::pg::indexer_runtime::Runtime) {
     ending.store(true,std::sync::atomic::Ordering::Release);worker.join().unwrap();
     assert!(runtime.owner.stop.load(std::sync::atomic::Ordering::Acquire));assert_eq!(runtime.owner.failure(),None);runtime.owner.close();
 }
+
+
+#[test]
+#[ignore="requires isolated PostgreSQL and owned HTTP for periodic details lifecycle"]
+fn native_periodic_details_lane_releases_owner_and_joins_inflight_http_before_close() {
+    crate::raw_store::native_pg_opensubtitles_cache_tests::native_details_parent();
+}
+
+pub(crate) fn run_details_held(runtime:&crate::pg::indexer_runtime::Runtime) {
+    use std::io::{Read,Write};
+    crate::pg::stage_queue_tests::push(runtime);
+    runtime.owner.with(|client|{client.execute("insert into media_release(release_id,kind,title_key,quality,tmdb_id) select id,1,id,0,42 from releases",&[])?;Ok(())}).unwrap();
+    let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();listener.set_nonblocking(true).unwrap();
+    let base=format!("http://127.0.0.1:{}",listener.local_addr().unwrap().port());
+    let (entered_tx,entered_rx)=mpsc::channel();let (release_tx,release_rx)=mpsc::channel();
+    let server=std::thread::spawn(move|| {
+        let until=Instant::now()+Duration::from_secs(5);
+        let mut socket=loop {match listener.accept() {Ok((socket,_))=>break socket,Err(error) if error.kind()==std::io::ErrorKind::WouldBlock=>{assert!(Instant::now()<until);std::thread::sleep(Duration::from_millis(5));},Err(error)=>panic!("{error}")}};
+        socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();let mut request=Vec::new();let mut byte=[0];
+        while request.len()<8192&&!request.ends_with(b"\r\n\r\n") {assert_eq!(socket.read(&mut byte).unwrap(),1);request.push(byte[0]);}
+        assert!(request.starts_with(b"GET /movie/42?"));entered_tx.send(()).unwrap();release_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let body=r#"{"title":"Held details control","overview":"Actual owned HTTP"}"#;
+        write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+    });
+    let mut config=crate::config::Config::default();config.postprocess.enabled=false;config.predb.enabled=false;
+    config.media.details_per_minute=60;config.media.tmdb.api_key="fixture-key".into();config.media.tmdb.base_url=Some(base);
+    let mut details=workers::details_service(&runtime.owner,&config,None).unwrap().expect("configured details-only factory");
+    details.start_without_delay_for_test();let mut handles=Vec::new();workers::start_details(&runtime.owner,details,&mut handles).unwrap();
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    // A real completed PG observation while provider I/O is held proves that
+    // this independent retained lane does not monopolize the writer mutex.
+    let owner=runtime.owner.clone();let (captured_tx,captured_rx)=mpsc::channel();let capture=std::thread::spawn(move||captured_tx.send(crate::pg::stage_telemetry::capture(&owner,None)).unwrap());
+    let observed=captured_rx.recv_timeout(Duration::from_secs(1));
+    if observed.is_err() {release_tx.send(()).unwrap();capture.join().unwrap();server.join().unwrap();let _=join_workers(&runtime.owner,handles);panic!("details provider I/O held the canonical writer mutex")}
+    observed.unwrap().unwrap();capture.join().unwrap();
+    let owner=runtime.owner.clone();let (done_tx,done_rx)=mpsc::channel();let finish=std::thread::spawn(move||done_tx.send(join_workers(&owner,handles)).unwrap());
+    let until=Instant::now()+Duration::from_secs(3);while !runtime.owner.stop.load(std::sync::atomic::Ordering::Acquire) {assert!(Instant::now()<until);std::thread::yield_now();}
+    assert!(matches!(done_rx.recv_timeout(Duration::from_millis(30)),Err(mpsc::RecvTimeoutError::Timeout)),"shutdown detached the live details HTTP worker");
+    release_tx.send(()).unwrap();server.join().unwrap();let joined=done_rx.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();finish.join().unwrap();
+    assert!(joined.pending().is_empty());assert!(joined.for_owner(&runtime.owner));assert_eq!(runtime.owner.failure(),None);runtime.owner.close();
+}

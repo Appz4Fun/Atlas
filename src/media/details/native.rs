@@ -22,6 +22,8 @@ impl Service {
         })} else {(None,None)};
         Ok(Self {cache,config:config.clone(),sources,image,assets,after:None,pending:VecDeque::new(),next:Instant::now()+BACKFILL_DELAY})
     }
+    #[cfg(test)]
+    pub(crate) fn start_without_delay_for_test(&mut self) {self.next=Instant::now();}
     pub(crate) fn tick(&mut self,now:i64)->Result<Progress> {self.tick_at(now,Instant::now())}
     pub(super) fn tick_at(&mut self,now:i64,at:Instant)->Result<Progress> {
         if !Self::enabled(&self.config) {return Ok(Progress::Disabled)}
