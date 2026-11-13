@@ -434,6 +434,8 @@ pub fn build_nzb(release_id: i64) -> Result<Option<String>> {
 
 /// `build_nzb` with the gaps it found: the release is complete only when they are none.
 pub fn build_nzb_checked(release_id: i64) -> Result<Option<NzbBuild>> {
+    let storage=crate::config::checked_storage_config().map_err(anyhow::Error::msg)?;
+    if storage.is_postgres(){return crate::metrics::timed("nzb.build",||crate::pg::fresh_nzb_tools::build(&storage,release_id,crate::pg::fresh_nzb::Pick::Whole));}
     crate::metrics::timed("nzb.build", || whole_nzb(release_id))
 }
 
@@ -536,6 +538,8 @@ pub fn build_nzb_file(release_id: i64, file: usize) -> Result<Option<String>> {
 
 /// `build_nzb_file` with the gaps it found.
 pub fn build_nzb_file_checked(release_id: i64, file: usize) -> Result<Option<NzbBuild>> {
+    let storage=crate::config::checked_storage_config().map_err(anyhow::Error::msg)?;
+    if storage.is_postgres(){return crate::metrics::timed("nzb.build_file",||crate::pg::fresh_nzb_tools::build(&storage,release_id,crate::pg::fresh_nzb::Pick::Ordinal(u64::try_from(file)?)));}
     crate::metrics::timed("nzb.build_file", || one_file_nzb(release_id, file))
 }
 
@@ -566,6 +570,8 @@ fn listed(articles: &[ArticleRow]) -> Vec<ListedFile> {
 
 /// The files a release's whole NZB lists, gaps filled from its copies as `t=get` fills them. None: no such release.
 pub fn file_list(release_id: i64) -> Result<Option<Vec<ListedFile>>> {
+    let storage=crate::config::checked_storage_config().map_err(anyhow::Error::msg)?;
+    if storage.is_postgres(){return crate::metrics::timed("nzb.file_list",||crate::pg::fresh_nzb_tools::files(&storage,release_id));}
     crate::metrics::timed("nzb.file_list", || {
         let Some(release) = get_release(release_id)? else { return Ok(None) };
         let (articles, _) = filled_inventory(&release)?;
@@ -593,6 +599,8 @@ fn files_named(articles: &[ArticleRow], name: &str) -> Vec<ArticleRow> {
 /// One file of a release as its own NZB, picked by its name: a release page links each file this way, since its
 /// list is sorted by name and not in the NZB's order.
 pub fn build_nzb_named_checked(release_id: i64, name: &str) -> Result<Option<NzbBuild>> {
+    let storage=crate::config::checked_storage_config().map_err(anyhow::Error::msg)?;
+    if storage.is_postgres(){return crate::metrics::timed("nzb.build_file",||crate::pg::fresh_nzb_tools::build(&storage,release_id,crate::pg::fresh_nzb::Pick::Name(name)));}
     crate::metrics::timed("nzb.build_file", || {
         let Some(release) = get_release(release_id)? else { return Ok(None) };
         let (articles, groups) = filled_inventory(&release)?;
@@ -618,6 +626,8 @@ fn one_file_nzb(release_id: i64, file: usize) -> Result<Option<NzbBuild>> {
 
 /// Write the nzb for a release, into `output_dir` or the current dir.
 pub fn generate_nzb(release_id: i64, output_dir: Option<&Path>) -> Result<PathBuf> {
+    let storage=crate::config::checked_storage_config().map_err(anyhow::Error::msg)?;
+    if storage.is_postgres(){return crate::pg::fresh_nzb_tools::generate(&storage,release_id,output_dir);}
     let release = get_release(release_id)?.ok_or_else(|| {
         ui::error("Release not found");
         anyhow!("release not found")

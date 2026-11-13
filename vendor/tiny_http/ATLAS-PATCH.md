@@ -23,6 +23,12 @@ These upstream files differ:
   Bounded body wire admission wraps the raw source before EqualReader or the
   chunk decoder, including framing/extensions/trailers in its positive byte
   allowance. Overflow returns an error and closes, rather than returning EOF.
+  In bounded mode raw body EOF is an UnexpectedEof error, preventing a partial
+  chunk from becoming the chunk decoder's successful end-of-body signal. A
+  complete framed body reaches its own end before requesting raw transport EOF.
+  A private per-request raw-EOF observation survives decoder error remapping,
+  including delimiter EOF becoming InvalidInput. It is set only by raw Read
+  returning zero and reset when the next bounded request begins.
   Ordinary constructors keep their existing behavior.
 - `src/response.rs`: let bounded Request cleanup privately emit
   `Connection: close` when it cannot safely retain a connection.
@@ -32,6 +38,11 @@ These upstream files differ:
 
 Bounded Request cleanup tracks transport body completion, closes incomplete
 bodies before destruction and notifies the connection loop after cleanup.
+Premature EOF of a streamed fixed-length or chunked bounded body returns UnexpectedEof
+without shutting down the response half first. Completion stays false, so an
+application can send its rejection with Connection: close; response cleanup
+then shuts down before the unread EqualReader is dropped. Read errors, idle
+timeouts, cancellation and absolute deadlines retain their immediate close.
 Raw writer extraction retains the request in bounded mode. Bounded HTTP
 pipelining is processed sequentially with safe keepalive after complete bodies.
 

@@ -11,7 +11,7 @@ pub(super) fn unavailable()->ApiResponse {
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<error code=\"900\" description=\"Native catalog temporarily unavailable\"/>".into())}
 }
 
-fn spools()->Result<Arc<crate::nzb_spool::Pool>> {
+pub(crate) fn spools()->Result<Arc<crate::nzb_spool::Pool>> {
     static POOL:Mutex<Option<(PathBuf,Arc<crate::nzb_spool::Pool>)>>=Mutex::new(None);
     let root=crate::paths::app_dir().join("nzb-spool");
     let mut slot=POOL.lock().unwrap_or_else(|error|error.into_inner());
@@ -36,10 +36,14 @@ pub(crate) fn handle(storage:&pg::StorageConfig,args:&HashMap<String,String>,bas
 }
 
 pub(crate) fn read<T>(storage:&pg::StorageConfig,work:impl FnOnce(&ReadView<'_>)->Result<T>)->Result<T> {
+    read_with_budget(storage,Budget {rows:100,..Budget::default()},work)
+}
+
+pub(crate) fn read_with_budget<T>(storage:&pg::StorageConfig,budget:Budget,work:impl FnOnce(&ReadView<'_>)->Result<T>)->Result<T> {
     let until=Instant::now()+Duration::from_secs(10);
     let pool=pg::Pool::new(storage)?;
     let mut connection=pool.get_before(until)?;
-    let view=ReadView::open(&mut connection,&storage.schema,Budget {rows:100,..Budget::default()},until)?;
+    let view=ReadView::open(&mut connection,&storage.schema,budget,until)?;
     view.header_config(&crate::config::header_store_config())?;
     work(&view)
 }
@@ -48,7 +52,7 @@ pub(crate) fn read<T>(storage:&pg::StorageConfig,work:impl FnOnce(&ReadView<'_>)
 /// accepts a live readonly transaction, not a caller-provided empty/ready flag.
 pub(crate) fn dispatch(view:&ReadView<'_>,args:&HashMap<String,String>,base:&str,key:&str)->Result<ApiResponse> {
     match args.get("t").map(String::as_str) {
-        Some("caps")=>Ok(ApiResponse::xml(200,caps_body(base,&crate::media::query::refreshed_id_params()))),
+        Some("caps")=>Ok(ApiResponse::xml(200,caps_body(base,&readable_ids()))),
         Some("files")=>{
             let id=args.get("id").and_then(|id|id.trim().parse().ok()).unwrap_or(0);
             if !view.visible(id)? {return Ok(ApiResponse::error(300,"No such item"));}
@@ -75,14 +79,44 @@ pub(crate) fn dispatch(view:&ReadView<'_>,args:&HashMap<String,String>,base:&str
                 }
             }
         }
-        Some("search"|"tvsearch"|"movie"|"music"|"audio"|"book")=>{
-            // An actually empty new catalog has a real successful zero result.
-            // Nonempty input must use the original Tantivy matcher/hydration;
-            // it must never become a plausible but fabricated empty answer.
-            ensure!(view.count()?==0,"native search index reader is not yet connected");
-            let offset=args.get("offset").and_then(|value|value.trim().parse::<i64>().ok()).unwrap_or(0).max(0);
-            Ok(rss_document(base,offset,0,""))
-        }
+        Some(kind @("search"|"tvsearch"|"movie"|"music"|"audio"|"book"))=>search(view,kind,args,base,key),
         _=>Err(anyhow::anyhow!("native API operation changed")),
     }
+}
+
+/// These are supported read namespaces, independent of whether an external
+/// provider is enabled. Retained IDs remain usable without provider traffic.
+fn readable_ids()->crate::media::query::IdParams {
+    use crate::media::query::{IdParams,IdSet};
+    IdParams {tv:IdSet {tvdb:true,tvmaze:true,trakt:true,tmdb:true,imdb:true,rid:true},
+        movie:IdSet {imdb:true,tmdb:true,trakt:true,..IdSet::default()}}
+}
+fn search(view:&ReadView<'_>,kind:&str,args:&HashMap<String,String>,base:&str,key:&str)->Result<ApiResponse> {
+    let on=readable_ids();let ids=crate::media::query::from_args(kind,args,&on);
+    let term=search_term(kind,args);let term=term.as_deref().unwrap_or("");
+    if ids.is_none() && term.is_empty() && search_term(kind,args).is_none(){return Ok(rss_document(base,0,0,""));}
+    let offset=args.get("offset").and_then(|value|value.trim().parse::<i64>().ok()).unwrap_or(0).max(0);
+    let limit=args.get("limit").and_then(|value|value.trim().parse::<usize>().ok()).unwrap_or(100).clamp(1,100);
+    let filter=args.get("cat").and_then(|category|crate::category::parse_filter(category));let all=wants_incomplete(args);
+    let mut rows=Vec::new();let mut at=offset;let mut total=None;let mut matched_ids=ids.as_ref();
+    for batch in 0..if all{1}else{COMPLETE_SCAN_PAGES} {
+        let mut page=view.api_query(term,matched_ids,filter.as_ref(),at,limit)?;
+        // Original ID fallback: only when the ID matched nothing, never when
+        // matching rows merely fail the incomplete filter.
+        if batch==0 && page.rows.is_empty() && matched_ids.is_some() && !term.is_empty() {
+            matched_ids=None;page=view.api_query(term,None,filter.as_ref(),at,limit)?;
+        }
+        let read=page.rows.len();total=page.total.or(total);at=at.checked_add(i64::try_from(read)?).context("native API page overflow")?;
+        rows.extend(page.rows.into_iter().filter(|row|all||row.complete).take(limit-rows.len()));
+        if read<limit||rows.len()>=limit{break;}
+    }
+    let ids:Vec<_>=rows.iter().map(|row|row.id).collect();let mut facts=view.api_facts(&ids)?;let mut items=String::new();
+    for row in rows {
+        let facts=facts.remove(&row.id).context("native API result facts disappeared")?;
+        items.push_str(&rss_item(base,key,&row,&on,RssItemFacts {size:row.size.unwrap_or(0),complete:row.complete,repair:false,category:facts.category,
+            password:facts.password.as_ref(),media:facts.media.as_ref(),copies:None,spot:None}));
+    }
+    let reached=offset.checked_add(i64::try_from(ids.len())?).context("native API total overflow")?;
+    let total=total.map(i64::try_from).transpose()?.unwrap_or(reached).max(reached);
+    Ok(rss_document(base,offset,total,&items))
 }

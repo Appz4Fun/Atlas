@@ -1,5 +1,7 @@
 //! Natural-key cache commands on the current native attempt's owned session.
 
+pub(crate) mod costly;
+
 use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 use std::rc::Rc;
@@ -21,15 +23,18 @@ pub(crate) struct NativeCacheScope {
     previous: Option<Weak<Owner>>,
     bound: Weak<Owner>,
     _thread: PhantomData<Rc<()>>,
+    _assets: super::worker_assets::Scope,
 }
 
 impl NativeCacheScope {
-    pub(crate) fn bind(owner: &Arc<Owner>) -> Result<Self> {
+    pub(crate) fn bind(owner: &Arc<Owner>) -> Result<Self> {Self::bind_with_assets(owner,None)}
+    pub(crate) fn bind_with_assets(owner: &Arc<Owner>,assets:Option<&Arc<super::worker_assets::Grant>>) -> Result<Self> {
+        let assets=super::worker_assets::Scope::bind(owner,assets)?;
         ensure!(owner.cache_destination().is_some(), "cache requires a validated native owner");
         NATIVE_SELECTED.with(|selected| selected.set(true));
         let bound = Arc::downgrade(owner);
         let previous = CACHE_OWNER.with(|slot| slot.replace(Some(bound.clone())));
-        Ok(Self { previous, bound, _thread: PhantomData })
+        Ok(Self { previous, bound, _thread: PhantomData, _assets: assets })
     }
 }
 
@@ -44,18 +49,20 @@ impl Drop for NativeCacheScope {
     }
 }
 
-pub(crate) enum NativeCacheCommand {
+pub(crate) enum NativeCacheCommand<'a> {
+    Costly(costly::Command<'a>),
     LookupOpenSubtitles { hash: String },
     PutOpenSubtitles { hash: String, feature: Option<Feature>, checked_at: i64 },
 }
 
 pub(crate) enum NativeCacheReply {
+    Costly(costly::Reply),
     Lookup(Option<Option<Feature>>),
     Stored,
 }
 
 /// None selects the legacy SQLite implementation only before a native scope exists.
-pub(crate) fn execute_if_native(command: NativeCacheCommand) -> Result<Option<NativeCacheReply>> {
+pub(crate) fn execute_if_native(command: NativeCacheCommand<'_>) -> Result<Option<NativeCacheReply>> {
     let (registered, owner) = CACHE_OWNER.with(|slot| {
         let current = slot.borrow();
         (current.is_some(), current.as_ref().and_then(Weak::upgrade))
@@ -64,33 +71,34 @@ pub(crate) fn execute_if_native(command: NativeCacheCommand) -> Result<Option<Na
         Ok(storage) => storage,
         Err(_) => {
             if let Some(owner) = &owner { owner.fail(Failure::Fatal); }
-            bail!("OpenSubtitles cache configuration is unavailable");
+            bail!("natural cache configuration is unavailable");
         }
     };
     let Some(owner) = owner else {
         let was_native = NATIVE_SELECTED.with(|selected| selected.get());
         if storage.is_postgres() { NATIVE_SELECTED.with(|selected| selected.set(true)); }
-        ensure!(!registered && !was_native, "OpenSubtitles cache attempt has ended");
-        storage.check().map_err(|_| anyhow::anyhow!("OpenSubtitles cache configuration is unavailable"))?;
-        ensure!(!storage.is_postgres(), "OpenSubtitles cache requires the native owner scope");
+        ensure!(!registered && !was_native, "natural cache attempt has ended");
+        storage.check().map_err(|_| anyhow::anyhow!("natural cache configuration is unavailable"))?;
+        ensure!(!storage.is_postgres(), "natural cache requires the native owner scope");
         return Ok(None);
     };
     let destination = owner.cache_destination().ok_or_else(|| anyhow::anyhow!("cache owner is not validated"))?.clone();
     if storage != destination.storage {
         owner.fail(Failure::Fatal);
-        bail!("OpenSubtitles cache destination changed");
+        bail!("natural cache destination changed");
     }
     // Stage lanes are existing standard threads. An entered Tokio context is not a sync-client lane.
-    ensure!(tokio::runtime::Handle::try_current().is_err(), "OpenSubtitles cache requires a standard worker thread");
+    ensure!(tokio::runtime::Handle::try_current().is_err(), "natural cache requires a standard worker thread");
     owner.with(move |client| {
         ensure!(destination_identity(client, &destination.storage.schema)? == destination.identity,
-            "OpenSubtitles cache destination identity changed");
+            "natural cache destination identity changed");
         ensure!(super::migrate::version(client, &destination.storage.schema)? == destination.version,
-            "OpenSubtitles cache schema version changed");
+            "natural cache schema version changed");
         let table = format!("\"{}\".ext_opensubtitles", destination.storage.schema);
         let mut tx = client.transaction()?;
         super::history_gate::native(&mut tx)?;
         let reply = match command {
+            NativeCacheCommand::Costly(command) => NativeCacheReply::Costly(costly::execute(&mut tx,command)?),
             NativeCacheCommand::LookupOpenSubtitles { hash } => {
                 let row = tx.query_opt(&format!(
                     "select imdb_id,tmdb_id,kind,title,year,season,episode,release_name from {table} where moviehash=$1"

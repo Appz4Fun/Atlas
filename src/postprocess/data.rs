@@ -1,13 +1,33 @@
-//! Checked Step reads. Native admission waits for a reviewed resolver and epoch protocol.
+//! Checked Step reads over legacy SQLite or the current canonical native owner.
 
 use rusqlite::{Connection, OptionalExtension};
 
 use super::step::StepError;
 
+#[derive(Debug)]
+pub(crate) struct NativeReadUnavailable;
+impl std::fmt::Display for NativeReadUnavailable {
+    fn fmt(&self,formatter:&mut std::fmt::Formatter<'_>)->std::fmt::Result {formatter.write_str("native Step read is not ported")}
+}
+impl std::error::Error for NativeReadUnavailable {}
+
+#[derive(Debug)]
+struct NativeInventoryError(anyhow::Error);
+impl std::fmt::Display for NativeInventoryError {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {std::fmt::Display::fmt(&self.0,f)}
+}
+impl std::error::Error for NativeInventoryError {
+    fn source(&self)->Option<&(dyn std::error::Error+'static)> {Some(self.0.as_ref())}
+}
+fn native_inventory_error(error:anyhow::Error)->rusqlite::Error {
+    rusqlite::Error::UserFunctionError(Box::new(NativeInventoryError(error)))
+}
+
 /// Read data is separate from mutation authority. No variant manufactures a native release reference.
 pub enum StepData<'a> {
     LegacySqlite(&'a Connection),
-    /// There is no accepted native Stage resolver or snapshot issuer yet.
+    Native(&'a crate::pg::stage_reads::StepReads),
+    /// An unported or absent native read capability remains unavailable.
     NativeUnavailable,
 }
 
@@ -15,6 +35,7 @@ impl StepData<'_> {
     fn legacy(&self) -> Result<&Connection, StepError> {
         match self {
             Self::LegacySqlite(conn) => Ok(conn),
+            Self::Native(_) => Err(StepError::Native(NativeReadUnavailable.into())),
             Self::NativeUnavailable => Err(StepError::Retry("native Step data is unavailable".into())),
         }
     }
@@ -26,7 +47,7 @@ impl StepData<'_> {
     fn legacy_inventory_connection(&self) -> rusqlite::Result<&Connection> {
         match self {
             Self::LegacySqlite(conn) => Ok(conn),
-            Self::NativeUnavailable => Err(rusqlite::Error::UserFunctionError(Box::new(std::io::Error::new(
+            Self::Native(_) | Self::NativeUnavailable => Err(rusqlite::Error::UserFunctionError(Box::new(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,"native Step inventory is unavailable",
             )))),
         }
@@ -34,14 +55,17 @@ impl StepData<'_> {
 
     /// Compatibility for legacy Steps' existing error handling. Unavailable native data is always an error.
     pub fn release_files(&self, release_id: i64) -> rusqlite::Result<Vec<crate::store::FileInfo>> {
+        if let Self::Native(native)=self {return native.files(release_id,5000).map_err(native_inventory_error);}
         crate::store::release_files(self.legacy_inventory_connection()?, release_id, 5_000)
     }
 
     pub fn file_segments(&self, file_id: i64, pick: &crate::store::SegmentPick) -> rusqlite::Result<Vec<crate::store::SegmentRef>> {
+        if let Self::Native(native)=self {return native.segments(file_id,pick).map_err(native_inventory_error);}
         crate::store::file_segments(self.legacy_inventory_connection()?, file_id, pick)
     }
 
     pub fn probe_moviehash(&self, release_id: i64) -> Result<Option<String>, StepError> {
+        if let Self::Native(native)=self {return native.probe_moviehash(release_id).map_err(StepError::Native);}
         self.legacy()?
             .query_row("select moviehash from release_probe where release_id = ?1", [release_id], |row| row.get(0))
             .optional()
@@ -50,6 +74,7 @@ impl StepData<'_> {
     }
 
     pub fn opensubtitles_asked(&self, release_id: i64, hash: &str) -> Result<bool, StepError> {
+        if let Self::Native(native)=self {return native.opensubtitles_asked(release_id,hash).map_err(StepError::Native);}
         self.legacy()?
             .query_row(
                 "select 1 from release_opensubtitles where release_id = ?1 and moviehash = ?2",
@@ -62,6 +87,7 @@ impl StepData<'_> {
     }
 
     pub fn opensubtitles_movie_imdb(&self, release_id: i64) -> Result<Option<i64>, StepError> {
+        if let Self::Native(native)=self {return native.opensubtitles_movie_imdb(release_id).map_err(StepError::Native);}
         self.legacy()?
             .query_row(
                 "select imdb_id from release_opensubtitles
@@ -74,11 +100,13 @@ impl StepData<'_> {
     }
 
     pub fn category_exists(&self, release_id: i64) -> Result<bool, StepError> {
+        if let Self::Native(native)=self {return native.category_exists(release_id).map_err(StepError::Native);}
         self.legacy()?.query_row("select 1 from release_category where release_id=?1", [release_id], |_| Ok(()))
             .optional().map(|row| row.is_some()).map_err(|_| StepError::Retry("category read failed".into()))
     }
 
     pub fn category_spot(&self, release_id: i64) -> Result<Option<(crate::spotnet::Kind, crate::spotnet::Subcats)>, StepError> {
+        if let Self::Native(native)=self {return native.category_spot(release_id).map_err(StepError::Native);}
         let row: Option<(String, String)> = self.legacy()?
             .query_row("select kind,coalesce(subcats,'') from spots where release_id=?1", [release_id],
                 |row| Ok((row.get(0)?, row.get(1)?)))
@@ -94,29 +122,50 @@ impl StepData<'_> {
     }
 
     pub fn probe_info(&self, release_id: i64) -> Result<Option<String>, StepError> {
+        if let Self::Native(native)=self {return native.probe_info(release_id).map_err(StepError::Native);}
         self.legacy()?.query_row("select info from release_probe where release_id=?1", [release_id], |row| row.get(0))
             .optional().map_err(|_| StepError::Retry("probe information read failed".into()))
     }
 
     /// Retains the legacy best-effort rerun marker policy; unavailable native data still returns an error.
     pub fn explicit_rerun(&self, release_id: i64, step: super::step::StepId) -> Result<bool, StepError> {
+        if let Self::Native(native)=self {return native.explicit_rerun(release_id,step).map_err(StepError::Native);}
         Ok(crate::raw_store::is_explicit_rerun(self.legacy()?, release_id, step))
     }
 
     /// A legacy accounting read failure defers eviction as before; native unavailability is never a zero.
     pub fn sidecar_text_bytes(&self) -> Result<i64, StepError> {
+        if let Self::Native(native)=self {return native.sidecar_text_bytes().map_err(StepError::Native);}
         Ok(crate::sidecar::text_bytes(self.legacy()?))
     }
 
     pub fn archive_inner_files(&self, release_id: i64) -> Result<Vec<crate::archive::store::InnerFileRow>, StepError> {
+        if let Self::Native(native)=self {return native.archive_inner_files(release_id).map_err(StepError::Native);}
         crate::archive::store::inner_files(self.legacy()?, release_id).map_err(|error| StepError::Retry(error.to_string()))
     }
 
+    pub(crate) fn xref_tried(&self,id:i64,name:&str)->Result<Option<(i64,i64)>,StepError> {
+        if let Self::Native(native)=self {return match native.xref_tried(id,name).map_err(StepError::Native)? {
+            crate::pg::stage_reads::xref::WindowRead::Publishing=>Err(StepError::Transient("native archive metadata publication pending".into())),
+            crate::pg::stage_reads::xref::WindowRead::Ready(probed,generation)=>Ok(Some((probed,generation))),
+        };}
+        self.legacy()?;Ok(crate::xref::tried(name))
+    }
+    pub(crate) fn xref_leads(&self,id:i64,name:&str,file:i64,generation:Option<i64>)->Result<Vec<i64>,StepError> {
+        if let Self::Native(native)=self {return match native.xref_leads(id,name,file,generation.ok_or_else(||StepError::Native(NativeReadUnavailable.into()))?).map_err(StepError::Native)? {
+            crate::pg::stage_reads::xref::LeadRead::Changed=>Err(StepError::Transient("native archive probe window changed".into())),
+            crate::pg::stage_reads::xref::LeadRead::Found(parts)=>Ok(parts),
+        };}
+        self.legacy()?;Ok(crate::xref::leads(name,file))
+    }
+
     pub fn archive_password(&self, release_id: i64) -> Result<Option<crate::archive::Password>, StepError> {
+        if let Self::Native(native)=self {return native.archive_password(release_id).map_err(StepError::Native);}
         crate::archive::store::password(self.legacy()?, release_id).map_err(|error| StepError::Retry(error.to_string()))
     }
 
     pub fn rename_named(&self, group: &str) -> Result<bool, StepError> {
+        if let Self::Native(native)=self {return native.rename_named(group).map_err(StepError::Native);}
         self.legacy()?.query_row("select value from meta where key in ('naming_rename_named',?1) limit 1",
             [crate::postprocess::reprocess::rename_named_key(group)], |row| row.get::<_, i64>(0))
             .optional().map(|row| row.is_some()).map_err(|error| StepError::Retry(error.to_string()))
@@ -124,27 +173,33 @@ impl StepData<'_> {
 
     /// Legacy content identity also installs its existing sibling raw-store path binding.
     pub fn release_content_id(&self, release_id: i64) -> Result<Option<Vec<u8>>, StepError> {
+        if let Self::Native(native)=self {return native.content_id(release_id).map_err(StepError::Native);}
         Ok(crate::raw_store::release_content_id(self.legacy()?, release_id))
     }
 
     pub fn nfo_password(&self, release_id: i64) -> Result<Option<String>, StepError> {
+        if let Self::Native(native)=self {return native.nfo_password(release_id).map_err(StepError::Native);}
         Ok(crate::archive::store::nfo_password(self.legacy()?, release_id))
     }
 
     pub fn local_password_check(&self, release_id: i64) -> Result<Option<crate::archive::PasswordTest>, StepError> {
+        if let Self::Native(native)=self {return native.local_password_check(release_id).map_err(StepError::Native);}
         Ok(crate::archive::store::local_password_check(self.legacy()?, release_id))
     }
 
     pub fn stored_nfo(&self, release_id: i64) -> Result<Option<crate::probe::nfo_store::StoredNfo>, StepError> {
+        if let Self::Native(native)=self {return native.stored_nfo(release_id).map_err(StepError::Native);}
         Ok(crate::probe::nfo_store::stored(self.legacy()?, release_id))
     }
 
     pub fn par2_names(&self, release_id: i64, files: &[crate::store::FileInfo]) -> Result<std::collections::HashMap<String,String>, StepError> {
+        if let Self::Native(native)=self {return native.par2_names(release_id, files).map_err(StepError::Native);}
         Ok(crate::archive::select::par2_name_map(self.legacy()?, release_id, files))
     }
 
     /// These legacy hints are best effort. Native data cannot fall through to that policy.
     pub fn archive_requires_password_list(&self, release_id: i64) -> Result<bool, StepError> {
+        if let Self::Native(native)=self {return native.archive_requires_password_list(release_id).map_err(StepError::Native);}
         let conn = self.legacy()?;
         let names_hidden = conn.query_row(
             "select 1 from archive_release ar where ar.release_id=?1 and (
@@ -156,6 +211,7 @@ impl StepData<'_> {
     }
 
     pub fn nfo_password_rerun_flags(&self, release_id: i64) -> Result<(bool,bool), StepError> {
+        if let Self::Native(native)=self {return native.nfo_password_rerun_flags(release_id).map_err(StepError::Native);}
         let names_hidden = self.archive_requires_password_list(release_id)?;
         let conn = self.legacy()?;
         let probe_encrypted = conn.query_row(
@@ -165,21 +221,32 @@ impl StepData<'_> {
     }
 
     pub fn media_imdb_marker(&self, release_id: i64) -> Result<Option<Option<i64>>, StepError> {
+        if let Self::Native(native)=self {return native.media_imdb_marker(release_id).map_err(StepError::Native);}
         self.legacy()?.query_row("select imdb_id from media_release where release_id=?1", [release_id], |row| row.get(0))
             .optional().map_err(|error| StepError::Retry(error.to_string()))
     }
 
     pub fn media_exists(&self, release_id: i64) -> Result<bool, StepError> {
+        if let Self::Native(native)=self {return native.media_exists(release_id).map_err(StepError::Native);}
         self.legacy()?.query_row("select 1 from media_release where release_id=?1", [release_id], |_| Ok(()))
             .optional().map(|row| row.is_some()).map_err(|error| StepError::Retry(error.to_string()))
     }
 
     pub fn saved_probe_media(&self, release_id: i64) -> Result<Option<crate::probe::media::MediaInfo>, StepError> {
+        if let Self::Native(native)=self {return native.saved_probe_media(release_id).map_err(StepError::Native);}
         Ok(crate::media::steps::saved_media(self.legacy()?, release_id))
     }
 
     pub fn stale_media_ids(&self, title_key: i64) -> Result<bool, StepError> {
+        if let Self::Native(native)=self {return native.stale_media_ids(title_key).map_err(StepError::Native);}
         crate::media::steps::stale_ids(self.legacy()?, title_key).map_err(|error| StepError::Retry(error.to_string()))
+    }
+
+    pub(crate) fn predb_find(&self,evidence:&crate::predb::matcher::Evidence<'_>)->Result<crate::pg::predb_cache::LookupStatus,StepError> {
+        match self {
+            Self::Native(native)=>native.predb_find(evidence).map_err(StepError::Native),
+            _=>Err(StepError::Retry("native PreDB lookup requires the native read scope".into())),
+        }
     }
 
     /// Explicit legacy catalog dependency. This does not open a reader or choose a native replacement.
@@ -189,34 +256,41 @@ impl StepData<'_> {
     }
 
     pub fn prior_predb_match(&self, release_id: i64) -> Result<Option<i64>, StepError> {
+        if let Self::Native(native)=self {return native.prior_predb_match(release_id).map_err(StepError::Native);}
         self.legacy()?.query_row("select title_id from predb_match where release_id=?1", [release_id], |row| row.get(0))
             .optional().map_err(|error| StepError::Retry(error.to_string()))
     }
 
     /// Legacy salt creation stays explicit; native data cannot reuse a cached legacy salt.
     pub fn key_salt(&self, cached: Option<i64>) -> Result<i64, StepError> {
+        if let Self::Native(native)=self {return native.key_salt(cached).map_err(StepError::Native);}
         crate::keys::legacy_step_salt(self.legacy()?, cached)
     }
 
     pub fn release_keys(&self, release_id: i64, parts: Option<i64>, salt: i64) -> Result<crate::keys::Keys, StepError> {
+        if let Self::Native(native)=self {return native.release_keys(release_id,parts,salt).map_err(StepError::Native);}
         crate::keys::read_keys(self.legacy()?, release_id, parts, Some(salt)).map_err(|error| StepError::Retry(error.to_string()))
     }
 
     pub fn stored_release_keys(&self, release_id: i64) -> Result<Option<crate::keys::Keys>, StepError> {
+        if let Self::Native(native)=self {return native.stored_release_keys(release_id).map_err(StepError::Native);}
         crate::keys::stored(self.legacy()?, release_id).map_err(|error| StepError::Retry(error.to_string()))
     }
 
     pub fn probe_info_best_effort(&self, release_id: i64) -> Result<Option<String>, StepError> {
+        if let Self::Native(native)=self {return native.probe_info(release_id).map_err(StepError::Native);}
         Ok(self.legacy()?.query_row("select info from release_probe where release_id=?1", [release_id], |row| row.get(0)).ok())
     }
 
     pub fn kept_stills(&self, release_id: i64) -> Result<Vec<(String,bool)>, StepError> {
+        if let Self::Native(native)=self {return native.kept_stills(release_id).map_err(StepError::Native);}
         self.legacy()?.prepare("select sha256,phash is not null from release_stills where release_id=?1")
             .and_then(|mut query| query.query_map([release_id], |row| Ok((row.get(0)?,row.get(1)?)))?.collect())
             .map_err(|error| StepError::Retry(error.to_string()))
     }
 
     pub fn has_audio_print(&self, release_id: i64) -> Result<bool, StepError> {
+        if let Self::Native(native)=self {return native.has_audio_print(release_id).map_err(StepError::Native);}
         Ok(crate::probe::audio_print::has_print(self.legacy()?, release_id))
     }
 
@@ -226,102 +300,138 @@ impl StepData<'_> {
             .ok_or_else(|| StepError::Retry("no main database".into()))
     }
 
+    pub fn audio_linked_by(&self,release_id:i64,lookup:&crate::keys::Lookup)->Result<Option<crate::keys::Kind>,StepError> {
+        if let Self::Native(native)=self {return native.audio_linked_by(release_id,lookup).map_err(StepError::Native);}
+        let main=self.legacy_main_path()?;
+        let all=crate::db::open_with_shards(&main).map_err(|error|StepError::Retry(error.to_string()))?;
+        Ok(crate::probe::audio_print::linked_by(&all,release_id,lookup))
+    }
+
+    pub fn same_file_stills(&self,release_id:i64,lookup:&crate::keys::Lookup)->Result<Option<crate::keys::Kind>,StepError> {
+        if let Self::Native(native)=self {return native.same_file_stills(release_id,lookup).map_err(StepError::Native);}
+        let main=self.legacy_main_path()?;
+        let all=crate::db::open_with_shards(&main).map_err(|error|StepError::Retry(error.to_string()))?;
+        Ok(crate::probe::stills::same_file_stills(&all,release_id,lookup).map(|(_,kind)|kind))
+    }
+
     pub fn release_lookup(&self, release_id: i64, parts: Option<i64>) -> Result<crate::keys::Lookup, StepError> {
+        if let Self::Native(native)=self {return native.release_lookup(release_id,parts).map_err(StepError::Native);}
         crate::keys::read_lookup(self.legacy()?, release_id, parts, None).map_err(|error| StepError::Retry(error.to_string()))
     }
 
     pub fn stills_lookup(&self, release_id: i64) -> Result<crate::keys::Lookup, StepError> {
+        if let Self::Native(native)=self {return native.stills_lookup(release_id).map_err(StepError::Native);}
         Ok(crate::probe::stills::file_lookup(self.legacy()?, "main", release_id))
     }
 
     pub fn par2_file_names(&self, release_id: i64) -> Result<Vec<String>, StepError> {
+        if let Self::Native(native)=self {return native.par2_file_names(release_id).map_err(StepError::Native);}
         Ok(crate::archive::select::par2_file_names(self.legacy()?, release_id))
     }
 
     pub(crate) fn same_mux_media(&self, release_id: i64, info: &crate::probe::ProbeInfo, stamp: u64) -> Result<Option<crate::probe::step::SameMux>, StepError> {
+        if let Self::Native(native)=self {return native.same_mux_media(release_id, info, stamp).map_err(StepError::Native);}
         Ok(crate::probe::step::same_mux_of_legacy(self.legacy()?, release_id, info, stamp))
     }
 
     pub fn linked_image_files(&self, release_id: i64) -> Result<Vec<crate::store::FileInfo>, StepError> {
+        if let Self::Native(native)=self {return native.linked_image_files(release_id).map_err(StepError::Native);}
         crate::images::step::linked_files(self.legacy()?, release_id).map_err(|error| StepError::Retry(error.to_string()))
     }
 
     pub fn requested_image_file(&self, release_id: i64, name: &str) -> Result<Option<crate::store::FileInfo>, StepError> {
+        if let Self::Native(native)=self {return native.requested_image_file(release_id, name).map_err(StepError::Native);}
         crate::images::step::asked_linked_file(self.legacy()?, release_id, name).map_err(|error| StepError::Retry(error.to_string()))
     }
 
     pub fn image_requests(&self, release_id: i64) -> Result<Vec<String>, StepError> {
+        if let Self::Native(native)=self {return native.image_requests(release_id).map_err(StepError::Native);}
         self.legacy()?.prepare_cached("select file from picture_requests where release_id=?1 and (done_at is null or outcome='shown')")
             .and_then(|mut query| query.query_map([release_id], |row| row.get(0))?.collect())
             .map_err(|error| StepError::Retry(error.to_string()))
     }
 
     pub fn kept_images(&self, release_id: i64) -> Result<std::collections::HashMap<String,String>, StepError> {
+        if let Self::Native(native)=self {return native.kept_images(release_id).map_err(StepError::Native);}
         crate::images::step::kept_before(self.legacy()?, release_id).map_err(|error| StepError::Retry(error.to_string()))
     }
 
     pub fn archive_source_name_bytes(&self, release_id: i64, source: i64) -> Result<i64, StepError> {
+        if let Self::Native(native)=self {return native.archive_source_name_bytes(release_id,source).map_err(StepError::Native);}
         self.legacy()?.query_row(crate::archive::store::BYTES_OF_SOURCE, rusqlite::params![release_id,source], |row| row.get(0))
             .map_err(|error| StepError::Retry(error.to_string()))
     }
 
     pub fn archive_total_name_bytes(&self) -> Result<i64, StepError> {
+        if let Self::Native(native)=self {return native.archive_total_name_bytes().map_err(StepError::Native);}
         crate::store::get_meta(self.legacy()?, "archive_name_bytes").map(|value| value.unwrap_or(0))
             .map_err(|error| StepError::Retry(error.to_string()))
     }
 
     pub fn legacy_step_key_salt(&self) -> Result<Option<i64>, StepError> {
+        if let Self::Native(native)=self {return native.legacy_step_key_salt().map_err(StepError::Native);}
         Ok(crate::keys::step_salt(self.legacy()?))
     }
 
     pub fn upload_lead(&self, release_id: i64) -> Result<Option<i64>, StepError> {
+        if let Self::Native(native)=self {return native.upload_lead(release_id).map_err(StepError::Native);}
         self.legacy()?.query_row("select lead_id from upload_link where release_id=?1", [release_id], |row| row.get(0))
             .optional().map_err(|error| StepError::Retry(error.to_string()))
     }
 
     pub fn upload_tried_count(&self, release_id: i64) -> Result<i64, StepError> {
+        if let Self::Native(native)=self {return native.upload_tried_count(release_id).map_err(StepError::Native);}
         self.legacy()?.query_row("select count(*) from upload_link_tried where release_id=?1", [release_id], |row| row.get(0))
             .map_err(|error| StepError::Retry(error.to_string()))
     }
 
     pub fn release_size(&self, release_id: i64) -> Result<Option<i64>, StepError> {
+        if let Self::Native(native)=self {return native.release_size(release_id).map_err(StepError::Native);}
         self.legacy()?.query_row("select coalesce(size,0) from releases where id=?1", [release_id], |row| row.get(0))
             .optional().map_err(|error| StepError::Retry(error.to_string()))
     }
 
     pub fn upload_is_lead(&self, release_id: i64) -> Result<bool, StepError> {
+        if let Self::Native(native)=self {return native.upload_is_lead(release_id).map_err(StepError::Native);}
         self.legacy()?.query_row("select 1 from upload_link where release_id=?1 and lead_id=?1", [release_id], |_| Ok(()))
             .optional().map(|row| row.is_some()).map_err(|error| StepError::Retry(error.to_string()))
     }
 
     pub fn release_name_marker(&self, release_id: i64) -> Result<Option<Option<String>>, StepError> {
+        if let Self::Native(native)=self {return native.release_name_marker(release_id).map_err(StepError::Native);}
         Ok(self.legacy()?.query_row("select display_name from releases where id=?1", [release_id], |row| row.get(0)).optional().unwrap_or(None))
     }
 
     pub fn posted_age_days(&self, posted: &str) -> Result<Option<f64>, StepError> {
+        if let Self::Native(native)=self {return native.posted_age_days(posted).map_err(StepError::Native);}
         Ok(self.legacy()?.query_row("select julianday('now')-julianday(?)", [posted], |row| row.get(0)).ok().flatten())
     }
 
     pub fn file_clock(&self, file_id: i64) -> Result<Option<crate::archive::link::Clock>, StepError> {
+        if let Self::Native(native)=self {return native.file_clock(file_id).map_err(StepError::Native);}
         Ok(self.legacy()?.query_row("select first_date,last_date,clock_first,clock_last from file_timing where file_id=?1", [file_id],
             |row| Ok(crate::archive::link::Clock::of(row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).ok().flatten())
     }
 
     pub fn par2_inventory(&self, release_id: i64) -> Result<Option<crate::par2::Inventory>, StepError> {
+        if let Self::Native(native)=self {return native.par2_inventory(release_id).map_err(StepError::Native);}
         Ok(crate::archive::store::par2_inventory(self.legacy()?, "main", release_id))
     }
 
     pub fn archive_source_exists(&self, release_id: i64, source: i64) -> Result<bool, StepError> {
+        if let Self::Native(native)=self {return native.archive_source_exists(release_id,source).map_err(StepError::Native);}
         Ok(self.legacy()?.query_row("select exists(select 1 from archive_inner_files where release_id=?1 and source=?2)",
             rusqlite::params![release_id,source], |row| row.get(0)).unwrap_or(false))
     }
 
     pub fn finished_step_bits(&self, release_id: i64, mask: super::step::StepMask) -> Result<super::step::StepMask, StepError> {
+        if let Self::Native(native)=self {return native.finished_step_bits(release_id,mask).map_err(StepError::Native);}
         self.legacy()?.query_row("select coalesce((select done|failed from pp_state where release_id=?1),0)&?2",rusqlite::params![release_id,mask], |row| row.get(0))
             .map_err(|error| StepError::Retry(error.to_string()))
     }
 
     pub fn beside_par2_files(&self, release_id: i64) -> Result<std::collections::HashSet<Vec<u8>>, StepError> {
+        if let Self::Native(native)=self {return native.beside_par2_files(release_id).map_err(StepError::Native);}
         self.legacy()?.prepare_cached("select par2_file from beside_files where release_id=?1")
             .and_then(|mut query| query.query_map([release_id], |row| row.get::<_,Option<Vec<u8>>>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()).map(|rows| rows.into_iter().flatten().collect())
@@ -329,44 +439,54 @@ impl StepData<'_> {
     }
 
     pub fn upload_members(&self, lead: i64) -> Result<Vec<(i64,Option<Vec<u8>>)>, StepError> {
+        if let Self::Native(native)=self {return native.upload_members(lead).map_err(StepError::Native);}
         self.legacy()?.prepare_cached("select release_id,par2_file from upload_link where lead_id=?1")
             .and_then(|mut query| query.query_map([lead], |row| Ok((row.get(0)?,row.get(1)?)))?.collect())
             .map_err(|error| StepError::Retry(error.to_string()))
     }
 
     pub(crate) fn link_beside_candidates(&self, release_id: i64, name: &str, window: (&str,&str,&str)) -> Result<Vec<crate::archive::link::Candidate>, StepError> {
+        if let Self::Native(native)=self {return native.link_beside_candidates(release_id, name, window).map_err(StepError::Native);}
         crate::archive::link::LinkStep::beside_candidates(self.legacy()?, release_id, name, window)
     }
 
     pub(crate) fn link_candidates(&self, release: &super::step::ReleaseInfo, sizes: (u64,u64), set: Option<[u8;16]>) -> Result<Vec<crate::archive::link::Candidate>, StepError> {
+        if let Self::Native(native)=self {return native.link_candidates(release, sizes, set).map_err(StepError::Native);}
         crate::archive::link::LinkStep::candidates_legacy(self.legacy()?, release, sizes, set)
     }
 
     pub fn beside_rows_with_files(&self, release_id: i64) -> Result<Vec<(i64,crate::store::FileInfo)>, StepError> {
+        if let Self::Native(native)=self {return native.beside_rows_with_files(release_id).map_err(StepError::Native);}
         crate::archive::beside::own_beside_legacy(self.legacy()?, release_id)
     }
 
     pub fn find_beside_nfo(&self, release_id: i64, stem: &str, posted: Option<&str>) -> Result<Option<(i64,crate::store::FileInfo)>, StepError> {
+        if let Self::Native(native)=self {return native.find_beside_nfo(release_id, stem, posted).map_err(StepError::Native);}
         crate::archive::beside::nfo_beside(self.legacy()?, release_id, stem, posted)
     }
 
     pub fn find_nfo_owner(&self, release_id: i64, stem: &str, posted: Option<&str>) -> Result<Option<i64>, StepError> {
+        if let Self::Native(native)=self {return native.find_nfo_owner(release_id, stem, posted).map_err(StepError::Native);}
         crate::archive::beside::nfo_owner(self.legacy()?, release_id, stem, posted)
     }
 
     pub fn post_posters(&self, name: &str, stem: &str, own: Option<&str>, posted: &str) -> Result<(Vec<String>,Vec<i64>), StepError> {
+        if let Self::Native(native)=self {return native.post_posters(name, stem, own, posted).map_err(StepError::Native);}
         crate::archive::beside::post_posters(self.legacy()?, name, stem, own, posted)
     }
 
     pub fn counter_files(&self, release_id: i64) -> Result<Vec<crate::store::FileInfo>, StepError> {
+        if let Self::Native(native)=self {return native.files(release_id,64).map_err(StepError::Native);}
         crate::store::release_files(self.legacy()?, release_id, 64).map_err(|error| StepError::Retry(error.to_string()))
     }
 
     pub fn find_thumbnail(&self, release_id: i64, total: i64, slots: &std::collections::HashSet<i64>, posters: &[String], posted: &str) -> Result<Option<i64>, StepError> {
+        if let Self::Native(native)=self {return native.find_thumbnail(release_id, total, slots, posters, posted).map_err(StepError::Native);}
         crate::archive::beside::thumbnail_beside(self.legacy()?, release_id, total, slots, posters, posted)
     }
 
     pub fn beside_owner_local(&self, row_id: i64) -> Result<Option<i64>, StepError> {
+        if let Self::Native(native)=self {return native.beside_owner_local(row_id).map_err(StepError::Native);}
         self.legacy()?.query_row("select release_id from beside_files where row_id=?1", [row_id], |row| row.get(0))
             .optional().map_err(|error| StepError::Retry(error.to_string()))
     }
@@ -375,6 +495,18 @@ impl StepData<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inventory_adapter_keeps_typed_owner_outage_and_filesystem_provenance() {
+        let cases=[
+            (anyhow::Error::new(crate::pg::outage::SessionUnavailable).context("native inventory"),crate::pg::outage::Failure::Unavailable),
+            (anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::ConnectionReset)).context("local inventory asset"),crate::pg::outage::Failure::Fatal),
+        ];
+        for (original,expected) in cases {
+            let StepError::Native(error)=StepError::from_inventory(native_inventory_error(original)) else {panic!("native cause became a release retry")};
+            assert_eq!(crate::pg::outage::classify(&error),expected);
+        }
+    }
 
     #[test]
     fn checked_reads_preserve_missing_negative_case_and_movie_semantics() {

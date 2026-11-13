@@ -63,6 +63,14 @@ impl<R: Read> Read for BodyWire<R> {
         }
         let length = output.len().min(self.remaining);
         let got = self.input.read(&mut output[..length])?;
+        if got == 0 {
+            control.0.body_eof_seen.store(true, Ordering::Release);
+            // A framed body finishes before asking its raw source for EOF.
+            // In particular, chunked_transfer can otherwise report Ok(0)
+            // while still inside an unfinished data chunk.
+            return Err(io::Error::new(ErrorKind::UnexpectedEof,
+                "HTTP body framing ended before completion"));
+        }
         self.remaining -= got;
         Ok(got)
     }
@@ -105,6 +113,7 @@ impl Admission {
             admission: self.clone(), socket,
             deadline: Mutex::new(Instant::now() + self.limits.request_timeout),
             closed: AtomicBool::new(false), body_limit_exceeded: AtomicBool::new(false),
+            body_eof_seen: AtomicBool::new(false),
         });
         let mut controls = self.controls.lock().unwrap_or_else(|error| error.into_inner());
         if self.stopping.load(Ordering::Acquire) {
@@ -133,6 +142,7 @@ struct Control {
     deadline: Mutex<Instant>,
     closed: AtomicBool,
     body_limit_exceeded: AtomicBool,
+    body_eof_seen: AtomicBool,
 }
 impl Drop for Control {
     fn drop(&mut self) {
@@ -146,6 +156,10 @@ impl Drop for Control {
 #[derive(Clone)]
 pub struct RequestControl(Arc<Control>);
 impl RequestControl {
+    pub(crate) fn body_eof_seen(&self) -> bool {
+        self.0.body_eof_seen.load(Ordering::Acquire)
+    }
+
     pub fn body_limit_exceeded(&self) -> bool {
         self.0.body_limit_exceeded.load(Ordering::Acquire)
     }
@@ -170,6 +184,7 @@ impl RequestControl {
         self.remaining()?;
         *self.0.deadline.lock().unwrap_or_else(|error| error.into_inner()) =
             Instant::now() + self.0.admission.limits.request_timeout;
+        self.0.body_eof_seen.store(false, Ordering::Release);
         Ok(())
     }
     pub(crate) fn limits(&self) -> &RequestLimits { &self.0.admission.limits }

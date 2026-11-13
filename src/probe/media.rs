@@ -20,6 +20,9 @@ pub struct MediaInfo {
     pub subtitles: Vec<SubtitleTrack>,
     /// the first edition's chapters, in order
     pub chapters: Vec<Chapter>,
+    /// The declared Chapters element and its selected entries were fully read,
+    /// without hitting the parser's chapter cap. Missing old proof defaults false.
+    pub chapters_complete: bool,
     /// when it was muxed, in Unix seconds
     pub muxed_at: Option<i64>,
     /// Matroska's SegmentUID, in hex: the same mux posted again has the same one
@@ -32,6 +35,12 @@ pub struct MediaInfo {
     pub encoder_options: Option<String>,
     /// files attached to it: fonts, cover art
     pub attachments: Vec<Attachment>,
+    /// Every encountered Attachments element and its metadata was read without
+    /// unknown/truncated lengths, lossy text or parser caps.
+    pub attachments_complete: bool,
+    /// Transient parser state for multiple Attachments elements.
+    #[serde(skip)]
+    pub attachment_elements_seen: bool,
     /// tags extracted from Tags element
     pub tags: HashMap<String, String>,
     /// a DVD's ID as libdvdread's `DVDDiscID` makes it (see `dvd::disc_id`): the same disc ripped twice has the same one.
@@ -42,10 +51,8 @@ pub struct MediaInfo {
     pub cover: Option<Cover>,
     /// Everything before the video was read: the first cluster, or an MP4's `moov`, was reached. False means
     /// more of the file's start would say more.
-    #[serde(skip)]
     pub header_complete: bool,
     /// The encoder's settings ran to their end in what was read, not to the end of the read.
-    #[serde(skip)]
     pub encoder_complete: bool,
     /// Each Matroska track's UID, its kind (1 video, 2 audio, 17 subtitles) and its place in that list: Tags name
     /// their track by UID.
@@ -196,7 +203,7 @@ pub struct SubtitleTrack {
     pub stats: Option<TrackStats>,
     /// A digest of the track's own header (`subtitle_header_key`): an ASS script's styles and info, or a VobSub's
     /// size and palette. The same subtitles muxed again have the same one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub header_key: Option<String>,
 }
 
@@ -517,7 +524,7 @@ fn segment(body: &[u8], info: &mut MediaInfo) {
     let mut video_tracks: Vec<(u64, usize, usize)> = Vec::new();
     let mut audio_tracks: Vec<(u64, usize)> = Vec::new();
     let mut next_track_num = 1u64;
-    walk(body, &mut |id, v| {
+    walk_sized(body, &mut |id, v, declared| {
         match id {
             0x1549_A966 => {
                 let (mut scale, mut duration) = (1_000_000u64, None);
@@ -566,9 +573,15 @@ fn segment(body: &[u8], info: &mut MediaInfo) {
                     info.editions += u32::from(id == 0x45B9);
                     true
                 });
-                chapters(v, info);
+                let complete=chapters(v, info);
+                info.chapters_complete=declared==Some(v.len() as u64) && complete;
             }
-            0x1941_A469 => attachments(v, info),
+            0x1941_A469 => {
+                let parsed=attachments(v, info);
+                let complete=declared==Some(v.len() as u64) && parsed;
+                info.attachments_complete=if info.attachment_elements_seen {info.attachments_complete && complete} else {complete};
+                info.attachment_elements_seen=true;
+            }
             0x1254_C367 if info.tags.len() < MAX_TAGS => {
                 tag_children(v, info, false);
                 walk(v, &mut |id, tag| {
@@ -623,10 +636,23 @@ const MAX_TAGS: usize = 64;
 /// The most chapters kept. A Blu-ray has a few dozen; these come from Usenet.
 const MAX_CHAPTERS: usize = 256;
 
+// A cut or malformed child cannot become proof merely because its containing
+// element's declared bytes were available. This walks boundaries without copies.
+fn complete_children(mut body:&[u8])->bool {
+    while !body.is_empty() {
+        let Some((_,id_len))=element_id(body) else{return false};
+        let Some((Some(size),size_len))=body.get(id_len..).and_then(element_size) else{return false};
+        let Some(end)=usize::try_from(size).ok().and_then(|size|id_len.checked_add(size_len)?.checked_add(size)) else{return false};
+        let Some(rest)=body.get(end..) else{return false};body=rest;
+    }
+    true
+}
+
 /// Chapter extraction with hidden edition filtering (EditionFlagDefault / EditionFlagHidden).
-fn chapters(body: &[u8], info: &mut MediaInfo) {
+fn chapters(body: &[u8], info: &mut MediaInfo)->bool {
     let mut selected_chapters = Vec::new();
     let mut found_default = false;
+    let mut complete=complete_children(body);
 
     walk(body, &mut |id, edition| {
         if id != 0x45B9 {
@@ -635,32 +661,39 @@ fn chapters(body: &[u8], info: &mut MediaInfo) {
         let mut is_hidden = false;
         let mut is_default = false;
         let mut candidate_chaps = Vec::new();
+        complete &= complete_children(edition);
 
         walk(edition, &mut |id, atom| {
             match id {
                 0x45BD => is_hidden = uint(atom) != 0,
                 0x45DB => is_default = uint(atom) != 0,
                 0xB6 if candidate_chaps.len() < MAX_CHAPTERS => {
+                    complete &= complete_children(atom);
                     let (mut start, mut chap_hidden, mut name) = (None, false, None);
                     walk(atom, &mut |id, v| {
                         match id {
                             0x91 => start = Some(uint(v)),
                             0x98 => chap_hidden = uint(v) != 0,
                             // the first display is the chapter's main name
-                            0x80 if name.is_none() => walk(v, &mut |id, v| {
+                            0x80 if name.is_none() => {
+                              complete &= complete_children(v);
+                              walk(v, &mut |id, v| {
                                 if id == 0x85 {
                                     name = Some(text(v)).filter(|n| !n.is_empty());
                                 }
                                 true
-                            }),
+                              });
+                            }
                             _ => {}
                         }
                         true
                     });
+                    if start.is_none() && !chap_hidden {complete=false;}
                     if let (Some(start), false) = (start, chap_hidden) {
                         candidate_chaps.push(Chapter { start_secs: start as f64 / 1e9, name });
                     }
                 }
+                0xB6 => complete=false,
                 _ => {}
             }
             true
@@ -681,6 +714,7 @@ fn chapters(body: &[u8], info: &mut MediaInfo) {
     });
 
     info.chapters = selected_chapters;
+    complete
 }
 
 /// Matroska's dates count nanoseconds from 2001-01-01.
@@ -704,28 +738,46 @@ fn short(b: &[u8]) -> String {
 /// The largest cover kept: covers are a few hundred KB, and each is stored with its release.
 pub const MAX_COVER: usize = 512 * 1024;
 
+fn attachment_text_complete(bytes:&[u8])->bool {
+    let Ok(text)=std::str::from_utf8(bytes) else{return false};
+    let text=text.trim_end_matches('\0').trim();
+    text.chars().take(MAX_ATTACHMENT_TEXT+1).count()<=MAX_ATTACHMENT_TEXT && text==short(bytes)
+}
+
 /// Every attachment, and the cover art when it's here whole.
-fn attachments(body: &[u8], info: &mut MediaInfo) {
+fn attachments(body: &[u8], info: &mut MediaInfo)->bool {
     let mut best: Option<(u8, Cover)> = None;
-    walk(body, &mut |id, file| {
-        if id != 0x61A7 || info.attachments.len() >= MAX_ATTACHMENTS {
-            return true;
-        }
+    let mut complete=complete_children(body);
+    walk_sized(body, &mut |id, file, declared| {
+        if id != 0x61A7 {return true;}
+        if info.attachments.len() >= MAX_ATTACHMENTS {complete=false;return true;}
+        complete &= declared==Some(file.len() as u64) && complete_children(file);
         let mut a = Attachment::default();
         let mut data: Option<(&[u8], bool)> = None;
         walk_sized(file, &mut |id, v, size| {
             match id {
-                0x466E => a.name = short(v),
-                0x4660 => a.mime = Some(short(v)).filter(|m| !m.is_empty()),
-                0x467E => a.description = Some(short(v)).filter(|d| !d.is_empty()),
+                0x466E => {
+                    complete &= !v.is_empty() && attachment_text_complete(v);
+                    a.name=short(v);
+                }
+                0x4660 => {
+                    complete &= attachment_text_complete(v);
+                    a.mime=Some(short(v)).filter(|m| !m.is_empty());
+                }
+                0x467E => {
+                    complete &= attachment_text_complete(v);
+                    a.description=Some(short(v)).filter(|d| !d.is_empty());
+                }
                 0x465C => {
                     a.size = size.unwrap_or(v.len() as u64);
+                    complete &= size==Some(v.len() as u64);
                     data = Some((v, size == Some(v.len() as u64)));
                 }
                 _ => {}
             }
             true
         });
+        complete &= !a.name.is_empty() && data.is_some();
         if let Some((bytes, true)) = data
             && let Some(rank) = cover_rank(&a.name)
             && best.as_ref().is_none_or(|(r, _)| rank < *r)
@@ -739,10 +791,11 @@ fn attachments(body: &[u8], info: &mut MediaInfo) {
     if let Some((_, cover)) = best {
         info.cover = Some(cover);
     }
+    complete
 }
 
 /// How good a cover a name makes, best first: the Matroska names for cover art, then any image.
-fn cover_rank(name: &str) -> Option<u8> {
+pub(super) fn cover_rank(name: &str) -> Option<u8> {
     let lower = name.to_ascii_lowercase();
     let stem = lower.rsplit_once('.').map_or(lower.as_str(), |(stem, _)| stem);
     match stem {
@@ -756,7 +809,7 @@ fn cover_rank(name: &str) -> Option<u8> {
 }
 
 /// A JPEG or PNG that is all there, by its own markers, and small enough to keep.
-fn cover_of(bytes: &[u8]) -> Option<Cover> {
+pub(crate) fn cover_mime(bytes: &[u8]) -> Option<&'static str> {
     if bytes.len() > MAX_COVER {
         return None;
     }
@@ -770,7 +823,10 @@ fn cover_of(bytes: &[u8]) -> Option<Cover> {
     } else {
         return None;
     };
-    Some(Cover { mime, bytes: bytes.to_vec() })
+    Some(mime)
+}
+fn cover_of(bytes: &[u8]) -> Option<Cover> {
+    Some(Cover {mime:cover_mime(bytes)?,bytes:bytes.to_vec()})
 }
 
 fn says_commentary(name: Option<&str>) -> bool {
@@ -3408,6 +3464,115 @@ mod tests {
                 .concat();
         data.truncate(data.len() - cut);
         data
+    }
+
+    fn font_fixture(files:&[u8])->Vec<u8> {
+        let body=[el(&[0x19,0x41,0xA4,0x69],files),el(&[0x1F,0x43,0xB6,0x75],&[])].concat();
+        [el(&[0x1A,0x45,0xDF,0xA3],&el(&[0x42,0x82],b"matroska")),el(&[0x18,0x53,0x80,0x67],&body)].concat()
+    }
+
+    #[test]
+    fn capped_or_truncated_font_metadata_never_gets_a_persisted_complete_key() {
+        let prefix=(0..MAX_ATTACHMENTS).flat_map(|n|attached(format!("font-{n}.ttf").as_bytes(),b"font/ttf",b"a")).collect::<Vec<_>>();
+        for suffix in [b"tail-a.ttf".as_slice(),b"tail-b.ttf".as_slice()] {
+            let media=parse(&font_fixture(&[prefix.clone(),attached(suffix,b"font/ttf",b"a")].concat())).unwrap();
+            assert!(media.header_complete);assert_eq!(media.attachments.len(),MAX_ATTACHMENTS);
+            let json=serde_json::to_string(&crate::probe::ProbeInfo {media:Some(media),..Default::default()}).unwrap();
+            let back:crate::probe::ProbeInfo=serde_json::from_str(&json).unwrap();
+            assert!(crate::keys::fonts_text(back.media.as_ref().unwrap()).is_none(),"unread 65th font must not equal the first64-font signature");
+        }
+        let long=[vec![b'a';MAX_ATTACHMENT_TEXT+1],b".ttf".to_vec()].concat();
+        for name in [long.as_slice(),b"\xff.ttf".as_slice()] {
+            let files=[attached(name,b"font/ttf",b"a"),attached(b"b.ttf",b"font/ttf",b"b")].concat();
+            let media=parse(&font_fixture(&files)).unwrap();assert!(media.header_complete);
+            let back:MediaInfo=serde_json::from_str(&serde_json::to_string(&media).unwrap()).unwrap();
+            assert!(crate::keys::fonts_text(&back).is_none(),"unknown/truncated attachment name is not a complete font list");
+        }
+        // Exactly64 is admissible when the declared element really ends here.
+        let whole=parse(&font_fixture(&prefix)).unwrap();
+        assert!(crate::keys::fonts_text(&whole).is_some());
+        let unicode=format!("{}.ttf","é".repeat(50));
+        let files=[attached(unicode.as_bytes(),b"font/ttf",b"a"),attached(b"b.ttf",b"font/ttf",b"b")].concat();
+        assert!(crate::keys::fonts_text(&parse(&font_fixture(&files)).unwrap()).is_some(),"complete Unicode text is not mistaken for truncation");
+    }
+
+    #[test]
+    fn persisted_complete_fonts_keep_the_producer_proof_while_old_and_partial_fonts_do_not() {
+        let fonts=[attached(b"A.ttf",b"font/ttf",b"font-a"),attached(b"B.ttf",b"font/ttf",b"font-b")].concat();
+        let header=el(&[0x1A,0x45,0xDF,0xA3],&el(&[0x42,0x82],b"matroska"));
+        let body=[el(&[0x19,0x41,0xA4,0x69],&fonts),el(&[0x1F,0x43,0xB6,0x75],&[])].concat();
+        let whole=[header,el(&[0x18,0x53,0x80,0x67],&body)].concat();
+        let media=parse(&whole).unwrap();assert!(media.header_complete);
+        let expected=crate::keys::fonts_text(&media).unwrap();
+        let info=crate::probe::ProbeInfo {media:Some(media),..Default::default()};
+        let mut saved=serde_json::to_value(&info).unwrap();
+        let restored:crate::probe::ProbeInfo=serde_json::from_value(saved.clone()).unwrap();
+        assert_eq!(crate::keys::fonts_text(restored.media.as_ref().unwrap()),Some(expected));
+        saved["media"].as_object_mut().unwrap().remove("header_complete");
+        let old:crate::probe::ProbeInfo=serde_json::from_value(saved).unwrap();
+        assert!(crate::keys::fonts_text(old.media.as_ref().unwrap()).is_none(),"old proof is unknown, never upgraded by presence of fonts");
+        let partial=parse(&with_attachments(&fonts,0)).unwrap();
+        assert!(!partial.header_complete);assert!(crate::keys::fonts_text(&partial).is_none());
+    }
+
+    #[test]
+    fn persisted_subtitle_headers_distinguish_known_absence_from_older_missing_fields() {
+        let media=parse(&sample_mkv()).unwrap();assert!(!media.subtitles.is_empty());
+        let saved=serde_json::to_value(crate::probe::ProbeInfo {media:Some(media),..Default::default()}).unwrap();
+        for track in saved["media"]["subtitles"].as_array().unwrap() {
+            assert_eq!(track.get("header_key"),Some(&serde_json::Value::Null),"current producer records the attempted/absent header key");
+        }
+    }
+
+    fn chapter_fixture(starts:&[u64])->(Vec<u8>,usize) {
+        let atoms=starts.iter().map(|start|el(&[0xB6],&el(&[0x91],&start.to_be_bytes()))).collect::<Vec<_>>();
+        let chapters=el(&[0x10,0x43,0xA7,0x70],&el(&[0x45,0xB9],&atoms.concat()));
+        let segment=el(&[0x18,0x53,0x80,0x67],&chapters);
+        let header=el(&[0x1A,0x45,0xDF,0xA3],&el(&[0x42,0x82],b"matroska"));
+        // el emits a two-byte size; this ends exactly after three full atoms,
+        // inside the still-incomplete declared Chapters and Edition elements.
+        let cut=header.len()+6+6+4+atoms.iter().take(3).map(Vec::len).sum::<usize>();
+        ([header,segment].concat(),cut)
+    }
+
+    #[test]
+    fn partial_chapter_prefixes_never_become_persisted_whole_signatures() {
+        let (one,cut)=chapter_fixture(&[0,92_342_000_000,1_301_100_000_000,2_544_000_000_000]);
+        let (two,_)=chapter_fixture(&[0,92_342_000_000,1_301_100_000_000,3_600_000_000_000]);
+        let whole_one=parse(&one).unwrap();let whole_two=parse(&two).unwrap();
+        assert!(!whole_one.header_complete,"complete Chapters proof is independent of reaching Cluster");
+        assert_ne!(crate::keys::chapters_text(&whole_one),crate::keys::chapters_text(&whole_two));
+        assert!(crate::keys::chapters_text(&whole_one).is_some());
+        for bytes in [&one[..cut],&two[..cut]] {
+            let partial=parse(bytes).unwrap();assert_eq!(partial.chapters.len(),3);
+            let json=serde_json::to_string(&crate::probe::ProbeInfo {media:Some(partial),..Default::default()}).unwrap();
+            let restored:crate::probe::ProbeInfo=serde_json::from_str(&json).unwrap();
+            assert!(crate::keys::chapters_text(restored.media.as_ref().unwrap()).is_none(),"shared prefix cannot suppress audio fingerprinting");
+        }
+        for end in cut..=one.len() {
+            let parsed=parse(&one[..end]).unwrap();
+            if end<one.len() {assert!(crate::keys::chapters_text(&parsed).is_none())}
+            else {assert_eq!(crate::keys::chapters_text(&parsed),crate::keys::chapters_text(&whole_one))}
+        }
+        let mut old=serde_json::to_value(crate::probe::ProbeInfo {media:Some(whole_one),..Default::default()}).unwrap();
+        old["media"].as_object_mut().unwrap().remove("chapters_complete");
+        let old:crate::probe::ProbeInfo=serde_json::from_value(old).unwrap();
+        assert!(crate::keys::chapters_text(old.media.as_ref().unwrap()).is_none(),"old cached list has no whole-element proof");
+    }
+
+    #[test]
+    fn chapter_caps_and_malformed_nested_extents_never_certify_a_shortened_list() {
+        let starts=(0..=MAX_CHAPTERS).map(|n|n as u64*n as u64*1_000_000_000).collect::<Vec<_>>();
+        let (file,_)=chapter_fixture(&starts);let parsed=parse(&file).unwrap();
+        assert_eq!(parsed.chapters.len(),MAX_CHAPTERS);assert!(!parsed.chapters_complete);
+        assert!(crate::keys::chapters_text(&parsed).is_none());
+        // An outer element can be available in full while one child's declared
+        // extent runs past its parent. That is not a complete chapter proof.
+        let mut atom=el(&[0xB6],&el(&[0x91],&92_000_000_000u64.to_be_bytes()));
+        atom[2]=atom[2].checked_add(1).unwrap();
+        let chapters=el(&[0x10,0x43,0xA7,0x70],&el(&[0x45,0xB9],&atom));
+        let file=[el(&[0x1A,0x45,0xDF,0xA3],&el(&[0x42,0x82],b"matroska")),el(&[0x18,0x53,0x80,0x67],&chapters)].concat();
+        assert!(!parse(&file).unwrap().chapters_complete);
     }
 
     #[test]

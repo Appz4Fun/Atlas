@@ -26,6 +26,8 @@ use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
 use crate::keep_export::{self, Column, Tally};
+use super::natural_cache::par2_quota;
+pub use super::natural_cache::par2_quota::{Phase as Par2QuotaPhase,Retention as Par2Retention,Usage as Par2Usage};
 
 /// One `ext_*` table filled from SQLite: the database beside `atlas.db` it comes from, and its table there.
 struct Source {
@@ -286,14 +288,17 @@ pub fn copy_from_sqlite_with_keep(
 /// hand-thaw state, full main-file witness or historical pairing receipt is
 /// imported. Exact cache copy checks run before the two explicit derived-state
 /// resets; `copied` reports those original source tallies, not a final receipt
-/// claiming the reset fields stayed unchanged.
+/// claiming the reset fields or optional PAR2 retention stayed unchanged.
 pub fn copy_caches_for_fresh_catalog(
     c:&mut Client,main:&Path,schema:&str,apply:bool,source:KeepSource<'_>,
 ) -> Result<FreshCacheImport> {
     copy_external(c,main,schema,apply,source,ImportPolicy::Fresh)
 }
 #[derive(Debug)]
-pub struct FreshCacheImport {pub copied:Vec<Moved>,pub predb_late_reset:u64,pub media_fanout_reset:u64}
+pub struct FreshCacheImport {pub copied:Vec<Moved>,pub predb_late_reset:u64,pub media_fanout_reset:u64,
+    /// Optional PAR2 source parity is verified before whole-inventory retention.
+    pub par2_retention:Option<Par2Retention>,
+}
 #[derive(Clone,Copy,PartialEq,Eq)] enum ImportPolicy {Paired,Fresh}
 fn copy_external(c:&mut Client,main:&Path,schema:&str,apply:bool,source:KeepSource<'_>,policy:ImportPolicy)->Result<FreshCacheImport> {
     ensure!(super::valid_schema(schema),"invalid external conversion schema");
@@ -356,12 +361,18 @@ fn copy_external(c:&mut Client,main:&Path,schema:&str,apply:bool,source:KeepSour
     }
     if policy==ImportPolicy::Paired {moved.push(freeze_exempt(&mut tx, &lite, main, apply, keep_schema)?);}
     let (mut predb_late_reset,mut media_fanout_reset)=(0,0);
+    let mut par2_retention=None;
     if apply {
         if policy==ImportPolicy::Fresh {
             predb_late_reset=tx.execute("update ext_predb_meta set value=0 where key='late_after_id' and value is distinct from 0",&[])?;
             media_fanout_reset=tx.execute("update ext_media_titles set fanout_done=0 where fanout_done is distinct from 0",&[])?;
         }
         advance_counters(&mut tx)?;
+        par2_retention=par2_quota::finish_import_if_installed(&mut tx)?;
+        if let Some(ref retention)=par2_retention {
+            println!("  PAR2 retention: {} accounted rows before policy, {} retained rows, {} whole-inventory rows evicted; phase {:?}",
+                retention.before.retained_rows,retention.retained.retained_rows,retention.evicted_rows()?,retention.retained.phase);
+        }
         if let Some(witness) = witness {
             witness.check(main)?;
             // The existing owner verifies source copies and keep top-ups.
@@ -390,7 +401,7 @@ fn copy_external(c:&mut Client,main:&Path,schema:&str,apply:bool,source:KeepSour
         }
         tx.commit()?;
     }
-    Ok(FreshCacheImport {copied:moved,predb_late_reset,media_fanout_reset})
+    Ok(FreshCacheImport {copied:moved,predb_late_reset,media_fanout_reset,par2_retention})
 }
 
 /// Inert original typed cache variants, not a reuse certificate or a source
@@ -765,6 +776,13 @@ pub struct Manifest {
     /// and newer ones only, not against the dumps before it
     #[serde(default)]
     pub baseline: bool,
+    /// Same-snapshot accounting of live optional PAR2 retention, not readiness.
+    #[serde(default)]
+    pub par2_usage:Option<Par2Usage>,
+    /// Restore returns the verified source manifest and explicit final policy
+    /// result; source COPY row counts/checksums are never relabelled retained.
+    #[serde(skip)]
+    pub restore_retention:Option<Par2Retention>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -786,7 +804,10 @@ pub struct Dumped {
 
 /// The rows of a `CHURNS` table that are kept forever: the HTTP cache's static historical PreDB archive snapshots
 /// (`raw_store::is_immutable_predb_page`).
-const PINNED: &[(&str, &str)] = &[("ext_http_cache", "source in ('nzedb_archive', 'dats_pciso_1998')")];
+const PINNED: &[(&str, &str)] = &[
+    ("ext_http_cache", "source in ('nzedb_archive', 'dats_pciso_1998')"),
+    ("ext_preserved_cache_rows", "family not in ('ext_raw_par2','ext_raw_par2_files')"),
+];
 
 /// A writer that hashes what goes through it.
 struct Hashed<W> {
@@ -838,6 +859,8 @@ pub fn dump(c: &mut Client, dir: &Path, keep: usize, allow_shrink: bool) -> Resu
             c.build_transaction().isolation_level(postgres::IsolationLevel::RepeatableRead).read_only(true).start()?;
         let schema: String = tx.query_one("select current_schema()::text", &[])?.get(0);
         let version: i32 = tx.query_one("select coalesce(max(version), 0) from schema_migrations", &[])?.get(0);
+        let par2_usage=if par2_quota::installed(&mut tx)? {Some(par2_quota::usage(&mut tx)?)} else {None};
+        ensure!(par2_usage.is_none_or(|u|u.phase==par2_quota::Phase::Ready),"PAR2 retention is incomplete: finish maintenance before a qualified backup");
         let names: Vec<String> = tables_of(&mut tx)?;
         if names.is_empty() {
             bail!("schema {schema} has no ext_* tables: nothing to dump (wrong schema, or not migrated)");
@@ -874,7 +897,8 @@ pub fn dump(c: &mut Client, dir: &Path, keep: usize, allow_shrink: bool) -> Resu
             tables.push(Dumped { table: t, columns, rows, file, bytes, sha256: Some(sha), pinned });
         }
         tx.commit()?;
-        let m = Manifest { taken_at: stamp.clone(), schema_version: version, tables, baseline: allow_shrink };
+        let m = Manifest { taken_at: stamp.clone(), schema_version: version, tables, baseline: allow_shrink,
+            par2_usage,restore_retention:None };
         if let Some(why) = shrank(&kept_manifests(dir), &m).filter(|_| !allow_shrink) {
             return Err(Shrank(why).into());
         }
@@ -956,6 +980,26 @@ const CHURNS: &[&str] = &["ext_http_cache"];
 /// only ever added to, so either is a sign of a wipe, a bad restore or a wrong schema, and such a dump mustn't push
 /// the good ones out of the rotation. Measured against the most any kept dump had, so a loss night after night is
 /// caught too.
+fn par2_table(table:&str)->bool {matches!(table,"ext_raw_par2"|"ext_raw_par2_files"|"ext_preserved_cache_rows")}
+fn par2_rows(manifest:&Manifest)->Option<u64> {
+    let mut rows=0u64;
+    for table in &manifest.tables {
+        if !par2_table(&table.table) {continue;}
+        let n=if table.table=="ext_preserved_cache_rows" {table.rows.checked_sub(table.pinned?)?} else {table.rows};
+        rows=rows.checked_add(u64::try_from(n).ok()?)?;
+    }
+    Some(rows)
+}
+fn quota_shrink(kept:&[Manifest],now:&Manifest)->bool {
+    let Some(usage)=now.par2_usage else{return false};let Some(retained)=par2_rows(now) else{return false};
+    if retained!=usage.retained_rows {return false;}
+    kept.iter().all(|prior| {
+        let Some(old)=par2_rows(prior) else{return false};if retained>=old {return true;}
+        let previous=prior.par2_usage.map_or(0,|u|u.evicted_rows);
+        usage.evicted_rows.checked_sub(previous).is_some_and(|evicted|evicted>=old-retained)
+    })
+}
+
 fn shrank(kept: &[Manifest], now: &Manifest) -> Option<String> {
     let mut most: std::collections::BTreeMap<&str, i64> = std::collections::BTreeMap::new();
     let mut most_pinned: std::collections::BTreeMap<&str, i64> = std::collections::BTreeMap::new();
@@ -976,11 +1020,15 @@ fn shrank(kept: &[Manifest], now: &Manifest) -> Option<String> {
             return Some(format!("{table} has {now_pinned} rows kept forever, an earlier dump had {pinned}"));
         }
     }
+    let quota_shrink=quota_shrink(kept,now);
     for (table, &rows) in &most {
         match now.tables.iter().find(|t| t.table == *table) {
             // gone is refused for a churning table too: only its row count may go down
             None => return Some(format!("{table} was in an earlier dump and is gone")),
             Some(_) if CHURNS.contains(table) => {}
+            Some(t) if par2_table(table) && t.rows<rows => {
+                if !quota_shrink {return Some(format!("{table} shrank without matching whole-inventory PAR2 retention"));}
+            }
             Some(t) if rows > 0 && (t.rows == 0 || t.rows * 10 < rows * 9) => {
                 return Some(format!("{table} has {} rows, an earlier dump had {rows}", t.rows));
             }
@@ -1029,13 +1077,17 @@ fn prune(dir: &Path, keep: usize) -> Result<()> {
 /// A dump put back: each of its tables COPYed into the connection's schema in one transaction, its SHA-256 and row
 /// count checked before anything commits. Tables that have rows are refused unless `replace`, which empties them first.
 pub fn restore(c: &mut Client, from: &Path, replace: bool) -> Result<Manifest> {
-    let m: Manifest = serde_json::from_slice(&std::fs::read(from.join(MANIFEST)).context("reading the manifest")?)?;
+    let mut m: Manifest = serde_json::from_slice(&std::fs::read(from.join(MANIFEST)).context("reading the manifest")?)?;
     let mut tx = c.transaction()?;
     durable(&mut tx)?;
     let version: i32 = tx.query_one("select coalesce(max(version), 0) from schema_migrations", &[])?.get(0);
     if version < m.schema_version {
         bail!("the dump is of schema version {}, this database is at {version}: migrate it first", m.schema_version);
     }
+    // Schema fence first, then accounting, then TRUNCATE table locks. Taking
+    // quota while waiting for a live exclusive owner would reverse its order.
+    tx.query_one("select pg_advisory_xact_lock_shared(hashtext('atlas.indexer'),hashtext(current_schema()))",&[])?;
+    if par2_quota::installed(&mut tx)? {par2_quota::lock(&mut tx)?;}
     // all or nothing: a dump missing a table would leave that table as it is beside restored ones
     let missing: Vec<String> =
         tables_of(&mut tx)?.into_iter().filter(|t| !m.tables.iter().any(|d| &d.table == t)).collect();
@@ -1093,6 +1145,11 @@ pub fn restore(c: &mut Client, from: &Path, replace: bool) -> Result<Manifest> {
         }
     }
     advance_counters(&mut tx)?;
+    m.restore_retention=par2_quota::finish_import_if_installed(&mut tx)?;
+    if let Some(ref retention)=m.restore_retention {
+        println!("  PAR2 restore retention: {} accounted rows before policy, {} retained rows, {} whole-inventory rows evicted; phase {:?}",
+            retention.before.retained_rows,retention.retained.retained_rows,retention.evicted_rows()?,retention.retained.phase);
+    }
     tx.commit()?;
     Ok(m)
 }
@@ -1217,7 +1274,7 @@ mod tests {
             sha256: None,
             pinned: None,
         };
-        let m = |tables| Manifest { taken_at: String::new(), schema_version: 2, tables, baseline: false };
+        let m = |tables| Manifest { taken_at: String::new(), schema_version: 2, tables, baseline: false,par2_usage:None,restore_retention:None };
         let kept = [
             m(vec![t("ext_a", 5000), t("ext_b", 3), t("ext_http_cache", 900)]),
             m(vec![t("ext_a", 4600), t("ext_b", 3), t("ext_http_cache", 10)]),
@@ -1250,6 +1307,23 @@ mod tests {
         let kept = [m(vec![cache(30, 0), t("ext_a", 5)])];
         assert_eq!(shrank(&kept, &m(vec![cache(0, 0), t("ext_a", 5)])), None);
         assert!(shrank(&kept, &m(vec![t("ext_a", 5)])).is_some(), "the HTTP cache table gone");
+    }
+
+    #[test]
+    fn backup_shrink_accepts_only_accounted_par2_eviction_and_pins_other_preserved_families() {
+        let table=|name:&str,rows,pinned|Dumped {table:name.into(),columns:vec![],rows,file:format!("{name}.copy.zst"),bytes:0,sha256:None,pinned};
+        let manifest=|files,preserved,pinned,evicted|Manifest {taken_at:String::new(),schema_version:11,
+          tables:vec![table("ext_raw_par2",0,None),table("ext_raw_par2_files",files,None),table("ext_preserved_cache_rows",preserved,Some(pinned)),table("ext_predb_titles",3,None)],
+          baseline:false,par2_usage:Some(par2_quota::Usage {phase:par2_quota::Phase::Ready,retained_rows:(files+preserved-pinned) as u64,
+            evicted_rows:evicted,..Default::default()}),restore_retention:None};
+        let old=manifest(10,10,5,0);let kept=[old];
+        assert!(shrank(&kept,&manifest(2,7,5,11)).is_none(),"11 actual optional rows evicted, all essential variants remain");
+        assert!(shrank(&kept,&manifest(2,7,5,10)).is_some(),"counter does not explain the drop");
+        assert!(shrank(&kept,&manifest(2,7,4,100)).is_some(),"even a large PAR2 counter cannot hide one non-PAR2 preserved loss");
+        let mut no_proof=manifest(2,7,5,11);no_proof.par2_usage=None;assert!(shrank(&kept,&no_proof).is_some());
+        let mut bad_count=manifest(2,7,5,11);bad_count.par2_usage.as_mut().unwrap().retained_rows=1;assert!(shrank(&kept,&bad_count).is_some());
+        let mut essential_loss=manifest(2,7,5,11);essential_loss.tables.iter_mut().find(|t|t.table=="ext_predb_titles").unwrap().rows=0;
+        assert!(shrank(&kept,&essential_loss).is_some(),"PreDB is never a churning family");
     }
 
     #[test]

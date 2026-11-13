@@ -7,17 +7,21 @@ use std::{io::{self,Read,Write},sync::Arc};
 use anyhow::{Context,Result,ensure};
 use postgres::fallible_iterator::FallibleIterator;
 
-pub(crate) struct Download {pub body:Spool,pub disposition:Option<crate::nzb_http::Disposition>,pub gaps:u64}
+pub(crate) struct Download {pub body:Spool,pub disposition:Option<crate::nzb_http::Disposition>,pub gaps:u64,pub details:Option<Vec<crate::nzb::FileGap>>}
 #[derive(Clone,Copy)]
 pub(crate) enum Pick<'a>{Whole,Ordinal(u64),Name(&'a str)}
 
-struct Message<'a,'c> {view:&'a ReadView<'c>,release:i64,key:[u8;32],at:i64,end:i64,buffer:Vec<u8>,used:usize}
+pub(super) struct Message<'a,'c> {view:&'a ReadView<'c>,release:i64,key:[u8;32],at:i64,end:i64,buffer:Vec<u8>,used:usize}
 impl<'a,'c> Message<'a,'c> {
     fn chunk(view:&ReadView<'_>,release:i64,key:&[u8;32],at:i64,n:i32)->Result<Vec<u8>> {
         view.before_query()?;
         let row=view.tx.borrow_mut().query_opt("select substring(message_id from $3::integer for $4::integer)
             from segments where release_id=$1 and message_key=$2",&[&release,&&key[..],&i32::try_from(at+1)?,&n])?.context("native article disappeared")?;
         let bytes:Vec<u8>=row.try_get(0)?;ensure!(bytes.len()<=n as usize,"native article range exceeded admission");Ok(bytes)
+    }
+    pub(super) fn raw(view:&'a ReadView<'c>,release:i64,key:[u8;32],length:i64)->Result<Self> {
+        ensure!(length>=0,"negative native article extent");
+        Ok(Self {view,release,key,at:0,end:length,buffer:Vec::new(),used:0})
     }
     fn new(view:&'a ReadView<'c>,release:i64,key:[u8;32],length:i64)->Result<Self> {
         ensure!(length>=0,"negative native article extent");let mut at=0;let mut end=length;
@@ -100,6 +104,18 @@ impl Read for SparseText<'_,'_> {
 }
 impl ReadView<'_> {
     pub(crate) fn nzb_own(&self,id:i64,pick:Pick<'_>,pool:&Arc<Pool>)->Result<Option<Download>> {
+        self.nzb_own_mode(id,pick,pool,false)
+    }
+    /// Preserve checked file gaps when an existing caller needs owned XML.
+    /// Streaming downloads retain their original bounded transport path.
+    pub(crate) fn nzb_owned_build(&self,id:i64,pick:Pick<'_>,pool:&Arc<Pool>)->Result<Option<crate::nzb::NzbBuild>> {
+        let Some(mut download)=self.nzb_own_mode(id,pick,pool,true)? else{return Ok(None)};
+        self.admit_owned(download.body.len().checked_mul(2).context("native owned NZB extent overflow")?)?;
+        let mut xml=String::with_capacity(usize::try_from(download.body.len())?);download.body.read_to_string(&mut xml)?;
+        let gaps=download.details.take().context("native owned gap report missing")?;
+        Ok(Some(crate::nzb::NzbBuild {xml,gaps}))
+    }
+    fn nzb_own_mode(&self,id:i64,pick:Pick<'_>,pool:&Arc<Pool>,collect_gaps:bool)->Result<Option<Download>> {
         let Some((group,posted,complete))=self.download_head(id)? else{return Ok(None)};
         let mut files=pool.open()?;self.before_query()?;
         let mut tx=self.tx.borrow_mut();
@@ -137,7 +153,7 @@ impl ReadView<'_> {
             selected=selected.checked_add(1).context("native selected file count overflow")?;
         }
         drop(rows);drop(tx);
-        if selected==0 && !matches!(pick,Pick::Whole){return Ok(None);}
+        if selected==0 && (collect_gaps||!matches!(pick,Pick::Whole)){return Ok(None);}
         let mut files=files.finish()?;let mut plan=pool.open()?;
         for _ in 0..selected {
             let descriptor=FileDescriptor::read(&mut files)?;let file=descriptor.file;let count=descriptor.count;
@@ -158,12 +174,20 @@ impl ReadView<'_> {
             ensure!(seen==count,"native article inventory changed within snapshot");
         }
         drop(files);let mut plan=plan.finish()?;
-        let mut xml=XmlWriter::new(pool.open()?,group.as_bytes())?;let mut gaps=0u64;
+        let mut xml=XmlWriter::new(pool.open()?,group.as_bytes())?;let mut gaps=0u64;let mut details=collect_gaps.then(Vec::new);
         for _ in 0..selected {
             let descriptor=FileDescriptor::read(&mut plan)?;let file=descriptor.file;let count=descriptor.count;
             let mut check=GapCheck::new(descriptor.expected);for _ in 0..count{let (_,part,_,_)=segment(&mut plan)?;check.push(part)?;}
             if let Some(gap)=check.finish(){
                 gaps=gaps.checked_add(1).context("native gap count overflow")?;
+                if let Some(details)=&mut details {
+                    self.admit_owned((descriptor.name_bytes as u64).checked_mul(3).and_then(|n|n.checked_add(1024)).context("native gap description extent overflow")?)?;
+                    let filename=if descriptor.name_bytes==0 {None}else{
+                        let mut name=String::new();Text::new(self,TextField::FileName(file)).read_to_string(&mut name)?;
+                        ensure!(name.len() as i64==descriptor.name_bytes,"native gap filename extent changed");Some(name)
+                    };
+                    details.push(crate::nzb::FileGap {files:false,filename,total:gap.total,have:gap.have,missing:gap.missing.clone(),stray:gap.stray});
+                }
                 let more=if(gap.total.unwrap_or(0)-gap.have) as usize>gap.missing.len(){",..."}else{""};
                 let missing=if gap.missing.is_empty(){"-".into()}else{gap.missing.iter().map(ToString::to_string).collect::<Vec<_>>().join(",")};
                 let suffix=format!(": {} of {} parts, missing {missing}{more}{}",gap.have,gap.total.map_or_else(||"?".into(),|n|n.to_string()),
@@ -190,7 +214,7 @@ impl ReadView<'_> {
         ensure!(plan.read(&mut[0u8;1])?==0,"native NZB inventory has trailing rows");drop(plan);
         let body=xml.finish()?.finish()?;
         let disposition=crate::nzb_http::Disposition::prepare(pool,Text::new(self,TextField::ReleaseName(id)),id)?;
-        Ok(Some(Download {body,disposition,gaps}))
+        Ok(Some(Download {body,disposition,gaps,details}))
     }
 }
 
@@ -285,5 +309,41 @@ mod sparse_nameless_tests {
         let view=ReadView::open(&mut client,&schema.name,Budget::default(),Instant::now()+Duration::from_secs(10)).unwrap();
         assert!(view.nzb_own(id,Pick::Whole,&pool).is_err(),"missing original metadata is unavailable, not a representative fallback");
         assert!(view.file_list(id,&pool).is_err(),"uncaptured empty filenames cannot invent unnamed list ordinals");
+    }
+}
+
+#[cfg(test)]
+mod owned_adapter_tests {
+    use super::*;
+    use crate::{parser::{Article,Release},pg::fresh_reader::Budget};
+    use std::time::{Duration,Instant};
+
+    #[test]
+    #[ignore="requires explicit isolated PostgreSQL and bounded native spool admission"]
+    fn owned_native_adapter_retains_gap_details_copies_and_whole_download_refusal() {
+        let schema=crate::pg::testing::Schema::new().expect("explicit isolated PostgreSQL");let mut client=schema.pool.get().unwrap();
+        let release=|name:&str,total|Release {name:name.into(),group:"alt.binaries.test".into(),poster:"accepted poster".into(),date:"Wed, 01 Jan 2020 00:00:00 +0000".into(),
+            articles:[17,23].into_iter().enumerate().map(|(n,bytes)|Article {filename:Some("video.mkv".into()),subject:format!("video.mkv yEnc (1/{total})"),
+                message_id:format!("{name}-{n}@example.invalid"),part:Some(1),total_parts:Some(total),bytes,..Default::default()}).collect(),..Default::default()};
+        assert_eq!(crate::pg::release_writer::save(&mut client,&[release("Partial.Adapter.Example",3),release("Complete.Adapter.Example",1)],1).unwrap().parts,4);
+        let partial:i64=client.query_one("select id from releases where name='Partial.Adapter.Example'",&[]).unwrap().get(0);
+        let complete:i64=client.query_one("select id from releases where name='Complete.Adapter.Example'",&[]).unwrap().get(0);
+        let(row,articles)=crate::pg::release_reader::inventory(&mut client,partial).unwrap().unwrap().into_nzb_rows();
+        let expected=crate::nzb::render_checked(&row,&articles,std::slice::from_ref(&row.group_name),false);
+        let(complete_row,complete_articles)=crate::pg::release_reader::inventory(&mut client,complete).unwrap().unwrap().into_nzb_rows();
+        let complete_expected=crate::nzb::render_checked(&complete_row,&complete_articles,std::slice::from_ref(&complete_row.group_name),true);
+        let root=tempfile::tempdir().unwrap();
+        #[cfg(unix)]{use std::os::unix::fs::PermissionsExt;std::fs::set_permissions(root.path(),std::fs::Permissions::from_mode(0o700)).unwrap();}
+        let pool=Pool::new(root.path().into(),crate::nzb_spool::Limits {requests:8,per_request_bytes:1<<20,total_bytes:8<<20,free_bytes:0}).unwrap();
+        let view=ReadView::open(&mut client,&schema.name,Budget::default(),Instant::now()+Duration::from_secs(10)).unwrap();
+        let built=view.nzb_owned_build(partial,Pick::Name("video.mkv"),&pool).unwrap().unwrap();
+        assert_eq!(built.xml,expected.xml);assert_eq!(built.xml.matches("<segment ").count(),2);
+        assert_eq!(built.gaps,vec![crate::nzb::FileGap {files:false,filename:Some("video.mkv".into()),total:Some(3),have:1,missing:vec![2,3],stray:0}]);
+        assert!(!built.complete());
+        assert!(view.nzb_owned_build(partial,Pick::Whole,&pool).is_err(),"owned API must retain the existing incomplete-whole refusal");
+        assert!(view.nzb_own(partial,Pick::Whole,&pool).is_err(),"stream API must retain the existing incomplete-whole refusal");
+        let built=view.nzb_owned_build(complete,Pick::Whole,&pool).unwrap().unwrap();
+        assert!(built.complete());assert_eq!(built.xml,complete_expected.xml);assert_eq!(built.xml.matches("<segment ").count(),2);
+        assert!(view.nzb_owned_build(complete,Pick::Ordinal(0),&pool).unwrap().is_none());
     }
 }

@@ -77,6 +77,7 @@ pub struct Client {
     pause: Mutex<Pause>,
     /// a loopback base is a test's fixture server: its answers are never cached
     cache: bool,
+    backend:super::cache::Backend,
 }
 
 pub enum Reply {
@@ -97,6 +98,7 @@ impl Client {
             bucket: Mutex::new(Bucket::new(per_minute, Instant::now())),
             pause: Mutex::default(),
             cache: !loopback(base),
+            backend:super::cache::Backend::selected(),
         }
     }
 
@@ -139,13 +141,22 @@ impl Client {
 
     /// `url` holds any key, soo it's never logged and never in a `Trouble`.
     pub fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<Reply, Trouble> {
-        if self.cache
-            && let Some((200, cached_body)) = crate::raw_store::get_http_cache(self.name, url)
-            && let Ok(json) = serde_json::from_str::<Value>(&cached_body)
-        {
-            return Ok(Reply::Json(json));
+        if self.cache {
+            if let Some((status,body))=self.backend.get(self.name,url).map_err(Trouble::Cache)? {
+                if status==200 {
+                    match serde_json::from_str::<Value>(&body) {
+                        Ok(json)=>return Ok(Reply::Json(json)),
+                        Err(_) if self.backend.is_native()=>return Err(Trouble::Cache(super::resolve::CacheFailure::new(anyhow::anyhow!("cached media response is not valid JSON")))),
+                        Err(_)=>{},
+                    }
+                }
+                if status==404 && self.backend.is_native() {return Ok(Reply::NotFound)}
+            }
+        } else {
+            self.backend.check().map_err(Trouble::Cache)?;
         }
         self.ready()?;
+        self.backend.check().map_err(Trouble::Cache)?;
         let span = crate::metrics::span("media.request");
         let mut request = self.agent.get(url);
         for (name, value) in headers {
@@ -157,7 +168,9 @@ impl Client {
 
     /// As `get`, with a body that can hold a key.
     pub fn post_json(&self, url: &str, body: &Value) -> Result<Reply, Trouble> {
+        self.backend.check().map_err(Trouble::Cache)?;
         self.ready()?;
+        self.backend.check().map_err(Trouble::Cache)?;
         let span = crate::metrics::span("media.request");
         let sent = self.agent.post(url).send_json(body);
         self.counted(&span, is_outage(&sent), self.answer(sent, None))
@@ -206,7 +219,7 @@ impl Client {
                 && !crate::raw_store::is_empty_media_json(&json)
                 && let Ok(text) = serde_json::to_string(&json)
             {
-                crate::raw_store::put_http_cache(self.name, url, 200, &text);
+                self.backend.put(self.name,url,200,&text).map_err(Trouble::Cache)?;
             }
             Ok(json)
         };
@@ -215,7 +228,9 @@ impl Client {
 
     /// A web page's text, None on a 404. Paced and paused as `get` is, and not cached: the caller keeps what it took.
     pub fn get_page(&self, url: &str) -> Result<Option<String>, Trouble> {
+        self.backend.check().map_err(Trouble::Cache)?;
         self.ready()?;
+        self.backend.check().map_err(Trouble::Cache)?;
         let span = crate::metrics::span("media.request");
         let sent = self.agent.get(url).call();
         let outage = is_outage(&sent);
@@ -235,6 +250,9 @@ impl Client {
         let _ = self.counted(&span, outage, as_reply);
         page
     }
+
+    pub(crate) fn cached(&self,source:&str,url:&str)->Result<Option<(u16,String)>,Trouble> {self.backend.get(source,url).map_err(Trouble::Cache)}
+    pub(crate) fn keep(&self,source:&str,url:&str,status:u16,body:&str)->Result<(),Trouble> {self.backend.put(source,url,status,body).map_err(Trouble::Cache)}
 
     /// 200 is `read`'s, 404 is None, and the rest pause or fail as each says.
     fn answered<T>(

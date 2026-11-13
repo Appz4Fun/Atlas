@@ -358,7 +358,9 @@ pub(crate) fn ack_step(client: &mut Client, epoch: i64, budget: usize) -> Result
                 tx.execute("insert into linker_uploads select release_name,group_name,first_posted,last_posted,files,generation,probed,added
                     from linker_planned_uploads where epoch=$1 and release_name=$2 on conflict(release_name) do update set
                     group_name=excluded.group_name,first_posted=excluded.first_posted,last_posted=excluded.last_posted,
-                    files=excluded.files,generation=excluded.generation,probed=excluded.probed,added=excluded.added", &[&epoch,s.release.as_ref().unwrap()])?;
+                    files=excluded.files,generation=excluded.generation,
+                    probed=case when linker_uploads.generation=excluded.generation then greatest(linker_uploads.probed,excluded.probed) else excluded.probed end,
+                    added=excluded.added", &[&epoch,s.release.as_ref().unwrap()])?;
                 s.stage = 9;
                 s.member = None;
             }
@@ -431,6 +433,27 @@ pub(crate) fn ack(client: &mut Client, epoch: i64) -> Result<()> {
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn native_metadata_promotion_keeps_newer_tried_counts_and_resets_on_growth() {
+        let Some(schema)=crate::pg::testing::Schema::new() else {return};
+        let runtime=crate::pg::stage_queue_tests::runtime(&schema);
+        runtime.owner.with(|client| {
+            let epoch:i64=client.query_one("insert into linker_epochs(logical_now,phase) values(1,'ack') returning id",&[])?.get(0);
+            client.batch_execute("insert into linker_uploads values('xref-upload-fixture','example.group',0,1,1,7,9,1)")?;
+            client.execute("insert into linker_planned_uploads select $1,release_name,group_name,first_posted,last_posted,files,generation,2,added from linker_uploads",&[&epoch])?;
+            let cursor=serde_json::to_string(&Ack {stage:8,release:Some("xref-upload-fixture".into()),..Default::default()})?;
+            client.execute("insert into linker_work(epoch,kind,state) values($1,'ack',$2)",&[&epoch,&cursor])?;
+            assert!(!ack_step(client,epoch,1)?);
+            let row=client.query_one("select generation,probed from linker_uploads",&[])?;
+            assert_eq!((row.get::<_,i64>(0),row.get::<_,i64>(1)),(7,9));
+            client.execute("update linker_planned_uploads set generation=8,probed=0,files=2 where epoch=$1",&[&epoch])?;
+            client.execute("update linker_work set state=$2 where epoch=$1 and kind='ack'",&[&epoch,&cursor])?;
+            assert!(!ack_step(client,epoch,1)?);
+            let row=client.query_one("select generation,probed from linker_uploads",&[])?;
+            assert_eq!((row.get::<_,i64>(0),row.get::<_,i64>(1)),(8,0));Ok(())
+        }).unwrap();runtime.owner.close();
+    }
 
     #[test]
     fn delayed_file_remains_pending_until_its_whole_chain_is_ready() {

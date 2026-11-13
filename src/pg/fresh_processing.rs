@@ -58,6 +58,40 @@ impl ReadView<'_> {
         match &owner {Some(owner)=>owner.verify_after(&mut *self.tx.borrow_mut())?,None=>ensure!(RuntimeObservation::read_in(&mut *self.tx.borrow_mut())?.is_none(),"native owner began during read")}
         Ok(Some(Processing {state,owner,now}))
     }
+    pub(crate) fn processing_rules(&self,state:&State,now:i64,cfg:&crate::config::Config)->Result<Vec<crate::web_pending::Applicability>> {
+        use crate::web_pending::{MediaRuleFacts,applicability_from_media};
+        use crate::media::{steps::{media_target,key_of},title::Kind};
+        let Some(release)=&state.release else{return Ok(applicability_from_media(MediaRuleFacts::NoRelease));};
+        let name=release.display_name.as_deref().unwrap_or(&release.name);
+        let target=match release.spot_kind {
+            Some(crate::spotnet::Kind::Movie)=>media_target(2000,"spot_kind",name),
+            Some(crate::spotnet::Kind::Series)=>media_target(5000,"spot_kind",name),
+            None=>{let choice=crate::category::classify_release(release,&cfg.category.options());media_target(choice.category,choice.rule,name)}
+        };
+        let Some((kind,parsed))=target else{return Ok(applicability_from_media(MediaRuleFacts::NoTitle));};
+        let key=key_of(kind,&parsed);self.before_query()?;
+        let row=self.tx.borrow_mut().query_opt("select state,checked_mask,next_check,imdb_id from ext_media_titles where title_key=$1",&[&key])?;
+        let mut enabled=0u8;
+        if !cfg.media.tmdb.api_key.is_empty(){enabled|=crate::media::tmdb::BIT;}
+        if !cfg.media.trakt.client_id.is_empty(){enabled|=crate::media::trakt::BIT;}
+        if kind==Kind::Tv {
+            if cfg.media.tvmaze.enabled{enabled|=crate::media::tvmaze::BIT;}
+            if !cfg.media.tvdb.api_key.is_empty(){enabled|=crate::media::tvdb::BIT;}
+        }
+        let (looked_up,imdb_known)=match row {
+            None=>(false,false),Some(row)=>{
+                let state:i64=row.try_get(0)?;let checked:i64=row.try_get(1)?;let next:Option<i64>=row.try_get(2)?;let imdb:Option<i64>=row.try_get(3)?;
+                (enabled!=0&&(i64::from(enabled)&!checked)==0&&(state==1||next.is_some_and(|next|now<next)),imdb.is_some())
+            }
+        };
+        Ok(applicability_from_media(match kind {Kind::Tv=>MediaRuleFacts::Tv {looked_up},Kind::Movie=>MediaRuleFacts::Movie {looked_up,imdb_known}}))
+    }
+
+    pub(crate) fn verify_runtime(&self,owner:Option<&RuntimeObservation>)->Result<()> {
+        self.before_query()?;
+        match owner {Some(owner)=>owner.verify_after(&mut *self.tx.borrow_mut()),None=>{ensure!(RuntimeObservation::read_in(&mut *self.tx.borrow_mut())?.is_none(),"native owner began during read");Ok(())}}
+    }
+
 }
 
 #[cfg(test)]

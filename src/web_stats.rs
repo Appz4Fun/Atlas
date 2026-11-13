@@ -66,7 +66,7 @@ fn label<'a>(labels: &'a Labels, key: &str) -> Option<&'a str> {
 }
 
 /// `{a="1",b="x\"y"}` -> [(a, 1), (b, x"y)]. None when it isn't well formed.
-fn parse_labels(text: &str) -> Option<Labels> {
+pub(crate) fn parse_labels(text: &str) -> Option<Labels> {
     let mut out = Vec::new();
     let mut rest = text.trim();
     while !rest.is_empty() {
@@ -161,9 +161,10 @@ pub(crate) struct Window {
     pub(crate) computed: Option<ComputedWindow>,
 }
 
-/// Bounded native view projection. The loader authenticates the complete
-/// original-series observation manifest at the same live head before accepting
-/// these reductions. Missing data is not a zero, empty vector or legacy fallback.
+/// Bounded native view projection of an atomically completed observation head.
+/// The loader checks the actual owner before/after its readonly snapshot and
+/// reduces original series before aggregation. This data grants no startup or
+/// writer authority; missing measurements are not invented counter samples.
 #[derive(Clone)]
 pub(crate) struct ComputedWindow {
     pub(crate) from: Option<f64>,
@@ -176,6 +177,8 @@ pub(crate) struct ComputedWindow {
 #[derive(Clone)]
 pub(crate) struct LagFacts {
     pub(crate) groups: usize,
+    pub(crate) incomplete: usize,
+    pub(crate) untimed: usize,
     pub(crate) behind: usize,
     pub(crate) late: usize,
     pub(crate) articles: f64,
@@ -747,6 +750,10 @@ fn step_names() -> Vec<(&'static str, bool)> {
 }
 
 fn pipelines(w: &Window, stats: &Value) -> String {
+    pipelines_with_pace(w,Some(stats),None)
+}
+
+fn pipelines_with_pace(w:&Window,stats:Option<&Value>,native:Option<&crate::web_pending::NativePace>)->String {
     let n = w.now.as_deref();
     let get = |name: &str| n.and_then(|n| n.sum(name));
     let with = |name: &str, key: &str, value: &str| n.and_then(|n| n.with(name, key, value));
@@ -806,8 +813,15 @@ fn pipelines(w: &Window, stats: &Value) -> String {
     net.waiting = with("atlas_stage_queue", "state", "net_wanted");
     net.running = in_progress(w, "stage.fetch_body");
     net.per_minute = w.per_minute("atlas_stage_bodies_total", |_| true);
-    let lane = &stats["postprocess"]["lanes"];
-    let sum = |key: &str| lane[key].as_array().map(|v| v.iter().filter_map(Value::as_f64).sum::<f64>());
+    let lane = stats.map(|stats|&stats["postprocess"]["lanes"]);
+    let sum = |key: &str| lane.and_then(|lane|lane[key].as_array()).map(|v| v.iter().filter_map(Value::as_f64).sum::<f64>());
+    if let Some(native)=native {
+        net.note=match native {
+            crate::web_pending::NativePace::Measured(pace)=>format!("{} releases visited and {} finished a minute, measured from the native counter instance",short(pace.net_visits),short(pace.net_finished)),
+            crate::web_pending::NativePace::Warming {..}=>"Native processing is running; its rate window is warming up.".into(),
+            crate::web_pending::NativePace::Stopped {..}=>"Native processing is on hold.".into(),
+        };
+    }
     if let (Some(visits), Some(finished)) = (sum("net_visits"), sum("net_finished")) {
         net.note = format!(
             "per minute: bodies fetched; {} releases visited and {} finished a minute",
@@ -909,16 +923,15 @@ fn net_shards(w: &Window, stats: &Value) -> String {
 
 /// Groups furthest behind the server, from `atlas_group_article_number` and `atlas_group_posted_timestamp_seconds`.
 fn lag(w: &Window, now: f64) -> String {
-    if let Some(window) = &w.computed {
-        return window.lag.as_ref().map_or_else(String::new, |facts| lag_from_facts(facts, now));
+    if let Some(facts) = w.computed.as_ref().and_then(|window|window.lag.as_ref()) {
+        return lag_from_facts(facts,now);
     }
     const SHOWN: usize = 15;
     const LATE_SECS: f64 = 30.0 * 60.0;
     let Some(n) = w.now.as_deref() else { return String::new() };
     let numbers = n.rows("atlas_group_article_number");
-    if numbers.is_empty() {
-        return String::new();
-    }
+    let newest = n.rows("atlas_group_posted_timestamp_seconds");
+    if numbers.is_empty() && newest.is_empty() { return String::new(); }
     // per group: the server's last article, the live cursor, the newest article indexed
     type Marks = (Option<f64>, Option<f64>, Option<f64>);
     let mut groups: HashMap<&str, Marks> = HashMap::new();
@@ -931,22 +944,23 @@ fn lag(w: &Window, now: f64) -> String {
             _ => {}
         }
     }
-    for (l, v) in n.rows("atlas_group_posted_timestamp_seconds") {
-        if let (Some(g), Some("newest")) = (label(l, "group"), label(l, "end"))
-            && let Some(e) = groups.get_mut(g)
-        {
-            e.2 = Some(*v);
+    for (l, v) in newest {
+        if let Some(g) = label(l, "group") {
+            let entry=groups.entry(g).or_default();
+            if label(l,"end")==Some("newest") {entry.2=Some(*v);}
         }
     }
+    let incomplete=groups.values().filter(|(last,live,_)|last.is_none()||live.is_none()).count();
+    let untimed=groups.values().filter(|(_,_,newest)|newest.is_none()).count();
     let mut rows: Vec<(&str, f64, Option<f64>)> = groups
         .iter()
         .filter_map(|(g, (last, live, newest))| Some((*g, ((*last)? - (*live)?).max(0.0), *newest)))
         .collect();
     let behind = rows.iter().filter(|r| r.1 > 0.0).count();
-    let late = rows.iter().filter(|r| r.2.is_some_and(|t| now - t > LATE_SECS)).count();
+    let late = groups.values().filter(|(_,_,newest)|newest.is_some_and(|at|now-at>LATE_SECS)).count();
     let total_lag: f64 = rows.iter().map(|r| r.1).sum();
     rows.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(b.0)));
-    let facts = LagFacts { groups: rows.len(), behind, late, articles: total_lag,
+    let facts = LagFacts { groups: groups.len(), incomplete,untimed,behind, late, articles: total_lag,
         rows: rows.into_iter().take(SHOWN).map(|(group, lag, newest)| (group.to_owned(), lag, newest)).collect() };
     lag_from_facts(&facts, now)
 }
@@ -966,19 +980,29 @@ fn lag_from_facts(facts: &LagFacts, now: f64) -> String {
             )
         })
         .collect();
+    let known=facts.groups.saturating_sub(facts.incomplete);
+    let articles=if known==0&&facts.incomplete>0{"unavailable".into()}else if facts.incomplete>0{format!("{} known",short(facts.articles))}else{short(facts.articles)};
+    let behind=if known==0&&facts.incomplete>0{"unavailable".into()}else if facts.incomplete>0{format!("{} known",thousands(facts.behind as i64))}else{thousands(facts.behind as i64)};
+    let quiet=if facts.untimed==facts.groups&&facts.untimed>0{"unavailable".into()}else if facts.untimed>0{format!("{} known",thousands(facts.late as i64))}else{thousands(facts.late as i64)};
     let tiles = [
-        tile("Articles behind", &short(facts.articles), "server's last article minus the live cursor, summed"),
-        tile("Groups behind", &thousands(facts.behind as i64), &format!("of {}", thousands(facts.groups as i64))),
-        tile("Quiet over 30 minutes", &thousands(facts.late as i64), "newest article indexed is older than that"),
+        tile("Articles behind", &articles, "server's last article minus the live cursor, over measured groups"),
+        tile("Groups behind", &behind, &format!("of {} observed groups", thousands(facts.groups as i64))),
+        tile("Quiet over 30 minutes", &quiet, "newest article indexed is older than that, over timed groups"),
     ];
+    let mut unavailable=String::new();
+    for (count,message) in [(facts.incomplete,"Progress"),(facts.untimed,"Newest-article time")] {
+        if count>0 {let _=write!(unavailable,"<p class=\"note\">{message} is unavailable for {} group{}.</p>",thousands(count as i64),if count==1{""}else{"s"});}
+    }
     let table = if table.is_empty() {
-        "<p class=\"sort\">Every group is caught up with its server.</p>".to_string()
+        if facts.incomplete==0 {"<p class=\"sort\">Every group is caught up with its server.</p>".to_string()}
+        else if known>0 {"<p class=\"sort\">Known groups are caught up with their servers.</p>".to_string()}
+        else {String::new()}
     } else {
         format!(
             "<div class=\"table-wrap\"><table><thead><tr><th>Furthest behind</th><th class=\"num\">Articles</th><th class=\"num\">Newest indexed</th></tr></thead><tbody>{table}</tbody></table></div>"
         )
     };
-    format!("<h2>Realtime</h2><div class=\"stat-grid\">{}</div>{table}", tiles.concat())
+    format!("<h2>Realtime</h2><div class=\"stat-grid\">{}</div>{unavailable}{table}", tiles.concat())
 }
 
 /// `answering`: the newest read of the metrics is recent and the last try didn't fail. A gauge kept from an older
@@ -986,7 +1010,6 @@ fn lag_from_facts(facts: &LagFacts, now: f64) -> String {
 fn headline(w: &Window, stats: &Value, now: f64, answering: bool) -> String {
     let n = w.now.as_deref();
     let get = |name: &str| n.and_then(|n| n.sum(name));
-    let with = |name: &str, key: &str, value: &str| n.and_then(|n| n.with(name, key, value));
     // the indexer writes stats.json every second: a listener that still answers while that has gone quiet is
     // a process that stopped moving
     let wrote = stats["load"]["at"].as_f64().filter(|at| *at > 0.0);
@@ -1005,6 +1028,12 @@ fn headline(w: &Window, stats: &Value, now: f64, answering: bool) -> String {
         }
         (false, false, _) => tag("tag-bad", "STOPPED"),
     };
+    headline_from_state(w,state)
+}
+
+fn headline_from_state(w:&Window,state:String)->String {
+    let n=w.now.as_deref();let get=|name:&str|n.and_then(|n|n.sum(name));
+    let with=|name:&str,key:&str,value:&str|n.and_then(|n|n.with(name,key,value));
     let wire = w.rate_where("atlas_nntp_traffic_bytes_total", |l| label(l, "kind") == Some("wire"));
     let articles = w.rate_where("atlas_articles_total", |_| true);
     let failures = w.per_minute("atlas_nntp_failures_total", |l| {
@@ -1338,6 +1367,45 @@ pub(crate) fn page_from_facts(w: &Window, error: Option<&str>, stats: &Value, no
     crate::web::page("Stats · Atlas", &content)
 }
 
+/// Presentation of actual fresh-catalog SQL and completed registry facts.
+/// It never synthesizes the retired eight-shard stats.json representation.
+pub(crate) struct NativeCatalog {pub total:i64,pub complete:i64,pub named:i64,pub matched:i64,pub obfuscated:i64,pub bytes:i64}
+pub(crate) struct NativeFeed {pub key:String,pub failures:i64,pub last_ok:Option<i64>,pub error:Option<String>}
+pub(crate) struct NativePredb {pub titles:i64,pub behind:Option<i64>,pub feeds:Vec<NativeFeed>}
+
+pub(crate) fn native_live_from_facts(facts:&crate::pg::fresh_statistics::NativeStatistics)->String {
+    let w=&facts.window;let now=facts.now;let n=w.now.as_deref();
+    let up=n.and_then(|sample|sample.sum("atlas_indexer_up"));
+    let state=match up {
+        Some(up) if up>0.0=>tag("tag-ok","RUNNING"),
+        Some(0.0)=>tag("tag-warn","ON HOLD"),
+        _=>tag("tag-warn","ACTIVITY NOT REPORTED"),
+    };
+    let catalog=&facts.catalog;
+    let catalog=format!("<h2>Releases</h2><div class=\"stat-grid\">{}</div><p class=\"sort\">Read from PostgreSQL. Native releases remain in this catalog.</p>",[
+        tile("Releases stored",&thousands(catalog.total),"PostgreSQL catalog"),tile("Complete releases",&thousands(catalog.complete),""),
+        tile("Named",&thousands(catalog.named),""),tile("Matched to the PreDB",&thousands(catalog.matched),""),
+        tile("Still obfuscated",&thousands(catalog.obfuscated),""),tile("Catalog size",&bytes(catalog.bytes as f64),"")].concat());
+    let mut feeds=String::new();
+    for feed in &facts.predb.feeds {
+        let _=write!(feeds,"<tr><td>{}</td><td class=\"num\">{}</td><td>{}</td><td class=\"name dim\">{}</td></tr>",escape(&feed.key),feed.failures,
+            feed.last_ok.map(|at|ago(at as f64,now)).unwrap_or_else(||"never".into()),escape(feed.error.as_deref().unwrap_or("")));
+    }
+    let feed_table=if feeds.is_empty(){String::new()}else{format!("<div class=\"table-wrap\"><table><thead><tr><th>Feed failing</th><th>In a row</th><th>Last answered</th><th>Error</th></tr></thead><tbody>{feeds}</tbody></table></div>")};
+    let predb=format!("<h2>PreDB</h2><div class=\"stat-grid\">{}{}{}</div>{feed_table}",tile("PreDB titles",&thousands(facts.predb.titles),"retained PostgreSQL cache"),
+        tile("Matched an hour",&opt(w.per_minute("atlas_predb_matches_total", |_|true).map(|rate|rate*60.0)),"releases matched to a title"),
+        tile("Titles to look at",&facts.predb.behind.map(|n|thousands(n)).unwrap_or_else(||"–".into()),"the recorded late matcher's backlog"));
+    let measured=if w.computed.as_ref().is_some_and(|window|!window.rates.series.is_empty()){"Original-series rates use their completed 30–300 second observation windows."}else{"Rates are unavailable until an original series has a completed observation window of at least 30 seconds."};
+    format!("<div id=\"stats-live\" hx-get=\"/ui/stats/live\" hx-trigger=\"every {REFRESH_SECS}s\" hx-swap=\"outerHTML\">{}{}{}{}{}{predb}<p class=\"sort\">Read {}; {measured}</p></div>",
+        headline_from_state(w,state),pipelines_with_pace(w,None,Some(&facts.pace)),lag(w,now),backfill(w),catalog,
+        w.now.as_ref().map(|sample|ago(sample.at,now)).unwrap_or_else(||"unavailable".into()))
+}
+
+pub(crate) fn native_page_from_facts(facts:&crate::pg::fresh_statistics::NativeStatistics)->String {
+    let content=format!("{}<div class=\"release stats\"><main><h1>Stats</h1>{}<div id=\"stats-stored\" hx-get=\"/ui/stats/stored\" hx-trigger=\"load\" hx-swap=\"outerHTML\"><h2>Last 24 hours</h2><p class=\"sort\">Reading PostgreSQL…</p></div></main></div>",crate::web::masthead(true),native_live_from_facts(facts));
+    crate::web::page("Stats · Atlas",&content)
+}
+
 pub fn live() -> ApiResponse {
     let (w, error) = window();
     html(200, live_html(&w, error.as_deref(), &stats_json(), now()))
@@ -1360,7 +1428,7 @@ mod tests {
         let native = Window { now: Some(now), computed: Some(ComputedWindow {
             from: Some(0.0), to: 60.0,
             rates: Arc::new(Scrape { at: 60.0, series: HashMap::from([("atlas_articles_total".into(), vec![(Vec::new(), 1.5)])]) }),
-            changes: HashMap::new(), lag: Some(LagFacts { groups: 3, behind: 2, late: 1, articles: 75.0,
+            changes: HashMap::new(), lag: Some(LagFacts { groups: 3,incomplete:0,untimed:0, behind: 2, late: 1, articles: 75.0,
                 rows: vec![("a".into(), 50.0, Some(1.0)), ("c".into(), 25.0, Some(1990.0)), ("b".into(), 0.0, Some(1900.0))] }),
         }), ..Default::default() };
         // +60 on a, +30 after b reset; a new series contributes no rate.
@@ -1561,5 +1629,51 @@ atlas_indexer_up 1
         assert!(out.contains("/ui/release?id=8") && out.contains("X264 · exact"));
         assert_eq!(out.contains("no index on the posted date"), shards.len() > 2, "said only for shards without it");
         assert!(out.contains("hx-get=\"/ui/stats/stored\" hx-trigger=\"every 60s\""), "it keeps refreshing");
+    }
+}
+
+
+#[cfg(test)]
+mod native_lag_evidence_tests {
+    use super::*;
+    fn native(text:&str)->Window {Window {now:Some(Arc::new(parse(text,2000.0))),computed:Some(ComputedWindow {from:None,to:0.0,rates:Arc::new(Scrape::default()),changes:HashMap::new(),lag:None}),..Default::default()}}
+    #[test]
+    fn missing_last_or_live_marks_never_claim_every_group_is_caught_up() {
+        for text in ["atlas_group_article_number{group=\"unknown\",mark=\"live_cursor\"} 50\n",
+            "atlas_group_article_number{group=\"unknown\",mark=\"last\"} 100\n"] {
+            let body=lag(&native(text),2000.0);
+            assert!(!body.contains("Every group is caught up"),"{body}");
+            assert!(body.contains("Progress is unavailable for 1 group"),"{body}");
+        }
+    }
+    #[test]
+    fn mixed_unknown_and_known_progress_retains_both_evidence_states() {
+        let zero="atlas_group_article_number{group=\"known\",mark=\"last\"} 100\natlas_group_article_number{group=\"known\",mark=\"live_cursor\"} 100\n";
+        let unknown="atlas_group_article_number{group=\"unknown\",mark=\"live_cursor\"} 20\n";
+        let body=lag(&native(&format!("{zero}{unknown}")),2000.0);
+        assert!(!body.contains("Every group is caught up"));assert!(body.contains("Known groups are caught up")&&body.contains("Progress is unavailable for 1 group"),"{body}");
+        assert!(body.contains("of 2"),"the incomplete group must remain in the denominator: {body}");
+        let behind=zero.replace("live_cursor\"} 100","live_cursor\"} 50");
+        let body=lag(&native(&format!("{behind}{unknown}")),2000.0);
+        assert!(body.contains("Progress is unavailable for 1 group")&&body.contains("?group=known"),"{body}");
+    }
+    #[test]
+    fn timestamp_only_groups_keep_unknown_progress_and_newest_time_explicit() {
+        for (end,missing_newest) in [("oldest",true),("newest",false)] {
+            let text=format!("atlas_group_posted_timestamp_seconds{{group=\"timestamp-only\",end=\"{end}\"}} 1990\n");
+            let body=lag(&native(&text),2000.0);
+            assert!(!body.contains("Every group is caught up"),"{body}");
+            assert!(body.contains("Progress is unavailable for 1 group"),"{body}");
+            assert!(body.contains("of 1 observed groups"),"the timestamp-only group must remain observed: {body}");
+            assert_eq!(body.contains("Newest-article time is unavailable for 1 group"),missing_newest,"{body}");
+        }
+    }
+    #[test]
+    fn complete_zero_progress_can_claim_caught_up_but_unknown_age_is_explicit() {
+        let text="atlas_group_article_number{group=\"known\",mark=\"last\"} 100\natlas_group_article_number{group=\"known\",mark=\"live_cursor\"} 100\n";
+        let body=lag(&native(text),2000.0);assert!(body.contains("Every group is caught up"));
+        assert!(body.contains("Newest-article time is unavailable for 1 group"),"{body}");
+        let body=lag(&native(&format!("{text}atlas_group_posted_timestamp_seconds{{group=\"known\",end=\"newest\"}} 1990\n")),2000.0);
+        assert!(body.contains("Every group is caught up"));assert!(!body.contains("unavailable"),"{body}");
     }
 }

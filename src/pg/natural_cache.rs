@@ -5,6 +5,8 @@
 
 use anyhow::{Result, ensure};
 use postgres::{GenericClient, Row};
+#[path="par2_quota.rs"]
+pub(crate) mod par2_quota;
 
 /// Closed registry of the costly natural-key families; no caller SQL/table name.
 #[derive(Clone, Copy, Debug)]
@@ -207,7 +209,7 @@ fn inventory(facts:Facts)->Result<Option<crate::par2::Inventory>> {
 }
 
 pub(crate) fn par2_files(client:&mut impl GenericClient,key:Key<'_>,budget:Budget)->Result<Option<crate::par2::Inventory>> {
-    budget.checked()?;
+    budget.checked()?;par2_quota::require_ready(client)?;
     let half=Budget {bytes:budget.bytes/2,rows:budget.rows};
     read(client,Family::Par2Files,key,half)?.map(inventory).transpose().map(Option::flatten)
 }
@@ -219,6 +221,7 @@ pub(crate) fn par2(
     client:&mut impl GenericClient,key:Key<'_>,parts:i64,complete:bool,budget:Budget,
 ) -> Result<Option<crate::raw_store::SavedPar2>> {
     budget.checked()?;
+    par2_quota::require_ready(client)?;
     let quarter=Budget {bytes:budget.bytes/4,rows:budget.rows};
     let Some(facts)=read(client,Family::Par2,key,quarter)? else {return Ok(None)};
     let row=&facts.rows[0];
@@ -446,6 +449,7 @@ pub(crate) fn put_par2_files(tx:&mut postgres::Transaction<'_>,key:Key<'_>,inven
     for file in &inventory.files {bytes=bytes.checked_add(file.name.len()).and_then(|size|size.checked_add(64)).ok_or_else(||anyhow::anyhow!("cache size overflow"))?;}
     for (_,creator) in &inventory.creators {bytes=bytes.checked_add(creator.len()).ok_or_else(||anyhow::anyhow!("cache size overflow"))?;}
     write_budget(key,bytes,inventory.files.len(),budget)?;
+    par2_quota::lock(tx)?;
     archive_current(tx,Family::Par2Files,key)?;
     tx.execute("delete from ext_raw_par2_files where natural_name_key=sha256(convert_to($1,'UTF8'))
       and natural_group_key=sha256(convert_to($2,'UTF8')) and name=$1 and group_name=$2",&[&key.name,&key.group])?;
@@ -456,6 +460,7 @@ pub(crate) fn put_par2_files(tx:&mut postgres::Transaction<'_>,key:Key<'_>,inven
           values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",&[&key.name,&key.group,&key.content_id,&&file.file_id[..],&&file.set_id[..],&&file.md5[..],&&file.md5_16k[..],
           &size,&file.name,&file.crc32.map(i64::from),&i64::from(file.bound),&i64::from(sealed),&i64::from(inventory.complete),&inventory.creator_of(&file.set_id)])?;
     }
+    par2_quota::finish(tx)?;
     Ok(())
 }
 
@@ -466,9 +471,11 @@ pub(crate) fn put_par2(tx:&mut postgres::Transaction<'_>,record:&crate::raw_stor
     let bytes=record.posted.map_or(0,<[u8]>::len).checked_add(record.content_fp.map_or(0,<[u8]>::len)).ok_or_else(||anyhow::anyhow!("cache size overflow"))?;
     write_budget(key,bytes,1,budget)?;
     if let Some(inventory)=record.inventory {ensure!(inventory.files.len()<budget.rows,"PAR2 header and inventory exceed row budget");}
+    par2_quota::lock(tx)?;
     scalar_upsert(tx,Family::Par2,key,&[&i64::from(record.covers_all),&record.posted,&record.sizes.map(|size|size.0),&record.sizes.map(|size|size.1),
       &record.parts,&i64::from(record.complete),&record.content_fp])?;
     if let Some(inventory)=record.inventory {put_par2_files(tx,key,inventory,budget)?;}
+    par2_quota::finish(tx)?;
     Ok(())
 }
 

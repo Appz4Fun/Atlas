@@ -9,7 +9,7 @@ use regex::Regex;
 use serde_json::Value;
 
 use super::Media;
-use super::store::{self, STATE_ASKING, STATE_FOUND, STATE_NOT_FOUND, TitleRow};
+use super::store::{STATE_ASKING, STATE_FOUND, STATE_NOT_FOUND, TitleRow};
 use super::title::Kind;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -63,7 +63,18 @@ pub enum Trouble {
     /// its key was refused: until then
     BadKey(i64),
     Bad(String),
+    Cache(CacheFailure),
 }
+
+#[derive(Clone,Debug)]
+pub struct CacheFailure(std::sync::Arc<anyhow::Error>);
+impl CacheFailure {
+    pub(crate) fn new(error:anyhow::Error)->Self {Self(std::sync::Arc::new(error))}
+    pub(crate) fn into_error(self)->anyhow::Error {anyhow::Error::new(self)}
+}
+impl PartialEq for CacheFailure {fn eq(&self,other:&Self)->bool {std::sync::Arc::ptr_eq(&self.0,&other.0)}}
+impl std::fmt::Display for CacheFailure {fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str("native service cache failed")}}
+impl std::error::Error for CacheFailure {fn source(&self)->Option<&(dyn std::error::Error+'static)> {Some(self.0.as_ref().as_ref())}}
 
 pub trait Provider: Send + Sync {
     fn bit(&self) -> u8;
@@ -105,6 +116,12 @@ pub(crate) fn year_of(v: &Value) -> Option<i32> {
 /// the longest a miss waits before it's asked again
 const MAX_NEGATIVE_DAYS: i64 = 180;
 
+#[derive(Debug)]
+pub(crate) enum ResolveFailure {Cache(anyhow::Error),Provider(String)}
+impl std::fmt::Display for ResolveFailure {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {match self {Self::Cache(error)=>write!(f,"{error}"),Self::Provider(error)=>f.write_str(error)}}
+}
+
 impl Media {
     /// What's known of this title, asking whichever providers are still owed an answer.
     pub fn resolve(&self, q: &TitleQuery<'_>, key: i64, now: i64) -> Result<Resolved, String> {
@@ -132,8 +149,22 @@ impl Media {
         stopping: &dyn Fn() -> bool,
         seed: Option<(&Ids, &str)>,
     ) -> Result<Resolved, String> {
+        self.resolve_seeded_checked(q,key,now,stopping,seed).map_err(|error|error.to_string())
+    }
+
+    pub(crate) fn resolve_seeded_checked(
+        &self,q:&TitleQuery<'_>,key:i64,now:i64,stopping:&dyn Fn()->bool,seed:Option<(&Ids,&str)>,
+    )->Result<Resolved,ResolveFailure> {
         let providers = self.providers();
-        let existing = self.with_store(|c| store::get(c, key))?;
+        let existing = self.title_get_checked(key).map_err(ResolveFailure::Cache)?;
+        if self.is_native() && let Some(row)=&existing {
+            if row.kind!=q.kind as i64 || row.year!=q.year || super::title::normalize(&row.title)!=super::title::normalize(q.title) {
+                return Err(ResolveFailure::Cache(anyhow::anyhow!("media query/cache identity mismatch")));
+            }
+        }
+        if self.is_native() && existing.is_none() && self.titles.load(std::sync::atomic::Ordering::Relaxed)>=u64::try_from(self.config.read().unwrap().max_titles).unwrap_or(0) {
+            self.titles_full.fetch_add(1,std::sync::atomic::Ordering::Relaxed);return Ok(Resolved::Later(now+30));
+        }
         let mut row = existing.clone().unwrap_or(TitleRow {
             key,
             kind: q.kind as i64,
@@ -182,6 +213,7 @@ impl Media {
                 Ok(Answer::NotFound) => row.checked_mask |= i64::from(provider.bit()),
                 Err(Trouble::Paused(t) | Trouble::BadKey(t)) => later = Some(later.map_or(t, |l: i64| l.min(t))),
                 Err(Trouble::Bad(e)) => bad = Some(e),
+                Err(Trouble::Cache(error))=>return Err(ResolveFailure::Cache(error.into_error())),
             }
         }
 
@@ -202,7 +234,7 @@ impl Media {
             row.misses += 1;
             row.next_check = Some(now + days * 86_400);
         }
-        self.with_store(|c| store::put(c, &row))?;
+        self.title_put_checked(&row).map_err(ResolveFailure::Cache)?;
         self.remember(&row, existing.is_none());
         self.clear_claim(key);
         // a provider still owed an answer keeps this release in the lane, even with IDs from another: no later
@@ -214,7 +246,7 @@ impl Media {
             return Ok(Resolved::Later(t));
         }
         if let Some(e) = bad {
-            return Err(e);
+            return Err(ResolveFailure::Provider(e));
         }
         Ok(if row.state == STATE_FOUND { Resolved::Found(row.ids) } else { Resolved::NotFound })
     }

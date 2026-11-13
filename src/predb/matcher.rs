@@ -100,6 +100,11 @@ fn unique(mut found: Vec<TitleRow>) -> Result<Option<TitleRow>, ()> {
     }
 }
 pub fn find(conn: &Connection, e: &Evidence<'_>) -> rusqlite::Result<Option<Match>> {
+    find_with(e, |key| rows_for_key(conn, key))
+}
+
+/// Storage supplies checked candidates; literal/hash/ambiguity rules stay identical.
+pub(crate) fn find_with<E>(e: &Evidence<'_>, mut rows_for_key: impl FnMut(i64) -> Result<Vec<TitleRow>, E>) -> Result<Option<Match>, E> {
     // hash-named posts: the full digest has to agree, a key only nominates, and all of them have to point at one title
     let mut hashed = Vec::new();
     for raw in std::iter::once(e.name).chain(e.files.iter().copied()).take(MAX_NAMES) {
@@ -108,7 +113,7 @@ pub fn find(conn: &Connection, e: &Evidence<'_>) -> rusqlite::Result<Option<Matc
         let Some(key) = hash_key(&name) else { continue };
         let want = name.to_ascii_lowercase();
         hashed.extend(
-            rows_for_key(conn, key)?.into_iter().filter(|t| md5_hex(&t.title) == want || sha1_hex(&t.title) == want),
+            rows_for_key(key)?.into_iter().filter(|t| md5_hex(&t.title) == want || sha1_hex(&t.title) == want),
         );
     }
     match unique(hashed) {
@@ -119,7 +124,7 @@ pub fn find(conn: &Connection, e: &Evidence<'_>) -> rusqlite::Result<Option<Matc
     // the release's own names
     for name in e.display_name.into_iter().chain([e.name]) {
         let clean = clean_candidate(name).unwrap_or_else(|| name.to_string());
-        let rows = rows_for_key(conn, name_key(&clean))?;
+        let rows = rows_for_key(name_key(&clean))?;
         if rows.len() > MAX_ROWS_PER_KEY {
             return Ok(None);
         }
@@ -155,7 +160,7 @@ pub fn find(conn: &Connection, e: &Evidence<'_>) -> rusqlite::Result<Option<Matc
             if !tried.insert(key) {
                 continue;
             }
-            for t in rows_for_key(conn, key)? {
+            for t in rows_for_key(key)? {
                 let same = literally(&name, &t.title) || identity_key(&name) == identity_key(&t.title);
                 if same
                     && is_full_title(&t.title)

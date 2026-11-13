@@ -571,13 +571,26 @@ impl Read for BoundedBody {
                 if let Some(remaining) = &mut self.remaining {
                     *remaining = remaining.saturating_sub(got);
                     if *remaining == 0 { self.complete.store(true, Ordering::Release); }
-                    else if got == 0 { self.control.close(); }
+                    else if got == 0 {
+                        // A peer's write EOF still allows its read half to
+                        // receive an application error. Keep completion false:
+                        // respond forces Connection: close and shuts down
+                        // before dropping/draining the incomplete body.
+                        return Err(io::Error::new(io::ErrorKind::UnexpectedEof,
+                            "HTTP body ended before Content-Length"));
+                    }
                 } else if got == 0 {
                     self.complete.store(true, Ordering::Release);
                 }
                 Ok(got)
             }
-            Err(error) => { self.control.close(); Err(error) }
+            Err(error) => {
+                // The chunk decoder can remap raw EOF into InvalidInput while
+                // reading a delimiter. Preserve only the actual transport EOF
+                // observation, never infer it from the decoder's error kind.
+                if !self.control.body_eof_seen() { self.control.close(); }
+                Err(error)
+            }
         }
     }
 }

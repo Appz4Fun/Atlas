@@ -337,13 +337,29 @@ impl WordIndex {
         &self, source: &mut impl SearchSource, words: &str, filter: Option<&CatFilter>, tags: &[&str],
         by: By, descending: bool, offset: usize, limit: usize, budget: Budget,
     ) -> Result<Hits> {
+        self.search_native_in_group(source,words,filter,tags,None,by,descending,offset,limit,budget)
+    }
+
+    /// The indexed group is an exact STRING field, matching the catalog's
+    /// case-sensitive group filter. Word/prefix scoring and all existing
+    /// tag/category constraints continue through the original query builder.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn search_native_in_group(
+        &self,source:&mut impl SearchSource,words:&str,filter:Option<&CatFilter>,tags:&[&str],group:Option<&str>,
+        by:By,descending:bool,offset:usize,limit:usize,budget:Budget,
+    )->Result<Hits> {
         budget.check()?;
         ensure!(words.trim().is_empty() || searchable(words), "query requires the native catalog matcher");
         let stamp = source.stamp()?;
         ensure!(self.native_ready(stamp)?, "native word index does not match its public source");
         self.native_catch_up(source.pending()?);
         let searcher = self.reader.searcher();
-        let (found, total) = self.top(&searcher, self.query(words, filter, tags).as_ref(), by, descending, offset, limit)?;
+        let mut query=self.query(words,filter,tags);
+        if let Some(group)=group {
+            let scoped=TermQuery::new(Term::from_field_text(self.fields.group,group),IndexRecordOption::Basic);
+            query=Box::new(BooleanQuery::new(vec![(Occur::Must,query),(Occur::Must,Box::new(scoped))]));
+        }
+        let (found, total) = self.top(&searcher,query.as_ref(),by,descending,offset,limit)?;
         let rows = source.visible_rows(&found, budget)?;
         ensure!(rows.len() <= found.len() && source.stamp()? == stamp, "native index hydration source mismatch");
         let mut at = 0;

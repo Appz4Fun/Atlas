@@ -104,3 +104,40 @@ impl BuildSource for Search<'_,'_> {
     }
     fn build_page(&mut self,after:i64,budget:Budget)->Result<Vec<Record>>{self.page(after,budget)}
 }
+
+#[cfg(test)]
+mod group_search_tests {
+    use super::*;
+    use crate::{parser::{Article,Release},pg::{self,Backend,StorageConfig},word_index::{WordIndex,By}};
+    use std::time::{Instant,Duration};
+    #[test]
+    #[ignore="requires explicit isolated fresh schema, original owner, and owned Tantivy directory"]
+    fn actual_pg_group_filter_keeps_tantivy_words_tags_and_case_sensitive_scope() {
+        let schema=pg::testing::Schema::new().expect("explicit fresh schema");let mut client=schema.pool.get().unwrap();
+        client.query_one("select pg_advisory_lock(hashtext('atlas.indexer'),hashtext($1))",&[&schema.name]).unwrap();
+        let root=tempfile::tempdir().unwrap();
+        let headers=crate::config::HeaderStoreConfig {enabled:true,dir:root.path().to_str().unwrap().into()};
+        let storage=StorageConfig {backend:Backend::Postgres,url:schema.url.clone(),schema:schema.name.clone(),max_connections:4,allow_plaintext:true};
+        let version=pg::migrate::version(&mut client,&schema.name).unwrap();
+        let epoch=pg::stage::open_epoch(&mut client,&storage,&headers,version).unwrap();
+        let releases=["alt.binaries.a","alt.binaries.b"].into_iter().enumerate().map(|(n,group)|Release {
+            name:"Alpha.Movie.2020.1080p".into(),group:group.into(),poster:"poster".into(),date:"Wed, 01 Jan 2020 00:00:00 +0000".into(),
+            articles:vec![Article {filename:Some("sample.bin".into()),subject:"sample.bin yEnc (1/1)".into(),message_id:format!("<group{n}@example.test>"),part:Some(1),total_parts:Some(1),bytes:17,..Default::default()}],..Default::default()
+        }).collect::<Vec<_>>();
+        pg::release_writer::save(&mut client,&releases,1).unwrap();
+        let actual:i64=client.query_one("select id from releases where group_name='alt.binaries.a'",&[]).unwrap().get(0);
+        let directory=epoch.catalog().word_index_root(&headers).unwrap();
+        let view=ReadView::open(&mut client,&schema.name,super::super::fresh_reader::Budget {rows:100,..Default::default()},Instant::now()+Duration::from_secs(15)).unwrap();
+        let mut source=Search::open(&view).unwrap();let stamp=source.stamp().unwrap();
+        let writer=WordIndex::open_native(&directory,stamp).unwrap();
+        assert_eq!(writer.build_native(&mut source,Budget::default(),||true).unwrap().documents,2);drop(writer);
+        let reader=WordIndex::read_native(&directory,stamp).unwrap();
+        let all=reader.search_native(&mut source,"alpha",None,&[],By::Newest,true,0,10,Budget::default()).unwrap();assert_eq!(all.total,2);
+        let scoped=reader.search_native_in_group(&mut source,"alpha",None,&["1080p"],Some("alt.binaries.a"),By::Newest,true,0,10,Budget::default()).unwrap();
+        assert_eq!(scoped.total,1);assert_eq!(scoped.rows.iter().map(|row|row.id).collect::<Vec<_>>(),[actual]);
+        for (word,tags,group) in [("gamma",&[][..],"alt.binaries.a"),("alpha",&["2160p"][..],"alt.binaries.a"),("alpha",&[][..],"Alt.Binaries.a")] {
+            let scoped=reader.search_native_in_group(&mut source,word,None,tags,Some(group),By::Newest,true,0,10,Budget::default()).unwrap();
+            assert_eq!(scoped.total,0);assert!(scoped.rows.is_empty());
+        }
+    }
+}

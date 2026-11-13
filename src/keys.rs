@@ -341,7 +341,7 @@ impl Kind {
     }
 
     /// The `release_keys` column, for the kinds kept there.
-    fn column(self) -> Option<&'static str> {
+    pub(crate) fn column(self) -> Option<&'static str> {
         match self {
             Kind::Account => Some("account"),
             Kind::Host => Some("host"),
@@ -363,7 +363,7 @@ impl Kind {
     }
 
     /// The `archive_release` column, for the archive's own keys.
-    fn archive_column(self) -> Option<&'static str> {
+    pub(crate) fn archive_column(self) -> Option<&'static str> {
         match self {
             Kind::ArchiveTwin => Some("twin_key"),
             Kind::Owner => Some("owner_key"),
@@ -398,7 +398,7 @@ impl Keys {
         *self == Keys::default()
     }
 
-    fn get(&self, kind: Kind) -> Option<i64> {
+    pub(crate) fn get(&self, kind: Kind) -> Option<i64> {
         match kind {
             Kind::Account => self.account,
             Kind::Host => self.host,
@@ -663,11 +663,15 @@ fn is_font(a: &crate::probe::media::Attachment) -> bool {
 }
 
 /// What the font key is taken over: every attached font's name (lower case) and size, sorted. None for fewer than
-/// `MIN_FONTS`, or when the file's header wasn't read to its end, soo the list may be cut short.
+/// `MIN_FONTS`, or without whole-header and complete attachment metadata proof:
+/// capped, truncated, unknown or ambiguous names never qualify.
 pub(crate) fn fonts_text(media: &crate::probe::media::MediaInfo) -> Option<String> {
-    if !media.header_complete {
+    if !media.header_complete || !media.attachments_complete {
         return None;
     }
+    // The existing textual key uses ':' and ',' separators. Such names are
+    // retained as facts but cannot enter this ambiguous key representation.
+    if media.attachments.iter().filter(|a|is_font(a)).any(|a|a.name.contains([':',','])) {return None;}
     let mut fonts: Vec<String> = media
         .attachments
         .iter()
@@ -686,6 +690,7 @@ const MIN_CHAPTERS: usize = 3;
 /// `MIN_CHAPTERS`, or when every gap between them is the same to the second: chapters made every few minutes by a
 /// tool, which every file of that length gets.
 pub(crate) fn chapters_text(media: &crate::probe::media::MediaInfo) -> Option<String> {
+    if !media.chapters_complete {return None;}
     let starts: Vec<i64> = media
         .chapters
         .iter()
@@ -1556,7 +1561,7 @@ mod tests {
     #[test]
     fn subtitle_font_and_chapter_keys_need_enough_to_tell_releases_apart() {
         use crate::probe::media::{Attachment, Chapter, MediaInfo, SubtitleTrack};
-        let mut m = MediaInfo { header_complete: true, ..Default::default() };
+        let mut m = MediaInfo { header_complete: true, attachments_complete:true, ..Default::default() };
         assert_eq!((subs_text(&m), fonts_text(&m), chapters_text(&m)), (None, None, None));
         m.subtitles = vec![
             SubtitleTrack { codec: "S_TEXT/UTF8".into(), ..Default::default() },
@@ -1573,6 +1578,7 @@ mod tests {
         m.header_complete = false;
         assert_eq!(fonts_text(&m), None, "a header cut short may list only some");
         let at = |secs: &[f64]| secs.iter().map(|s| Chapter { start_secs: *s, name: None }).collect::<Vec<_>>();
+        m.chapters_complete=true;
         m.chapters = at(&[0.0, 312.5]);
         assert_eq!(chapters_text(&m), None);
         m.chapters = at(&[0.0, 300.0, 600.0, 900.0, 1000.0]);
@@ -1582,6 +1588,15 @@ mod tests {
         assert_eq!(chapters_text(&MediaInfo { chapters: at(&[0.0, 0.0, 1301.1]), ..Default::default() }), None);
         m.chapters.push(Chapter { start_secs: f64::NAN, name: None });
         assert_eq!(chapters_text(&m), None, "a start not read leaves the list unknown");
+    }
+
+    #[test]
+    fn font_names_cannot_alias_key_field_or_inventory_boundaries() {
+        use crate::probe::media::{Attachment,MediaInfo};
+        let font=|name:&str,size|Attachment {name:name.into(),size,..Default::default()};
+        let a=MediaInfo {header_complete:true,attachments_complete:true,attachments:vec![font("a.ttf",10),font("b.ttf",20),font("c.ttf",30)],..Default::default()};
+        let b=MediaInfo {attachments:vec![font("a.ttf:10,b.ttf",20),font("c.ttf",30)],..a.clone()};
+        assert!(fonts_text(&a).is_some());assert!(fonts_text(&b).is_none(),"retained names cannot concatenate into another inventory's accepted key");
     }
 
     #[test]

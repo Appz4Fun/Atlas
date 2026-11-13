@@ -176,7 +176,7 @@ impl Step for OpenSubtitlesStep {
             return Ok(Outcome::default());
         }
         let reply = if let Some(cached) = crate::raw_store::get_opensubtitles(&hash)
-            .map_err(|_| StepError::Retry("OpenSubtitles cache read failed".into()))? {
+            .map_err(StepError::from_cache)? {
             cached
         } else {
             let Some((key, base, client)) = self.client() else { return Ok(Outcome::default()) };
@@ -185,18 +185,19 @@ impl Step for OpenSubtitlesStep {
                 Ok(Reply::Json(json)) => {
                     let matched = best_match(&json);
                     crate::raw_store::put_opensubtitles(&hash, matched.as_ref())
-                        .map_err(|_| StepError::Retry("OpenSubtitles cache write failed".into()))?;
+                        .map_err(StepError::from_cache)?;
                     matched
                 }
                 Ok(Reply::NotFound) => {
                     crate::raw_store::put_opensubtitles(&hash, None)
-                        .map_err(|_| StepError::Retry("OpenSubtitles cache write failed".into()))?;
+                        .map_err(StepError::from_cache)?;
                     None
                 }
                 Err(Trouble::Paused(until) | Trouble::BadKey(until)) => {
                     return Ok(Outcome { wait_until: Some(until), ..Outcome::default() });
                 }
                 Err(Trouble::Bad(why)) => return Err(StepError::Retry(why)),
+                Err(Trouble::Cache(error)) => return Err(StepError::from_cache(error.into_error())),
             }
         };
         let film_imdb = reply.as_ref().and_then(|feature| feature.imdb_id.filter(|_| feature.is_movie()));
@@ -317,7 +318,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_read_failure_keeps_the_actual_step_retryable_without_fetching() {
+    fn missing_native_owner_is_fatal_without_fetching_or_cache_fallback() {
         use std::net::TcpListener;
         use std::process::{Command, Stdio};
         use std::time::{Duration, Instant};
@@ -394,12 +395,72 @@ mod tests {
         };
         let step = OpenSubtitlesStep::default();
         assert!(step.client().is_none(), "provider must stay disabled");
-        let Err(StepError::Retry(message)) = step.run(&mut context) else {
-            panic!("cache failure did not produce a retryable actual Step outcome");
+        let Err(StepError::Native(error)) = step.run(&mut context) else {
+            panic!("missing native owner did not preserve the actual Step storage error");
         };
-        assert!(!message.contains("host="));
-        assert!(!message.contains("port="));
+        assert_eq!(crate::pg::outage::classify(&error),crate::pg::outage::Failure::Fatal,
+            "a missing owner scope is not a retryable PostgreSQL transport outage");
+        assert!(!error.to_string().contains("host="));
+        assert!(!error.to_string().contains("port="));
         assert_eq!(conn.query_row("select count(*) from release_opensubtitles", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
         assert!(context.crcs.is_empty());
     }
+
+    #[test]
+    #[ignore="requires explicit isolated PostgreSQL for genuine owned backend loss"]
+    fn owned_pg_loss_preserves_actual_step_unavailability_without_fetching() {
+        use std::{net::TcpListener,process::{Command,Stdio},time::{Duration,Instant}};
+        let schema=crate::pg::testing::Schema::new().expect("explicit isolated PostgreSQL required");
+        let home=tempfile::tempdir().unwrap();let http=TcpListener::bind("127.0.0.1:0").unwrap();http.set_nonblocking(true).unwrap();
+        let config=format!("[storage]\nbackend='postgres'\nurl={}\nschema={}\nmax_connections=1\n[media.opensubtitles]\napi_key=''\nbase_url='http://127.0.0.1:{}'\n",serde_json::to_string(&schema.url).unwrap(),serde_json::to_string(&schema.name).unwrap(),http.local_addr().unwrap().port());
+        std::fs::write(home.path().join("config.toml"),config).unwrap();let sentinel=b"native cache must not open this SQLite sentinel";
+        std::fs::write(home.path().join("atlas.raw.db"),sentinel).unwrap();
+        let mut child=Command::new(std::env::current_exe().unwrap()).args(["--ignored","--exact","probe::opensubtitles::tests::owned_cache_loss_child","--nocapture"])
+            .env("ATLAS_HOME",home.path()).env("ATLAS_NO_KEYRING","1").env("ATLAS_CACHE_OWNED_LOSS_CHILD","1").env_remove("ATLAS_PG_TEST_URL")
+            .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        let until=Instant::now()+Duration::from_secs(30);
+        loop {if child.try_wait().unwrap().is_some(){break;}if Instant::now()>=until{child.kill().unwrap();let _=child.wait();panic!("owned PostgreSQL loss child did not stop");}std::thread::sleep(Duration::from_millis(20));}
+        let output=child.wait_with_output().unwrap();
+        assert!(output.status.success(),"owned PostgreSQL loss child failed: {}\n{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+        assert_eq!(std::fs::read(home.path().join("atlas.raw.db")).unwrap(),sentinel);
+        assert!(matches!(http.accept(),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock));
+        let mut client=schema.pool.get().unwrap();
+        assert_eq!(client.query_one("select count(*) from release_opensubtitles",&[]).unwrap().get::<_,i64>(0),0);
+        assert_eq!(client.query_one("select count(*) from ext_opensubtitles",&[]).unwrap().get::<_,i64>(0),0);
+    }
+
+    #[test]
+    #[ignore="only the owned PostgreSQL parent may run this child"]
+    fn owned_cache_loss_child() {
+        use std::{sync::atomic::AtomicBool,time::{Duration,Instant}};
+        use crate::pg::outage::{Failure,AttemptOutcome,SessionUnavailable};
+        assert_eq!(std::env::var("ATLAS_CACHE_OWNED_LOSS_CHILD").unwrap(),"1");
+        let storage=crate::config::checked_storage_config().expect("owned child configuration");
+        let native=crate::raw_store::native_pg_opensubtitles_cache_tests::open_test_native_owner().expect("genuine canonical owner");
+        let _scope=native.db.bind_native_cache_scope().unwrap();
+        crate::raw_store::set_test_raw_path(Some(crate::paths::app_dir().join("atlas.raw.db")));
+        let (id,pid,started)=native.owner.with(|client| {
+            crate::pg::release_writer::save(client,&[crate::parser::Release {name:"Example.Release".into(),group:"example.group".into(),articles:vec![crate::parser::Article {filename:Some("video.mkv".into()),message_id:"owned-cache@example.invalid".into(),part:Some(1),total_parts:Some(1),bytes:17,..Default::default()}],..Default::default()}],1)?;
+            let id:i64=client.query_one("select id from releases",&[])?.try_get(0)?;
+            let row=client.query_one("select pid,backend_start::text from pg_stat_activity where pid=pg_backend_pid()",&[])?;
+            Ok((id,row.try_get::<_,i32>(0)?,row.try_get::<_,String>(1)?))
+        }).unwrap();
+        let reads=crate::pg::stage_reads::StepReads::for_owner(&native.owner).unwrap();
+        let runtime=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let bodies=crate::postprocess::bodies::BodyFetcher::new(Arc::new(crate::nntp::Pool::new(&[])),runtime.handle().clone(),Arc::new(AtomicBool::new(false)),crate::config::PostprocessConfig::default(),Arc::new(crate::postprocess::stats::Stats::default()));
+        let mut context=StepCtx {release:ReleaseInfo {id,name:"Example.Release".into(),group:"example.group".into(),..Default::default()},data:crate::postprocess::data::StepData::Native(&reads),facts:vec![(MOVIEHASH_FACT,"abcdef0123456789".into())],bodies:&bodies,used_bodies:0,deadline:Instant::now()+Duration::from_secs(5),lane_can_fetch:false,crcs:Vec::new(),pictures:false};
+        let mut observer=postgres::Client::connect(&storage.url,postgres::NoTls).unwrap();
+        let killed=observer.query("select pg_terminate_backend(pid) from pg_stat_activity where pid=$1 and backend_start=$2::text::timestamptz and usename=current_user and datname=current_database()",&[&pid,&started]).unwrap();
+        assert_eq!(killed.len(),1,"only the actual owned backend identity may be stopped");assert!(killed[0].get::<_,bool>(0));
+        let until=Instant::now()+Duration::from_secs(5);
+        while observer.query_one("select exists(select 1 from pg_stat_activity where pid=$1 and backend_start=$2::text::timestamptz)",&[&pid,&started]).unwrap().get::<_,bool>(0) {assert!(Instant::now()<until,"owned backend did not end");std::thread::sleep(Duration::from_millis(10));}
+        let step=OpenSubtitlesStep::default();assert!(step.client().is_none());
+        let Err(StepError::Native(error))=step.run(&mut context) else {panic!("real owned session loss must preserve the actual Step cause")};
+        assert!(error.chain().any(|cause|cause.is::<SessionUnavailable>()||cause.downcast_ref::<postgres::Error>().is_some()),"native error must retain real driver/session provenance");
+        assert_eq!(crate::pg::outage::classify(&error),Failure::Unavailable);
+        assert_eq!(native.owner.failure(),Some(Failure::Unavailable));
+        assert!(matches!(AttemptOutcome::from_exit(1,native.owner.failure()),AttemptOutcome::Unavailable),"the actual outer runner retries the failed attempt, never ACKs the release");
+        assert!(context.crcs.is_empty());assert_eq!(context.used_bodies,0);
+    }
+
 }

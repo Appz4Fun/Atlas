@@ -322,11 +322,22 @@ fn stale_saved(info: &str) -> bool {
     // and before `keyframe_key` was kept, the rows `DV_WITHOUT_KEYFRAME_KEY` picks: a null one was looked for
     let dv_before_keyframe_key =
         !p["media"]["video"][0]["dv_profile"].is_null() && p["media"]["video"][0].get("keyframe_key").is_none();
+    // These are missing producer fields, not a config-version guess. Only a
+    // currently visited target with this saved payload asks for missing facts;
+    // the preserved cache row is not deleted or relabelled as a genuine miss.
+    let media=&p["media"];
+    let matroska=media["container"].as_str().is_some_and(|c|matches!(c,"matroska"|"webm"));
+    let old_media_coverage=matroska && (
+        media.get("header_complete").is_none()
+        || (media["attachments"].as_array().is_some_and(|files|!files.is_empty()) && media.get("attachments_complete").is_none())
+        || media["subtitles"].as_array().is_some_and(|tracks|tracks.iter().any(|track|track.get("header_key").is_none()))
+        || (media["chapters"].as_array().is_some_and(|chapters|!chapters.is_empty()) && media.get("chapters_complete").is_none()));
     // and before `stream_key` was kept, the rows `DV_WITHOUT_AUDIO_KEY` picks
     let dv_before_audio_key = !p["media"]["video"][0]["dv_profile"].is_null()
         && p["media"]["audio"][0]["codec"].as_str().is_some_and(|c| KEYED_AUDIO.contains(&c))
         && p["media"]["audio"][0].get("stream_key").is_none();
-    mp4_without_tracks
+    old_media_coverage
+        || mp4_without_tracks
         || dvd_folder_as_vob
         || dv_before_audio_key
         || dv_before_from_rpu
@@ -335,6 +346,81 @@ fn stale_saved(info: &str) -> bool {
             && (newly_read(p["file"].as_str())
                 || newly_read(p["archive"]["name"].as_str())
                 || p["file"].as_str().is_some_and(later_volume))
+}
+
+/// A preserved row can exist without the fields needed by the current target.
+/// This state is deliberately distinct from a natural-cache miss or decode error.
+pub(crate) enum SavedCoverage {
+    Current(CheckedSavedProbe),
+    NeedsTargetRefresh,
+}
+
+/// Non-deserializable admission result, minted only by the real bounded decode.
+/// It binds the exact JSON bytes so an actor can recheck its PG association
+/// without allocating a second expanded ProbeInfo on the same worker frame.
+pub(crate) struct CheckedSavedProbe {probe:ProbeInfo,length:usize,digest:[u8;32]}
+impl CheckedSavedProbe {
+    pub(crate) fn matches(&self,json:&str)->bool {
+        use sha2::Digest;
+        self.length==json.len()&&self.digest==<[u8;32]>::from(sha2::Sha256::digest(json.as_bytes()))
+    }
+    fn into_probe(self)->ProbeInfo {self.probe}
+}
+impl std::ops::Deref for CheckedSavedProbe {type Target=ProbeInfo;fn deref(&self)->&ProbeInfo {&self.probe}}
+
+/// Bound expanded serde ownership before any of the legacy JSON predicates can
+/// allocate a Value tree. The shared admission reserves four struct widths and
+/// 64 bytes per decoded string byte, covering the temporary predicate tree while
+/// the typed probe remains live. No preserved bytes or stamps are rewritten.
+pub(crate) fn native_saved_probe(info: &str, remaining: &mut u64) -> anyhow::Result<SavedCoverage> {
+    let decoded = crate::pg::probe_decode::decode(info.as_bytes(), remaining)?;
+    use sha2::Digest;
+    Ok(if stale_saved(info) { SavedCoverage::NeedsTargetRefresh } else {
+        SavedCoverage::Current(CheckedSavedProbe {probe:decoded,length:info.len(),digest:sha2::Sha256::digest(info.as_bytes()).into()})
+    })
+}
+
+// The parser recognizes cover names independently of declared MIME. Its cover
+// bytes are serde(skip), so serialized media alone cannot prove asset absence.
+fn native_media_needs_asset(media: Option<&media::MediaInfo>) -> bool {
+    media.is_some_and(|media| media.cover.is_some() || media.attachments.iter().any(|a| {
+        media::cover_rank(&a.name).is_some()
+            || a.mime.as_deref().and_then(|mime| mime.get(..6)).is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/"))
+    }))
+}
+
+/// Metadata-only SameMux reuse. The caller must select and observe the candidate
+/// on its original owner's RR snapshot; the returned ID is not write authority.
+/// This never authorizes article-byte lending. Until retained image assets have
+/// a qualified worker grant, candidates with image attachments are ineligible.
+/// A missing/old semantic proof is a known ineligible candidate, whereas malformed
+/// or over-budget saved data is an error and must not trigger provider fallback.
+pub(crate) fn native_same_mux_candidate(
+    own: i64, candidate: i64, group: &str, info: &ProbeInfo, json: &str,
+    moviehash: Option<&str>, cover: Option<(&str, &str)>, stamp: u64, remaining: &mut u64,
+) -> anyhow::Result<Option<SameMux>> {
+    if own == candidate || crate::filters::group_blocked(group) { return Ok(None) }
+    let SavedCoverage::Current(other) = native_saved_probe(json, remaining)? else { return Ok(None) };
+    let other=other.into_probe();
+    if cover.is_some() || native_media_needs_asset(other.media.as_ref()) { return Ok(None) }
+    let Some(mine) = info.media.as_ref() else { return Ok(None) };
+    let Some(mux) = crate::keys::mux_text(mine) else { return Ok(None) };
+    // Packed probes do not currently bind the inner payload's whole checksum.
+    // Refuse their cross-release metadata reuse rather than compare outer CRCs.
+    if info.archive.is_some() || !info.layers.is_empty() || other.archive.is_some() || !other.layers.is_empty()
+        || info.file_crc32.zip(other.file_crc32).is_none_or(|(a,b)| a != b)
+        || content_size(info).is_none() || content_size(info) != content_size(&other)
+        || moviehash.filter(|h| !h.is_empty()).is_none_or(|h| info.moviehash.as_deref() != Some(h) || other.moviehash.as_deref() != Some(h))
+        || other.media_whole != Some(whole_mark(stamp))
+    { return Ok(None) }
+    let Some(media) = other.media else { return Ok(None) };
+    if !media.header_complete || !media.encoder_complete || !first_frame_read(&media)
+        || (!media.attachments.is_empty() && !media.attachments_complete)
+        || (!media.chapters.is_empty() && !media.chapters_complete)
+        || crate::keys::mux_text(&media).as_ref() != Some(&mux)
+        || media.video.is_empty() || !same_header(mine, &media)
+    { return Ok(None) }
+    Ok(Some(SameMux { release_id: candidate, media, cover: None }))
 }
 
 /// Asks for the probe again on releases whose probe read a later volume of a set and found no media, before
@@ -413,7 +499,6 @@ impl Step for ProbeStep {
         1 | 2 | 4 | 8 | 16 | 32 | 64
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
-        let retry = |e: rusqlite::Error| StepError::Retry(e.to_string());
         let release_id = ctx.release().id;
         let rel_name = ctx.release().name.clone();
         let rel_group = ctx.release().group.clone();
@@ -423,18 +508,43 @@ impl Step for ProbeStep {
         let content_id = ctx.data().release_content_id(release_id)?.unwrap_or_default();
         let existing_db_pw = ctx.data().nfo_password(release_id)?;
         let known_pw =
-            existing_db_pw.clone().or_else(|| crate::raw_store::get_nfo_password(&rel_name, &rel_group, &content_id));
-        if !ctx.data().explicit_rerun(release_id, PROBE_STEP)?
-            && let Some(saved) =
-                crate::raw_store::get_probe(&rel_name, &rel_group, &content_id, rel_parts, rel_complete, stamp).filter(
-                    |s| {
-                        let has_pw = s.nfo_password.is_some() || known_pw.is_some();
-                        s.cover.as_ref().is_none_or(|(_, sha)| super::cover_file(sha).is_some_and(|p| p.exists()))
-                            && !stale_saved(&s.info)
-                            && !(has_pw && encrypted_without_media(&s.info))
-                    },
-                )
-        {
+            match existing_db_pw.clone() {
+                Some(password) => Some(password),
+                None => crate::raw_store::get_nfo_password_checked(&rel_name, &rel_group, &content_id).map_err(StepError::from_cache)?,
+            };
+        let native = matches!(ctx.data(), crate::postprocess::data::StepData::Native(_));
+        let saved = if ctx.data().explicit_rerun(release_id, PROBE_STEP)? { None } else {
+            crate::raw_store::get_probe_checked(&rel_name, &rel_group, &content_id, rel_parts, rel_complete, stamp)
+                .map_err(StepError::from_cache)?
+        };
+        let mut asset_hold:Option<Box<dyn std::any::Any+Send>>=None;
+        let saved = match saved {
+            Some(saved) if native => match native_saved_probe(&saved.info, &mut (32 << 20)).map_err(StepError::from_cache)? {
+                SavedCoverage::NeedsTargetRefresh => None,
+                SavedCoverage::Current(decoded) => {
+                    if saved.cover.is_some() {
+                        let grant=crate::pg::worker_assets::current().map_err(StepError::from_cache)?
+                            .ok_or_else(||StepError::Transient("native cover namespace has not been selected".into()))?;
+                        match grant.verify_probe(release_id,crate::pg::natural_cache::Key {name:&rel_name,group:&rel_group,content_id:&content_id},rel_parts,rel_complete,stamp,&saved,&decoded).map_err(StepError::from_cache)? {
+                            crate::pg::worker_assets::CoverStatus::Verified(hold)=>asset_hold=Some(Box::new(hold)),
+                            crate::pg::worker_assets::CoverStatus::Changed=>return Err(StepError::Transient("saved probe association changed".into())),
+                            crate::pg::worker_assets::CoverStatus::Missing=>return Err(StepError::Transient("selected native cover bytes are unavailable".into())),
+                        }
+                    } else if native_media_needs_asset(decoded.media.as_ref()) {
+                        return Err(StepError::Transient("saved probe has no verified cover association".into()));
+                    }
+                    Some((saved, Some(decoded.into_probe())))
+                }
+            },
+            Some(saved) => Some((saved, None)),
+            None => None,
+        };
+        if let Some((saved, decoded)) = saved.filter(|(saved, decoded)| {
+            let has_pw = saved.nfo_password.is_some() || known_pw.is_some();
+            (asset_hold.is_some() || saved.cover.as_ref().is_none_or(|(_, sha)| super::cover_file(sha).is_some_and(|p| p.exists())))
+                && (decoded.is_some() || !stale_saved(&saved.info))
+                && !(has_pw && encrypted_without_media(&saved.info))
+        }) {
             // a video probed before the probe kept the server's body CRC gets it from one HEAD
             let backfill = super::body_crc::wants_backfill(&saved.info);
             let mut writes = Vec::new();
@@ -446,7 +556,7 @@ impl Step for ProbeStep {
                 None => StepWrite::for_mutation(release_id, StepMutation::ClearCover),
             });
             let hash = saved.moviehash.clone();
-            let decoded: Option<ProbeInfo> = serde_json::from_str(&saved.info).ok();
+            let decoded = decoded.or_else(|| serde_json::from_str::<ProbeInfo>(&saved.info).ok());
             writes.extend(title_writes(release_id, decoded.as_ref().and_then(|i| i.media.as_ref())));
             writes.push(StepWrite::for_mutation(release_id, StepMutation::KeepProbe {
                 crc32: saved.crc32,agent: saved.agent,json: saved.info,moviehash: hash.clone(),
@@ -456,9 +566,9 @@ impl Step for ProbeStep {
                 | if hash.is_some() { mask(super::opensubtitles::OPENSUBTITLES_STEP) } else { 0 }
                 | if backfill { mask(super::body_crc::BODY_CRC_STEP) } else { 0 };
             let facts = hash.map(|h| vec![(MOVIEHASH_FACT, h)]).unwrap_or_default();
-            return Ok(Outcome { matched: true, writes, facts, rerun, ..Outcome::default() });
+            return Ok(Outcome { matched: true, writes, facts, rerun, hold:asset_hold, ..Outcome::default() });
         }
-        let files = ctx.files().map_err(retry)?;
+        let files = ctx.files().map_err(StepError::from_inventory)?;
         let par2_names = ctx.data().par2_names(release_id, &files)?;
         let par2_all = ctx.data().par2_file_names(release_id)?;
         let mut check = ctx.data().local_password_check(release_id)?;
@@ -475,7 +585,7 @@ impl Step for ProbeStep {
             release_info::find_verified_password(texts, &[], check.as_ref())
         });
         if let Some(ref pw) = found_nfo_password {
-            crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, pw);
+            crate::raw_store::put_nfo_password_checked(&rel_name, &rel_group, &content_id, pw).map_err(StepError::from_cache)?;
             writes.push(StepWrite::for_mutation(release_id, StepMutation::SetNfoPassword { password: pw.clone() }));
         }
 
@@ -499,7 +609,7 @@ impl Step for ProbeStep {
             let (text, from_start) = match reused {
                 Some(k) => (k.text, true),
                 None => {
-                    let Some(seg) = ctx.segments(file.id, &SegmentPick::First(1)).map_err(retry)?.into_iter().next()
+                    let Some(seg) = ctx.segments(file.id, &SegmentPick::First(1)).map_err(StepError::from_inventory)?.into_iter().next()
                     else {
                         continue;
                     };
@@ -515,7 +625,7 @@ impl Step for ProbeStep {
                 if found_nfo_password.is_none()
                     && let Some(password) = release_info::find_verified_password([text.as_str()], &[], check.as_ref())
                 {
-                    crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, &password);
+                    crate::raw_store::put_nfo_password_checked(&rel_name, &rel_group, &content_id, &password).map_err(StepError::from_cache)?;
                     found_nfo_password = Some(password.clone());
                     writes.push(StepWrite::for_mutation(release_id, StepMutation::SetNfoPassword { password }));
                 }
@@ -534,7 +644,7 @@ impl Step for ProbeStep {
         }
         if found_nfo_password.is_none() {
             for nzb_file in archive::select::nzb_sources_with_par2(&files, &par2_names) {
-                let Some(seg) = ctx.segments(nzb_file.id, &SegmentPick::First(1)).map_err(retry)?.into_iter().next()
+                let Some(seg) = ctx.segments(nzb_file.id, &SegmentPick::First(1)).map_err(StepError::from_inventory)?.into_iter().next()
                 else {
                     continue;
                 };
@@ -546,7 +656,7 @@ impl Step for ProbeStep {
                     && let Some(password) =
                         release_info::find_verified_password(std::iter::empty(), &[meta_pw], check.as_ref())
                 {
-                    crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, &password);
+                    crate::raw_store::put_nfo_password_checked(&rel_name, &rel_group, &content_id, &password).map_err(StepError::from_cache)?;
                     found_nfo_password = Some(password.clone());
                     writes.push(StepWrite::for_mutation(release_id, StepMutation::SetNfoPassword { password }));
                     break;
@@ -598,7 +708,7 @@ impl Step for ProbeStep {
                             && let Some(password) =
                                 release_info::find_verified_password([nfo_s.as_str()], &[], check.as_ref())
                         {
-                            crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, &password);
+                            crate::raw_store::put_nfo_password_checked(&rel_name, &rel_group, &content_id, &password).map_err(StepError::from_cache)?;
                             found_nfo_password = Some(password.clone());
                             writes.push(StepWrite::for_mutation(release_id, StepMutation::SetNfoPassword { password }));
                         }
@@ -608,7 +718,7 @@ impl Step for ProbeStep {
             }
             let total = file.expected.unwrap_or(file.parts_seen);
             if total > 2 {
-                let middle = ctx.segments(file.id, &SegmentPick::Parts(vec![(total + 1) / 2])).map_err(retry)?;
+                let middle = ctx.segments(file.id, &SegmentPick::Parts(vec![(total + 1) / 2])).map_err(StepError::from_inventory)?;
                 if let Some(middle) = middle.into_iter().next()
                     && let Some(there) = ctx.article_exists(&middle.message_id, &file.filename)?
                 {
@@ -673,8 +783,12 @@ impl Step for ProbeStep {
         }
         // a look that finds no cover drops one an earlier look kept
         let cover = info.media.as_mut().and_then(|m| m.cover.take());
-        let saved_cover =
-            cover.and_then(|c| super::keep_cover(&c.bytes).map(|sha256| (c.mime.to_string(), sha256))).or(twin_cover);
+        let saved_cover = if native && cover.is_some() {
+            let grant=crate::pg::worker_assets::current().map_err(StepError::from_cache)?
+                .ok_or_else(||StepError::Transient("native cover namespace has not been selected".into()))?;
+            let hold=grant.produce_cover(release_id,cover.as_ref().expect("present native cover")).map_err(StepError::from_cache)?;
+            let descriptor=hold.descriptor();asset_hold=Some(Box::new(hold));Some(descriptor)
+        } else {cover.and_then(|c| super::keep_cover(&c.bytes).map(|sha256| (c.mime.to_string(), sha256))).or(twin_cover)};
         writes.push(match &saved_cover {
             Some((mime, sha256)) => {
                 StepWrite::for_mutation(release_id, StepMutation::KeepCover { mime: mime.clone(),sha256: sha256.clone() })
@@ -685,7 +799,7 @@ impl Step for ProbeStep {
         let agent = agent_of(&info.headers).map(str::to_string);
         let hash = info.moviehash.clone();
         let json = serde_json::to_string(&info).map_err(|e| StepError::Permanent(e.to_string()))?;
-        crate::raw_store::put_probe(&crate::raw_store::ProbeRecord {
+        crate::raw_store::put_probe_checked(&crate::raw_store::ProbeRecord {
             name: &rel_name,
             group_name: &rel_group,
             content_id: &content_id,
@@ -698,7 +812,7 @@ impl Step for ProbeStep {
             config_stamp: stamp,
             nfo_password: found_nfo_password.as_deref(),
             cover: saved_cover.as_ref().map(|(m, s)| (m.as_str(), s.as_str())),
-        });
+        }).map_err(StepError::from_cache)?;
         writes.extend(title_writes(release_id, info.media.as_ref()));
         writes.push(StepWrite::for_mutation(release_id, StepMutation::KeepProbe { crc32: crc,agent,json,moviehash: hash.clone() }));
         // a hash found on a later look is asked about then too
@@ -710,7 +824,7 @@ impl Step for ProbeStep {
             | if hash.is_some() { mask(super::opensubtitles::OPENSUBTITLES_STEP) } else { 0 }
             | if needs_list_decrypt { mask(archive::steps::LIST_STEP) } else { 0 };
         let facts = hash.map(|h| vec![(MOVIEHASH_FACT, h)]).unwrap_or_default();
-        Ok(Outcome { matched: true, writes, facts, rerun, ..Outcome::default() })
+        Ok(Outcome { matched: true, writes, facts, rerun, hold:asset_hold, ..Outcome::default() })
     }
 }
 
@@ -1087,7 +1201,7 @@ pub(super) fn read_part(
     part: i64,
     offset: u64,
 ) -> Result<Option<Vec<u8>>, StepError> {
-    let segs = ctx.segments(file.id, &SegmentPick::Parts(vec![part])).map_err(|e| StepError::Retry(e.to_string()))?;
+    let segs = ctx.segments(file.id, &SegmentPick::Parts(vec![part])).map_err(StepError::from_inventory)?;
     let Some(seg) = segs.into_iter().next().filter(|s| s.part.is_none_or(|p| p == part)) else { return Ok(None) };
     let Got::Body(raw) = fetch_raw(ctx, &seg.message_id, &file.filename)? else { return Ok(None) };
     let article = yenc::split_article(&raw);
@@ -1822,6 +1936,26 @@ mod tests {
     }
 
     #[test]
+    fn old_missing_probe_coverage_is_not_current_known_absence_or_a_partial_current_read() {
+        let old=r#"{"media":{"container":"matroska","subtitles":[{"codec":"S_TEXT/ASS"}]}}"#;
+        assert!(stale_saved(old),"the current target needs missing producer facts, not a global stamp sweep");
+        let mut current=media::MediaInfo {container:"matroska".into(),..Default::default()};
+        current.subtitles.push(media::SubtitleTrack {codec:"S_TEXT/ASS".into(),..Default::default()});
+        let partial=serde_json::to_string(&ProbeInfo {media:Some(current.clone()),..Default::default()}).unwrap();
+        assert!(!stale_saved(&partial),"explicit partial read retains known facts without inventing whole-header proof");
+        current.header_complete=true;
+        let negative=serde_json::to_string(&ProbeInfo {media:Some(current),..Default::default()}).unwrap();
+        assert!(!stale_saved(&negative),"a completed header with no supported subtitle key is a genuine known absence");
+        let mut old:serde_json::Value=serde_json::from_str(&negative).unwrap();
+        old["media"]["subtitles"][0].as_object_mut().unwrap().remove("header_key");
+        assert!(stale_saved(&old.to_string()));
+        let mut old:serde_json::Value=serde_json::from_str(&negative).unwrap();
+        old["media"]["chapters"]=serde_json::json!([{"start_secs":0},{"start_secs":92},{"start_secs":1301}]);
+        old["media"].as_object_mut().unwrap().remove("chapters_complete");
+        assert!(stale_saved(&old.to_string()),"old chapter list is not complete-element evidence");
+    }
+
+    #[test]
     fn a_saved_avi_probe_with_no_tracks_isnt_reused() {
         assert!(stale_saved(r#"{"file":"Show.S01E01.XviD.avi","media":null}"#));
         assert!(stale_saved(r#"{"file":"a.part01.rar","archive":{"name":"Movie.CD1.AVI"},"media":null}"#));
@@ -1862,7 +1996,9 @@ mod tests {
             assert!(!later_volume(first), "{first}");
         }
         assert!(stale_saved(r#"{"file":"x.7z.002","media":null}"#), "a later volume with no media");
-        assert!(!stale_saved(r#"{"file":"x.7z.002","media":{"container":"matroska"}}"#));
+        let current=ProbeInfo {file:Some("x.7z.002".into()),media:Some(media::MediaInfo {container:"matroska".into(),..Default::default()}),..Default::default()};
+        assert!(!stale_saved(&serde_json::to_string(&current).unwrap()),"already read current media is not stale merely because it is a later volume");
+        assert!(stale_saved(r#"{"file":"x.7z.002","media":{"container":"matroska"}}"#),"older missing coverage is a separate reason to refresh this target");
     }
 
     #[test]
@@ -1953,3 +2089,7 @@ mod tests {
         assert!(main_file(&[file("a.nfo", 1)]).is_none());
     }
 }
+
+#[cfg(test)]
+#[path = "native_reuse_tests.rs"]
+mod native_reuse_tests;

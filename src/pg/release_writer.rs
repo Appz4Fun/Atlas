@@ -29,6 +29,9 @@ pub struct SaveStats {
 struct Incoming<'a> {
     release: &'a Release,
     release_key: [u8; 32],
+    original_name_key: [u8; 32],
+    posted_at: i64,
+    posted_clock: Option<i64>,
     article: Option<&'a Article>,
 }
 
@@ -45,7 +48,8 @@ impl Incoming<'_> {
             .map_or(0, |a| a.filename.as_deref().map_or(0, str::len) + a.subject.len() + a.message_id.len());
         let rare = self.article.filter(|a| a.filename.is_none())
             .map_or(0, |a| a.subject.len() + r.poster.len() + r.date.len() + 32);
-        256 + r.name.len() + r.poster.len() + r.date.len() + r.display_name.as_deref().map_or(0, str::len) + article + rare
+        304 + 2*r.name.len() + r.poster.len() + r.date.len() + r.display_name.as_deref().map_or(0, str::len) + article + rare
+            + self.article.and_then(|a|a.filename.as_deref()).map_or(0,str::len)
     }
 }
 
@@ -95,11 +99,14 @@ pub fn save(client: &mut Client, releases: &[Release], now: i64) -> Result<SaveS
             };
             // A single marker retracts a release with a program. Other
             // releases stage only articles with IDs, as the shard writer does.
+            let original_name_key: [u8;32] = Sha256::digest(release.name.as_bytes()).into();
+            let posted_at = crate::dates::article_timestamp(&release.date);
+            let posted_clock = crate::dates::naive_timestamp(&release.date);
             let rows = std::iter::once(None)
                 .filter(|_| marker)
                 .chain(release.articles.iter().filter(|article| !marker && !article.message_id.is_empty()).map(Some));
             for article in rows {
-                let row = Incoming { release, release_key: key.1, article };
+                let row = Incoming { release, release_key: key.1, original_name_key, posted_at, posted_clock, article };
                 let size = row.approx_bytes();
                 if batch.len() == MAX_BATCH_ROWS || (!batch.is_empty() && bytes + size > MAX_BATCH_BYTES) {
                     flush(&mut tx, group, &batch, now, &mut stats)?;
@@ -145,7 +152,8 @@ fn copy_input(tx: &mut Transaction<'_>, batch: &[Incoming<'_>]) -> Result<()> {
         "copy pg_temp.atlas_release_input (
             ordinal, identity_key, is_collection, name, poster, posted_date, display_name, is_obfuscated,
             junk, filename_key, filename, message_key, message_id, subject, part, expected, file_total,
-            zero_file_index, bytes, nzb_subject, nzb_poster, nzb_posted_date, nzb_timestamp, nzb_file_index
+            zero_file_index, bytes, original_name, original_filename, file_index, original_name_key, posted_at, posted_clock,
+            nzb_subject, nzb_poster, nzb_posted_date, nzb_timestamp, nzb_file_index
          ) from stdin binary",
     )?;
     use Type as T;
@@ -173,6 +181,12 @@ fn copy_input(tx: &mut Transaction<'_>, batch: &[Incoming<'_>]) -> Result<()> {
             T::INT8,
             T::BYTEA,
             T::BYTEA,
+            T::INT8,
+            T::BYTEA,
+            T::INT8,
+            T::INT8,
+            T::BYTEA,
+            T::BYTEA,
             T::BYTEA,
             T::INT8,
             T::INT8,
@@ -182,6 +196,7 @@ fn copy_input(tx: &mut Transaction<'_>, batch: &[Incoming<'_>]) -> Result<()> {
         let r = row.release;
         let a = row.article;
         let filename = a.map(|article| article.filename.as_deref().unwrap_or(""));
+        let original_filename=filename.map(str::as_bytes);
         let filename_key: Option<[u8; 32]> = filename.map(|name| Sha256::digest(name).into());
         let message_id = a.map(|article| article.message_id.as_bytes());
         let message_key: Option<[u8; 32]> = message_id.map(|id| Sha256::digest(id).into());
@@ -213,6 +228,12 @@ fn copy_input(tx: &mut Transaction<'_>, batch: &[Incoming<'_>]) -> Result<()> {
                 article.subject.contains('[') && crate::parser::has_zero_file_index(&article.subject)
             }),
             &a.map_or(0, |article| article.bytes),
+            &r.name.as_bytes(),
+            &original_filename,
+            &a.and_then(|article|article.file_index),
+            &&row.original_name_key[..],
+            &row.posted_at,
+            &row.posted_clock,
             &nameless.map(|article|article.subject.as_bytes()),
             &nameless.map(|_|r.poster.as_bytes()),
             &nameless.map(|_|r.date.as_bytes()),
@@ -248,6 +269,12 @@ const CREATE_STAGE: &str = "
         file_total bigint,
         zero_file_index boolean not null,
         bytes bigint not null,
+        original_name bytea not null,
+        original_filename bytea,
+        file_index bigint,
+        original_name_key bytea not null,
+        posted_at bigint not null,
+        posted_clock bigint,
         nzb_subject bytea,
         nzb_poster bytea,
         nzb_posted_date bytea,
@@ -268,9 +295,9 @@ const WRITE_RELEASES: &str = "
         delete from releases r using marked j
         where r.group_name = $1 and (r.is_collection, r.identity_key) = (j.is_collection, j.identity_key)
     ), added as (
-        insert into releases (group_name, is_collection, identity_key, name, poster, posted_date, display_name, is_obfuscated)
+        insert into releases (group_name, is_collection, identity_key, name, poster, posted_date, display_name, is_obfuscated, original_name, original_name_key, posted_at, posted_clock)
         select distinct on (s.is_collection, s.identity_key)
-            $1, s.is_collection, s.identity_key, s.name, s.poster, s.posted_date, s.display_name, s.is_obfuscated
+            $1, s.is_collection, s.identity_key, s.name, s.poster, s.posted_date, s.display_name, s.is_obfuscated, s.original_name, s.original_name_key, s.posted_at, s.posted_clock
         from pg_temp.atlas_release_input s
         where not exists (
             select 1 from marked j where (j.is_collection, j.identity_key) = (s.is_collection, s.identity_key)
@@ -287,7 +314,7 @@ const WRITE_RELEASES: &str = "
 const WRITE_ARTICLES: &str = "
     with candidates as materialized (
         select distinct on (r.id, s.message_key)
-            r.id as release_id, s.ordinal, s.filename_key, s.filename, s.message_key, s.message_id, s.part, s.bytes,
+            r.id as release_id, s.ordinal, s.filename_key, s.filename, s.original_filename, s.message_key, s.message_id, s.part, s.bytes,
             s.nzb_subject,s.nzb_poster,s.nzb_posted_date,s.nzb_timestamp,s.expected,s.nzb_file_index,s.file_total
         from pg_temp.atlas_release_input s
         join releases r on r.group_name = $1 and (r.is_collection, r.identity_key) = (s.is_collection, s.identity_key)
@@ -296,10 +323,10 @@ const WRITE_ARTICLES: &str = "
         )
         order by r.id, s.message_key, s.ordinal
     ), file_keys as (
-        select distinct release_id, filename_key, filename from candidates
+        select distinct release_id, filename_key, filename, original_filename from candidates
     ), added_files as (
-        insert into files (release_id, filename_key, filename)
-        select release_id, filename_key, filename from file_keys
+        insert into files (release_id, filename_key, filename, original_filename)
+        select release_id, filename_key, filename, original_filename from file_keys
         on conflict (release_id, filename_key) do nothing
         returning id, release_id, filename_key
     ), file_map as (
@@ -338,7 +365,7 @@ const UPDATE_FILES: &str = "
         select file_id, max(expected) as expected, max(file_total) as file_total
         from pg_temp.atlas_release_input where file_id is not null group by file_id
     ), subjects as (
-        select distinct on (file_id) file_id, subject, part, message_id, zero_file_index
+        select distinct on (file_id) file_id, subject, part, message_id, zero_file_index, file_index, file_total, expected
         from pg_temp.atlas_release_input where file_id is not null
         order by file_id, part nulls first, message_id
     ), combined as (
@@ -348,6 +375,7 @@ const UPDATE_FILES: &str = "
             least(f.first_part, p.first) as first_part,
             greatest(f.last_part, p.last) as last_part,
             s.subject, s.part, s.message_id, s.zero_file_index,
+            s.file_index as subject_file_index,s.file_total as subject_file_total,s.expected as subject_total_parts,
             f.subject_mid is null or
             (s.part is not null, coalesce(s.part, 0), s.message_id) <
             (f.subject_part is not null, coalesce(f.subject_part, 0), f.subject_mid) as better_subject
@@ -362,6 +390,9 @@ const UPDATE_FILES: &str = "
         subject = case when c.better_subject then c.subject else f.subject end,
         subject_part = case when c.better_subject then c.part else f.subject_part end,
         subject_mid = case when c.better_subject then c.message_id else f.subject_mid end,
+        subject_file_index = case when c.better_subject then c.subject_file_index else f.subject_file_index end,
+        subject_file_total = case when c.better_subject then c.subject_file_total else f.subject_file_total end,
+        subject_total_parts = case when c.better_subject then c.subject_total_parts else f.subject_total_parts end,
         zero_file_index = case when c.better_subject then c.zero_file_index else f.zero_file_index end
     from combined c where c.id = f.id";
 
@@ -370,7 +401,7 @@ const UPDATE_RELEASES_AND_QUEUE: &str = "
         select release_id, count(*) as parts, sum(bytes)::bigint as bytes, max(file_total) as file_total
         from pg_temp.atlas_release_input where release_id is not null group by release_id
     ), metadata as (
-        select distinct on (release_id) release_id, poster, posted_date, is_obfuscated
+        select distinct on (release_id) release_id, poster, posted_date, posted_at, posted_clock, is_obfuscated
         from pg_temp.atlas_release_input where release_id is not null order by release_id, ordinal desc
     ), display_names as (
         select distinct on (release_id) release_id, display_name from pg_temp.atlas_release_input
@@ -384,7 +415,7 @@ const UPDATE_RELEASES_AND_QUEUE: &str = "
             file_total = greatest(r.file_total, c.file_total),
             complete = f.all_whole and (greatest(r.file_total, c.file_total) is null or
                 f.files = greatest(r.file_total, c.file_total) + case when f.zero_indexed then 1 else 0 end),
-            poster = m.poster, posted_date = m.posted_date,
+            poster = m.poster, posted_date = m.posted_date, posted_at = m.posted_at, posted_clock = m.posted_clock,
             display_name = case when r.name_source is null then coalesce(d.display_name, r.display_name) else r.display_name end,
             is_obfuscated = case when r.name_source is null and not r.is_collection then m.is_obfuscated else r.is_obfuscated end
         from changes c join metadata m using (release_id) join completion f using (release_id)
@@ -563,5 +594,75 @@ mod sparse_nzb_metadata_tests {
         client.execute("delete from releases where name='Rare.Meta.Example'",&[]).unwrap();
         assert_eq!(client.query_one("select count(*) from segment_nzb_metadata",&[]).unwrap().get::<_,i64>(0),0);
         assert_eq!(client.query_one("select count(*) from segments",&[]).unwrap().get::<_,i64>(0),2);
+    }
+}
+
+#[cfg(test)]
+mod native_subject_counter_tests {
+    use super::*;
+    #[test]
+    #[ignore="requires explicit fresh schema9 representative-column admission"]
+    fn representative_counters_follow_subject_winner_not_aggregate_maxima_or_replay() {
+        let schema=crate::pg::testing::Schema::new().expect("explicit fresh PostgreSQL schema9");let mut client=schema.pool.get().unwrap();
+        let release=|mid:&str,part:Option<i64>,index:Option<i64>,files:Option<i64>,parts:Option<i64>|Release {
+            name:"Counters.Example.Release".into(),group:"alt.binaries.test".into(),poster:"poster".into(),date:"2020-01-01".into(),
+            articles:vec![Article {filename:Some("sample.bin".into()),subject:format!("subject of {mid}"),message_id:mid.into(),part,file_index:index,file_total:files,total_parts:parts,bytes:17,..Default::default()}],..Default::default()
+        };
+        save(&mut client,&[release("<one@example.test>",Some(1),Some(2),Some(4),Some(2))],1).unwrap();
+        save(&mut client,&[release("<zero@example.test>",Some(0),Some(1),Some(7),Some(3))],2).unwrap();
+        save(&mut client,&[release("<two@example.test>",Some(2),Some(6),Some(99),Some(9))],3).unwrap();
+        let read=|client:&mut Client|{
+            let row=client.query_one("select subject,subject_mid,subject_file_index,subject_file_total,subject_total_parts,expected,file_total,original_filename from files",&[]).unwrap();
+            (row.get::<_,Option<String>>(0),row.get::<_,Option<Vec<u8>>>(1),row.get::<_,Option<i64>>(2),row.get::<_,Option<i64>>(3),row.get::<_,Option<i64>>(4),row.get::<_,Option<i64>>(5),row.get::<_,Option<i64>>(6),row.get::<_,Option<Vec<u8>>>(7))
+        };
+        let expected=(Some("subject of <zero@example.test>".into()),Some(b"<zero@example.test>".to_vec()),Some(1),Some(7),Some(3),Some(9),Some(99),Some(b"sample.bin".to_vec()));
+        assert_eq!(read(&mut client),expected);
+        let replay=save(&mut client,&[release("<zero@example.test>",Some(0),Some(111),Some(222),Some(250000))],4).unwrap();
+        assert_eq!(replay.parts,0);assert_eq!(read(&mut client),expected);
+        save(&mut client,&[release("<unknown@example.test>",None,None,None,None)],5).unwrap();
+        let row=client.query_one("select subject_file_index,subject_file_total,subject_total_parts,original_filename from files",&[]).unwrap();
+        assert_eq!(row.get::<_,Option<i64>>(0),None);assert_eq!(row.get::<_,Option<i64>>(1),None);assert_eq!(row.get::<_,Option<i64>>(2),None);
+        assert_eq!(row.get::<_,Option<Vec<u8>>>(3),Some(b"sample.bin".to_vec()));
+    }
+}
+
+#[cfg(test)]
+mod original_name_key_tests {
+    use super::*;
+    #[test]
+    #[ignore="requires isolated fresh PostgreSQL with the owner-approved original_name_key schema"]
+    fn original_name_key_hashes_accepted_raw_name_and_keeps_first_collection_identity() {
+        let schema=crate::pg::testing::Schema::new().expect("explicit isolated PostgreSQL schema");let mut client=schema.pool.get().unwrap();
+        let mut release=Release {name:"Original\0.Movie".into(),collection:Some("Shared.Collection".into()),group:"alt.binaries.test".into(),poster:"poster".into(),
+            date:"Wed, 01 Jan 2020 00:00:00 +0000".into(),articles:vec![Article {filename:Some("video.mkv".into()),subject:"video.mkv yEnc (1/2)".into(),
+                message_id:"name-key-first@example.invalid".into(),part:Some(1),total_parts:Some(2),bytes:13,..Default::default()}],..Default::default()};
+        assert_eq!(save(&mut client,&[release.clone()],1).unwrap(),SaveStats {releases:1,files:1,parts:1});
+        let first=client.query_one("select id,encode(original_name_key,'hex'),original_name_key<>identity_key from releases",&[]).unwrap();
+        let id:i64=first.get(0);assert_eq!(first.get::<_,String>(1),"c5629d0e0516eaa3e9fba6a784b13d73ca8c08d0355e1856a3feb15ab46b6ac5");assert!(first.get::<_,bool>(2));
+        release.name="Different\0.Title".into();release.articles[0].message_id="name-key-second@example.invalid".into();release.articles[0].part=Some(2);
+        assert_eq!(save(&mut client,&[release],2).unwrap(),SaveStats {releases:0,files:0,parts:1});
+        let kept=client.query_one("select id,encode(original_name_key,'hex') from releases",&[]).unwrap();
+        assert_eq!(kept.get::<_,i64>(0),id);assert_eq!(kept.get::<_,String>(1),"c5629d0e0516eaa3e9fba6a784b13d73ca8c08d0355e1856a3feb15ab46b6ac5");
+    }
+}
+
+#[cfg(test)]
+mod posted_at_tests {
+    use super::*;
+    #[test]
+    #[ignore="requires isolated fresh PostgreSQL with the owner-approved posted_at schema"]
+    fn parsed_posted_time_follows_the_same_accepted_envelope_and_ignores_replay() {
+        let schema=crate::pg::testing::Schema::new().expect("explicit isolated PostgreSQL schema");let mut client=schema.pool.get().unwrap();
+        let mut first=Release {name:"Envelope.Date.Release".into(),group:"alt.binaries.test".into(),poster:"first".into(),date:"Wed, 01 Jan 2020 00:00:00 +0000".into(),
+            articles:vec![Article {filename:Some("video.mkv".into()),subject:"video.mkv yEnc (1/3)".into(),message_id:"date-first@example.invalid".into(),part:Some(1),total_parts:Some(3),bytes:13,..Default::default()}],..Default::default()};
+        let mut second=first.clone();second.poster="second".into();second.date="Thu, 02 Jan 2020 00:00:00 +0000".into();second.articles[0].message_id="date-second@example.invalid".into();second.articles[0].part=Some(2);second.articles[0].subject="video.mkv yEnc (2/3)".into();
+        assert_eq!(save(&mut client,&[first.clone(),second.clone()],1).unwrap(),SaveStats {releases:1,files:1,parts:2});
+        let read=|client:&mut Client|{let row=client.query_one("select poster,posted_date,posted_at from releases where name='Envelope.Date.Release'",&[]).unwrap();(row.get::<_,String>(0),row.get::<_,String>(1),row.get::<_,i64>(2))};
+        assert_eq!(read(&mut client),("second".into(),"Thu, 02 Jan 2020 00:00:00 +0000".into(),1577923200));
+        second.date="Fri, 03 Jan 2020 00:00:00 +0000".into();assert_eq!(save(&mut client,&[second],2).unwrap().parts,0);
+        assert_eq!(read(&mut client),("second".into(),"Thu, 02 Jan 2020 00:00:00 +0000".into(),1577923200));
+        first.poster="third".into();first.date="Fri, 03 Jan 2020 00:00:00 +0000".into();first.articles[0].message_id="date-third@example.invalid".into();first.articles[0].part=Some(3);first.articles[0].subject="video.mkv yEnc (3/3)".into();
+        assert_eq!(save(&mut client,&[first],3).unwrap().parts,1);
+        assert_eq!(read(&mut client),("third".into(),"Fri, 03 Jan 2020 00:00:00 +0000".into(),1578009600));
     }
 }

@@ -9,6 +9,7 @@ pub mod bodies;
 pub mod data;
 pub(crate) mod engine;
 pub(crate) mod mutation;
+pub(crate) mod native;
 pub mod purge;
 pub mod reprocess;
 pub mod rules;

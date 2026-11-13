@@ -319,7 +319,7 @@ impl Step for SidecarStep {
         Reruns { on_rename: false, on_growth: true }
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
-        let files = ctx.files().map_err(|e| StepError::Retry(e.to_string()))?;
+        let files = ctx.files().map_err(StepError::from_inventory)?;
         let r = ctx.release().clone();
         if !is_sidecar(&files, r.file_total, r.size) {
             return Ok(Outcome::default());
@@ -377,7 +377,7 @@ impl Step for SidecarImageStep {
         Reruns { on_rename: false, on_growth: true }
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
-        let files = ctx.files().map_err(|e| StepError::Retry(e.to_string()))?;
+        let files = ctx.files().map_err(StepError::from_inventory)?;
         let r = ctx.release().clone();
         if !is_sidecar(&files, r.file_total, r.size) || !files.iter().all(|f| is_sidecar_image(&f.filename)) {
             return Ok(Outcome::default());

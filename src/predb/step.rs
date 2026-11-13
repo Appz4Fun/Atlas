@@ -174,9 +174,8 @@ impl Step for PredbMatch {
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let retry = |e: rusqlite::Error| StepError::Retry(e.to_string());
         let id = ctx.release().id;
-        let files = ctx.files().map_err(retry)?;
+        let files = ctx.files().map_err(StepError::from_inventory)?;
         let inner = ctx.data().archive_inner_files(id)?;
-        let path = ctx.data().predb_catalog_path()?;
 
         let r = ctx.release();
         let evidence = Evidence {
@@ -186,19 +185,31 @@ impl Step for PredbMatch {
             files: files.iter().map(|f| f.filename.as_str()).collect(),
             inner: inner.iter().map(|f| f.name.as_str()).collect(),
         };
-        // before reading titles: a title landing after this waits for this run's keys
-        let (hold, found) = with_reader(&path, |c| {
-            let top: i64 = c.query_row("select coalesce(max(id), 0) from titles", [], |r| r.get(0))?;
-            let hold = record_read(&path, top);
-            Ok((hold, find(c, &evidence)?))
-        })
-        .map_err(retry)?;
+        let (hold, found, revision): (Option<Box<dyn std::any::Any + Send>>, _, _) = match ctx.data() {
+            crate::postprocess::data::StepData::Native(_) => {
+                match ctx.data().predb_find(&evidence)? {
+                    crate::pg::predb_cache::LookupStatus::Pending => return Err(StepError::Transient("PreDB matcher index is rebuilding".into())),
+                    crate::pg::predb_cache::LookupStatus::Ready(lookup) => (None, lookup.found, Some(lookup.revision)),
+                }
+            }
+            _ => {
+                let path = ctx.data().predb_catalog_path()?;
+                // A late title waits until this legacy run's inner keys commit.
+                let (hold, found) = with_reader(&path, |c| {
+                    let top: i64 = c.query_row("select coalesce(max(id), 0) from titles", [], |r| r.get(0))?;
+                    let hold = record_read(&path, top);
+                    Ok((hold, find(c, &evidence)?))
+                }).map_err(retry)?;
+                (Some(Box::new(hold)), found, None)
+            }
+        };
+        let guard = || revision.map(|revision| StepWrite::for_mutation(id, StepMutation::PredbRead { revision }));
 
         let hit = found.filter(|m| !renames_pack_to_episode(current_name(r), &m.title.title));
         let lookup = if hit.is_some() { "matched" } else { "no_match" };
         crate::metrics::names::PREDB_LOOKUPS.inc(&[("result", lookup)], 1);
         let Some(m) = hit else {
-            let mut writes = Vec::new();
+            let mut writes: Vec<_> = guard().into_iter().collect();
             if !inner.is_empty() {
                 writes.push(StepWrite::for_mutation(id, StepMutation::ClearPredbInnerKeys));
                 let paths = inner.iter().map(|f| (f.name.as_str(), f.size.unwrap_or(1).max(1) as u64));
@@ -206,7 +217,7 @@ impl Step for PredbMatch {
                     writes.push(StepWrite::for_mutation(id, StepMutation::AddPredbInnerKey { key: name_key(&name) }));
                 }
             }
-            return Ok(Outcome { writes, hold: Some(Box::new(hold)), ..Outcome::default() });
+            return Ok(Outcome { writes, hold, ..Outcome::default() });
         };
 
         let t = m.title;
@@ -224,12 +235,13 @@ impl Step for PredbMatch {
         if let Some(category) = &t.category {
             facts.push(("predb.category", category.clone()));
         }
-        let writes = vec![
+        let mut writes: Vec<_> = guard().into_iter().collect();
+        writes.extend([
             StepWrite::for_mutation(id, StepMutation::KeepPredbMatch {
                 title_id: t.id,kind: m.kind,category: t.category.clone(),pre_at: t.pre_at,nuked: t.nuked,matched_at: now,
             }),
             StepWrite::for_mutation(id, StepMutation::ClearPredbInnerKeys),
-        ];
+        ]);
         Ok(Outcome {
             matched: true,
             writes,
@@ -242,7 +254,7 @@ impl Step for PredbMatch {
             rerun: if known == Some(t.id) { 0 } else { LATER_PARTS },
             facts,
             wait_until: None,
-            hold: Some(Box::new(hold)),
+            hold,
             junk: None,
         })
     }

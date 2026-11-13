@@ -503,7 +503,7 @@ pub fn kept_for<'a>(titles: impl Iterator<Item = (i64, i64, &'a Ids)>) -> HashMa
     out
 }
 
-fn lookup_key(kind: i64, ids: &Ids) -> String {
+pub(crate) fn lookup_key(kind: i64, ids: &Ids) -> String {
     format!("{kind}:{:?}:{:?}", ids.imdb, ids.tvdb)
 }
 
@@ -533,13 +533,17 @@ fn poster_dir() -> PathBuf {
     crate::paths::app_dir().join("posters")
 }
 
-fn poster_file(path: &str) -> Option<PathBuf> {
+/// The exact kept filename used by the legacy image cache, without opening a
+/// cache database, inspecting files or fetching a provider.
+pub(crate) fn kept_image_name(path: &str) -> Option<String> {
     if path.starts_with("http") {
-        let name: String =
-            path.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' }).collect();
-        return Some(poster_dir().join(name));
+        return Some(path.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' }).collect());
     }
-    safe_image_path(path).then(|| poster_dir().join(path.trim_start_matches('/')))
+    safe_image_path(path).then(||path.trim_start_matches('/').to_owned())
+}
+
+fn poster_file(path: &str) -> Option<PathBuf> {
+    kept_image_name(path).map(|name|poster_dir().join(name))
 }
 
 /// Whether a poster can be shown with nothing fetched, for a page of results.

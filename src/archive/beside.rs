@@ -30,7 +30,7 @@ use super::link::{BESIDE_SECS, ID_WINDOW, RESUME_SECS, beside_window, id_window,
 /// is up, which for a big one is hours after its first file.
 pub const NFO_SECS: i64 = 6 * 3600;
 /// Rows of one name looked at, at most, for an NFO or a thumbnail.
-const NAME_ROWS: i64 = 16;
+pub(crate) const NAME_ROWS: i64 = 16;
 /// The names posting tools give the one picture they post with an upload. Each is one lookup by the name's index.
 const PICTURE_NAMES: &[&str] = &[
     "thumbnail.jpg",
@@ -50,11 +50,11 @@ const PICTURE_NAMES: &[&str] = &[
 /// Files a post can be short of, at most, for a thumbnail to be looked for: the thumbnail and one more.
 const MAX_SHORT: usize = 2;
 /// Leading characters two posters' local parts share, at least, to be one upload's when they aren't the same.
-const POSTER_PREFIX: usize = 8;
+pub(crate) const POSTER_PREFIX: usize = 8;
 /// Index entries read, at most, for one range the thumbnail lookup scans.
-const SCANNED: usize = 4_096;
+pub(crate) const SCANNED: usize = 4_096;
 /// Rows read either way of a release's id when its thumbnail can't be looked for by poster.
-const NEIGHBOURS: i64 = 20_000;
+pub(crate) const NEIGHBOURS: i64 = 20_000;
 
 static FILE_COUNTER: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"\[(\d+)\s*/\s*(\d+)\]").unwrap());
 
@@ -167,7 +167,7 @@ enum NfoRead {
 
 /// An NFO's text, from its first article.
 fn read_nfo(ctx: &mut StepCtx<'_>, file: &FileInfo) -> Result<NfoRead, StepError> {
-    let Some(seg) = ctx.segments(file.id, &SegmentPick::First(1)).map_err(retry)?.into_iter().next() else {
+    let Some(seg) = ctx.segments(file.id, &SegmentPick::First(1)).map_err(StepError::from_inventory)?.into_iter().next() else {
         return Ok(NfoRead::Never);
     };
     // a later article's text isn't the NFO's start, which the next readers go by
@@ -461,7 +461,7 @@ pub(crate) fn thumbnail_beside(
 
 /// Whether a row's name is one of `PICTURE_NAMES`, in any case, or one with the part of a hash a name another row
 /// has already gets (`thumbnail.jpg [01234567]`).
-fn picture_named(name: &str) -> bool {
+pub(crate) fn picture_named(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     let bare = match lower.split_once(" [") {
         Some((head, rest)) if rest.ends_with(']') && rest[..rest.len() - 1].bytes().all(|b| b.is_ascii_digit()) => head,
@@ -471,7 +471,7 @@ fn picture_named(name: &str) -> bool {
 }
 
 /// A subject's file counter `[k/N]`.
-fn counter(subject: &str) -> Option<(i64, i64)> {
+pub(crate) fn counter(subject: &str) -> Option<(i64, i64)> {
     let c = FILE_COUNTER.captures(subject)?;
     Some((c[1].parse().ok()?, c[2].parse().ok()?))
 }
@@ -502,7 +502,7 @@ fn strip_nfo(name: &str) -> Option<&str> {
 }
 
 /// A file that describes a release and carries none of it: text, a checksum list, a picture, a PAR2 set.
-fn is_side_file(name: &str) -> bool {
+pub(crate) fn is_side_file(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     let ext = lower.rsplit_once('.').map_or("", |(_, ext)| ext);
     crate::frozen::rules::SIDECAR_FILES.contains(&ext)

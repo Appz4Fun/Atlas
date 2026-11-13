@@ -286,6 +286,27 @@ pub(crate) struct Pace {
     pub(crate) walk_rows: f64,
 }
 
+/// Actual native telemetry states. Warming/stopped carry no numeric rate;
+/// only a completed, same-instance measurement can carry measured Pace.
+pub(crate) enum NativePace {Stopped {enabled:Option<i64>},Warming {enabled:i64},Measured(Pace)}
+impl NativePace {
+    pub(crate) fn measured(&self)->Option<&Pace> {match self {Self::Measured(pace)=>Some(pace),_=>None}}
+    fn presentation(&self)->Pace {
+        match self {
+            Self::Measured(pace)=>pace.clone(),
+            // These private adapter slots are never observed/displayed as
+            // rates: measured() is false and window_secs=0. The public native
+            // data model above has no numeric rate in either unknown state.
+            Self::Stopped {enabled}=>Pace {running:false,enabled:*enabled,..Pace::default()},
+            Self::Warming {enabled}=>Pace {running:true,enabled:Some(*enabled),..Pace::default()},
+        }
+    }
+}
+
+pub(crate) fn native_with_pace(state:&State,pace:&NativePace,waits:&Waits,rules:&[Applicability],now:i64)->anyhow::Result<String> {
+    native_from_facts(ProcessingScope::Native,state,&pace.presentation(),waits,rules,now)
+}
+
 impl Pace {
     fn measured(&self) -> bool {
         self.running && self.window_secs >= MIN_WINDOW_SECS
@@ -679,7 +700,7 @@ fn render_using<S: ViewStep>(scope: ProcessingScope, state: &State, pace: &Pace,
                 let at = if pace.running {
                     when(wait, *after, lane, scope)
                 } else {
-                    "on hold: the indexer isn't running".into()
+                    match scope {ProcessingScope::Native=>"on hold: native processing isn't running",ProcessingScope::Shard(_)=>"on hold: the indexer isn't running"}.into()
                 };
                 (chip, escape(&at))
             }
@@ -731,9 +752,9 @@ fn render_using<S: ViewStep>(scope: ProcessingScope, state: &State, pace: &Pace,
             pace.net_finished, pace.net_visits, pace.queue_taken
         )
     } else if pace.running {
-        "The indexer started a moment ago: times show once it has run a minute.".into()
+        match scope {ProcessingScope::Native=>"The native stage has not yet measured a full minute; timing estimates will appear once it has.",ProcessingScope::Shard(_)=>"The indexer started a moment ago: times show once it has run a minute."}.into()
     } else {
-        "The indexer isn't running, soo nothing moves until it's back.".into()
+        match scope {ProcessingScope::Native=>"Native processing isn't running; work stays on hold until it resumes.",ProcessingScope::Shard(_)=>"The indexer isn't running, soo nothing moves until it's back."}.into()
     };
     format!(
         "<section id=\"pending\"><h2>Processing</h2><p>{}</p><div class=\"table-wrap\"><table><thead><tr><th>Step</th>\
