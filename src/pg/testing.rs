@@ -6,6 +6,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::{Pool, StorageConfig};
 
+// Test-only access to the real manifest producer, without exposing its
+// private production module to API/media/worker fixture siblings.
+pub(crate) use super::cache_assets::{capture_file as capture_asset_manifest,Limits as AssetCaptureLimits};
+
 pub struct Schema {
     pub name: String,
     pub url: String,
