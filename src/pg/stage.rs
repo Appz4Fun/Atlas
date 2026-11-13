@@ -18,7 +18,9 @@ impl CatalogIdentity {
     pub(crate) fn nonce(&self)->&[u8;32] {&self.nonce}
     pub(crate) fn codec_version(&self)->i32 {1}
     pub(crate) fn word_index_root(&self,configured:&crate::config::HeaderStoreConfig)->Result<std::path::PathBuf> {
-        Ok(self.header_config(configured)?.root().join("words"))
+        // NXV enumerates every ordinary child directory as a news group.
+        // Its reserved _state directory is excluded from group recovery/expiry.
+        Ok(self.header_config(configured)?.root().join("_state").join("words"))
     }
     pub(crate) fn header_config(&self,configured:&crate::config::HeaderStoreConfig)->Result<crate::config::HeaderStoreConfig> {
         let expected=catalog_root(configured,&self.nonce)?;
