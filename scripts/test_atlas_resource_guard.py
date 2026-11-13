@@ -576,6 +576,130 @@ class OwnedGroupLifetimeTests(unittest.TestCase):
         self.assertEqual(events[-1], ("unlink",), "natural successful exit should retain existing fence semantics")
 
 
+class DarwinProbeSettlementTests(unittest.TestCase):
+    """Only signal-zero EPERM may await fresh zombie-only ownership proof."""
+
+    Child = OwnedGroupLifetimeTests.Child
+    setUp = OwnedGroupLifetimeTests.setUp
+
+    def test_delayed_zombie_proof_allows_cleanup_without_another_signal_or_early_reap(self):
+        events = []
+        child = self.Child(events)
+        clock = [0.0]
+        tables = iter(("123 123 Z\n124 123 S\n",  # cleanup's first inventory
+                       "123 123 Z\n124 123 S\n",  # EPERM: still live
+                       OSError("temporarily unreadable"),
+                       "123 123 Z\n124 123 Z\n"))
+        def inventory(command, **kwargs):
+            self.assertIsNone(child.returncode)
+            events.append(("ps",))
+            table = next(tables)
+            if isinstance(table, BaseException):
+                raise table
+            return subprocess.CompletedProcess(command, 0, stdout=table)
+        def send(pid, signum):
+            self.assertEqual(pid, child.pid)
+            self.assertIsNone(child.returncode)
+            events.append(("killpg", signum))
+            if signum == 0:
+                raise PermissionError(errno.EPERM, "settling group")
+        def sleep(delay):
+            self.assertGreater(delay, 0)
+            self.assertLessEqual(delay, .02)
+            clock[0] += delay
+        with patch.object(guard.sys, "platform", "darwin"), \
+                patch.object(guard.os, "killpg", side_effect=send), \
+                patch.object(guard.subprocess, "run", side_effect=inventory), \
+                patch.object(guard.time, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(guard.time, "sleep", side_effect=sleep):
+            try:
+                guard.stop_child(child)
+            except PermissionError:
+                self.fail("fresh zombie-only proof within the settlement window must finish cleanup")
+        self.assertEqual([e for e in events if e[0] == "killpg"],
+                         [("killpg", signal.SIGTERM), ("killpg", 0)])
+        self.assertEqual(events[-1], ("wait",))
+        self.assertEqual(events.count(("wait",)), 1)
+        self.assertNotIn(("poll",), events)
+        self.assertLessEqual(clock[0], .5)
+
+    def test_permanently_live_or_unknown_probe_retains_ownership_and_refuses(self):
+        for table in ("123 123 S\n", "123 123 Z\n124 123 S\n",
+                      "124 123 Z\n", "unparseable\n", OSError("unavailable")):
+            with self.subTest(table=str(table)):
+                events = []
+                child = self.Child(events)
+                clock = [0.0]
+                denied = PermissionError(errno.EPERM, "denied")
+                def inventory(command, **kwargs):
+                    self.assertIsNone(child.returncode)
+                    self.assertGreater(kwargs["timeout"], 0)
+                    self.assertLessEqual(kwargs["timeout"], .5)
+                    if isinstance(table, BaseException):
+                        raise table
+                    return subprocess.CompletedProcess(command, 0, stdout=table)
+                def sleep(delay):
+                    self.assertLessEqual(delay, .02)
+                    clock[0] += delay
+                with patch.object(guard.sys, "platform", "darwin"), \
+                        patch.object(guard.os, "killpg", side_effect=denied) as send, \
+                        patch.object(guard.subprocess, "run", side_effect=inventory), \
+                        patch.object(guard.time, "monotonic", side_effect=lambda: clock[0]), \
+                        patch.object(guard.time, "sleep", side_effect=sleep):
+                    with self.assertRaises(PermissionError) as raised:
+                        guard.signal_owned_group(child, 0)
+                self.assertIs(raised.exception, denied)
+                send.assert_called_once_with(child.pid, 0)
+                self.assertIsNone(child.returncode)
+                self.assertEqual(events, [])
+                self.assertLessEqual(clock[0], .5)
+
+    def test_zombie_proof_arriving_after_deadline_is_not_accepted(self):
+        child = self.Child([])
+        clock = [0.0]
+        def late(command, **kwargs):
+            clock[0] += .6  # Metadata completion crossed the allowed window.
+            return subprocess.CompletedProcess(command, 0, stdout="123 123 Z\n")
+        with patch.object(guard.sys, "platform", "darwin"), \
+                patch.object(guard.os, "killpg", side_effect=PermissionError(errno.EPERM, "denied")), \
+                patch.object(guard.subprocess, "run", side_effect=late), \
+                patch.object(guard.time, "monotonic", side_effect=lambda: clock[0]):
+            with self.assertRaises(PermissionError):
+                guard.signal_owned_group(child, 0)
+        self.assertIsNone(child.returncode)
+
+    def test_linux_and_term_kill_refusal_policies_do_not_gain_retries(self):
+        for platform, signum in (("linux", 0), ("darwin", signal.SIGTERM),
+                                 ("darwin", signal.SIGKILL)):
+            with self.subTest(platform=platform, signum=signum):
+                child = self.Child([])
+                with patch.object(guard.sys, "platform", platform), \
+                        patch.object(guard.os, "killpg", side_effect=PermissionError(errno.EPERM, "denied")) as send, \
+                        patch.object(guard.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, stdout="123 123 S\n")) as read:
+                    with self.assertRaises(PermissionError):
+                        guard.signal_owned_group(child, signum)
+                send.assert_called_once_with(child.pid, signum)
+                self.assertEqual(read.call_count, 0 if platform == "linux" else 1)
+                self.assertIsNone(child.returncode)
+
+    def test_lost_unreaped_identity_during_settlement_cannot_authorize_success(self):
+        child = self.Child([])
+        clock = [0.0]
+        def sleep(delay):
+            clock[0] += delay
+            child.returncode = 0  # Simulates an invalid outside reaper.
+        with patch.object(guard.sys, "platform", "darwin"), \
+                patch.object(guard.os, "killpg", side_effect=PermissionError(errno.EPERM, "denied")) as send, \
+                patch.object(guard.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, stdout="123 123 S\n")) as read, \
+                patch.object(guard.time, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(guard.time, "sleep", side_effect=sleep):
+            with self.assertRaises(PermissionError):
+                guard.signal_owned_group(child, 0)
+        send.assert_called_once_with(child.pid, 0)
+        self.assertEqual(read.call_count, 1)
+        self.assertNotIn(("wait",), child.events)
+
+
 class SigchldPolicyTests(unittest.TestCase):
     """Unsafe child-reaping policies must be refused before any child is spawned."""
 
