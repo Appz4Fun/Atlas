@@ -101,3 +101,62 @@ fn stopped_header_storage_sql_and_invariant_errors_remain_fatal_with_their_cause
         no_effects(&schema);runtime.owner.close();
     }
 }
+
+#[test]
+#[ignore="requires isolated PG for joined sibling provider/fatal precedence in both orders"]
+fn joined_provider_and_fatal_siblings_retain_the_fatal_cause_in_both_orders() {
+    for kind in [End::Stop,End::Unavailable] {
+        for reverse in [false,true] {
+            for header in [false,true] {
+                let (schema,runtime,_handle,service)=fixture();let owner=runtime.owner.clone();let (done_tx,done_rx)=mpsc::channel();
+                let worker=workers::spawn(&runtime.owner,"native-paired-provider-control".into(),move|| {
+                    let barrier=Arc::new(std::sync::Barrier::new(2));
+                    let results=std::thread::scope(|scope| {
+                        let (one,first,gate)=(service.clone(),owner.clone(),barrier.clone());
+                        let provider=scope.spawn(move||one.network_for_test::<()>(async {
+                            gate.wait();end(&first,kind);
+                            Err(NntpError::Reply {code:431,message:"paired ready provider".into()})
+                        }));
+                        let (two,second,gate)=(service.clone(),owner.clone(),barrier.clone());
+                        let fatal=scope.spawn(move|| {
+                            let result=two.network_for_test::<()>(async {
+                                // Both actual original-owner checks complete
+                                // BEFORE either response can end the attempt.
+                                gate.wait();end(&second,kind);
+                                if header {Err(NntpError::HeaderStore("paired genuine header storage failure".into()))}else{Ok(())}
+                            });
+                            if header {result}else{result.and_then(|_|Err(anyhow::anyhow!("paired unexpected invariant")))}
+                        });
+                        let provider=provider.join().unwrap();let fatal=fatal.join().unwrap();
+                        if reverse {vec![fatal,provider]}else{vec![provider,fatal]}
+                    });
+                    let mut failure=None;
+                    for result in results {if let Err(error)=result {crate::spotnet::native::prefer_failure(&mut failure,error);}}
+                    let terminal=provider_pass::<()>(Err(failure.expect("both children failed")));
+                    assert!(terminal.is_err(),"a provider sibling cannot discard a storage/invariant failure");
+                    done_tx.send(()).unwrap();terminal?;Ok(None)
+                }).unwrap();
+                let mut drain=Drain {owner:runtime.owner.clone(),worker:Some(worker)};
+                done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let error=match drain.finish() {Ok(_)=>panic!("joined fatal sibling must reach worker failure"),Err(error)=>error};
+                assert_eq!(runtime.owner.failure(),Some(Failure::Fatal));
+                if header {assert!(matches!(error.downcast_ref::<NntpError>(),Some(NntpError::HeaderStore(_))))}
+                else {assert!(error.to_string().contains("paired unexpected invariant"));}
+                no_effects(&schema);runtime.owner.close();
+            }
+        }
+    }
+}
+
+#[test]
+fn joined_unmarked_session_and_storage_errors_retain_storage_in_both_orders() {
+    for reverse in [false,true] {
+        let session=anyhow::Error::new(crate::pg::outage::SessionUnavailable);
+        let storage=anyhow::Error::new(std::io::Error::new(std::io::ErrorKind::PermissionDenied,"joined local storage failure"));
+        let errors=if reverse {vec![storage,session]}else{vec![session,storage]};let mut failure=None;
+        for error in errors {crate::spotnet::native::prefer_failure(&mut failure,error);}
+        let error=provider_pass::<()>(Err(failure.unwrap())).unwrap_err();
+        assert_eq!(error.downcast_ref::<std::io::Error>().unwrap().kind(),std::io::ErrorKind::PermissionDenied);
+        assert_eq!(crate::pg::outage::classify(&error),Failure::Fatal);
+    }
+}
