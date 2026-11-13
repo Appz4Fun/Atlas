@@ -7,14 +7,14 @@ use std::collections::HashMap;
 use crate::{archive::Password,media::{query::MediaAttrs,resolve::Ids,details::Details}};
 
 pub(crate) struct ApiFacts {pub category:i64,pub password:Option<Password>,pub media:Option<MediaAttrs>}
-pub(crate) struct Facts {pub category:i64,pub password:Option<Password>,pub media:Option<MediaAttrs>,pub details:Option<Details>}
+pub(crate) struct Facts {pub category:i64,pub password:Option<Password>,pub media:Option<MediaAttrs>,pub details:Option<Details>,pub recovery:Option<crate::release_info::RecoveryOnly>}
 impl ReadView<'_> {
     pub(crate) fn listing_facts(&self,ids:&[i64])->Result<HashMap<i64,Facts>> {
         self.api_facts(ids)?.into_iter().map(|(id,facts)|{
             let details=match facts.media.as_ref() {
                 Some(media)=>self.kept_details_for(media.kind,&media.ids)?,None=>None,
             };
-            Ok((id,Facts {category:facts.category,password:facts.password,media:facts.media,details}))
+            Ok((id,Facts {category:facts.category,password:facts.password,media:facts.media,details,recovery:self.own_recovery(id)?}))
         }).collect()
     }
     /// API output uses its own IDs/raw names; it does not load UI details,

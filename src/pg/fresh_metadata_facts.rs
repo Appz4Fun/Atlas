@@ -56,8 +56,8 @@ impl ReadView<'_> {
             // The old shard-specific IdKey/collection recomputation has no
             // meaning for fresh native public IDs. Never reuse its old secret.
             id_key:None,collection:None,timing,par2_creators,rev_volumes,
-            // The page explicitly reports these separate readers unavailable.
-            // No empty relationship result is certified or used for lending.
-            same:Vec::new(),points_to:Vec::new(),sidecars:Vec::new()})
+            // Verified copy/whole-post authority is separate from these
+            // observed name/UID display associations. No lookup grants lending.
+            same:Vec::new(),points_to:self.metadata_nzb_targets(inputs)?,sidecars:self.metadata_sidecars(inputs)?})
     }
 }
