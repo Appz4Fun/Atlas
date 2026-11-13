@@ -3,6 +3,7 @@ import importlib.util
 import errno
 import json
 import os
+import select
 import signal
 import subprocess
 import sys
@@ -31,6 +32,18 @@ def process_is_running(pid):
         # A killed orphan may await reaping by a container's PID 1.
         return state != "Z"
     return True
+
+
+def fixture_observer_barrier(mode, stage, leader, descendant):
+    """Optionally let an external test observer verify identities before proceeding."""
+    if os.environ.get("ATLAS_TEST_LINEAGE_BARRIER") != "1":
+        return
+    print(f"ATLAS_TEST_LINEAGE {mode} {stage} {leader} {descendant}", flush=True)
+    ready, _, _ = select.select([sys.stdin], [], [], 5)
+    if not ready:
+        raise TimeoutError("fixture observer acknowledgement timed out")
+    if os.read(sys.stdin.fileno(), 1) != b"G":
+        raise RuntimeError("fixture observer refused acknowledgement")
 
 
 class ResourceGuardTests(unittest.TestCase):
@@ -203,20 +216,29 @@ class ResourceGuardTests(unittest.TestCase):
             "import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); "
             "print('ready',flush=True); time.sleep(60)")
         parent = (
-            "import subprocess,sys,time; "
-            f"p=subprocess.Popen([sys.executable,'-c',{grandchild!r}],stdout=subprocess.PIPE,text=True); "
-            "p.stdout.readline(); print(p.pid,flush=True); " +
+            "import os,select,subprocess,sys,time\n"
+            f"p=subprocess.Popen([sys.executable,'-c',{grandchild!r}],stdout=subprocess.PIPE,text=True)\n"
+            "p.stdout.readline(); print(p.pid,flush=True)\n"
+            "if not select.select([sys.stdin],[],[],10)[0] or os.read(sys.stdin.fileno(),1)!=b'G':\n"
+            "    raise RuntimeError('fixture release timed out or was refused')\n" +
             ("sys.exit(0)" if leader_exits else "time.sleep(60)"))
         child = subprocess.Popen(
             [sys.executable, "-c", parent], start_new_session=True,
-            stdout=subprocess.PIPE, text=True)
-        descendant = int(child.stdout.readline())
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE)
         try:
+            descendant = int(child.stdout.readline())
+            mode = "exited" if leader_exits else "running"
+            fixture_observer_barrier(mode, "ready", child.pid, descendant)
+            child.stdin.write(b"G")
+            child.stdin.flush()
             if leader_exits:
                 deadline = time.monotonic() + 5
                 while not guard.leader_has_exited(child):
                     self.assertLess(time.monotonic(), deadline, "leader did not exit while held")
                     time.sleep(0.01)
+            else:
+                self.assertFalse(guard.leader_has_exited(child), "running leader exited early")
+            fixture_observer_barrier(mode, "state", child.pid, descendant)
             guard.stop_child(child, grace_seconds=0.05)
             deadline = time.monotonic() + 2
             while time.monotonic() < deadline:
@@ -227,9 +249,12 @@ class ResourceGuardTests(unittest.TestCase):
                 self.fail("a descendant survived its supervised process group")
         finally:
             # Never signal the old numeric group after stop_child released its leader.
-            if child.returncode is None:
-                guard.stop_child(child, grace_seconds=0.05)
-            child.stdout.close()
+            try:
+                if child.returncode is None:
+                    guard.stop_child(child, grace_seconds=0.05)
+            finally:
+                child.stdin.close()
+                child.stdout.close()
 
     def test_failed_startup_fence_prevents_any_child_launch(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -288,6 +313,57 @@ class ResourceGuardTests(unittest.TestCase):
 
 
 class DescendantFixtureCleanupTests(unittest.TestCase):
+    def test_observer_captures_lineage_before_release_and_checks_both_leader_states(self):
+        from io import StringIO
+        from unittest.mock import Mock
+        for leader_exits in (False, True):
+            with self.subTest(leader_exits=leader_exits):
+                child = Mock(pid=123, returncode=None)
+                child.stdout = StringIO("124\n")
+                output = StringIO()
+                releases = []
+                def release(data):
+                    self.assertIn("ready 123 124\n", output.getvalue())
+                    releases.append(data)
+                    return len(data)
+                child.stdin = Mock(write=release)
+                def stop(owned, **unused):
+                    owned.returncode = 0
+                with patch.dict(os.environ, {"ATLAS_TEST_LINEAGE_BARRIER": "1"}), \
+                        patch.object(subprocess, "Popen", return_value=child), \
+                        patch.object(guard, "stop_child", side_effect=stop), \
+                        patch.object(guard, "leader_has_exited", return_value=leader_exits), \
+                        patch.object(sys, "stdout", output), \
+                        patch.object(select, "select", return_value=([sys.stdin], [], [])), \
+                        patch.object(os, "read", return_value=b"G"), \
+                        patch.object(sys.modules[__name__], "process_is_running", return_value=False):
+                    ResourceGuardTests().assert_stops_descendant(leader_exits)
+                mode = "exited" if leader_exits else "running"
+                self.assertEqual(output.getvalue(),
+                                 f"ATLAS_TEST_LINEAGE {mode} ready 123 124\n"
+                                 f"ATLAS_TEST_LINEAGE {mode} state 123 124\n")
+                self.assertEqual(releases, [b"G"])
+                self.assertEqual(child.returncode, 0)
+
+    def test_observer_timeout_cleans_up_without_releasing_the_leader(self):
+        from io import StringIO
+        from unittest.mock import Mock
+        child = Mock(pid=123, returncode=None)
+        child.stdout = StringIO("124\n")
+        def stop(owned, **unused):
+            owned.returncode = 0
+        with patch.dict(os.environ, {"ATLAS_TEST_LINEAGE_BARRIER": "1"}), \
+                patch.object(subprocess, "Popen", return_value=child), \
+                patch.object(guard, "stop_child", side_effect=stop), \
+                patch.object(guard, "leader_has_exited", return_value=True), \
+                patch.object(select, "select", return_value=([], [], [])), \
+                patch.object(sys.modules[__name__], "process_is_running", return_value=False):
+            with self.assertRaises(TimeoutError):
+                ResourceGuardTests().assert_stops_descendant(True)
+        child.stdin.write.assert_not_called()
+        self.assertEqual(child.returncode, 0)
+        self.assertTrue(child.stdout.closed)
+
     def test_failed_leader_status_wait_still_cleans_up_the_fixture(self):
         from io import StringIO
         from unittest.mock import Mock
