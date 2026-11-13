@@ -31,125 +31,14 @@
 //! The raw posting account and host, an archive's owner and zone are never stored, only their salted digests, and the
 //! archive keys are never printed: the page shows how many releases share one, not its value.
 
-use std::sync::OnceLock;
-
-use rusqlite::{Connection, OptionalExtension, params_from_iter};
-use sha2::{Digest, Sha256};
-
-use crate::postprocess::schema::ShardTable;
 use crate::postprocess::step::{Needs, Outcome, Reruns, Step, StepCtx, StepError, StepId, StepMutation, StepWrite};
 use crate::probe::ProbeInfo;
-use crate::store;
-
-pub const RELEASE_KEYS: ShardTable = ShardTable {
-    name: "release_keys",
-    create: "create table if not exists release_keys (
-        release_id INTEGER PRIMARY KEY,
-        account    INTEGER,
-        host       INTEGER,
-        layout     INTEGER,
-        lines      INTEGER,
-        file_crc   INTEGER,
-        body_crc   INTEGER
-    )",
-    indexes: &[
-        (
-            "release_keys_account",
-            "create index if not exists release_keys_account on release_keys(account) where account is not null",
-        ),
-        (
-            "release_keys_host",
-            "create index if not exists release_keys_host on release_keys(host) where host is not null",
-        ),
-        (
-            "release_keys_layout",
-            "create index if not exists release_keys_layout on release_keys(layout) where layout is not null",
-        ),
-        (
-            "release_keys_lines",
-            "create index if not exists release_keys_lines on release_keys(lines) where lines is not null",
-        ),
-        (
-            "release_keys_file_crc",
-            "create index if not exists release_keys_file_crc on release_keys(file_crc) where file_crc is not null",
-        ),
-        (
-            "release_keys_body_crc",
-            "create index if not exists release_keys_body_crc on release_keys(body_crc) where body_crc is not null",
-        ),
-        (
-            "release_keys_video",
-            "create index if not exists release_keys_video on release_keys(video) where video is not null",
-        ),
-        (
-            "release_keys_audio",
-            "create index if not exists release_keys_audio on release_keys(audio) where audio is not null",
-        ),
-        ("release_keys_mux", "create index if not exists release_keys_mux on release_keys(mux) where mux is not null"),
-        (
-            "release_keys_encode",
-            "create index if not exists release_keys_encode on release_keys(encode) where encode is not null",
-        ),
-        (
-            "release_keys_thread",
-            "create index if not exists release_keys_thread on release_keys(thread) where thread is not null",
-        ),
-        (
-            "release_keys_subs",
-            "create index if not exists release_keys_subs on release_keys(subs) where subs is not null",
-        ),
-        (
-            "release_keys_fonts",
-            "create index if not exists release_keys_fonts on release_keys(fonts) where fonts is not null",
-        ),
-        (
-            "release_keys_chapters",
-            "create index if not exists release_keys_chapters on release_keys(chapters) where chapters is not null",
-        ),
-        (
-            "release_keys_volumes",
-            "create index if not exists release_keys_volumes on release_keys(volumes) where volumes is not null",
-        ),
-    ],
-    release_key: Some("release_id"),
-    // `video`: the first keyframe's key, from the probe's `keyframe_key`; `audio`: the first audio track's
-    // `stream_key`
-    // `mux`: SegmentUID and DateUTC; `encode`: the encoder's settings and the length; `thread`: the thread's root id
-    // `subs`: the subtitle tracks' header keys; `fonts`: the attached fonts; `chapters`: the chapter start times
-    // `volumes`: an encrypted set's volume size, count and last size (`volumes_text`)
-    added: &[
-        ("file_crc", "INTEGER"),
-        ("body_crc", "INTEGER"),
-        ("video", "INTEGER"),
-        ("audio", "INTEGER"),
-        ("mux", "INTEGER"),
-        ("encode", "INTEGER"),
-        ("thread", "INTEGER"),
-        ("subs", "INTEGER"),
-        ("fonts", "INTEGER"),
-        ("chapters", "INTEGER"),
-        ("volumes", "INTEGER"),
-    ],
-};
-
-pub(crate) const UPSERT: &str = "insert or replace into release_keys
-    (release_id, account, host, layout, lines, file_crc, body_crc, video, audio, mux, encode, thread, subs, fonts,
-     chapters, volumes)
-    values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)";
+use sha2::{Digest, Sha256};
+use std::sync::OnceLock;
 
 pub const KEYS_STEP: StepId = StepId(40);
-
-/// The most other releases a count goes to, and the most the list page shows.
 pub const COUNT_CAP: i64 = 1_000;
 pub const LIST_CAP: i64 = 100;
-/// PAR2 sets a release is looked up by, at most: nearly every release has one.
-const SETS_CAP: usize = 4;
-/// Files a Lines key is taken over, at most: the page reads as many (`web_meta::FILES_CAP`).
-const FILES_CAP: i64 = 5_000;
-/// Files (size, CRC32) a release is looked up by, at most: its probed main file and what its PAR2 sets describe.
-const CRC_FILES_CAP: usize = 8;
-/// Files smaller than this aren't looked up by their CRC: an empty or tiny file (a 0-byte marker, a stock .sfv) is
-/// the same in thousands of unrelated posts.
 pub const CRC_MIN_SIZE: i64 = 1 << 20;
 
 /// What another release can share with this one.
@@ -671,7 +560,9 @@ pub(crate) fn fonts_text(media: &crate::probe::media::MediaInfo) -> Option<Strin
     }
     // The existing textual key uses ':' and ',' separators. Such names are
     // retained as facts but cannot enter this ambiguous key representation.
-    if media.attachments.iter().filter(|a|is_font(a)).any(|a|a.name.contains([':',','])) {return None;}
+    if media.attachments.iter().filter(|a| is_font(a)).any(|a| a.name.contains([':', ','])) {
+        return None;
+    }
     let mut fonts: Vec<String> = media
         .attachments
         .iter()
@@ -690,7 +581,9 @@ const MIN_CHAPTERS: usize = 3;
 /// `MIN_CHAPTERS`, or when every gap between them is the same to the second: chapters made every few minutes by a
 /// tool, which every file of that length gets.
 pub(crate) fn chapters_text(media: &crate::probe::media::MediaInfo) -> Option<String> {
-    if !media.chapters_complete {return None;}
+    if !media.chapters_complete {
+        return None;
+    }
     let starts: Vec<i64> = media
         .chapters
         .iter()
@@ -768,23 +661,6 @@ pub(crate) fn volumes_text(files: &[(String, i64)]) -> Option<String> {
     Some(format!("volumes:{format}:{size}:{}:{last}", vols.len()))
 }
 
-/// The volume key of a release whose archive is encrypted (its probe says soo), from its PAR2 file list, read whole
-/// (`complete`): a list cut short would key the part of the set it saw. An unencrypted archive has its files' own
-/// CRCs to go by.
-pub fn volume_key(shard: &Connection, release_id: i64, probe: Option<&ProbeInfo>) -> Option<i64> {
-    let archive = probe?.archive.as_ref()?;
-    if !archive.encrypted && !archive.headers_encrypted {
-        return None;
-    }
-    let mut q = shard
-        .prepare_cached("select name, size from par2_files where release_id = ?1 and bound = 1 and complete = 1")
-        .ok()?;
-    let files: Vec<(String, i64)> =
-        q.query_map([release_id], |r| Ok((r.get(0)?, r.get(1)?))).ok()?.filter_map(Result::ok).collect();
-    volumes_text(&files).map(|t| as_key(digest8(t.as_bytes())))
-}
-
-/// The keys over what a release has: its probe and its `file_timing` rows.
 pub fn keys_of(
     probe: Option<&ProbeInfo>,
     timing: &[(Option<i64>, i64)],
@@ -815,274 +691,10 @@ pub fn keys_of(
     keys
 }
 
-// ---------------------------------------------------------------- reading
-
-/// The install's salt for the account and host keys: made once, by whoever asks first, and kept in shard 0's
-/// `meta`. `conn` has the shards attached. None when it can't be read or made, and then no salted key is made.
-pub fn salt(conn: &Connection) -> Option<i64> {
-    salt_in(conn, "s0.meta")
-}
-
-/// `salt` over `meta`, the shard 0 table as `conn` names it: `s0.meta` with the shards attached, `meta` on shard 0
-/// opened alone.
-fn salt_in(conn: &Connection, meta: &str) -> Option<i64> {
-    let read = || {
-        conn.query_row(&format!("select value from {meta} where key = 'key_salt'"), [], |r| r.get::<_, i64>(0))
-            .optional()
-            .ok()
-            .flatten()
-    };
-    if let Some(found) = read() {
-        return Some(found);
-    }
-    let mut bytes = [0u8; 8];
-    getrandom::fill(&mut bytes).ok()?;
-    let fresh = i64::from_le_bytes(bytes);
-    // two at once: `or ignore` keeps the first, and both read it back
-    let _ = conn.execute(&format!("insert or ignore into {meta} (key, value) values ('key_salt', ?1)"), [fresh]);
-    read()
-}
-
-/// The install's salt as a step on any shard reads it: from shard 0 beside `conn`'s shard (`shard_zero`), made there
-/// when it isn't yet, and remembered by shard 0's path. None for a connection with no shard file behind it.
-pub fn step_salt(conn: &Connection) -> Option<i64> {
-    static SALTS: std::sync::Mutex<Vec<(std::path::PathBuf, i64)>> = std::sync::Mutex::new(Vec::new());
-    let zero = conn.path().and_then(shard_zero)?;
-    if let Some((_, s)) = SALTS.lock().ok()?.iter().find(|(p, _)| *p == zero) {
-        return Some(*s);
-    }
-    let shard = crate::db::open_shard(&zero).ok()?;
-    let found = salt_in(&shard, "meta")?;
-    SALTS.lock().ok()?.push((zero, found));
-    Some(found)
-}
-
-/// Which salt a salted key was made with, as a key of its own: soo a key kept outside the shards (the raw store) is
-/// only used again under the same salt.
 pub fn salt_id(salt: i64) -> i64 {
     as_key(digest8(format!("salt:{salt}").as_bytes()))
 }
 
-/// The probe a release has, decoded. None when it has none or it doesn't decode.
-fn probe_of(shard: &Connection, release_id: i64) -> rusqlite::Result<Option<ProbeInfo>> {
-    let info: Option<String> = shard
-        .prepare_cached("select info from release_probe where release_id = ?1")?
-        .query_row([release_id], |r| r.get(0))
-        .optional()?;
-    Ok(info.and_then(|i| serde_json::from_str(&i).ok()))
-}
-
-/// A release's `file_timing` rows as `(lines, articles)`, in file name order.
-fn timing_of(shard: &Connection, release_id: i64) -> rusqlite::Result<Vec<(Option<i64>, i64)>> {
-    shard
-        .prepare_cached(
-            "select t.lines, t.articles from file_timing t join files f on f.id = t.file_id
-             where f.release_id = ?1 order by f.filename limit ?2",
-        )?
-        .query_map(rusqlite::params![release_id, FILES_CAP], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect()
-}
-
-/// The keys a release has now, read from its own shard (`shard`, on its own or as `main`).
-pub fn read_keys(shard: &Connection, release_id: i64, parts: Option<i64>, salt: Option<i64>) -> rusqlite::Result<Keys> {
-    let probe = probe_of(shard, release_id)?;
-    let timing = timing_of(shard, release_id)?;
-    let mut keys = keys_of(probe.as_ref(), &timing, parts, salt);
-    // no trailer read for the probed file: a file every article of which was read whole stands in
-    if keys.file_crc.is_none() {
-        keys.file_crc = folded_files(shard, release_id).first().map(|f| f.key());
-    }
-    keys.volumes = volume_key(shard, release_id, probe.as_ref());
-    Ok(keys)
-}
-
-/// The most files of a release looked at for a fold, and the most articles a file may have to be folded.
-const FOLD_FILES: usize = 64;
-const FOLD_PARTS: i64 = 4_096;
-
-/// The files of a release every article of which a step read whole (`archive::store::SEGMENT_CRC`), with their
-/// whole-file CRC32 folded from the articles' in part order (`gf2::crc32_combine`), the biggest first. Only a file
-/// whose parts are all there, numbered 1 to its count, each read once over its decoded length, and big enough to look
-/// up. Empty on a shard without the table.
-pub fn folded_files(shard: &Connection, release_id: i64) -> Vec<FileCrc> {
-    let Ok(mut q) = shard.prepare_cached("select message_id, decoded, crc32 from segment_crc where release_id = ?1")
-    else {
-        return Vec::new();
-    };
-    let Ok(rows) =
-        q.query_map([release_id], |r| Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))))
-    else {
-        return Vec::new();
-    };
-    let read: std::collections::HashMap<String, (i64, i64)> = rows.flatten().collect();
-    if read.is_empty() {
-        return Vec::new();
-    }
-    let Ok(files) = store::release_files(shard, release_id, FOLD_FILES) else { return Vec::new() };
-    let mut out = Vec::new();
-    for f in files {
-        let Some(n) = f.expected.filter(|n| (1..=FOLD_PARTS).contains(n)) else { continue };
-        if f.parts_seen < n || (read.len() as i64) < n {
-            continue;
-        }
-        let Ok(segs) = store::file_segments(shard, f.id, &store::SegmentPick::Parts((1..=n).collect())) else {
-            continue;
-        };
-        let mut by_part: std::collections::BTreeMap<i64, (i64, i64)> = std::collections::BTreeMap::new();
-        for s in &segs {
-            if let (Some(part), Some(got)) = (s.part, read.get(&s.message_id)) {
-                by_part.entry(part).or_insert(*got);
-            }
-        }
-        if by_part.len() as i64 != n || by_part.keys().next() != Some(&1) || by_part.keys().last() != Some(&n) {
-            continue;
-        }
-        let (mut crc, mut size) = (0u32, 0i64);
-        for (i, (len, part_crc)) in by_part.values().enumerate() {
-            let (Ok(len_bytes), Ok(part_crc)) = (usize::try_from(*len), u32::try_from(*part_crc)) else {
-                size = -1;
-                break;
-            };
-            crc = if i == 0 { part_crc } else { crate::gf2::crc32_combine(crc, part_crc, len_bytes) };
-            size += len;
-        }
-        if let Some(file) = (size > 0).then(|| FileCrc::new(size, crc)).flatten()
-            && !out.contains(&file)
-        {
-            out.push(file);
-        }
-    }
-    out.sort_by_key(|f| std::cmp::Reverse(f.size));
-    out
-}
-
-/// What a release can be looked up by, read from its own shard: the keys it has now, and the PAR2 sets and the
-/// OpenSubtitles hash.
-pub fn read_lookup(
-    shard: &Connection,
-    release_id: i64,
-    parts: Option<i64>,
-    salt: Option<i64>,
-) -> rusqlite::Result<Lookup> {
-    let probe = probe_of(shard, release_id)?;
-    let timing = timing_of(shard, release_id)?;
-    let keys = keys_of(probe.as_ref(), &timing, parts, salt);
-    let par2_sets = par2_sets(shard, release_id)?;
-    let files = crc_files(shard, release_id, probe.as_ref())?;
-    let moviehash = shard
-        .prepare_cached("select moviehash from release_probe where release_id = ?1")
-        .ok()
-        .and_then(|mut q| q.query_row([release_id], |r| r.get::<_, Option<String>>(0)).optional().ok().flatten())
-        .flatten();
-    let inner_files = inner_crc_files(shard, release_id);
-    let archive = archive_keys(shard, release_id);
-    let audio_print = crate::probe::audio_print::has_print(shard, release_id);
-    Ok(Lookup { keys, par2_sets, moviehash, files, inner_files, archive, audio_print })
-}
-
-/// Sources of `archive_inner_files` rows read from an archive's own headers: RAR, 7z, ZIP.
-const ARCHIVE_SOURCES: &str = "(2, 3, 4)";
-
-/// The files inside a release's archives whose whole CRC32 a header gives, the biggest first, at most
-/// `CRC_FILES_CAP`, each once. Empty on a shard without the columns yet.
-pub fn inner_crc_files(shard: &Connection, release_id: i64) -> Vec<FileCrc> {
-    let sql = format!(
-        "select distinct size, crc32 from archive_inner_files
-         where release_id = ?1 and source in {ARCHIVE_SOURCES} and crc32 is not null and size >= ?2
-         order by size desc limit ?3"
-    );
-    let Ok(mut q) = shard.prepare_cached(&sql) else { return Vec::new() };
-    let Ok(rows) = q.query_map(rusqlite::params![release_id, CRC_MIN_SIZE, CRC_FILES_CAP as i64], |r| {
-        Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
-    }) else {
-        return Vec::new();
-    };
-    rows.flatten().filter_map(|(size, crc)| u32::try_from(crc).ok().and_then(|c| FileCrc::new(size, c))).collect()
-}
-
-/// A release's archive keys as `archive_release` keeps them. Nothing on a shard without the columns yet.
-pub fn archive_keys(shard: &Connection, release_id: i64) -> crate::archive::store::ArchiveKeys {
-    shard
-        .prepare_cached("select packer, twin_key, owner_key, zone_key from archive_release where release_id = ?1")
-        .ok()
-        .and_then(|mut q| {
-            q.query_row([release_id], |r| {
-                Ok(crate::archive::store::ArchiveKeys {
-                    packer: r.get(0)?,
-                    twin_key: r.get(1)?,
-                    owner_key: r.get(2)?,
-                    zone_key: r.get(3)?,
-                })
-            })
-            .optional()
-            .ok()
-            .flatten()
-        })
-        .unwrap_or_default()
-}
-
-/// The files a release knows the size and whole-file CRC32 of: the probed main file first, then the biggest ones
-/// its PAR2 sets describe, then the RAR data volumes its first `.rev` file names (`archive::rev`), at most
-/// `CRC_FILES_CAP`, each once. None from a table the shard doesn't have yet.
-pub fn crc_files(shard: &Connection, release_id: i64, probe: Option<&ProbeInfo>) -> rusqlite::Result<Vec<FileCrc>> {
-    let mut out: Vec<FileCrc> = probe.and_then(probe_file).into_iter().collect();
-    for f in folded_files(shard, release_id) {
-        if !out.contains(&f) {
-            out.push(f);
-        }
-    }
-    if let Ok(mut q) = shard.prepare_cached(
-        "select distinct size, crc32 from par2_files
-         where release_id = ?1 and bound = 1 and crc32 is not null and size >= ?2
-         order by size desc limit ?3",
-    ) {
-        let rows = q.query_map(rusqlite::params![release_id, CRC_MIN_SIZE, CRC_FILES_CAP as i64], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
-        })?;
-        for row in rows {
-            let (size, crc) = row?;
-            if let Some(f) = u32::try_from(crc).ok().and_then(|c| FileCrc::new(size, c))
-                && !out.contains(&f)
-            {
-                out.push(f);
-            }
-        }
-    }
-    out.extend(rev_files(shard, release_id, CRC_FILES_CAP.saturating_sub(out.len()), &out)?);
-    out.truncate(CRC_FILES_CAP);
-    Ok(out)
-}
-
-/// Up to `room` of the RAR data volumes a release's `.rev` header names, biggest first, none of them in `have`.
-fn rev_files(shard: &Connection, release_id: i64, room: usize, have: &[FileCrc]) -> rusqlite::Result<Vec<FileCrc>> {
-    let mut out = Vec::new();
-    if room == 0 {
-        return Ok(out);
-    }
-    let Ok(mut q) = shard.prepare_cached(
-        "select distinct size, crc32 from rev_volumes where release_id = ?1 and size >= ?2
-         order by size desc, crc32 limit ?3",
-    ) else {
-        return Ok(out);
-    };
-    let wanted = (room + have.len()) as i64;
-    for row in q.query_map(rusqlite::params![release_id, CRC_MIN_SIZE, wanted], |r| {
-        Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
-    })? {
-        let (size, crc) = row?;
-        if let Some(f) = u32::try_from(crc).ok().and_then(|c| FileCrc::new(size, c))
-            && !have.contains(&f)
-            && !out.contains(&f)
-            && out.len() < room
-        {
-            out.push(f);
-        }
-    }
-    Ok(out)
-}
-
-/// A file a release knows the whole-file CRC32 of, under a name: the one it was posted as, for the probed file, or the
-/// one its PAR2 set gives it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NamedCrc {
     pub file: FileCrc,
@@ -1092,273 +704,6 @@ pub struct NamedCrc {
     pub md5: Option<Vec<u8>>,
 }
 
-/// The most releases one file asks for donors from.
-const DONORS_CAP: i64 = 8;
-
-/// `crc_files` with names, for a release in any shard of `conn` (the main database with the shards attached).
-pub fn named_crc_files(conn: &Connection, release_id: i64) -> Vec<NamedCrc> {
-    let s = store::shard_of_id(release_id);
-    let mut out: Vec<NamedCrc> = Vec::new();
-    if let Some(probe) = probe_in(conn, release_id)
-        && let (Some(file), Some(name)) = (probe_file(&probe), probe.file.clone())
-    {
-        out.push(NamedCrc { file, name, md5: None });
-    }
-    let sql = format!(
-        "select size, crc32, name, md5 from s{s}.par2_files
-         where release_id = ?1 and bound = 1 and crc32 is not null and size >= ?2
-         order by size desc, name limit ?3"
-    );
-    if let Ok(mut q) = conn.prepare_cached(&sql)
-        && let Ok(rows) = q.query_map(rusqlite::params![release_id, CRC_MIN_SIZE, CRC_FILES_CAP as i64], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, Vec<u8>>(3)?))
-        })
-    {
-        for (size, crc, name, md5) in rows.flatten() {
-            let Some(file) = u32::try_from(crc).ok().and_then(|c| FileCrc::new(size, c)) else { continue };
-            // the probed file, when the set describes it too, takes the set's MD5
-            for probed in out.iter_mut().filter(|n| n.file == file && n.md5.is_none()) {
-                probed.md5 = Some(md5.clone());
-            }
-            if !out.iter().any(|n| n.file == file && n.name == name) {
-                out.push(NamedCrc { file, name, md5: Some(md5) });
-            }
-        }
-    }
-    out.truncate(CRC_FILES_CAP);
-    out
-}
-
-/// Whether a set of `id` gives `file` (by size and CRC) another whole-file MD5 than `md5`.
-fn md5_differs(conn: &Connection, id: i64, file: FileCrc, md5: Option<&[u8]>) -> bool {
-    let Some(md5) = md5 else { return false };
-    let s = store::shard_of_id(id);
-    let sql = format!(
-        "select 1 from s{s}.par2_files where release_id = ?1 and bound = 1 and size = ?2 and crc32 = ?3 and md5 != ?4"
-    );
-    conn.prepare_cached(&sql)
-        .and_then(|mut q| q.exists(rusqlite::params![id, file.size, i64::from(file.crc32), md5]))
-        .unwrap_or(false)
-}
-
-/// A release's probe, read through `conn` with the shards attached.
-fn probe_in(conn: &Connection, release_id: i64) -> Option<ProbeInfo> {
-    let s = store::shard_of_id(release_id);
-    let sql = format!("select info from s{s}.release_probe where release_id = ?1");
-    let info: String = conn.prepare_cached(&sql).ok()?.query_row([release_id], |r| r.get(0)).optional().ok()??;
-    serde_json::from_str(&info).ok()
-}
-
-/// The other releases that hold `file`, each with the name it has there: a probed file of the same size and CRC
-/// (under its posted name), or a file a bound PAR2 set lists with them (under the set's name). Shown releases only,
-/// newest first, at most `DONORS_CAP`.
-pub fn crc_donors(conn: &Connection, own: i64, file: FileCrc, md5: Option<&[u8]>) -> Vec<(i64, String)> {
-    let mut out: Vec<(i64, String)> = Vec::new();
-    for s in 0..store::SHARDS {
-        let probed = format!(
-            "select k.release_id from s{s}.release_keys k join s{s}.releases r on r.id = k.release_id
-             where k.file_crc = ?1 and k.release_id != ?2 and not atlas_blocked(r.group_name)
-             order by k.release_id desc limit ?3"
-        );
-        if let Ok(mut q) = conn.prepare_cached(&probed)
-            && let Ok(rows) = q.query_map(rusqlite::params![file.key(), own, DONORS_CAP], |r| r.get::<_, i64>(0))
-        {
-            for id in rows.flatten().collect::<Vec<_>>() {
-                // the key is a hash: the donor's own probe must say the same size and CRC, and name the file
-                if let Some(probe) = probe_in(conn, id)
-                    && probe_file(&probe) == Some(file)
-                    && !md5_differs(conn, id, file, md5)
-                    && let Some(name) = probe.file
-                {
-                    out.push((id, name));
-                }
-            }
-        }
-        let described = format!(
-            "select distinct p.release_id, p.name from s{s}.par2_files p join s{s}.releases r on r.id = p.release_id
-             where p.bound = 1 and p.size = ?1 and p.crc32 = ?2 and p.release_id != ?3
-               and (?5 is null or p.md5 = ?5) and not atlas_blocked(r.group_name)
-             order by p.release_id desc limit ?4"
-        );
-        if let Ok(mut q) = conn.prepare_cached(&described)
-            && let Ok(rows) = q
-                .query_map(rusqlite::params![file.size, i64::from(file.crc32), own, DONORS_CAP, md5], |r| {
-                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-                })
-        {
-            out.extend(rows.flatten());
-        }
-    }
-    out.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-    out.dedup();
-    out.truncate(DONORS_CAP as usize);
-    out
-}
-
-/// The PAR2 set ids a release's files are described by, at most `SETS_CAP`; none on a shard without the table yet.
-pub fn par2_sets(shard: &Connection, release_id: i64) -> rusqlite::Result<Vec<Vec<u8>>> {
-    let Ok(mut q) = shard.prepare_cached(
-        "select distinct set_id from par2_files where release_id = ?1 and bound = 1 order by set_id limit ?2",
-    ) else {
-        return Ok(Vec::new());
-    };
-    q.query_map(rusqlite::params![release_id, SETS_CAP as i64], |r| r.get(0))?.collect()
-}
-
-/// The `release_keys` row a release has. None: no row.
-pub(crate) fn stored(shard: &Connection, release_id: i64) -> rusqlite::Result<Option<Keys>> {
-    shard
-        .prepare_cached(
-            "select account, host, layout, lines, file_crc, body_crc, video, audio, mux, encode, thread, subs, fonts,
-             chapters, volumes from release_keys where release_id = ?1",
-        )?
-        .query_row([release_id], |r| {
-            Ok(Keys {
-                account: r.get(0)?,
-                host: r.get(1)?,
-                layout: r.get(2)?,
-                lines: r.get(3)?,
-                file_crc: r.get(4)?,
-                body_crc: r.get(5)?,
-                video: r.get(6)?,
-                audio: r.get(7)?,
-                mux: r.get(8)?,
-                encode: r.get(9)?,
-                thread: r.get(10)?,
-                subs: r.get(11)?,
-                fonts: r.get(12)?,
-                chapters: r.get(13)?,
-                volumes: r.get(14)?,
-            })
-        })
-        .optional()
-}
-
-/// The query over one shard (`s{shard}.`) for the releases other than `?1` sharing `kind`, newest first, with the
-/// values bound from `?3` on, at most `?2`; and how many values it takes. Only releases the pages would show count:
-/// one deleted or in a blocked group (`atlas_blocked`) is left out before the limit, soo the count and the list agree.
-fn others_sql(kind: Kind, shard: usize, sets: usize) -> String {
-    if matches!(kind, Kind::FileCrc | Kind::InnerFile) {
-        // `sets` files: their keys first (?3..), then each one's size and CRC; a file posted bare, one a PAR2 set
-        // describes and one inside an archive are the same bytes either way
-        let keys: Vec<String> = (0..sets).map(|i| format!("?{}", i + 3)).collect();
-        let pairs: Vec<String> =
-            (0..sets).map(|i| format!("(size = ?{} and crc32 = ?{})", sets + 3 + 2 * i, sets + 4 + 2 * i)).collect();
-        return format!(
-            "select distinct k.release_id from (
-                 select release_id from s{shard}.release_keys where file_crc in ({keys})
-                 union select release_id from s{shard}.par2_files where bound = 1 and ({pairs})
-                 union select release_id from s{shard}.rev_volumes where {pairs}
-                 union select release_id from s{shard}.archive_inner_files
-                     where source in {ARCHIVE_SOURCES} and crc32 is not null and ({pairs})
-             ) k join s{shard}.releases r on r.id = k.release_id
-             where k.release_id != ?1 and not atlas_blocked(r.group_name)
-             order by k.release_id desc limit ?2",
-            keys = keys.join(", "),
-            pairs = pairs.join(" or ")
-        );
-    }
-    if let Some(col) = kind.archive_column() {
-        return format!(
-            "select distinct k.release_id from s{shard}.archive_release k join s{shard}.releases r on r.id = k.release_id
-             where k.{col} = ?3 and k.release_id != ?1 and not atlas_blocked(r.group_name)
-             order by k.release_id desc limit ?2"
-        );
-    }
-    let (from, matches) = match kind.column() {
-        Some(col) => (format!("s{shard}.release_keys k"), format!("k.{col} = ?3")),
-        None if kind == Kind::Par2 => {
-            let marks: Vec<String> = (0..sets).map(|i| format!("?{}", i + 3)).collect();
-            (format!("s{shard}.par2_files k"), format!("k.set_id in ({}) and k.bound = 1", marks.join(", ")))
-        }
-        None => (format!("s{shard}.release_probe k"), "k.moviehash = ?3".to_string()),
-    };
-    format!(
-        "select distinct k.release_id from {from} join s{shard}.releases r on r.id = k.release_id
-         where {matches} and k.release_id != ?1 and not atlas_blocked(r.group_name)
-         order by k.release_id desc limit ?2"
-    )
-}
-
-fn values(lookup: &Lookup, kind: Kind) -> Vec<rusqlite::types::Value> {
-    use rusqlite::types::Value;
-    match kind {
-        Kind::Par2 => lookup.par2_sets.iter().map(|s| Value::Blob(s.clone())).collect(),
-        Kind::MovieHash => lookup.moviehash.iter().map(|h| Value::Text(h.clone())).collect(),
-        Kind::FileCrc | Kind::InnerFile => {
-            let files = if kind == Kind::FileCrc { &lookup.files } else { &lookup.inner_files };
-            files
-                .iter()
-                .map(|f| Value::Integer(f.key()))
-                .chain(files.iter().flat_map(|f| [Value::Integer(f.size), Value::Integer(i64::from(f.crc32))]))
-                .collect()
-        }
-        Kind::ArchiveTwin | Kind::Owner | Kind::Zone => {
-            lookup.archive_key(kind).map(Value::Integer).into_iter().collect()
-        }
-        _ => lookup.keys.get(kind).map(Value::Integer).into_iter().collect(),
-    }
-}
-
-/// What `others_sql` is told it binds: the file kinds bind three values a file.
-fn binds(kind: Kind, values: usize) -> usize {
-    if matches!(kind, Kind::FileCrc | Kind::InnerFile) { values / 3 } else { values }
-}
-
-/// The releases other than `own` that share `kind` with it, over every shard of `conn` (the main database with
-/// the shards attached), newest first, at most `limit`. A shard without the table yet has none.
-pub fn others(conn: &Connection, own: i64, lookup: &Lookup, kind: Kind, limit: i64) -> Vec<i64> {
-    if kind == Kind::AudioPrint {
-        return if lookup.audio_print { crate::probe::audio_print::others(conn, own, limit) } else { Vec::new() };
-    }
-    let bound = values(lookup, kind);
-    if bound.is_empty() || limit <= 0 {
-        return Vec::new();
-    }
-    let mut found = Vec::new();
-    for shard in 0..store::SHARDS {
-        let sql = others_sql(kind, shard, binds(kind, bound.len()));
-        let Ok(mut q) = conn.prepare(&sql) else { continue };
-        let args = [rusqlite::types::Value::Integer(own), rusqlite::types::Value::Integer(limit)]
-            .into_iter()
-            .chain(bound.iter().cloned());
-        let Ok(rows) = q.query_map(params_from_iter(args), |r| r.get::<_, i64>(0)) else { continue };
-        found.extend(rows.filter_map(Result::ok));
-    }
-    // ids grow with time, within a shard and across them closely enough
-    found.sort_unstable_by(|a, b| b.cmp(a));
-    found.dedup();
-    found.truncate(limit as usize);
-    found
-}
-
-/// How many releases other than `own` share `kind` with it, up to `COUNT_CAP`.
-pub fn count_others(conn: &Connection, own: i64, lookup: &Lookup, kind: Kind) -> i64 {
-    if kind == Kind::AudioPrint {
-        return others(conn, own, lookup, kind, COUNT_CAP).len() as i64;
-    }
-    let bound = values(lookup, kind);
-    if bound.is_empty() {
-        return 0;
-    }
-    let mut total = 0;
-    for shard in 0..store::SHARDS {
-        let sql = format!("select count(*) from ({})", others_sql(kind, shard, binds(kind, bound.len())));
-        let Ok(mut q) = conn.prepare(&sql) else { continue };
-        let args = [rusqlite::types::Value::Integer(own), rusqlite::types::Value::Integer(COUNT_CAP - total)]
-            .into_iter()
-            .chain(bound.iter().cloned());
-        total += q.query_row(params_from_iter(args), |r| r.get::<_, i64>(0)).unwrap_or(0);
-        if total >= COUNT_CAP {
-            return COUNT_CAP;
-        }
-    }
-    total
-}
-
-// ---------------------------------------------------------------- the report
-
-/// What `--crc-links` found over its sample.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct CrcReport {
     pub sampled: i64,
@@ -1370,85 +715,6 @@ pub struct CrcReport {
     pub body_linked: i64,
 }
 
-/// Counts, over the newest `per_shard` probed releases of each shard, how many the file and first-article keys
-/// link to another release, and how many of those no PAR2 set links. Reads only.
-pub fn crc_report(conn: &Connection, main: &std::path::Path, per_shard: i64) -> rusqlite::Result<CrcReport> {
-    let mut r = CrcReport::default();
-    for n in 0..store::SHARDS {
-        let Ok(shard) = crate::db::open_shard(&store::shard_path(main, n)) else { continue };
-        let ids: Vec<i64> =
-            match shard.prepare("select release_id from release_probe order by release_id desc limit ?1") {
-                Ok(mut q) => q.query_map([per_shard], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?,
-                Err(_) => continue,
-            };
-        for id in ids {
-            let lookup = read_lookup(&shard, id, None, None)?;
-            r.sampled += 1;
-            if lookup.has(Kind::FileCrc) {
-                r.with_file += 1;
-                if count_others(conn, id, &lookup, Kind::FileCrc) > 0 {
-                    r.file_linked += 1;
-                    if count_others(conn, id, &lookup, Kind::Par2) == 0 {
-                        r.file_only += 1;
-                    }
-                }
-            }
-            if lookup.has(Kind::BodyCrc) {
-                r.with_body += 1;
-                if count_others(conn, id, &lookup, Kind::BodyCrc) > 0 {
-                    r.body_linked += 1;
-                }
-            }
-        }
-    }
-    Ok(r)
-}
-
-/// `--crc-links [--sample N]`: the report over the newest N probed releases (20,000 by default).
-pub fn run_report(args: &[String]) -> i32 {
-    let sample = args
-        .iter()
-        .position(|a| a == "--sample")
-        .and_then(|i| args.get(i + 1))
-        .and_then(|n| n.parse::<i64>().ok())
-        .unwrap_or(20_000)
-        .max(store::SHARDS as i64);
-    let main = crate::paths::database();
-    let conn = match crate::db::open_with_shards(&main) {
-        Ok(c) => c,
-        Err(e) => {
-            println!("couldnt open {}: {e}", main.display());
-            return 1;
-        }
-    };
-    match crc_report(&conn, &main, sample / store::SHARDS as i64) {
-        Ok(r) => {
-            let pct = |n: i64, of: i64| if of > 0 { 100.0 * n as f64 / of as f64 } else { 0.0 };
-            println!("newest probed releases looked at   {:>10}", r.sampled);
-            println!("  with a file CRC (1 MiB or more)  {:>10}", r.with_file);
-            println!(
-                "  sharing it with another release  {:>10}  ({:.1}% of those with one)",
-                r.file_linked,
-                pct(r.file_linked, r.with_file)
-            );
-            println!("  of those, with no PAR2 set link  {:>10}  (no shared PAR2 set linked them)", r.file_only);
-            println!("  with a first-article body CRC    {:>10}", r.with_body);
-            println!(
-                "  sharing it with another release  {:>10}  ({:.1}% of those with one)",
-                r.body_linked,
-                pct(r.body_linked, r.with_body)
-            );
-            0
-        }
-        Err(e) => {
-            println!("couldnt read the shards: {e}");
-            1
-        }
-    }
-}
-
-// ---------------------------------------------------------------- the step
-
 /// Keeps `release_keys` up to date: after a probe (which asks for it again), and as a release grows, for the Lines
 /// key. A release with no key has no row.
 #[derive(Default)]
@@ -1457,30 +723,11 @@ pub struct KeysStep {
 }
 
 impl KeysStep {
-    /// The salt, read once from shard 0, beside the shard `conn` is on: the one the pages read.
+    /// The original native owner reads and verifies the catalog salt; the Step retains that value.
     fn salt(&self, data: &crate::postprocess::data::StepData<'_>) -> Result<i64, StepError> {
         let found = data.key_salt(self.salt.get().copied())?;
         Ok(*self.salt.get_or_init(|| found))
     }
-}
-
-/// The existing legacy shard-zero salt read/create path, available only through checked legacy Step data.
-pub(crate) fn legacy_step_salt(conn: &Connection, cached: Option<i64>) -> Result<i64, StepError> {
-    if let Some(salt) = cached { return Ok(salt); }
-    let none = || StepError::Retry("the key salt could not be read or made".into());
-    let zero = conn.path().and_then(shard_zero).ok_or_else(none)?;
-    let shard = crate::db::open_shard(&zero).map_err(|error| StepError::Retry(error.to_string()))?;
-    salt_in(&shard, "meta").ok_or_else(none)
-}
-
-/// Shard 0's file, from another shard's (`atlas.s3.db` gives `atlas.s0.db`): `store::shard_path`'s names.
-fn shard_zero(path: &str) -> Option<std::path::PathBuf> {
-    let path = std::path::Path::new(path);
-    let name = path.file_name()?.to_str()?;
-    let stem = name.strip_suffix(".db")?;
-    let (base, shard) = stem.rsplit_once(".s")?;
-    shard.parse::<usize>().ok()?;
-    Some(path.with_file_name(format!("{base}.s0.db")))
 }
 
 impl Step for KeysStep {
@@ -1561,7 +808,7 @@ mod tests {
     #[test]
     fn subtitle_font_and_chapter_keys_need_enough_to_tell_releases_apart() {
         use crate::probe::media::{Attachment, Chapter, MediaInfo, SubtitleTrack};
-        let mut m = MediaInfo { header_complete: true, attachments_complete:true, ..Default::default() };
+        let mut m = MediaInfo { header_complete: true, attachments_complete: true, ..Default::default() };
         assert_eq!((subs_text(&m), fonts_text(&m), chapters_text(&m)), (None, None, None));
         m.subtitles = vec![
             SubtitleTrack { codec: "S_TEXT/UTF8".into(), ..Default::default() },
@@ -1578,7 +825,7 @@ mod tests {
         m.header_complete = false;
         assert_eq!(fonts_text(&m), None, "a header cut short may list only some");
         let at = |secs: &[f64]| secs.iter().map(|s| Chapter { start_secs: *s, name: None }).collect::<Vec<_>>();
-        m.chapters_complete=true;
+        m.chapters_complete = true;
         m.chapters = at(&[0.0, 312.5]);
         assert_eq!(chapters_text(&m), None);
         m.chapters = at(&[0.0, 300.0, 600.0, 900.0, 1000.0]);
@@ -1592,11 +839,17 @@ mod tests {
 
     #[test]
     fn font_names_cannot_alias_key_field_or_inventory_boundaries() {
-        use crate::probe::media::{Attachment,MediaInfo};
-        let font=|name:&str,size|Attachment {name:name.into(),size,..Default::default()};
-        let a=MediaInfo {header_complete:true,attachments_complete:true,attachments:vec![font("a.ttf",10),font("b.ttf",20),font("c.ttf",30)],..Default::default()};
-        let b=MediaInfo {attachments:vec![font("a.ttf:10,b.ttf",20),font("c.ttf",30)],..a.clone()};
-        assert!(fonts_text(&a).is_some());assert!(fonts_text(&b).is_none(),"retained names cannot concatenate into another inventory's accepted key");
+        use crate::probe::media::{Attachment, MediaInfo};
+        let font = |name: &str, size| Attachment { name: name.into(), size, ..Default::default() };
+        let a = MediaInfo {
+            header_complete: true,
+            attachments_complete: true,
+            attachments: vec![font("a.ttf", 10), font("b.ttf", 20), font("c.ttf", 30)],
+            ..Default::default()
+        };
+        let b = MediaInfo { attachments: vec![font("a.ttf:10,b.ttf", 20), font("c.ttf", 30)], ..a.clone() };
+        assert!(fonts_text(&a).is_some());
+        assert!(fonts_text(&b).is_none(), "retained names cannot concatenate into another inventory's accepted key");
     }
 
     #[test]
@@ -1655,7 +908,6 @@ mod tests {
         assert_eq!(keys.audio, Some(as_key(digest8(b"abc"))));
         assert_eq!(keys_of(Some(&probe(&[None, Some("0123456789abcdef")])), &[], None, None).audio, None);
         assert_eq!(keys_of(Some(&probe(&[])), &[], None, None).audio, None);
-        assert!(others_sql(Kind::Audio, 2, 1).contains("k.audio = ?3"));
         assert_eq!(Kind::parse("audio"), Some(Kind::Audio));
     }
 
@@ -1674,21 +926,6 @@ mod tests {
         assert_eq!(hex16(keys.video.unwrap()), "ba7816bf8f01cfea", "the page prints what the probe kept");
         assert_eq!(keys_of(Some(&probe(None)), &[], None, None).video, None);
         assert_eq!(keys_of(Some(&probe(Some("nothex"))), &[], None, None).video, None);
-        assert!(
-            others_sql(Kind::Video, 2, 1).contains("s2.release_keys k")
-                && others_sql(Kind::Video, 2, 1).contains("k.video = ?3")
-        );
-    }
-
-    #[test]
-    fn shard_zero_sits_beside_any_shard() {
-        let main = std::path::Path::new("/data/atlas.db");
-        for n in 0..store::SHARDS {
-            let shard = store::shard_path(main, n);
-            assert_eq!(shard_zero(shard.to_str().unwrap()), Some(store::shard_path(main, 0)));
-        }
-        assert_eq!(shard_zero("/data/atlas.db"), None);
-        assert_eq!(shard_zero(""), None);
     }
 
     #[test]
@@ -1698,50 +935,6 @@ mod tests {
             assert!(!kind.about().is_empty() && !kind.heading().is_empty());
         }
         assert_eq!(Kind::parse("raw"), None);
-    }
-
-    #[test]
-    fn par2_lookups_bind_each_set() {
-        let sql = others_sql(Kind::Par2, 3, 2);
-        assert!(sql.contains("s3.par2_files k") && sql.contains("set_id in (?3, ?4)"), "{sql}");
-        assert!(sql.contains("join s3.releases r") && sql.contains("not atlas_blocked(r.group_name)"), "{sql}");
-        assert!(others_sql(Kind::Lines, 0, 1).contains("s0.release_keys k join s0.releases r"));
-        assert!(others_sql(Kind::Lines, 0, 1).contains("k.lines = ?3"));
-        assert!(others_sql(Kind::MovieHash, 7, 1).contains("k.moviehash = ?3"));
-    }
-
-    #[test]
-    fn only_bound_par2_files_of_shown_releases_match() {
-        let conn = Connection::open_in_memory().unwrap();
-        crate::filters::register_sql(&conn).unwrap();
-        conn.execute("attach ':memory:' as s0", []).unwrap();
-        conn.execute_batch(&crate::archive::store::PAR2_FILES.create.replace("par2_files (", "s0.par2_files ("))
-            .unwrap();
-        conn.execute_batch("create table s0.releases (id integer primary key, group_name text not null)").unwrap();
-        let blocked = "alt.binaries.pictures.erotica.teen";
-        assert!(crate::filters::group_blocked(blocked));
-        let set = vec![7u8; 16];
-        // 1 asks; 2 shares it; 3 only holds an unbound copy; 4 is in a blocked group; 5 has no release row
-        for (release, bound, group) in
-            [(1, 1, Some("a.b.c")), (2, 1, Some("a.b.c")), (3, 0, Some("a.b.c")), (4, 1, Some(blocked)), (5, 1, None)]
-        {
-            if let Some(group) = group {
-                conn.execute(
-                    "insert into s0.releases (id, group_name) values (?1, ?2)",
-                    rusqlite::params![release, group],
-                )
-                .unwrap();
-            }
-            conn.execute(
-                "insert into s0.par2_files (release_id, file_id, set_id, md5, md5_16k, size, name, bound)
-                 values (?1, ?2, ?3, x'', x'', 1, 'a.mkv', ?4)",
-                rusqlite::params![release, vec![release as u8], set, bound],
-            )
-            .unwrap();
-        }
-        let lookup = Lookup { par2_sets: vec![set], ..Default::default() };
-        assert_eq!(others(&conn, 1, &lookup, Kind::Par2, 1), vec![2], "the limit counts only the shown ones");
-        assert_eq!(count_others(&conn, 1, &lookup, Kind::Par2), 1);
     }
 
     #[test]
@@ -1802,177 +995,6 @@ mod tests {
     }
 
     #[test]
-    fn a_rev_volume_finds_the_same_rar_volume_by_size_and_crc() {
-        let volume = FileCrc::new(50 << 20, 0xdead_beef).unwrap();
-        // the release's own shard: what it can be looked up by
-        let shard = Connection::open_in_memory().unwrap();
-        shard.execute_batch(crate::archive::store::PAR2_FILES.create).unwrap();
-        shard.execute_batch(crate::archive::rev::REV_VOLUMES.create).unwrap();
-        let header = crate::archive::rev::header_bytes(&[(50 << 20, 0xdead_beef), (1_000, 0x1111_1111)], 1, 2);
-        let h = crate::archive::rev::parse(&header).unwrap();
-        for w in crate::archive::rev::writes(1, &h.volumes) {
-            shard.execute(w.sql, params_from_iter(w.params)).unwrap();
-        }
-        assert_eq!(crc_files(&shard, 1, None).unwrap(), vec![volume], "the small volume is left out");
-
-        // every shard: who else has it
-        let conn = Connection::open_in_memory().unwrap();
-        crate::filters::register_sql(&conn).unwrap();
-        conn.execute("attach ':memory:' as s0", []).unwrap();
-        conn.execute_batch(&crate::archive::store::PAR2_FILES.create.replace("par2_files (", "s0.par2_files ("))
-            .unwrap();
-        conn.execute_batch(&RELEASE_KEYS.create.replace("release_keys (", "s0.release_keys (")).unwrap();
-        conn.execute_batch(INNER_FILES_FIXTURE).unwrap();
-        conn.execute_batch(&crate::archive::rev::REV_VOLUMES.create.replace("rev_volumes (", "s0.rev_volumes ("))
-            .unwrap();
-        for (_, index) in crate::archive::rev::REV_VOLUMES.indexes {
-            conn.execute_batch(&index.replacen("exists ", "exists s0.", 1)).unwrap();
-        }
-        conn.execute_batch("create table s0.releases (id integer primary key, group_name text not null)").unwrap();
-        for id in 1..=4 {
-            conn.execute("insert into s0.releases (id, group_name) values (?1, 'a.b.c')", [id]).unwrap();
-        }
-        // 1 asks; 2's PAR2 set lists the volume; 3's .rev names it too; 4's .rev names it at another size
-        conn.execute(
-            "insert into s0.par2_files (release_id, file_id, set_id, md5, md5_16k, size, name, crc32, bound)
-             values (2, x'01', x'02', x'', x'', ?1, 'x.part01.rar', ?2, 1)",
-            rusqlite::params![volume.size, i64::from(volume.crc32)],
-        )
-        .unwrap();
-        for (id, size) in [(1, volume.size), (3, volume.size), (4, volume.size + 1)] {
-            conn.execute(
-                "insert into s0.rev_volumes (release_id, volume, size, crc32) values (?1, 0, ?2, ?3)",
-                rusqlite::params![id, size, i64::from(volume.crc32)],
-            )
-            .unwrap();
-        }
-        let lookup = Lookup { files: vec![volume], ..Default::default() };
-        assert_eq!(others(&conn, 1, &lookup, Kind::FileCrc, 10), vec![3, 2]);
-        assert_eq!(count_others(&conn, 1, &lookup, Kind::FileCrc), 2);
-        // and the other way: the PAR2 set's release finds both .rev releases
-        assert_eq!(others(&conn, 2, &lookup, Kind::FileCrc, 10), vec![3, 1]);
-        let plan: Vec<String> = conn
-            .prepare(&format!("explain query plan {}", others_sql(Kind::FileCrc, 0, 1)))
-            .unwrap()
-            .query_map(rusqlite::params![1, 10, volume.key(), volume.size, i64::from(volume.crc32)], |r| r.get(3))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
-        assert!(plan.iter().any(|p| p.contains("rev_volumes_crc")), "the .rev side seeks size and CRC: {plan:?}");
-    }
-
-    #[test]
-    fn a_file_matches_by_its_key_or_a_par2_file_list() {
-        let conn = Connection::open_in_memory().unwrap();
-        crate::filters::register_sql(&conn).unwrap();
-        conn.execute("attach ':memory:' as s0", []).unwrap();
-        conn.execute_batch(&crate::archive::store::PAR2_FILES.create.replace("par2_files (", "s0.par2_files ("))
-            .unwrap();
-        conn.execute_batch(&RELEASE_KEYS.create.replace("release_keys (", "s0.release_keys (")).unwrap();
-        conn.execute_batch(&crate::archive::rev::REV_VOLUMES.create.replace("rev_volumes (", "s0.rev_volumes ("))
-            .unwrap();
-        conn.execute_batch(INNER_FILES_FIXTURE).unwrap();
-        conn.execute_batch("create table s0.releases (id integer primary key, group_name text not null)").unwrap();
-        let blocked = "alt.binaries.pictures.erotica.teen";
-        for (id, group) in [(1, "a.b.c"), (2, "a.b.c"), (3, "a.b.d"), (4, "a.b.c"), (5, blocked), (6, "a.b.c")] {
-            conn.execute("insert into s0.releases (id, group_name) values (?1, ?2)", rusqlite::params![id, group])
-                .unwrap();
-        }
-        let file = FileCrc::new(8 << 20, 0xfeed_beef).unwrap();
-        // 1 asks; 2 probed the same file; 3's PAR2 set lists it; 4's PAR2 copy is unbound; 5 is blocked;
-        // 6 has the same CRC at another size
-        for (id, key) in [(1, file.key()), (2, file.key()), (5, file.key())] {
-            conn.execute(
-                "insert into s0.release_keys (release_id, file_crc) values (?1, ?2)",
-                rusqlite::params![id, key],
-            )
-            .unwrap();
-        }
-        for (id, size, bound) in [(3, 8i64 << 20, 1), (4, 8 << 20, 0), (6, 9 << 20, 1)] {
-            conn.execute(
-                "insert into s0.par2_files (release_id, file_id, set_id, md5, md5_16k, size, name, crc32, bound)
-                 values (?1, x'01', x'02', x'', x'', ?2, 'a.mkv', ?3, ?4)",
-                rusqlite::params![id, size, i64::from(0xfeed_beef_u32), bound],
-            )
-            .unwrap();
-        }
-        for (_, index) in crate::archive::store::PAR2_FILES.indexes {
-            conn.execute_batch(&index.replacen("exists ", "exists s0.", 1)).unwrap();
-        }
-        let lookup = Lookup { files: vec![file], ..Default::default() };
-        assert!(lookup.has(Kind::FileCrc));
-        let plan: Vec<String> = conn
-            .prepare(&format!("explain query plan {}", others_sql(Kind::FileCrc, 0, 1)))
-            .unwrap()
-            .query_map(rusqlite::params![1, 10, file.key(), file.size, i64::from(file.crc32)], |r| r.get(3))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
-        assert!(plan.iter().any(|p| p.contains("par2_files_crc")), "the PAR2 side seeks size and CRC: {plan:?}");
-        assert_eq!(others(&conn, 1, &lookup, Kind::FileCrc, 10), vec![3, 2]);
-        assert_eq!(count_others(&conn, 1, &lookup, Kind::FileCrc), 2);
-        let none = Lookup::default();
-        assert!(others(&conn, 1, &none, Kind::FileCrc, 10).is_empty());
-
-        // 6 also holds the file inside a RAR: the file key and the inner-file key find it there, and a PAR2 or NZB
-        // list of the same size and CRC (sources 1 and 5) isn't an archive's header
-        for (id, seq, source) in [(6, 1, crate::archive::store::SOURCE_RAR), (4, 2, crate::archive::store::SOURCE_PAR2)]
-        {
-            conn.execute(
-                "insert into s0.archive_inner_files (release_id, seq, name, size, source, crc32) values (?1, ?2, 'a.mkv', ?3, ?4, ?5)",
-                rusqlite::params![id, seq, file.size, source, i64::from(file.crc32)],
-            )
-            .unwrap();
-        }
-        assert_eq!(others(&conn, 1, &lookup, Kind::FileCrc, 10), vec![6, 3, 2]);
-        let inner = Lookup { inner_files: vec![file], ..Default::default() };
-        assert!(inner.has(Kind::InnerFile) && !inner.has(Kind::FileCrc));
-        assert_eq!(others(&conn, 1, &inner, Kind::InnerFile, 10), vec![6, 3, 2], "a bare, a PAR2 and an archived copy");
-    }
-
-    /// `archive_inner_files` as a shard has it, on `s0`, without the trigger on `releases`.
-    const INNER_FILES_FIXTURE: &str = "create table s0.archive_inner_files (
-        release_id INTEGER NOT NULL, seq INTEGER NOT NULL, name TEXT NOT NULL, size INTEGER, source INTEGER NOT NULL,
-        crc32 INTEGER, mtime INTEGER, host_os INTEGER, primary key (release_id, seq)) without rowid";
-
-    #[test]
-    fn an_archives_own_keys_match_only_their_own_column() {
-        let conn = Connection::open_in_memory().unwrap();
-        crate::filters::register_sql(&conn).unwrap();
-        conn.execute("attach ':memory:' as s0", []).unwrap();
-        conn.execute_batch(
-            "create table s0.archive_release (release_id INTEGER PRIMARY KEY, password INTEGER NOT NULL,
-                packer TEXT, twin_key INTEGER, owner_key INTEGER, zone_key INTEGER);
-             create table s0.releases (id integer primary key, group_name text not null)",
-        )
-        .unwrap();
-        // 1 asks; 2 is the same archive; 3 has the same owner only; 4 the same zone only
-        for (id, twin, owner, zone) in [(1, 10, 20, 30), (2, 10, 21, 31), (3, 11, 20, 32), (4, 12, 22, 30)] {
-            conn.execute("insert into s0.releases (id, group_name) values (?1, 'a.b.c')", [id]).unwrap();
-            conn.execute(
-                "insert into s0.archive_release (release_id, password, twin_key, owner_key, zone_key) values (?1, 0, ?2, ?3, ?4)",
-                rusqlite::params![id, twin, owner, zone],
-            )
-            .unwrap();
-        }
-        let lookup = Lookup {
-            archive: crate::archive::store::ArchiveKeys {
-                packer: None,
-                twin_key: Some(10),
-                owner_key: Some(20),
-                zone_key: Some(30),
-            },
-            ..Default::default()
-        };
-        assert_eq!(others(&conn, 1, &lookup, Kind::ArchiveTwin, 10), vec![2]);
-        assert_eq!(others(&conn, 1, &lookup, Kind::Owner, 10), vec![3]);
-        assert_eq!(others(&conn, 1, &lookup, Kind::Zone, 10), vec![4]);
-        assert!(!Lookup::default().has(Kind::ArchiveTwin));
-        assert_eq!(archive_keys(&conn, 2).twin_key, Some(10), "read back from the shard's table");
-        assert_eq!(archive_keys(&conn, 99), crate::archive::store::ArchiveKeys::default());
-    }
-
-    #[test]
     fn the_mux_encode_and_thread_keys_need_their_parts() {
         let mut media = crate::probe::media::MediaInfo {
             segment_uid: Some("0102030405060708090a0b0c0d0e0f10".into()),
@@ -1996,64 +1018,5 @@ mod tests {
         media.segment_uid = Some("00000000000000000000000000000000".into());
         media.duration_secs = None;
         assert_eq!((mux_text(&media), encode_text(&media)), (None, None), "no UID, no length: no key");
-    }
-
-    #[test]
-    fn a_file_read_whole_folds_to_its_crc() {
-        let dir = std::env::temp_dir().join(format!("atlas-fold-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let main = dir.join("atlas.db");
-        crate::db::create_db_at(&main).unwrap();
-        let shard = crate::db::open_shard(&store::shard_path(&main, 0)).unwrap();
-        // three articles of 1 MiB, 1 MiB and 512 KiB
-        let parts: Vec<Vec<u8>> =
-            [1usize << 20, 1 << 20, 1 << 19].iter().enumerate().map(|(i, n)| vec![i as u8 + 7; *n]).collect();
-        let whole: Vec<u8> = parts.concat();
-        shard
-            .execute(
-                "insert into files (id, release_id, filename, expected, seen) values (1, 8, 'a.mkv', 3, x'0e')",
-                [],
-            )
-            .unwrap();
-        shard
-            .execute(
-                "insert into files (id, release_id, filename, expected, seen) values (2, 8, 'b.mkv', 3, x'0e')",
-                [],
-            )
-            .unwrap();
-        for (file, part) in [(1, 1), (1, 2), (1, 3), (2, 1), (2, 2), (2, 3)] {
-            shard
-                .execute(
-                    "insert into segments (file_id, local, domain, part, bytes) values (?1, ?2, 0, ?3, 1000)",
-                    rusqlite::params![file, format!("R<{file}.{part}@x>").into_bytes(), part],
-                )
-                .unwrap();
-        }
-        let ids = |file| store::file_segments(&shard, file, &store::SegmentPick::Parts(vec![1, 2, 3])).unwrap();
-        // every part of a.mkv read; b.mkv misses its last
-        for s in ids(1) {
-            let data = &parts[s.part.unwrap() as usize - 1];
-            shard
-                .execute(
-                    "insert into segment_crc (release_id, message_id, decoded, crc32) values (8, ?1, ?2, ?3)",
-                    rusqlite::params![s.message_id, data.len() as i64, i64::from(crate::archive::crc32(data))],
-                )
-                .unwrap();
-        }
-        for s in ids(2).into_iter().filter(|s| s.part != Some(3)) {
-            shard
-                .execute(
-                    "insert into segment_crc (release_id, message_id, decoded, crc32) values (8, ?1, 1, 1)",
-                    [s.message_id],
-                )
-                .unwrap();
-        }
-        let folded = folded_files(&shard, 8);
-        assert_eq!(folded, vec![FileCrc::new(whole.len() as i64, crate::archive::crc32(&whole)).unwrap()]);
-        assert_eq!(read_keys(&shard, 8, None, None).unwrap().file_crc, Some(folded[0].key()));
-        assert!(crc_files(&shard, 8, None).unwrap().contains(&folded[0]));
-        assert!(folded_files(&shard, 16).is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
