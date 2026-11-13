@@ -1,6 +1,12 @@
 //! Frozen retained v1 digest atoms. These are not executable SQL or caller input.
 //! Exact atom/field bytes remain stable while storage implementations retire.
 
+macro_rules! lead_now {
+    ($lead:literal) => {
+        concat!("coalesce((select n.lead_id from upload_link n where n.release_id = ", $lead, "), ", $lead, ")")
+    };
+}
+
 macro_rules! set_vouches_sql {
     () => {
         "exists (select 1 from par2_files where release_id = ?1 and complete = 1)
