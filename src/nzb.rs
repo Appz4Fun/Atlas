@@ -521,7 +521,7 @@ fn listed(articles: &[ArticleRow]) -> Vec<ListedFile> {
 /// The files the native release's own NZB lists. None: no such release.
 pub fn file_list(release_id: i64) -> Result<Option<Vec<ListedFile>>> {
     let storage = crate::config::checked_storage_config().map_err(anyhow::Error::msg)?;
-    crate::metrics::timed("nzb.files", || crate::pg::fresh_nzb_tools::files(&storage, release_id))
+    crate::metrics::timed("nzb.file_list", || crate::pg::fresh_nzb_tools::files(&storage, release_id))
 }
 /// The articles of every file named `name` in the whole NZB of `articles`: the one file, or, in an upload linked by
 /// its PAR2 set, each row's file of that name, which the NZB keeps apart as `name #id` and a release page lists as one.
