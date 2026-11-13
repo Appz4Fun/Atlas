@@ -702,6 +702,79 @@ class DarwinProbeSettlementTests(unittest.TestCase):
         self.assertNotIn(("wait",), child.events)
 
 
+class DarwinTransitionalStateTests(unittest.TestCase):
+    """A real XNU ?Es row is parseable metadata, never terminal proof."""
+
+    Child = OwnedGroupLifetimeTests.Child
+    setUp = OwnedGroupLifetimeTests.setUp
+
+    def test_actual_unknown_exiting_row_is_parseable_but_neither_exited_nor_drained(self):
+        child = self.Child([])
+        child.pid = 75445
+        row = subprocess.CompletedProcess([], 0, stdout="75445 75445 ?Es \n")
+        with patch.object(guard.sys, "platform", "darwin"), \
+                patch.object(guard.subprocess, "run", return_value=row):
+            try:
+                rows = guard.owned_group_states(child, leader_only=True)
+            except RuntimeError:
+                self.fail("the observed Darwin ?Es token must parse without proving death")
+            self.assertEqual(rows, {75445: (75445, "?Es")})
+            self.assertFalse(guard.leader_has_exited(child))
+            self.assertFalse(guard.group_has_no_live_members(child))
+        self.assertIsNone(child.returncode)
+        # This exception is Darwin-only and leading-only; malformed fields and
+        # ordinary unknown tokens must not broaden their acceptance.
+        for platform, raw in (("linux", "75445 75445 ?Es\n"),
+                              ("darwin", "75445 75445 Z?Es\n"),
+                              ("darwin", "75445 75445 ??Es\n"),
+                              ("darwin", "75445 75445 ?Es!\n"),
+                              ("darwin", "75445 75445 ?Es extra\n")):
+            with self.subTest(platform=platform, raw=raw), \
+                    patch.object(guard.sys, "platform", platform), \
+                    patch.object(guard.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, stdout=raw)):
+                with self.assertRaises(RuntimeError):
+                    guard.owned_group_states(child, leader_only=True)
+
+    def test_unknown_exiting_state_needs_later_zombie_proof_within_existing_window(self):
+        child = self.Child([])
+        clock = [0.0]
+        rows = iter(("123 123 ?Es\n", "123 123 Zs\n"))
+        def inventory(command, **kwargs):
+            self.assertIsNone(child.returncode)
+            return subprocess.CompletedProcess(command, 0, stdout=next(rows))
+        def sleep(delay):
+            clock[0] += delay
+        with patch.object(guard.sys, "platform", "darwin"), \
+                patch.object(guard.subprocess, "run", side_effect=inventory) as read, \
+                patch.object(guard.os, "killpg", side_effect=PermissionError(errno.EPERM, "settling")) as send, \
+                patch.object(guard.time, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(guard.time, "sleep", side_effect=sleep):
+            self.assertFalse(guard.signal_owned_group(child, 0))
+        self.assertEqual(read.call_count, 2, "?Es cannot replace fresh all-Z proof")
+        send.assert_called_once_with(child.pid, 0)
+        self.assertGreater(clock[0], 0)
+        self.assertLessEqual(clock[0], .5)
+        self.assertIsNone(child.returncode)
+        self.assertEqual(child.events, [])
+
+    def test_permanent_unknown_exiting_state_never_qualifies_as_dead(self):
+        child = self.Child([])
+        clock = [0.0]
+        def sleep(delay):
+            clock[0] += delay
+        with patch.object(guard.sys, "platform", "darwin"), \
+                patch.object(guard.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, stdout="123 123 ?Es\n")), \
+                patch.object(guard.os, "killpg", side_effect=PermissionError(errno.EPERM, "denied")) as send, \
+                patch.object(guard.time, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(guard.time, "sleep", side_effect=sleep):
+            with self.assertRaises(PermissionError):
+                guard.signal_owned_group(child, 0)
+        self.assertLessEqual(clock[0], .5)
+        send.assert_called_once_with(child.pid, 0)
+        self.assertIsNone(child.returncode)
+        self.assertEqual(child.events, [])
+
+
 class SigchldPolicyTests(unittest.TestCase):
     """Unsafe child-reaping policies must be refused before any child is spawned."""
 
