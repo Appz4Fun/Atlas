@@ -151,58 +151,80 @@ class Sampler:
         return Observation(memory, swap, free, reads)
 
 
-def group_has_no_live_members(child):
-    # Darwin can report EPERM for a zombie-only group. Require a reaped
-    # leader and a readable process inventory before treating it as gone.
-    if sys.platform != "darwin" or child.poll() is None:
-        return False
-    try:
-        result = subprocess.run(
-            ["/bin/ps", "-axo", "pgid=,stat="], capture_output=True,
-            text=True, check=True, timeout=2)
-    except (OSError, subprocess.SubprocessError):
-        return False
-    rows = result.stdout.splitlines()
-    if not rows:
-        return False
-    for row in rows:
+def require_unreaped_leader(child):
+    # This supervisor exclusively owns wait/poll for its new-session Popen child.
+    # Keeping that child unreaped pins its PID/PGID until the final group access.
+    if child.returncode is not None:
+        raise RuntimeError("cannot use a process group after its leader was reaped")
+
+
+def owned_group_states(child, *, leader_only=False):
+    require_unreaped_leader(child)
+    command = (["/bin/ps", "-p", str(child.pid), "-o", "pid=,pgid=,stat="] if leader_only
+               else ["/bin/ps", "-axo", "pid=,pgid=,stat="])
+    result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=2)
+    require_unreaped_leader(child)
+    # Validate the returned snapshot before using it. The timeout bounds ps;
+    # this response ceiling is checked after capture, not a kernel allocation cap.
+    if not result.stdout or len(result.stdout) > 1 << 20:
+        raise RuntimeError("empty or oversized process inventory")
+    rows = {}
+    for row in result.stdout.splitlines():
         fields = row.split()
-        if len(fields) != 2 or not fields[0].isdigit():
-            return False
-        if int(fields[0]) == child.pid and not fields[1].startswith("Z"):
-            return False
-    return True
+        if (len(fields) != 3 or not fields[0].isdigit() or not fields[1].isdigit()
+                or not re.fullmatch(r"[A-Zt][A-Za-z0-9+<>=-]*", fields[2])):
+            raise RuntimeError("unreadable process inventory")
+        pid, pgid = int(fields[0]), int(fields[1])
+        if pid in rows:
+            raise RuntimeError("duplicate process identity in inventory")
+        rows[pid] = (pgid, fields[2])
+    if child.pid not in rows or rows[child.pid][0] != child.pid or (leader_only and len(rows) != 1):
+        raise RuntimeError("owned process-group leader is missing or changed")
+    return rows
+
+
+def leader_has_exited(child):
+    return owned_group_states(child, leader_only=True)[child.pid][1].startswith("Z")
+
+
+def group_has_no_live_members(child):
+    # A zombie leader stays unreaped while we inspect its still-owned group.
+    # Unreadable/ambiguous metadata cannot turn EPERM into successful cleanup.
+    try:
+        rows = owned_group_states(child)
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+        return False
+    return all(state.startswith("Z") for pgid, state in rows.values() if pgid == child.pid)
 
 
 def signal_owned_group(child, signum):
+    require_unreaped_leader(child)
     try:
         os.killpg(child.pid, signum)
     except ProcessLookupError:
-        child.wait()
         return False
     except PermissionError:
-        if not group_has_no_live_members(child):
+        if sys.platform != "darwin" or not group_has_no_live_members(child):
             raise
-        child.wait()
         return False
     return True
 
 
 def stop_child(child, grace_seconds=10):
-    """Only call for a child started with start_new_session=True."""
-    if not signal_owned_group(child, signal.SIGTERM):
-        return
-    deadline = time.monotonic() + grace_seconds
-    while True:
-        # Reap an exited leader, but descendants still belong to the owned group.
-        child.poll()
-        if not signal_owned_group(child, 0):
-            return
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        time.sleep(min(remaining, 0.02))
-    signal_owned_group(child, signal.SIGKILL)
+    """Only call for an exclusively owned, unreaped start_new_session Popen child."""
+    require_unreaped_leader(child)
+    if signal_owned_group(child, signal.SIGTERM):
+        deadline = time.monotonic() + grace_seconds
+        while True:
+            if group_has_no_live_members(child) or not signal_owned_group(child, 0):
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                signal_owned_group(child, signal.SIGKILL)
+                break
+            time.sleep(min(remaining, 0.02))
+    # This is the only reap, after the last inventory/signal, on every successful
+    # cleanup route. A failed/ambiguous signal never releases group ownership.
     child.wait()
 
 
@@ -235,6 +257,9 @@ def supervise(command, limits, storage_paths, stop_file, interval=0.5):
     if stop_file.exists():
         print("Atlas resource guard: an earlier stop requires operator review.", file=sys.stderr)
         return 0
+    # Automatic/custom child reaping would defeat the unreaped leader's PID pin.
+    if signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL:
+        raise RuntimeError("default SIGCHLD and exclusive child wait ownership are required")
     sampler = Sampler(storage_paths)
     initial_swap, free = sampler.system_usage(time.monotonic())
     if free < limits.minimum_free_bytes:
@@ -258,28 +283,36 @@ def supervise(command, limits, storage_paths, stop_file, interval=0.5):
     child = None
     reason = None
     observation = None
+    leader_exited = False
     try:
         child = subprocess.Popen(command, start_new_session=True)
-        monitor = Monitor(limits, initial_swap)
-        while child.poll() is None and not stop.is_set():
-            now = time.monotonic()
-            try:
-                observation = sampler.sample(child.pid, now)
-                reason = monitor.check(observation, now)
-            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
-                if child.poll() is not None:
+        try:
+            monitor = Monitor(limits, initial_swap)
+            while not leader_has_exited(child) and not stop.is_set():
+                now = time.monotonic()
+                try:
+                    observation = sampler.sample(child.pid, now)
+                    reason = monitor.check(observation, now)
+                except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+                    if leader_has_exited(child):
+                        break
+                    reason = "measurement_failed"
+                if reason:
                     break
-                reason = "measurement_failed"
-            if reason:
-                break
-            stop.wait(interval)
-        if child.poll() is not None and child.returncode:
-            reason = reason or "child_failed"
+                stop.wait(interval)
+            leader_exited = leader_has_exited(child)
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+            # Failed inventory is not exit proof and cannot erase a resource reason.
+            reason = reason or "measurement_failed"
     finally:
-        if child is not None:
-            stop_child(child)
-        for signum, previous in previous_signals.items():
-            signal.signal(signum, previous)
+        try:
+            if child is not None:
+                stop_child(child)
+        finally:
+            for signum, previous in previous_signals.items():
+                signal.signal(signum, previous)
+    if leader_exited and child.returncode:
+        reason = reason or "child_failed"
     if reason:
         try:
             write_stop_receipt(stop_file, reason, child.pid, observation)
