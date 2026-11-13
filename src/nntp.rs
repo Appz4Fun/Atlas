@@ -26,6 +26,32 @@ use crate::parser::Article;
 pub(crate) mod group_capture;
 #[cfg(test)]
 mod inferred_tests;
+#[cfg(test)]
+mod overview_budget_tests;
+
+// The same per-fetch headroom used by NXV admission. Half is conservatively
+// charged to raw/capture/parsed rows; the other half covers bounded compressed
+// input/output, a partial line, connection buffers and temporary decode copies.
+const OVERVIEW_CHARGE: usize = crate::nxv_store::store::FETCH_HEADROOM / 2;
+const OVERVIEW_TEXT: usize = crate::nxv_store::store::FETCH_HEADROOM / 8;
+const OVERVIEW_LINE: usize = crate::nxv_store::slab::MAX_LINE;
+#[derive(Debug)]
+struct OverviewBudgetExceeded;
+impl fmt::Display for OverviewBudgetExceeded {
+    fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result {write!(f,"overview response exceeds native fetch admission")}
+}
+impl std::error::Error for OverviewBudgetExceeded {}
+fn overview_budget() -> NntpError {NntpError::Io(io::Error::new(io::ErrorKind::InvalidData,OverviewBudgetExceeded))}
+struct OverviewBudget {left:usize,rows:u64}
+impl OverviewBudget {
+    fn new(start:u64,end:u64)->Self {Self {left:OVERVIEW_CHARGE,rows:end.checked_sub(start).and_then(|n|n.checked_add(1)).unwrap_or(0)}}
+    fn row(&mut self,len:usize)->Result<()> {
+        let charge=len.checked_add(2).and_then(|n|n.checked_mul(4))
+            .and_then(|n|n.checked_add(2*std::mem::size_of::<Overview>()+2*std::mem::size_of::<Vec<u8>>()));
+        if len>OVERVIEW_LINE || self.rows==0 || charge.is_none_or(|n|n>self.left) {return Err(overview_budget())}
+        self.left-=charge.unwrap();self.rows-=1;Ok(())
+    }
+}
 
 #[derive(Debug)]
 pub enum NntpError {
@@ -58,6 +84,8 @@ impl NntpError {
     }
 
     /// A read or the whole request took too long.
+    pub(crate) fn is_overview_budget(&self)->bool {matches!(self,Self::Io(e) if e.get_ref().is_some_and(|e|e.is::<OverviewBudgetExceeded>()))}
+
     pub fn is_timeout(&self) -> bool {
         matches!(self, NntpError::Io(e) if e.kind() == io::ErrorKind::TimedOut)
     }
@@ -874,7 +902,7 @@ impl Conn {
         };
 
         let mut conn = Conn::over(stream, timeout);
-        conn.status_limit=status_limit;
+        conn.status_limit=Some(status_limit.unwrap_or(512));
         conn.server = server_key(server).into();
         let measure = conn.measure("LOGIN", "nntp.login");
         let r = conn.log_in(server, compress).await;
@@ -940,7 +968,7 @@ impl Conn {
         Conn {
             io: BufReader::with_capacity(256 * 1024, stream),
             timeout,
-            status_limit: None,
+            status_limit: Some(512),
             group: None,
             compressed: false,
             gzip_refused: false,
@@ -1073,9 +1101,9 @@ impl Conn {
 
     async fn read_status(&mut self) -> Result<(u16, String)> {
         let line = if let Some(limit)=self.status_limit {
-            let line=self.read_line_capped(limit).await?.ok_or_else(||NntpError::Protocol("NNTP status exceeds capture admission".into()))?;
-            if line.len()>limit{return Err(NntpError::Protocol("NNTP status exceeds capture admission".into()));}line
-        }else{self.read_raw_line().await?};
+            let line=self.read_line_capped(limit).await?.ok_or_else(||NntpError::Protocol("NNTP status exceeds control-line admission".into()))?;
+            if line.len()>limit{return Err(NntpError::Protocol("NNTP status exceeds control-line admission".into()));}line
+        }else{self.read_line_capped(512).await?.ok_or_else(||NntpError::Protocol("NNTP status exceeds control-line admission".into()))?};
         let line = String::from_utf8_lossy(&line);
         let (code, message) = line.split_once(' ').unwrap_or((&line, ""));
 
@@ -1084,40 +1112,27 @@ impl Conn {
         Ok((code, message.to_string()))
     }
 
-    /// One line of at most about `max` bytes. None: past that, with at most one
-    /// read's worth more off the socket and the rest left unread, soo the
-    /// connection cant take another request.
+    /// No payload growth past the caller's limit; only the possible CRLF
+    /// is additional. Refusal leaves unread bytes and poisons this connection.
     async fn read_line_capped(&mut self, max: usize) -> Result<Option<Vec<u8>>> {
         let mut buf = Vec::new();
         loop {
             let (used, ended) = {
                 let chunk = with_timeout(self.timeout, self.io.fill_buf()).await?;
-                if chunk.is_empty() {
-                    return Err(NntpError::Io(io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed")));
-                }
-                match chunk.iter().position(|b| *b == b'\n') {
-                    Some(at) => {
-                        buf.extend_from_slice(&chunk[..=at]);
-                        (at + 1, true)
-                    }
-                    None => {
-                        buf.extend_from_slice(chunk);
-                        (chunk.len(), false)
-                    }
-                }
+                if chunk.is_empty() {return Err(NntpError::Io(io::Error::new(io::ErrorKind::UnexpectedEof,"connection closed")))}
+                let ended=chunk.iter().position(|b|*b==b'\n');
+                let used=ended.map_or(chunk.len(),|n|n+1);
+                if used>max.saturating_add(2).saturating_sub(buf.len()) {self.poisoned=true;return Ok(None)}
+                buf.reserve_exact(used);buf.extend_from_slice(&chunk[..used]);
+                (used,ended.is_some())
             };
-            self.rate_limiter.acquire(used).await;
-            self.io.consume(used);
-            self.wire += used as u64;
-            self.text += used as u64;
+            self.rate_limiter.acquire(used).await;self.io.consume(used);
+            self.wire+=used as u64;self.text+=used as u64;
             if ended {
-                while buf.last().is_some_and(|b| *b == b'\n' || *b == b'\r') {
-                    buf.pop();
-                }
+                if buf.last()==Some(&b'\n') {buf.pop();}
+                if buf.last()==Some(&b'\r') {buf.pop();}
+                if buf.len()>max {self.poisoned=true;return Ok(None)}
                 return Ok(Some(buf));
-            }
-            if buf.len() > max {
-                return Ok(None);
             }
         }
     }
@@ -1386,7 +1401,7 @@ impl Conn {
         if code != 224 {
             return Err(NntpError::Reply { code, message });
         }
-        self.read_response_body(&message).await
+        self.read_overview_body(&message,start,end).await
     }
 
     /// Queries the NNTP server's UTC clock via `DATE` (`111 YYYYMMDDhhmmss`).
@@ -1439,13 +1454,11 @@ impl Conn {
     ) -> Result<Vec<Overview>> {
         let wire = self.xzver_raw_unmeasured(start, end);
         let raw_lines = if let Some(limit) = deadline { within(limit, "XZVER", wire).await? } else { wire.await? };
-        if self.group.is_some() && (crate::overview_archive::enabled() || fetch.enabled()) {
-            let lines = decode_xzver_raw(&raw_lines)?;
-            drop(raw_lines);
-            let lines = self.archive(lines, fetch).await?;
-            return Ok(lines.iter().filter_map(|l| parse_overview(l)).collect());
-        }
-        decode_xzver_lines(&raw_lines)
+        let decoded=decode_xzver_bounded(&raw_lines,start,end);
+        if decoded.as_ref().err().is_some_and(NntpError::is_overview_budget) {self.poisoned=true;}
+        let lines=decoded?;drop(raw_lines);
+        let lines=self.archive(lines,fetch).await?;
+        Ok(lines.iter().filter_map(|line|parse_overview(line)).collect())
     }
 
     async fn xzver_raw_unmeasured(&mut self, start: u64, end: u64) -> Result<Vec<Vec<u8>>> {
@@ -1459,13 +1472,7 @@ impl Conn {
         if code != 224 {
             return Err(NntpError::Reply { code, message });
         }
-        let mut raw_lines = Vec::new();
-        self.each_plain_line(|l| {
-            raw_lines.push(l);
-            true
-        })
-        .await?;
-        Ok(raw_lines)
+        self.read_overview_body("",0,u64::MAX-1).await
     }
 
     /// BODY, yEnc decoded when the article is yEnc.
@@ -1485,6 +1492,51 @@ impl Conn {
 
         let lines = self.read_response_body(&message).await?;
         Ok(yenc_decode(&lines).unwrap_or_else(|| lines.join(&b'\n')))
+    }
+
+    async fn read_overview_body(&mut self,status:&str,start:u64,end:u64)->Result<Vec<Vec<u8>>> {
+        let result=self.read_overview_body_in(status,start,end,None).await;
+        if result.is_err() {self.poisoned=true;}result
+    }
+    async fn read_overview_body_in(&mut self,status:&str,start:u64,end:u64,stop_after:Option<usize>)->Result<Vec<Vec<u8>>> {
+        let mut budget=OverviewBudget::new(start,end);let mut rows=Vec::new();
+        if !status.to_ascii_uppercase().contains("COMPRESS=GZIP") {
+            loop {
+                let mut line=self.read_line_capped(OVERVIEW_LINE).await?.ok_or_else(overview_budget)?;
+                if line==b"." {return Ok(rows)}
+                if line.starts_with(b"..") {line.remove(0);}
+                budget.row(line.len())?;rows.push(line);
+                if stop_after.is_some_and(|n|rows.len()>=n){self.poisoned=true;return Ok(rows)}
+            }
+        }
+        let mut inflater=Inflater::default();let mut text=Vec::new();let mut terminated=false;
+        loop {
+            if !terminated {
+                let mut scanned=0;
+                while let Some(nl)=text[scanned..].iter().position(|b|*b==b'\n') {
+                    let raw=&text[scanned..scanned+nl];let raw=raw.strip_suffix(b"\r").unwrap_or(raw);
+                    scanned+=nl+1;
+                    if raw==b"." {terminated=true;break;}
+                    let raw=if raw.starts_with(b"..") {&raw[1..]}else{raw};
+                    budget.row(raw.len())?;rows.push(raw.to_vec());
+                    self.text+=raw.len() as u64+2;
+                    if stop_after.is_some_and(|n|rows.len()>=n){self.poisoned=true;return Ok(rows)}
+                }
+                text.drain(..scanned);
+                if !terminated && text.len()>OVERVIEW_LINE+1 {return Err(overview_budget())}
+            }
+            if terminated&&inflater.finished() {return Ok(rows)}
+            let chunk=if terminated {
+                match self.read_chunk(STREAM_END_WAIT).await {
+                    Err(e) if e.is_timeout()=>{self.poisoned=true;return Ok(rows)},r=>r?,
+                }
+            }else{self.read_chunk(self.timeout).await?};
+            let plain=inflater.feed_bounded(&chunk,&mut text,OVERVIEW_TEXT+3)?;
+            if !terminated {
+                if plain.len()>OVERVIEW_TEXT+3-text.len() {return Err(overview_budget())}
+                text.extend_from_slice(&plain);
+            }
+        }
     }
 
     /// Lines of a multi-line response. With XFEATURE COMPRESS GZIP on, servers
@@ -1531,17 +1583,11 @@ impl Conn {
             return Err(NntpError::Reply { code, message });
         }
 
-        let mut ends = Ends::default();
-        let whole = self
-            .each_line(&message, |line| {
-                if ends.rows == rows {
-                    return false;
-                }
-                ends.add(&line);
-                true
-            })
-            .await?;
-        ends.whole = whole;
+        let result=self.read_overview_body_in(&message,start,end,Some(rows.saturating_add(1))).await;
+        if result.is_err(){self.poisoned=true;}let lines=result?;
+        let mut ends=Ends::default();
+        for line in &lines {if ends.rows==rows {break}ends.add(line);}
+        ends.whole=lines.len()<=rows;
         Ok(ends)
     }
 
@@ -1633,11 +1679,13 @@ impl Inflater {
 
     /// Inflate `input` into `out`. Returns bytes that came after the end of
     /// the compressed stream (plain text).
-    fn feed(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<Vec<u8>> {
+    fn feed(&mut self,input:&[u8],out:&mut Vec<u8>)->Result<Vec<u8>> {self.feed_bounded(input,out,usize::MAX)}
+    fn feed_bounded(&mut self, input: &[u8], out: &mut Vec<u8>, max:usize) -> Result<Vec<u8>> {
         let bad = |m: &str| NntpError::Decompress(m.to_string());
 
         if let InflateState::Start = self.state {
-            self.head.extend_from_slice(input);
+            if input.len()>max.saturating_sub(self.head.len()) {return Err(overview_budget())}
+            self.head.reserve_exact(input.len());self.head.extend_from_slice(input);
             let head = std::mem::take(&mut self.head);
 
             if head.len() < 2
@@ -1680,7 +1728,7 @@ impl Inflater {
             };
 
             self.state = InflateState::Running(Box::new(decompress), gzip);
-            return self.feed(&head[skip..], out);
+            return self.feed_bounded(&head[skip..], out,max);
         }
 
         let mut rest: &[u8] = input;
@@ -1691,13 +1739,16 @@ impl Inflater {
             // output space: headers compress way better than 8:1 and whatever
             // didnt fit stays buffered inside the decompressor
             loop {
-                out.reserve(rest.len().saturating_mul(8).max(256 * 1024));
-                let (in_before, out_before) = (d.total_in(), out.len());
-                let status = d
-                    .decompress_vec(rest, out, flate2::FlushDecompress::None)
-                    .map_err(|e| NntpError::Decompress(e.to_string()))?;
-                rest = &rest[(d.total_in() - in_before) as usize..];
-                let produced = out.len() - out_before;
+                // Fixed scratch: never reserve from an advertised compression
+                // ratio and never let decompress_vec grow an entire expansion.
+                let mut scratch=[0u8;64*1024];
+                let (in_before,out_before)=(d.total_in(),d.total_out());
+                let status=d.decompress(rest,&mut scratch,flate2::FlushDecompress::None)
+                    .map_err(|e|NntpError::Decompress(e.to_string()))?;
+                rest=&rest[(d.total_in()-in_before) as usize..];
+                let produced=(d.total_out()-out_before) as usize;
+                if produced>max.saturating_sub(out.len()) {return Err(overview_budget())}
+                out.reserve_exact(produced);out.extend_from_slice(&scratch[..produced]);
 
                 if status == flate2::Status::StreamEnd {
                     self.state = InflateState::Done;
@@ -3722,6 +3773,14 @@ impl Pool {
     /// soo the hole is crossed once. Post dates are only roughly in order, soo
     /// the answer is approximate near the edges: callers overlap their ranges.
     pub async fn article_at(&self, i: usize, group: &str, low: u64, high: u64, when: i64) -> Result<u64> {
+        self.article_at_in(i,group,low,high,when,None).await
+    }
+
+    pub(crate) async fn article_at_with_fetch(&self,i:usize,group:&str,low:u64,high:u64,when:i64,fetch:&HeaderFetch)->Result<u64> {
+        self.article_at_in(i,group,low,high,when,Some(fetch)).await
+    }
+
+    async fn article_at_in(&self,i:usize,group:&str,low:u64,high:u64,when:i64,fetch:Option<&HeaderFetch>)->Result<u64> {
         // every article before lo is older than `when`, none from hi on is;
         // first is the first article from hi on (high + 1 when there is none)
         let (mut lo, mut hi, mut first) = (low, high + 1, high + 1);
@@ -3735,7 +3794,7 @@ impl Pool {
             if let Some((n, t)) = found
                 && t < when
             {
-                match self.first_dated_from(i, group, n, hi, when).await? {
+                match self.first_dated_from(i, group, n, hi, when, fetch).await? {
                     None => {
                         lo = n + 1;
                         continue;
@@ -3763,7 +3822,11 @@ impl Pool {
 
     /// The articles of `start..=end` on server `i`, empty when there are none.
     async fn listing(&self, i: usize, group: &str, start: u64, end: u64) -> Result<Vec<Overview>> {
-        match self.xover_on(i, group, start, end).await {
+        self.listing_in(i,group,start,end,None).await
+    }
+
+    async fn listing_in(&self,i:usize,group:&str,start:u64,end:u64,fetch:Option<&HeaderFetch>)->Result<Vec<Overview>> {
+        match self.xover_on_in(i, group, start, end, fetch).await {
             Err(e) if e.is_empty_range() => Ok(Vec::new()),
             r => r,
         }
@@ -3772,9 +3835,9 @@ impl Pool {
     /// The first article in the `DATE_LOOK` numbers from `n` (below `hi`) on
     /// server `i` posted at or after `when`, by its plausible Date. None when
     /// every one of them was posted before.
-    async fn first_dated_from(&self, i: usize, group: &str, n: u64, hi: u64, when: i64) -> Result<Option<u64>> {
+    async fn first_dated_from(&self, i: usize, group: &str, n: u64, hi: u64, when: i64, fetch:Option<&HeaderFetch>) -> Result<Option<u64>> {
         let end = n.saturating_add(DATE_LOOK - 1).min(hi.saturating_sub(1)).max(n);
-        let rows = self.listing(i, group, n, end).await?;
+        let rows = self.listing_in(i, group, n, end, fetch).await?;
         Ok(rows.iter().find(|o| plausible_post_time(&o.date).is_some_and(|t| t >= when)).map(|o| o.number))
     }
 
@@ -3826,11 +3889,19 @@ impl Pool {
         Ok(self.xover_on(i, group, start, end).await?.into_iter().map(|o| (o.number, o.message_id)).collect())
     }
 
+    pub(crate) async fn ids_on_with_fetch(&self,i:usize,group:&str,start:u64,end:u64,fetch:&HeaderFetch)->Result<Vec<(u64,String)>> {
+        Ok(self.xover_on_in(i,group,start,end,Some(fetch)).await?.into_iter().map(|o|(o.number,o.message_id)).collect())
+    }
+
     pub(crate) async fn xover_on(&self, i: usize, group: &str, start: u64, end: u64) -> Result<Vec<Overview>> {
-        let mut r = self.xover_once(i, group, start, end, false).await;
+        self.xover_on_in(i,group,start,end,None).await
+    }
+
+    async fn xover_on_in(&self,i:usize,group:&str,start:u64,end:u64,fetch:Option<&HeaderFetch>)->Result<Vec<Overview>> {
+        let mut r = self.xover_once(i, group, start, end, false, fetch).await;
         if r.as_ref().err().is_some_and(NntpError::is_closed) {
             // the server closed the connection before answering: once more, on another one
-            r = self.xover_once(i, group, start, end, false).await;
+            r = self.xover_once(i, group, start, end, false, fetch).await;
         }
         match r {
             // also after a closed connection's retry, which used to hand an unreadable listing to the indexer as an
@@ -3838,11 +3909,11 @@ impl Pool {
             Err(NntpError::Decompress(e)) => {
                 // count it against the server's compression, and redo the slice uncompressed
                 self.no_compression(i, &e);
-                self.xover_once(i, group, start, end, true).await
+                self.xover_once(i, group, start, end, true, fetch).await
             }
             // too wide to answer in time: in halves (see `xover_halves`)
             Err(e) if e.is_timeout() && end.saturating_sub(start) + 1 >= 2 * MIN_CHUNK => {
-                self.xover_halves(i, group, start, end).await
+                self.xover_halves(i, group, start, end, fetch).await
             }
             r => r,
         }
@@ -3859,13 +3930,25 @@ impl Pool {
         group: &'a str,
         start: u64,
         end: u64,
+        fetch:Option<&'a HeaderFetch>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Overview>>> + Send + 'a>> {
         Box::pin(async move {
             let mid = start + (end - start) / 2;
             let mut rows = Vec::new();
             for (from, to) in [(start, mid), (mid + 1, end)] {
-                match self.xover_on(i, group, from, to).await {
-                    Ok(half) => rows.extend(half),
+                match self.xover_on_in(i, group, from, to, fetch).await {
+                    Ok(half) => {
+                        // Split wire requests must not recombine into an
+                        // oversized retained response. Let stream_headers
+                        // deliver smaller leaves to the writer instead.
+                        let bytes=rows.iter().chain(half.iter()).try_fold(0usize,|n,row:&Overview| {
+                            [row.subject.len(),row.from.len(),row.date.len(),row.message_id.len(),row.references.len()]
+                                .into_iter().try_fold(n,|n,len|n.checked_add(len))
+                                .and_then(|n|n.checked_add(2*std::mem::size_of::<Overview>()))
+                        });
+                        if bytes.is_none_or(|n|n>OVERVIEW_CHARGE/4) {return Err(overview_budget())}
+                        rows.extend(half);
+                    },
                     Err(e) if e.is_empty_range() => {}
                     Err(e) => return Err(e),
                 }
@@ -3876,9 +3959,9 @@ impl Pool {
 
     /// One XOVER of `start..=end` on server `i`; `plain`: on a connection that didnt ask for compressed headers. On a
     /// server that refused compression it is an `XZVER` when that works there (see `wants_xzver`).
-    async fn xover_once(&self, i: usize, group: &str, start: u64, end: u64, plain: bool) -> Result<Vec<Overview>> {
+    async fn xover_once(&self, i: usize, group: &str, start: u64, end: u64, plain: bool, provided:Option<&HeaderFetch>) -> Result<Vec<Overview>> {
         let mut xzver_allowed = !plain;
-        let fetch = wait_for_header_store().await?;
+        let owned;let fetch=if let Some(fetch)=provided {fetch}else{owned=wait_for_header_store().await?;&owned};
         loop {
             let mut lease = self.lease_for(i, Some(group), false).await?;
             if plain {
@@ -3901,17 +3984,17 @@ impl Pool {
             let (method, r) = if matches!(ask, Ask::No) {
                 let compressed = lease.conn.as_ref().is_some_and(|c| c.compressed);
                 let method = if compressed { "xover_gzip" } else { "xover" };
-                (method, lease.begin().xover_timed(start, end, Some(self.xover_deadline), &fetch).await)
+                (method, lease.begin().xover_timed(start, end, Some(self.xover_deadline), fetch).await)
             } else {
                 let deadline =
                     if probing { self.xover_deadline.min(XZVER_PROBE_DEADLINE) } else { self.xover_deadline };
-                match lease.begin().xzver_timed(start, end, Some(deadline), &fetch).await {
+                match lease.begin().xzver_timed(start, end, Some(deadline), fetch).await {
                     // nothing to tell it works by, and a server that ignores the range would read empty for good:
                     // the connection takes a plain XOVER of the slice, and the next listing probes
                     Ok(rows) if probing && rows.is_empty() => {
                         lease.busy = false;
                         requests = 2;
-                        let r = lease.begin().xover_timed(start, end, Some(self.xover_deadline), &fetch).await;
+                        let r = lease.begin().xover_timed(start, end, Some(self.xover_deadline), fetch).await;
                         if r.as_ref().is_ok_and(|rows| !rows.is_empty()) {
                             // XOVER has rows XZVER said werent there
                             let e = NntpError::Protocol("XZVER answered empty where XOVER has headers".into());
@@ -3921,7 +4004,7 @@ impl Pool {
                     }
                     Ok(rows) => {
                         self.xzver_works(&lease.server);
-                        let (r, asked) = self.xzver_rest(&mut lease, rows, end, deadline, &fetch).await;
+                        let (r, asked) = self.xzver_rest(&mut lease, rows, end, deadline, fetch).await;
                         requests += asked;
                         ("xzver", r)
                     }
@@ -3946,7 +4029,7 @@ impl Pool {
                         self.xzver_failed(&lease.server, &e, probing, false);
                         lease.busy = false;
                         requests = 2;
-                        ("xover", lease.begin().xover_timed(start, end, Some(self.xover_deadline), &fetch).await)
+                        ("xover", lease.begin().xover_timed(start, end, Some(self.xover_deadline), fetch).await)
                     }
                     // where it works, a wide slice that times out is halved like an XOVER's (see `xover_on`)
                     Err(e) if !probing && e.is_timeout() && wide => ("xzver", Err(e)),
@@ -4170,9 +4253,28 @@ impl Pool {
                         return;
                     }
 
-                    let Some(result) = unless_stopped(&stop, pool.xover_on(i, &group, start, end)).await else {
-                        return;
+                    let fetch=match unless_stopped(&stop,wait_for_header_store()).await {
+                        None=>return,Some(Ok(fetch))=>fetch,Some(Err(error))=>{
+                            halt.store(true,Ordering::Relaxed);
+                            let _=tx.send(HeaderSlice {start,end,result:Err(error),unsaved}).await;return;
+                        },
                     };
+                    let result=unless_stopped(&stop,pool.xover_on_in(i,&group,start,end,Some(&fetch))).await;
+                    // Finish is deliberately outside cancellation: raw capture
+                    // already admitted on this request must end before its
+                    // Unsaved slot/capacity can be released. Storage failure
+                    // wins over both a provider error and intentional stop.
+                    let result=match fetch.finish().await {
+                        Err(error)=>Err(NntpError::HeaderStore(format!("{error:#}"))),
+                        Ok(())=>match result {Some(result)=>result,None=>return},
+                    };
+                    if result.as_ref().err().is_some_and(NntpError::is_overview_budget) && start<end {
+                        drop(unsaved);
+                        let mid=start+(end-start)/2;
+                        let mut queue=queue.lock().await;
+                        queue.push_front((mid+1,end));queue.push_front((start,mid));
+                        continue;
+                    }
                     unsaved.keep(result.as_ref().map_or(0, Vec::len));
 
                     if let Err(e) = &result
@@ -4712,8 +4814,16 @@ fn xzver_rows(inflated: &[u8]) -> impl Iterator<Item = &[u8]> {
         .filter(|l| !l.is_empty() && *l != b".")
 }
 
+fn decode_xzver_bounded(lines:&[Vec<u8>],start:u64,end:u64)->Result<Vec<Vec<u8>>> {
+    let inflated=inflate_xzver_in(lines,OVERVIEW_TEXT+3)?;
+    let mut budget=OverviewBudget::new(start,end);let mut rows=Vec::new();
+    for line in xzver_rows(&inflated) {budget.row(line.len())?;rows.push(line.to_vec());}
+    Ok(rows)
+}
+
 /// The overview stream an `XZVER` body carries, inflated.
-fn inflate_xzver(lines: &[Vec<u8>]) -> Result<Vec<u8>> {
+fn inflate_xzver(lines: &[Vec<u8>]) -> Result<Vec<u8>> {inflate_xzver_in(lines,usize::MAX)}
+fn inflate_xzver_in(lines:&[Vec<u8>],max:usize)->Result<Vec<u8>> {
     if lines.is_empty() {
         return Ok(Vec::new());
     }
@@ -4731,7 +4841,7 @@ fn inflate_xzver(lines: &[Vec<u8>]) -> Result<Vec<u8>> {
     };
     let mut inflater = Inflater::default();
     let mut inflated = Vec::new();
-    inflater.feed(&compressed, &mut inflated)?;
+    inflater.feed_bounded(&compressed, &mut inflated,max)?;
     if !inflater.finished() {
         return Err(NntpError::Decompress("truncated XZVER deflate stream".into()));
     }

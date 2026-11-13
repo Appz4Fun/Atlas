@@ -7,18 +7,18 @@ pub(crate) struct ConfigPin {
     postprocess:crate::config::PostprocessConfig,archive:crate::config::ArchiveConfig,
     naming:crate::config::NamingConfig,predb:crate::config::PredbConfig,
     category:crate::config::CategoryConfig,media:crate::config::MediaConfig,
-    servers:Vec<crate::config::UsenetServer>,plan:Vec<(usize,usize)>,unsaved:usize,
+    servers:Vec<crate::config::UsenetServer>,plan:Vec<(usize,usize)>,unsaved:usize,repair_request:u64,
 }
 impl ConfigPin {
     pub(crate) fn capture(config:&Config,servers:&[crate::config::UsenetServer],plan:&[(usize,usize)])->Self {
         Self {assets:config.native_assets.clone(),spots:config.spots.clone(),inferred_parts:config.inferred_parts,postprocess:config.postprocess.clone(),archive:config.archive.clone(),naming:config.naming.clone(),
             predb:config.predb.clone(),category:config.category.clone(),media:config.media.clone(),
-            servers:servers.to_vec(),plan:plan.to_vec(),unsaved:config.max_unsaved_headers()}
+            servers:servers.to_vec(),plan:plan.to_vec(),unsaved:config.max_unsaved_headers(),repair_request:config.request_size()}
     }
     pub(crate) fn check(&self,config:&Config,servers:&[crate::config::UsenetServer],plan:&[(usize,usize)])->Result<()> {
         ensure!(self.assets==config.native_assets && self.spots==config.spots && self.inferred_parts==config.inferred_parts && self.postprocess==config.postprocess && self.archive==config.archive && self.naming==config.naming
             && self.predb==config.predb && self.category==config.category && self.media==config.media
-            && self.servers==servers && self.plan==plan && self.unsaved==config.max_unsaved_headers(),
+            && self.servers==servers && self.plan==plan && self.unsaved==config.max_unsaved_headers() && self.repair_request==config.request_size(),
             "native worker configuration changed; restart with the intended worker settings");Ok(())
     }
 }
@@ -76,6 +76,13 @@ mod tests {
         // typed outage into a configuration failure.
         let unavailable=anyhow::Error::new(crate::pg::outage::SessionUnavailable);
         assert_eq!(crate::pg::outage::classify(&unavailable),crate::pg::outage::Failure::Unavailable);
+    }
+    #[test]
+    fn native_reload_refuses_changed_overview_request_size() {
+        let config=Config::default();let pin=ConfigPin::capture(&config,&[],&[]);
+        let mut changed=config.clone();changed.request_size=Some(config.request_size()+1);
+        assert!(pin.check(&changed,&[],&[]).is_err());
+        assert!(pin.check(&config,&[],&[]).is_ok());
     }
     #[test]
     fn native_reload_refuses_stale_captured_pool_without_logging_account_values() {

@@ -41,7 +41,7 @@ const RECOVERY_OPEN_BYTES: usize = 64 << 20;
 const RECOVERY_OPEN_LOGS: usize = 1024;
 const MAX_RECOVERY_LOG_BYTES: u64 = (SLAB_MAX_BYTES + slab::MAX_LINE + MAX_BLOCK_ROWS * 16) as u64;
 const LIVE_MEMORY_BUDGET: usize = 512 << 20;
-const FETCH_HEADROOM: usize = 16 << 20;
+pub(crate) const FETCH_HEADROOM: usize = 16 << 20;
 /// How long a day claimed here stays kept after its last claim, on top of the keep set's source.
 pub const RECENT_CLAIM: Duration = Duration::from_secs(6 * 3600);
 
@@ -165,6 +165,62 @@ impl Ticket {
             }
             g = self.shared.synced.wait_timeout(g, left).unwrap_or_else(|e| e.into_inner()).0;
         }
+    }
+}
+
+// Request-local ownership, never a global "all fetches idle" barrier. Only
+// live::Fetch owns the admission handle; detached record jobs hold private
+// clones. Consuming Fetch closes all safe-Rust borrowing/record admission.
+pub(super) struct FetchRequest {
+    permit: OwnedSemaphorePermit,
+    state: Mutex<FetchState>,
+    changed: Arc<tokio::sync::Notify>,
+}
+#[derive(Default)]
+struct FetchState {group:Option<String>,ticket:Option<Ticket>}
+impl FetchRequest {
+    fn group(&self,group:&str)->Result<()> {
+        let mut state=self.state.lock().map_err(|_|anyhow!("header request state is poisoned"))?;
+        anyhow::ensure!(state.group.as_deref().is_none_or(|g|g==group),"one header fetch changed its group");
+        if state.group.is_none(){state.group=Some(group.to_owned());}Ok(())
+    }
+    fn remember(&self,ticket:&Ticket)->Result<()> {
+        let mut state=self.state.lock().map_err(|_|anyhow!("header request state is poisoned"))?;
+        if let Some(prior)=&state.ticket {anyhow::ensure!(Arc::ptr_eq(&prior.group,&ticket.group),"header request acknowledgment changed group");if prior.epoch>=ticket.epoch{return Ok(())}}
+        // Keep only this request's latest exact acknowledgment; its capture
+        // days and a later foreign sync_point are not needed for this drain.
+        state.ticket=Some(Ticket {group:ticket.group.clone(),epoch:ticket.epoch,shared:ticket.shared.clone(),days:Vec::new()});Ok(())
+    }
+    pub(super) async fn finish(mut self:Arc<Self>,store:Arc<Store>)->Result<()> {
+        let ready=loop {
+            // Register before inspecting the count. CaptureHold drops its
+            // request clone BEFORE notifying, preventing a lost final wake.
+            let notify=self.changed.clone();let notified=notify.notified();tokio::pin!(notified);notified.as_mut().enable();
+            match Arc::try_unwrap(self) {Ok(ready)=>break ready,Err(active)=>{self=active;notified.await;}}
+        };
+        let FetchRequest {permit,state,..}=ready;
+        let mut hold=CaptureHold {request:None,permit:Some(permit),shared:store.shared.clone(),finished:false};
+        if let Some(error)=store.failure(){hold.finished=true;return Err(anyhow!("the header store stopped: {error}"))}
+        let ticket=state.into_inner().map_err(|_|anyhow!("header request state is poisoned"))?.ticket;
+        if let Some(ticket)=ticket {
+            // The acknowledgment and admission move together into the existing
+            // blocking pool. Even cancellation of this await cannot release
+            // capacity ahead of already-started durable storage work.
+            tokio::task::spawn_blocking(move|| {
+                let result=ticket.wait(Duration::from_secs(600));
+                if let Err(error)=&result {hold.shared.fail(anyhow!("{error:#}"));}
+                hold.finished=true;result
+            }).await?
+        } else {hold.finished=true;Ok(())}
+    }
+}
+struct CaptureHold {request:Option<Arc<FetchRequest>>,permit:Option<OwnedSemaphorePermit>,shared:Arc<Shared>,finished:bool}
+impl Drop for CaptureHold {
+    fn drop(&mut self) {
+        if !self.finished&&(self.request.is_some()||self.permit.is_some()){self.shared.fail(anyhow!("admitted header recording task ended without its result"));}
+        let notify=self.request.as_ref().map(|request|request.changed.clone());drop(self.request.take());
+        if let Some(notify)=notify {notify.notify_waiters();}
+        // Owned permit fields drop only after failure publication above.
     }
 }
 
@@ -639,6 +695,10 @@ impl Store {
         Ok(fetch)
     }
 
+    pub(super) async fn fetch_request(&self)->Result<Arc<FetchRequest>> {
+        Ok(Arc::new(FetchRequest {permit:self.wait_for_fetch().await?,state:Mutex::new(FetchState::default()),changed:Arc::new(tokio::sync::Notify::new())}))
+    }
+
     fn request_drain(&self) {
         let _guard = self.shared.wake_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.shared.drain_requested.store(true, Ordering::Release);
@@ -667,6 +727,15 @@ impl Store {
         clamp: Clamp,
         fetch: Option<Arc<OwnedSemaphorePermit>>,
     ) -> Result<(Vec<Vec<u8>>, Ticket)> {
+        self.record_live_request(server,group,lines,clamp,fetch,None).await
+    }
+
+    pub(super) async fn record_live_for_fetch(self:&Arc<Self>,server:&str,group:&str,lines:Vec<Vec<u8>>,clamp:Clamp,request:Arc<FetchRequest>)->Result<(Vec<Vec<u8>>,Ticket)> {
+        request.group(group)?;
+        self.record_live_request(server,group,lines,clamp,None,Some(request)).await
+    }
+
+    async fn record_live_request(self:&Arc<Self>,server:&str,group:&str,lines:Vec<Vec<u8>>,clamp:Clamp,fetch:Option<Arc<OwnedSemaphorePermit>>,request:Option<Arc<FetchRequest>>)->Result<(Vec<Vec<u8>>,Ticket)> {
         let budget = self.cfg.memory_budget;
         let charge = listing_charge(&lines);
         if charge <= budget {
@@ -674,7 +743,7 @@ impl Store {
             let (store, server, group) = (Arc::clone(self), server.to_owned(), group.to_owned());
             return tokio::task::spawn_blocking(move || {
                 let _fetch = fetch;
-                let ticket = store.record_charged(&server, &group, &lines, clamp, None, permit)?;
+                let ticket = store.record_for_request(&server,&group,&lines,clamp,None,permit,request)?;
                 Ok((lines, ticket))
             })
             .await?;
@@ -705,9 +774,10 @@ impl Store {
             let permit = self.reserve_memory(bytes as u32).await?;
             let (store, server, group) = (Arc::clone(self), server.to_owned(), group.to_owned());
             let (batch, fetch) = (Arc::clone(&lines), fetch.clone());
+            let request=request.clone();
             let mut ticket = tokio::task::spawn_blocking(move || {
                 let _fetch = fetch;
-                store.record_charged(&server, &group, &batch[range], clamp, bounds, permit)
+                store.record_for_request(&server,&group,&batch[range],clamp,bounds,permit,request)
             })
             .await??;
             for (day, count) in std::mem::take(&mut ticket.days) {
@@ -719,6 +789,16 @@ impl Store {
         ticket.days = days.into_iter().collect();
         let lines = Arc::try_unwrap(lines).expect("all recording batches finished");
         Ok((lines, ticket))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_for_request(&self,server:&str,group:&str,lines:&[Vec<u8>],clamp:Clamp,bounds:Option<((i64,i64),bool)>,permit:OwnedSemaphorePermit,request:Option<Arc<FetchRequest>>)->Result<Ticket> {
+        let mut hold=CaptureHold {request,permit:None,shared:self.shared.clone(),finished:false};
+        let result=self.record_charged(server,group,lines,clamp,bounds,permit).and_then(|ticket| {
+            if let Some(request)=&hold.request {request.remember(&ticket)?;}Ok(ticket)
+        });
+        if let Err(error)=&result {if hold.request.is_some(){self.shared.fail(anyhow!("{error:#}"));}}
+        hold.finished=true;result
     }
 
     fn record_charged(
@@ -1631,6 +1711,10 @@ fn commit(batch: &[Pending]) -> Result<usize> {
     // the logs' names gone durably is not needed: a log left behind is found committed at the next start
     Ok(reserved.len())
 }
+
+#[cfg(test)]
+#[path="fetch_finish_tests.rs"]
+mod fetch_finish_tests;
 
 #[cfg(test)]
 mod tests {

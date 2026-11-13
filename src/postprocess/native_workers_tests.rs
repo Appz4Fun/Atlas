@@ -95,7 +95,8 @@ pub(crate) fn run_predb_only(runtime:&crate::pg::indexer_runtime::Runtime) {
     let end=ending.clone();let owner=runtime.owner.clone();let db=runtime.db.clone();let headers=runtime.configured_headers();
     let worker=std::thread::spawn(move|| {
         let handle=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        handle.block_on(workers::run(owner,db,headers,config,Arc::new(crate::nntp::Pool::new(&[])),move||end.load(std::sync::atomic::Ordering::Acquire)));
+        let ctx=crate::indexer::PassContext {pool:Arc::new(crate::nntp::Pool::new(&[])),states:Default::default(),stop:owner.stop.clone(),verbose:false};
+        handle.block_on(workers::run(owner,db,headers,config,ctx,move||end.load(std::sync::atomic::Ordering::Acquire)));
     });
     let deadline=Instant::now()+Duration::from_secs(5);
     loop {
@@ -199,7 +200,8 @@ pub(crate) fn run_header_only(runtime:&crate::pg::indexer_runtime::Runtime) {
     let ending=Arc::new(std::sync::atomic::AtomicBool::new(false));let end=ending.clone();let owner=runtime.owner.clone();let db=runtime.db.clone();let headers=runtime.configured_headers();
     let worker=std::thread::spawn(move|| {
         let handle=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        handle.block_on(workers::run(owner,db,headers,config,Arc::new(crate::nntp::Pool::new(&[])),move||end.load(std::sync::atomic::Ordering::Acquire)));
+        let ctx=crate::indexer::PassContext {pool:Arc::new(crate::nntp::Pool::new(&[])),states:Default::default(),stop:owner.stop.clone(),verbose:false};
+        handle.block_on(workers::run(owner,db,headers,config,ctx,move||end.load(std::sync::atomic::Ordering::Acquire)));
     });
     let deadline=Instant::now()+Duration::from_secs(5);
     loop {

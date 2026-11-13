@@ -2250,7 +2250,7 @@ impl Pass<'_> {
             }
         }
 
-        if error.is_none() && saved.articles == 0 && done == total {
+        if error.is_none() && saved.articles == 0 && finished.ends(start.max(0) as u64,end.max(0) as u64).0==Some(end.max(0) as u64) {
             println!("[{kind}] {group} {start}-{end} empty, skipping");
         }
 
@@ -2269,7 +2269,7 @@ impl Pass<'_> {
         // failed or stopped early: what got saved stays, the cursor moves past
         // the done run next to it and waits for the rest
         let (low_done, high_done) = finished.ends(start.max(0) as u64, end.max(0) as u64);
-        Ranged { saved, complete: done == total, in_window, low_done, high_done, error }
+        Ranged { saved, complete: low_done==Some(end.max(0) as u64), in_window, low_done, high_done, error }
     }
 }
 
@@ -2291,11 +2291,26 @@ pub async fn reread_window(
     }
     let start = ctx.pool.article_at(server, group, first, last, from).await?;
     let end = ctx.pool.article_at(server, group, first, last, to).await?.saturating_sub(1).min(last);
+    reread_range(ctx,settings,db,group,server,start,end,max_articles).await
+}
+
+#[derive(Debug)]
+pub(crate) struct RereadWindowTooWide {group:String,count:u64,start:u64,end:u64}
+impl std::fmt::Display for RereadWindowTooWide {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {write!(f,"{}: {} articles from {} to {}, more than a window takes",self.group,self.count,self.start,self.end)}
+}
+impl std::error::Error for RereadWindowTooWide {}
+
+/// The exact ordinary repair range pipeline, after provider-specific bounds
+/// have been observed. Native callers retain/join their cancellable probes,
+/// then await this whole parse/admission/commit/NXV operation without cancel.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn reread_range(ctx:&PassContext,settings:&PassSettings,db:&Db,group:&str,server:usize,start:u64,end:u64,max_articles:u64)->Result<Progress> {
     if end < start {
         return Ok(Progress::default());
     }
     if end - start + 1 > max_articles {
-        anyhow::bail!("{group}: {} articles from {start} to {end}, more than a window takes", end - start + 1);
+        return Err(RereadWindowTooWide {group:group.into(),count:end-start+1,start,end}.into());
     }
     // a key no cursor has: the dates this pass finds are noted nowhere
     let key = format!("repair:{group}@{}", ctx.pool.host(server));
@@ -2343,17 +2358,25 @@ struct Finished(Vec<(u64, u64)>);
 impl Finished {
     fn add(&mut self, start: u64, end: u64) {
         self.0.push((start, end));
+        self.0.sort_unstable();
+        let mut kept=0;
+        for i in 0..self.0.len() {
+            let (a,b)=self.0[i];
+            if kept>0 && a<=self.0[kept-1].1.saturating_add(1) {
+                self.0[kept-1].1=self.0[kept-1].1.max(b);
+            }else{self.0[kept]=(a,b);kept+=1;}
+        }
+        self.0.truncate(kept);
     }
 
     /// How far `start..=end` is done from each end: the last number of the
     /// done run starting at `start`, the first of the one ending at `end`.
     fn ends(&self, start: u64, end: u64) -> (Option<u64>, Option<u64>) {
-        let mut done = self.0.clone();
-        done.sort_unstable();
+        let done=&self.0;
 
         let mut low = None;
         let mut next = start;
-        for &(a, b) in &done {
+        for &(a, b) in done {
             if a != next {
                 break;
             }
@@ -2758,6 +2781,16 @@ mod tests {
         let mut bottom = Finished::default();
         bottom.add(0, 9);
         assert_eq!(bottom.ends(0, u64::MAX), (Some(9), None));
+    }
+
+    #[test]
+    fn adaptively_split_finished_ranges_coalesce_and_never_cover_a_missing_leaf() {
+        let mut finished=Finished::default();
+        for (a,b) in [(1,4),(9,12),(5,6)] {finished.add(a,b);}
+        assert_eq!(finished.ends(1,12),(Some(6),Some(9)),"the unreceived7-8 leaf prevents completion");
+        finished.add(7,8);assert_eq!(finished.ends(1,12),(Some(12),Some(1)));
+        assert_eq!(finished.0,[(1,12)],"one original slice split into many leaves retains one covered interval");
+        finished.add(5,6);assert_eq!(finished.0,[(1,12)],"replayed leaves cannot grow the retained interval set");
     }
 
     /// `#key`s that differ by case are two servers, and the host in a key is

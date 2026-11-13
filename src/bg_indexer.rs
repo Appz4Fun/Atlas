@@ -246,7 +246,7 @@ pub(crate) async fn nap(d: Duration, done: impl Fn() -> bool) {
     }
 }
 
-fn settings_of(config: &Config) -> PassSettings {
+pub(crate) fn settings_of(config: &Config) -> PassSettings {
     PassSettings {
         mode: config.index_mode.clone(),
         batch_size: config.batch_size() as i64,
@@ -1406,7 +1406,7 @@ async fn run_servers(
             runtime.db.clone(),
             runtime.configured_headers(),
             config.clone(),
-            sched.ctx.pool.clone(),
+            sched.ctx.clone(),
             move || s.stopping()
         )
     ));

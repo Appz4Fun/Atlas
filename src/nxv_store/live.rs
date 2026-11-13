@@ -182,7 +182,9 @@ fn spawn_with_mapping(cfg: &crate::config::HeaderStoreConfig, bounded_maps: bool
 }
 
 /// One admitted listing, held through NNTP reads and any detached disk work.
-pub struct Fetch(Option<(Arc<Store>, Arc<tokio::sync::OwnedSemaphorePermit>)>);
+// Deliberately non-Clone with private admission state. finish consumes the
+// only public recording capability; borrowed record futures must end first.
+pub struct Fetch(Option<(Arc<Store>, Arc<super::store::FetchRequest>)>);
 
 impl Fetch {
     pub async fn begin() -> anyhow::Result<Self> {
@@ -191,8 +193,8 @@ impl Fetch {
     }
 
     pub(crate) async fn begin_on(store: Arc<Store>) -> anyhow::Result<Self> {
-        let permit = Arc::new(store.wait_for_fetch().await?);
-        Ok(Self(Some((store, permit))))
+        let request = store.fetch_request().await?;
+        Ok(Self(Some((store, request))))
     }
 
     pub fn enabled(&self) -> bool {
@@ -207,9 +209,15 @@ impl Fetch {
         }
         let now = now();
         let (lines, ticket) =
-            store.record_live(server, group, lines, Clamp::Unknown { now }, Some(Arc::clone(fetch))).await?;
+            store.record_live_for_fetch(server, group, lines, Clamp::Unknown { now }, Arc::clone(fetch)).await?;
         refresh_claimed(&ticket.days, now);
         Ok(lines)
+    }
+
+    /// Close admission and join only this request's admitted capture jobs and
+    /// exact acknowledgment. This await is never canceled by production stop.
+    pub async fn finish(self)->anyhow::Result<()> {
+        if let Some((store,request))=self.0 {request.finish(store).await?;}Ok(())
     }
 }
 
