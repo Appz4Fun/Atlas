@@ -596,3 +596,38 @@ fn malformed_zero_column_rows_do_not_amplify_visitor_work() {
         reader.calls, reader.bytes
     );
 }
+
+#[test]
+fn test_only_payload_oracle_preserves_literal_frozen_v1_wire_bytes() {
+    let oracle = payload::Payload {
+        domains: vec![(-1, "@x>".into())],
+        tables: vec![payload::Table {
+            name: "t".into(),
+            columns: vec!["v".into()],
+            rows: vec![
+                vec![Value::Null],
+                vec![Value::Integer(-1)],
+                vec![Value::Integer(0)],
+                vec![Value::Real(-0.0)],
+                vec![Value::Text("é".into())],
+                vec![Value::Blob(vec![0, 255])],
+                vec![Value::Integer(i64::MIN)],
+                vec![Value::Integer(i64::MAX)],
+            ],
+        }],
+    };
+    // Fixed independent v1 vector: domain zigzag, one-column rows and all
+    // five value tags. The final two ten-byte varints are MIN and MAX.
+    let expected: &[u8] = &[
+        1, 1, 1, 3, b'@', b'x', b'>', 1, 1, b't', 1, 1, b'v', 8, 0, 1, 1, 1, 0, 2, 0, 0, 0, 0, 0, 0, 0, 128, 3, 2,
+        0xc3, 0xa9, 4, 2, 0, 255, 1, 255, 255, 255, 255, 255, 255, 255, 255, 255, 1, 1, 254, 255, 255, 255, 255, 255,
+        255, 255, 255, 1,
+    ];
+    let encoded = payload::encode(&oracle).unwrap();
+    assert_eq!(zstd::stream::decode_all(&encoded[..]).unwrap(), expected);
+    assert_eq!(payload::decode(&packed(expected)).unwrap(), oracle);
+    assert_eq!(frozen_rows(&packed(expected)).unwrap(), oracle);
+    let decoded = payload::decode(&encoded).unwrap();
+    let Value::Real(real) = decoded.tables[0].rows[3][0] else { panic!("expected real") };
+    assert_eq!(real.to_bits(), (-0.0f64).to_bits());
+}
