@@ -10,6 +10,7 @@ pub mod bg_indexer;
 pub mod blob;
 pub mod blob_bytes;
 pub mod category;
+pub mod catalog_facts;
 pub mod chunks;
 pub mod collections;
 pub mod compact;
