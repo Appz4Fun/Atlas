@@ -26,9 +26,6 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::postprocess::schema::ShardTable;
-use crate::store;
-
 pub use archive::{ArchiveFormat, ArchiveHead, ArchiveStream, DecompressError};
 pub use media::{
     AudioBitstream, AudioProbeResult, AudioTrack, AvcDepth, Chapter, DiscInfo, DiscProber, DolbyVisionInfo, H265Sps,
@@ -36,103 +33,6 @@ pub use media::{
 };
 pub use nest::{Layer, Nest, unwrap as unwrap_nested};
 pub use step::ProbeStep;
-
-/// What a probe found, kept as JSON: it's only ever read whole. The columns are what can be searched on.
-pub const PROBE: ShardTable = ShardTable {
-    name: "release_probe",
-    create: "create table if not exists release_probe (
-        release_id INTEGER PRIMARY KEY,
-        crc32      INTEGER,
-        agent      TEXT,
-        info       TEXT NOT NULL
-    )",
-    indexes: &[
-        (
-            "release_probe_crc32",
-            "create index if not exists release_probe_crc32 on release_probe(crc32) where crc32 is not null",
-        ),
-        (
-            "release_probe_agent",
-            "create index if not exists release_probe_agent on release_probe(agent) where agent is not null",
-        ),
-        (
-            "release_probe_moviehash",
-            "create index if not exists release_probe_moviehash on release_probe(moviehash) where moviehash is not null",
-        ),
-    ],
-    release_key: Some("release_id"),
-    added: &[("moviehash", "TEXT")],
-};
-
-/// Which cover art a release has. The image itself is a file in `covers/`, named by its SHA-256, soo a cover
-/// posted again and again is kept once, and the folder is trimmed to `MAX_COVER_CACHE`, oldest first: what's
-/// posted can't grow it without end.
-pub const COVER: ShardTable = ShardTable {
-    name: "release_cover",
-    create: "create table if not exists release_cover (
-        release_id INTEGER PRIMARY KEY,
-        mime       TEXT NOT NULL,
-        sha256     TEXT NOT NULL
-    )",
-    indexes: &[],
-    release_key: Some("release_id"),
-    added: &[],
-};
-
-pub const SET_COVER: &str = "insert or replace into release_cover (release_id, mime, sha256) values (?1, ?2, ?3)";
-pub const DROP_COVER: &str = "delete from release_cover where release_id = ?1";
-
-/// Past this, the oldest covers go. Most are a few hundred KB.
-const MAX_COVER_CACHE: u64 = 1 << 30;
-/// How many new covers between looks at the folder's size: a look reads the whole folder.
-const TRIM_COVERS_EVERY: u64 = 64;
-
-fn cover_dir() -> std::path::PathBuf {
-    crate::paths::app_dir().join("covers")
-}
-
-pub(crate) fn cover_file(sha256: &str) -> Option<std::path::PathBuf> {
-    (sha256.len() == 64 && sha256.bytes().all(|b| b.is_ascii_hexdigit())).then(|| cover_dir().join(sha256))
-}
-
-/// Keeps a cover's bytes, and gives the name to find them by.
-pub fn keep_cover(bytes: &[u8]) -> Option<String> {
-    use sha2::Digest;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    let sha256: String = sha2::Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect();
-    let file = cover_file(&sha256)?;
-    if !file.exists() {
-        static WRITTEN: AtomicU64 = AtomicU64::new(0);
-        std::fs::create_dir_all(cover_dir()).ok()?;
-        crate::atomic::write_atomic(&file, bytes).ok()?;
-        if WRITTEN.fetch_add(1, Ordering::Relaxed).is_multiple_of(TRIM_COVERS_EVERY) {
-            crate::media::details::trim_posters(&cover_dir(), MAX_COVER_CACHE);
-        }
-    }
-    Some(sha256)
-}
-
-fn cover_row(conn: &rusqlite::Connection, release_id: i64) -> Option<(String, String)> {
-    let s = store::shard_of_id(release_id);
-    conn.query_row(&format!("select mime, sha256 from s{s}.release_cover where release_id = ?"), [release_id], |r| {
-        Ok((r.get(0)?, r.get(1)?))
-    })
-    .ok()
-}
-
-/// A release's cover art: its type and bytes, while the folder still has them.
-pub fn cover(conn: &rusqlite::Connection, release_id: i64) -> Option<(String, Vec<u8>)> {
-    let (mime, sha256) = cover_row(conn, release_id)?;
-    Some((mime, std::fs::read(cover_file(&sha256)?).ok()?))
-}
-
-/// Whether a release's cover art can be shown, without reading it.
-pub fn has_cover(conn: &rusqlite::Connection, release_id: i64) -> bool {
-    cover_row(conn, release_id).and_then(|(_, sha256)| cover_file(&sha256)).is_some_and(|f| f.exists())
-}
-
-pub const SET_PROBE: &str = "insert or replace into release_probe (release_id, crc32, agent, info, moviehash)
-    values (?1, ?2, ?3, ?4, ?5)";
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ProbeInfo {
@@ -298,14 +198,6 @@ pub fn derive(info: &mut ProbeInfo, wire_bytes: i64, expected_parts: Option<i64>
         }
     }
     info.file_crc32 = last.and_then(|l| l.crc32).or(y.crc32);
-}
-
-pub fn read(conn: &rusqlite::Connection, release_id: i64) -> Option<ProbeInfo> {
-    let s = store::shard_of_id(release_id);
-    let text: String = conn
-        .query_row(&format!("select info from s{s}.release_probe where release_id = ?"), [release_id], |r| r.get(0))
-        .ok()?;
-    serde_json::from_str(&text).ok()
 }
 
 /// NFOs are often CP437: what isn't UTF-8 reads as that.

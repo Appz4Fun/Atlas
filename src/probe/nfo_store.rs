@@ -4,27 +4,7 @@
 //! most once a release. Only an NFO read from its file's first article is kept: a later article's text, read while
 //! the first wasn't indexed yet, isn't the NFO, and the first is read once it's there.
 
-use rusqlite::{Connection, OptionalExtension};
-
-use crate::postprocess::schema::ShardTable;
 use crate::postprocess::step::{StepMutation, StepWrite};
-use crate::store;
-
-/// An NFO read by a step other than the probe, while the probe has none. The probe moves it into its JSON.
-pub const RELEASE_NFO: ShardTable = ShardTable {
-    name: "release_nfo",
-    create: "create table if not exists release_nfo (
-        release_id INTEGER PRIMARY KEY,
-        file       TEXT NOT NULL,
-        text       TEXT NOT NULL
-    )",
-    indexes: &[],
-    release_key: Some("release_id"),
-    added: &[],
-};
-
-/// Once the probe's JSON holds the same NFO.
-pub const DROP: &str = "delete from release_nfo where release_id = ?1 and file = ?2";
 
 /// As much of an NFO as is kept, in characters: the probe's own cap.
 pub const MAX_CHARS: usize = 256 * 1024;
@@ -44,58 +24,6 @@ impl StoredNfo {
     }
 }
 
-/// The NFO already read for a release, the probe's first, on a shard connection or one with the shard attached as
-/// `s{n}`. A probe's NFO without its file (read before it kept one, or from a later article) isn't known to be the
-/// NFO's start, soo it isn't one. Any failure, such as a shard without the table yet, reads as none.
-pub fn stored(conn: &Connection, release_id: i64) -> Option<StoredNfo> {
-    from_probe(conn, release_id).or_else(|| from_table(conn, release_id))
-}
-
-fn on_shard<T>(
-    conn: &Connection,
-    release_id: i64,
-    sql: &str,
-    row: impl Fn(&rusqlite::Row) -> rusqlite::Result<T>,
-) -> Option<T> {
-    let s = store::shard_of_id(release_id);
-    let qualified = sql.replace("{schema}", &format!("s{s}."));
-    let plain = sql.replace("{schema}", "");
-    let ask = |q: &str| conn.query_row(q, [release_id], &row).optional();
-    match ask(&qualified) {
-        Ok(found) => found,
-        Err(_) => ask(&plain).ok().flatten(),
-    }
-}
-
-fn from_probe(conn: &Connection, release_id: i64) -> Option<StoredNfo> {
-    let (text, file) = on_shard(
-        conn,
-        release_id,
-        "select json_extract(info, '$.nfo'), json_extract(info, '$.nfo_file') from {schema}release_probe
-         where release_id = ?1",
-        |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)),
-    )?;
-    Some(StoredNfo { file: file?, text: text? })
-}
-
-/// Any NFO text read for a release, the probe's even from a later article: for the page to say what's in it.
-pub fn any_text(conn: &Connection, release_id: i64) -> Option<String> {
-    on_shard(
-        conn,
-        release_id,
-        "select json_extract(info, '$.nfo') from {schema}release_probe where release_id = ?1",
-        |r| r.get::<_, Option<String>>(0),
-    )
-    .flatten()
-    .or_else(|| from_table(conn, release_id).map(|nfo| nfo.text))
-}
-
-fn from_table(conn: &Connection, release_id: i64) -> Option<StoredNfo> {
-    on_shard(conn, release_id, "select file, text from {schema}release_nfo where release_id = ?1", |r| {
-        Ok(StoredNfo { file: r.get(0)?, text: r.get(1)? })
-    })
-}
-
 /// Keeps an NFO a step read, for the probe and the other steps to use in place of fetching it again.
 pub fn keep(release_id: i64, file: &str, text: &str) -> StepWrite {
     let text: String = text.chars().take(MAX_CHARS).collect();
@@ -106,60 +34,86 @@ pub fn keep(release_id: i64, file: &str, text: &str) -> StepWrite {
 mod tests {
     use super::*;
 
-    fn shard() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "create table release_probe (release_id INTEGER PRIMARY KEY, crc32 INTEGER, agent TEXT, info TEXT NOT NULL);",
-        )
-        .unwrap();
-        conn.execute_batch(RELEASE_NFO.create).unwrap();
-        conn
-    }
-
-    fn apply(conn: &Connection, w: StepWrite) {
-        conn.execute(w.sql, rusqlite::params_from_iter(w.params.iter())).unwrap();
-    }
-
     #[test]
-    fn the_probes_nfo_comes_first_then_one_a_step_kept() {
-        let conn = shard();
-        assert_eq!(stored(&conn, 8), None);
-        apply(&conn, keep(8, "a.nfo", "kept by a step"));
-        assert_eq!(stored(&conn, 8), Some(StoredNfo { file: "a.nfo".into(), text: "kept by a step".into() }));
-        // a second reader's NFO doesn't replace the first
-        apply(&conn, keep(8, "b.nfo", "another"));
-        assert_eq!(stored(&conn, 8).unwrap().text, "kept by a step");
-        conn.execute(
-            "insert into release_probe (release_id, info) values (8, '{\"nfo\":\"from the probe\",\"nfo_file\":\"a.nfo\"}')",
-            [],
-        )
-        .unwrap();
-        assert_eq!(stored(&conn, 8), Some(StoredNfo { file: "a.nfo".into(), text: "from the probe".into() }));
-        // a probe without an NFO leaves the kept one
-        conn.execute("insert into release_probe (release_id, info) values (16, '{\"nfo\":null}')", []).unwrap();
-        apply(&conn, keep(16, "c.nfo", "kept"));
-        assert_eq!(stored(&conn, 16).unwrap().text, "kept");
-    }
-
-    #[test]
-    fn a_probes_nfo_without_its_file_isnt_reused() {
-        let conn = shard();
-        // an old probe, or one that read a later article: the step reads the NFO's start itself
-        conn.execute("insert into release_probe (release_id, info) values (8, '{\"nfo\":\"part 2\"}')", []).unwrap();
-        assert_eq!(stored(&conn, 8), None);
-        assert_eq!(any_text(&conn, 8).as_deref(), Some("part 2"), "the page still reads it");
-        apply(&conn, keep(8, "a.nfo", "the start"));
-        assert_eq!(stored(&conn, 8).unwrap().text, "the start");
+    fn stored_nfo_matches_only_its_file_or_par2_name() {
         let named = StoredNfo { file: "Real.nfo".into(), text: String::new() };
         assert!(named.is_of("Real.nfo", None));
         assert!(named.is_of("x7f3a9", Some("Real.nfo")));
         assert!(!named.is_of("Other.nfo", None));
+        assert!(!named.is_of("real.nfo", None));
     }
 
     #[test]
-    fn it_is_capped() {
-        let conn = shard();
-        apply(&conn, keep(8, "a.nfo", &"x".repeat(MAX_CHARS + 10)));
-        assert_eq!(stored(&conn, 8).unwrap().text.len(), MAX_CHARS);
+    fn it_is_capped_by_characters_without_splitting_unicode() {
+        let write = keep(8, "a.nfo", &"é".repeat(MAX_CHARS + 10));
+        let StepMutation::KeepNfo { file, text } = write.mutation() else { panic!("typed NFO mutation") };
+        assert_eq!(file, "a.nfo");
+        assert_eq!(text.chars().count(), MAX_CHARS);
+        assert_eq!(text.len(), MAX_CHARS * 2);
+    }
+
+    #[test]
+    #[ignore = "requires isolated PostgreSQL test database"]
+    fn native_probe_nfo_precedes_first_kept_nfo_and_partial_probe_cannot_replace_it() {
+        use crate::pg::{
+            stage_queue::{Queue, Settlement, Visit},
+            stage_reads::StepReads,
+        };
+        use crate::postprocess::apply::Applied;
+        let schema = crate::pg::testing::Schema::new().expect("PostgreSQL fixture required");
+        let runtime = crate::pg::stage_queue_tests::runtime(&schema);
+        crate::pg::stage_queue_tests::push(&runtime);
+        let queue = Queue::for_owner(&runtime.owner).unwrap();
+        let claims = queue.claim(10, 1, 60).unwrap();
+        assert_eq!(claims.len(), 1);
+        let claim = &claims[0];
+        let id = claim.release_id();
+        let reads = StepReads::for_owner(&runtime.owner).unwrap();
+        assert_eq!(reads.stored_nfo(id).unwrap(), None);
+        let applied = Applied {
+            release_id: id,
+            set_done: 4,
+            writes: vec![(4, keep(id, "a.nfo", "kept by a step")), (4, keep(id, "b.nfo", "another"))],
+            ..Default::default()
+        };
+        assert_eq!(
+            queue.settle(claim, Visit::prepare(claim, applied, [9; 32]).unwrap(), 11).unwrap(),
+            Settlement::Applied
+        );
+        assert_eq!(
+            reads.stored_nfo(id).unwrap(),
+            Some(StoredNfo { file: "a.nfo".into(), text: "kept by a step".into() })
+        );
+        let set_probe = |probe: crate::probe::ProbeInfo| {
+            let json = serde_json::to_string(&probe).unwrap();
+            runtime.owner.with(|client| {
+                client.execute("insert into release_probe(release_id,info) values($1,$2) on conflict(release_id) do update set info=excluded.info", &[&id,&json])?;
+                Ok(())
+            }).unwrap();
+        };
+        set_probe(crate::probe::ProbeInfo {
+            nfo: Some("from the probe".into()),
+            nfo_file: Some("probe.nfo".into()),
+            ..Default::default()
+        });
+        assert_eq!(
+            reads.stored_nfo(id).unwrap(),
+            Some(StoredNfo { file: "probe.nfo".into(), text: "from the probe".into() })
+        );
+        set_probe(crate::probe::ProbeInfo { nfo: Some("part 2".into()), ..Default::default() });
+        assert_eq!(reads.stored_nfo(id).unwrap().unwrap().text, "kept by a step");
+        set_probe(Default::default());
+        assert_eq!(reads.stored_nfo(id).unwrap().unwrap().text, "kept by a step");
+        runtime
+            .owner
+            .with(|client| {
+                assert_eq!(client.query_one("select count(*) from native_operations", &[])?.get::<_, i64>(0), 1);
+                client.execute("delete from release_nfo where release_id=$1", &[&id])?;
+                Ok(())
+            })
+            .unwrap();
+        set_probe(crate::probe::ProbeInfo { nfo: Some("part 2".into()), ..Default::default() });
+        assert_eq!(reads.stored_nfo(id).unwrap(), None);
+        runtime.owner.close();
     }
 }

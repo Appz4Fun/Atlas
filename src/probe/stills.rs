@@ -5,11 +5,12 @@
 
 use sha2::Digest;
 
+use crate::catalog_facts::{FileInfo, SegmentPick};
 use crate::config::Config;
 use crate::keys;
-use crate::postprocess::schema::ShardTable;
-use crate::postprocess::step::{Got, Needs, Outcome, Reruns, Step, StepCtx, StepError, StepId, StepMutation, StepWrite, mask};
-use crate::store::{self, FileInfo, SegmentPick};
+use crate::postprocess::step::{
+    Got, Needs, Outcome, Reruns, Step, StepCtx, StepError, StepId, StepMutation, StepWrite,
+};
 use crate::video::mkv::{self, Codec, Found, VideoTrack};
 use crate::video::mp4;
 use crate::video::{h264, hevc, jpeg};
@@ -29,23 +30,6 @@ const FRONT_ARTICLES: i64 = 3;
 /// How wide a still is kept, at most.
 const STILL_WIDTH: usize = 960;
 const QUALITY: u8 = 85;
-
-pub const STILLS: ShardTable = ShardTable {
-    name: "release_stills",
-    create: "create table if not exists release_stills (
-        release_id INTEGER NOT NULL,
-        position   INTEGER NOT NULL,
-        at_ms      INTEGER,
-        sha256     TEXT NOT NULL,
-        width      INTEGER NOT NULL,
-        height     INTEGER NOT NULL,
-        PRIMARY KEY (release_id, position)
-    )",
-    indexes: &[],
-    release_key: Some("release_id"),
-    // a 64-bit perceptual hash, stored as its bits in an i64: "the same film" across releases
-    added: &[("phash", "INTEGER")],
-};
 
 /// Past this, the oldest stills go. One is 50 to 150 KB.
 const MAX_STILL_CACHE: u64 = 2 << 30;
@@ -75,182 +59,25 @@ fn keep(bytes: &[u8]) -> Option<String> {
     Some(sha256)
 }
 
-/// A release's stills, in order: (position, time in ms, width, height).
-pub fn stills(conn: &rusqlite::Connection, release_id: i64) -> Vec<(u8, Option<i64>, u32, u32)> {
-    let s = store::shard_of_id(release_id);
-    let sql = format!(
-        "select position, at_ms, width, height from s{s}.release_stills where release_id = ? order by position"
-    );
-    let Ok(mut q) = conn.prepare(&sql) else { return Vec::new() };
-    q.query_map([release_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
-        .map(|rows| rows.filter_map(Result::ok).collect())
-        .unwrap_or_default()
-}
-
 /// The keys that name the video file itself, whichever release carries it: the Matroska SegmentUID with the mux's
 /// DateUTC, and the OpenSubtitles hash (the size with the first and last 64 KiB). Both come from the probed main
 /// file, never a sample or an extra, soo a release that shares one has the same pictures at the same places.
 const SAME_FILE: [keys::Kind; 2] = [keys::Kind::Mux, keys::Kind::MovieHash];
 
-/// Releases with every still hashed looked at per key and shard, newest first, for one whose files are on disk.
-const SAME_FILE_CANDIDATES: i64 = 16;
-
-/// What a release's video file can be found by: its mux key and its OpenSubtitles hash, read from its probe in
-/// `schema` (`main` on a shard opened alone, `sN` with the shards attached). Empty when it has no probe.
-pub fn file_lookup(conn: &rusqlite::Connection, schema: &str, release_id: i64) -> keys::Lookup {
-    let row: Option<(String, Option<String>)> = conn
-        .prepare_cached(&format!("select info, moviehash from {schema}.release_probe where release_id = ?1"))
-        .and_then(|mut q| q.query_row([release_id], |r| Ok((r.get(0)?, r.get(1)?))))
-        .ok();
-    let Some((info, moviehash)) = row else { return keys::Lookup::default() };
-    let mux = serde_json::from_str::<ProbeInfo>(&info)
-        .ok()
-        .and_then(|p| p.media.as_ref().and_then(keys::mux_text))
-        .map(|t| keys::as_key(keys::digest8(t.as_bytes())));
-    keys::Lookup {
-        keys: keys::Keys { mux, ..keys::Keys::default() },
-        moviehash: moviehash.filter(|h| !h.is_empty()),
-        ..keys::Lookup::default()
-    }
-}
-
-/// Whether a release has every still, each hashed and still on disk, read with the shards attached to `conn`.
-fn has_all_stills(conn: &rusqlite::Connection, release_id: i64) -> bool {
-    let s = store::shard_of_id(release_id);
-    let kept: Vec<(String, bool)> = conn
-        .prepare_cached(&format!("select sha256, phash is not null from s{s}.release_stills where release_id = ?1"))
-        .and_then(|mut q| q.query_map([release_id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect())
-        .unwrap_or_default();
-    kept.len() == POSITIONS.len() && kept.iter().all(|(h, hashed)| *hashed && still_file(h).is_some_and(|f| f.exists()))
-}
-
-/// The releases other than `?1` in shard `shard` whose probed file has the `kind` key `?3`, that the pages would show
-/// and that have every still hashed, newest first, at most `?2`: those without stills are left out in SQL, soo any
-/// number of releases that borrow can't hide the one they borrow from.
-fn with_stills_sql(kind: keys::Kind, shard: usize) -> String {
-    let (from, matches) = match kind {
-        keys::Kind::Mux => (format!("s{shard}.release_keys k"), "k.mux = ?3"),
-        _ => (format!("s{shard}.release_probe k"), "k.moviehash = ?3"),
-    };
-    format!(
-        "select k.release_id from {from} join s{shard}.releases r on r.id = k.release_id
-         where {matches} and k.release_id != ?1 and not atlas_blocked(r.group_name)
-           and (select count(*) from s{shard}.release_stills s
-                where s.release_id = k.release_id and s.phash is not null) = {}
-         order by k.release_id desc limit ?2",
-        POSITIONS.len()
-    )
-}
-
-/// Another release carrying the same video file (`SAME_FILE`) that already has its stills, and the key that ties
-/// them, over every shard of `conn`. The stills are read from it, by its id: none are made or kept twice.
-pub fn same_file_stills(conn: &rusqlite::Connection, own: i64, lookup: &keys::Lookup) -> Option<(i64, keys::Kind)> {
-    for kind in SAME_FILE {
-        let value: Option<rusqlite::types::Value> = match kind {
-            keys::Kind::Mux => lookup.keys.mux.map(Into::into),
-            _ => lookup.moviehash.clone().map(Into::into),
-        };
-        let Some(value) = value else { continue };
-        let mut found: Vec<i64> = Vec::new();
-        for shard in 0..store::SHARDS {
-            // a shard without the tables yet has none
-            let Ok(mut q) = conn.prepare_cached(&with_stills_sql(kind, shard)) else { continue };
-            let Ok(rows) = q.query_map(rusqlite::params![own, SAME_FILE_CANDIDATES, value], |r| r.get::<_, i64>(0))
-            else {
-                continue;
-            };
-            found.extend(rows.filter_map(Result::ok));
-        }
-        found.sort_unstable_by(|a, b| b.cmp(a));
-        if let Some(other) = found.into_iter().find(|other| has_all_stills(conn, *other)) {
-            return Some((other, kind));
-        }
-    }
-    None
-}
-
-/// Whose stills a release shows, with the shards attached to `conn`: its own, else those of a release with the same
-/// video file, with the key that ties them. None: no stills to show.
-pub fn shown_stills(conn: &rusqlite::Connection, release_id: i64) -> Option<(i64, Option<keys::Kind>)> {
-    if !stills(conn, release_id).is_empty() {
-        return Some((release_id, None));
-    }
-    let lookup = file_lookup(conn, &format!("s{}", store::shard_of_id(release_id)), release_id);
-    same_file_stills(conn, release_id, &lookup).map(|(other, kind)| (other, Some(kind)))
-}
-
-/// The most releases listed as the same film.
-const MAX_SAME_FILM: usize = 50;
-
 /// How far apart in the film two stills may be and still be compared: each encode puts its keyframes in its own
 /// places, soo the one nearest a quarter of the way in is seconds off from another's.
+#[cfg(test)]
 const SAME_FILM_WINDOW_MS: i64 = 15_000;
-
-/// Other releases whose stills show the same pictures as this one's: at least two of its stills each within
-/// `MATCH_BITS` of one of theirs taken near the same time, newest first. Only ever "the same film" (another encode,
-/// a remux, a cut), never a twin.
-pub fn same_film(conn: &rusqlite::Connection, release_id: i64) -> Vec<i64> {
-    let s = store::shard_of_id(release_id);
-    let own: Vec<(u8, Option<i64>, u64)> = conn
-        .prepare(&format!(
-            "select position, at_ms, phash from s{s}.release_stills where release_id = ? and phash is not null"
-        ))
-        .and_then(|mut q| {
-            q.query_map([release_id], |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? as u64)))?.collect()
-        })
-        .unwrap_or_default();
-    if own.len() < 2 {
-        return Vec::new();
-    }
-    // per release: which of our stills found a match, one bit each
-    let mut hits: std::collections::HashMap<i64, u8> = std::collections::HashMap::new();
-    for shard in 0..store::SHARDS {
-        let sql = format!(
-            "select release_id, position, at_ms, phash from s{shard}.release_stills
-             where phash is not null and release_id != ?"
-        );
-        // a shard that hasn't got the table yet has none
-        let Ok(mut q) = conn.prepare(&sql) else { continue };
-        let Ok(rows) = q.query_map([release_id], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, u8>(1)?, r.get::<_, Option<i64>>(2)?, r.get::<_, i64>(3)?))
-        }) else {
-            continue;
-        };
-        for (other, position, at, hash) in rows.filter_map(Result::ok) {
-            let matched = own.iter().enumerate().filter(|(_, mine)| still_matches(**mine, (position, at, hash as u64)));
-            for (i, _) in matched {
-                *hits.entry(other).or_default() |= 1 << i;
-            }
-        }
-    }
-    let mut found: Vec<i64> = hits.into_iter().filter(|&(_, bits)| bits.count_ones() >= 2).map(|(id, _)| id).collect();
-    // ids grow with time, within a shard and across them closely enough
-    found.sort_unstable_by(|a, b| b.cmp(a));
-    found.truncate(MAX_SAME_FILM);
-    found
-}
 
 /// Two stills, (position, time, hash), show the same picture: taken near the same time (or at the same position,
 /// when a time is missing) and close in hash.
+#[cfg(test)]
 fn still_matches(a: (u8, Option<i64>, u64), b: (u8, Option<i64>, u64)) -> bool {
     let near = match (a.1, b.1) {
         (Some(x), Some(y)) => (x - y).abs() <= SAME_FILM_WINDOW_MS,
         _ => a.0 == b.0,
     };
     near && crate::video::phash::distance(a.2, b.2) <= crate::video::phash::MATCH_BITS
-}
-
-/// One still's JPEG, while the folder still has it.
-pub fn still(conn: &rusqlite::Connection, release_id: i64, position: u8) -> Option<Vec<u8>> {
-    let s = store::shard_of_id(release_id);
-    let sha256: String = conn
-        .query_row(
-            &format!("select sha256 from s{s}.release_stills where release_id = ?1 and position = ?2"),
-            rusqlite::params![release_id, position],
-            |r| r.get(0),
-        )
-        .ok()?;
-    std::fs::read(still_file(&sha256)?).ok()
 }
 
 /// Where the video's bytes are: one file, or a stored file across RAR volumes.
@@ -803,24 +630,6 @@ fn cued_keyframe(
 /// MP4 sample entries of the video the decoders read, as the probe names them.
 const MP4_CODECS: [&str; 4] = ["avc1", "avc3", "hvc1", "hev1"];
 
-/// Asks for stills again on every MP4 with HEVC or H.264 video: they had none before `mp4_frames`. Once, from the
-/// stage's seed.
-pub(crate) fn rerun_mp4(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<usize> {
-    let codecs = MP4_CODECS.map(|c| format!("'{c}'")).join(", ");
-    let ids: Vec<i64> = conn
-        .prepare(&format!(
-            "select release_id from release_probe
-             where json_extract(info, '$.media.container') = 'mp4'
-               and json_extract(info, '$.media.video[0].codec') in ({codecs})"
-        ))?
-        .query_map([], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    for id in &ids {
-        crate::postprocess::rerun_on(conn, *id, mask(STILLS_STEP), now)?;
-    }
-    Ok(ids.len())
-}
-
 /// A still from a keyframe: JPEG bytes, width, height, and its perceptual hash when it has one.
 fn still_of(track: &VideoTrack, frame: &[u8]) -> Option<(Vec<u8>, u32, u32, Option<u64>)> {
     let picture = match track.codec {
@@ -1237,39 +1046,6 @@ mod tests {
     }
 
     #[test]
-    fn mp4s_with_video_we_decode_are_asked_for_stills_again() {
-        let dir = tempfile::tempdir().unwrap();
-        let main = dir.path().join("atlas.db");
-        crate::db::create_db_at(&main).unwrap();
-        let conn = crate::db::open_shard(&crate::store::shard_path(&main, 0)).unwrap();
-        for (id, info) in [
-            (1i64, r#"{"media":{"container":"mp4","video":[{"codec":"hev1"}]}}"#),
-            (2, r#"{"media":{"container":"mp4","video":[{"codec":"avc1"}]}}"#),
-            (3, r#"{"media":{"container":"mp4","video":[{"codec":"mp4v"}]}}"#),
-            (4, r#"{"media":{"container":"matroska","video":[{"codec":"V_MPEGH/ISO/HEVC"}]}}"#),
-        ] {
-            conn.execute("insert into releases (id, name, group_name) values (?, ?, 'g')", rusqlite::params![id, id])
-                .unwrap();
-            conn.execute(
-                "insert into pp_state (release_id, done) values (?, ?)",
-                rusqlite::params![id, mask(STILLS_STEP)],
-            )
-            .unwrap();
-            conn.execute("insert into release_probe (release_id, info) values (?, ?)", rusqlite::params![id, info])
-                .unwrap();
-        }
-        assert_eq!(rerun_mp4(&conn, 100).unwrap(), 2);
-        let done: Vec<i64> = conn
-            .prepare("select done from pp_state order by release_id")
-            .unwrap()
-            .query_map([], |r| r.get(0))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
-        assert_eq!(done, [0, 0, mask(STILLS_STEP) as i64, mask(STILLS_STEP) as i64]);
-    }
-
-    #[test]
     fn volumes_keep_their_place_by_number() {
         assert_eq!(volume_number("Film.part001.rar"), Some(1));
         assert_eq!(volume_number("film.PART12.RAR"), Some(12));
@@ -1340,92 +1116,92 @@ mod tests {
         let (stills, _) = mp4_stills(&[(film, parts)], false);
         assert_eq!(stills.iter().map(|s| s.0).collect::<Vec<_>>(), [50]);
     }
-
-    /// The main database in memory with shard 0 attached: releases, keys, probes and stills.
-    fn shards() -> rusqlite::Connection {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::filters::register_sql(&conn).unwrap();
-        conn.execute("attach ':memory:' as s0", []).unwrap();
-        conn.execute_batch("create table s0.releases (id integer primary key, group_name text not null)").unwrap();
-        for table in [&keys::RELEASE_KEYS, &super::super::PROBE, &STILLS] {
-            conn.execute_batch(&table.create.replacen("exists ", "exists s0.", 1)).unwrap();
-            for (column, kind) in table.added {
-                let _ = conn.execute_batch(&format!("alter table s0.{} add column {column} {kind}", table.name));
-            }
-        }
-        conn
-    }
-
-    /// A release in shard 0, probed with `media` (a Matroska SegmentUID, or none) and `moviehash`, with stills at
-    /// `positions`, each kept on disk.
-    fn release(conn: &rusqlite::Connection, id: i64, uid: Option<&str>, moviehash: Option<&str>, positions: &[u8]) {
-        conn.execute("insert into s0.releases (id, group_name) values (?1, 'a.b.c')", [id]).unwrap();
-        let media = uid.map(|u| crate::probe::MediaInfo {
-            container: "matroska".into(),
-            segment_uid: Some(u.into()),
-            muxed_at: Some(1_700_000_000),
-            ..Default::default()
-        });
-        let info = ProbeInfo { media, ..Default::default() };
-        conn.execute(
-            "insert into s0.release_probe (release_id, info, moviehash) values (?1, ?2, ?3)",
-            rusqlite::params![id, serde_json::to_string(&info).unwrap(), moviehash],
-        )
-        .unwrap();
-        let mux = file_lookup(conn, "s0", id).keys.mux;
-        conn.execute("insert into s0.release_keys (release_id, mux) values (?1, ?2)", rusqlite::params![id, mux])
-            .unwrap();
-        for &p in positions {
-            let sha = keep(format!("still {id} {p}").as_bytes()).unwrap();
-            conn.execute(
-                "insert into s0.release_stills (release_id, position, at_ms, sha256, width, height, phash)
-                 values (?1, ?2, 0, ?3, 960, 540, 1)",
-                rusqlite::params![id, p, sha],
-            )
-            .unwrap();
-        }
-    }
-
     #[test]
-    fn a_release_with_the_same_video_file_shows_the_stills_already_made() {
-        let conn = shards();
-        // 0 has its stills; 8 is the same mux packed in a 7z, with none; 16 the same mux with only two
-        release(&conn, 0, Some("ab12"), Some("1d9da161e916b2fd"), &POSITIONS);
-        release(&conn, 8, Some("ab12"), None, &[]);
-        release(&conn, 16, Some("ab12"), None, &[25, 50]);
-        // 24 has only the OpenSubtitles hash of 0's file; 32 another file altogether
-        release(&conn, 24, None, Some("1d9da161e916b2fd"), &[]);
-        release(&conn, 32, Some("ffff"), Some("0000000000000001"), &[]);
-
-        assert_eq!(file_lookup(&conn, "s0", 8).keys.mux, file_lookup(&conn, "s0", 0).keys.mux);
-        assert!(file_lookup(&conn, "s0", 99).keys.mux.is_none(), "no probe, nothing to look by");
-        assert_eq!(shown_stills(&conn, 0), Some((0, None)), "its own first");
-        assert_eq!(shown_stills(&conn, 8), Some((0, Some(keys::Kind::Mux))));
-        assert_eq!(shown_stills(&conn, 16), Some((16, None)), "its own, even short");
-        assert_eq!(shown_stills(&conn, 24), Some((0, Some(keys::Kind::MovieHash))));
-        assert_eq!(shown_stills(&conn, 32), None);
-        // twenty newer releases of the same file that borrow (and so have none) don't hide the one they borrow from
-        for n in 1..=20 {
-            release(&conn, 32 + 8 * n, Some("ab12"), None, &[]);
-        }
-        assert_eq!(shown_stills(&conn, 8), Some((0, Some(keys::Kind::Mux))));
-        assert_eq!(shown_stills(&conn, 32 + 8 * 20), Some((0, Some(keys::Kind::Mux))));
-        // nor does a lender whose JPEGs were trimmed from the folder count
-        let gone: String = conn
-            .query_row("select sha256 from s0.release_stills where release_id = 0 and position = 50", [], |r| r.get(0))
+    #[ignore = "requires isolated PostgreSQL test database"]
+    fn native_still_lookup_requires_complete_descriptors_and_rejects_bad_hashes() {
+        use crate::pg::stage_reads::StepReads;
+        let schema = crate::pg::testing::Schema::new().expect("PostgreSQL fixture required");
+        let runtime = crate::pg::stage_queue_tests::runtime(&schema);
+        let ids = runtime
+            .owner
+            .with(|client| {
+                for n in 0..2 {
+                    crate::pg::release_writer::save(
+                        client,
+                        &[crate::parser::Release {
+                            name: format!("Stills.Example.{n}"),
+                            group: "example.group".into(),
+                            articles: vec![crate::parser::Article {
+                                filename: Some("video.mkv".into()),
+                                message_id: format!("<stills-{n}@example.test>"),
+                                part: Some(1),
+                                total_parts: Some(1),
+                                bytes: 1,
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        }],
+                        -10000,
+                    )?;
+                }
+                Ok(client
+                    .query("select id from releases order by name", &[])?
+                    .into_iter()
+                    .map(|r| r.get::<_, i64>(0))
+                    .collect::<Vec<_>>())
+            })
             .unwrap();
-        conn.execute(
-            "update s0.release_stills set sha256 = ?1 where release_id = 0 and position = 50",
-            [gone.replace(&gone[..1], if &gone[..1] == "0" { "1" } else { "0" })],
-        )
-        .unwrap();
-        assert_eq!(shown_stills(&conn, 8), None);
-        conn.execute("update s0.release_stills set sha256 = ?1 where release_id = 0 and position = 50", [&gone])
+        assert_eq!(ids.len(), 2);
+        let info = ProbeInfo {
+            media: Some(crate::probe::MediaInfo {
+                container: "matroska".into(),
+                segment_uid: Some("ab12".into()),
+                muxed_at: Some(1_700_000_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mux = keys::as_key(keys::digest8(keys::mux_text(info.media.as_ref().unwrap()).unwrap().as_bytes()));
+        let json = serde_json::to_string(&info).unwrap();
+        runtime
+            .owner
+            .with(|client| {
+                for id in &ids {
+                    client.execute(
+                        "insert into release_probe(release_id,info,moviehash) values($1,$2,'1d9da161e916b2fd')",
+                        &[id, &json],
+                    )?;
+                    client.execute("insert into release_keys(release_id,mux) values($1,$2)", &[id, &mux])?;
+                }
+                Ok(())
+            })
             .unwrap();
-        assert_eq!(shown_stills(&conn, 8), Some((0, Some(keys::Kind::Mux))));
-        // a release in a blocked group lends nothing
-        conn.execute("update s0.releases set group_name = 'alt.binaries.pictures.erotica.teen' where id = 0", [])
+        let reads = StepReads::for_owner(&runtime.owner).unwrap();
+        let lookup = reads.stills_lookup(ids[0]).unwrap();
+        assert_eq!(lookup.keys.mux, Some(mux));
+        assert_eq!(lookup.moviehash.as_deref(), Some("1d9da161e916b2fd"));
+        assert_eq!(reads.same_file_stills(ids[0], &lookup).unwrap(), None, "a key without pictures is not a donor");
+        runtime.owner.with(|client| {
+            for position in POSITIONS {
+                client.execute("insert into release_stills(release_id,position,at_ms,sha256,width,height,phash) values($1,$2,0,$3,960,540,1)",&[&ids[1],&i64::from(position),&"g".repeat(64)])?;
+            } Ok(())
+        }).unwrap();
+        assert!(
+            reads.same_file_stills(ids[0], &lookup).is_err(),
+            "invalid native hash is an error, never a cache miss"
+        );
+        runtime
+            .owner
+            .with(|client| {
+                client.execute("delete from release_stills where release_id=$1 and position=50", &[&ids[1]])?;
+                Ok(())
+            })
             .unwrap();
-        assert_eq!(shown_stills(&conn, 8), None);
+        assert_eq!(
+            reads.same_file_stills(ids[0], &lookup).unwrap(),
+            None,
+            "two pictures do not suppress a full three-picture probe"
+        );
+        runtime.owner.close();
     }
 }

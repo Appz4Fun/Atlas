@@ -3,17 +3,18 @@
 use std::sync::Mutex;
 
 use crate::archive::{self, crc32};
+use crate::catalog_facts::{FileInfo, SegmentPick};
 use crate::config::Config;
 use crate::nntp::yenc_decode;
 use crate::postprocess::step::{
-    BodyRequest, Got, Needs, Outcome, ReleaseInfo, Reruns, Step, StepCtx, StepError, StepId, StepMutation, StepWrite, mask,
+    BodyRequest, Got, Needs, Outcome, ReleaseInfo, Reruns, Step, StepCtx, StepError, StepId, StepMutation, StepWrite,
+    mask,
 };
 use crate::release_info;
-use crate::store::{FileInfo, SegmentPick};
 
 use super::{
-    ProbeInfo, agent_of, derive, imdb_ids, keep_headers, media, moviehash, nest,
-    nfo_text, parse_sfv, xref_groups, yenc, yenc_quirks,
+    ProbeInfo, agent_of, derive, imdb_ids, keep_headers, media, moviehash, nest, nfo_text, parse_sfv, xref_groups,
+    yenc, yenc_quirks,
 };
 
 pub const PROBE_STEP: StepId = StepId(4);
@@ -115,99 +116,8 @@ fn capped(message_id: &str, file: &str) -> BodyRequest {
     BodyRequest { message_id: message_id.to_string(), file: file.to_string(), max_bytes: Some(archive::ARTICLE_CAP) }
 }
 
-/// Asks for the probe again on releases whose probe found the main file's first article too big to read, before
-/// `fetch_head`: it saw only that the article was there, no yEnc header. Once, from the stage's seed.
-pub(crate) fn rerun_big_heads(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<usize> {
-    rerun_probes(conn, "json_extract(info, '$.yenc') is null and json_extract(info, '$.health.first') = 1", now)
-}
-
-/// Asks for the probe again on AVI files it found no tracks in, before `avi` read them: posted bare, split into
-/// `.avi.001` and on, or stored in an archive. Once, from the stage's seed.
-pub(crate) fn rerun_avi(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<usize> {
-    rerun_unread(conn, &["avi"], now)
-}
-
-/// The same for WMV and ASF files, before `asf` read them.
-pub(crate) fn rerun_asf(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<usize> {
-    rerun_unread(conn, &["wmv", "asf"], now)
-}
-
-/// Asks for the probe again on MP4s posted whole whose front gave no tracks, before `read_tail_moov` read the end
-/// of the file. Once, from the stage's seed.
-pub(crate) fn rerun_mp4_tail(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<usize> {
-    rerun_probes(conn, MP4_WITHOUT_TRACKS, now)
-}
-
-/// A probe row of an MP4 posted whole with no tracks.
-const MP4_WITHOUT_TRACKS: &str = "json_extract(info, '$.media.container') = 'mp4'
-     and json_extract(info, '$.archive') is null
-     and coalesce(json_array_length(json_extract(info, '$.media.video')), 0) = 0
-     and coalesce(json_array_length(json_extract(info, '$.media.audio')), 0) = 0";
-
-/// The same for MPEG program streams, before `mpegps` read them.
-pub(crate) fn rerun_mpeg_ps(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<usize> {
-    rerun_unread(conn, &["mpg", "mpeg", "vob"], now)
-}
-
-/// The same for DVD-Video discs and folders, before `dvd` read their title sets: an ISO or IMG image, or a
-/// `VIDEO_TS` folder whose first file is an IFO or BUP.
-pub(crate) fn rerun_dvd(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<usize> {
-    Ok(rerun_unread(conn, &["iso", "img", "ifo", "bup"], now)? + rerun_probes(conn, DVD_FOLDER_AS_VOB, now)?)
-}
-
-/// A probe row of a `VIDEO_TS` folder in an archive read from its VOB only, before its IFO was looked for.
-const DVD_FOLDER_AS_VOB: &str = "json_extract(info, '$.media.container') = 'mpeg-ps'
-     and lower(json_extract(info, '$.archive.name')) like '%video_ts%'";
-/// The same for Blu-ray discs and folders, before `bluray` read their playlists: a disc image, or a `BDMV` folder
-/// whose first file is one of its small ones. Images again too: the DVD step's rerun may have run before this.
-pub(crate) fn rerun_bluray(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<usize> {
-    rerun_unread(conn, &["iso", "img", "bdmv", "clpi", "mpls", "bdjo", "m2ts"], now)
-}
-
-/// Asks for the probe again on Dolby Vision video whose RPU wasn't read, or was read before the probe kept that it
-/// had been: only an RPU says whether a profile 7 enhancement layer is FEL or MEL, and which content mapping it
-/// carries. One front read a release, and only Dolby Vision ones. Once, from the stage's seed.
-pub(crate) fn rerun_dv_without_rpu(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<usize> {
-    rerun_probes(conn, DV_WITHOUT_RPU, now)
-}
-
-/// A probe row whose first video track is Dolby Vision, saved before `from_rpu` was kept. A row that has it, true
-/// or false, was probed since and isn't asked for again.
-const DV_WITHOUT_RPU: &str = "json_extract(info, '$.media.video[0].dv_profile') is not null
-     and json_type(info, '$.media.video[0].dolby_vision.from_rpu') is null";
-
-/// Asks for the probe again on Dolby Vision video probed before the first keyframe was keyed, soo the remuxes the
-/// owner looks for most can be found by their video stream. One front read a release, Dolby Vision only: other
-/// releases get the key from their next probe. Once, from the stage's seed.
-pub(crate) fn rerun_dv_without_keyframe_key(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<usize> {
-    rerun_probes(conn, DV_WITHOUT_KEYFRAME_KEY, now)
-}
-
-/// A probe row whose first video track is Dolby Vision, saved before `keyframe_key` was kept (a probe since keeps
-/// it, null when it found no whole keyframe).
-const DV_WITHOUT_KEYFRAME_KEY: &str = "json_extract(info, '$.media.video[0].dv_profile') is not null
-     and json_type(info, '$.media.video[0].keyframe_key') is null";
-
-/// Asks for the probe again on Dolby Vision video whose first audio track is AC-3, E-AC-3 or FLAC, probed before
-/// that track's stream was keyed. One front read a release, as for the keyframe key. Once, from the stage's seed.
-pub(crate) fn rerun_dv_without_audio_key(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<usize> {
-    rerun_probes(conn, DV_WITHOUT_AUDIO_KEY, now)
-}
-
 /// The codecs `stream_key` is taken for, as Matroska and MP4 name them.
 const KEYED_AUDIO: &[&str] = &["A_AC3", "A_EAC3", "A_FLAC", "ac-3", "ec-3", "fLaC"];
-
-/// A probe row whose first video track is Dolby Vision and first audio track a keyed codec, saved before
-/// `stream_key` was kept (a probe since keeps it, null when the frames read ran out).
-const DV_WITHOUT_AUDIO_KEY: &str = "json_extract(info, '$.media.video[0].dv_profile') is not null
-     and json_extract(info, '$.media.audio[0].codec') in ('A_AC3', 'A_EAC3', 'A_FLAC', 'ac-3', 'ec-3', 'fLaC')
-     and json_type(info, '$.media.audio[0].stream_key') is null";
-
-/// The same for MPEG transport streams, before `mpegts` read their program map: a capture's `.ts` or `.mts`, or a
-/// Blu-ray's `.m2ts`.
-pub(crate) fn rerun_mpeg_ts(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<usize> {
-    rerun_unread(conn, &["ts", "mts", "m2ts"], now)
-}
 
 /// Extensions of the files a probe reads tracks from since it first ran: a saved probe of one with no media is
 /// from before.
@@ -222,28 +132,6 @@ fn named(name: &str, ext: &str) -> bool {
     lower.strip_suffix(ext).is_some_and(|s| s.ends_with('.')) || lower.contains(&format!(".{ext}.0"))
 }
 
-/// Asks for the probe again where it found no media in a file with one of these extensions: the file itself, or the
-/// first one of the archive it read.
-fn rerun_unread(conn: &rusqlite::Connection, exts: &[&str], now: i64) -> rusqlite::Result<usize> {
-    let ids: Vec<i64> = conn
-        .prepare(
-            "select release_id, json_extract(info, '$.file'), json_extract(info, '$.archive.name') from release_probe
-             where json_extract(info, '$.media') is null",
-        )?
-        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?)))?
-        .filter_map(|row| match row {
-            Ok((id, file, inner)) => {
-                [file, inner].iter().flatten().any(|n| exts.iter().any(|e| named(n, e))).then_some(Ok(id))
-            }
-            Err(e) => Some(Err(e)),
-        })
-        .collect::<rusqlite::Result<_>>()?;
-    for id in &ids {
-        crate::postprocess::rerun_on(conn, *id, mask(PROBE_STEP), now)?;
-    }
-    Ok(ids.len())
-}
-
 /// Whether a saved probe stopped at encryption without extracting media tracks.
 fn encrypted_without_media(info: &str) -> bool {
     let Ok(p) = serde_json::from_str::<serde_json::Value>(info) else { return false };
@@ -254,55 +142,6 @@ fn encrypted_without_media(info: &str) -> bool {
         || p["layers"]
             .as_array()
             .is_some_and(|ls| ls.iter().any(|l| l["encrypted"] == true || l["stop"] == "encrypted"))
-}
-
-/// Asks for `archive_list` and `probe` again on encrypted releases that now have a known password in
-/// `release_nfo_password` (`names_hidden = 1` with no inner files, or a probe that stopped at encryption).
-pub(crate) fn rerun_encrypted_with_password(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<usize> {
-    let mut count = 0usize;
-    let list_ids: Vec<i64> = conn
-        .prepare(
-            "select ar.release_id from archive_release ar
-             join release_nfo_password pw on pw.release_id = ar.release_id
-             where (ar.names_hidden = 1
-                    and not exists (
-                        select 1 from archive_inner_files f
-                        where f.release_id = ar.release_id and f.source in (1, 2, 3)
-                    ))
-                or (ar.password = 1
-                    and exists (
-                        select 1 from archive_inner_files f
-                        where f.release_id = ar.release_id and f.source in (1, 2, 3) and lower(f.name) like '%.nzb'
-                    )
-                    and not exists (
-                        select 1 from archive_inner_files f
-                        where f.release_id = ar.release_id and f.source = 5
-                    ))",
-        )?
-        .query_map([], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    for id in &list_ids {
-        crate::postprocess::rerun_on(conn, *id, mask(archive::steps::LIST_STEP), now)?;
-        count += 1;
-    }
-    let probe_ids: Vec<i64> = conn
-        .prepare(
-            "select p.release_id, p.info from release_probe p
-             join release_nfo_password pw on pw.release_id = p.release_id
-             where json_extract(p.info, '$.media') is null",
-        )?
-        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
-        .filter_map(|row| match row {
-            Ok((id, info)) if encrypted_without_media(&info) => Some(Ok(id)),
-            Ok(_) => None,
-            Err(e) => Some(Err(e)),
-        })
-        .collect::<rusqlite::Result<_>>()?;
-    for id in &probe_ids {
-        crate::postprocess::rerun_on(conn, *id, mask(PROBE_STEP), now)?;
-        count += 1;
-    }
-    Ok(count)
 }
 
 /// A saved probe with no media of a file in `NEWLY_READ`, from before its reader, or of a set's later volume, from
@@ -358,15 +197,26 @@ pub(crate) enum SavedCoverage {
 /// Non-deserializable admission result, minted only by the real bounded decode.
 /// It binds the exact JSON bytes so an actor can recheck its PG association
 /// without allocating a second expanded ProbeInfo on the same worker frame.
-pub(crate) struct CheckedSavedProbe {probe:ProbeInfo,length:usize,digest:[u8;32]}
+pub(crate) struct CheckedSavedProbe {
+    probe: ProbeInfo,
+    length: usize,
+    digest: [u8; 32],
+}
 impl CheckedSavedProbe {
     pub(crate) fn matches(&self,json:&str)->bool {
         use sha2::Digest;
         self.length==json.len()&&self.digest==<[u8;32]>::from(sha2::Sha256::digest(json.as_bytes()))
     }
-    fn into_probe(self)->ProbeInfo {self.probe}
+    fn into_probe(self) -> ProbeInfo {
+        self.probe
+    }
 }
-impl std::ops::Deref for CheckedSavedProbe {type Target=ProbeInfo;fn deref(&self)->&ProbeInfo {&self.probe}}
+impl std::ops::Deref for CheckedSavedProbe {
+    type Target = ProbeInfo;
+    fn deref(&self) -> &ProbeInfo {
+        &self.probe
+    }
+}
 
 /// Bound expanded serde ownership before any of the legacy JSON predicates can
 /// allocate a Value tree. The shared admission reserves four struct widths and
@@ -375,18 +225,30 @@ impl std::ops::Deref for CheckedSavedProbe {type Target=ProbeInfo;fn deref(&self
 pub(crate) fn native_saved_probe(info: &str, remaining: &mut u64) -> anyhow::Result<SavedCoverage> {
     let decoded = crate::pg::probe_decode::decode(info.as_bytes(), remaining)?;
     use sha2::Digest;
-    Ok(if stale_saved(info) { SavedCoverage::NeedsTargetRefresh } else {
-        SavedCoverage::Current(CheckedSavedProbe {probe:decoded,length:info.len(),digest:sha2::Sha256::digest(info.as_bytes()).into()})
+    Ok(if stale_saved(info) {
+        SavedCoverage::NeedsTargetRefresh
+    } else {
+        SavedCoverage::Current(CheckedSavedProbe {
+            probe: decoded,
+            length: info.len(),
+            digest: sha2::Sha256::digest(info.as_bytes()).into(),
+        })
     })
 }
 
 // The parser recognizes cover names independently of declared MIME. Its cover
 // bytes are serde(skip), so serialized media alone cannot prove asset absence.
 fn native_media_needs_asset(media: Option<&media::MediaInfo>) -> bool {
-    media.is_some_and(|media| media.cover.is_some() || media.attachments.iter().any(|a| {
-        media::cover_rank(&a.name).is_some()
-            || a.mime.as_deref().and_then(|mime| mime.get(..6)).is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/"))
-    }))
+    media.is_some_and(|media| {
+        media.cover.is_some()
+            || media.attachments.iter().any(|a| {
+                media::cover_rank(&a.name).is_some()
+                    || a.mime
+                        .as_deref()
+                        .and_then(|mime| mime.get(..6))
+                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/"))
+            })
+    })
 }
 
 /// Metadata-only SameMux reuse. The caller must select and observe the candidate
@@ -396,64 +258,55 @@ fn native_media_needs_asset(media: Option<&media::MediaInfo>) -> bool {
 /// A missing/old semantic proof is a known ineligible candidate, whereas malformed
 /// or over-budget saved data is an error and must not trigger provider fallback.
 pub(crate) fn native_same_mux_candidate(
-    own: i64, candidate: i64, group: &str, info: &ProbeInfo, json: &str,
-    moviehash: Option<&str>, cover: Option<(&str, &str)>, stamp: u64, remaining: &mut u64,
+    own: i64,
+    candidate: i64,
+    group: &str,
+    info: &ProbeInfo,
+    json: &str,
+    moviehash: Option<&str>,
+    cover: Option<(&str, &str)>,
+    stamp: u64,
+    remaining: &mut u64,
 ) -> anyhow::Result<Option<SameMux>> {
-    if own == candidate || crate::filters::group_blocked(group) { return Ok(None) }
+    if own == candidate || crate::filters::group_blocked(group) {
+        return Ok(None);
+    }
     let SavedCoverage::Current(other) = native_saved_probe(json, remaining)? else { return Ok(None) };
-    let other=other.into_probe();
-    if cover.is_some() || native_media_needs_asset(other.media.as_ref()) { return Ok(None) }
+    let other = other.into_probe();
+    if cover.is_some() || native_media_needs_asset(other.media.as_ref()) {
+        return Ok(None);
+    }
     let Some(mine) = info.media.as_ref() else { return Ok(None) };
     let Some(mux) = crate::keys::mux_text(mine) else { return Ok(None) };
     // Packed probes do not currently bind the inner payload's whole checksum.
     // Refuse their cross-release metadata reuse rather than compare outer CRCs.
-    if info.archive.is_some() || !info.layers.is_empty() || other.archive.is_some() || !other.layers.is_empty()
-        || info.file_crc32.zip(other.file_crc32).is_none_or(|(a,b)| a != b)
-        || content_size(info).is_none() || content_size(info) != content_size(&other)
-        || moviehash.filter(|h| !h.is_empty()).is_none_or(|h| info.moviehash.as_deref() != Some(h) || other.moviehash.as_deref() != Some(h))
+    if info.archive.is_some()
+        || !info.layers.is_empty()
+        || other.archive.is_some()
+        || !other.layers.is_empty()
+        || info.file_crc32.zip(other.file_crc32).is_none_or(|(a, b)| a != b)
+        || content_size(info).is_none()
+        || content_size(info) != content_size(&other)
+        || moviehash
+            .filter(|h| !h.is_empty())
+            .is_none_or(|h| info.moviehash.as_deref() != Some(h) || other.moviehash.as_deref() != Some(h))
         || other.media_whole != Some(whole_mark(stamp))
-    { return Ok(None) }
+    {
+        return Ok(None);
+    }
     let Some(media) = other.media else { return Ok(None) };
-    if !media.header_complete || !media.encoder_complete || !first_frame_read(&media)
+    if !media.header_complete
+        || !media.encoder_complete
+        || !first_frame_read(&media)
         || (!media.attachments.is_empty() && !media.attachments_complete)
         || (!media.chapters.is_empty() && !media.chapters_complete)
         || crate::keys::mux_text(&media).as_ref() != Some(&mux)
-        || media.video.is_empty() || !same_header(mine, &media)
-    { return Ok(None) }
+        || media.video.is_empty()
+        || !same_header(mine, &media)
+    {
+        return Ok(None);
+    }
     Ok(Some(SameMux { release_id: candidate, media, cover: None }))
-}
-
-/// Asks for the probe again on releases whose probe read a later volume of a set and found no media, before
-/// `first_of_set`. Once, from the stage's seed.
-pub(crate) fn rerun_later_volumes(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<usize> {
-    let ids: Vec<i64> = conn
-        .prepare(
-            "select release_id, json_extract(info, '$.file') from release_probe
-             where json_extract(info, '$.media') is null",
-        )?
-        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)))?
-        .filter_map(|row| match row {
-            Ok((id, Some(file))) if later_volume(&file) => Some(Ok(id)),
-            Ok(_) => None,
-            Err(e) => Some(Err(e)),
-        })
-        .collect::<rusqlite::Result<_>>()?;
-    for id in &ids {
-        crate::postprocess::rerun_on(conn, *id, mask(PROBE_STEP), now)?;
-    }
-    Ok(ids.len())
-}
-
-/// The probe again, past its saved result, on the releases whose probe row matches `filter`.
-fn rerun_probes(conn: &rusqlite::Connection, filter: &str, now: i64) -> rusqlite::Result<usize> {
-    let ids: Vec<i64> = conn
-        .prepare(&format!("select release_id from release_probe where {filter}"))?
-        .query_map([], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    for id in &ids {
-        crate::postprocess::rerun_on(conn, *id, mask(PROBE_STEP), now)?;
-    }
-    Ok(ids.len())
 }
 
 /// Whether a server has it. None: this doesn't say, as when the article's too big to read, or the budget's gone.
@@ -507,43 +360,62 @@ impl Step for ProbeStep {
         let stamp = self.config_stamp();
         let content_id = ctx.data().release_content_id(release_id)?.unwrap_or_default();
         let existing_db_pw = ctx.data().nfo_password(release_id)?;
-        let known_pw =
-            match existing_db_pw.clone() {
-                Some(password) => Some(password),
-                None => crate::raw_store::get_nfo_password_checked(&rel_name, &rel_group, &content_id).map_err(StepError::from_cache)?,
-            };
-        let native = matches!(ctx.data(), crate::postprocess::data::StepData::Native(_));
-        let saved = if ctx.data().explicit_rerun(release_id, PROBE_STEP)? { None } else {
+        let known_pw = match existing_db_pw.clone() {
+            Some(password) => Some(password),
+            None => crate::raw_store::get_nfo_password_checked(&rel_name, &rel_group, &content_id)
+                .map_err(StepError::from_cache)?,
+        };
+        let saved = if ctx.data().explicit_rerun(release_id, PROBE_STEP)? {
+            None
+        } else {
             crate::raw_store::get_probe_checked(&rel_name, &rel_group, &content_id, rel_parts, rel_complete, stamp)
                 .map_err(StepError::from_cache)?
         };
-        let mut asset_hold:Option<Box<dyn std::any::Any+Send>>=None;
+        let mut asset_hold: Option<Box<dyn std::any::Any + Send>> = None;
         let saved = match saved {
-            Some(saved) if native => match native_saved_probe(&saved.info, &mut (32 << 20)).map_err(StepError::from_cache)? {
+            Some(saved) => match native_saved_probe(&saved.info, &mut (32 << 20)).map_err(StepError::from_cache)? {
                 SavedCoverage::NeedsTargetRefresh => None,
                 SavedCoverage::Current(decoded) => {
                     if saved.cover.is_some() {
-                        let grant=crate::pg::worker_assets::current().map_err(StepError::from_cache)?
-                            .ok_or_else(||StepError::Transient("native cover namespace has not been selected".into()))?;
-                        match grant.verify_probe(release_id,crate::pg::natural_cache::Key {name:&rel_name,group:&rel_group,content_id:&content_id},rel_parts,rel_complete,stamp,&saved,&decoded).map_err(StepError::from_cache)? {
-                            crate::pg::worker_assets::CoverStatus::Verified(hold)=>asset_hold=Some(Box::new(hold)),
-                            crate::pg::worker_assets::CoverStatus::Changed=>return Err(StepError::Transient("saved probe association changed".into())),
-                            crate::pg::worker_assets::CoverStatus::Missing=>return Err(StepError::Transient("selected native cover bytes are unavailable".into())),
+                        let grant =
+                            crate::pg::worker_assets::current().map_err(StepError::from_cache)?.ok_or_else(|| {
+                                StepError::Transient("native cover namespace has not been selected".into())
+                            })?;
+                        match grant
+                            .verify_probe(
+                                release_id,
+                                crate::pg::natural_cache::Key {
+                                    name: &rel_name,
+                                    group: &rel_group,
+                                    content_id: &content_id,
+                                },
+                                rel_parts,
+                                rel_complete,
+                                stamp,
+                                &saved,
+                                &decoded,
+                            )
+                            .map_err(StepError::from_cache)?
+                        {
+                            crate::pg::worker_assets::CoverStatus::Verified(hold) => asset_hold = Some(Box::new(hold)),
+                            crate::pg::worker_assets::CoverStatus::Changed => {
+                                return Err(StepError::Transient("saved probe association changed".into()));
+                            }
+                            crate::pg::worker_assets::CoverStatus::Missing => {
+                                return Err(StepError::Transient("selected native cover bytes are unavailable".into()));
+                            }
                         }
                     } else if native_media_needs_asset(decoded.media.as_ref()) {
                         return Err(StepError::Transient("saved probe has no verified cover association".into()));
                     }
-                    Some((saved, Some(decoded.into_probe())))
+                    Some((saved, decoded.into_probe()))
                 }
             },
-            Some(saved) => Some((saved, None)),
             None => None,
         };
-        if let Some((saved, decoded)) = saved.filter(|(saved, decoded)| {
+        if let Some((saved, decoded)) = saved.filter(|(saved, _)| {
             let has_pw = saved.nfo_password.is_some() || known_pw.is_some();
-            (asset_hold.is_some() || saved.cover.as_ref().is_none_or(|(_, sha)| super::cover_file(sha).is_some_and(|p| p.exists())))
-                && (decoded.is_some() || !stale_saved(&saved.info))
-                && !(has_pw && encrypted_without_media(&saved.info))
+            (asset_hold.is_some() || saved.cover.is_none()) && !(has_pw && encrypted_without_media(&saved.info))
         }) {
             // a video probed before the probe kept the server's body CRC gets it from one HEAD
             let backfill = super::body_crc::wants_backfill(&saved.info);
@@ -556,17 +428,22 @@ impl Step for ProbeStep {
                 None => StepWrite::for_mutation(release_id, StepMutation::ClearCover),
             });
             let hash = saved.moviehash.clone();
-            let decoded = decoded.or_else(|| serde_json::from_str::<ProbeInfo>(&saved.info).ok());
-            writes.extend(title_writes(release_id, decoded.as_ref().and_then(|i| i.media.as_ref())));
-            writes.push(StepWrite::for_mutation(release_id, StepMutation::KeepProbe {
-                crc32: saved.crc32,agent: saved.agent,json: saved.info,moviehash: hash.clone(),
-            }));
+            writes.extend(title_writes(release_id, decoded.media.as_ref()));
+            writes.push(StepWrite::for_mutation(
+                release_id,
+                StepMutation::KeepProbe {
+                    crc32: saved.crc32,
+                    agent: saved.agent,
+                    json: saved.info,
+                    moviehash: hash.clone(),
+                },
+            ));
             // the account, host and layout keys come from what the probe holds
             let rerun = mask(crate::keys::KEYS_STEP)
                 | if hash.is_some() { mask(super::opensubtitles::OPENSUBTITLES_STEP) } else { 0 }
                 | if backfill { mask(super::body_crc::BODY_CRC_STEP) } else { 0 };
             let facts = hash.map(|h| vec![(MOVIEHASH_FACT, h)]).unwrap_or_default();
-            return Ok(Outcome { matched: true, writes, facts, rerun, hold:asset_hold, ..Outcome::default() });
+            return Ok(Outcome { matched: true, writes, facts, rerun, hold: asset_hold, ..Outcome::default() });
         }
         let files = ctx.files().map_err(StepError::from_inventory)?;
         let par2_names = ctx.data().par2_names(release_id, &files)?;
@@ -585,7 +462,8 @@ impl Step for ProbeStep {
             release_info::find_verified_password(texts, &[], check.as_ref())
         });
         if let Some(ref pw) = found_nfo_password {
-            crate::raw_store::put_nfo_password_checked(&rel_name, &rel_group, &content_id, pw).map_err(StepError::from_cache)?;
+            crate::raw_store::put_nfo_password_checked(&rel_name, &rel_group, &content_id, pw)
+                .map_err(StepError::from_cache)?;
             writes.push(StepWrite::for_mutation(release_id, StepMutation::SetNfoPassword { password: pw.clone() }));
         }
 
@@ -609,7 +487,11 @@ impl Step for ProbeStep {
             let (text, from_start) = match reused {
                 Some(k) => (k.text, true),
                 None => {
-                    let Some(seg) = ctx.segments(file.id, &SegmentPick::First(1)).map_err(StepError::from_inventory)?.into_iter().next()
+                    let Some(seg) = ctx
+                        .segments(file.id, &SegmentPick::First(1))
+                        .map_err(StepError::from_inventory)?
+                        .into_iter()
+                        .next()
                     else {
                         continue;
                     };
@@ -625,7 +507,8 @@ impl Step for ProbeStep {
                 if found_nfo_password.is_none()
                     && let Some(password) = release_info::find_verified_password([text.as_str()], &[], check.as_ref())
                 {
-                    crate::raw_store::put_nfo_password_checked(&rel_name, &rel_group, &content_id, &password).map_err(StepError::from_cache)?;
+                    crate::raw_store::put_nfo_password_checked(&rel_name, &rel_group, &content_id, &password)
+                        .map_err(StepError::from_cache)?;
                     found_nfo_password = Some(password.clone());
                     writes.push(StepWrite::for_mutation(release_id, StepMutation::SetNfoPassword { password }));
                 }
@@ -637,14 +520,21 @@ impl Step for ProbeStep {
                     if from_start {
                         info.nfo_file = Some(file.filename.clone());
                         // the probe's JSON holds it now: a copy a step kept goes
-                        writes.push(StepWrite::for_mutation(release_id, StepMutation::DropNfoCopy { file: file.filename.clone() }));
+                        writes.push(StepWrite::for_mutation(
+                            release_id,
+                            StepMutation::DropNfoCopy { file: file.filename.clone() },
+                        ));
                     }
                 }
             }
         }
         if found_nfo_password.is_none() {
             for nzb_file in archive::select::nzb_sources_with_par2(&files, &par2_names) {
-                let Some(seg) = ctx.segments(nzb_file.id, &SegmentPick::First(1)).map_err(StepError::from_inventory)?.into_iter().next()
+                let Some(seg) = ctx
+                    .segments(nzb_file.id, &SegmentPick::First(1))
+                    .map_err(StepError::from_inventory)?
+                    .into_iter()
+                    .next()
                 else {
                     continue;
                 };
@@ -656,7 +546,8 @@ impl Step for ProbeStep {
                     && let Some(password) =
                         release_info::find_verified_password(std::iter::empty(), &[meta_pw], check.as_ref())
                 {
-                    crate::raw_store::put_nfo_password_checked(&rel_name, &rel_group, &content_id, &password).map_err(StepError::from_cache)?;
+                    crate::raw_store::put_nfo_password_checked(&rel_name, &rel_group, &content_id, &password)
+                        .map_err(StepError::from_cache)?;
                     found_nfo_password = Some(password.clone());
                     writes.push(StepWrite::for_mutation(release_id, StepMutation::SetNfoPassword { password }));
                     break;
@@ -708,7 +599,8 @@ impl Step for ProbeStep {
                             && let Some(password) =
                                 release_info::find_verified_password([nfo_s.as_str()], &[], check.as_ref())
                         {
-                            crate::raw_store::put_nfo_password_checked(&rel_name, &rel_group, &content_id, &password).map_err(StepError::from_cache)?;
+                            crate::raw_store::put_nfo_password_checked(&rel_name, &rel_group, &content_id, &password)
+                                .map_err(StepError::from_cache)?;
                             found_nfo_password = Some(password.clone());
                             writes.push(StepWrite::for_mutation(release_id, StepMutation::SetNfoPassword { password }));
                         }
@@ -718,7 +610,9 @@ impl Step for ProbeStep {
             }
             let total = file.expected.unwrap_or(file.parts_seen);
             if total > 2 {
-                let middle = ctx.segments(file.id, &SegmentPick::Parts(vec![(total + 1) / 2])).map_err(StepError::from_inventory)?;
+                let middle = ctx
+                    .segments(file.id, &SegmentPick::Parts(vec![(total + 1) / 2]))
+                    .map_err(StepError::from_inventory)?;
                 if let Some(middle) = middle.into_iter().next()
                     && let Some(there) = ctx.article_exists(&middle.message_id, &file.filename)?
                 {
@@ -748,8 +642,7 @@ impl Step for ProbeStep {
             info.moviehash = moviehash_of(ctx, file, &files, &front, &info, known_last.clone())?;
             // the same mux already read whole by another release's probe: its media is taken, and nothing more of
             // this file is read for it (an explicit rerun reads its own)
-            let shared = if front.is_empty() || ctx.data().explicit_rerun(release_id, PROBE_STEP)?
-            {
+            let shared = if front.is_empty() || ctx.data().explicit_rerun(release_id, PROBE_STEP)? {
                 None
             } else {
                 ctx.data().same_mux_media(release_id, &info, stamp)?
@@ -783,16 +676,24 @@ impl Step for ProbeStep {
         }
         // a look that finds no cover drops one an earlier look kept
         let cover = info.media.as_mut().and_then(|m| m.cover.take());
-        let saved_cover = if native && cover.is_some() {
-            let grant=crate::pg::worker_assets::current().map_err(StepError::from_cache)?
-                .ok_or_else(||StepError::Transient("native cover namespace has not been selected".into()))?;
-            let hold=grant.produce_cover(release_id,cover.as_ref().expect("present native cover")).map_err(StepError::from_cache)?;
-            let descriptor=hold.descriptor();asset_hold=Some(Box::new(hold));Some(descriptor)
-        } else {cover.and_then(|c| super::keep_cover(&c.bytes).map(|sha256| (c.mime.to_string(), sha256))).or(twin_cover)};
+        let saved_cover = if cover.is_some() {
+            let grant = crate::pg::worker_assets::current()
+                .map_err(StepError::from_cache)?
+                .ok_or_else(|| StepError::Transient("native cover namespace has not been selected".into()))?;
+            let hold = grant
+                .produce_cover(release_id, cover.as_ref().expect("present native cover"))
+                .map_err(StepError::from_cache)?;
+            let descriptor = hold.descriptor();
+            asset_hold = Some(Box::new(hold));
+            Some(descriptor)
+        } else {
+            twin_cover
+        };
         writes.push(match &saved_cover {
-            Some((mime, sha256)) => {
-                StepWrite::for_mutation(release_id, StepMutation::KeepCover { mime: mime.clone(),sha256: sha256.clone() })
-            }
+            Some((mime, sha256)) => StepWrite::for_mutation(
+                release_id,
+                StepMutation::KeepCover { mime: mime.clone(), sha256: sha256.clone() },
+            ),
             None => StepWrite::for_mutation(release_id, StepMutation::ClearCover),
         });
         let crc = info.file_crc32.map(i64::from);
@@ -812,19 +713,22 @@ impl Step for ProbeStep {
             config_stamp: stamp,
             nfo_password: found_nfo_password.as_deref(),
             cover: saved_cover.as_ref().map(|(m, s)| (m.as_str(), s.as_str())),
-        }).map_err(StepError::from_cache)?;
+        })
+        .map_err(StepError::from_cache)?;
         writes.extend(title_writes(release_id, info.media.as_ref()));
-        writes.push(StepWrite::for_mutation(release_id, StepMutation::KeepProbe { crc32: crc,agent,json,moviehash: hash.clone() }));
+        writes.push(StepWrite::for_mutation(
+            release_id,
+            StepMutation::KeepProbe { crc32: crc, agent, json, moviehash: hash.clone() },
+        ));
         // a hash found on a later look is asked about then too
         let needs_list_decrypt = found_nfo_password.is_some()
-            && (existing_db_pw != found_nfo_password
-                || info.archive.as_ref().is_some_and(|a| a.name.is_some()))
+            && (existing_db_pw != found_nfo_password || info.archive.as_ref().is_some_and(|a| a.name.is_some()))
             && ctx.data().archive_requires_password_list(release_id)?;
         let rerun = mask(crate::keys::KEYS_STEP)
             | if hash.is_some() { mask(super::opensubtitles::OPENSUBTITLES_STEP) } else { 0 }
             | if needs_list_decrypt { mask(archive::steps::LIST_STEP) } else { 0 };
         let facts = hash.map(|h| vec![(MOVIEHASH_FACT, h)]).unwrap_or_default();
-        Ok(Outcome { matched: true, writes, facts, rerun, hold:asset_hold, ..Outcome::default() })
+        Ok(Outcome { matched: true, writes, facts, rerun, hold: asset_hold, ..Outcome::default() })
     }
 }
 
@@ -837,9 +741,6 @@ fn whole_mark(stamp: u64) -> u64 {
     stamp | MEDIA_WHOLE_RULES << 32
 }
 
-/// Releases looked at per shard, newest first, for one whose probe already read the same mux.
-const SAME_MUX_CANDIDATES: i64 = 16;
-
 /// What another release's probe already read of the same Matroska mux.
 #[derive(Debug, PartialEq)]
 pub(crate) struct SameMux {
@@ -847,14 +748,6 @@ pub(crate) struct SameMux {
     pub media: media::MediaInfo,
     /// its cover art, `(mime, sha256)`, while the folder still has it
     pub cover: Option<(String, String)>,
-}
-
-/// `same_mux_media` for the release being probed, with every shard opened beside its own. None without a mux key.
-pub(crate) fn same_mux_of_legacy(conn: &rusqlite::Connection, release_id: i64, info: &ProbeInfo, stamp: u64) -> Option<SameMux> {
-    let mux = info.media.as_ref().and_then(crate::keys::mux_text)?;
-    let main = conn.path().and_then(super::audio_print::main_of)?;
-    let all = crate::db::open_with_shards(&main).ok()?;
-    same_mux_media(&all, release_id, info, &mux, stamp)
 }
 
 /// Puts what another probe read of the same file (`same_mux_media`) on this one: its media, keeping this file's own
@@ -913,99 +806,6 @@ fn same_header(mine: &media::MediaInfo, other: &media::MediaInfo) -> bool {
         })
         && prefix(&mine.attachments, &other.attachments, whole, |a| (a.name.clone(), a.size))
         && prefix(&mine.chapters, &other.chapters, whole, |c| (c.start_secs.to_bits(), c.name.clone()))
-}
-
-/// The releases other than `?1` in shard `shard` with the mux key `?3`, whose probe read its media whole under the
-/// config stamp `?4`, that the pages would show, newest first, at most `?2`, each with its probe and cover. The
-/// file checks come after, in Rust (`same_mux_media`): many newer reposts that fail them can hide an older lender,
-/// which costs only the reads it would have saved.
-fn same_mux_sql(shard: usize) -> String {
-    format!(
-        "select p.release_id, p.info, p.moviehash, c.mime, c.sha256 from s{shard}.release_keys k
-         join s{shard}.release_probe p on p.release_id = k.release_id
-         join s{shard}.releases r on r.id = k.release_id
-         left join s{shard}.release_cover c on c.release_id = k.release_id
-         where k.mux = ?3 and k.release_id != ?1 and not atlas_blocked(r.group_name)
-           and json_extract(p.info, '$.media_whole') = ?4
-         order by k.release_id desc limit ?2"
-    )
-}
-
-/// Another release whose probe already read the Matroska mux `mux` (`keys::mux_text`) that `own`'s first article
-/// shows, over every shard of `conn`, and whose file is this one: what it read is what the rest of this file's start
-/// and its end would say. Only a probe that read its media to the end under this probe's config `stamp`
-/// (`media_whole`) and isn't `stale_saved`, of a file of the same size and OpenSubtitles hash (and CRC32, when both
-/// have one) whose header
-/// agrees with what this first article shows (`same_header`), not from inside an archive when this file is posted
-/// bare (the end Tags are only read from a bare file), and not one whose attached cover is no longer kept. A packed
-/// file may borrow from a bare one: it then has the end Tags' statistics its own probe never reads from inside an
-/// archive, true of the same file all the same.
-pub(crate) fn same_mux_media(
-    conn: &rusqlite::Connection,
-    own: i64,
-    info: &ProbeInfo,
-    mux: &str,
-    stamp: u64,
-) -> Option<SameMux> {
-    let key = crate::keys::as_key(crate::keys::digest8(mux.as_bytes()));
-    // JSON keeps the mark as a number, which SQLite reads back as a 64-bit integer
-    let mark = whole_mark(stamp);
-    let mark_i64 = i64::try_from(mark).ok()?;
-    let mine = info.media.as_ref()?;
-    let bare = info.archive.is_none() && info.layers.is_empty();
-    type Row = (i64, String, Option<String>, Option<String>, Option<String>);
-    let mut found: Vec<Row> = Vec::new();
-    for shard in 0..crate::store::SHARDS {
-        // a shard without the tables yet has none
-        let Ok(mut q) = conn.prepare_cached(&same_mux_sql(shard)) else { continue };
-        let Ok(rows) = q.query_map(rusqlite::params![own, SAME_MUX_CANDIDATES, key, mark_i64], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-        }) else {
-            continue;
-        };
-        found.extend(rows.filter_map(Result::ok));
-    }
-    found.sort_unstable_by_key(|row| std::cmp::Reverse(row.0));
-    found.into_iter().find_map(|(release_id, json, moviehash, mime, sha256)| {
-        if stale_saved(&json) {
-            return None;
-        }
-        let other: ProbeInfo = serde_json::from_str(&json).ok()?;
-        let packed = other.archive.is_some() || !other.layers.is_empty();
-        let size = content_size(info);
-        let crc_same = !packed && bare && other.file_crc32.zip(info.file_crc32).is_some_and(|(a, b)| a == b);
-        let crc_differs = !packed && bare && other.file_crc32.zip(info.file_crc32).is_some_and(|(a, b)| a != b);
-        // the OpenSubtitles hash, over the size and first and last 64 KiB, the same on both: none on either side
-        // (a missing last article, a compressed set) and nothing ties the ends of the two files
-        let hash_differs =
-            moviehash.as_deref().filter(|h| !h.is_empty()).is_none_or(|h| info.moviehash.as_deref() != Some(h));
-        if other.media_whole != Some(mark)
-            || (bare && packed)
-            || size.is_none()
-            || content_size(&other) != size
-            || crc_differs
-            || hash_differs
-        {
-            return None;
-        }
-        let media = other.media?;
-        if crate::keys::mux_text(&media).as_deref() != Some(mux) || media.video.is_empty() || !same_header(mine, &media)
-        {
-            return None;
-        }
-        // the title ids the lender's tags name (front or end, which can't be told apart) go on this release's row:
-        // ones this first article doesn't show are taken only from a file the whole CRC32 proves the same
-        if media.title_ids() != mine.title_ids() && !crc_same {
-            return None;
-        }
-        let cover = mime.zip(sha256).filter(|(_, sha)| super::cover_file(sha).is_some_and(|f| f.exists()));
-        let attached_cover =
-            media.attachments.iter().any(|a| a.mime.as_deref().is_some_and(|m| m.starts_with("image/")));
-        if attached_cover && cover.is_none() {
-            return None;
-        }
-        Some(SameMux { release_id, media, cover })
-    })
 }
 
 /// Articles read from the start of a file, at most, when its header runs past the first one: Matroska puts
@@ -1400,21 +1200,6 @@ mod buffered_tags_tests;
 mod tests {
     use super::*;
 
-    /// The main database in memory with shard 0 attached: releases, keys, probes and covers.
-    fn mux_shards() -> rusqlite::Connection {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::filters::register_sql(&conn).unwrap();
-        conn.execute("attach ':memory:' as s0", []).unwrap();
-        conn.execute_batch("create table s0.releases (id integer primary key, group_name text not null)").unwrap();
-        for table in [&crate::keys::RELEASE_KEYS, &super::super::PROBE, &super::super::COVER] {
-            conn.execute_batch(&table.create.replacen("exists ", "exists s0.", 1)).unwrap();
-            for (column, kind) in table.added {
-                let _ = conn.execute_batch(&format!("alter table s0.{} add column {column} {kind}", table.name));
-            }
-        }
-        conn
-    }
-
     /// A Matroska mux with `video` video tracks and `audio` audio tracks, as a first article shows it.
     fn mkv(uid: &str, video: usize, audio: usize) -> media::MediaInfo {
         media::MediaInfo {
@@ -1425,23 +1210,6 @@ mod tests {
             audio: vec![media::AudioTrack { codec: "A_EAC3".into(), ..Default::default() }; audio],
             ..Default::default()
         }
-    }
-
-    /// A release in shard 0 whose probe read `info`, keyed by its mux as the keys step would.
-    fn probed(conn: &rusqlite::Connection, id: i64, group: &str, info: &ProbeInfo, moviehash: Option<&str>) {
-        conn.execute("insert into s0.releases (id, group_name) values (?1, ?2)", rusqlite::params![id, group]).unwrap();
-        conn.execute(
-            "insert into s0.release_probe (release_id, info, moviehash) values (?1, ?2, ?3)",
-            rusqlite::params![id, serde_json::to_string(info).unwrap(), moviehash.or(info.moviehash.as_deref())],
-        )
-        .unwrap();
-        let mux = info
-            .media
-            .as_ref()
-            .and_then(crate::keys::mux_text)
-            .map(|t| crate::keys::as_key(crate::keys::digest8(t.as_bytes())));
-        conn.execute("insert into s0.release_keys (release_id, mux) values (?1, ?2)", rusqlite::params![id, mux])
-            .unwrap();
     }
 
     const STAMP: u64 = 127;
@@ -1465,172 +1233,40 @@ mod tests {
         ProbeInfo { media_whole: None, ..whole_bare(media) }
     }
 
-    /// The same, with the file inside a RAR set whose first entry is a small NFO: `SIZE` bytes unpacked.
-    fn packed(mut p: ProbeInfo) -> ProbeInfo {
-        p.archive = Some(super::super::ArchiveHead { unpacked: Some(4_000), ..Default::default() });
-        p.layers = vec![nest::Layer { format: "RAR5".into(), unpacked: Some(SIZE), ..Default::default() }];
-        p
-    }
-
     #[test]
-    fn a_mux_another_release_already_read_is_taken_from_it() {
-        let conn = mux_shards();
+    fn same_mux_header_comparison_preserves_exact_tracks_tags_and_partial_prefixes() {
         let mut whole = mkv("ab12", 1, 2);
-        whole.tags.insert("BPS".into(), "12000000".into());
+        whole.header_complete = true;
         whole.chapters = vec![media::Chapter::default(); 3];
-        whole.encoder_options = Some("crf=18".into());
-        // what a first article holding the whole header shows: no encoder settings or end Tags yet
-        let front = media::MediaInfo { tags: Default::default(), encoder_options: None, ..whole.clone() };
-        let first = first_bare(front.clone());
-        let mux = crate::keys::mux_text(first.media.as_ref().unwrap()).unwrap();
-        let lender = |conn: &rusqlite::Connection, first: &ProbeInfo| {
-            same_mux_media(conn, 99, first, &mux, STAMP).map(|t| t.release_id)
-        };
-
-        // 0 read the whole mux, bare; 8 is in a blocked group; 16 stopped after its first article
-        probed(&conn, 0, "a.b.c", &whole_bare(whole.clone()), Some(HASH));
-        probed(&conn, 8, "alt.binaries.pictures.erotica.teen", &whole_bare(whole.clone()), Some(HASH));
-        probed(&conn, 16, "a.b.c", &first_bare(whole.clone()), None);
-        // 24 has another mux
-        probed(&conn, 24, "a.b.c", &whole_bare(mkv("ffff", 1, 2)), Some("0000000000000001"));
-
-        let got = same_mux_media(&conn, 99, &first, &mux, STAMP).expect("0 read it");
-        assert_eq!(got.release_id, 0, "the newest that read it whole, the blocked group's left out");
-        assert_eq!(got.media, whole, "its tracks, chapters, encoder and end tags");
-        assert!(got.cover.is_none(), "no cover row");
-        assert_eq!(same_mux_media(&conn, 0, &first, &mux, STAMP).map(|t| t.release_id), None, "never itself");
-        // a probe read under another config stamp lends nothing
-        assert_eq!(same_mux_media(&conn, 99, &first, &mux, STAMP | 128).map(|t| t.release_id), None);
-        // nor one marked whole under looser rules than these, with the bare stamp
-        conn.execute(
-            "update s0.release_probe set info = json_set(info, '$.media_whole', ?1) where release_id = 0",
-            [STAMP as i64],
-        )
-        .unwrap();
-        assert_eq!(same_mux_media(&conn, 99, &first, &mux, STAMP).map(|t| t.release_id), None);
-        conn.execute(
-            "update s0.release_probe set info = json_set(info, '$.media_whole', ?1) where release_id = 0",
-            [whole_mark(STAMP) as i64],
-        )
-        .unwrap();
-
-        // the same mux key on a file whose header was changed in place (mkvpropedit), or that is another size
-        let mut renamed = front.clone();
-        renamed.title = Some("Retitled".into());
-        assert_eq!(lender(&conn, &first_bare(renamed)), None, "another title");
-        let mut relabelled = front.clone();
-        relabelled.audio[0].language = Some("ger".into());
-        assert_eq!(lender(&conn, &first_bare(relabelled.clone())), None, "another track language");
-        let mut flagged = front.clone();
-        flagged.audio[0].default = true;
-        assert_eq!(lender(&conn, &first_bare(flagged)), None, "another default flag");
-        let mut hdr = front.clone();
-        hdr.video[0].hdr = Some("HDR10".into());
-        assert_eq!(lender(&conn, &first_bare(hdr)), None, "other colour properties");
-        let mut tagged = front.clone();
-        tagged.tags.insert("IMDB".into(), "tt0133093".into());
-        assert_eq!(lender(&conn, &first_bare(tagged)), None, "a front tag the lender lacks");
-        // a header the first article cut off may show its last track only in part: that one isn't compared, and the
-        // lender may have more
-        let mut cut = mkv("ab12", 1, 2);
-        cut.audio[1].language = Some("ger".into());
-        let mut cut = first_bare(cut);
-        cut.media.as_mut().unwrap().header_complete = false;
-        assert_eq!(lender(&conn, &cut), Some(0));
-        // a whole header with fewer chapters than the lender's is another file
-        let mut fewer = front.clone();
-        fewer.chapters.pop();
-        assert_eq!(lender(&conn, &first_bare(fewer)), None);
-        // a bare file's own OpenSubtitles hash must agree with the lender's
-        let mut rehashed = first.clone();
-        rehashed.moviehash = Some("00000000000000ff".into());
-        assert_eq!(lender(&conn, &rehashed), None, "another hash");
-        rehashed.moviehash = None;
-        assert_eq!(lender(&conn, &rehashed), None, "no hash of its own, nothing ties the ends");
-        let mut packed_rehashed = packed(first.clone());
-        packed_rehashed.moviehash = Some("00000000000000ff".into());
-        assert_eq!(lender(&conn, &packed_rehashed), None, "a packed file's hash is compared too");
-        let mut bigger = first.clone();
-        bigger.yenc.as_mut().unwrap().file_size = Some(SIZE + 1);
-        assert_eq!(lender(&conn, &bigger), None, "another size");
-        let mut other_crc = first.clone();
-        other_crc.file_crc32 = Some(1);
-        conn.execute("update s0.release_probe set info = json_set(info, '$.file_crc32', 2) where release_id = 0", [])
-            .unwrap();
-        assert_eq!(lender(&conn, &other_crc), None, "another CRC32");
-        assert_eq!(lender(&conn, &first), Some(0), "no CRC32 of its own to compare");
-        // title ids in the lender's tags that this first article doesn't show need the whole CRC32 to agree
-        conn.execute(
-            "update s0.release_probe set info = json_set(info, '$.media.tags.IMDB', 'tt0133093') where release_id = 0",
-            [],
-        )
-        .unwrap();
-        assert_eq!(lender(&conn, &first), None, "an IMDb id only the lender names");
-        let mut same_crc = first.clone();
-        same_crc.file_crc32 = Some(2);
-        assert_eq!(lender(&conn, &same_crc), Some(0), "the same file by its CRC32");
-        conn.execute(
-            "update s0.release_probe set info = json_remove(info, '$.media.tags.IMDB') where release_id = 0",
-            [],
-        )
-        .unwrap();
-        // a first article that shows more audio than the saved probe read
-        let mut more = front.clone();
-        more.audio.push(media::AudioTrack { codec: "A_EAC3".into(), ..Default::default() });
-        assert_eq!(lender(&conn, &first_bare(more)), None);
-
-        // a lender with no hash saved ties nothing
-        conn.execute("update s0.release_probe set moviehash = null where release_id = 0", []).unwrap();
-        assert_eq!(lender(&conn, &first), None);
-        conn.execute("update s0.release_probe set moviehash = ?1 where release_id = 0", [HASH]).unwrap();
-        // a probe from inside an archive lends to a packed file, never to a bare one, whose end tags it would lack
-        probed(&conn, 32, "a.b.c", &packed(whole_bare(whole.clone())), None);
-        assert_eq!(lender(&conn, &first), Some(0));
-        assert_eq!(lender(&conn, &packed(first.clone())), Some(32));
-        // the size compared is the file the media came from, not the archive's first entry
-        let mut other_inner = packed(first.clone());
-        other_inner.layers[0].unpacked = Some(SIZE - 1);
-        assert_eq!(lender(&conn, &other_inner), None, "another file inside the same-looking set");
-        // nor does a packed file whose size can't be read, or whose layers stopped short, borrow
-        let mut unsized_ = packed(first.clone());
-        unsized_.layers[0].unpacked = None;
-        assert_eq!(lender(&conn, &unsized_), None);
-        let mut stopped = packed(first.clone());
-        stopped.layers[0].stop = Some("encrypted".into());
-        assert_eq!(lender(&conn, &stopped), None);
-        let mut listed_only = packed(first.clone());
-        listed_only.layers.clear();
-        assert_eq!(lender(&conn, &listed_only), None, "an archive with no layer followed");
-
-        // a lender whose media names an attached cover it no longer keeps isn't used: the cover would be lost
-        let mut with_cover = whole.clone();
-        with_cover.attachments =
-            vec![media::Attachment { name: "cover.jpg".into(), mime: Some("image/jpeg".into()), ..Default::default() }];
-        let mut cover_mux = with_cover.clone();
-        cover_mux.segment_uid = Some("ef56".into());
-        with_cover.segment_uid = cover_mux.segment_uid.clone();
-        probed(&conn, 40, "a.b.c", &whole_bare(with_cover), None);
-        let cover_first =
-            first_bare(media::MediaInfo { tags: Default::default(), encoder_options: None, ..cover_mux.clone() });
-        let cover_key = crate::keys::mux_text(&cover_mux).unwrap();
-        assert!(same_mux_media(&conn, 99, &cover_first, &cover_key, STAMP).is_none());
-        conn.execute("insert into s0.release_cover (release_id, mime, sha256) values (40, 'image/jpeg', 'gone')", [])
-            .unwrap();
-        assert!(same_mux_media(&conn, 99, &cover_first, &cover_key, STAMP).is_none(), "its file is gone");
-
-        // one saved before a reader this probe has isn't taken: Dolby Vision without `from_rpu`
-        let mut dv = mkv("cd34", 1, 1);
-        dv.video[0].dv_profile = Some(8);
-        probed(&conn, 48, "a.b.c", &whole_bare(dv.clone()), None);
-        let dv_mux = crate::keys::mux_text(&dv).unwrap();
-        assert!(same_mux_media(&conn, 99, &first_bare(dv), &dv_mux, STAMP).is_none());
-
-        // what a borrower keeps round-trips through its JSON
-        let borrowed = ProbeInfo { media_from: Some(0), ..whole_bare(whole) };
-        let back: ProbeInfo = serde_json::from_str(&serde_json::to_string(&borrowed).unwrap()).unwrap();
-        assert_eq!((back.media_from, back.media_whole), (Some(0), Some(whole_mark(STAMP))));
-        // no mux key in the first article, nothing to look by
-        assert!(crate::keys::mux_text(&mkv("", 1, 1)).is_none());
+        let front = whole.clone();
+        assert!(same_header(&front, &whole));
+        let mut changed = front.clone();
+        changed.title = Some("Retitled".into());
+        assert!(!same_header(&changed, &whole));
+        let mut changed = front.clone();
+        changed.audio[0].language = Some("ger".into());
+        assert!(!same_header(&changed, &whole));
+        let mut changed = front.clone();
+        changed.audio[0].default = true;
+        assert!(!same_header(&changed, &whole));
+        let mut changed = front.clone();
+        changed.video[0].hdr = Some("HDR10".into());
+        assert!(!same_header(&changed, &whole));
+        let mut changed = front.clone();
+        changed.tags.insert("IMDB".into(), "tt0133093".into());
+        assert!(!same_header(&changed, &whole));
+        let mut changed = front.clone();
+        changed.chapters.pop();
+        assert!(!same_header(&changed, &whole));
+        let mut changed = front.clone();
+        changed.audio.push(Default::default());
+        assert!(!same_header(&changed, &whole));
+        let mut partial = front;
+        partial.header_complete = false;
+        partial.audio[1].language = Some("ger".into());
+        assert!(same_header(&partial, &whole), "only the incomplete final track is omitted");
+        partial.audio[0].language = Some("ger".into());
+        assert!(!same_header(&partial, &whole), "complete preceding tracks must still agree");
     }
 
     #[test]
@@ -1681,35 +1317,6 @@ mod tests {
         assert!(!media_read_whole(true, true, Some(&keyed)), "only Matroska is lent");
     }
 
-    #[test]
-    #[ignore = "needs more than one shard; store::SHARDS is 1"]
-    fn lenders_in_every_shard_are_looked_at_newest_first() {
-        let conn = mux_shards();
-        conn.execute("attach ':memory:' as s1", []).unwrap();
-        conn.execute_batch("create table s1.releases (id integer primary key, group_name text not null)").unwrap();
-        for table in [&crate::keys::RELEASE_KEYS, &super::super::PROBE, &super::super::COVER] {
-            conn.execute_batch(&table.create.replacen("exists ", "exists s1.", 1)).unwrap();
-            for (column, kind) in table.added {
-                let _ = conn.execute_batch(&format!("alter table s1.{} add column {column} {kind}", table.name));
-            }
-        }
-        let whole = mkv("ab12", 1, 2);
-        probed(&conn, 0, "a.b.c", &whole_bare(whole.clone()), None);
-        let info = whole_bare(whole.clone());
-        conn.execute("insert into s1.releases (id, group_name) values (9, 'a.b.c')", []).unwrap();
-        conn.execute(
-            "insert into s1.release_probe (release_id, info, moviehash) values (9, ?1, '1d9da161e916b2fd')",
-            [serde_json::to_string(&info).unwrap()],
-        )
-        .unwrap();
-        let mux = crate::keys::mux_text(&whole).unwrap();
-        let key = crate::keys::as_key(crate::keys::digest8(mux.as_bytes()));
-        conn.execute("insert into s1.release_keys (release_id, mux) values (9, ?1)", [key]).unwrap();
-        let first = first_bare(whole.clone());
-        assert_eq!(same_mux_media(&conn, 99, &first, &mux, STAMP).map(|t| t.release_id), Some(9));
-        assert_eq!(same_mux_media(&conn, 9, &first, &mux, STAMP).map(|t| t.release_id), Some(0));
-    }
-
     fn file(name: &str, parts: i64) -> FileInfo {
         FileInfo {
             id: 1,
@@ -1726,30 +1333,6 @@ mod tests {
 
     #[test]
     fn dolby_vision_probes_without_an_rpu_are_asked_for_again() {
-        let dir = tempfile::tempdir().unwrap();
-        let main = dir.path().join("atlas.db");
-        crate::db::create_db_at(&main).unwrap();
-        let conn = crate::db::open_shard(&crate::store::shard_path(&main, 0)).unwrap();
-        for (id, info) in [
-            // stored before from_rpu was kept
-            (1i64, r#"{"media":{"video":[{"dv_profile":7,"dolby_vision":{"profile":7,"fel":true}}]}}"#),
-            (2, r#"{"media":{"video":[{"dv_profile":8,"dolby_vision":{"profile":8,"from_rpu":false}}]}}"#),
-            (3, r#"{"media":{"video":[{"dv_profile":7,"dolby_vision":{"profile":7,"from_rpu":true}}]}}"#),
-            (4, r#"{"media":{"video":[{"hdr":"HDR10"}]}}"#),
-            (5, r#"{"media":null}"#),
-        ] {
-            conn.execute("insert into releases (id, name, group_name) values (?, ?, 'g')", rusqlite::params![id, id])
-                .unwrap();
-            conn.execute(
-                "insert into pp_state (release_id, done) values (?, ?)",
-                rusqlite::params![id, mask(PROBE_STEP)],
-            )
-            .unwrap();
-            conn.execute("insert into release_probe (release_id, info) values (?, ?)", rusqlite::params![id, info])
-                .unwrap();
-        }
-        // 1 has no from_rpu; 2 and 3 were probed since, whatever they found
-        assert_eq!(rerun_dv_without_rpu(&conn, 100).unwrap(), 1);
         assert!(stale_saved(r#"{"media":{"video":[{"dv_profile":7,"dolby_vision":{"profile":7,"fel":true}}]}}"#));
         assert!(stale_saved(r#"{"media":{"video":[{"dv_profile":7}]}}"#));
         assert!(!stale_saved(
@@ -1760,28 +1343,6 @@ mod tests {
 
     #[test]
     fn dolby_vision_probes_from_before_the_audio_key_are_asked_for_again() {
-        let dir = tempfile::tempdir().unwrap();
-        let main = dir.path().join("atlas.db");
-        crate::db::create_db_at(&main).unwrap();
-        let conn = crate::db::open_shard(&crate::store::shard_path(&main, 0)).unwrap();
-        for (id, info) in [
-            (1i64, r#"{"media":{"video":[{"dv_profile":8}],"audio":[{"codec":"A_EAC3"}]}}"#),
-            (2, r#"{"media":{"video":[{"dv_profile":8}],"audio":[{"codec":"A_EAC3","stream_key":null}]}}"#),
-            (3, r#"{"media":{"video":[{"dv_profile":8}],"audio":[{"codec":"A_TRUEHD"}]}}"#),
-            (4, r#"{"media":{"video":[{"codec":"V_MPEGH/ISO/HEVC"}],"audio":[{"codec":"A_AC3"}]}}"#),
-            (5, r#"{"media":{"video":[{"dv_profile":5}],"audio":[{"codec":"fLaC"}]}}"#),
-        ] {
-            conn.execute("insert into releases (id, name, group_name) values (?, ?, 'g')", rusqlite::params![id, id])
-                .unwrap();
-            conn.execute(
-                "insert into pp_state (release_id, done) values (?, ?)",
-                rusqlite::params![id, mask(PROBE_STEP)],
-            )
-            .unwrap();
-            conn.execute("insert into release_probe (release_id, info) values (?, ?)", rusqlite::params![id, info])
-                .unwrap();
-        }
-        assert_eq!(rerun_dv_without_audio_key(&conn, 100).unwrap(), 2, "1 and 5");
         let saved = |codec: &str, v: &str| {
             format!(
                 r#"{{"media":{{"video":[{{"dv_profile":8,"dolby_vision":{{"from_rpu":true}},"keyframe_key":null}}],"audio":[{{"codec":"{codec}"{v}}}]}}}}"#
@@ -1794,145 +1355,11 @@ mod tests {
 
     #[test]
     fn dolby_vision_probes_from_before_the_keyframe_key_are_asked_for_again() {
-        let dir = tempfile::tempdir().unwrap();
-        let main = dir.path().join("atlas.db");
-        crate::db::create_db_at(&main).unwrap();
-        let conn = crate::db::open_shard(&crate::store::shard_path(&main, 0)).unwrap();
-        for (id, info) in [
-            (1i64, r#"{"media":{"video":[{"dv_profile":8}]}}"#),
-            (2, r#"{"media":{"video":[{"dv_profile":8,"keyframe_key":null}]}}"#),
-            (3, r#"{"media":{"video":[{"dv_profile":7,"keyframe_key":"0123456789abcdef"}]}}"#),
-            (4, r#"{"media":{"video":[{"codec":"V_MPEGH/ISO/HEVC"}]}}"#),
-        ] {
-            conn.execute("insert into releases (id, name, group_name) values (?, ?, 'g')", rusqlite::params![id, id])
-                .unwrap();
-            conn.execute(
-                "insert into pp_state (release_id, done) values (?, ?)",
-                rusqlite::params![id, mask(PROBE_STEP)],
-            )
-            .unwrap();
-            conn.execute("insert into release_probe (release_id, info) values (?, ?)", rusqlite::params![id, info])
-                .unwrap();
-        }
-        assert_eq!(rerun_dv_without_keyframe_key(&conn, 100).unwrap(), 1);
         let saved =
             |v: &str| format!(r#"{{"media":{{"video":[{{"dv_profile":8,"dolby_vision":{{"from_rpu":true}}{v}}}]}}}}"#);
         assert!(stale_saved(&saved("")), "a restored probe from before the key is probed again");
         assert!(!stale_saved(&saved(r#","keyframe_key":null"#)));
         assert!(!stale_saved(&saved(r#","keyframe_key":"0123456789abcdef""#)));
-    }
-
-    #[test]
-    fn probes_that_couldnt_read_the_first_article_are_asked_for_again() {
-        let dir = tempfile::tempdir().unwrap();
-        let main = dir.path().join("atlas.db");
-        crate::db::create_db_at(&main).unwrap();
-        let conn = crate::db::open_shard(&crate::store::shard_path(&main, 0)).unwrap();
-        for (id, info) in [
-            (1i64, r#"{"health":{"first":true},"yenc":null}"#),
-            (2, r#"{"health":{"first":true},"yenc":{"part":1}}"#),
-            (3, r#"{"health":{"first":false},"yenc":null}"#),
-        ] {
-            conn.execute("insert into releases (id, name, group_name) values (?, ?, 'g')", rusqlite::params![id, id])
-                .unwrap();
-            conn.execute(
-                "insert into pp_state (release_id, done) values (?, ?)",
-                rusqlite::params![id, mask(PROBE_STEP)],
-            )
-            .unwrap();
-            conn.execute("insert into release_probe (release_id, info) values (?, ?)", rusqlite::params![id, info])
-                .unwrap();
-        }
-        assert_eq!(rerun_big_heads(&conn, 100).unwrap(), 1);
-        for (id, info) in [
-            (4i64, r#"{"file":"Show.S01E01.XviD.avi","media":null}"#),
-            (5, r#"{"file":"Movie.part01.rar","archive":{"name":"Movie.CD1.avi"},"media":null}"#),
-            (6, r#"{"file":"Movie.avi.001","media":null}"#),
-            (7, r#"{"file":"Movie.avi","media":{"container":"avi"}}"#),
-            (8, r#"{"file":"Movie.mkv","media":null}"#),
-        ] {
-            conn.execute("insert into releases (id, name, group_name) values (?, ?, 'g')", rusqlite::params![id, id])
-                .unwrap();
-            conn.execute(
-                "insert into pp_state (release_id, done) values (?, ?)",
-                rusqlite::params![id, mask(PROBE_STEP)],
-            )
-            .unwrap();
-            conn.execute("insert into release_probe (release_id, info) values (?, ?)", rusqlite::params![id, info])
-                .unwrap();
-        }
-        assert_eq!(rerun_avi(&conn, 100).unwrap(), 3, "a bare one, one in an archive, a split one");
-        conn.execute("insert into releases (id, name, group_name) values (9, '9', 'g')", []).unwrap();
-        conn.execute("insert into pp_state (release_id, done) values (9, ?)", [mask(PROBE_STEP)]).unwrap();
-        conn.execute(
-            "insert into release_probe (release_id, info) values (9, '{\"file\":\"x.7z.002\",\"media\":null}')",
-            [],
-        )
-        .unwrap();
-        assert_eq!(rerun_later_volumes(&conn, 100).unwrap(), 1, "the 7z's second volume, not the mkv");
-        conn.execute("insert into releases (id, name, group_name) values (10, '10', 'g')", []).unwrap();
-        conn.execute("insert into pp_state (release_id, done) values (10, ?)", [mask(PROBE_STEP)]).unwrap();
-        conn.execute("insert into release_probe (release_id, info) values (10, '{\"file\":\"Clip.wmv\"}')", [])
-            .unwrap();
-        assert_eq!(rerun_asf(&conn, 100).unwrap(), 1);
-        conn.execute("insert into releases (id, name, group_name) values (12, '12', 'g')", []).unwrap();
-        conn.execute("insert into pp_state (release_id, done) values (12, ?)", [mask(PROBE_STEP)]).unwrap();
-        conn.execute(
-            "insert into release_probe (release_id, info) values (12, '{\"media\":{\"container\":\"mp4\"}}')",
-            [],
-        )
-        .unwrap();
-        assert_eq!(rerun_mp4_tail(&conn, 100).unwrap(), 1);
-        conn.execute("insert into releases (id, name, group_name) values (11, '11', 'g')", []).unwrap();
-        conn.execute("insert into pp_state (release_id, done) values (11, ?)", [mask(PROBE_STEP)]).unwrap();
-        conn.execute(
-            "insert into release_probe (release_id, info) values (11, '{\"archive\":{\"name\":\"VTS_01_1.VOB\"}}')",
-            [],
-        )
-        .unwrap();
-        assert_eq!(rerun_mpeg_ps(&conn, 100).unwrap(), 1);
-        conn.execute("insert into releases (id, name, group_name) values (13, '13', 'g')", []).unwrap();
-        conn.execute("insert into pp_state (release_id, done) values (13, ?)", [mask(PROBE_STEP)]).unwrap();
-        conn.execute(
-            "insert into release_probe (release_id, info) values (13, '{\"archive\":{\"name\":\"VIDEO_TS.BUP\"}}')",
-            [],
-        )
-        .unwrap();
-        assert_eq!(rerun_dvd(&conn, 100).unwrap(), 1);
-        conn.execute("insert into releases (id, name, group_name) values (15, '15', 'g')", []).unwrap();
-        conn.execute("insert into pp_state (release_id, done) values (15, ?)", [mask(PROBE_STEP)]).unwrap();
-        conn.execute(
-            "insert into release_probe (release_id, info)
-             values (15, '{\"archive\":{\"name\":\"VIDEO_TS/X.VOB\"},\"media\":{\"container\":\"mpeg-ps\"}}')",
-            [],
-        )
-        .unwrap();
-        assert_eq!(rerun_dvd(&conn, 100).unwrap(), 2, "the folder read as a VOB too, and the earlier one again");
-        conn.execute("insert into releases (id, name, group_name) values (14, '14', 'g')", []).unwrap();
-        conn.execute("insert into pp_state (release_id, done) values (14, ?)", [mask(PROBE_STEP)]).unwrap();
-        conn.execute(
-            "insert into release_probe (release_id, info) values (14, '{\"archive\":{\"name\":\"BDMV/index.bdmv\"}}')",
-            [],
-        )
-        .unwrap();
-        assert_eq!(rerun_bluray(&conn, 100).unwrap(), 1, "the BDMV folder");
-        conn.execute("insert into releases (id, name, group_name) values (16, '16', 'g')", []).unwrap();
-        conn.execute("insert into pp_state (release_id, done) values (16, ?)", [mask(PROBE_STEP)]).unwrap();
-        conn.execute("insert into release_probe (release_id, info) values (16, '{\"file\":\"Match.ts\"}')", [])
-            .unwrap();
-        assert_eq!(rerun_mpeg_ts(&conn, 100).unwrap(), 1);
-        let state = |id: i64| -> (i64, i64) {
-            conn.query_row("select done, rerun_mask from pp_state where release_id = ?", [id], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
-            .unwrap()
-        };
-        assert_eq!(state(1), (0, mask(PROBE_STEP)), "too big: probed again, past the saved probe");
-        assert_eq!(state(2), (mask(PROBE_STEP), 0), "read");
-        assert_eq!(state(3), (mask(PROBE_STEP), 0), "missing");
-        let queued: i64 = conn.query_row("select count(*) from pp_queue", [], |r| r.get(0)).unwrap();
-        assert_eq!(queued, 12);
-        assert_eq!(state(7), (mask(PROBE_STEP), 0), "read already");
     }
 
     #[test]
