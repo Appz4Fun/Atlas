@@ -8,4 +8,4 @@ RUN cargo build --release --locked
 FROM debian:trixie-slim
 COPY --from=build /src/target/release/sealed-log /usr/local/bin/sealed-log
 USER 1000:1000
-ENTRYPOINT ["sealed-log", "/data", "0.0.0.0:7711"]
+ENTRYPOINT ["sealed-log", "/data"]

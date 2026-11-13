@@ -3,8 +3,8 @@
 //! here, against the time Atlas waits for it, is what the network costs.
 
 use std::fmt::Write as _;
-use std::io::{self, BufRead, BufReader, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering::Relaxed};
@@ -261,24 +261,34 @@ pub fn render(log: &Log) -> String {
     out
 }
 
-fn answer(log: &Log, s: TcpStream) -> io::Result<()> {
-    s.set_read_timeout(Some(Duration::from_secs(10)))?;
-    s.set_write_timeout(Some(Duration::from_secs(10)))?;
-    let mut r = BufReader::new(s.try_clone()?);
+pub(crate) fn answer(log: &Log, stream: &mut (impl Read + Write)) -> io::Result<()> {
+    // TLS/ACL admission already happened. Bound the complete HTTP header,
+    // including an unterminated line, before retaining request text.
+    let mut reader = BufReader::new((&mut *stream).take(8193));
     let mut first = String::new();
-    r.read_line(&mut first)?;
-    // the rest of the request says nothing we need
-    let mut line = String::new();
-    while r.read_line(&mut line)? > 2 {
-        line.clear();
+    let mut total = reader.read_line(&mut first)?;
+    if total == 0 || total > 8192 || !first.ends_with('\n') {
+        return Err(crate::invalid("invalid metrics request line"));
     }
+    loop {
+        let mut line = String::new();
+        let count = reader.read_line(&mut line)?;
+        total += count;
+        if count == 0 || total > 8192 {
+            return Err(crate::invalid("metrics headers exceed admission"));
+        }
+        if line == "\r\n" || line == "\n" {
+            break;
+        }
+    }
+    drop(reader);
     let path = first.split_whitespace().nth(1).unwrap_or("");
     let (status, body) = if path == "/metrics" || path.starts_with("/metrics?") {
         ("200 OK", render(log))
     } else {
         ("404 Not Found", "only /metrics here\n".to_string())
     };
-    let mut w = s;
+    let w = stream;
     write!(
         w,
         "HTTP/1.1 {status}\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -287,24 +297,18 @@ fn answer(log: &Log, s: TcpStream) -> io::Result<()> {
     w.flush()
 }
 
-/// Answers scrapes on `listener` until the process ends.
-pub fn serve(log: Arc<Log>, listener: TcpListener) {
+/// Authenticated scrapes require the same explicit STATS certificate grant.
+pub fn serve(log: Arc<Log>, listener: TcpListener, tls: Arc<crate::ServerTls>) -> io::Result<()> {
     STARTED.store(
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64),
         Relaxed,
     );
-    for s in listener.incoming().flatten() {
-        let log = log.clone();
-        let _ = std::thread::Builder::new().name("sealed-log-metrics".into()).spawn(move || {
-            let _ = answer(&log, s);
-        });
-    }
+    crate::transport::serve(log, listener, tls, true)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
 
     fn value_of(text: &str, line_start: &str) -> f64 {
         let line = text.lines().find(|l| l.starts_with(line_start)).unwrap_or_else(|| panic!("{line_start} in {text}"));
@@ -315,24 +319,13 @@ mod tests {
     fn a_scrape_shows_what_was_written_and_read_and_the_disk() {
         let dir = std::env::temp_dir().join(format!("sealed-log-metrics-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let log = Log::open(&dir).unwrap();
-        let data = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = data.local_addr().unwrap().to_string();
-        let served = log.clone();
-        std::thread::spawn(move || crate::serve(served, data));
-        let mut c = crate::Client::connect(&addr).unwrap();
+        let log = crate::transport::tests::open_log(&dir);
+        let mut c = crate::transport::tests::peer(log.clone(), crate::Permissions::ALL);
         let places = c.append(&[(1, &[7u8; 1000][..]), (2, b"two")]).unwrap();
         c.read(&places).unwrap();
         assert!(c.read(&[crate::Locator { segment: 99, offset: 0, len: 1 }]).is_err());
 
-        let scrapes = TcpListener::bind("127.0.0.1:0").unwrap();
-        let at = scrapes.local_addr().unwrap();
-        let scraped = log.clone();
-        std::thread::spawn(move || serve(scraped, scrapes));
-        let mut s = TcpStream::connect(at).unwrap();
-        s.write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
-        let mut text = String::new();
-        s.read_to_string(&mut text).unwrap();
+        let text = crate::transport::tests::metrics_request(log.clone(), b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n");
         assert!(text.starts_with("HTTP/1.1 200 OK"), "{text}");
 
         // other tests share these counters, so at least what this one did
@@ -348,10 +341,7 @@ mod tests {
         assert!(value_of(&text, "sealed_log_filesystem_bytes{kind=\"size\"}") > 0.0);
         assert!(text.contains("sealed_log_request_duration_seconds_bucket{op=\"read\",le=\"+Inf\"}"), "{text}");
 
-        let mut s = TcpStream::connect(at).unwrap();
-        s.write_all(b"GET / HTTP/1.1\r\n\r\n").unwrap();
-        let mut text = String::new();
-        s.read_to_string(&mut text).unwrap();
+        let text = crate::transport::tests::metrics_request(log.clone(), b"GET / HTTP/1.1\r\n\r\n");
         assert!(text.starts_with("HTTP/1.1 404"), "{text}");
     }
 
