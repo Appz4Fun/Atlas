@@ -39,7 +39,7 @@ fn native_sidecar_quota_settlement_preserves_names_and_unread_reruns() {
         .with(|client| {
             client.batch_execute(
                 "insert into sidecars(release_id,name,group_name,kind,release_name,text,at) values
-            (-101,'older-a','example.group','nfo','Name.A','aaaa',1),
+            (-101,'older-a','example.group','nfo','Name.A','éé',1),
             (-102,'older-b','example.group','nfo','Name.B','bbbb',2)",
             )?;
             assert_eq!(
