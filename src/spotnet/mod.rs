@@ -26,7 +26,7 @@ mod native_store;
 mod native_tests;
 #[cfg(test)]
 #[path="native_peer_tests.rs"]
-mod native_peer_tests;
+pub(crate) mod native_peer_tests;
 pub mod release;
 pub mod sign;
 pub mod store;

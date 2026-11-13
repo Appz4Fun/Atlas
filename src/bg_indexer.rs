@@ -1473,7 +1473,7 @@ async fn run_servers(
     if let Some(runtime)=native {
         let s=sched.clone();
         tasks.spawn(named!("native stage".into(),crate::postprocess::native::run(
-            runtime.owner.clone(),config.clone(),sched.ctx.pool.clone(),move||s.stopping())));
+            runtime.owner.clone(),runtime.db.clone(),config.clone(),sched.ctx.pool.clone(),move||s.stopping())));
     } else if config.postprocess.enabled {
         let stage = Stage::start(StageParams {
             main: paths::database(),
@@ -1529,7 +1529,7 @@ async fn run_servers(
         tasks.spawn(named!("follow_media".into(), follow_media(sched.clone(), db.clone())));
     }
     // Spotnet spots of movies and TV, saved as releases (see `spotnet::ingest`)
-    if config.spots.enabled {
+    if native.is_none() && config.spots.enabled {
         let s = sched.clone();
         let (pool, spots) = (sched.ctx.pool.clone(), config.spots.clone());
         tasks.spawn(named!("spots".into(), crate::spotnet::ingest::run(pool, db.clone(), spots, move || s.stopping())));
