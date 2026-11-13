@@ -1,31 +1,22 @@
-//! One way to run a query on either backend, so a table's code is written once and runs on SQLite today and on
-//! Postgres after the move (`[storage] backend`), tested on both.
+//! PostgreSQL query parameters, rows and transaction callbacks.
 //!
-//! A query is written in the SQL both understand:
-//! - parameters are `$1`, `$2`, ... (rewritten to SQLite's `?1`, `?2`, ...);
-//! - a parameter whose type the query doesn't give it (in a `values` list, or `$1 is null`) is cast:
-//!   `cast($1 as bigint)`, `cast($1 as text)`, since Postgres must know every parameter's type;
-//! - `insert ... on conflict ... do nothing / do update`, never `insert or ignore / or replace`;
-//! - `case` in place of SQLite's two-argument `min`/`max` and its `sum(x = y)`; a `sum` is cast to bigint
-//!   (Postgres sums bigints to numeric);
-//! - no temp tables, pragmas or `sqlite_master` (`Sql::has_table` asks the backend).
-//!
-//! Numbers are read back as `i64` whatever their width, booleans as 0 or 1, as SQLite has them.
+//! Queries use PostgreSQL `$1` parameters and explicit casts for otherwise
+//! untyped values. Integer widths normalize to `i64`, and booleans to 0 or 1.
 
 use std::cell::RefCell;
 use std::fmt;
 
-/// Which backend a `Sql` runs on, for the little that can't be written once.
+/// The query dialect exposed to existing native SQL callers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dialect {
-    Sqlite,
     Postgres,
 }
 
 #[derive(Debug)]
 pub enum Error {
-    Sqlite(rusqlite::Error),
     Postgres(postgres::Error),
+    /// Native registration/isolation refusal, retaining its complete cause chain.
+    NativeGate(anyhow::Error),
     /// a value that isn't what the caller reads it as, or a query that returned no row where one was needed
     Value(String),
 }
@@ -35,8 +26,8 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Sqlite(e) => e.fmt(f),
             Error::Postgres(e) => e.fmt(f),
+            Error::NativeGate(e) => e.fmt(f),
             Error::Value(s) => f.write_str(s),
         }
     }
@@ -45,16 +36,10 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Error::Sqlite(e) => Some(e),
             Error::Postgres(e) => Some(e),
+            Error::NativeGate(e) => Some(e.as_ref()),
             Error::Value(_) => None,
         }
-    }
-}
-
-impl From<rusqlite::Error> for Error {
-    fn from(e: rusqlite::Error) -> Self {
-        Error::Sqlite(e)
     }
 }
 
@@ -64,22 +49,12 @@ impl From<postgres::Error> for Error {
     }
 }
 
-/// So the callers still written against rusqlite take this module's errors with `?`. A SQLite error comes back as
-/// it was; any other is wrapped (its message kept).
-impl From<Error> for rusqlite::Error {
-    fn from(e: Error) -> Self {
-        match e {
-            Error::Sqlite(e) => e,
-            e => rusqlite::Error::UserFunctionError(Box::new(e)),
-        }
-    }
-}
-
 impl Error {
     /// The Postgres error under this one, when it is one.
     pub fn postgres(&self) -> Option<&postgres::Error> {
         match self {
             Error::Postgres(e) => Some(e),
+            Error::NativeGate(e) => e.chain().find_map(|cause| cause.downcast_ref::<postgres::Error>()),
             _ => None,
         }
     }
@@ -227,15 +202,14 @@ impl Row {
     }
 }
 
-/// A connection, or a transaction on one, of either backend.
+/// A PostgreSQL connection or transaction.
 pub trait Sql {
     fn dialect(&self) -> Dialect;
     /// Runs a statement; the rows it changed.
     fn execute(&self, sql: &str, params: &[Value]) -> Result<usize>;
     /// Every row a query returns.
     fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>>;
-    /// `execute` for a statement whose text is built per call (a list of n values, a time written in): not kept
-    /// in SQLite's statement cache, where it would push out the statements run over and over.
+    /// `execute` for a statement whose text is built per call (a list of n values, a time written in).
     fn execute_uncached(&self, sql: &str, params: &[Value]) -> Result<usize> {
         self.execute(sql, params)
     }
@@ -243,12 +217,12 @@ pub trait Sql {
     fn query_uncached(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>> {
         self.query(sql, params)
     }
-    /// Statements without parameters, `;`-separated.
-    /// The first row of `query`, reading no further (as rusqlite's `query_row` did).
+    /// The first row returned by `query`.
     fn query_first(&self, sql: &str, params: &[Value]) -> Result<Option<Row>> {
         Ok(self.query(sql, params)?.into_iter().next())
     }
 
+    /// Statements without parameters, `;`-separated.
     fn batch(&self, sql: &str) -> Result<()>;
     /// Whether the table exists (in the schema queries name tables in).
     fn has_table(&self, table: &str) -> Result<bool>;
@@ -290,25 +264,9 @@ impl dyn Sql + '_ {
         self.one::<bool>(&format!("select exists ({sql})"), params)
     }
 
-    /// Waits for, and holds to the end of the transaction this runs in, the lock named `name`: what's done under
-    /// it runs one at a time across connections, as everything does on SQLite's one writer. Nothing on SQLite.
-    /// A query that picks a row then changes it (a claim) can otherwise pick the row another connection is
-    /// changing at the same moment, on Postgres, where each statement sees the rows as they were when it began.
+    /// Holds the named transaction lock until commit, before changing rows selected under it.
     pub fn lock(&self, name: &str) -> Result<()> {
-        if self.dialect() == Dialect::Postgres {
-            self.execute("select pg_advisory_xact_lock(hashtext($1 || '.' || current_schema()))", vals![name])?;
-        }
-        Ok(())
-    }
-
-    /// In a transaction on SQLite, takes the write lock of `table`'s database now, waiting its turn as any write
-    /// does: a deferred transaction that reads before it writes fails at once (no busy wait) when another connection
-    /// wrote in between, in WAL. Not `begin immediate`, which would lock every attached database too. `column` is
-    /// any of the table's columns. Nothing on Postgres, where `lock` serializes what needs it.
-    pub fn write_first(&self, table: &str, column: &str) -> Result<()> {
-        if self.dialect() == Dialect::Sqlite {
-            self.execute(&format!("update {table} set {column} = {column} where 0 = 1"), &[])?;
-        }
+        self.execute("select pg_advisory_xact_lock(hashtext($1 || '.' || current_schema()))", vals![name])?;
         Ok(())
     }
 
@@ -322,192 +280,6 @@ impl dyn Sql + '_ {
             Ok(())
         })?;
         out.ok_or_else(|| Error::Value("a transaction ended without its work".into()))
-    }
-}
-
-// ---------------------------------------------------------------- SQLite
-
-/// `$1`-style parameters as SQLite's `?1`, outside quotes and comments.
-pub fn sqlite_sql(sql: &str) -> std::borrow::Cow<'_, str> {
-    if !sql.contains('$') {
-        return sql.into();
-    }
-    let b = sql.as_bytes();
-    let mut out = String::with_capacity(sql.len());
-    let mut i = 0;
-    while i < b.len() {
-        let c = b[i];
-        match c {
-            b'\'' | b'"' | b'`' | b'[' => {
-                // to the closing quote; a doubled one is part of the text
-                let c = if c == b'[' { b']' } else { c };
-                let start = i;
-                i += 1;
-                while i < b.len() {
-                    if b[i] == c {
-                        if c != b']' && b.get(i + 1) == Some(&c) {
-                            i += 2;
-                            continue;
-                        }
-                        break;
-                    }
-                    i += 1;
-                }
-                i = (i + 1).min(b.len());
-                out.push_str(&sql[start..i]);
-            }
-            b'-' if b.get(i + 1) == Some(&b'-') => {
-                let end = sql[i..].find('\n').map_or(b.len(), |n| i + n);
-                out.push_str(&sql[i..end]);
-                i = end;
-            }
-            b'/' if b.get(i + 1) == Some(&b'*') => {
-                let end = sql[i + 2..].find("*/").map_or(b.len(), |n| i + 2 + n + 2);
-                out.push_str(&sql[i..end]);
-                i = end;
-            }
-            b'$' if b.get(i + 1).is_some_and(u8::is_ascii_digit)
-                && !(i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_')) =>
-            {
-                out.push('?');
-                i += 1;
-            }
-            _ => {
-                let ch = sql[i..].chars().next().unwrap();
-                out.push(ch);
-                i += ch.len_utf8();
-            }
-        }
-    }
-    out.into()
-}
-
-impl rusqlite::ToSql for Value {
-    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
-        use rusqlite::types::{ToSqlOutput, ValueRef};
-        Ok(ToSqlOutput::Borrowed(match self {
-            Value::Null => ValueRef::Null,
-            Value::Int(i) => ValueRef::Integer(*i),
-            Value::Real(f) => ValueRef::Real(*f),
-            Value::Text(s) => ValueRef::Text(s.as_bytes()),
-            Value::Blob(b) => ValueRef::Blob(b),
-        }))
-    }
-}
-
-fn sqlite_value(v: rusqlite::types::ValueRef<'_>) -> Result<Value> {
-    use rusqlite::types::ValueRef;
-    Ok(match v {
-        ValueRef::Null => Value::Null,
-        ValueRef::Integer(i) => Value::Int(i),
-        ValueRef::Real(f) => Value::Real(f),
-        ValueRef::Text(t) => {
-            Value::Text(String::from_utf8(t.to_vec()).map_err(|e| Error::Value(format!("text that isn't UTF-8: {e}")))?)
-        }
-        ValueRef::Blob(b) => Value::Blob(b.to_vec()),
-    })
-}
-
-fn sqlite_rows(stmt: &mut rusqlite::Statement<'_>, params: &[Value]) -> Result<Vec<Row>> {
-    sqlite_rows_upto(stmt, params, usize::MAX)
-}
-
-/// At most `most` rows: the statement isn't stepped past them.
-fn sqlite_rows_upto(stmt: &mut rusqlite::Statement<'_>, params: &[Value], most: usize) -> Result<Vec<Row>> {
-    let n = stmt.column_count();
-
-    let mut rows = stmt.query(rusqlite::params_from_iter(params))?;
-    let mut out = Vec::new();
-    while out.len() < most
-        && let Some(r) = rows.next()?
-    {
-        let mut row = Vec::with_capacity(n);
-        for i in 0..n {
-            row.push(sqlite_value(r.get_ref(i)?)?);
-        }
-        out.push(Row(row));
-    }
-    Ok(out)
-}
-
-impl Sql for rusqlite::Connection {
-    fn dialect(&self) -> Dialect {
-        Dialect::Sqlite
-    }
-
-    fn execute(&self, sql: &str, params: &[Value]) -> Result<usize> {
-        Ok(self.prepare_cached(&sqlite_sql(sql))?.execute(rusqlite::params_from_iter(params))?)
-    }
-
-    fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>> {
-        sqlite_rows(&mut *self.prepare_cached(&sqlite_sql(sql))?, params)
-    }
-
-    fn query_first(&self, sql: &str, params: &[Value]) -> Result<Option<Row>> {
-        Ok(sqlite_rows_upto(&mut *self.prepare_cached(&sqlite_sql(sql))?, params, 1)?.into_iter().next())
-    }
-
-    fn execute_uncached(&self, sql: &str, params: &[Value]) -> Result<usize> {
-        Ok(self.prepare(&sqlite_sql(sql))?.execute(rusqlite::params_from_iter(params))?)
-    }
-
-    fn query_uncached(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>> {
-        sqlite_rows(&mut self.prepare(&sqlite_sql(sql))?, params)
-    }
-
-    fn batch(&self, sql: &str) -> Result<()> {
-        Ok(self.execute_batch(sql)?)
-    }
-
-    fn has_table(&self, table: &str) -> Result<bool> {
-        Ok(self.prepare_cached("select 1 from sqlite_master where type = 'table' and name = ?1")?.exists([table])?)
-    }
-
-    fn transaction(&self, f: &mut dyn FnMut(&dyn Sql) -> Result<()>) -> Result<()> {
-        if self.is_autocommit() {
-            let tx = self.unchecked_transaction()?;
-            f(&*tx)?;
-            return Ok(tx.commit()?);
-        }
-        // in a transaction already: a savepoint, released or rolled back to
-        self.execute_batch("savepoint atlas_sql")?;
-        match f(self) {
-            Ok(()) => Ok(self.execute_batch("release atlas_sql")?),
-            Err(e) => {
-                let _ = self.execute_batch("rollback to atlas_sql; release atlas_sql");
-                Err(e)
-            }
-        }
-    }
-}
-
-impl Sql for rusqlite::Transaction<'_> {
-    fn dialect(&self) -> Dialect {
-        Dialect::Sqlite
-    }
-    fn execute(&self, sql: &str, params: &[Value]) -> Result<usize> {
-        Sql::execute(&**self, sql, params)
-    }
-    fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>> {
-        Sql::query(&**self, sql, params)
-    }
-    fn query_first(&self, sql: &str, params: &[Value]) -> Result<Option<Row>> {
-        Sql::query_first(&**self, sql, params)
-    }
-    fn execute_uncached(&self, sql: &str, params: &[Value]) -> Result<usize> {
-        Sql::execute_uncached(&**self, sql, params)
-    }
-    fn query_uncached(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>> {
-        Sql::query_uncached(&**self, sql, params)
-    }
-    fn batch(&self, sql: &str) -> Result<()> {
-        Sql::batch(&**self, sql)
-    }
-    fn has_table(&self, table: &str) -> Result<bool> {
-        Sql::has_table(&**self, table)
-    }
-    fn transaction(&self, f: &mut dyn FnMut(&dyn Sql) -> Result<()>) -> Result<()> {
-        Sql::transaction(&**self, f)
     }
 }
 
@@ -690,10 +462,7 @@ impl<C: PgClient> Sql for Pg<C> {
         // a savepoint when this is a transaction already
         let mut transaction = c.pg_transaction()?;
         // Fence before the callback can acquire application/group row locks.
-        super::history_gate::native(&mut transaction).map_err(|error| match error.downcast::<postgres::Error>() {
-            Ok(error) => Error::Postgres(error),
-            Err(error) => Error::Value(error.to_string()),
-        })?;
+        super::history_gate::native(&mut transaction).map_err(Error::NativeGate)?;
         let tx = Pg::new(transaction);
         f(&tx)?;
         Ok(tx.into_inner().commit()?)
@@ -705,14 +474,86 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parameters_are_rewritten_outside_quotes_and_comments() {
-        assert_eq!(sqlite_sql("select $1, $12 from t"), "select ?1, ?12 from t");
-        assert_eq!(sqlite_sql("select '$1', \"$2\" -- $3\n, $4"), "select '$1', \"$2\" -- $3\n, ?4");
-        assert_eq!(sqlite_sql("select 'it''s $1', $2"), "select 'it''s $1', ?2");
-        assert_eq!(sqlite_sql("select 'é', $1"), "select 'é', ?1");
-        assert_eq!(sqlite_sql("select $x"), "select $x");
-        assert_eq!(sqlite_sql("select /* $1 */ a$1, $2"), "select /* $1 */ a$1, ?2");
-        assert_eq!(sqlite_sql("select [$1], `$2`, $3"), "select [$1], `$2`, ?3");
+    fn row_values_keep_null_binary_boolean_and_type_boundaries() {
+        let row = Row(vec![Value::Null, Value::Int(-7), Value::Text("café".into()), Value::Blob(vec![0, 255])]);
+        assert_eq!(row.get::<Option<i64>>(0).unwrap(), None);
+        assert_eq!(row.get::<i64>(1).unwrap(), -7);
+        assert!(row.get::<bool>(1).unwrap());
+        assert_eq!(row.get::<f64>(1).unwrap(), -7.0);
+        assert_eq!(row.get::<String>(2).unwrap(), "café");
+        assert_eq!(row.get::<Vec<u8>>(3).unwrap(), [0, 255]);
+        assert!(row.get::<i64>(2).is_err());
+        assert!(row.get::<String>(3).is_err());
+        assert!(row.get::<Value>(4).is_err());
+    }
+
+    #[test]
+    fn postgres_parameter_encoding_keeps_fixed_binary_vectors_and_refusals() {
+        use postgres::types::{IsNull, ToSql, Type};
+
+        for (value, ty, expected) in [
+            (Value::Int(258), Type::INT2, vec![1u8, 2]),
+            (Value::Int(-3), Type::INT4, vec![255, 255, 255, 253]),
+            (Value::Int(1), Type::BOOL, vec![1]),
+            (Value::Real(0.5), Type::FLOAT8, vec![63, 224, 0, 0, 0, 0, 0, 0]),
+            (Value::Text("é".into()), Type::TEXT, vec![195, 169]),
+            (Value::Blob(vec![0, 255]), Type::BYTEA, vec![0, 255]),
+        ] {
+            let mut out = bytes::BytesMut::new();
+            assert!(matches!(value.to_sql(&ty, &mut out).unwrap(), IsNull::No));
+            assert_eq!(&out[..], expected);
+        }
+        let mut out = bytes::BytesMut::new();
+        assert!(matches!(Value::Null.to_sql(&Type::INT8, &mut out).unwrap(), IsNull::Yes));
+        assert!(out.is_empty());
+        assert!(Value::Int(32768).to_sql(&Type::INT2, &mut out).is_err());
+        assert!(Value::Text("20000101".into()).to_sql(&Type::INT8, &mut out).is_err());
+        assert!(out.is_empty(), "refused values must not publish partial parameter bytes");
+    }
+
+    #[test]
+    fn native_gate_errors_keep_typed_causes() {
+        let error = Error::NativeGate(
+            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied)).context("native ownership"),
+        );
+        let mut cause = std::error::Error::source(&error);
+        let mut found = false;
+        while let Some(current) = cause {
+            if let Some(io) = current.downcast_ref::<std::io::Error>() {
+                assert_eq!(io.kind(), std::io::ErrorKind::PermissionDenied);
+                found = true;
+            }
+            cause = current.source();
+        }
+        assert!(found, "native refusal must retain its typed cause through context");
+    }
+
+    #[test]
+    fn postgres_driver_causes_remain_discoverable_through_native_gate_context() {
+        crate::pg::testing::each(|db| {
+            let error = db.query("select * from missing_sql_cause_fixture", vals![]).unwrap_err();
+            let error = Error::NativeGate(anyhow::Error::new(error).context("native ownership"));
+            assert_eq!(error.postgres().unwrap().code(), Some(&postgres::error::SqlState::UNDEFINED_TABLE));
+        });
+    }
+
+    #[test]
+    fn postgres_fixed_snapshot_refuses_callback_before_mutation() {
+        let Some(schema) = crate::pg::testing::Schema::new() else {
+            eprintln!("skipping PostgreSQL test: ATLAS_PG_TEST_URL is required");
+            return;
+        };
+        let mut client = schema.pool.get().unwrap();
+        client.batch_execute("set default_transaction_isolation='repeatable read'").unwrap();
+        let pg = Pg::new(client);
+        let db: &dyn Sql = &pg;
+        let entered = std::cell::Cell::new(false);
+        let result = db.tx(|_| {
+            entered.set(true);
+            Ok(())
+        });
+        assert!(matches!(result, Err(Error::NativeGate(_))));
+        assert!(!entered.get(), "the native history gate must precede the callback");
     }
 
     fn check(db: &dyn Sql) {
@@ -729,6 +570,11 @@ mod tests {
         assert!(db.exists("select 1 from t where n = $1", vals![2i64]).unwrap());
         assert!(db.one::<bool>("select exists(select 1 from t where k = $1)", vals!["a"]).unwrap());
         assert_eq!(db.one::<f64>("select f from t where k = 'a'", vals![]).unwrap(), 0.5);
+        assert_eq!(db.one::<Vec<u8>>("select $1::bytea", vals![vec![0u8, 255]]).unwrap(), [0, 255]);
+        assert_eq!(
+            db.query("select 2::smallint,3::integer,4::bigint,false", vals![]).unwrap(),
+            [Row(vec![Value::Int(2), Value::Int(3), Value::Int(4), Value::Int(0)])]
+        );
         assert_eq!(
             db.one::<i64>("select cast(sum(case when n > 0 then n else 0 end) as bigint) from t", vals![]).unwrap(),
             3
@@ -759,14 +605,12 @@ mod tests {
         assert!(r.is_err());
         assert_eq!(db.one::<i64>("select count(*) from t", vals![]).unwrap(), 3);
         assert_eq!(db.query_uncached("select k from t where n = $1", vals![10i64]).unwrap().len(), 1);
-        if db.dialect() == Dialect::Postgres {
-            // text is never taken for a number's bytes
-            assert!(db.one::<i64>("select count(*) from t where n = $1", vals!["20000101"]).is_err());
-        }
+        // Text is never taken for a number's bytes.
+        assert!(db.one::<i64>("select count(*) from t where n = $1", vals!["20000101"]).is_err());
     }
 
     #[test]
-    fn both_backends_answer_alike() {
-        crate::pg::testing::each(|_| {}, check);
+    fn postgres_queries_and_nested_transactions_preserve_values() {
+        crate::pg::testing::each(check);
     }
 }

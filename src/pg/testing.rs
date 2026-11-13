@@ -64,14 +64,13 @@ impl Drop for Schema {
     }
 }
 
-/// Runs `body` on an in-memory SQLite database made ready by `sqlite_setup` (Postgres's tables come from the
-/// migrations), then on a fresh migrated test schema when there's a test server.
-pub fn each(sqlite_setup: impl Fn(&rusqlite::Connection), body: impl Fn(&dyn super::sql::Sql)) {
-    let c = rusqlite::Connection::open_in_memory().unwrap();
-    sqlite_setup(&c);
-    body(&c);
-    if let Some(s) = Schema::new() {
-        let conn = s.pool.get().expect("connecting to the test server");
-        body(&super::sql::Pg::new(conn));
-    }
+/// Runs `body` on a fresh migrated PostgreSQL schema. Without explicit test
+/// admission, reports the native requirement and skips; no backend substitutes.
+pub fn each(body: impl FnOnce(&dyn super::sql::Sql)) {
+    let Some(s) = Schema::new() else {
+        eprintln!("skipping PostgreSQL test: ATLAS_PG_TEST_URL is required");
+        return;
+    };
+    let conn = s.pool.get().expect("connecting to the test server");
+    body(&super::sql::Pg::new(conn));
 }
