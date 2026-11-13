@@ -113,9 +113,8 @@ impl Queue {
                 coalesce((select rerun_gen from pp_state s where s.release_id=q.release_id),0),due_at,
                 (select native_work_revision from releases r where r.id=q.release_id),q.native_work_revision,
                 native_walk_id,native_walk_before,native_walk_redo
-                from pp_queue q where due_at<=$1 and (lease_until is null or lease_until<=$1)
-                and not exists(select 1 from pp_state s where s.release_id=q.release_id and s.native_net_until>$1)
-                order by {},release_id limit $2 for update skip locked",crate::postprocess::engine::queue_order(batches)),&[&now,&(limit as i64)])?;
+                from pp_queue q where {}
+                order by {},release_id limit $2 for update skip locked",super::stage_stats::DB_READY,crate::postprocess::engine::queue_order(batches)),&[&now,&(limit as i64)])?;
             let mut claims=Vec::with_capacity(rows.len());
             for row in rows {
                 if self.owner.stop.load(std::sync::atomic::Ordering::Acquire) {return Err(super::outage::AttemptEnded.into());}

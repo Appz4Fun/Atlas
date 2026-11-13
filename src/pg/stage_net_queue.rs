@@ -22,9 +22,8 @@ impl Queue {
             // other lane's live lease is checked in the same claim transaction.
             let rows=tx.query(&format!("select release_id,native_net_serial,native_net_operation_id,native_net_revision,rerun_gen,net_next_at,
                 (select native_work_revision from releases r where r.id=s.release_id),native_net_rerun
-                from pp_state s where net_wanted=true and net_next_at<=$1 and (native_net_until is null or native_net_until<=$1)
-                and not exists(select 1 from pp_queue q where q.release_id=s.release_id and q.lease_until>$1)
-                order by {order} limit $2 for update skip locked"),&[&now,&(limit as i64)])?;
+                from pp_state s where {}
+                order by {order} limit $2 for update skip locked",crate::pg::stage_stats::NET_READY),&[&now,&(limit as i64)])?;
             let mut claims=Vec::new();
             for row in rows {
                 if self.owner.stop.load(std::sync::atomic::Ordering::Acquire) {return Err(crate::pg::outage::AttemptEnded.into());}

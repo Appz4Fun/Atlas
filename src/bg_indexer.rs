@@ -57,7 +57,7 @@ fn write_status(running: bool, group: &str, mode: &str, idle: bool, status: &str
         "status": status,
         "error_count": errors,
         "pid": std::process::id(),
-        "postprocess_backlog": crate::postprocess::stats::backlog(),
+        "postprocess_backlog": crate::postprocess::native::backlog_snapshot(),
     });
 
     if let Err(e) = write_atomic(&paths::status_file(), data.to_string()) {
@@ -83,7 +83,7 @@ struct GroupStats {
     last_indexed: f64,
 }
 
-struct Stats {
+pub(crate) struct Stats {
     history: Vec<HistoryPoint>,
     total_articles: i64,
     total_bytes: i64,
@@ -107,7 +107,7 @@ pub const RATE_BIN: i64 = 10;
 const RATE_KEEP: i64 = 6 * 3600;
 
 impl Stats {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Stats {
             history: Vec::new(),
             total_articles: 0,
@@ -191,7 +191,7 @@ impl Stats {
         (max(&a_speeds), max(&b_speeds), avg(&a_speeds), avg(&b_speeds))
     }
 
-    fn write(&self, group: &str, mode: &str, running: bool, idle: bool) {
+    pub(crate) fn write(&self, group: &str, mode: &str, running: bool, idle: bool) {
         let (peak_a, peak_b, avg_a, avg_b) = self.speeds();
         let db_size = self.database_bytes;
 
@@ -228,9 +228,12 @@ impl Stats {
         let mut data = data;
         if let Some(map) = data.as_object_mut() {
             map.extend(self.extra.clone());
+            map.insert("postprocess".into(),crate::postprocess::native::stats_snapshot().unwrap_or(serde_json::Value::Null));
         }
 
-        let _ = write_atomic(&paths::stats_file(), data.to_string());
+        if let Ok(bytes)=crate::postprocess::native::stats_json(&data) {
+            let _ = write_atomic(&paths::stats_file(), bytes);
+        }
     }
 }
 
