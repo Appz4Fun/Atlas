@@ -18,6 +18,12 @@ const MAX_PREDB_CATEGORIES: usize = 10_000;
 /// release group names kept during a walk; past this the ones seen once go
 const MAX_RELEASE_GROUPS: usize = 200_000;
 
+/// Retain the sampler's I/O breathing room when the native observer schedules
+/// another walk. The next successful walk rests at least four walk durations.
+pub(crate) fn rest_after(every: Duration, took: Duration) -> Duration {
+    every.max(took.saturating_mul(4).min(Duration::from_secs(24 * 60 * 60)))
+}
+
 fn name_source_label(source: Option<i64>) -> &'static str {
     match source {
         None => "posted",
@@ -372,6 +378,13 @@ fn top_with_other(counts: &BTreeMap<String, u64>, limit: usize) -> Vec<(String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_walk_rests_longer_than_its_interval() {
+        assert_eq!(rest_after(Duration::from_secs(60),Duration::from_secs(1200)),Duration::from_secs(4800));
+        assert_eq!(rest_after(Duration::from_secs(60),Duration::ZERO),Duration::from_secs(60));
+        assert_eq!(rest_after(Duration::from_secs(60),Duration::MAX),Duration::from_secs(86400));
+    }
 
     #[test]
     fn native_feed_labels_and_category_sizes_follow_admitted_rows() {

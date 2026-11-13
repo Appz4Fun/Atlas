@@ -86,3 +86,20 @@ fn native_catalog_walk_does_not_turn_query_or_identity_failure_into_empty_succes
     assert!(Scan::begin(&view(&mut client,&schema.name),destination,&destination.storage,catalog,&stop).is_err());
     drop(client);runtime.owner.close();
 }
+
+#[test]
+#[ignore="Root-only isolated PostgreSQL and native runtime admission"]
+fn native_catalog_walk_query_deadline_keeps_the_driver_cause_and_no_completed_result() {
+    let schema=pg::testing::Schema::new().expect("explicit isolated PostgreSQL");
+    let runtime=pg::stage_queue_tests::runtime(&schema);pg::stage_queue_tests::push(&runtime);
+    let destination=runtime.owner.cache_destination().unwrap();let catalog=runtime.owner.epoch().unwrap().catalog();
+    let stop=AtomicBool::new(false);let mut client=schema.pool.get().unwrap();
+    let mut walk={let view=view(&mut client,&schema.name);Scan::begin(&view,destination,&destination.storage,catalog,&stop).unwrap()};
+    let mut locker=schema.pool.get().unwrap();let mut held=locker.transaction().unwrap();
+    held.batch_execute("lock table releases in access exclusive mode").unwrap();
+    let view=ReadView::open(&mut client,&schema.name,Budget::default(),Instant::now()+Duration::from_millis(200)).unwrap();
+    let error=walk.page(&view,&destination.storage,&stop).unwrap_err();
+    assert!(error.chain().filter_map(|source|source.downcast_ref::<postgres::Error>())
+        .any(|error|error.code()==Some(&postgres::error::SqlState::QUERY_CANCELED)));
+    assert!(walk.finish(&stop).is_err());drop(view);held.rollback().unwrap();drop(locker);drop(client);runtime.owner.close();
+}

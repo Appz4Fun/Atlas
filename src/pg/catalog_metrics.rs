@@ -53,6 +53,9 @@ fn verify(view:&ReadView<'_>,destination:&CacheDestination,storage:&super::Stora
     ensure!(destination_identity_in(&mut *view.tx.borrow_mut(),&storage.schema)?==destination.identity,
         "native catalog metrics destination identity changed");
     view.before_query()?;
+    ensure!(view.tx.borrow_mut().query_one("select coalesce(max(version),0) from schema_migrations",&[])?.try_get::<_,i32>(0)?==destination.version,
+        "native catalog metrics schema version changed");
+    view.before_query()?;
     let current=CatalogIdentity::read_in(&mut *view.tx.borrow_mut())?;
     ensure!(current==*catalog,"native catalog metrics catalog identity changed");
     stopping(stop)
