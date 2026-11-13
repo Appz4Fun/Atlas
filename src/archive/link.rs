@@ -8,16 +8,14 @@ use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use md5::{Digest, Md5};
-use rusqlite::{OptionalExtension, params};
 
 use crate::config::{ArchiveConfig, Config};
 use crate::par2::{self, Par2File};
 use crate::postprocess::bodies::PAST_BUDGET;
-use crate::postprocess::schema::ShardTable;
 use crate::postprocess::step::{
     BodyRequest, Got, Needs, Outcome, ReleaseInfo, Reruns, Step, StepCtx, StepError, StepId, StepMask, StepMutation, StepWrite, mask,
 };
-use crate::store::{FileInfo, SegmentPick, SegmentRef};
+use crate::catalog_facts::{FileInfo, SegmentPick, SegmentRef};
 
 use super::names::best_name;
 use super::steps::{fetch_one, first_article};
@@ -25,126 +23,6 @@ use super::store::SOURCE_PAR2;
 use super::{ARTICLE_CAP, NAME_SOURCE_PAR2, select};
 
 pub const LINK_STEP: StepId = StepId(7);
-
-/// Each row of a linked upload, the lead's own included, and the row it's linked to. A row of the files repaired keeps
-/// which of the set's files it is (its file id in the set), and a recovery row how many of them its set has to look for,
-/// and its set's id when the set's list of files was sealed by it.
-pub const UPLOAD_LINK: ShardTable = ShardTable {
-    name: "upload_link",
-    create: "create table if not exists upload_link (
-        release_id INTEGER PRIMARY KEY,
-        lead_id    INTEGER NOT NULL,
-        recovery   INTEGER NOT NULL DEFAULT 0,
-        par2_file  BLOB,
-        wanted     INTEGER,
-        set_id     BLOB
-    )",
-    indexes: &[
-        ("upload_link_lead", "create index if not exists upload_link_lead on upload_link(lead_id)"),
-        // a volume in another shard finds its upload by its sealed set (`release_info::linked_post_with`)
-        (
-            "upload_link_set",
-            "create index if not exists upload_link_set on upload_link(set_id) where set_id is not null",
-        ),
-    ],
-    release_key: Some("release_id"),
-    added: &[],
-};
-
-/// The rows a recovery row has fetched an article of and found none of its set's files in, soo a later run goes on
-/// from the rest.
-pub const UPLOAD_LINK_TRIED: ShardTable = ShardTable {
-    name: "upload_link_tried",
-    create: "create table if not exists upload_link_tried (
-        release_id   INTEGER NOT NULL,
-        candidate_id INTEGER NOT NULL,
-        PRIMARY KEY (release_id, candidate_id)
-    ) without rowid",
-    indexes: &[],
-    release_key: Some("release_id"),
-    added: &[],
-};
-
-/// A row of one small file found beside a release by the release's PAR2 set (`LinkStep::small_beside`): a
-/// thumbnail posted under a subject of its own. The release's whole post takes it in (`release_info::whole_post_with`)
-/// whichever of its rows is asked for, and it isn't an upload's lead, soo nothing else about the post changes.
-pub const BESIDE_FILES: ShardTable = ShardTable {
-    name: "beside_files",
-    create: "create table if not exists beside_files (
-        row_id     INTEGER PRIMARY KEY,
-        release_id INTEGER NOT NULL,
-        par2_file  BLOB
-    )",
-    indexes: &[("beside_files_release", "create index if not exists beside_files_release on beside_files(release_id)")],
-    release_key: Some("row_id"),
-    added: &[],
-};
-
-/// ?1 the small file's row, ?2 the release it was found beside, ?3 its file id in the set
-pub(crate) const SET_BESIDE: &str = "insert into beside_files (row_id, release_id, par2_file) values (?1, ?2, ?3)
-    on conflict(row_id) do update set release_id = excluded.release_id, par2_file = excluded.par2_file";
-
-/// The release a small file's row was found beside, if any.
-pub fn beside_owner(conn: &rusqlite::Connection, row: i64) -> rusqlite::Result<Option<i64>> {
-    let s = crate::store::shard_of_id(row);
-    // a shard that hasn't got the table yet has found nothing
-    let Ok(mut stmt) = conn.prepare_cached(&format!("select release_id from s{s}.beside_files where row_id = ?1"))
-    else {
-        return Ok(None);
-    };
-    stmt.query_row([row], |r| r.get(0)).optional()
-}
-
-/// The rows of small files found beside release `id`.
-pub fn beside_rows(conn: &rusqlite::Connection, id: i64) -> rusqlite::Result<Vec<i64>> {
-    let s = crate::store::shard_of_id(id);
-    let Ok(mut stmt) = conn.prepare_cached(&format!("select row_id from s{s}.beside_files where release_id = ?1"))
-    else {
-        return Ok(Vec::new());
-    };
-    stmt.query_map([id], |r| r.get(0))?.collect()
-}
-
-/// Where a lead's rows are now: another run may have moved them on to a bigger file since this one read them.
-macro_rules! lead_now {
-    ($lead:literal) => {
-        concat!("coalesce((select n.lead_id from upload_link n where n.release_id = ", $lead, "), ", $lead, ")")
-    };
-}
-/// ?1 the old lead, ?2 the new: every row of the old one's upload goes with the new.
-pub const MOVE_UPLOAD: &str =
-    concat!("update upload_link set lead_id = ", lead_now!("?2"), " where lead_id = ?1 and ?1 != ?2");
-pub const LINK_LEAD: &str = "insert into upload_link (release_id, lead_id) values (?1, ?1)
-    on conflict(release_id) do nothing";
-/// ?1 a row of one of the files repaired, ?2 its lead, ?3 the file's id in the set
-pub const LINK_DATA: &str = concat!(
-    "insert into upload_link (release_id, lead_id, recovery, par2_file) values (?1, ",
-    lead_now!("?2"),
-    ", 0, ?3)
-    on conflict(release_id) do update set lead_id = excluded.lead_id, recovery = 0, par2_file = excluded.par2_file"
-);
-/// ?1 a row of recovery data, ?2 its lead, ?3 how many files its set looks for, ?4 its sealed set's id
-pub const LINK_RECOVERY: &str = concat!(
-    "insert into upload_link (release_id, lead_id, recovery, wanted, set_id) values (?1, ",
-    lead_now!("?2"),
-    ", 1, ?3, ?4)
-    on conflict(release_id) do update set lead_id = excluded.lead_id, recovery = 1, wanted = excluded.wanted,
-        set_id = excluded.set_id"
-);
-pub(crate) const TRIED: &str = "insert into upload_link_tried (release_id, candidate_id) values (?1, ?2) on conflict do nothing";
-/// The lead's name, from the set, unless something better named it.
-pub(crate) const NAME_LEAD: &str = "update releases set display_name = ?2, name_source = ?3
-    where id = ?1 and display_name is null and coalesce(name_source, 0) <= ?3";
-/// The lead's steps that go by its name, to run again now it has one.
-pub(crate) const RERUN_LEAD: &str = "insert into pp_state (release_id, net_wanted, rerun_gen, rerun_mask, net_left)
-        values (?1, case when ?3 != 0 then 1 end, 1, ?2, nullif(?3, 0))
-    on conflict(release_id) do update set done = done & ~?2, failed = failed & ~?2,
-        net_wanted = case when ?3 != 0 then 1 else net_wanted end,
-        net_left = case when ?3 != 0 then coalesce(net_left, 0) | ?3 else net_left end,
-        net_next_at = case when ?3 != 0 then 0 else net_next_at end,
-        rerun_gen = rerun_gen + 1, rerun_mask = rerun_mask | ?2";
-pub(crate) const QUEUE_LEAD: &str = "insert into pp_queue (release_id, due_at) values (?1, ?2)
-    on conflict(release_id) do update set due_at = min(due_at, excluded.due_at)";
 
 /// Files smaller than this aren't looked for: an NFO or a sample says too little, and costs a fetch all the same.
 const MIN_LINKED: u64 = 1 << 20;
@@ -154,10 +32,6 @@ const MIN_SIZE_ONLY: u64 = 64 << 20;
 /// groups' saves come in between, and an upload cut across groups lands in each group's own run.
 pub(crate) const ID_WINDOW: i64 = 2_000_000;
 
-/// The ids `saves` saves either way of `id`, one id to a save.
-pub(super) fn id_window(id: i64, saves: i64) -> (i64, i64) {
-    (id - saves, id + saves)
-}
 /// How far apart, in seconds, a small file posted beside a release can say it was posted: an upload's files go up
 /// within a minute or two of each other, and this allows a slow one.
 pub(crate) const BESIDE_SECS: i64 = 30 * 60;
@@ -189,10 +63,6 @@ static ON_RENAME: LazyLock<(StepMask, StepMask)> = LazyLock::new(|| {
         if s.needs() == Needs::Database { (db | mask(s.id()), net) } else { (db, net | mask(s.id())) }
     })
 });
-
-pub(super) fn retry(e: impl std::fmt::Display) -> StepError {
-    StepError::Retry(e.to_string())
-}
 
 fn is_par2_name(name: &str) -> bool {
     name.to_ascii_lowercase().ends_with(".par2")
@@ -464,57 +334,6 @@ impl LinkStep {
         Ok(Outcome { matched: true, writes, rerun, wait_until, ..Default::default() })
     }
 
-    /// Rows posted within `window` (from, to, and the release's own time) holding one file named `name` and nothing
-    /// else, in at most two articles, that no other upload has taken. Nearest in time first: an uploader that names
-    /// every thumbnail the same posts dozens an hour. Such a row is named after its file (with ` [N]` after it when the
-    /// name is taken), soo the name's index finds them (the date is kept off its own index, which would read the whole
-    /// hour), not a scan of every file. The name is matched as the set spells it.
-    pub(crate) fn beside_candidates(
-        conn: &rusqlite::Connection,
-        me: i64,
-        name: &str,
-        window: (&str, &str, &str),
-    ) -> Result<Vec<Candidate>, StepError> {
-        let mut stmt = conn
-            .prepare_cached(
-                "select r.id, coalesce(r.size, 0), coalesce(r.parts, 0), f.id, f.filename, f.expected
-                 from releases r join files f on f.release_id = r.id
-                 where r.name >= ?4 and r.name < ?4 || char(127)
-                   and +r.posted_date between ?1 and ?2 and r.id != ?3 and f.filename = ?4 collate nocase
-                   and coalesce(f.expected, 1) <= 2
-                   and not exists (select 1 from files g where g.release_id = r.id and g.id != f.id)
-                   and not exists (select 1 from upload_link l where l.release_id = r.id)
-                   and not exists (select 1 from beside_files b join releases o on o.id = b.release_id
-                                   where b.row_id = r.id and b.release_id != ?3)
-                   and not exists (select 1 from upload_link_tried t where t.release_id = ?3 and t.candidate_id = r.id)
-                 order by abs(julianday(r.posted_date) - julianday(?6)), r.id limit ?5",
-            )
-            .map_err(retry)?;
-        let rows = stmt
-            .query_map(params![window.0, window.1, me, name, BESIDE_CHECKS as i64, window.2], |r| {
-                Ok(Candidate {
-                    id: r.get(0)?,
-                    bytes: r.get(1)?,
-                    parts: r.get(2)?,
-                    file: FileInfo {
-                        id: r.get(3)?,
-                        filename: r.get(4)?,
-                        subject: None,
-                        subject_part: None,
-                        expected: r.get(5)?,
-                        file_total: None,
-                        parts_seen: 0,
-                        touched_at: None,
-                        sealed: false,
-                    },
-                    apart: 0.0,
-                    clock: None,
-                })
-            })
-            .map_err(retry)?;
-        rows.collect::<rusqlite::Result<_>>().map_err(retry)
-    }
-
     /// The set's list of files: as the PAR2 step kept it, when it read the whole set, or else from the volume's first
     /// article and, when that doesn't hold all of it or can't be read, its last: a set repeats its descriptions there.
     /// With it, the writes that keep what was read, soo the next run reads nothing.
@@ -546,80 +365,6 @@ impl LinkStep {
         }
         let kept = if inventory.files.is_empty() { Vec::new() } else { super::store::par2_file_writes(id, &inventory) };
         Ok((inventory, kept))
-    }
-
-    /// Single-file rows near this one, in any group of this shard, that could hold a file of between `sizes` bytes,
-    /// nearest in time first. Only rows that nothing has named, or that lead an upload already: the row's file is
-    /// checked against the set's size and first 16 KiB before anything links, which is what makes a file that file,
-    /// whoever posted it and under whatever subject. What the article count must be for those sizes is weighed here
-    /// too, roughly, soo a busy shard's other rows don't crowd the real one out of the limit; `parts_fit` then weighs
-    /// each closely.
-    pub(crate) fn candidates_legacy(
-        conn: &rusqlite::Connection,
-        me: &ReleaseInfo,
-        sizes: (u64, u64),
-        set: Option<[u8; 16]>,
-    ) -> Result<Vec<Candidate>, StepError> {
-        let Some(posted) = me.posted_date.clone() else { return Ok(Vec::new()) };
-        // `ID_WINDOW` saves either way of this one
-        let (low, high) = id_window(me.id, ID_WINDOW);
-        let mut stmt = conn
-            .prepare_cached(
-                "select r.id, coalesce(r.size, 0), coalesce(r.parts, 0), f.id, f.filename, f.expected,
-                        abs(julianday(r.posted_date) - julianday(?4)),
-                        t.first_date, t.last_date, t.clock_first, t.clock_last
-                 from releases r join files f on f.release_id = r.id
-                 left join file_timing t on t.file_id = f.id
-                 where r.id between ?1 and ?2 and r.id != ?3
-                   and abs(julianday(r.posted_date) - julianday(?4)) <= ?5
-                   and not exists (select 1 from files g where g.release_id = r.id and g.id != f.id)
-                   and not exists (select 1 from upload_link l where l.release_id = r.id and l.lead_id != r.id)
-                   and not exists (select 1 from upload_link_tried t where t.release_id = ?3 and t.candidate_id = r.id)
-                   and r.size > 0 and r.parts > 0
-                   and (r.display_name is null
-                        or exists (select 1 from upload_link m where m.lead_id = r.id and m.recovery = 1
-                                   and m.set_id = ?9))
-                   and f.expected between ?7 * 1.005 * r.parts / r.size - 2 and ?8 * 1.08 * r.parts / r.size + 2
-                 order by abs(julianday(r.posted_date) - julianday(?4))
-                 limit ?6",
-            )
-            .map_err(retry)?;
-        let rows = stmt
-            .query_map(
-                params![
-                    low,
-                    high,
-                    me.id,
-                    posted,
-                    DAY_WINDOW,
-                    MAX_CANDIDATES as i64,
-                    sizes.0 as f64,
-                    sizes.1 as f64,
-                    set.map(|id| id.to_vec())
-                ],
-                |r| {
-                    Ok(Candidate {
-                        id: r.get(0)?,
-                        bytes: r.get(1)?,
-                        parts: r.get(2)?,
-                        file: FileInfo {
-                            id: r.get(3)?,
-                            filename: r.get(4)?,
-                            subject: None,
-                            subject_part: None,
-                            expected: r.get(5)?,
-                            file_total: None,
-                            parts_seen: 0,
-                            touched_at: None,
-                            sealed: false,
-                        },
-                        apart: r.get::<_, Option<f64>>(6)?.unwrap_or(DAY_WINDOW),
-                        clock: Clock::of(r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?),
-                    })
-                },
-            )
-            .map_err(retry)?;
-        rows.collect::<rusqlite::Result<_>>().map_err(retry)
     }
 
     /// The article a file is checked by: its first, or any it has when that's missing.
@@ -1002,36 +747,6 @@ mod tests {
         assert!(!small.is(&file(2 << 20, 3)), "too small to go by size alone");
     }
 
-    fn links(conn: &rusqlite::Connection) -> Vec<(i64, i64)> {
-        let mut stmt = conn.prepare("select release_id, lead_id from upload_link order by release_id").unwrap();
-        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap()
-    }
-
-    fn write(conn: &rusqlite::Connection, sql: &str, params: Vec<rusqlite::types::Value>) {
-        conn.execute(sql, rusqlite::params_from_iter(params)).unwrap();
-    }
-
-    #[test]
-    fn a_bigger_file_found_later_takes_the_whole_upload() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("atlas.s0.db");
-        crate::store::create_shard(&path).unwrap();
-        let conn = rusqlite::Connection::open(&path).unwrap();
-        let (sample, mkv, vol_a, vol_b) = (8i64, 16i64, 24i64, 32i64);
-        // one volume finds only the sample, and it leads
-        write(&conn, LINK_DATA, vec![sample.into(), sample.into(), vec![1u8; 16].into()]);
-        write(&conn, LINK_RECOVERY, vec![vol_a.into(), sample.into(), 2i64.into(), rusqlite::types::Value::Null]);
-        // another finds both: the bigger file leads, and the sample's upload goes with it
-        write(&conn, MOVE_UPLOAD, vec![sample.into(), mkv.into()]);
-        write(&conn, LINK_DATA, vec![mkv.into(), mkv.into(), vec![2u8; 16].into()]);
-        write(&conn, LINK_RECOVERY, vec![vol_b.into(), mkv.into(), 2i64.into(), rusqlite::types::Value::Null]);
-        assert_eq!(links(&conn), [(sample, mkv), (mkv, mkv), (vol_a, mkv), (vol_b, mkv)]);
-        // a run that still thinks the sample leads links to where its upload went
-        write(&conn, LINK_DATA, vec![sample.into(), sample.into(), vec![1u8; 16].into()]);
-        write(&conn, LINK_RECOVERY, vec![vol_a.into(), sample.into(), 2i64.into(), rusqlite::types::Value::Null]);
-        assert_eq!(links(&conn), [(sample, mkv), (mkv, mkv), (vol_a, mkv), (vol_b, mkv)]);
-    }
-
     #[test]
     fn small_files_a_releases_set_names_are_looked_for_beside_it() {
         let mut thumb = file(148_562, 7);
@@ -1058,56 +773,6 @@ mod tests {
     }
 
     #[test]
-    fn a_small_file_beside_a_release_is_a_row_of_one_file_near_it_that_no_other_upload_took() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("atlas.s0.db");
-        crate::store::create_shard(&path).unwrap();
-        let conn = rusqlite::Connection::open(&path).unwrap();
-        let row = |id: i64, name: &str, posted: &str, files: &[&str]| {
-            conn.execute(
-                "insert into releases (id, name, group_name, posted_date, size, parts) values (?1, ?2, 'g', ?3, 1, 1)",
-                params![id, name, posted],
-            )
-            .unwrap();
-            for (n, f) in files.iter().enumerate() {
-                conn.execute(
-                    "insert into files (id, release_id, filename, expected, seen) values (?1, ?2, ?3, 1, x'01')",
-                    params![id * 10 + n as i64, id, f],
-                )
-                .unwrap();
-            }
-        };
-        row(1, "Some.Film.2160p", "2026-10-10 00:01:39", &["Some.Film.2160p.mp4", "Some.Film.2160p.par2"]);
-        row(2, "00-thumbnail.jpg", "2026-10-10 00:01:40", &["00-thumbnail.jpg"]);
-        row(3, "00-thumbnail.jpg [1]", "2026-10-10 02:00:00", &["00-thumbnail.jpg"]);
-        row(4, "00-thumbnail.jpg [2]", "2026-10-10 00:02:05", &["00-thumbnail.jpg"]);
-        row(5, "pics", "2026-10-10 00:01:41", &["00-thumbnail.jpg", "01.jpg"]);
-        // another upload's already
-        row(6, "00-thumbnail.jpg [3]", "2026-10-10 00:03:00", &["00-THUMBNAIL.JPG"]);
-        write(&conn, LINK_DATA, vec![6i64.into(), 9i64.into(), vec![1u8; 16].into()]);
-        let window = beside_window("2026-10-10 00:01:39", BESIDE_SECS).unwrap();
-        let found =
-            LinkStep::beside_candidates(&conn, 1, "00-thumbnail.jpg", (&window.0, &window.1, "2026-10-10 00:01:39"))
-                .unwrap();
-        let ids: Vec<i64> = found.iter().map(|c| c.id).collect();
-        assert_eq!(ids, [2, 4], "nearest in time first, one file, not taken; the check against the set decides");
-        // found beside this release, it's no other's to take, and stays this one's on the next run
-        write(&conn, SET_BESIDE, vec![2i64.into(), 1i64.into(), vec![7u8; 16].into()]);
-        let owner: i64 =
-            conn.query_row("select release_id from beside_files where row_id = 2", [], |r| r.get(0)).unwrap();
-        assert_eq!(owner, 1);
-        let posted = "2026-10-10 00:01:39";
-        let again = LinkStep::beside_candidates(&conn, 1, "00-thumbnail.jpg", (&window.0, &window.1, posted)).unwrap();
-        assert_eq!(again.iter().map(|c| c.id).collect::<Vec<_>>(), [2, 4]);
-        let other = LinkStep::beside_candidates(&conn, 4, "00-thumbnail.jpg", (&window.0, &window.1, posted)).unwrap();
-        // one checked and found to be another upload's isn't fetched again
-        write(&conn, TRIED, vec![1i64.into(), 4i64.into()]);
-        let left = LinkStep::beside_candidates(&conn, 1, "00-thumbnail.jpg", (&window.0, &window.1, posted)).unwrap();
-        assert_eq!(left.iter().map(|c| c.id).collect::<Vec<_>>(), [2]);
-        assert!(!other.iter().any(|c| c.id == 2), "another release can't take it");
-    }
-
-    #[test]
     fn files_posted_one_after_another_join_by_the_clock() {
         let a = Clock { start: 1_000.0, end: 1_600.0 };
         let next = Clock { start: 1_601.5, end: 2_200.0 };
@@ -1123,51 +788,13 @@ mod tests {
     }
 
     #[test]
-    fn a_set_read_once_is_kept_and_read_back() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("atlas.s0.db");
-        crate::store::create_shard(&path).unwrap();
-        let conn = crate::db::open_shard(&path).unwrap();
-        let mut a = file(2 << 20, 1);
-        a.name = "a.mkv".into();
-        a.crc32 = Some(7);
-        let mut b = file(3 << 20, 2);
-        b.name = "b.mkv".into();
-        // a descriptor whose id doesn't hash its size and name reads back as it was parsed: not bound
-        let mut c = file(4 << 20, 3);
-        c.name = "c.mkv".into();
-        c.bound = false;
-        let inventory = par2::Inventory {
-            files: vec![a.clone(), b.clone(), c.clone()],
-            block_size: Some(1024),
-            complete: true,
-            truncated: false,
-            sealed: vec![(a.set_id, a.file_id)],
-            creators: vec![(a.set_id, "ParPar v0.4.1 x64 [https://github.com/animetosho/parpar]".into())],
-        };
-        for w in super::super::store::par2_file_writes(8, &inventory) {
-            write(&conn, w.sql, w.params.into_iter().map(Into::into).collect());
-        }
-        let back = super::super::store::par2_inventory(&conn, "main", 8).expect("read back");
-        assert_eq!(back.files, vec![a.clone(), b, c]);
-        assert_eq!(back.sealed, vec![(a.set_id, a.file_id)]);
-        assert_eq!(back.creators, inventory.creators, "the set's Creator string reads back with it");
-        assert!(back.complete);
-        assert!(!back.files[2].bound, "what failed validation when parsed still fails it read back");
-        assert_eq!(wanted(&back.files).len(), 2, "c names nothing");
-        assert_eq!(sealed_set(&back, &wanted(&back.files)), None, "b was not sealed");
-        // a set read only in part isn't read back: the next run reads the rest
-        let partial = par2::Inventory { complete: false, ..inventory };
-        for w in super::super::store::par2_file_writes(16, &partial) {
-            write(&conn, w.sql, w.params.into_iter().map(Into::into).collect());
-        }
-        assert!(super::super::store::par2_inventory(&conn, "main", 16).is_none());
-    }
-
-    #[test]
     fn a_rename_reruns_some_steps() {
         let (db, net) = *ON_RENAME;
         assert_ne!(db | net, 0);
         assert_eq!(db & net, 0);
     }
 }
+
+#[cfg(test)]
+#[path = "native_shipping_tests.rs"]
+mod native_shipping_tests;
