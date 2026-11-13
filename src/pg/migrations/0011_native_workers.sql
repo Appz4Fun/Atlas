@@ -20,6 +20,11 @@ create index native_segments_file_message on segments(file_id,message_key);
 create index native_inferred_ids_next on inferred_ids(next_at,message_id);
 create index native_inferred_asked_next on inferred_asked(next_at,release_id);
 
+-- Exact SQLite ASCII-NOCASE metadata association; lower() is locale-sensitive.
+-- Equality prefix plus newest/tie suffix matches the bounded reader query.
+create index native_sidecars_ascii_name on sidecars
+ ((translate(release_name,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz') collate "C"),at desc,release_id desc);
+
 -- Spotnet originals are bytes: display-safe text never replaces XML/body evidence.
 alter table spots add column native_original_xml bytea;
 alter table spot_comments add column native_original_body bytea;
