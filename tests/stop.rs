@@ -1,20 +1,20 @@
-//! Stopping while a request is stuck: a provider that stops answering mid
-//! XOVER must not hold up stopping (SIGTERM / "Stop Indexing") for the read
-//! timeout, the stuck connection must never be handed out again, and the
-//! unfinished pass's cursor must not move past the stuck slice.
-//!
-//! One test, and the environment is set before any thread starts.
+//! Real provider cancellation: discard the stuck connection, retain completed
+//! slices, and stop the normal PostgreSQL Atlas binary without crossing its gap.
 
-mod common;
+#![cfg(unix)]
 
+use atlas as atlas_api;
+#[path = "common/native_background.rs"]
+mod native_background;
+#[path = "common/nntp.rs"]
+mod nntp;
+
+use atlas::nntp::{BlockingPool, Pool};
+use nntp::{GROUP, Server, mock, post, spawn_server};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use atlas::nntp::{BlockingPool, Pool};
-use common::{GROUP, Server, mock, post, spawn_server};
-
-/// way longer than stopping is allowed to take
 const STALL: Duration = Duration::from_secs(20);
 const PROMPT: Duration = Duration::from_secs(3);
 
@@ -22,20 +22,21 @@ fn stalling_server(stalls: usize) -> Arc<Server> {
     let posts =
         (1..=200).map(|n| post(n, &format!(r#""rel{}.part{}.rar" yEnc (1/1)"#, n / 20, n % 20 + 1), 10, vec![]));
     let mut s = Server::new(posts.collect());
-    let s_mut = Arc::get_mut(&mut s).unwrap();
-    s_mut.compress = true;
-    s_mut.stall = STALL;
-    s_mut.stalls_left.store(stalls, Ordering::SeqCst);
+    let fixture = Arc::get_mut(&mut s).unwrap();
+    fixture.compress = true;
+    fixture.stall = STALL;
+    fixture.stalls_left.store(stalls, Ordering::SeqCst);
     s
 }
 
-/// set `stop` once a request is stuck on the server, returns when it was set
 fn stop_when_stalled(server: Arc<Server>, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<Instant> {
     std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(12);
         while server.stalled.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline, "scripted NNTP request never stalled");
             std::thread::sleep(Duration::from_millis(10));
         }
-        // let the other slices finish first
+        // Preserve the pool control's allowance for its other slices to finish.
         std::thread::sleep(Duration::from_millis(1500));
         stop.store(true, Ordering::SeqCst);
         Instant::now()
@@ -43,22 +44,14 @@ fn stop_when_stalled(server: Arc<Server>, stop: Arc<AtomicBool>) -> std::thread:
 }
 
 #[test]
+#[ignore = "requires explicit isolated ATLAS_PG_TEST_URL and actual Atlas BIN"]
 fn stop_does_not_wait_for_a_stuck_request() {
-    let home = tempfile::tempdir().unwrap();
-    // SAFETY: only test in this binary, set before any thread is spawned
-    unsafe {
-        std::env::set_var("ATLAS_HOME", home.path());
-        std::env::set_var("ATLAS_NO_KEYRING", "1");
-        std::env::set_var("ATLAS_SAB_DIR", home.path().join("no-sabnzbd"));
-    }
-
-    // the pool on its own: stop returns right away, and the stuck connection
-    // is thrown away instead of going back to the idle list
+    // Mandatory admission precedes even this test's provider-only control.
+    let mut harness = native_background::Harness::new();
     let state = stalling_server(1);
     let port = spawn_server(state.clone());
     let pool = BlockingPool::from_pool(Pool::new(&[mock(port, "secret", 2, 1)]).with_timeout(Duration::from_secs(5)));
     pool.connect().unwrap();
-
     let slices: Vec<(u64, u64)> = (0..10).map(|i| (i * 20 + 1, i * 20 + 20)).collect();
     let stop = Arc::new(AtomicBool::new(false));
     let stopper = stop_when_stalled(state.clone(), stop.clone());
@@ -74,45 +67,25 @@ fn stop_does_not_wait_for_a_stuck_request() {
     let waited = stopper.join().unwrap().elapsed();
     assert!(waited < PROMPT, "stream took {waited:?} to stop with a request stuck");
     assert!(got < slices.len(), "the stuck slice cant have come back");
-
-    // everything again on the same pool: a reused stuck connection would read
-    // nothing until the stalled reply shows up (and fail on the 5s timeout)
     let started = Instant::now();
     let rows = pool.fetch_headers(GROUP, 1, 200).unwrap();
     assert_eq!(rows.len(), 200);
     assert!(started.elapsed() < PROMPT, "took {:?}, the stuck connection was reused", started.elapsed());
+    pool.disconnect();
+    drop(pool);
 
-    // the whole background indexer: stopping with a request stuck
     let state = stalling_server(1);
     let port = spawn_server(state.clone());
-    let config = serde_json::json!({
-        "usenet_servers": [{"host": "127.0.0.1", "username": "bob", "password": "secret", "port": port, "ssl": false, "connections": 2, "priority": 1}],
-        "group": GROUP,
-        "groups": [GROUP],
-        "index_mode": "backfill",
-        "batch_size": 200,
-        "request_size": 20
+    harness.configure("backfill", port, 2);
+    let mut runner = harness.start();
+    runner.wait_for("stalled top slice and other committed releases", |run| {
+        state.stalled.load(Ordering::SeqCst) > 0 && run.saved() > 0 && run.cursors().1 == 200
     });
-    std::fs::write(home.path().join("config.json"), config.to_string()).unwrap();
-    atlas::db::create_db().unwrap();
-
-    let stop = Arc::new(AtomicBool::new(false));
-    let stopper = stop_when_stalled(state.clone(), stop.clone());
-    let cfg = atlas::config::load_config().unwrap();
-    let runner = std::thread::spawn(move || atlas::bg_indexer::run_until(cfg, stop));
-
-    let stopped_at = stopper.join().unwrap();
-    assert_eq!(runner.join().unwrap(), 0);
-    let waited = stopped_at.elapsed();
+    assert_eq!(runner.cursors().1, 200, "cursor must not cross the stuck top slice before TERM");
+    let waited = runner.stop_within(PROMPT);
     assert!(waited < PROMPT, "indexer took {waited:?} to stop with a request stuck");
-
-    // the pass never finished: what was saved stays, the cursor didnt move past the stuck top slice
-    let db = atlas::db::open().unwrap();
-    let cursor: i64 = db.query_row("select backfill_cursor from groups where name = ?", [GROUP], |r| r.get(0)).unwrap();
-    assert_eq!(cursor, 200, "the backfill cursor moved past the stuck slice");
-    let saved: i64 = db.query_row("select count(*) from releases", [], |r| r.get(0)).unwrap();
-    assert!(saved > 0, "the slices that came back were saved");
-
-    let status = std::fs::read_to_string(home.path().join("status.json")).unwrap();
-    assert!(status.contains(r#""status":"stopped""#), "{status}");
+    assert_eq!(runner.cursors().1, 200, "the backfill cursor moved past the stuck slice");
+    assert!(runner.saved() > 0, "the slices that came back were saved");
+    drop(runner);
+    harness.verify_nxv(1);
 }

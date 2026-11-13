@@ -8,9 +8,11 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use crate::config::{Config, HeaderStoreConfig, UsenetServer};
-use crate::indexer::Indexer;
+use crate::indexer::{Db, Indexer, PassContext, RunStates};
 use crate::nntp::BlockingPool;
+use crate::nntp::Pool;
 use crate::pg::indexer_runtime::Runtime;
+use std::sync::Arc;
 
 const CHILD_TEST: &str = "indexer::native_provider_contract::fixture_child";
 const COMPLETED: &str = "provider-contract-completed";
@@ -167,9 +169,21 @@ impl Harness {
     pub fn indexer(&self, mode: &str) -> Indexer {
         let pool = BlockingPool::new(&self.config.servers);
         pool.connect().expect("connect scripted loopback NNTP");
+        self.indexer_on(pool, mode)
+    }
+
+    pub fn indexer_on(&self, pool: BlockingPool, mode: &str) -> Indexer {
         let mut indexer = Indexer::new(pool, mode, self.runtime.db.clone());
         indexer.stop = self.runtime.owner.stop.clone();
         indexer
+    }
+
+    pub fn context(&self, pool: Arc<Pool>) -> PassContext {
+        PassContext { pool, states: RunStates::default(), stop: self.runtime.owner.stop.clone(), verbose: false }
+    }
+
+    pub fn db(&self) -> Db {
+        self.runtime.db.clone()
     }
 
     pub fn articles(&mut self) -> i64 {
