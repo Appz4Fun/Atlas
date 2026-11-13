@@ -15,19 +15,18 @@ use std::sync::LazyLock;
 
 use chrono::Datelike;
 use regex::Regex;
-use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
-use crate::api::{ApiResponse, escape};
+use crate::api::escape;
 use crate::archive::store::{InnerFileRow, InnerView, SOURCE_7Z, SOURCE_NZB, SOURCE_PAR2, SOURCE_RAR, SOURCE_ZIP};
 use crate::keys::Kind;
 use crate::naming::NameSource;
 use crate::probe::yenc_quirks;
 use crate::release_info::{self, Contents, Names};
-use crate::search::{ArticleRow, ReleaseRow};
-use crate::store::{self, FileInfo, SegmentPick, SegmentRef};
+use crate::search::ReleaseRow;
+use crate::store::{self, FileInfo, SegmentRef};
 use crate::ui::{fmt_date, fmt_size};
-use crate::web::{COLUMNS, html, panel, tag, thousands, verdict};
+use crate::web::{COLUMNS, panel, tag, thousands, verdict};
 
 /// The most files a page reads of a release; past it the counts say "or more".
 const FILES_CAP: usize = 5_000;
@@ -49,55 +48,6 @@ pub(crate) struct MetaInputs<'a> {
     pub names: Option<&'a Names>,
     pub contents: &'a Contents,
     pub probe: Option<&'a crate::probe::ProbeInfo>,
-}
-
-/// The six panels in reading order; a panel with nothing to say is left out. `conn` serves the facts that
-/// need a query (files, segments, fingerprints, PreDB, keys); without one they are skipped.
-pub(crate) fn meta_html(conn: Option<&Connection>, i: &MetaInputs<'_>) -> String {
-    let mut l = look(conn, i.release.id);
-    if let Some(conn) = conn {
-        l.same = same_counts(conn, i, &l);
-        l.points_to = nzb_targets(conn, i);
-        l.sidecars = sidecars_of(conn, i);
-    }
-    meta_from_facts(i, &l)
-}
-
-/// What the release can be looked up by, from what the page already read: the keys `release_keys` keeps (worked
-/// out here too, soo a release the keys step hasn't reached yet counts the same), its PAR2 sets and its
-/// OpenSubtitles hash.
-fn lookup_of(i: &MetaInputs<'_>, l: &MetaFacts) -> crate::keys::Lookup {
-    let timing: Vec<(Option<i64>, i64)> = l.timing.iter().map(|t| (t.lines, t.articles)).collect();
-    let shard = shard_conn(i.release.id);
-    crate::keys::Lookup {
-        keys: crate::keys::Keys {
-            volumes: shard.as_ref().and_then(|s| crate::keys::volume_key(s, i.release.id, i.probe)),
-            ..crate::keys::keys_of(i.probe, &timing, i.release.parts, l.salt)
-        },
-        par2_sets: shard
-            .as_ref()
-            .map(|s| crate::keys::par2_sets(s, i.release.id).unwrap_or_default())
-            .unwrap_or_default(),
-        moviehash: i.probe.and_then(|p| p.moviehash.clone()),
-        files: shard
-            .as_ref()
-            .and_then(|s| crate::keys::crc_files(s, i.release.id, i.probe).ok())
-            .unwrap_or_else(|| i.probe.and_then(crate::keys::probe_file).into_iter().collect()),
-        inner_files: shard.as_ref().map(|s| crate::keys::inner_crc_files(s, i.release.id)).unwrap_or_default(),
-        archive: shard.as_ref().map(|s| crate::keys::archive_keys(s, i.release.id)).unwrap_or_default(),
-        audio_print: shard.as_ref().is_some_and(|s| crate::probe::audio_print::has_print(s, i.release.id)),
-    }
-}
-
-/// How many other releases share each key the release has, the kinds with none left out.
-fn same_counts(conn: &Connection, i: &MetaInputs<'_>, l: &MetaFacts) -> Vec<(crate::keys::Kind, i64)> {
-    let lookup = lookup_of(i, l);
-    crate::keys::Kind::ALL
-        .into_iter()
-        .filter(|kind| lookup.has(*kind))
-        .map(|kind| (kind, crate::keys::count_others(conn, i.release.id, &lookup, kind)))
-        .filter(|(_, n)| *n > 0)
-        .collect()
 }
 
 /// " · in 12 other releases", linking to them, when other releases share the key.
@@ -132,36 +82,6 @@ fn panels_html(i: &MetaInputs<'_>, l: &MetaFacts) -> String {
     out
 }
 
-/// `/ui/meta?id=&part=headers|parts|hashes`: the body of one lazy `<details>`.
-pub(crate) fn fragment(args: &HashMap<String, String>) -> ApiResponse {
-    let id = arg_id(args);
-    let part = args.get("part").map(String::as_str).unwrap_or("");
-    if !matches!(part, "headers" | "parts" | "hashes") {
-        return html(400, String::new());
-    }
-    let Ok(conn) = crate::db::open() else { return html(500, String::new()) };
-    // the reader the page, the NZB and the drawer use: a release in a blocked group, or none, is not served
-    match crate::search::get_release_with(&conn, id) {
-        Ok(Some(_)) => {}
-        Ok(None) => return html(404, String::new()),
-        Err(_) => return html(500, String::new()),
-    }
-    let body = match part {
-        "headers" => headers_fragment(&conn, id),
-        "parts" => parts_fragment(&conn, id),
-        _ => hashes_fragment(&conn, id),
-    };
-    html(200, body)
-}
-
-/// `/ui/row?id=&as=row|card`: one `<tr class="drawer-row">` (default) or one `<div class="drawer-card">`.
-pub(crate) fn row_panel(args: &HashMap<String, String>) -> ApiResponse {
-    let id = arg_id(args);
-    let as_card = args.get("as").is_some_and(|v| v == "card");
-    let Ok(conn) = crate::db::open() else { return html(500, String::new()) };
-    html(200, drawer_html(&conn, id, as_card))
-}
-
 /// The button a result row carries in its name cell: the first click loads the drawer under the row.
 pub(crate) fn drawer_trigger(id: i64) -> String {
     trigger(&format!("/ui/row?id={id}"), "closest tr", "afterend")
@@ -180,10 +100,6 @@ fn trigger(url: &str, target: &str, swap: &str) -> String {
     format!(
         " <button class=\"icon-button drawer-toggle\" type=\"button\" title=\"More facts\" aria-label=\"More facts\" aria-expanded=\"false\" hx-get=\"{url}\" hx-target=\"{target}\" hx-swap=\"{swap}\" hx-trigger=\"click\" hx-sync=\"this:drop\">+</button>"
     )
-}
-
-fn arg_id(args: &HashMap<String, String>) -> i64 {
-    args.get("id").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0)
 }
 
 // ---------------------------------------------------------------- what the panels read
@@ -258,114 +174,6 @@ pub(crate) struct PredbFacts {
     pub(crate) category: Option<String>,
     pub(crate) pre_at: Option<i64>,
     pub(crate) nuked: bool,
-}
-
-/// The release's shard on its own, for the readers that want one (`release_files`, `file_segments`, `IdKey`).
-fn shard_conn(release_id: i64) -> Option<Connection> {
-    let main = crate::paths::database();
-    crate::db::open_shard(&store::shard_path(&main, store::shard_of_id(release_id))).ok()
-}
-
-fn look(conn: Option<&Connection>, release_id: i64) -> MetaFacts {
-    let mut l = MetaFacts::default();
-    let Some(conn) = conn else { return l };
-    if let Some(s) = shard_conn(release_id) {
-        l.files = store::release_files(&s, release_id, FILES_CAP).unwrap_or_default();
-        l.main = crate::probe::step::main_file(&l.files).cloned();
-        if let Some(main) = &l.main {
-            // the subject's article is the lowest in (part, message-id) order: what `First(1)` would return,
-            // without decoding the file's blob
-            l.first_id = s
-                .query_row("select subject_mid from files where id = ?", [main.id], |r| r.get::<_, Option<String>>(0))
-                .ok()
-                .flatten();
-            if l.first_id.is_none() {
-                l.first_id = store::file_segments(&s, main.id, &SegmentPick::First(1))
-                    .ok()
-                    .and_then(|found| found.into_iter().next())
-                    .map(|seg| seg.message_id);
-            }
-            l.last = store::file_segments(&s, main.id, &SegmentPick::Last(1))
-                .ok()
-                .and_then(|found| found.into_iter().next());
-        }
-        if let Ok((posted, content)) =
-            s.query_row("select posted, content from release_fingerprint where release_id = ?", [release_id], |r| {
-                Ok((r.get::<_, Option<Vec<u8>>>(0)?, r.get::<_, Option<Vec<u8>>>(1)?))
-            })
-        {
-            l.posted_fp = posted;
-            l.content_fp = content;
-        }
-        l.predb = s
-            .query_row(
-                "select kind, category, pre_at, nuked from predb_match where release_id = ?",
-                [release_id],
-                |r| {
-                    Ok(PredbFacts {
-                        kind: r.get(0)?,
-                        category: r.get(1)?,
-                        pre_at: r.get(2)?,
-                        nuked: r.get::<_, Option<i64>>(3)?.unwrap_or(0) != 0,
-                    })
-                },
-            )
-            .ok();
-        l.id_key = store::IdKey::of(&s).ok();
-        l.timing = read_timing(&s, release_id).unwrap_or_default();
-        l.par2_creators = crate::archive::store::par2_creators(&s, "main", release_id);
-        l.rev_volumes = s
-            .query_row("select count(*) from rev_volumes where release_id = ?", [release_id], |r| r.get(0))
-            .unwrap_or(0);
-    }
-    l.salt = salt(conn);
-    l
-}
-
-/// The release's `file_timing` rows, by file name, through `files` soo a row of a file that is gone is not one.
-fn read_timing(s: &Connection, release_id: i64) -> rusqlite::Result<Vec<FileTiming>> {
-    s.prepare_cached(
-        "select t.first_date, t.last_date, t.number_first, t.number_last, t.lines, t.references_seen, t.xref_groups_max,
-                t.from_variants, t.encoded_subject, t.late_articles, t.articles, t.from_hash,
-                t.tool, t.clock_first, t.clock_last, t.hw_host, t.hw_key, t.hw_n_first, t.hw_n_last
-         from file_timing t join files f on f.id = t.file_id
-         where f.release_id = ?1 order by f.filename limit ?2",
-    )?
-    .query_map(rusqlite::params![release_id, FILES_CAP as i64], |r| {
-        Ok(FileTiming {
-            first_date: r.get(0)?,
-            last_date: r.get(1)?,
-            number_first: r.get(2)?,
-            number_last: r.get(3)?,
-            lines: r.get(4)?,
-            references_seen: r.get(5)?,
-            xref_groups_max: r.get(6)?,
-            from_variants: r.get(7)?,
-            encoded_subject: r.get::<_, i64>(8)? != 0,
-            late_articles: r.get(9)?,
-            articles: r.get(10)?,
-            from_hash: r.get(11)?,
-            tool: r.get(12)?,
-            clock_first: r.get(13)?,
-            clock_last: r.get(14)?,
-            hw_host: r.get(15)?,
-            hw_key: r.get(16)?,
-            hw_n_first: r.get(17)?,
-            hw_n_last: r.get(18)?,
-        })
-    })?
-    .collect()
-}
-
-/// The install's salt for the account and host keys: made once, by whoever asks first, and kept in shard 0's
-/// `meta`. None when it can't be read or made, and then no salted key is shown at all.
-/// The install's salt for the account and host keys, for the pages that show headers on their own.
-pub(crate) fn salt_of(conn: Option<&Connection>) -> Option<i64> {
-    conn.and_then(salt)
-}
-
-fn salt(conn: &Connection) -> Option<i64> {
-    crate::keys::salt(conn)
 }
 
 // ---------------------------------------------------------------- a panel under construction
@@ -1625,37 +1433,6 @@ fn nzb_release_names(inner: &InnerView) -> Vec<String> {
     crate::archive::nzb::release_names(inner.files.iter().filter(|r| r.source == SOURCE_NZB).map(|r| r.name.as_str()))
 }
 
-/// The releases a posted NZB points to, by name in every shard, not this one: up to 5 a name.
-fn nzb_targets(conn: &Connection, i: &MetaInputs<'_>) -> Vec<(String, Vec<ReleaseRow>)> {
-    let own = i.release.id;
-    nzb_release_names(i.inner)
-        .into_iter()
-        .map(|name| {
-            let mut found = Vec::new();
-            for shard in 0..store::SHARDS {
-                let sql = format!("select id from s{shard}.releases where name = ?1 and id != ?2 order by id limit 5");
-                let ids: Vec<i64> = conn
-                    .prepare(&sql)
-                    .and_then(|mut stmt| stmt.query_map(rusqlite::params![name, own], |r| r.get(0))?.collect())
-                    .unwrap_or_default();
-                found.extend(ids.into_iter().filter_map(|id| crate::search::get_release_with(conn, id).ok().flatten()));
-            }
-            found.truncate(5);
-            (name, found)
-        })
-        .collect()
-}
-
-/// Sidecars posted on their own that describe this release: by its MKV's Segment UID, then by its names.
-fn sidecars_of(conn: &Connection, i: &MetaInputs<'_>) -> Vec<crate::sidecar::Found> {
-    let mut names: Vec<&str> = vec![i.release.name.as_str()];
-    if let Some(display) = i.names.and_then(|n| n.display.as_deref()) {
-        names.push(display);
-    }
-    let uid = i.probe.and_then(|p| p.media.as_ref()).and_then(|m| m.segment_uid.as_deref());
-    crate::sidecar::describing(conn, i.release.id, &names, uid, 5)
-}
-
 /// each sidecar: what it is, the post it came in and how it was matched, its text folded under it
 fn sidecars_html(found: &[crate::sidecar::Found]) -> Option<String> {
     let items: Vec<String> = found
@@ -2156,8 +1933,13 @@ fn keys_panel(i: &MetaInputs<'_>, l: &MetaFacts, compact: bool) -> Facts {
     }
     f.add("Tail bytes", l.last.as_ref().map(|s| format!("{} bytes", thousands(s.bytes))));
     let collection = l.collection.or_else(|| {
-        collection_key(l.id_key.as_ref()?, &i.release.group_name, l.main.as_ref()?.subject.as_deref()?,
-            i.release.poster.as_deref().unwrap_or(""), i.release.posted_date.as_deref().unwrap_or(""))
+        collection_key(
+            l.id_key.as_ref()?,
+            &i.release.group_name,
+            l.main.as_ref()?.subject.as_deref()?,
+            i.release.poster.as_deref().unwrap_or(""),
+            i.release.posted_date.as_deref().unwrap_or(""),
+        )
     });
     if let Some((hash, weak)) = collection {
         let note =
@@ -2369,8 +2151,20 @@ fn nzblnk(i: &MetaInputs<'_>, subject: &str) -> String {
 
 // ---------------------------------------------------------------- the lazy fragments
 
-const HEADER_ORDER: &[&str] = &["Path", "Date", "Injection-Date", "NNTP-Posting-Date", "Injection-Info",
-    "NNTP-Posting-Host", "User-Agent", "X-Newsreader", "X-Newsposter", "Organization", "X-Complaints-To", "Xref"];
+const HEADER_ORDER: &[&str] = &[
+    "Path",
+    "Date",
+    "Injection-Date",
+    "NNTP-Posting-Date",
+    "Injection-Info",
+    "NNTP-Posting-Host",
+    "User-Agent",
+    "X-Newsreader",
+    "X-Newsposter",
+    "Organization",
+    "X-Complaints-To",
+    "Xref",
+];
 const HEADER_PREFIX: &str = "<div class=\"table-wrap\"><table><thead><tr><th>Header</th><th>Value</th><th class=\"num\">Bytes</th></tr></thead><tbody>";
 const HEADER_SUFFIX: &str = "</tbody></table></div><p class=\"dim\">The headers kept from the main file's first article, 512 characters each at most. The posting account and host are shown as salted keys.</p>";
 
@@ -2382,29 +2176,44 @@ pub(crate) fn header_order(name: &str) -> (usize, &str) {
 /// existing privacy redactor; their temporary allocations are pre-admitted by
 /// the native loader. Nothing becomes publishable until the caller checks its
 /// complete source and finishes the body spool.
-pub(crate) struct HeaderWriter<W> { output: W, rows: u64, failed: bool }
+pub(crate) struct HeaderWriter<W> {
+    output: W,
+    rows: u64,
+    failed: bool,
+}
 impl<W: std::io::Write> HeaderWriter<W> {
-    pub(crate) fn new(output: W) -> Self { Self { output, rows: 0, failed: false } }
+    pub(crate) fn new(output: W) -> Self {
+        Self { output, rows: 0, failed: false }
+    }
     fn begin(&mut self, name: &str) -> std::io::Result<()> {
-        if self.failed { return Err(std::io::Error::other("header writer already failed")); }
+        if self.failed {
+            return Err(std::io::Error::other("header writer already failed"));
+        }
         self.failed = true;
-        if self.rows == 0 { self.output.write_all(HEADER_PREFIX.as_bytes())?; }
+        if self.rows == 0 {
+            self.output.write_all(HEADER_PREFIX.as_bytes())?;
+        }
         write!(self.output, "<tr><td>{}</td><td>", escape(name))?;
         Ok(())
     }
     fn end(&mut self, bytes: u64) -> std::io::Result<()> {
         write!(self.output, "</td><td class=\"num\">{bytes}</td></tr>")?;
         self.rows = self.rows.checked_add(1).ok_or_else(|| std::io::Error::other("header row count overflow"))?;
-        self.failed = false; Ok(())
+        self.failed = false;
+        Ok(())
     }
     pub(crate) fn text(&mut self, name: &str, value: impl std::io::Read, bytes: u64) -> std::io::Result<()> {
         self.begin(name)?;
         let mut seen = 0u64;
         crate::nzb_stream::text_chunks(value, |text| {
-            seen = seen.checked_add(text.len() as u64).ok_or_else(|| std::io::Error::other("header text extent overflow"))?;
+            seen = seen
+                .checked_add(text.len() as u64)
+                .ok_or_else(|| std::io::Error::other("header text extent overflow"))?;
             self.output.write_all(escape(text).as_bytes())
         })?;
-        if seen != bytes { return Err(std::io::Error::other("header text extent mismatch")); }
+        if seen != bytes {
+            return Err(std::io::Error::other("header text extent mismatch"));
+        }
         self.end(bytes)
     }
     pub(crate) fn kept(&mut self, name: &str, value: &str, salt: Option<i64>) -> std::io::Result<()> {
@@ -2413,25 +2222,36 @@ impl<W: std::io::Write> HeaderWriter<W> {
         self.end(value.len() as u64)
     }
     pub(crate) fn finish(mut self) -> std::io::Result<W> {
-        if self.failed { return Err(std::io::Error::other("header writer is incomplete")); }
-        self.output.write_all(if self.rows == 0 { b"<p class=\"dim\">No article of this release has been read yet.</p>" } else { HEADER_SUFFIX.as_bytes() })?;
-        self.output.flush()?; Ok(self.output)
+        if self.failed {
+            return Err(std::io::Error::other("header writer is incomplete"));
+        }
+        self.output.write_all(if self.rows == 0 {
+            b"<p class=\"dim\">No article of this release has been read yet.</p>"
+        } else {
+            HEADER_SUFFIX.as_bytes()
+        })?;
+        self.output.flush()?;
+        Ok(self.output)
     }
-}
-
-/// The probed article's headers, with the account and host as keys, plus its Message-ID and Subject.
-fn headers_fragment(conn: &Connection, id: i64) -> String {
-    let probe = crate::probe::read(conn, id);
-    headers_from_facts(probe.as_ref(), &look(Some(conn), id))
 }
 
 /// Render fully loaded header facts. Native readers supply source-qualified
 /// data; this function has no connection, shard opener or provider capability.
 pub(crate) fn headers_from_facts(probe: Option<&crate::probe::ProbeInfo>, l: &MetaFacts) -> String {
-    headers_from_fields(l.first_id.as_deref(),l.main.as_ref().and_then(|main|main.subject.as_deref()),l.salt,probe.map(|probe|&probe.headers))
+    headers_from_fields(
+        l.first_id.as_deref(),
+        l.main.as_ref().and_then(|main| main.subject.as_deref()),
+        l.salt,
+        probe.map(|probe| &probe.headers),
+    )
 }
 
-pub(crate) fn headers_from_fields(first_id:Option<&str>,subject:Option<&str>,salt:Option<i64>,headers:Option<&BTreeMap<String,String>>)->String {
+pub(crate) fn headers_from_fields(
+    first_id: Option<&str>,
+    subject: Option<&str>,
+    salt: Option<i64>,
+    headers: Option<&BTreeMap<String, String>>,
+) -> String {
     let mut rows = String::new();
     let mut row = |name: &str, value: String, bytes: usize| {
         let _ = write!(rows, "<tr><td>{}</td><td>{value}</td><td class=\"num\">{bytes}</td></tr>", escape(name));
@@ -2518,70 +2338,32 @@ impl FileParts {
     }
 }
 
-/// Every article of the release through `each`, stopping after `budget` of them: false when it stopped or the
-/// read failed, soo the caller says the list is partial instead of showing it as whole.
-fn walk_articles(conn: &Connection, id: i64, budget: usize, each: &mut dyn FnMut(ArticleRow)) -> bool {
-    let mut seen = 0usize;
-    store::each_article(conn, id, &mut |a| {
-        seen += 1;
-        if seen > budget {
-            return Err(rusqlite::Error::ToSqlConversionFailure("over the article budget".into()));
-        }
-        each(a);
-        Ok(())
-    })
-    .is_ok()
-}
-
-/// One row per file: subject, part map, first and last id, id grammar, article sizes, reposted parts.
-fn parts_fragment(conn: &Connection, id: i64) -> String {
-    let Some(shard) = shard_conn(id) else { return String::new() };
-    let files = store::release_files(&shard, id, FILES_CAP).unwrap_or_default();
-    parts_fragment_of(conn, id, &files, ARTICLE_BUDGET)
-}
-
-/// The Parts table from one pass over the articles, which gathers only the files the table shows and stops at
-/// `budget` articles.
-fn parts_fragment_of(conn: &Connection, id: i64, files: &[FileInfo], budget: usize) -> String {
-    if files.is_empty() {
-        return "<p class=\"dim\">This release has no files on record.</p>".into();
-    }
-    let shown: HashSet<&str> = files.iter().take(PARTS_ROWS).map(|f| f.filename.as_str()).collect();
-    let mut by_file: HashMap<String, FileParts> = HashMap::new();
-    let walked = walk_articles(conn, id, budget, &mut |a| {
-        let name = a.filename.unwrap_or_default();
-        if shown.contains(name.as_str()) {
-            by_file.entry(name).or_default().offer(a.part, a.message_id, a.bytes);
-        }
-    });
-    // a pass cut short would show the files it never reached as holed: the maps stay blank and the note says why
-    if !walked {
-        by_file.clear();
-    }
-    parts_table(files, &by_file, walked)
-}
-
 /// The Parts table's heading: no Name, Posted size or Articles column, which the NZB file list shows.
 const PARTS_HEAD: &str = "<tr><th>Subject</th><th>Parts</th><th>First id</th><th>Last id</th><th>Ids look like</th><th class=\"num\">Smallest</th><th class=\"num\">Largest</th><th class=\"num\">Reposted</th></tr>";
 
 /// The first `PARTS_ROWS` files as rows. `walked`: the article pass finished; when it did not, the maps show
 /// the parts counted at ingest only.
 fn parts_table(files: &[FileInfo], by_file: &HashMap<String, FileParts>, walked: bool) -> String {
-    let rows = files.iter().take(PARTS_ROWS).map(|file| {
-        let parts = by_file.get(&file.filename);
-        let expected = file.expected.unwrap_or(file.parts_seen).max(file.parts_seen);
-        let seen = parts.map(|parts| &parts.seen);
-        PartFacts {
-            subject: file.subject.as_deref().unwrap_or(&file.filename).to_string(),
-            expected, seen: file.parts_seen,
-            map: seen.map_or(0, |seen| part_map_mask(seen, expected)),
-            first: parts.and_then(|parts| parts.first.as_ref()).map(|(_, id)| id.clone()),
-            last: parts.and_then(|parts| parts.last.as_ref()).map(|(_, id)| id.clone()),
-            smallest: parts.and_then(|parts| parts.smallest),
-            largest: parts.and_then(|parts| parts.largest),
-            reposted: parts.map_or(0, |parts| parts.reposted),
-        }
-    }).collect();
+    let rows = files
+        .iter()
+        .take(PARTS_ROWS)
+        .map(|file| {
+            let parts = by_file.get(&file.filename);
+            let expected = file.expected.unwrap_or(file.parts_seen).max(file.parts_seen);
+            let seen = parts.map(|parts| &parts.seen);
+            PartFacts {
+                subject: file.subject.as_deref().unwrap_or(&file.filename).to_string(),
+                expected,
+                seen: file.parts_seen,
+                map: seen.map_or(0, |seen| part_map_mask(seen, expected)),
+                first: parts.and_then(|parts| parts.first.as_ref()).map(|(_, id)| id.clone()),
+                last: parts.and_then(|parts| parts.last.as_ref()).map(|(_, id)| id.clone()),
+                smallest: parts.and_then(|parts| parts.smallest),
+                largest: parts.and_then(|parts| parts.largest),
+                reposted: parts.map_or(0, |parts| parts.reposted),
+            }
+        })
+        .collect();
     parts_from_facts(&PartsFacts { rows, files: files.len(), complete: walked })
 }
 
@@ -2654,22 +2436,37 @@ pub(crate) fn write_parts_from_facts(output: &mut impl std::io::Write, facts: &P
     };
     write!(output, "<div class=\"table-wrap\"><table><thead>{PARTS_HEAD}</thead><tbody>")?;
     for file in facts.rows.iter().take(PARTS_ROWS) {
-        output.write_all(b"<tr><td class=\"name\">")?; text(output, &file.subject)?;
-        write!(output, "</td><td class=\"partmap\" title=\"{} of {} parts\">{}</td><td>",
-            file.seen, file.expected, part_map_from_mask(if facts.complete { file.map } else { 0 }))?;
+        output.write_all(b"<tr><td class=\"name\">")?;
+        text(output, &file.subject)?;
+        write!(
+            output,
+            "</td><td class=\"partmap\" title=\"{} of {} parts\">{}</td><td>",
+            file.seen,
+            file.expected,
+            part_map_from_mask(if facts.complete { file.map } else { 0 })
+        )?;
         text(output, file.first.as_deref().unwrap_or(""))?;
-        output.write_all(b"</td><td>")?; text(output, file.last.as_deref().unwrap_or(""))?;
-        write!(output, "</td><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
+        output.write_all(b"</td><td>")?;
+        text(output, file.last.as_deref().unwrap_or(""))?;
+        write!(
+            output,
+            "</td><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
             file.first.as_deref().and_then(id_grammar).unwrap_or(""),
-            file.smallest.map(thousands).unwrap_or_default(), file.largest.map(thousands).unwrap_or_default(), file.reposted)?;
+            file.smallest.map(thousands).unwrap_or_default(),
+            file.largest.map(thousands).unwrap_or_default(),
+            file.reposted
+        )?;
     }
     output.write_all(b"</tbody></table></div>")?;
     if !facts.complete {
         output.write_all(b"<p class=\"dim\">Too many articles to list: the maps are blank, and each map's title has the parts counted at ingest.</p>")?;
     }
     if facts.files > PARTS_ROWS {
-        let total = if facts.files >= FILES_CAP { format!("{} or more", thousands(FILES_CAP as i64)) }
-            else { thousands(facts.files as i64) };
+        let total = if facts.files >= FILES_CAP {
+            format!("{} or more", thousands(FILES_CAP as i64))
+        } else {
+            thousands(facts.files as i64)
+        };
         write!(output, "<p class=\"dim\">The first {PARTS_ROWS} of {total} files.</p>")?;
     }
     Ok(())
@@ -2682,7 +2479,9 @@ fn part_map(seen: &BTreeSet<i64>, expected: i64) -> String {
 }
 
 fn part_map_mask(seen: &BTreeSet<i64>, expected: i64) -> u64 {
-    if expected <= 0 { return 0; }
+    if expected <= 0 {
+        return 0;
+    }
     (0..MAP_CELLS).fold(0, |mask, cell| {
         let lo = cell * expected / MAP_CELLS + 1;
         let hi = ((cell + 1) * expected / MAP_CELLS).max(lo);
@@ -2694,29 +2493,6 @@ fn part_map_from_mask(mask: u64) -> String {
     (0..MAP_CELLS).map(|cell| if mask & (1u64 << cell) != 0 { '▮' } else { '▯' }).collect()
 }
 
-/// The digests over the articles: the segment set, the first part's CRC.
-fn hashes_fragment(conn: &Connection, id: i64) -> String {
-    hashes_fragment_of(conn, id, ARTICLE_BUDGET)
-}
-
-/// `hashes_fragment` with the segment set read from at most `budget` articles.
-fn hashes_fragment_of(conn: &Connection, id: i64, budget: usize) -> String {
-    let probe = crate::probe::read(conn, id);
-    let mut ids: Vec<String> = Vec::new();
-    let walked = walk_articles(conn, id, budget, &mut |a| ids.push(a.message_id));
-    let digest = if walked && !ids.is_empty() {
-        ids.sort();
-        ids.dedup();
-        let mut hash = Sha256::new();
-        for id in &ids {
-            hash.update(id.as_bytes());
-            hash.update(b"\n");
-        }
-        Some(hash.finalize().into())
-    } else { None };
-    hashes_from_facts(probe.as_ref(), &HashFacts { digest, articles: ids.len(), complete: walked })
-}
-
 /// The original bounded metadata view's sorted/deduplicated segment digest.
 /// This is a projection summary, not a request-sized list of message IDs.
 pub(crate) struct HashFacts {
@@ -2726,8 +2502,11 @@ pub(crate) struct HashFacts {
 }
 
 pub(crate) fn hashes_from_facts(probe: Option<&crate::probe::ProbeInfo>, summary: &HashFacts) -> String {
-    hashes_with_crcs(probe.and_then(|p| p.yenc.as_ref()).and_then(|y| y.pcrc32),
-        probe.and_then(|p| p.yenc.as_ref()).and_then(|y| y.crc32), summary)
+    hashes_with_crcs(
+        probe.and_then(|p| p.yenc.as_ref()).and_then(|y| y.pcrc32),
+        probe.and_then(|p| p.yenc.as_ref()).and_then(|y| y.crc32),
+        summary,
+    )
 }
 
 pub(crate) fn hashes_with_crcs(pcrc32: Option<u32>, crc32: Option<u32>, summary: &HashFacts) -> String {
@@ -2755,25 +2534,6 @@ pub(crate) fn hashes_with_crcs(pcrc32: Option<u32>, crc32: Option<u32>, summary:
 }
 
 // ---------------------------------------------------------------- the drawer
-
-/// The compact facts of one release under its result row, or as a card.
-fn drawer_html(conn: &Connection, id: i64, as_card: bool) -> String {
-    let Some(release) = crate::search::get_release_with(conn, id).ok().flatten() else {
-        return missing_drawer(id, as_card);
-    };
-    let inner = crate::archive::store::view_with(conn, id);
-    let names = release_info::names_with(conn, id).ok().flatten();
-    let contents = release_info::contents_with(conn, id).unwrap_or_default();
-    let probe = crate::probe::read(conn, id);
-    let inputs = MetaInputs {
-        release: &release,
-        inner: &inner,
-        names: names.as_ref(),
-        contents: &contents,
-        probe: probe.as_ref(),
-    };
-    drawer_from_facts(&inputs, &look(Some(conn), id), as_card)
-}
 
 /// The drawer's facts: each panel's compact rows, in one `dl`.
 pub(crate) fn compact_from_facts(i: &MetaInputs<'_>, l: &MetaFacts) -> String {
@@ -2808,8 +2568,13 @@ pub(crate) struct DrawerFacts {
     pub salt: Option<i64>,
 }
 pub(crate) fn drawer_from_loaded(i: &MetaInputs<'_>, facts: DrawerFacts, as_card: bool) -> String {
-    let compact = MetaFacts { files: facts.files, main: facts.main, first_id: facts.first_id,
-        salt: facts.salt, ..MetaFacts::default() };
+    let compact = MetaFacts {
+        files: facts.files,
+        main: facts.main,
+        first_id: facts.first_id,
+        salt: facts.salt,
+        ..MetaFacts::default()
+    };
     drawer_from_facts(i, &compact, as_card)
 }
 
@@ -2840,13 +2605,17 @@ mod tests {
         let p = probe();
         let facts = looked(vec![file("é<&>.bin", 2)]);
         let mut output = HeaderWriter::new(Vec::new());
-        if let Some(id) = &facts.first_id { output.text("Message-ID", id.as_bytes(), id.len() as u64).unwrap(); }
+        if let Some(id) = &facts.first_id {
+            output.text("Message-ID", id.as_bytes(), id.len() as u64).unwrap();
+        }
         if let Some(subject) = facts.main.as_ref().and_then(|file| file.subject.as_ref()) {
             output.text("Subject", subject.as_bytes(), subject.len() as u64).unwrap();
         }
         let mut headers: Vec<_> = p.headers.iter().collect();
         headers.sort_by(|(left, _), (right, _)| header_order(left).cmp(&header_order(right)));
-        for (name, value) in headers { output.kept(name, value, facts.salt).unwrap(); }
+        for (name, value) in headers {
+            output.kept(name, value, facts.salt).unwrap();
+        }
         let actual = String::from_utf8(output.finish().unwrap()).unwrap();
         assert_eq!(actual, headers_from_facts(Some(&p), &facts));
         assert!(!actual.contains(ACCOUNT) && !actual.contains(HOST));
@@ -2862,23 +2631,41 @@ mod tests {
     fn streamed_native_parts_keep_the_legacy_html_and_partial_horizons() {
         for complete in [false, true] {
             for files in [1, 5000] {
-                let facts = PartsFacts { files, complete, rows: (0..files.min(PARTS_ROWS)).map(|index| PartFacts {
-                    subject: format!("\"<&é>\" file {index}"), expected: 2, seen: 2, map: u64::MAX,
-                    first: complete.then(|| "<0123456789abcdef0123456789abcdef@ngPost>".to_owned()),
-                    last: complete.then(|| "<last&é@example>".to_owned()),
-                    smallest: complete.then_some(17), largest: complete.then_some(1234), reposted: usize::from(complete),
-                }).collect() };
+                let facts = PartsFacts {
+                    files,
+                    complete,
+                    rows: (0..files.min(PARTS_ROWS))
+                        .map(|index| PartFacts {
+                            subject: format!("\"<&é>\" file {index}"),
+                            expected: 2,
+                            seen: 2,
+                            map: u64::MAX,
+                            first: complete.then(|| "<0123456789abcdef0123456789abcdef@ngPost>".to_owned()),
+                            last: complete.then(|| "<last&é@example>".to_owned()),
+                            smallest: complete.then_some(17),
+                            largest: complete.then_some(1234),
+                            reposted: usize::from(complete),
+                        })
+                        .collect(),
+                };
                 let expected = parts_from_facts(&facts);
-                let mut output = Vec::new(); write_parts_from_facts(&mut output, &facts).unwrap();
+                let mut output = Vec::new();
+                write_parts_from_facts(&mut output, &facts).unwrap();
                 assert_eq!(String::from_utf8(output).unwrap(), expected);
             }
         }
         struct Broken;
         impl std::io::Write for Broken {
-            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> { Err(std::io::Error::other("synthetic output failure")) }
-            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("synthetic output failure"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
         }
-        assert!(write_parts_from_facts(&mut Broken, &PartsFacts { files: 0, complete: true, rows: Vec::new() }).is_err());
+        assert!(
+            write_parts_from_facts(&mut Broken, &PartsFacts { files: 0, complete: true, rows: Vec::new() }).is_err()
+        );
     }
     use crate::archive::{PasswordTest, rar, zip};
     use crate::probe::ProbeInfo;
@@ -3886,48 +3673,8 @@ mod tests {
     }
 
     #[test]
-    fn the_collection_key_is_the_ingests_own() {
+    fn collection_field_strength_is_explicit() {
         assert!(is_weak("g\0n\x005\0a\0d") && !is_weak("g\0n\x005"));
-        let dir = tempfile::tempdir().unwrap();
-        let main = dir.path().join("atlas.db");
-        crate::db::create_db_at(&main).unwrap();
-        let subject = format!("[01/52] - \"{VOLUME1}\" yEnc (1/50)");
-        let poster = "poster <p@example.com>";
-        let date = "2026-10-03 17:41:49";
-        let parsed = crate::parser::parse_subject(&subject).unwrap();
-        let article = crate::parser::Article {
-            subject: subject.clone(),
-            author: poster.into(),
-            date: date.into(),
-            message_id: NYUU_ID.into(),
-            bytes: 716_800,
-            filename: Some(parsed.filename.clone()),
-            release_name: Some(parsed.release_name.clone()),
-            part: Some(1),
-            total_parts: Some(50),
-            file_index: Some(1),
-            file_total: Some(52),
-            ..Default::default()
-        };
-        let collection = crate::collections::Collections::new(GROUP)
-            .of(&article, &parsed)
-            .expect("a file of a 52-file post belongs to a collection");
-        let release = crate::parser::Release {
-            name: parsed.release_name.clone(),
-            articles: vec![article],
-            size: 716_800,
-            group: GROUP.into(),
-            poster: poster.into(),
-            date: date.into(),
-            collection: Some(collection.clone()),
-            ..Default::default()
-        };
-        store::save(&main, &[release]).unwrap();
-        let shard = crate::db::open_shard(&store::shard_path(&main, store::shard_of(GROUP))).unwrap();
-        let saved: i64 = shard.query_row("select key from collections", [], |r| r.get(0)).unwrap();
-        let key = store::IdKey::of(&shard).unwrap();
-        assert_eq!(collection_key(&key, GROUP, &subject, poster, date), Some((saved, is_weak(&collection))));
-        assert_eq!(collection_key(&key, GROUP, "no file name here", poster, date), None);
     }
 
     #[test]
@@ -4232,68 +3979,6 @@ mod tests {
             assert!(!THEIRS.contains(label), "{label} is already on the release page");
             assert!(seen.insert(*label), "{label} appears twice in {html}");
         }
-    }
-
-    #[test]
-    fn fragments_stop_at_the_article_budget() {
-        let dir = tempfile::tempdir().unwrap();
-        let main = dir.path().join("atlas.db");
-        crate::db::create_db_at(&main).unwrap();
-        let poster = "poster <p@example.com>";
-        let date = "2026-10-03 17:41:49";
-        let articles: Vec<crate::parser::Article> = (1..=3)
-            .map(|part| {
-                let subject = format!("[01/52] - \"{VOLUME1}\" yEnc ({part}/3)");
-                let parsed = crate::parser::parse_subject(&subject).unwrap();
-                crate::parser::Article {
-                    subject,
-                    author: poster.into(),
-                    date: date.into(),
-                    message_id: format!("<part{part}@nyuu>"),
-                    bytes: 700_000 + part,
-                    filename: Some(parsed.filename.clone()),
-                    release_name: Some(parsed.release_name.clone()),
-                    part: Some(part),
-                    total_parts: Some(3),
-                    file_index: Some(1),
-                    file_total: Some(52),
-                    ..Default::default()
-                }
-            })
-            .collect();
-        let parsed = crate::parser::parse_subject(&articles[0].subject).unwrap();
-        let collection = crate::collections::Collections::new(GROUP).of(&articles[0], &parsed);
-        let release = crate::parser::Release {
-            name: parsed.release_name.clone(),
-            articles,
-            size: 2_100_006,
-            group: GROUP.into(),
-            poster: poster.into(),
-            date: date.into(),
-            collection,
-            ..Default::default()
-        };
-        store::save(&main, &[release]).unwrap();
-        let conn = crate::db::open_with_shards(&main).unwrap();
-        let shard = crate::db::open_shard(&store::shard_path(&main, store::shard_of(GROUP))).unwrap();
-        let id: i64 = shard.query_row("select id from releases", [], |r| r.get(0)).unwrap();
-        let files = store::release_files(&shard, id, FILES_CAP).unwrap();
-        assert_eq!(files.len(), 1);
-        // within the budget: the three parts are mapped and the ids read
-        let table = parts_fragment_of(&conn, id, &files, ARTICLE_BUDGET);
-        assert!(
-            table.contains("title=\"3 of 3 parts\"")
-                && table.contains("<td>&lt;part1@nyuu&gt;</td><td>&lt;part3@nyuu&gt;</td>")
-                && !table.contains("Too many articles"),
-            "{table}"
-        );
-        let hashes = hashes_fragment_of(&conn, id, ARTICLE_BUDGET);
-        assert!(hashes.contains("over 3 articles"), "{hashes}");
-        // past it: the pass stops, the maps stay blank and both fragments say so
-        let table = parts_fragment_of(&conn, id, &files, 2);
-        assert!(table.contains("Too many articles to list") && !table.contains("part1@nyuu"), "{table}");
-        let hashes = hashes_fragment_of(&conn, id, 2);
-        assert!(hashes.contains("too many articles to list") && !hashes.contains("over 3 articles"), "{hashes}");
     }
 
     #[test]
