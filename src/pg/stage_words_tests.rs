@@ -52,13 +52,18 @@ impl Source for AtAck {
 #[test]
 fn native_word_compare_version_keeps_a_change_queued_during_real_commit() {
     let Some(f)=Fixture::new() else {return};let index=open_index(&f.runtime.owner,&f.headers,&AtomicBool::new(false)).unwrap();let id=f.push();
+    f.runtime.owner.with(|client| {
+        client.execute("update releases set display_name='Example.ObsoleteLabel' where id=$1",&[&id])?;Ok(())
+    }).unwrap();
     let mut raced=AtAck {source:Delivery::for_owner(&f.runtime.owner).unwrap(),owner:f.runtime.owner.clone(),id,close:false};
     assert_eq!(index.drain_native(&mut raced,Budget::default()).unwrap(),1);
     assert_eq!(f.pending(),1,"the newer version must remain pending");
     let mut source=Delivery::for_owner(&f.runtime.owner).unwrap();
     assert_eq!(index.drain_native(&mut source,Budget::default()).unwrap(),1);assert_eq!(f.pending(),0);
     assert_eq!(index.count_native(&mut source,"changed",None,&[]).unwrap(),1);
-    assert_eq!(index.count_native(&mut source,"release",None,&[]).unwrap(),0);
+    assert_eq!(index.count_native(&mut source,"obsoletelabel",None,&[]).unwrap(),0);
+    assert_eq!(index.count_native(&mut source,"release",None,&[]).unwrap(),1,
+        "the original release name remains searchable after a display-name change");
 }
 #[test]
 fn native_word_commit_before_owner_loss_preserves_the_queue_without_an_ack() {
