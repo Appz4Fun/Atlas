@@ -15,6 +15,42 @@ use crate::pg::indexer_runtime::Runtime;
 const CHILD_TEST: &str = "indexer::native_provider_contract::fixture_child";
 const COMPLETED: &str = "provider-contract-completed";
 
+/// Only this parent session creates/drops the random test namespace. Bound
+/// setup and cleanup as well as the child; never format a PostgreSQL error.
+struct ParentSchema {
+    client: postgres::Client,
+    name: String,
+}
+
+impl ParentSchema {
+    fn open(url: &str) -> Self {
+        let mut connection: postgres::Config =
+            url.parse().unwrap_or_else(|_| panic!("parse explicit native fixture URL"));
+        connection.connect_timeout(Duration::from_secs(5));
+        connection.tcp_user_timeout(Duration::from_secs(5));
+        connection.options("-c statement_timeout=10000 -c lock_timeout=1000");
+        let client =
+            connection.connect(postgres::NoTls).unwrap_or_else(|_| panic!("connect explicit native fixture server"));
+        let mut nonce = [0; 8];
+        getrandom::fill(&mut nonce).unwrap_or_else(|_| panic!("native fixture namespace entropy"));
+        let name = format!("t_provider_{}_{:016x}", std::process::id(), u64::from_le_bytes(nonce));
+        let mut schema = Self { client, name };
+        crate::pg::migrate::run(&mut schema.client, &schema.name)
+            .unwrap_or_else(|_| panic!("migrate isolated native fixture namespace"));
+        schema
+    }
+}
+
+impl Drop for ParentSchema {
+    fn drop(&mut self) {
+        if self.client.batch_execute(&format!("drop schema if exists \"{}\" cascade", self.name)).is_err() {
+            // This generated identifier is nonsecret; no connection error is
+            // interpolated into output, even during another assertion unwind.
+            eprintln!("native provider fixture cleanup failed for {}", self.name);
+        }
+    }
+}
+
 struct ChildGuard(Child);
 impl Drop for ChildGuard {
     fn drop(&mut self) {
@@ -43,7 +79,7 @@ fn required_url() -> String {
 pub fn run_child(case: &str) {
     let url = required_url();
     // The parent owns schema cleanup even when a timed-out child must be killed.
-    let schema = crate::pg::testing::Schema::new().expect("explicit isolated PostgreSQL required");
+    let schema = ParentSchema::open(&url);
     let home = tempfile::tempdir().expect("private native fixture home");
     let log_path = home.path().join("provider-child.log");
     let mut options = OpenOptions::new();
