@@ -677,6 +677,11 @@ pub fn stop() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn selected_handle(path: &str, query: &str, base: &str, key: &str) -> ApiResponse {
+        super::handle_with_storage(path, query, base, key, &crate::pg::StorageConfig::default())
+    }
+
     #[derive(Default)]
     struct Listed {
         rows: Vec<crate::search::ReleaseRow>,
@@ -794,7 +799,7 @@ mod tests {
             "{xml}"
         );
         assert!(xml.contains("<file n=\"2\" size=\"3\" articles=\"1\"/>"), "{xml}");
-        assert_eq!(handle("/api", "t=files&id=1", "http://x", "key").status, 401, "it needs the key");
+        assert_eq!(selected_handle("/api", "t=files&id=1", "http://x", "key").status, 401, "it needs the key");
     }
 
     #[test]
@@ -803,18 +808,18 @@ mod tests {
         assert_eq!(r.status, 200);
         assert!(r.body.contains("<caps>"));
 
-        let r = handle("/api", "t=search&apikey=wrong", "http://x", "key");
+        let r = selected_handle("/api", "t=search&apikey=wrong", "http://x", "key");
         assert_eq!(r.status, 401);
         assert!(r.body.contains("Invalid API Key"));
 
-        assert_eq!(handle("/nope", "t=caps", "http://x", "key").status, 404);
+        assert_eq!(selected_handle("/nope", "t=caps", "http://x", "key").status, 404);
         assert!(
             caps_body("http://192.168.1.172:9091", &Default::default()).contains(r#"url="http://192.168.1.172:9091""#)
         );
-        let unknown = handle("/api", "t=wat&apikey=key", "http://x", "key");
+        let unknown = selected_handle("/api", "t=wat&apikey=key", "http://x", "key");
         assert_eq!(unknown.status, 200);
         assert!(unknown.body.contains(r#"<error code="203""#));
-        assert!(handle("/api", "apikey=key", "http://x", "key").body.contains(r#"<error code="200""#));
+        assert!(selected_handle("/api", "apikey=key", "http://x", "key").body.contains(r#"<error code="200""#));
     }
 
     #[test]
