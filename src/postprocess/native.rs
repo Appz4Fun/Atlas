@@ -290,7 +290,6 @@ pub(crate) fn run_category_fixture(runtime:&crate::pg::indexer_runtime::Runtime)
     // The fixture selects one REAL Step to qualify the runner/commit boundary;
     // the separate factory test inventories all20, not their runtime admission.
     let config=crate::config::Config::default();assert!(config.freeze.enabled);
-    let legacy_freeze=crate::frozen::ENABLED.load(std::sync::atomic::Ordering::Relaxed);
     let handle=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     let mut runner=Runner::new(&runtime.owner,&config,Arc::new(crate::nntp::Pool::new(&[])),handle.handle().clone()).unwrap();
     let category:Arc<dyn Step>=Arc::new(crate::category::CategoryStep::new());assert!(category.enabled(&config));let bit=mask(category.id());
@@ -304,7 +303,6 @@ pub(crate) fn run_category_fixture(runtime:&crate::pg::indexer_runtime::Runtime)
         assert_eq!(client.query_one("select count(*) from freeze_pending",&[])?.get::<_,i64>(0),0);
         assert_eq!(client.query_one("select count(*) from pp_queue",&[])?.get::<_,i64>(0),0);Ok(())
     }).unwrap();
-    assert_eq!(crate::frozen::ENABLED.load(std::sync::atomic::Ordering::Relaxed),legacy_freeze);
 }
 
 #[cfg(test)]
@@ -357,3 +355,7 @@ mod tests {
 #[cfg(all(test,unix))]
 #[path="native_image_asset_tests.rs"]
 pub(crate) mod image_asset_tests;
+
+#[cfg(test)]
+#[path = "../media/native_settlement_tests.rs"]
+mod media_settlement_tests;

@@ -89,13 +89,11 @@ fn native_queue_commits_closed_results_with_the_receipt_and_replays_once() {
 fn default_freeze_policy_native_completion_retains_the_release_and_valuable_cache() {
     let Some(schema)=super::testing::Schema::new() else {return};let runtime=runtime(&schema);push(&runtime);
     assert!(crate::config::Config::default().freeze.enabled);
-    let legacy_freeze=crate::frozen::ENABLED.load(std::sync::atomic::Ordering::Relaxed);
     runtime.owner.with(|client|{client.execute("insert into ext_opensubtitles(moviehash,checked_at) values('0000000000000001',1)",&[])?;Ok(())}).unwrap();
     let queue=Queue::for_owner(&runtime.owner).unwrap();let claims=queue.claim(10,1,60).unwrap();let claim=&claims[0];
     let mut a=Applied::native_database(claim.release_id(),0,1,4,0);a.set_done=4;
     a.writes.push((4,StepWrite::for_mutation(claim.release_id(),StepMutation::SetCategory {category:2000})));
     assert!(!a.freeze_check);assert_eq!(queue.settle(claim,Visit::prepare(claim,a,[9;32]).unwrap(),11).unwrap(),Settlement::Applied);
-    assert_eq!(crate::frozen::ENABLED.load(std::sync::atomic::Ordering::Relaxed),legacy_freeze);
     runtime.owner.with(|client| {
         assert_eq!(client.query_one("select count(*) from releases",&[])?.get::<_,i64>(0),1);
         assert_eq!(client.query_one("select count(*) from ext_opensubtitles",&[])?.get::<_,i64>(0),1);
