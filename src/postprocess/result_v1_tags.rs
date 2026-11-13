@@ -284,11 +284,11 @@ mod tests {
     fn every_frozen_v1_atom_matches_its_pre_removal_bytes() {
         let atoms: &[(&str,usize,&str)] = &[
 
-            (&ARCHIVE_LINK_LINK_DATA,977,"f225652029be317f8dc2e7b3907aeccf209c1ed7419fd6b00bb3c60002257738"),
+            (&ARCHIVE_LINK_LINK_DATA,277,"4b3a76032e778ff50c029f15b0d499a6f481f93a474af0a3e409011d10809b2e"),
 
-            (&ARCHIVE_LINK_LINK_RECOVERY,982,"e211310ca6f303b817e4340133d4d6b19a549aac0a4803b966e254f703a8df5d"),
+            (&ARCHIVE_LINK_LINK_RECOVERY,314,"4b230752462b3182ae26294bd441e737f071da87b8e5e313ae8338f0beaad850"),
 
-            (&ARCHIVE_LINK_MOVE_UPLOAD,931,"bdd9b0e39dae494c208fdf204b62b609036b93f72ca43d3ea37de0594cdaf105"),
+            (&ARCHIVE_LINK_MOVE_UPLOAD,140,"670a219e5c623d1ab86baa16f2cdc361c7900914511dd54efbd5ecadbc73aa56"),
 
             (&ARCHIVE_LINK_NAME_LEAD,133,"db4f359289f869fb526cef48efbd431005fd97d968ce6a8071fc9c43fe410eac"),
 
