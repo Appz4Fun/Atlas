@@ -696,9 +696,6 @@ impl Search {
                 "<a href=\"/?{everywhere}\" hx-get=\"/ui/results?{everywhere}\" hx-target=\"#results\">Look in all categories</a>. "
             );
         }
-        if self.filters_by_tags() && self.indexed().is_none() {
-            let _ = write!(hint, "The filters look through the first {SORT_WINDOW} results. ");
-        }
         if self.hide_incomplete {
             let shown = attr(&self.incomplete_toggled());
             let _ = write!(
@@ -3440,6 +3437,11 @@ mod tests {
         .nothing_found();
         assert!(word.contains("&lt;b&gt;") && !word.contains("<b>"), "{word}");
         assert!(!word.contains("Look in all categories"), "{word}");
+        let native_tags = Search::from_args(&parse_query("filters=DV&incomplete=hide"));
+        assert!(native_tags.filters_by_tags());
+        let empty = native_tags.nothing_found();
+        assert!(empty.contains("nothing matches these filters") && empty.contains("Incomplete releases are hidden"));
+        assert!(!empty.contains("The filters look through the first"), "native reads have no legacy window fallback");
     }
 
     #[test]
