@@ -229,7 +229,7 @@ impl InferredFile {
 
 /// `id` (with or without its `<>`) split as `part{p}of{total}.{rest}`, written just soo (no leading zeros):
 /// the rest, or None.
-fn pattern_rest(id: &str, p: i64, total: i64) -> Option<&str> {
+pub(crate) fn pattern_rest(id: &str, p: i64, total: i64) -> Option<&str> {
     // a number exactly as `{n}` writes it
     fn number(s: &str, n: i64) -> Option<&str> {
         let digits = s.bytes().take_while(u8::is_ascii_digit).count();
