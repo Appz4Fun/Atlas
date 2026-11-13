@@ -1312,3 +1312,114 @@ fn stem_overflow_returns_none_without_returning_a_partial_post() {
         },
     );
 }
+
+impl Fixture {
+    fn own_hint(&self, id: i64, override_names: Option<&Names>) -> Result<Option<PasswordHint>> {
+        self.runtime.owner.with(|c| {
+            let view = crate::pg::fresh_reader::ReadView::open(
+                c,
+                &self.schema.name,
+                Default::default(),
+                Instant::now() + Duration::from_secs(10),
+            )?;
+            let Some(names) = view.own_names(id)? else { return Ok(None) };
+            let inner = view.own_inner(id)?;
+            let nfo = view.own_nfo_text(id)?;
+            view.own_password_hint(id, override_names.unwrap_or(&names), &inner, nfo.as_deref())
+        })
+    }
+}
+
+#[test]
+#[ignore = "explicit isolated PostgreSQL; own inner-file password facts"]
+fn a_password_in_a_name_inside_is_a_hint() {
+    isolated("release_info::native_grouping_tests::a_password_in_a_name_inside_is_a_hint", || {
+        let f = Fixture::new();
+        let g = "alt.binaries.password";
+        f.put_row(1, "Some.Post-GRP", g, "p", &[("Some.Post.rar", &[1], 26)]);
+        let id = f.row_of(1, g).id;
+        f.mutate(
+            id,
+            &[],
+            vec![StepMutation::KeepArchiveFile {
+                sequence: 131072,
+                source: 2,
+                file: crate::archive::InnerFile {
+                    name: "Some.Post-{{s3cret}}.nzb".into(),
+                    size: Some(1),
+                    crc32: None,
+                    mtime: None,
+                    host_os: None,
+                },
+            }],
+        );
+        let hint = f.own_hint(id, None).unwrap().unwrap();
+        assert_eq!((hint.password.as_str(), hint.source), ("s3cret", "a file inside"));
+        assert!(f.own_hint(i64::MAX, None).unwrap().is_none());
+    });
+}
+
+#[test]
+#[ignore = "explicit isolated PostgreSQL; stored own password source labels"]
+fn a_kept_password_says_where_it_is() {
+    isolated("release_info::native_grouping_tests::a_kept_password_says_where_it_is", || {
+        let f = Fixture::new();
+        let g = "alt.binaries.password";
+        for (label, name, file) in [
+            (8, "YMFFZeoeVI6fG4iz", "YMFFZeoeVI6fG4iz.part001.rar"),
+            (16, "Some.Post-GRP", "k3m9x.part01.rar"),
+            (24, "Other.Post-GRP", "Other.Post.part01.rar"),
+            (32, "Third.Post-GRP", "Third.Post.part01.rar"),
+            (40, "Fourth.Post-GRP", "Fourth.Post.part01.rar"),
+            (48, "q8w7e6r5", "a1b2c3.rar"),
+        ] {
+            f.put_row(label, name, g, "p", &[(file, &[1], 50)]);
+        }
+        f.pending.borrow_mut().get_mut(&(8, g.into())).unwrap().display_name =
+            Some("Gone.with.the.Wind.1939-GRP".into());
+        f.pending.borrow_mut().get_mut(&(24, g.into())).unwrap().articles[0].subject =
+            "Other.Post [pw x7Q2p] yEnc (1/50)".into();
+        let ids = [8, 16, 24, 32, 40, 48].map(|label| f.row_of(label, g).id);
+        for (id, password) in
+            ids.into_iter().zip(["YMFFZeoeVI6fG4iz", "k3m9x", "x7Q2p", "n0tH3re", "fr0mNfo", "Zq9vK2"])
+        {
+            f.mutate(id, &[], vec![StepMutation::SetNfoPassword { password: password.into() }]);
+        }
+        f.mutate(
+            ids[4],
+            &[],
+            vec![StepMutation::KeepNfoForLegacyTarget {
+                target_id: ids[4],
+                file: "Fourth.nfo".into(),
+                text: "Password: fr0mNfo".into(),
+            }],
+        );
+        f.mutate(
+            ids[5],
+            &[],
+            vec![StepMutation::KeepPar2File {
+                file: crate::par2::Par2File {
+                    file_id: [1; 16],
+                    set_id: [2; 16],
+                    md5: [3; 16],
+                    md5_16k: [4; 16],
+                    size: 10,
+                    name: "Renamed.Post-Zq9vK2.rar".into(),
+                    bound: false,
+                    crc32: None,
+                },
+                sealed: false,
+                complete: false,
+            }],
+        );
+        let source = |id| f.own_hint(id, None).unwrap().unwrap().source;
+        assert_eq!(source(ids[0]), "the original article name", "not the NFO: there is none");
+        assert_eq!(source(ids[1]), "a file name");
+        assert_eq!(source(ids[2]), "the article subject");
+        assert_eq!(source(ids[3]), "another copy of this post, or a posted NZB");
+        assert_eq!(source(ids[4]), "the NFO");
+        assert_eq!(source(ids[5]), "a file name in the PAR2 set");
+        let names = Names { posted: "YMFFZeoeVI6fG4iz".into(), display: None, obfuscated: true, source: None };
+        assert_eq!(f.own_hint(ids[0], Some(&names)).unwrap().unwrap().source, "the release name");
+    });
+}
