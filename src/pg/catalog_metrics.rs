@@ -3,6 +3,7 @@
 //! reading, feed fetch, canonical mutation or implicit retry is introduced.
 use anyhow::{Context,Result,ensure};
 use std::sync::atomic::{AtomicBool,Ordering};
+use std::{sync::Arc,time::{Duration,Instant},thread::{self,JoinHandle}};
 use super::{fresh_reader::ReadView,indexer_runtime::{CacheDestination,destination_identity_in},stage::CatalogIdentity};
 use crate::metrics::catalog::{Row,Tally};
 
@@ -154,6 +155,113 @@ impl Scan {
         stopping(stop)?;
         ensure!(self.is_complete(),"native catalog metrics walk is incomplete or failed");
         Ok(Completed {tally:self.tally,relation_bytes:self.relation_bytes.context("native catalog metrics size was not observed")?})
+    }
+}
+
+/// Detailed metrics share the immutable original Owner session. Each admitted
+/// view has a <=10s SQL deadline, but mutex wait and epoch preflight follow the
+/// existing Owner overdue/quarantine contract. Shutdown always really joins;
+/// it never promises a 10s wall-clock bound or substitutes a new connection.
+pub(crate) struct Observer {
+    stopping:Arc<AtomicBool>,
+    owner:Arc<super::indexer_runtime::Owner>,
+    handle:Option<JoinHandle<Result<()>>>,
+}
+
+impl Observer {
+    pub(crate) fn start(owner:&Arc<super::indexer_runtime::Owner>,every:Duration,on_completed:impl Fn(u64)+Send+'static)->Result<Self> {
+        ensure!(!every.is_zero(),"native catalog observer interval must be positive");
+        let destination=owner.cache_destination().context("native catalog observer destination unavailable")?.clone();
+        let catalog=owner.epoch().context("native catalog observer epoch unavailable")?.catalog().clone();
+        let stopping=Arc::new(AtomicBool::new(false));check_attempt(owner,&stopping)?;
+        let thread_stop=stopping.clone();let thread_owner=owner.clone();
+        let handle=thread::Builder::new().name("atlas-native-catalog".into()).spawn(move || {
+            let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+                observe(&thread_owner,&thread_stop,&destination,&catalog,every,&on_completed)))
+                .unwrap_or_else(|_|Err(anyhow::anyhow!("native catalog observer panicked")));
+            match result {
+                Err(error) if super::outage::is_attempt_ended(&error)
+                    && (thread_stop.load(Ordering::Acquire)||thread_owner.stop.load(Ordering::Acquire))
+                    && thread_owner.failure().is_none()=>Ok(()),
+                Err(error)=>{thread_owner.fail(super::outage::classify(&error));Err(error)},
+                Ok(())=>Ok(()),
+            }
+        }).context("starting native catalog observer")?;
+        Ok(Self {stopping,owner:owner.clone(),handle:Some(handle)})
+    }
+
+    /// Stops only this observer. Other admitted native work retains its own
+    /// lifecycle authority. Call on a standard lane before Owner::close.
+    pub(crate) fn finish(mut self)->Result<()> {
+        self.stopping.store(true,Ordering::Release);self.join()
+    }
+
+    fn join(&mut self)->Result<()> {
+        match self.handle.take() {
+            Some(handle)=>match handle.join() {
+                Ok(result)=>result,
+                Err(_)=>{self.owner.fail(super::outage::Failure::Fatal);Err(anyhow::anyhow!("native catalog observer join failed"))},
+            },None=>Ok(()),
+        }
+    }
+}
+
+impl Drop for Observer {
+    fn drop(&mut self) {
+        // A forgotten finish must not detach a reader across Owner close.
+        // Explicit finish remains necessary to inspect its original result.
+        self.stopping.store(true,Ordering::Release);
+        if self.join().is_err()&&self.owner.failure().is_none() {self.owner.fail(super::outage::Failure::Fatal);}
+    }
+}
+
+fn check_attempt(owner:&super::indexer_runtime::Owner,stop:&AtomicBool)->Result<()> {
+    stopping(stop)?;
+    if owner.stop.load(Ordering::Acquire) {return Err(super::outage::AttemptEnded.into())}Ok(())
+}
+
+fn observer_read<T>(owner:&super::indexer_runtime::Owner,stop:&AtomicBool,
+    work:impl FnOnce(&ReadView<'_>,&super::StorageConfig)->Result<T>)->Result<T> {
+    check_attempt(owner,stop)?;
+    let result=owner.with(|client| {
+        if stop.load(Ordering::Acquire) {return Ok(None)}
+        let storage=crate::config::checked_storage_config().map_err(|_|anyhow::anyhow!("native catalog observer configuration unavailable"))?;
+        let view=ReadView::open(client,&storage.schema,super::fresh_reader::Budget {rows:PAGE_ROWS,bytes:4*1024*1024},Instant::now()+Duration::from_secs(10))?;
+        match work(&view,&storage) {
+            // Private cancellation is not loss of the original Owner session.
+            // Translate it while still inside Owner::with so its classifier
+            // does not quarantine unrelated work as a transport failure.
+            Err(error) if super::outage::is_attempt_ended(&error)&&stop.load(Ordering::Acquire)=>Ok(None),
+            result=>result.map(Some),
+        }
+    })?;
+    check_attempt(owner,stop)?;
+    result.ok_or_else(||super::outage::AttemptEnded.into())
+}
+
+fn wait(duration:Duration,owner:&super::indexer_runtime::Owner,stop:&AtomicBool)->Result<()> {
+    let start=Instant::now();
+    loop {
+        check_attempt(owner,stop)?;let left=duration.saturating_sub(start.elapsed());
+        if left.is_zero() {return Ok(())}thread::sleep(left.min(Duration::from_millis(50)));
+    }
+}
+
+fn observe(owner:&super::indexer_runtime::Owner,stop:&AtomicBool,destination:&CacheDestination,catalog:&CatalogIdentity,
+    every:Duration,on_completed:&impl Fn(u64))->Result<()> {
+    loop {
+        check_attempt(owner,stop)?;let began=Instant::now();
+        let mut scan=observer_read(owner,stop,|view,storage|Scan::begin(view,destination,storage,catalog,stop))?;
+        while !scan.is_complete() {
+            observer_read(owner,stop,|view,storage|scan.page(view,storage,stop))?;
+            if !scan.is_complete() {wait(Duration::from_millis(2),owner,stop)?;}
+        }
+        check_attempt(owner,stop)?;let completed=scan.finish(stop)?;let took=began.elapsed();
+        // The complete ReadView and Owner lock are gone before registry or
+        // Stats locking, avoiding a Stats -> Owner / Owner -> Stats inversion.
+        check_attempt(owner,stop)?;completed.publish(took);check_attempt(owner,stop)?;
+        on_completed(completed.relation_bytes);
+        wait(crate::metrics::catalog::rest_after(every,took).min(Duration::from_secs(86400)),owner,stop)?;
     }
 }
 

@@ -103,3 +103,56 @@ fn native_catalog_walk_query_deadline_keeps_the_driver_cause_and_no_completed_re
         .any(|error|error.code()==Some(&postgres::error::SqlState::QUERY_CANCELED)));
     assert!(walk.finish(&stop).is_err());drop(view);held.rollback().unwrap();drop(locker);drop(client);runtime.owner.close();
 }
+
+#[test]
+#[ignore="Root-only isolated PostgreSQL and native runtime admission"]
+fn native_catalog_observer_reports_completed_size_and_joins_before_owner_close() {
+    let runtime=configured_observer_runtime();pg::stage_queue_tests::push(&runtime);
+    let (sent,received)=std::sync::mpsc::channel();
+    let observer=Observer::start(&runtime.owner,Duration::from_secs(60),move |bytes|{sent.send(bytes).unwrap();}).unwrap();
+    assert!(received.recv_timeout(Duration::from_secs(5)).unwrap()>0);
+    observer.finish().unwrap();assert!(!runtime.owner.stop.load(Ordering::Acquire));
+    assert_eq!(runtime.owner.failure(),None);
+    runtime.owner.with(|client|{assert_eq!(client.query_one("select 1",&[])?.get::<_,i32>(0),1);Ok(())}).unwrap();
+    runtime.owner.close();
+}
+
+#[test]
+#[ignore="Root-only isolated PostgreSQL and native runtime admission"]
+fn native_catalog_observer_failure_never_calls_completed_and_preserves_owner_failure() {
+    let runtime=configured_observer_runtime();pg::stage_queue_tests::push(&runtime);
+    runtime.owner.with(|client|{client.execute("update releases set size=-1",&[])?;Ok(())}).unwrap();
+    let calls=std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));let completed=calls.clone();
+    let observer=Observer::start(&runtime.owner,Duration::from_secs(60),move |_|{completed.fetch_add(1,Ordering::Relaxed);}).unwrap();
+    let until=Instant::now()+Duration::from_secs(5);
+    while !runtime.owner.stop.load(Ordering::Acquire)&&Instant::now()<until {std::thread::sleep(Duration::from_millis(10));}
+    assert_eq!(runtime.owner.failure(),Some(pg::outage::Failure::Fatal));
+    assert!(observer.finish().is_err());assert_eq!(calls.load(Ordering::Acquire),0);runtime.owner.close();
+}
+
+#[test]
+#[ignore="Root-only owned configured PostgreSQL home in a separate child"]
+fn native_catalog_observer_private_cancel_inside_view_keeps_owner_usable() {
+    let runtime=configured_observer_runtime();let local=AtomicBool::new(false);
+    let result:Result<()>=observer_read(&runtime.owner,&local,|_,_| {
+        local.store(true,Ordering::Release);stopping(&local)
+    });
+    assert!(pg::outage::is_attempt_ended(&result.unwrap_err()));
+    assert!(!runtime.owner.stop.load(Ordering::Acquire));assert_eq!(runtime.owner.failure(),None);
+    runtime.owner.with(|client|{assert_eq!(client.query_one("select 1",&[])?.get::<_,i32>(0),1);Ok(())}).unwrap();
+    runtime.owner.close();
+}
+
+// Observer checks the actual configured destination on every page. Root must
+// run each observer control in a separate child with its own fresh PG schema
+// and ATLAS_HOME config, rather than mutate process-global configuration here.
+fn configured_observer_runtime()->pg::indexer_runtime::Runtime {
+    assert_eq!(std::env::var("ATLAS_METRICS_TEST_OWNED").as_deref(),Ok("1"));
+    assert!(std::env::var_os("ATLAS_HOME").is_some(),"explicit Root-owned home required");
+    let storage=crate::config::checked_storage_config().expect("Root-owned configured PG destination");
+    let mut config=crate::config::Config::default();
+    config.postprocess.enabled=false;config.predb.enabled=false;config.spots.enabled=false;config.inferred_parts=false;
+    config.media.tvmaze.enabled=false;config.media.allocine.enabled=false;config.media.details_per_minute=0;
+    let headers=crate::config::HeaderStoreConfig {enabled:true,..Default::default()};
+    pg::indexer_runtime::Runtime::open(&config,storage,headers,&[],&mut None).unwrap()
+}
