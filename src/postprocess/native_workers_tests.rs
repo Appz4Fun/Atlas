@@ -91,10 +91,10 @@ pub(crate) fn run_predb_only(runtime:&crate::pg::indexer_runtime::Runtime) {
     let mut config=crate::config::Config::default();config.postprocess.enabled=false;
     config.predb.enabled=true;config.predb.sources.clear();
     let ending=Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let end=ending.clone();let owner=runtime.owner.clone();
+    let end=ending.clone();let owner=runtime.owner.clone();let db=runtime.db.clone();
     let worker=std::thread::spawn(move|| {
         let handle=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        handle.block_on(workers::run(owner,config,Arc::new(crate::nntp::Pool::new(&[])),move||end.load(std::sync::atomic::Ordering::Acquire)));
+        handle.block_on(workers::run(owner,db,config,Arc::new(crate::nntp::Pool::new(&[])),move||end.load(std::sync::atomic::Ordering::Acquire)));
     });
     let deadline=Instant::now()+Duration::from_secs(5);
     loop {
@@ -194,10 +194,10 @@ pub(crate) fn run_header_only(runtime:&crate::pg::indexer_runtime::Runtime) {
     // A genuine process counter, observed through the existing producer; no
     // fabricated Stage lane or manually inserted telemetry completion row.
     crate::metrics::names::API_REQUESTS.inc(&[("endpoint","native-header-control"),("status","200")],7);
-    let ending=Arc::new(std::sync::atomic::AtomicBool::new(false));let end=ending.clone();let owner=runtime.owner.clone();
+    let ending=Arc::new(std::sync::atomic::AtomicBool::new(false));let end=ending.clone();let owner=runtime.owner.clone();let db=runtime.db.clone();
     let worker=std::thread::spawn(move|| {
         let handle=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        handle.block_on(workers::run(owner,config,Arc::new(crate::nntp::Pool::new(&[])),move||end.load(std::sync::atomic::Ordering::Acquire)));
+        handle.block_on(workers::run(owner,db,config,Arc::new(crate::nntp::Pool::new(&[])),move||end.load(std::sync::atomic::Ordering::Acquire)));
     });
     let deadline=Instant::now()+Duration::from_secs(5);
     loop {

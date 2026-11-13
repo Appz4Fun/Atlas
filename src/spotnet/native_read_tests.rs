@@ -43,9 +43,7 @@ fn native_original_spot_snapshot_does_not_mix_newer_body_and_removed_tags() {
     let (schema,runtime,_dir,id)=fixture();let mut client=schema.pool.get().unwrap();
     let view=crate::pg::fresh_reader::ReadView::open(&mut client,&schema.name,crate::pg::fresh_reader::Budget::default(),Instant::now()+Duration::from_secs(5)).unwrap();
     let before=view.spot_view(id).unwrap().unwrap();
-    let storage=crate::spotnet::native_store::Store::new(&runtime.owner).unwrap();
-    storage.settle_comments(&[("real.8.one.two@spot.net".into(),comments::Outcome::Read("New supplied text".into()))]).unwrap();
-    storage.with(|tx|Ok(store::note_disposals(&crate::pg::sql::Pg::new(tx),&[store::Disposal {message_id:"real@spot.net".into(),spotter:String::new(),at:2}])?)).unwrap();
+    crate::spotnet::native_read_fixture_tests::replace_comment_and_note_disposal(&runtime);
     assert_eq!(view.spot_view(id).unwrap().unwrap().1,before.1,"same RR cannot mix later body state");
     assert!(view.spot_tags(&[id]).unwrap().contains_key(&id));drop(view);
     let view=crate::pg::fresh_reader::ReadView::open(&mut client,&schema.name,crate::pg::fresh_reader::Budget::default(),Instant::now()+Duration::from_secs(5)).unwrap();
