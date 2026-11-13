@@ -109,7 +109,7 @@ impl StepReads {
             let info=crate::postprocess::step::ReleaseInfo {id,
                 // Existing step data includes a group fairness bucket. It is
                 // never a SQLite attachment or an encoding of this PG row ID.
-                shard:crate::store::shard_of(&group),name:String::from_utf8(row.try_get(0)?)?,display_name:row.try_get(1)?,group,
+                shard:crate::catalog_facts::shard_of(&group),name:String::from_utf8(row.try_get(0)?)?,display_name:row.try_get(1)?,group,
                 poster:row.try_get(3)?,posted_date:row.try_get::<_,Option<String>>(4)?.map(|value|crate::dates::to_iso_date(&value)),size:row.try_get(5)?,complete:row.try_get(6)?,parts:row.try_get(7)?,file_total:row.try_get(8)?,is_obfuscated:row.try_get(9)?,name_source:row.try_get(10)?,
                 spot_kind:original_kind};
             let mut summary=crate::postprocess::rules::FileSummary {all_par2:true,all_images:true,..Default::default()};
@@ -272,20 +272,20 @@ impl StepReads {
     pub(crate) fn legacy_step_key_salt(&self)->Result<Option<i64>> {
         self.optional("select value from meta where key='key_salt' and $1::bigint=0",0)
     }
-    pub(crate) fn files(&self,id:i64,limit:usize)->Result<Vec<crate::store::FileInfo>> {
+    pub(crate) fn files(&self,id:i64,limit:usize)->Result<Vec<crate::catalog_facts::FileInfo>> {
         ensure!(limit<=5000,"native Step file limit exceeds read admission");
         self.read(|tx| {
             let metadata=tx.query("select id,coalesce(octet_length(original_filename),0)::bigint+coalesce(octet_length(subject),0)::bigint from files where release_id=$1 order by id limit $2",&[&id,&(limit as i64)])?;
             let mut ids=Vec::with_capacity(metadata.len());let mut bytes=0i64;
             for row in metadata {ids.push(row.try_get::<_,i64>(0)?);bytes=bytes.checked_add(row.try_get::<_,i64>(1)?).ok_or_else(||anyhow::anyhow!("native file byte count overflow"))?;}
             ensure!(bytes<=64*1024*1024,"native Step file inventory exceeds read admission");
-            tx.query("select id,original_filename,subject,subject_part,expected,file_total,distinct_parts,touched_at from files where release_id=$1 and id=any($2) order by id",&[&id,&ids])?.into_iter().map(|row|Ok(crate::store::FileInfo {
+            tx.query("select id,original_filename,subject,subject_part,expected,file_total,distinct_parts,touched_at from files where release_id=$1 and id=any($2) order by id",&[&id,&ids])?.into_iter().map(|row|Ok(crate::catalog_facts::FileInfo {
                 id:row.try_get(0)?,filename:String::from_utf8(row.try_get(1)?)?,subject:row.try_get(2)?,subject_part:row.try_get(3)?,expected:row.try_get(4)?,file_total:row.try_get(5)?,parts_seen:row.try_get(6)?,touched_at:row.try_get(7)?,sealed:false,
             })).collect()
         })
     }
-    pub(crate) fn segments(&self,id:i64,pick:&crate::store::SegmentPick)->Result<Vec<crate::store::SegmentRef>> {
-        use crate::store::SegmentPick;
+    pub(crate) fn segments(&self,id:i64,pick:&crate::catalog_facts::SegmentPick)->Result<Vec<crate::catalog_facts::SegmentRef>> {
+        use crate::catalog_facts::SegmentPick;
         self.read(|tx| {
             let (sql,limit,parts)=match pick {
                 SegmentPick::First(n)=>("select message_key,octet_length(message_id) from segments where file_id=$1 order by part nulls first,message_id limit $2",*n,None),
@@ -300,7 +300,7 @@ impl StepReads {
             let mut keys:Vec<Vec<u8>>=Vec::with_capacity(metadata.len());let mut bytes=0i64;
             for row in metadata {keys.push(row.try_get(0)?);bytes=bytes.checked_add(i64::from(row.try_get::<_,i32>(1)?)).ok_or_else(||anyhow::anyhow!("native segment byte count overflow"))?;}
             ensure!(bytes<=64*1024*1024,"native Step segment inventory exceeds read admission");
-            tx.query("select message_id,part,bytes from segments where file_id=$1 and message_key=any($2) order by part nulls first,message_id",&[&id,&keys])?.into_iter().map(|row|Ok(crate::store::SegmentRef {
+            tx.query("select message_id,part,bytes from segments where file_id=$1 and message_key=any($2) order by part nulls first,message_id",&[&id,&keys])?.into_iter().map(|row|Ok(crate::catalog_facts::SegmentRef {
                 message_id:String::from_utf8(row.try_get(0)?)?,part:row.try_get(1)?,bytes:row.try_get(2)?,
             })).collect()
         })
@@ -421,7 +421,7 @@ mod tests {
         assert_eq!(data.archive_total_name_bytes().unwrap(),0);
         assert!(!data.has_audio_print(id).unwrap());
         let files=data.release_files(id).unwrap();assert_eq!(files.len(),1);
-        let segments=data.file_segments(files[0].id,&crate::store::SegmentPick::First(1)).unwrap();
+        let segments=data.file_segments(files[0].id,&crate::catalog_facts::SegmentPick::First(1)).unwrap();
         assert_eq!(segments[0].message_id,"<part@example.test>");
         runtime.owner.close();
         assert!(data.probe_moviehash(id).is_err());

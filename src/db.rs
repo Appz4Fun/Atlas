@@ -3,6 +3,7 @@
 //! store.rs. A database from before the shards still holds everything in
 //! `atlas.db` until convert.rs moves it over.
 
+pub use crate::catalog_facts::{Dated, GroupProgress, GroupState, best_progress, row_numbers};
 use crate::pg::sql::{Sql, vals};
 use std::collections::BTreeSet;
 use std::fs;
@@ -851,12 +852,6 @@ pub fn purge_broken() -> anyhow::Result<i64> {
     Ok(before - size())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GroupState {
-    pub live_cursor: i64,
-    pub backfill_cursor: i64,
-}
-
 pub fn get_group_state(db: &dyn Sql, group: &str) -> crate::pg::sql::Result<Option<GroupState>> {
     let row: Option<(Option<i64>, Option<i64>)> = db
         .row("select live_cursor, backfill_cursor from groups where name = $1", vals![group])?
@@ -886,9 +881,6 @@ pub fn save_group_bounds(db: &dyn Sql, group: &str, first: i64, last: i64) -> cr
     Ok(())
 }
 
-/// An article number and when the articles around it were posted (unix time).
-pub type Dated = (i64, i64);
-
 /// Widen the dated ends of what has been indexed on a group (cursor key): `low`
 /// replaces the stored low end when it is further back, `high` the high end
 /// when it is further ahead.
@@ -904,19 +896,6 @@ pub fn save_group_dates(db: &dyn Sql, group: &str, low: Dated, high: Dated) -> c
         vals![low.0, low.1, high.0, high.1, group],
     )?;
     Ok(())
-}
-
-/// One row of indexing progress: cursors, the server's article range and the
-/// dated ends of what has been indexed.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct GroupProgress {
-    pub key: String,
-    pub live_cursor: i64,
-    pub backfill_cursor: i64,
-    pub first: Option<i64>,
-    pub last: Option<i64>,
-    pub low: Option<Dated>,
-    pub high: Option<Dated>,
 }
 
 pub fn group_progress(db: &dyn Sql) -> crate::pg::sql::Result<Vec<GroupProgress>> {
@@ -940,38 +919,6 @@ pub fn group_progress(db: &dyn Sql) -> crate::pg::sql::Result<Vec<GroupProgress>
         })
     })
     .collect()
-}
-
-/// A row's article numbers on the server, and how many of them are indexed: everything between its cursors.
-pub fn row_numbers(row: &GroupProgress) -> Option<(i64, i64)> {
-    let (first, last) = (row.first?, row.last?);
-    let total = (last - first + 1).max(0);
-    let covered = (row.live_cursor.min(last) - row.backfill_cursor.max(first - 1)).clamp(0, total);
-    Some((total, covered))
-}
-
-/// Each group's (article numbers, of them indexed, the row they come from): of its rows (one a server), the one
-/// furthest along. A split group's cursors stand still while its day chunks (`chunks`: done, all) are indexed, soo
-/// those say how far it is, as that share of its article numbers; once they are all done its home cursor sweeps on
-/// for what they missed, and the cursor says it again. Rows with no range on the server yet are left out.
-pub fn best_progress<'a>(
-    progress: &'a [GroupProgress],
-    chunks: &std::collections::BTreeMap<String, (i64, i64)>,
-) -> std::collections::BTreeMap<String, (i64, i64, &'a GroupProgress)> {
-    let mut best: std::collections::BTreeMap<String, (i64, i64, &GroupProgress)> = Default::default();
-    for row in progress {
-        let group = row.key.split('@').next().unwrap_or(&row.key);
-        let Some((total, covered)) = row_numbers(row) else { continue };
-        if best.get(group).is_none_or(|(t, c, _)| (covered, total) > (*c, *t)) {
-            best.insert(group.to_string(), (total, covered, row));
-        }
-    }
-    for (group, (total, covered, _)) in best.iter_mut() {
-        if let Some(&(done, all)) = chunks.get(group).filter(|c| c.1 > 0 && c.0 < c.1) {
-            *covered = (*total as i128 * done.clamp(0, all) as i128 / all as i128) as i64;
-        }
-    }
-    best
 }
 
 pub fn save_group_state(db: &dyn Sql, group: &str, state: GroupState) -> crate::pg::sql::Result<()> {

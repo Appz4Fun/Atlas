@@ -20,34 +20,26 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use indexmap::IndexMap;
 use rusqlite::{Connection, OptionalExtension, Result, TransactionBehavior, params};
 
+use crate::catalog_facts::SIDE_EXTENSIONS;
+pub(crate) use crate::catalog_facts::{
+    ArticleFacts, ROUTE_SLACK_SECS, VIDEO_EXTENSIONS, adds_parts, due, has_part, insert_part, is_exactly, keyed_hash,
+    merge_parts, one_video_named, parts_overlap, same_parts, subject_key,
+};
+pub use crate::catalog_facts::{
+    COMPLETE_SETTLE_SECS, FileInfo, READ_MAX_SEGMENTS, SEAL_AGE, SEAL_MAX_SEGMENTS, SETTLE_SECS, SHARDS, SegmentPick,
+    SegmentRef, global_id, seen_count, shard_of, shard_of_id,
+};
 use crate::db;
 use crate::parser::{Article, Release};
 use crate::postprocess::schema::ShardTable;
 use crate::profile;
 use crate::search::ArticleRow;
-
-pub const SHARDS: usize = 1;
-
-/// the shard a group's releases live in
-pub fn shard_of(group: &str) -> usize {
-    let hash = group.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
-    (hash % SHARDS as u64) as usize
-}
-
-/// the shard a release id lives in
-pub fn shard_of_id(id: i64) -> usize {
-    id.rem_euclid(SHARDS as i64) as usize
-}
-
-pub fn global_id(seq: i64, shard: usize) -> i64 {
-    seq * SHARDS as i64 + shard as i64
-}
 
 /// `atlas.db` -> `atlas.s3.db`
 pub fn shard_path(main: &Path, shard: usize) -> PathBuf {
@@ -268,12 +260,6 @@ pub fn migrate_shard(conn: &Connection) -> Result<()> {
     crate::word_index::migrate(conn)
 }
 
-/// How long a release has to be quiet before the stage looks at it, seconds.
-/// Saves have no config: the stage sets these from it. At least 1, soo a touch
-/// always moves `due_at`.
-pub static SETTLE_SECS: AtomicI64 = AtomicI64::new(7200);
-/// the same for a complete release
-pub static COMPLETE_SETTLE_SECS: AtomicI64 = AtomicI64::new(900);
 /// `tests/pp_enqueue_cost.rs` compares a save with and without the queue
 #[doc(hidden)]
 pub static SKIP_ENQUEUE_FOR_BENCH: AtomicBool = AtomicBool::new(false);
@@ -764,131 +750,6 @@ pub(crate) fn decode(local: &[u8], suffix: Option<&str>) -> String {
 
 // ---------------------------------------------------------------- part bitmaps
 
-// Legacy bitmaps end in a nonzero byte. A trailing zero marks a bitmap made of
-// sorted blocks, each with a one-byte index and 256 bytes of part bits.
-const PART_BLOCK_BYTES: usize = 256;
-const PART_BLOCK_RECORD: usize = PART_BLOCK_BYTES + 1;
-const LEGACY_PART_LIMIT: i64 = 100_000;
-
-fn sparse_parts(bits: &[u8]) -> bool {
-    bits.len() > PART_BLOCK_RECORD && bits.last() == Some(&0) && bits.len() % PART_BLOCK_RECORD == 1
-}
-
-fn part_blocks(bits: &[u8]) -> impl Iterator<Item = (usize, &[u8])> {
-    let sparse = sparse_parts(bits);
-    bits.chunks(if sparse { PART_BLOCK_RECORD } else { PART_BLOCK_BYTES })
-        .enumerate()
-        .filter_map(move |(index, block)| {
-            if sparse {
-                (block.len() == PART_BLOCK_RECORD).then(|| (usize::from(block[0]), &block[1..]))
-            } else {
-                Some((index, block))
-            }
-        })
-}
-
-fn part_byte(bits: &[u8], byte: usize) -> u8 {
-    if !sparse_parts(bits) {
-        return bits.get(byte).copied().unwrap_or(0);
-    }
-    let index = byte / PART_BLOCK_BYTES;
-    part_blocks(bits)
-        .find(|(block, _)| *block == index)
-        .map_or(0, |(_, block)| block[byte % PART_BLOCK_BYTES])
-}
-
-fn add_part_byte(bits: &mut Vec<u8>, byte: usize, value: u8) {
-    if value == 0 {
-        return;
-    }
-    if !sparse_parts(bits) {
-        if byte <= LEGACY_PART_LIMIT as usize / 8 {
-            if bits.len() <= byte {
-                bits.resize(byte + 1, 0);
-            }
-            bits[byte] |= value;
-            return;
-        }
-        let mut sparse = Vec::new();
-        for (index, block) in part_blocks(bits).filter(|(_, block)| block.iter().any(|&b| b != 0)) {
-            sparse.push(index as u8);
-            sparse.extend_from_slice(block);
-            sparse.resize(sparse.len() + PART_BLOCK_BYTES - block.len(), 0);
-        }
-        sparse.push(0);
-        *bits = sparse;
-    }
-    let index = (byte / PART_BLOCK_BYTES) as u8;
-    let at = bits[..bits.len() - 1]
-        .chunks_exact(PART_BLOCK_RECORD)
-        .take_while(|block| block[0] < index)
-        .count()
-        * PART_BLOCK_RECORD;
-    if at == bits.len() - 1 || bits[at] != index {
-        let mut block = [0; PART_BLOCK_RECORD];
-        block[0] = index;
-        bits.splice(at..at, block);
-    }
-    bits[at + 1 + byte % PART_BLOCK_BYTES] |= value;
-}
-
-pub(crate) fn insert_part(bits: &mut Vec<u8>, part: i64) {
-    if (0..=crate::parser::MAX_PARTS).contains(&part) {
-        add_part_byte(bits, (part / 8) as usize, 1 << (part % 8));
-    }
-}
-
-pub(crate) fn has_part(bits: &[u8], part: i64) -> bool {
-    (0..=crate::parser::MAX_PARTS).contains(&part)
-        && part_byte(bits, (part / 8) as usize) & (1 << (part % 8)) != 0
-}
-
-fn part_bytes(bits: &[u8]) -> impl Iterator<Item = (usize, u8)> {
-    part_blocks(bits).flat_map(|(index, block)| {
-        block.iter().enumerate().filter_map(move |(offset, &byte)| {
-            (byte != 0).then_some((index * PART_BLOCK_BYTES + offset, byte))
-        })
-    })
-}
-
-pub(crate) fn same_parts(left: &[u8], right: &[u8]) -> bool {
-    part_bytes(left).eq(part_bytes(right))
-}
-
-pub(crate) fn adds_parts(ours: &[u8], theirs: &[u8], expected: Option<i64>) -> bool {
-    part_bytes(theirs).any(|(index, byte)| {
-        let new = byte & !part_byte(ours, index);
-        new != 0 && expected.is_none_or(|end| (index * 8 + new.trailing_zeros() as usize) as i64 <= end)
-    })
-}
-
-pub(crate) fn parts_overlap(left: &[u8], right: &[u8]) -> bool {
-    part_bytes(right).any(|(index, byte)| part_byte(left, index) & byte != 0)
-}
-
-pub(crate) fn merge_parts(left: &mut Vec<u8>, right: &[u8]) -> bool {
-    let mut overlap = false;
-    for (index, byte) in part_bytes(right) {
-        overlap |= part_byte(left, index) & byte != 0;
-        add_part_byte(left, index, byte);
-    }
-    overlap
-}
-
-/// Exactly parts 1..=expected or exactly 0..expected for zero-based files.
-pub(crate) fn is_exactly(bits: &[u8], expected: i64) -> bool {
-    if expected <= 0 {
-        return false;
-    }
-    let mut count = 0;
-    let mut highest = None;
-    for (index, byte) in part_bytes(bits) {
-        count += i64::from(byte.count_ones());
-        highest = Some(index as i64 * 8 + 7 - i64::from(byte.leading_zeros()));
-    }
-    count == expected && highest == Some(expected - i64::from(has_part(bits, 0)))
-}
-
 /// When each release's `release_ids` were last made in full (`index_release`): a release indexed again without a
 /// new article (all copies) isn't quiet for the pruning walk till SEAL_AGE after
 /// (`ShardWriter::prune_ids_some`).
@@ -968,23 +829,6 @@ pub const UPLOAD_ROUTES: ShardTable = ShardTable {
 /// (`route_uploads`): half the least gap `repost_split::decide` takes between uploads, soo an article never lands
 /// in a neighbour's row, and a new upload started past it isnt taken in. Further out, it goes where the save would
 /// put it anyway. Less when two of the release's windows are nearer.
-pub(crate) const ROUTE_SLACK_SECS: i64 = 90;
-
-/// What a save reads off one article without the database (its Date, what its message-id says), worked out by
-/// `prepare` before the slice reaches the shard's writer: the writer is what limits how fast slices are saved, and
-/// this is a tenth of its time otherwise.
-#[derive(Debug, Default)]
-pub(crate) struct ArticleFacts {
-    pub(crate) date: Option<i64>,
-    pub(crate) id: crate::discovery::IdFacts,
-}
-
-impl ArticleFacts {
-    pub(crate) fn of(a: &Article) -> ArticleFacts {
-        ArticleFacts { date: crate::dates::naive_timestamp(&a.date), id: crate::discovery::id_facts(&a.message_id) }
-    }
-}
-
 /// One release's `ArticleFacts`, an article each in order, and whether a file name in it is a program
 /// (`junk::is_executable`).
 #[derive(Debug, Default)]
@@ -1167,12 +1011,6 @@ impl Timing {
         ])?;
         Ok(())
     }
-}
-
-/// the article whose subject a file's NZB entry uses comes first in (part, a
-/// missing part first, then message-id) order: how the NZB lists them
-pub(crate) fn subject_key(part: Option<i64>, message_id: &str) -> (bool, i64, &str) {
-    (part.is_some(), part.unwrap_or(0), message_id)
 }
 
 /// One file of a release as the shard stores it.
@@ -1400,17 +1238,6 @@ pub(crate) struct IdKey {
     k1: u64,
 }
 
-/// SipHash of `text` under the pair, as `IdKey::hash`; never 0 (a release's own row in `release_ids`)
-pub(crate) fn keyed_hash(k0: u64, k1: u64, text: &str) -> i64 {
-    #[allow(deprecated)]
-    let mut h = std::hash::SipHasher::new_with_keys(k0, k1);
-    std::hash::Hasher::write(&mut h, text.as_bytes());
-    match std::hash::Hasher::finish(&h) as i64 {
-        0 => 1,
-        n => n,
-    }
-}
-
 impl IdKey {
     pub(crate) fn of(conn: &Connection) -> Result<IdKey> {
         let get =
@@ -1561,12 +1388,6 @@ fn vouched_by_set(conn: &Connection, release_id: i64) -> Result<bool> {
     conn.prepare_cached(concat!("select ", set_vouches_sql!()))?.query_row([release_id], |r| r.get(0))
 }
 
-/// The small files posted beside an archive set that aren't part of it.
-const SIDE_EXTENSIONS: &[&str] = &[
-    ".par2", ".nfo", ".sfv", ".srr", ".srs", ".txt", ".jpg", ".jpeg", ".png", ".md5", ".srt", ".sub", ".idx", ".nzb",
-    ".url",
-];
-
 /// Whether the release's files are one RAR set, named as the release, there from its first volume to its last with
 /// no gap, beside side files only (`SIDE_EXTENSIONS`). A set's volumes are all one size but its last, soo a last one
 /// shorter than the others, which are alike, is where it ends. An episode of a season posted under one counter is a
@@ -1638,11 +1459,6 @@ fn own_whole_rar_set(conn: &Connection, release_id: i64) -> Result<bool> {
     Ok(in_order && even && named)
 }
 
-/// The extensions of a video that plays on its own.
-/// `.m2ts` before `.ts`, so `film.m2ts` comes out as `film`.
-pub(crate) const VIDEO_EXTENSIONS: &[&str] =
-    &[".mkv", ".mp4", ".m4v", ".avi", ".m2ts", ".ts", ".wmv", ".mov", ".mpg", ".mpeg", ".webm"];
-
 /// Whether the release's files are one whole video named as the release, beside side files only (`one_video_named`).
 fn own_whole_video(conn: &Connection, release_id: i64) -> Result<bool> {
     let Some(name) = conn
@@ -1658,45 +1474,6 @@ fn own_whole_video(conn: &Connection, release_id: i64) -> Result<bool> {
         .query_map([release_id], |r| r.get(0))?
         .collect::<Result<_>>()?;
     Ok(one_video_named([name.as_str()], files.iter().map(String::as_str)))
-}
-
-/// Whether `files` are one video named as the release (any of `names`: the file's name, with or without its
-/// extension, or with the post's id after it, `name [54205819]`) beside side files only (`SIDE_EXTENSIONS`: its PAR2
-/// set, an NFO, a thumbnail). The video plays on its own, soo the release is whole whatever the subject counter
-/// says. A season posted under one counter is a row per episode, each "1 of 24 files", and each a whole episode. An
-/// uploader can count a file that turns up as a row of its own: `[9/9] - "thumbnail.jpg"` under another name and
-/// poster, posted after the film and its PAR2 set. Not a part of a video cut in pieces (`CD1`, `Part 2`, `Disc 1`):
-/// that needs the others; nor a sample, which is whole but not what was posted; nor two videos.
-pub(crate) fn one_video_named<'a, 'b>(
-    names: impl IntoIterator<Item = &'a str>,
-    files: impl IntoIterator<Item = &'b str>,
-) -> bool {
-    static PIECE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        #[allow(clippy::unwrap_used)]
-        regex::Regex::new(r"(?i)(?:^|[^a-z0-9])(cd|dis[ck]|part|pt)[ ._-]?\d|sample").unwrap()
-    });
-    let mut others = files
-        .into_iter()
-        .map(|file| file.trim().to_lowercase())
-        .filter(|file| !SIDE_EXTENSIONS.iter().any(|ext| file.ends_with(ext)));
-    let (Some(file), None) = (others.next(), others.next()) else { return false };
-    let Some(stem) = VIDEO_EXTENSIONS.iter().find_map(|ext| file.strip_suffix(ext)) else { return false };
-    if stem.is_empty() || PIECE.is_match(&file) {
-        return false;
-    }
-    names.into_iter().any(|name| {
-        let name = name.trim().to_lowercase();
-        let name = without_post_id(&name);
-        name == file || name == stem
-    })
-}
-
-/// A release name without the post's id a collection put after it: `name [54205819]` is `name`.
-fn without_post_id(name: &str) -> &str {
-    name.strip_suffix(']')
-        .and_then(|rest| rest.rsplit_once(" ["))
-        .filter(|(_, id)| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
-        .map_or(name, |(name, _)| name)
 }
 
 /// The incomplete movie and TV releases that are whole after all (`release_complete`): the rows saved before a
@@ -1748,19 +1525,6 @@ pub fn repair_zero_indexed_complete(conn: &Connection) -> Result<usize> {
 }
 
 // ---------------------------------------------------------------- sealing
-
-/// files untouched this long get sealed even when incomplete
-pub const SEAL_AGE: i64 = 3 * 86_400;
-
-/// A file with more segments than this never seals: a blob is built in
-/// memory, and a poster can put any number of rows under one file. Real files
-/// have a few thousand parts at most.
-pub const SEAL_MAX_SEGMENTS: i64 = 50_000;
-
-/// The most a stored blob may hold when read. Older files can hold more than `SEAL_MAX_SEGMENTS`, and refusing them
-/// stops every save and NZB that touches them, so a late article could never join its release. This only guards
-/// against a corrupt count: nothing seals past `SEAL_MAX_SEGMENTS`.
-pub const READ_MAX_SEGMENTS: i64 = 1_000_000;
 
 /// sql: file `f` has more than SEAL_MAX_SEGMENTS rows, counting no further
 /// than one past
@@ -2410,13 +2174,6 @@ fn still_due(conn: &Connection, file_id: i64, now: i64) -> Result<bool> {
     })
     .optional()
     .map(|due| due.unwrap_or(false))
-}
-
-/// A file with rows is due to seal when it's complete and not sealed yet, or
-/// untouched for `SEAL_AGE` (never touched since the upgrade counts as old).
-pub(crate) fn due(expected: Option<i64>, seen: &[u8], touched: Option<i64>, sealed: bool, now: i64) -> bool {
-    let complete = !sealed && expected.is_some_and(|e| is_exactly(seen, e));
-    complete || touched.is_none_or(|t| t < now - SEAL_AGE)
 }
 
 /// the segments a `SealedCache` keeps decoded at most: a save can touch a
@@ -3487,42 +3244,6 @@ pub fn save(main: &Path, releases: &[Release]) -> Result<()> {
 
 // ---------------------------------------------------------------- reading
 
-/// A release's file, for a processing step.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FileInfo {
-    pub id: i64,
-    pub filename: String,
-    pub subject: Option<String>,
-    pub subject_part: Option<i64>,
-    pub expected: Option<i64>,
-    pub file_total: Option<i64>,
-    /// how many parts were seen
-    pub parts_seen: i64,
-    pub touched_at: Option<i64>,
-    pub sealed: bool,
-}
-
-/// One article of a file, for a processing step.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SegmentRef {
-    pub message_id: String,
-    pub part: Option<i64>,
-    pub bytes: i64,
-}
-
-/// Which of a file's articles a step wants.
-#[derive(Clone, Debug)]
-pub enum SegmentPick {
-    First(usize),
-    Last(usize),
-    Parts(Vec<i64>),
-}
-
-/// How many parts a `seen` bitmap has.
-pub fn seen_count(bits: &[u8]) -> i64 {
-    part_bytes(bits).map(|(_, byte)| i64::from(byte.count_ones())).sum()
-}
-
 /// What deleting a release took.
 pub(crate) struct Deleted {
     pub articles: i64,
@@ -4317,56 +4038,6 @@ mod tests {
         }
         assert!(global_id(11, 0) > global_id(10, SHARDS - 1), "a later seq sorts after, whatever the shard");
         assert_eq!(shard_path(Path::new("/x/atlas.db"), 3), PathBuf::from("/x/atlas.s3.db"));
-    }
-
-    #[test]
-    fn sparse_part_sets_preserve_legacy_bits_and_bound_high_parts() {
-        let mut legacy = vec![0b110];
-        let mut high = Vec::new();
-        insert_part(&mut high, 234_450);
-        insert_part(&mut high, 1_099_511_627_776);
-        assert_eq!(high.len(), PART_BLOCK_RECORD + 1);
-        assert_eq!(seen_count(&high), 1);
-        assert!(has_part(&high, 234_450));
-        assert!(!has_part(&high, 234_449));
-        assert!(!is_exactly(&high, 234_450));
-        assert!(!parts_overlap(&high, &legacy));
-        assert!(adds_parts(&legacy, &high, Some(234_450)));
-        assert!(!adds_parts(&legacy, &high, Some(234_449)));
-        assert!(!merge_parts(&mut legacy, &high));
-        assert!(parts_overlap(&high, &legacy));
-        assert!(merge_parts(&mut high, &legacy));
-        assert!(same_parts(&legacy, &high));
-        let mut complete = Vec::new();
-        for part in 1..=250_000 {
-            insert_part(&mut complete, part);
-        }
-        assert!(is_exactly(&complete, 250_000));
-    }
-
-    #[test]
-    fn part_sets() {
-        let mut bits = Vec::new();
-        for i in [1, 2, 3] {
-            insert_part(&mut bits, i);
-        }
-        assert!(is_exactly(&bits, 3));
-        assert!(!is_exactly(&bits, 4));
-        insert_part(&mut bits, 5);
-        assert!(!is_exactly(&bits, 4), "part 4 missing");
-        let mut zero = Vec::new();
-        insert_part(&mut zero, 0);
-        insert_part(&mut zero, 1);
-        assert!(!is_exactly(&zero, 1), "a part 0 doesnt belong");
-        assert!(is_exactly(&zero, 2), "0 and 1 are a whole file numbered from 0");
-        insert_part(&mut zero, 3);
-        assert!(!is_exactly(&zero, 3), "part 2 missing");
-        assert!(!is_exactly(&zero, 4), "part 2 missing, counted from 0");
-        insert_part(&mut zero, 2);
-        assert!(is_exactly(&zero, 4));
-        let mut huge = Vec::new();
-        insert_part(&mut huge, 5_000_000_000);
-        assert!(huge.is_empty());
     }
 
     /// a shard with one release: file a.rar (3 parts) and b.rar (2 parts)

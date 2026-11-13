@@ -170,8 +170,8 @@ fn flush(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], now: i64
     if parts > 0 {
         timing::write(tx, parts)?;
         tx.execute(UPDATE_FILES, &[&now, &crate::parser::MAX_PARTS])?;
-        let complete_due = now.saturating_add(crate::store::COMPLETE_SETTLE_SECS.load(Ordering::Relaxed).max(1));
-        let incomplete_due = now.saturating_add(crate::store::SETTLE_SECS.load(Ordering::Relaxed).max(1));
+        let complete_due = now.saturating_add(crate::catalog_facts::COMPLETE_SETTLE_SECS.load(Ordering::Relaxed).max(1));
+        let incomplete_due = now.saturating_add(crate::catalog_facts::SETTLE_SECS.load(Ordering::Relaxed).max(1));
         tx.execute(UPDATE_RELEASES_AND_QUEUE, &[&complete_due, &incomplete_due])?;
     }
     Ok(())
@@ -242,13 +242,13 @@ fn copy_input(tx: &mut Transaction<'_>, batch: &[Incoming<'_>], timing_key: Opti
         let nameless = a.filter(|article| article.filename.is_none());
         // Only one article's parsing scratch is live. No parallel Timing map
         // or clone of the original batch is retained beside the COPY input.
-        let facts = a.map(crate::store::ArticleFacts::of);
+        let facts = a.map(crate::catalog_facts::ArticleFacts::of);
         let id = facts.as_ref().map(|facts| &facts.id);
         let hardware = id.filter(|id| id.hw_host.is_some() && id.hw_key.is_some() && id.hw_n.is_some());
         let number = a.filter(|article| article.number > 0)
             .map(|article| i64::try_from(article.number)).transpose()?;
         let from = a.map(|article| {
-            timing_key.map(|key| crate::store::keyed_hash(key as u64, 0, &article.author))
+            timing_key.map(|key| crate::catalog_facts::keyed_hash(key as u64, 0, &article.author))
                 .ok_or_else(|| anyhow::anyhow!("native writer timing has no catalog key"))
         }).transpose()?;
         writer.write(&[
@@ -548,7 +548,7 @@ mod tests {
         assert_eq!(row.get::<_, i64>("generation"), 3);
         assert_eq!(
             row.get::<_, i64>("due_at"),
-            103 + crate::store::COMPLETE_SETTLE_SECS.load(std::sync::atomic::Ordering::Relaxed)
+            103 + crate::catalog_facts::COMPLETE_SETTLE_SECS.load(std::sync::atomic::Ordering::Relaxed)
         );
     }
 

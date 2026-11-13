@@ -4,7 +4,7 @@ use anyhow::{Result,ensure};
 use postgres::{Transaction,types::ToSql};
 use std::collections::{HashMap,HashSet};
 use super::StepReads;
-use crate::store::FileInfo;
+use crate::catalog_facts::FileInfo;
 use crate::archive::{beside,link,select};
 const BYTES:i64=64*1024*1024;
 #[derive(Default)]
@@ -96,7 +96,7 @@ impl StepReads {
         start(tx)?;let Some(posted)=posted else{return Ok(None)};let Some((from,to))=link::beside_window(posted,beside::NFO_SECS) else{return Ok(None)};
         let mut budget=Budget::default();for (other,name,_) in named(tx,id,stem,(&from,&to,posted),&mut budget)? {
             self.observe_in(tx,&[other])?;
-            let fits=name==stem || name.strip_prefix(stem).is_some_and(|rest|rest.starts_with(" [")) || crate::store::VIDEO_EXTENSIONS.iter().any(|ext|name.strip_suffix(ext).is_some_and(|base|base==stem));
+            let fits=name==stem || name.strip_prefix(stem).is_some_and(|rest|rest.starts_with(" [")) || crate::catalog_facts::VIDEO_EXTENSIONS.iter().any(|ext|name.strip_suffix(ext).is_some_and(|base|base==stem));
             if fits && files(tx,other,64,&mut budget)?.iter().any(|f|!crate::archive::beside::is_side_file(&f.filename)) {return Ok(Some(other))}
         }Ok(None)
     })}

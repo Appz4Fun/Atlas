@@ -102,7 +102,7 @@ impl Observed {
                         ensure!(rows.len()<=LIMIT,"native pointed target fanout exceeds admission");
                         for row in rows {
                             let other:String=row.try_get(1)?;
-                            if crate::store::shard_of(&other)==crate::store::shard_of(group) {selected.push(row.try_get::<_,i64>(0)?);}
+                            if crate::catalog_facts::shard_of(&other)==crate::catalog_facts::shard_of(group) {selected.push(row.try_get::<_,i64>(0)?);}
                         }
                     }
                     complete &= include(tx,&mut expected,&selected)?;pointed.insert(name.to_owned(),selected);
