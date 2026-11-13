@@ -312,6 +312,10 @@ fn owner_connection_config(storage: &super::StorageConfig) -> Result<postgres::C
 }
 
 #[cfg(test)]
+#[path = "native_profile_tests.rs"]
+mod native_profile_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
