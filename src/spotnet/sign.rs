@@ -23,9 +23,16 @@ const SPOTNET_KEYS: [(i32, &str); 3] = [
 /// The key id of a spot the spotter signed with their own key.
 pub const SELF_SIGNED_KEY: i32 = 7;
 
-/// A user key in a key-2 `From` longer than this makes it a spotter's own `DISPOSE` of their spot, not a
-/// moderator's command.
+/// A restored, padded user key in a key-2 `From` longer than this makes it a
+/// spotter's own `DISPOSE` of their spot, not a moderator's command.
 const PERSONAL_KEY_LEN: usize = 50;
+
+fn personal_key_length(prepared_len: usize, restored_len: usize) -> bool {
+    // Spotweb pads BEFORE restoring '-s'/'-p'. Compare without allocating the
+    // padding or adding it to a potentially maximal input byte length.
+    let padding = (4 - prepared_len % 4) % 4;
+    restored_len > PERSONAL_KEY_LEN.saturating_sub(padding)
+}
 
 /// What the signatures of an overview line say.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -77,10 +84,11 @@ pub fn verify(title: &str, from: &str, message_id: &str) -> Verdict {
     signed.extend_from_slice(&header.as_bytes()[..header.len() - header_sig.len() - 1]);
     signed.extend_from_slice(poster);
     let Some(header_sig) = decode_base64(&unprepare_base64(header_sig)) else { return no };
-    let (user_key, user_sig) = match local.split_once('.') {
-        Some((k, s)) => (unprepare_base64(k), Some(unprepare_base64(s))),
-        None => (unprepare_base64(local), None),
+    let (prepared_user_key, user_sig) = match local.split_once('.') {
+        Some((k, s)) => (k, Some(unprepare_base64(s))),
+        None => (local, None),
     };
+    let user_key = unprepare_base64(prepared_user_key);
     let user_modulus = decode_base64(&user_key).unwrap_or_default();
     let by_user = || !user_modulus.is_empty() && rsa_sha1(&signed, &header_sig, &user_modulus);
 
@@ -93,7 +101,7 @@ pub fn verify(title: &str, from: &str, message_id: &str) -> Verdict {
             verdict.title_signed = true;
         }
     } else if let Some((_, modulus)) = SPOTNET_KEYS.iter().find(|(k, _)| *k == key_id) {
-        if key_id == 2 && user_key.len() > PERSONAL_KEY_LEN {
+        if key_id == 2 && personal_key_length(prepared_user_key.len(), user_key.len()) {
             verdict.personal = true;
             verdict.verified = hashcash(&message_id);
             if verdict.verified && by_user() {
@@ -164,6 +172,7 @@ fn rsa_sha1(message: &[u8], sig: &[u8], modulus: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
 
     // overview lines from free.pt, October 2026
     const SPOT_ID: &str = "<vKCGetIwSd0z2PcagDlUt@spot.net>";
@@ -241,6 +250,91 @@ mod tests {
         assert_eq!(verify("t", "x <k@17a09z00.100.1.2.3.4.>", SPOT_ID), Verdict::default());
         assert_eq!(verify("t", "someone <abc@example.com>", SPOT_ID), Verdict::default());
         assert_eq!(verify("", SPOT_FROM, SPOT_ID), Verdict::default());
+    }
+
+    fn boundary_from(key: &str, user_sig: Option<&str>) -> String {
+        let user_sig = user_sig.map(|sig| format!(".{sig}")).unwrap_or_default();
+        format!("Fixture <{key}{user_sig}@12a01.999.1.2.3.NL.eA>")
+    }
+
+    fn assert_boundary_verdict(key: &str, personal: bool) {
+        let verdict = verify("Boundary.Header", &boundary_from(key, None), SPOT_ID);
+        assert_eq!(verdict, Verdict { verified: personal, personal, ..Verdict::default() });
+        // All synthetic moduli here are below the minimum RSA encoding size.
+        // A hashcash-only classification must not invent signed identity.
+        assert!(!verdict.title_signed && !verdict.message_id_signed && verdict.spotter_id.is_none());
+        assert_eq!(verify("Boundary.Header", &boundary_from(key, Some("!!!")), SPOT_ID), Verdict::default());
+    }
+
+    #[test]
+    fn personal_key_boundary_counts_reference_padding_for_every_short_modulus() {
+        // Literal Base64 lengths, before/after omitted '=' restoration.
+        for (bytes, unpadded_len, padded_len, personal) in [
+            (32, 43, 44, false),
+            (33, 44, 44, false),
+            (34, 46, 48, false),
+            (35, 47, 48, false),
+            (36, 48, 48, false),
+            (37, 50, 52, true),
+            (38, 51, 52, true),
+            (39, 52, 52, true),
+            (40, 54, 56, true),
+            (41, 55, 56, true),
+            (42, 56, 56, true),
+        ] {
+            let padded = STANDARD.encode(vec![0u8; bytes]);
+            let unpadded = padded.trim_end_matches('=');
+            assert_eq!((unpadded.len(), padded.len()), (unpadded_len, padded_len));
+            assert_eq!(decode_base64(unpadded).unwrap().len(), bytes);
+            assert_boundary_verdict(unpadded, personal);
+            assert_boundary_verdict(&padded, personal);
+        }
+    }
+
+    #[test]
+    fn personal_key_padding_precedes_restoring_the_prepared_alphabet() {
+        // Spotweb pads the prepared input BEFORE '-s' shrinks to '/'. For two
+        // escapes,52 prepared bytes restore to50 with no padding: not personal.
+        for (escapes, prepared_personal) in [(1, true), (2, false), (3, true), (4, true)] {
+            for (symbol, escaped) in [("/", "-s"), ("+", "-p")] {
+                let bare = format!("{}{}", symbol.repeat(escapes), "A".repeat(50 - escapes));
+                let prepared = bare.replace(symbol, escaped);
+                assert_eq!(decode_base64(&bare).unwrap().len(), 37);
+                assert_eq!((bare.len(), prepared.len()), (50, 50 + escapes));
+                assert_boundary_verdict(&bare, true);
+                assert_boundary_verdict(&prepared, prepared_personal);
+                assert_boundary_verdict(&format!("{bare}=="), true);
+                assert_boundary_verdict(&format!("{prepared}=="), true);
+            }
+        }
+    }
+
+    #[test]
+    fn short_personal_keys_cannot_authorize_a_disposal_by_hashcash_alone() {
+        for bytes in 37..=42 {
+            let padded = STANDARD.encode(vec![0xFFu8; bytes]);
+            let from = boundary_from(padded.trim_end_matches('='), None);
+            let overview = crate::nntp::Overview {
+                subject: "DISPOSE target@spot.net - Boundary.Header".into(),
+                from,
+                message_id: SPOT_ID.into(),
+                ..Default::default()
+            };
+            let verdict = verify(&overview.subject, &overview.from, SPOT_ID);
+            assert!(verdict.verified && verdict.personal);
+            assert!(!verdict.title_signed && !verdict.message_id_signed && verdict.spotter_id.is_none());
+            assert!(
+                crate::spotnet::ingest::removal(&overview, 1).is_none(),
+                "personal classification cannot grant moderator authority"
+            );
+        }
+    }
+
+    #[test]
+    fn personal_key_length_comparison_does_not_add_past_usize() {
+        assert!(personal_key_length(usize::MAX, usize::MAX));
+        assert!(!personal_key_length(52, 50));
+        assert!(personal_key_length(51, 50));
     }
 
     #[test]
