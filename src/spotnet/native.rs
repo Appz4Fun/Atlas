@@ -34,6 +34,21 @@ fn provider_error(error:crate::nntp::NntpError)->anyhow::Error {
 }
 fn is_provider_failure(error:&anyhow::Error)->bool {error.downcast_ref::<ProviderFailure>().is_some()}
 
+// All scoped children finish before this reducer chooses the pass error.
+// A retry can never displace an independent storage/invariant failure, nor
+// can a queued/session cancellation hide an independently fatal child.
+pub(crate) fn prefer_failure(current:&mut Option<anyhow::Error>,incoming:anyhow::Error) {
+    let replace=current.as_ref().is_none_or(|prior| {
+        match (is_provider_failure(prior),is_provider_failure(&incoming)) {
+            (true,false)=>true,
+            (false,true)|(true,true)=>false,
+            (false,false)=>crate::pg::outage::classify(prior)==crate::pg::outage::Failure::Unavailable
+                && crate::pg::outage::classify(&incoming)==crate::pg::outage::Failure::Fatal,
+        }
+    });
+    if replace {*current=Some(incoming);}
+}
+
 /// A typed provider failure is always a retry outcome, even if stop or a PG
 /// failure arrived after a caller's earlier live check. No owner state is
 /// cleared and no storage error is converted. The worker loop/backoff decides
@@ -105,7 +120,7 @@ impl Service {
                     Ok(Some(Some(store::SAVED)))=>done.saved+=1,
                     Ok(Some(Some(_)))=>done.skipped+=1,
                     Ok(Some(None))=>done.retry+=1,
-                    Err(error)=>{if failure.is_none() {failure=Some(error);}},
+                    Err(error)=>{prefer_failure(&mut failure,error);},
                 }
             }
             if let Some(error)=failure {return Err(error)}
@@ -279,7 +294,7 @@ impl Service {
                 })).collect::<Vec<_>>()
             });
             let mut failure=None;
-            for result in results {match result {Ok(outcome)=>outcomes.push(outcome),Err(error)=>{if failure.is_none(){failure=Some(error)}}}}
+            for result in results {match result {Ok(outcome)=>outcomes.push(outcome),Err(error)=>{prefer_failure(&mut failure,error)}}}
             if let Some(error)=failure {return Err(error)}
             if outcomes.len()>=ingest::SETTLE_BATCH {self.commit_comments(&mut outcomes,&mut done)?;}
         }

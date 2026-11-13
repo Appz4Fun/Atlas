@@ -102,6 +102,13 @@ fn stopped_header_storage_sql_and_invariant_errors_remain_fatal_with_their_cause
     }
 }
 
+fn pair_gate(entered:&std::sync::atomic::AtomicUsize) {
+    entered.fetch_add(1,Ordering::AcqRel);let deadline=std::time::Instant::now()+Duration::from_secs(5);
+    while entered.load(Ordering::Acquire)<2 {
+        assert!(std::time::Instant::now()<deadline,"both original-owner checks must reach the bounded completion gate");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
 #[test]
 #[ignore="requires isolated PG for joined sibling provider/fatal precedence in both orders"]
 fn joined_provider_and_fatal_siblings_retain_the_fatal_cause_in_both_orders() {
@@ -110,11 +117,11 @@ fn joined_provider_and_fatal_siblings_retain_the_fatal_cause_in_both_orders() {
             for header in [false,true] {
                 let (schema,runtime,_handle,service)=fixture();let owner=runtime.owner.clone();let (done_tx,done_rx)=mpsc::channel();
                 let worker=workers::spawn(&runtime.owner,"native-paired-provider-control".into(),move|| {
-                    let barrier=Arc::new(std::sync::Barrier::new(2));
+                    let barrier=Arc::new(std::sync::atomic::AtomicUsize::new(0));
                     let results=std::thread::scope(|scope| {
                         let (one,first,gate)=(service.clone(),owner.clone(),barrier.clone());
                         let provider=scope.spawn(move||one.network_for_test::<()>(async {
-                            gate.wait();end(&first,kind);
+                            pair_gate(&gate);end(&first,kind);
                             Err(NntpError::Reply {code:431,message:"paired ready provider".into()})
                         }));
                         let (two,second,gate)=(service.clone(),owner.clone(),barrier.clone());
@@ -122,7 +129,7 @@ fn joined_provider_and_fatal_siblings_retain_the_fatal_cause_in_both_orders() {
                             let result=two.network_for_test::<()>(async {
                                 // Both actual original-owner checks complete
                                 // BEFORE either response can end the attempt.
-                                gate.wait();end(&second,kind);
+                                pair_gate(&gate);end(&second,kind);
                                 if header {Err(NntpError::HeaderStore("paired genuine header storage failure".into()))}else{Ok(())}
                             });
                             if header {result}else{result.and_then(|_|Err(anyhow::anyhow!("paired unexpected invariant")))}
