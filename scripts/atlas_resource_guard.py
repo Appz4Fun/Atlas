@@ -158,21 +158,24 @@ def require_unreaped_leader(child):
         raise RuntimeError("cannot use a process group after its leader was reaped")
 
 
-def owned_group_states(child, *, leader_only=False):
+def owned_group_states(child, *, leader_only=False, timeout=2):
     require_unreaped_leader(child)
     command = (["/bin/ps", "-p", str(child.pid), "-o", "pid=,pgid=,stat="] if leader_only
                else ["/bin/ps", "-axo", "pid=,pgid=,stat="])
-    result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=2)
+    result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=timeout)
     require_unreaped_leader(child)
     # Validate the returned snapshot before using it. The timeout bounds ps;
     # this response ceiling is checked after capture, not a kernel allocation cap.
     if not result.stdout or len(result.stdout) > 1 << 20:
         raise RuntimeError("empty or oversized process inventory")
     rows = {}
+    # Darwin can report ?Es while the run state is unavailable during exit.
+    # Preserve '?' as unknown/live; only a leading Z is terminal proof.
+    state_pattern = r"[A-Zt?][A-Za-z0-9+<>=-]*" if sys.platform == "darwin" else r"[A-Zt][A-Za-z0-9+<>=-]*"
     for row in result.stdout.splitlines():
         fields = row.split()
         if (len(fields) != 3 or not fields[0].isdigit() or not fields[1].isdigit()
-                or not re.fullmatch(r"[A-Zt][A-Za-z0-9+<>=-]*", fields[2])):
+                or not re.fullmatch(state_pattern, fields[2])):
             raise RuntimeError("unreadable process inventory")
         pid, pgid = int(fields[0]), int(fields[1])
         if pid in rows:
@@ -187,11 +190,11 @@ def leader_has_exited(child):
     return owned_group_states(child, leader_only=True)[child.pid][1].startswith("Z")
 
 
-def group_has_no_live_members(child):
+def group_has_no_live_members(child, *, timeout=2):
     # A zombie leader stays unreaped while we inspect its still-owned group.
     # Unreadable/ambiguous metadata cannot turn EPERM into successful cleanup.
     try:
-        rows = owned_group_states(child)
+        rows = owned_group_states(child, timeout=timeout)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
         return False
     return all(state.startswith("Z") for pgid, state in rows.values() if pgid == child.pid)
@@ -204,9 +207,27 @@ def signal_owned_group(child, signum):
     except ProcessLookupError:
         return False
     except PermissionError:
-        if sys.platform != "darwin" or not group_has_no_live_members(child):
+        if sys.platform != "darwin":
             raise
-        return False
+        if signum != 0:
+            if not group_has_no_live_members(child):
+                raise
+            return False
+        # XNU can deny a zero-signal probe while a just-terminated group is
+        # settling. Keep the leader unreaped; only fresh zombie-only proof
+        # permits cleanup. This window issues metadata reads, never signals.
+        deadline = time.monotonic() + 0.5
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            drained = group_has_no_live_members(child, timeout=remaining)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            if drained:
+                return False
+            time.sleep(min(0.02, remaining))
     return True
 
 
