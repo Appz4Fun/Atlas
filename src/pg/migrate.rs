@@ -17,6 +17,7 @@ pub const MIGRATIONS: &[(i32, &str, &str)] = &[
     (9, "native_stage", include_str!("migrations/0009_native_stage.sql")),
     (10, "valuable_caches", include_str!("migrations/0010_valuable_caches.sql")),
     (11, "native_workers", include_str!("migrations/0011_native_workers.sql")),
+    (12, "media_trakt_identity", include_str!("migrations/0012_media_trakt_identity.sql")),
 ];
 
 /// Bring the schema `schema` up to the last migration. Returns the versions applied now.

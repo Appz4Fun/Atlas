@@ -8,6 +8,36 @@ const FIELDS:&str="title,overview,genres,status,network,cast_names,released,blur
 
 pub(crate) struct Source {pub release:i64,pub kind:i64,pub ids:Ids}
 pub(crate) struct Page {pub rows:Vec<Source>,pub after:Option<i64>,pub exhausted:bool}
+#[derive(Debug,PartialEq,Eq)]
+pub(crate) enum TraktIdentity {Absent,Unique(i64),Ambiguous}
+
+/// Both endpoints share one statement snapshot and an exact equality/NULL
+/// prefix of migration12's partial index. Duplicates may span any number of
+/// source pages: no release-order scan or unbounded ID collection is needed.
+pub(crate) fn trakt_identity_in(client:&mut impl GenericClient,kind:i64,ids:&Ids)->Result<TraktIdentity> {
+    ensure!((1..=2).contains(&kind),"native details kind unsupported");
+    let mut conditions=vec!["kind=$1".to_string(),"trakt_id is not null".to_string()];
+    let mut params:Vec<&(dyn postgres::types::ToSql+Sync)>=vec![&kind];
+    for (column,id) in [("tmdb_id",&ids.tmdb),("imdb_id",&ids.imdb),("tvdb_id",&ids.tvdb),("tvmaze_id",&ids.tvmaze),("tvrage_id",&ids.tvrage)] {
+        if let Some(id)=id {
+            ensure!(*id>0,"native details provider identity is not positive");
+            params.push(id);conditions.push(format!("{column}=${}",params.len()));
+        } else {conditions.push(format!("{column} is null"));}
+    }
+    let prefix=conditions.join(" and ");
+    let row=client.query_one(&format!("select
+        (select trakt_id from media_release where {prefix} order by trakt_id asc limit 1),
+        (select trakt_id from media_release where {prefix} order by trakt_id desc limit 1)"),&params)?;
+    let (first,last):(Option<i64>,Option<i64>)=(row.try_get(0)?,row.try_get(1)?);
+    match (first,last) {
+        (None,None)=>Ok(TraktIdentity::Absent),
+        (Some(first),Some(last))=>{
+            ensure!(first>0&&last>=first,"native details Trakt identity is invalid");
+            Ok(if first==last {TraktIdentity::Unique(first)}else{TraktIdentity::Ambiguous})
+        },
+        _=>anyhow::bail!("native details Trakt endpoints disagree"),
+    }
+}
 pub(crate) fn page_in(client:&mut impl GenericClient,after:Option<i64>,limit:u16)->Result<Page> {
     ensure!((1..=64).contains(&limit),"native details page outside admission");
     // Limit the PK scan BEFORE filtering resolved/current titles. An empty
@@ -67,9 +97,14 @@ pub(crate) fn put_lookup_in(client:&mut impl GenericClient,key:&str,id:Option<i6
     client.execute("insert into ext_media_details_lookups(lookup,tmdb_id,checked_at) values($1,$2,$3) on conflict(lookup) do update set tmdb_id=excluded.tmdb_id,checked_at=excluded.checked_at",&[&key,&id,&now])?;Ok(())
 }
 impl super::Cache {
+    pub(crate) fn details_trakt(&self,kind:i64,ids:&Ids)->Result<TraktIdentity> {self.with(|tx|trakt_identity_in(tx,kind,ids))}
     pub(crate) fn details_page(&self,after:Option<i64>)->Result<Page> {self.with(|tx|page_in(tx,after,64))}
     pub(crate) fn details(&self,kind:i64,id:i64)->Result<Option<Details>> {self.with(|tx|read_in(tx,kind,id))}
     pub(crate) fn put_details(&self,details:&Details)->Result<()> {self.with(|tx|put_in(tx,details))}
     pub(crate) fn details_lookup(&self,key:&str)->Result<Option<(Option<i64>,i64)>> {self.with(|tx|lookup_in(tx,key))}
     pub(crate) fn put_details_lookup(&self,key:&str,id:Option<i64>,now:i64)->Result<()> {self.with(|tx|put_lookup_in(tx,key,id,now))}
 }
+
+#[cfg(test)]
+#[path="details_trakt_tests.rs"]
+mod trakt_tests;

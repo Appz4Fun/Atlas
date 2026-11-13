@@ -1,15 +1,73 @@
 //! Bounded periodic details for one canonical native attempt. No legacy service,
 //! SQLite handle, detached task or transaction spanning provider I/O is used.
 use super::*;
-use crate::{media::{cache,resolve::{Trouble,CacheFailure}},pg::{indexer_runtime::Owner,service_cache::{Cache,details::Source},worker_assets::Grant}};
-use std::{collections::{VecDeque,HashSet},time::Instant};
+use crate::{media::{cache,resolve::{Trouble,CacheFailure}},pg::{indexer_runtime::Owner,service_cache::{Cache,details::{Source,TraktIdentity}},worker_assets::Grant}};
+use std::{collections::VecDeque,time::Instant};
 use anyhow::Result;
+
+#[derive(Clone,Copy,Default)]
+struct RatingFailures {omdb:bool,trakt:bool}
+struct Refreshed {details:Details,failed:RatingFailures}
+struct Pending {source:Source,trakt_missing:bool}
+
+/// Preserve only a failed provider's previous valid ratings, for this exact
+/// natural key. Successful, absent, disabled and unrated responses remain new
+/// observations; they do not inherit unrelated or obsolete provider scores.
+fn preserve_failed_scores(mut fresh:Refreshed,kept:Option<&Details>)->Details {
+    if let Some(old)=kept.filter(|old|old.kind==fresh.details.kind&&old.tmdb_id==fresh.details.tmdb_id) {
+        let valid=|score:Option<i64>|score.filter(|score|(0..=100).contains(score));
+        if fresh.failed.omdb {
+            fresh.details.imdb_score=fresh.details.imdb_score.or(valid(old.imdb_score));
+            fresh.details.rotten=fresh.details.rotten.or(valid(old.rotten));
+            fresh.details.metacritic=fresh.details.metacritic.or(valid(old.metacritic));
+        }
+        if fresh.failed.trakt {fresh.details.trakt_score=fresh.details.trakt_score.or(valid(old.trakt_score));}
+    }
+    fresh.details
+}
+
+/// This is deliberately page-local: Cache::details_page supplies at most64
+/// rows. Keep newest-release precedence, filling only a missing Trakt ID for
+/// identical other provider IDs. Conflicting observations stay separate.
+fn merge_sources(mut rows:Vec<Source>)->VecDeque<Pending> {
+    rows.sort_by_key(|row|std::cmp::Reverse(row.release));
+    let mut merged:VecDeque<Pending>=VecDeque::new();
+    for row in rows {
+        let same=|pending:&&mut Pending| {let kept=&pending.source;kept.kind==row.kind&&kept.ids.tmdb==row.ids.tmdb&&kept.ids.imdb==row.ids.imdb
+            &&kept.ids.tvdb==row.ids.tvdb&&kept.ids.tvmaze==row.ids.tvmaze&&kept.ids.tvrage==row.ids.tvrage
+            &&kept.ids.trakt.zip(row.ids.trakt).is_none_or(|(a,b)|a==b)};
+        if let Some(kept)=merged.iter_mut().find(same) {kept.source.ids.trakt=kept.source.ids.trakt.or(row.ids.trakt);}
+        else {merged.push_back(Pending {trakt_missing:row.ids.trakt.is_none(),source:row});}
+    }
+    merged
+}
+
+/// Return whether this provider failed. Cache failures remain fatal to the
+/// native attempt; definitive absence does not become an outage or retry.
+fn rating_reply(details:&mut Details,reply:Result<Reply,Trouble>,now:i64,apply:fn(&mut Details,&Value))->Result<bool,Trouble> {
+    match reply {
+        Ok(Reply::Json(body))=>{apply(details,&body);Ok(false)},
+        Ok(Reply::NotFound)=>Ok(false),
+        Err(Trouble::Cache(error))=>Err(Trouble::Cache(error)),
+        Err(_)=>{try_again_soon(details,now);Ok(true)},
+    }
+}
+
+fn bind_trakt(mut ids:Ids,identity:TraktIdentity)->Result<Ids,Trouble> {
+    if ids.trakt.is_some() {return Ok(ids)}
+    match identity {
+        TraktIdentity::Absent=>{},
+        TraktIdentity::Unique(id)=>ids.trakt=Some(id),
+        TraktIdentity::Ambiguous=>return Err(Trouble::Bad("ambiguous native details rating identity".into())),
+    }
+    Ok(ids)
+}
 
 #[derive(Debug)]
 pub(crate) enum Progress {Disabled,Idle,Visited,ArtworkUnavailable,Deferred,Waiting(Duration)}
 pub(crate) struct Service {
     cache:Arc<Cache>,config:MediaConfig,sources:Option<Arc<Sources>>,image:Option<Client>,assets:Option<Arc<Grant>>,
-    after:Option<i64>,pending:VecDeque<Source>,next:Instant,
+    after:Option<i64>,pending:VecDeque<Pending>,next:Instant,
 }
 impl Service {
     pub(crate) fn enabled(config:&MediaConfig)->bool {backfill_on(config)}
@@ -33,13 +91,12 @@ impl Service {
             let page=self.cache.details_page(self.after)?;
             if page.exhausted {self.after=None;self.next=at+BACKFILL_REST;return Ok(Progress::Idle)}
             self.after=page.after;
-            let mut seen=HashSet::new();
-            self.pending.extend(page.rows.into_iter().filter(|row|seen.insert((row.kind,row.ids.tmdb,row.ids.imdb,row.ids.tvdb))));
+            self.pending.extend(merge_sources(page.rows));
             if self.pending.is_empty() {self.next=at+Duration::from_millis(100);return Ok(Progress::Visited)}
         }
-        let Some(source)=self.pending.pop_front() else{return Ok(Progress::Idle)};
+        let Some(Pending {source,trakt_missing})=self.pending.pop_front() else{return Ok(Progress::Idle)};
         self.next=at+Duration::from_secs_f64(60.0/self.config.details_per_minute.max(1) as f64);
-        match self.for_title(source.kind,&source.ids,now) {
+        match self.for_title_with_trakt(source.kind,&source.ids,trakt_missing,now) {
             Ok(Some(details))=>{
                 if let Some(path)=details.poster.as_deref() {
                     let Some(assets)=&self.assets else{return Ok(Progress::ArtworkUnavailable)};
@@ -55,22 +112,22 @@ impl Service {
                         match reply {
                             Ok(Some(bytes))=>{if !bytes.starts_with(&[0xff,0xd8,0xff]) {return Ok(Progress::Deferred)}if assets.produce_poster(details.kind,details.tmdb_id,path,&bytes)?==crate::pg::worker_assets::ArtworkStatus::Changed {return Ok(Progress::Deferred)}},
                             Ok(None)=>{},
-                            Err(error)=>return self.problem(error,source,now,at),
+                            Err(error)=>return self.problem(error,source,trakt_missing,now,at),
                         }
                     }
                 }
                 Ok(Progress::Visited)
             },
             Ok(None)=>Ok(Progress::Visited),
-            Err(error)=>self.problem(error,source,now,at),
+            Err(error)=>self.problem(error,source,trakt_missing,now,at),
         }
     }
-    fn problem(&mut self,error:Trouble,source:Source,now:i64,at:Instant)->Result<Progress> {
+    fn problem(&mut self,error:Trouble,source:Source,trakt_missing:bool,now:i64,at:Instant)->Result<Progress> {
         match error {
             Trouble::Cache(error)=>Err(error.into_error()),
             Trouble::Paused(until)|Trouble::BadKey(until)=>{
                 let wait=Duration::from_secs(until.saturating_sub(now).max(1) as u64);self.next=at+wait;
-                self.pending.push_front(source);Ok(Progress::Waiting(wait))
+                self.pending.push_front(Pending {source,trakt_missing});Ok(Progress::Waiting(wait))
             },
             // A provider failure says nothing about the title. Keep prior rows,
             // advance this bounded pass, and retry it on the next ordinary pass.
@@ -87,7 +144,17 @@ impl Service {
         self.cache.put_details_lookup(&key,found,now).map_err(Self::failure)?;Ok(found)
     }
     pub(super) fn for_title(&self,kind:i64,ids:&Ids,now:i64)->Result<Option<Details>,Trouble> {
+        self.for_title_with_trakt(kind,ids,ids.trakt.is_none(),now)
+    }
+    fn for_title_with_trakt(&self,kind:i64,ids:&Ids,trakt_missing:bool,now:i64)->Result<Option<Details>,Trouble> {
         if !(1..=2).contains(&kind) {return Err(Trouble::Bad("unsupported native details kind".into()))}
+        // Fill only a missing rating-provider ID, before any lookup/provider or
+        // freshness decision. Known IDs retain their existing authority.
+        // A page merge must not hide ambiguity on an older page. The private
+        // pending flag remembers whether the newest source originally lacked
+        // Trakt; only its provisional page addition may be replaced here.
+        let ids=if trakt_missing {bind_trakt(Ids {trakt:None,..*ids},self.cache.details_trakt(kind,ids).map_err(Self::failure)?)?}else{*ids};
+        let ids=&ids;
         let tmdb=match ids.tmdb {Some(id)=>Some(id),None=>self.lookup(kind,ids,now)?};
         let own=if kind==Kind::Tv as i64 {ids.tvdb}else{None};
         let own_kept=match own {
@@ -99,7 +166,8 @@ impl Service {
             if kept.as_ref().is_some_and(fresh) {return Ok(kept)}
             if own_kept.as_ref().is_some_and(fresh) {return Ok(own_kept)}
             if !self.config.tmdb.api_key.is_empty() {
-                if let Some(details)=self.sources.as_ref().expect("enabled metadata sources").native_fetch(kind,tmdb,ids,now)? {
+                if let Some(fresh)=self.sources.as_ref().expect("enabled metadata sources").native_fetch(kind,tmdb,ids,now)? {
+                    let details=preserve_failed_scores(fresh,kept.as_ref());
                     self.cache.put_details(&details).map_err(Self::failure)?;return Ok(Some(details))
                 }
             }
@@ -108,7 +176,8 @@ impl Service {
         let Some(tvdb)=own else{return Ok(None)};
         if own_kept.as_ref().is_some_and(fresh) {return Ok(own_kept)}
         let Some(sources)=self.sources.as_ref() else{return Ok(own_kept)};
-        let Some(details)=sources.native_tvdb(tvdb,ids,now)? else{return Ok(own_kept)};
+        let Some(fresh)=sources.native_tvdb(tvdb,ids,now)? else{return Ok(own_kept)};
+        let details=preserve_failed_scores(fresh,own_kept.as_ref());
         self.cache.put_details(&details).map_err(Self::failure)?;Ok(Some(details))
     }
 }
@@ -125,28 +194,31 @@ impl Sources {
             },
         }
     }
-    fn native_fetch(&self,kind:i64,id:i64,ids:&Ids,now:i64)->Result<Option<Details>,Trouble> {
+    fn native_fetch(&self,kind:i64,id:i64,ids:&Ids,now:i64)->Result<Option<Refreshed>,Trouble> {
         let section=if kind==Kind::Tv as i64{"tv"}else{"movie"};let extra=if kind==Kind::Tv as i64{"credits"}else{"credits,release_dates"};
         let url=format!("{}/{section}/{id}?append_to_response={extra}&api_key={}",self.tmdb_base(),encode(&self.tmdb.api_key));
         let Reply::Json(body)=self.tmdb_client.get(&url,&[])? else{return Ok(None)};
-        let mut details=from_tmdb(kind,id,&body,now);self.native_ratings(&mut details,kind,ids,now)?;Ok(Some(details))
+        let mut details=from_tmdb(kind,id,&body,now);let failed=self.native_ratings(&mut details,kind,ids,now)?;Ok(Some(Refreshed {details,failed}))
     }
-    fn native_tvdb(&self,id:i64,ids:&Ids,now:i64)->Result<Option<Details>,Trouble> {
+    fn native_tvdb(&self,id:i64,ids:&Ids,now:i64)->Result<Option<Refreshed>,Trouble> {
         let Some(tvdb)=&self.tvdb else{return Ok(None)};
         let Some(body)=tvdb.series(id)? else{return Ok(None)};
         let mut details=from_tvdb(id,&body,self.tvdb_config.base_url.as_deref().unwrap_or(TVDB_IMAGES),now);
-        self.native_ratings(&mut details,Kind::Tv as i64,ids,now)?;Ok(Some(details))
+        let failed=self.native_ratings(&mut details,Kind::Tv as i64,ids,now)?;Ok(Some(Refreshed {details,failed}))
     }
-    fn native_ratings(&self,details:&mut Details,kind:i64,ids:&Ids,now:i64)->Result<(),Trouble> {
+    fn native_ratings(&self,details:&mut Details,kind:i64,ids:&Ids,now:i64)->Result<RatingFailures,Trouble> {
+        let mut failed=RatingFailures::default();
         if let Some(imdb)=ids.imdb && !self.omdb.api_key.is_empty() {
             let base=self.omdb.base_url.as_deref().unwrap_or(OMDB_BASE);let url=format!("{base}/?i=tt{imdb:07}&apikey={}",encode(&self.omdb.api_key));
-            match self.omdb_client.get(&url,&[]) {Ok(Reply::Json(body))=>add_omdb(details,&body),Ok(Reply::NotFound)=>{},Err(Trouble::Cache(error))=>return Err(Trouble::Cache(error)),Err(_)=>try_again_soon(details,now)}
+            failed.omdb=rating_reply(details,self.omdb_client.get(&url,&[]),now,add_omdb)?;
         }
         if let Some(trakt)=ids.trakt && !self.trakt.client_id.is_empty() {
             let base=self.trakt.base_url.as_deref().unwrap_or(TRAKT_BASE);let section=if kind==Kind::Tv as i64{"shows"}else{"movies"};let url=format!("{base}/{section}/{trakt}?extended=full");
-            match self.trakt_client.get(&url,&[("trakt-api-version","2"),("trakt-api-key",self.trakt.client_id.as_str())]) {
-                Ok(Reply::Json(body))=>details.trakt_score=trakt_score(&body),Ok(Reply::NotFound)=>{},Err(Trouble::Cache(error))=>return Err(Trouble::Cache(error)),Err(_)=>try_again_soon(details,now),
-            }
-        }Ok(())
+            failed.trakt=rating_reply(details,self.trakt_client.get(&url,&[("trakt-api-version","2"),("trakt-api-key",self.trakt.client_id.as_str())]),now,|d,body|d.trakt_score=trakt_score(body))?;
+        }Ok(failed)
     }
 }
+
+#[cfg(test)]
+#[path="native_merge_tests.rs"]
+mod merge_tests;
