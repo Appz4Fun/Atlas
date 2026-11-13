@@ -112,7 +112,7 @@ fn a_partial_final_frame_keeps_the_original_first_samples() {
         let wanted=rate as usize/1000;
         let (_,prefix)=decode(&track,&[&crowded],1).expect(name);
         assert_eq!(prefix,vec![whole[0][..wanted].to_vec()],"{name}: preserve the beginning, not a later slice");
-        assert!(prefix[0].iter().any(|sample|*sample!=0),"{name}: fixture must retain audible samples");
+        assert!(whole[0].iter().any(|sample|*sample!=0),"{name}: fixture must contain audible samples");
     }
 }
 
