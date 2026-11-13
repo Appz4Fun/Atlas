@@ -36,6 +36,7 @@ fn verify(grant:&Arc<Grant>,id:i64,key:crate::pg::natural_cache::Key<'_>,parts:i
     grant.verify_probe(id,key,parts,complete,stamp,saved,&checked)
 }
 #[test]
+#[ignore="requires isolated PostgreSQL and genuine Unix asset identity"]
 fn worker_cover_grant_uses_real_pg_association_and_pins_verified_spool_until_settlement() {
     let schema=crate::pg::testing::Schema::new().expect("explicit isolated PG required");let runtime=crate::pg::stage_queue_tests::runtime(&schema);
     let (id,name,group,content,parts,complete)=source(&runtime);let key=crate::pg::natural_cache::Key {name:&name,group:&group,content_id:&content};
@@ -50,6 +51,7 @@ fn worker_cover_grant_uses_real_pg_association_and_pins_verified_spool_until_set
     assert!(hold.check(&runtime.owner,id+1).is_err());
 }
 #[test]
+#[ignore="requires isolated PostgreSQL and genuine Unix asset identity"]
 fn worker_cover_grant_refuses_wrong_content_forged_descriptor_and_ended_owner() {
     let schema=crate::pg::testing::Schema::new().expect("explicit isolated PG required");let runtime=crate::pg::stage_queue_tests::runtime(&schema);
     let (id,name,group,content,parts,complete)=source(&runtime);let key=crate::pg::natural_cache::Key {name:&name,group:&group,content_id:&content};
@@ -62,6 +64,7 @@ fn worker_cover_grant_refuses_wrong_content_forged_descriptor_and_ended_owner() 
     assert!(hold.check(&runtime.owner,id).is_err());assert!(verify(&grant,id,key,parts,complete,127,&saved).is_err());
 }
 #[test]
+#[ignore="requires isolated PostgreSQL and genuine Unix asset identity"]
 fn worker_native_produced_cover_reuses_durable_receipt_without_manifest_rewrite() {
     let schema=crate::pg::testing::Schema::new().expect("explicit isolated PG required");let runtime=crate::pg::stage_queue_tests::runtime(&schema);
     let (id,name,group,content,parts,complete)=source(&runtime);let key=crate::pg::natural_cache::Key {name:&name,group:&group,content_id:&content};
@@ -81,6 +84,7 @@ fn worker_asset_selection_redacts_paths_and_requires_exact_physical_manifest() {
 }
 
 #[test]
+#[ignore="requires isolated PostgreSQL and genuine Unix asset identity"]
 fn worker_cover_missing_and_overlarge_files_do_not_become_provider_cache_misses() {
     let schema=crate::pg::testing::Schema::new().expect("explicit isolated PG required");let runtime=crate::pg::stage_queue_tests::runtime(&schema);
     let (id,name,group,content,parts,complete)=source(&runtime);let key=crate::pg::natural_cache::Key {name:&name,group:&group,content_id:&content};
@@ -95,6 +99,7 @@ fn worker_cover_missing_and_overlarge_files_do_not_become_provider_cache_misses(
 }
 
 #[test]
+#[ignore="requires isolated PostgreSQL and genuine Unix asset identity"]
 fn worker_cover_rejects_real_pg_mime_mismatch_and_preserves_driver_errors() {
     let schema=crate::pg::testing::Schema::new().expect("explicit isolated PG required");let runtime=crate::pg::stage_queue_tests::runtime(&schema);
     let (id,name,group,content,parts,complete)=source(&runtime);let key=crate::pg::natural_cache::Key {name:&name,group:&group,content_id:&content};
@@ -108,6 +113,7 @@ fn worker_cover_rejects_real_pg_mime_mismatch_and_preserves_driver_errors() {
 }
 
 #[test]
+#[ignore="requires isolated PostgreSQL and genuine Unix asset identity"]
 fn worker_cover_producer_requires_real_source_and_never_overwrites_conflicting_bytes() {
     let schema=crate::pg::testing::Schema::new().expect("explicit isolated PG required");let runtime=crate::pg::stage_queue_tests::runtime(&schema);
     let (id,_,_,_,_,_)=source(&runtime);let (root,_evidence,selection,_)=selected(&jpeg());let grant=Grant::open(&runtime.owner,Some(&selection)).unwrap().unwrap();
@@ -121,6 +127,7 @@ fn worker_cover_producer_requires_real_source_and_never_overwrites_conflicting_b
 }
 
 #[test]
+#[ignore="requires isolated PostgreSQL and genuine Unix asset identity"]
 fn native_generated_poster_is_available_through_same_pg_bound_manifest_family() {
     let schema=crate::pg::testing::Schema::new().expect("explicit isolated PG required");let runtime=crate::pg::stage_queue_tests::runtime(&schema);
     let (_root,_evidence,selection,_)=selected(&jpeg());let grant=Grant::open(&runtime.owner,Some(&selection)).unwrap().unwrap();
