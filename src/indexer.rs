@@ -3116,3 +3116,11 @@ mod tests {
 #[cfg(test)]
 #[path = "../tests/common/native_provider_contract.rs"]
 mod native_provider_contract;
+
+#[cfg(test)]
+#[path = "../tests/common/native_per_article_contract.rs"]
+mod native_per_article_contract;
+
+#[cfg(test)]
+#[path = "../tests/common/native_collection_paths.rs"]
+mod native_collection_paths;
