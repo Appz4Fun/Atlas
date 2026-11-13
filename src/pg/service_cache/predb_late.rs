@@ -10,7 +10,7 @@ const TEXT_BYTES:i64=64*1024*1024;
 const CANDIDATES:i64=64;
 
 #[derive(Debug,Default)]
-pub(crate) struct LateReport {pub(crate) indexed:usize,pub(crate) titles:usize,pub(crate) reruns:usize,pub(crate) overflow:usize,pub(crate) pending:bool}
+pub(crate) struct LateReport {pub(crate) indexed:usize,pub(crate) titles:usize,pub(crate) reruns:usize,pub(crate) overflow:usize,pub(crate) pending:bool,pub(crate) budget_exhausted:bool}
 impl Service {
     /// Actual native maintenance entry point. Config-off/zero stays idle;
     /// monotonic time admits at most one configured title budget per second.
@@ -33,13 +33,10 @@ impl Service {
         }
         let mut report=self.late_tick_inner(now,32)?;
         for _ in report.titles..usize::try_from(cfg.late_per_second.min(1000))? {
-            if report.pending {break}
-            if started.elapsed()>=std::time::Duration::from_millis(200) {
-                self.counters.out_of_budget.fetch_add(1,std::sync::atomic::Ordering::Relaxed);break
-            }
+            if report.pending || started.elapsed()>=std::time::Duration::from_millis(200) {break}
             let page=self.cache.with(|tx|late_page(tx,now))?;
             self.counters.page(&page);
-            report.titles+=page.titles;report.reruns+=page.reruns;report.overflow+=page.overflow;report.pending=page.pending;
+            report.titles+=page.titles;report.reruns+=page.reruns;report.overflow+=page.overflow;report.pending=page.pending;report.budget_exhausted|=page.budget_exhausted;
             if page.titles==0 {break}
         }
         Ok(report)
@@ -57,7 +54,7 @@ impl Service {
         }
         let page=self.cache.with(|tx|late_page(tx,now))?;
         self.counters.page(&page);
-        report.titles=page.titles;report.reruns=page.reruns;report.overflow=page.overflow;report.pending=page.pending;
+        report.titles=page.titles;report.reruns=page.reruns;report.overflow=page.overflow;report.pending=page.pending;report.budget_exhausted=page.budget_exhausted;
         Ok(report)
     }
 }
@@ -173,7 +170,7 @@ fn late_page(tx:&mut Transaction<'_>,now:i64)->Result<LateReport> {
             report.overflow=1;finish(tx,title_id)?;report.titles=1;return Ok(report)
         }
     }
-    if more {tx.execute("update predb_late_scan set after_release=$1 where singleton",&[&next])?;report.pending=true;return Ok(report)}
+    if more {tx.execute("update predb_late_scan set after_release=$1 where singleton",&[&next])?;report.pending=true;report.budget_exhausted=true;return Ok(report)}
     let rows=tx.query("select release_id from predb_late_matches order by release_id limit 17",&[])?;
     ensure!(rows.len()<=LATE_MAX_RERUNS,"late PreDB nomination invariant");
     let ids=rows.into_iter().map(|row|row.try_get::<_,i64>(0)).collect::<Result<Vec<_>,_>>()?;
