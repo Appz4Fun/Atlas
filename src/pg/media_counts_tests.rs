@@ -144,3 +144,23 @@ fn native_media_count_work_deadline_begins_after_healthy_original_owner_contenti
     runtime.owner.with(|client| {assert_eq!(observed(client),vec![("alt.binaries.uhd".into(),1)]);
         assert_eq!(client.query_one("select 1::bigint",&[])?.get::<_,i64>(0),1);Ok(())}).unwrap();runtime.owner.close();
 }
+
+#[test]
+#[ignore="requires explicit isolated owned PostgreSQL; real elapsed local work budget must defer without owner failure"]
+fn native_media_count_local_work_budget_defers_without_publication_or_scan_advance() {
+    let schema=pg::testing::Schema::new().expect("explicit isolated PostgreSQL required");let (runtime,headers,_root)=runtime(&schema);
+    runtime.owner.with(|client| {pg::release_writer::save(client,&[release("alt.binaries.uhd","Movie.2160p",0,4<<30)],1)?;
+        client.execute("insert into backfill_media(grp,releases) values('prior',42)",&[])?;Ok(())}).unwrap();
+    let mut service=Service::new(&runtime.owner,runtime.db.clone(),&headers).unwrap();let next=service.next;
+    runtime.owner.with(|client| {
+        let until=Instant::now()+PAGE_DEADLINE;
+        // Real elapsed standard-thread delay after owner admission. No clock
+        // injection or PG statement timeout substitutes for local expiry.
+        std::thread::sleep(Duration::from_secs(6));
+        assert!(service.page(client,until)?.is_none());Ok(())
+    }).unwrap();
+    assert_eq!(runtime.owner.failure(),None);assert!(!service.initialized&&service.scan.is_none());assert_eq!(service.next,next);
+    runtime.owner.with(|client| {assert_eq!(observed(client),vec![("prior".into(),42)]);Ok(())}).unwrap();
+    assert_eq!(service.tick().unwrap(),Tick::Stored);
+    runtime.owner.with(|client| {assert_eq!(observed(client),vec![("alt.binaries.uhd".into(),1)]);Ok(())}).unwrap();runtime.owner.close();
+}

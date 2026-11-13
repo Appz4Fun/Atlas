@@ -21,6 +21,12 @@ const PAGE_DEADLINE:Duration=Duration::from_secs(5);
 pub(crate) enum Tick {Idle,Progress,Stored}
 #[derive(Clone,Copy)]
 struct Scan {after:Option<i64>,through:Option<i64>}
+#[derive(Debug)]
+struct PageBudgetEnded;
+impl std::fmt::Display for PageBudgetEnded {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str("native media count page budget ended")}
+}
+impl std::error::Error for PageBudgetEnded {}
 
 /// One service on the original native standard-thread lane. Its random-named
 /// temporary table belongs to that owner's actual PostgreSQL session; no pool,
@@ -46,14 +52,24 @@ impl Service {
         self.db.check_native_owner(&self.owner)?;
         if self.owner.stop.load(Ordering::Acquire) {return Err(super::outage::AttemptEnded.into())}
         if self.scan.is_none()&&clock<self.next {return Ok(Tick::Idle)}
-        let began=Instant::now();let owner=&self.owner;
-        let epoch=owner.epoch().context("native media count original epoch ended")?;
-        let table=&self.table;let headers=&self.headers;let scan=self.scan;
-        let (next,stored)=owner.with(|client| {
+        let began=Instant::now();
+        let outcome=self.owner.with(|client| {
             // Waiting for the shared owner and its preflight is not page work.
             // A healthy sibling worker must leave this page its full budget.
             let until=Instant::now()+PAGE_DEADLINE;
-            let mut tx=client.transaction()?;
+            self.page(client,until)
+        })?;
+        let Some((next,stored))=outcome else {return Ok(Tick::Progress)};
+        // Neither scan position nor daily cadence can advance on failed COMMIT.
+        self.initialized=true;
+        if stored {self.scan=None;self.next=clock+began.elapsed()+COUNT_EVERY;Ok(Tick::Stored)}
+        else {self.scan=Some(next);Ok(Tick::Progress)}
+    }
+    fn page(&self,client:&mut postgres::Client,until:Instant)->Result<Option<(Scan,bool)>> {
+        let owner=&self.owner;let epoch=owner.epoch().context("native media count original epoch ended")?;
+        let table=&self.table;let headers=&self.headers;let scan=self.scan;
+        let mut tx=client.transaction()?;
+        let outcome:Result<(Scan,bool)>=(|| {
             bound(&mut tx,owner,until)?;super::history_gate::native(&mut tx)?;
             bound(&mut tx,owner,until)?;epoch.verify(&mut tx)?;
             epoch.catalog().header_config(headers)?;
@@ -90,18 +106,21 @@ impl Service {
                 bound(&mut tx,owner,until)?;tx.batch_execute(&format!("truncate pg_temp.\"{table}\""))?;
             }
             bound(&mut tx,owner,until)?;epoch.verify(&mut tx)?;
-            bound(&mut tx,owner,until)?;tx.commit()?;
+            bound(&mut tx,owner,until)?;
             Ok((Scan {after,through:scan.through},stored))
-        })?;
-        // Neither scan position nor daily cadence can advance on failed COMMIT.
-        self.initialized=true;
-        if stored {self.scan=None;self.next=clock+began.elapsed()+COUNT_EVERY;Ok(Tick::Stored)}
-        else {self.scan=Some(next);Ok(Tick::Progress)}
+        })();
+        // Confirm actual rollback BEFORE translating a local scheduling outcome.
+        // A real rollback/COMMIT driver failure still reaches Owner unchanged.
+        match outcome {
+            Ok(value)=>{tx.commit()?;Ok(Some(value))},
+            Err(error) if error.is::<PageBudgetEnded>()=>{tx.rollback()?;Ok(None)},
+            Err(error)=>Err(error),
+        }
     }
 }
 fn bound(tx:&mut postgres::Transaction<'_>,owner:&Owner,until:Instant)->Result<()> {
     if owner.stop.load(Ordering::Acquire) {return Err(super::outage::AttemptEnded.into())}
-    let remaining=until.checked_duration_since(Instant::now()).filter(|duration|!duration.is_zero()).context("native media count page deadline expired")?;
+    let remaining=until.checked_duration_since(Instant::now()).filter(|duration|!duration.is_zero()).ok_or(PageBudgetEnded)?;
     let millis=remaining.as_millis().clamp(1,i32::MAX as u128).to_string();
     tx.query_one("select set_config('statement_timeout',$1,true),set_config('lock_timeout',$1,true)",&[&millis])?;Ok(())
 }
