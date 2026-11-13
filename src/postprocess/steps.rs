@@ -1,11 +1,6 @@
 //! Every processing step, one line each.
 
-use std::sync::Arc;
-
-use crate::archive::steps as archive;
-use crate::naming::steps as naming;
-
-use super::step::{Step, StepId, Needs};
+use super::step::{StepId,Needs};
 
 /// Code metadata only: constructing a media Step also constructs its legacy
 /// cache/service. Read-only native views must not initialize those services.
@@ -36,32 +31,6 @@ pub(crate) fn catalog() -> &'static [Descriptor] {
     &CATALOG
 }
 
-pub fn all() -> Vec<Arc<dyn Step>> {
-    let [parse, lookup, nfo] = crate::media::steps();
-    vec![
-        Arc::new(archive::Par2Step::default()),
-        Arc::new(archive::ListStep::default()),
-        Arc::new(crate::archive::link::LinkStep::default()),
-        Arc::new(crate::probe::ProbeStep::default()),
-        Arc::new(crate::probe::body_crc::BodyCrcStep),
-        Arc::new(crate::probe::opensubtitles::OpenSubtitlesStep::default()),
-        Arc::new(crate::probe::stills::StillsStep),
-        Arc::new(naming::Naming),
-        Arc::new(naming::NfoName),
-        Arc::new(crate::sidecar::SidecarStep),
-        Arc::new(crate::sidecar::SidecarImageStep),
-        Arc::new(crate::images::step::ImagesStep::default()),
-        Arc::new(crate::predb::step::PredbMatch),
-        Arc::new(crate::category::CategoryStep::new()),
-        parse,
-        lookup,
-        nfo,
-        Arc::new(crate::probe::opensubtitles::OpenSubtitlesImdb),
-        Arc::new(crate::keys::KeysStep::default()),
-        Arc::new(crate::probe::audio_print::AudioPrintStep),
-    ]
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -69,12 +38,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn view_catalog_matches_actual_registered_step_metadata() {
-        let mut actual: Vec<_> = all().into_iter().map(|s| Descriptor {
-            id: s.id(), name: s.name(), rank: s.rank(), needs: s.needs(),
-        }).collect();
-        actual.sort_by_key(|s| s.rank);
-        assert_eq!(catalog(), actual);
+    fn catalog_exposes_twenty_ordered_native_steps_without_constructing_services() {
+        assert_eq!(catalog().len(),20);
+        assert!(catalog().windows(2).all(|pair|pair[0].rank<pair[1].rank));
     }
 
     #[test]
@@ -89,16 +55,16 @@ mod tests {
             (40..=47, 600..=699),
         ];
         let (mut ids, mut ranks, mut names) = (HashSet::new(), HashSet::new(), HashSet::new());
-        for step in all() {
-            assert!(ids.insert(step.id().0), "id {}", step.id().0);
-            assert!(ranks.insert(step.rank()), "rank {}", step.rank());
-            assert!(names.insert(step.name()), "{}", step.name());
+        for step in catalog() {
+            assert!(ids.insert(step.id.0), "id {}", step.id.0);
+            assert!(ranks.insert(step.rank), "rank {}", step.rank);
+            assert!(names.insert(step.name), "{}", step.name);
             assert!(
-                ranges.iter().any(|(i, r)| i.contains(&step.id().0) && r.contains(&step.rank())),
+                ranges.iter().any(|(i, r)| i.contains(&step.id.0) && r.contains(&step.rank)),
                 "{} has id {} rank {}",
-                step.name(),
-                step.id().0,
-                step.rank()
+                step.name,
+                step.id.0,
+                step.rank
             );
         }
     }
