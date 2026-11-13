@@ -67,7 +67,9 @@ fn every_source(h: &Home) {
 #[test]
 fn current_classifier_vectors_survive_unname_retirement() {
     assert!(atlas::parser::is_obfuscated("kP93xQ7rL.ZMtwBfa"));
-    assert!(atlas::parser::is_obfuscated("Xk3Mz9PqL [12345678]"));
+    let identity = atlas::naming::without_collision_suffix("Xk3Mz9PqL [12345678]");
+    assert_eq!(identity, "Xk3Mz9PqL");
+    assert!(atlas::parser::is_obfuscated(identity));
     assert!(!atlas::parser::is_obfuscated("Good.Release.2024"));
 }
 
