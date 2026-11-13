@@ -444,3 +444,39 @@ fn an_orphan_checkpoint_cannot_create_an_empty_replacement_log() {
     assert!(!segment_path(&fixture.dir, 0).exists());
     assert_eq!(fs::read(fixture.dir.join("tail")).unwrap(), before);
 }
+
+#[test]
+fn append_reply_extent_is_admitted_before_any_commit() {
+    let fixture = Fixture::new(&[]);
+    let scope = test_io::Scope::enter(&fixture.dir, None);
+    let log = fixture.open().unwrap();
+    let before = log.tail();
+    let body: Vec<u8> =
+        (0u64..6).flat_map(|key| [key.to_be_bytes().as_slice(), &0u32.to_be_bytes()].concat()).collect();
+    assert_eq!(body.len(), 72);
+    let error = handle_append(&log, &body, 100).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidData);
+    assert!(error.to_string().contains("append response"));
+    assert_eq!(log.tail(), before, "rejected response extent must not publish a batch");
+    assert!(fixture.bytes(0).is_empty(), "rejected batch must not enter the writer");
+    assert!(scope.allocations().is_empty());
+    let reply = handle_append(&log, &body[..60], 105).unwrap();
+    assert_eq!(reply.len(), 105, "the exact five-locator boundary remains writable");
+    assert_ne!(log.tail(), before);
+    drop(log);
+}
+
+#[test]
+fn append_extent_checks_both_directions_and_overflow_without_large_allocations() {
+    let extent = append_extent([0; 5], 105).unwrap();
+    assert_eq!((extent.request, extent.response, extent.count), (60, 105, 5));
+    for (lengths, limit) in [(vec![0; 6], 100), (vec![94], 105), (vec![usize::MAX], usize::MAX)] {
+        assert_eq!(append_extent(lengths, limit).err().unwrap().kind(), ErrorKind::InvalidData);
+    }
+    let count = MAX_FRAME / REF_BYTES + 1;
+    assert_eq!(count, 25_565_282);
+    assert_eq!(count * 12, 306_783_384);
+    assert_eq!(count * REF_BYTES, 536_870_922);
+    let mut extent = AppendExtent { request: 0, response: 0, count: usize::MAX / REF_BYTES };
+    assert_eq!(extent.include(0, usize::MAX).unwrap_err().kind(), ErrorKind::InvalidData);
+}
