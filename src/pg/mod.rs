@@ -32,6 +32,8 @@ pub(crate) mod stage;
 pub(crate) mod stage_words;
 pub(crate) mod content_id;
 pub mod stage_reads;
+#[path="../spotnet/native_reads.rs"]
+pub(crate) mod fresh_spots;
 pub(crate) mod stage_telemetry;
 pub(crate) mod stage_group_refresh;
 #[cfg(test)]
