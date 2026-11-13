@@ -143,29 +143,36 @@ impl<'client> ReadView<'client> {
     pub(crate) fn recent(&self, offset: i64, limit: usize) -> Result<Vec<ReleaseRow>> {
         ensure!(offset >= 0 && limit <= self.budget.rows, "native recent page exceeds admission");
         if limit == 0 { return Ok(Vec::new()); }
-        let mut before: Option<i64> = None;
-        let mut skipped = 0i64;
-        let mut rejected = 0usize;
-        let mut found = Vec::new();
-        loop {
+        // Skipped rows carry only a fixed ID and an admitted group descriptor.
+        // Their temporary workspace ends before the single page hydration;
+        // rows() retains every charge for the values actually returned.
+        let available=self.budget.bytes.checked_sub(self.owned.get()).context("native reader ownership exceeded admission")?;
+        let selection=(limit as u64).checked_mul(16).and_then(|n|n.checked_add(4096)).context("native recent selection extent overflow")?;
+        let room=available.checked_sub(selection).context("native recent descriptor workspace exceeds admission")?;
+        let page_size=self.budget.rows.min(128).min(usize::try_from(room/2048).unwrap_or(usize::MAX));
+        ensure!(page_size>0,"native recent descriptor workspace exceeds admission");
+        let mut before:Option<i64>=None;let mut skipped=0i64;let mut rejected=0usize;let mut ids=Vec::with_capacity(limit);
+        'pages: loop {
             self.before_query()?;
-            let ids = self.tx.borrow_mut().query("select id from releases
-                where (display_name is not null or (not is_obfuscated and (length(name)<16 or name collate \"C\" ~ '[^A-Za-z0-9]')))
-                  and ($1::bigint is null or id<$1) order by id desc limit $2", &[&before,&i64::try_from(self.budget.rows)?])?
-                .into_iter().map(|row|row.try_get(0)).collect::<std::result::Result<Vec<i64>,_>>()?;
-            if ids.is_empty() { break; }
-            let mut page: std::collections::HashMap<_,_> = self.rows(&ids)?.into_iter().map(|row|(row.id,row)).collect();
-            for id in &ids {
-                before = Some(*id);
-                if let Some(row) = page.remove(id) {
-                    if skipped < offset { skipped += 1; } else { found.push(row); }
-                } else { rejected += 1; }
-                if found.len() == limit || rejected > crate::search::Bounds::DEFAULT.rejects { return Ok(found); }
+            let descriptors=self.tx.borrow_mut().query("select id,case when octet_length(group_name)<=$3 then group_name else null::text end
+                from releases where (display_name is not null or(not is_obfuscated and(length(name)<16 or name collate \"C\" ~ '[^A-Za-z0-9]')))
+                and($1::bigint is null or id<$1) order by id desc limit $2",&[&before,&i64::try_from(page_size)?,&(crate::filters::MAX_GROUP_NAME as i32)])?;
+            let count=descriptors.len();if count==0{break;}
+            for descriptor in descriptors {
+                self.check_deadline()?;let id:i64=descriptor.try_get(0)?;before=Some(id);
+                let group:Option<String>=descriptor.try_get(1)?;
+                if group.as_deref().is_some_and(|group|!crate::filters::group_blocked(group)) {
+                    if skipped<offset {skipped=skipped.checked_add(1).context("native recent offset overflow")?;}else{ids.push(id);}
+                }else{rejected+=1;}
+                if ids.len()==limit||rejected>crate::search::Bounds::DEFAULT.rejects {break 'pages;}
             }
-            if ids.len() < self.budget.rows { break; }
+            if count<page_size{break;}
         }
-        Ok(found)
+        let rows=self.rows(&ids)?;
+        ensure!(rows.len()==ids.len(),"native recent visibility changed during page hydration");
+        Ok(rows)
     }
+
 }
 
 #[cfg(test)]
