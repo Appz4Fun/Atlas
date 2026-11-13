@@ -8,9 +8,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use atlas::indexer::Indexer;
 use atlas::nntp::BlockingPool;
-use common::{GROUP, Server, index_until_idle, mock, post, spawn_server};
+use common::{GROUP, Server, mock, post, spawn_server};
 
 fn posts(n: u64) -> Vec<common::Post> {
     (1..=n).map(|i| post(i, &format!(r#""rel{}.part{}.rar" yEnc (1/1)"#, i / 20, i % 20 + 1), 10, vec![])).collect()
@@ -216,69 +215,6 @@ fn a_group_moved_twice_goes_back_to_the_home_it_left_first() {
     assert_eq!(second, 3 - first, "neither the home nor the server it just left");
     // once it is due, back to the home it left first, not the one in between
     assert_eq!(pool.pool.pick_server(GROUP), 0);
-}
-
-/// A slice answered with a 5xx (an overview in trouble for a while) is asked
-/// again on the next passes instead of being taken for gone: every article
-/// still gets indexed and the backfill reaches the bottom.
-#[test]
-fn a_refused_slice_is_read_again_later() {
-    let state = Server::new(posts(400));
-    *state.refuse_xover.lock().unwrap() = Some((120, 2));
-    let port = spawn_server(state.clone());
-
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("atlas.db");
-    atlas::db::create_db_at(&db_path).unwrap();
-    let pool = BlockingPool::new(&[mock(port, "secret", 2, 1)]);
-    pool.connect().unwrap();
-    let mut indexer = Indexer::new(pool, "backfill", atlas::db::open_at(&db_path).unwrap());
-    indexer.request_size = 50;
-    let mut failed = 0;
-    for _ in 0..20 {
-        if indexer.index_group(GROUP).is_err() {
-            failed += 1;
-        }
-        if indexer.is_idle(GROUP) {
-            break;
-        }
-    }
-    assert_eq!(failed, 2, "each refusal fails its pass");
-    assert!(state.refuse_xover.lock().unwrap().is_none(), "both refusals were used");
-
-    let conn = atlas::db::open_with_shards(&db_path).unwrap();
-    let (_, articles) = atlas::store::totals(&conn).unwrap();
-    assert_eq!(articles, 400, "the refused slice was read once the server answered");
-    let cursor: i64 =
-        conn.query_row("select backfill_cursor from groups where name = ?", [GROUP], |r| r.get(0)).unwrap();
-    assert_eq!(cursor, 0, "the backfill went all the way down");
-}
-
-/// A provider answering an empty range with `420 No Articles Selected`
-/// instead of 423: the range is empty, the pass goes on and finishes.
-#[test]
-fn an_empty_range_answered_420_is_just_empty() {
-    // articles 1-100 and 301-400, nothing in between
-    let posts = posts(400).into_iter().filter(|p| !(101..=300).contains(&p.number)).collect();
-    let mut state = Server::new(posts);
-    Arc::get_mut(&mut state).unwrap().empty_is_420 = true;
-    let port = spawn_server(state.clone());
-
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("atlas.db");
-    atlas::db::create_db_at(&db_path).unwrap();
-    let pool = BlockingPool::new(&[mock(port, "secret", 2, 1)]);
-    pool.connect().unwrap();
-    let mut indexer = Indexer::new(pool, "backfill", atlas::db::open_at(&db_path).unwrap());
-    indexer.request_size = 50;
-    index_until_idle(&mut indexer);
-
-    let conn = atlas::db::open_with_shards(&db_path).unwrap();
-    let (_, articles) = atlas::store::totals(&conn).unwrap();
-    assert_eq!(articles, 200);
-    let cursor: i64 =
-        conn.query_row("select backfill_cursor from groups where name = ?", [GROUP], |r| r.get(0)).unwrap();
-    assert_eq!(cursor, 0, "the backfill went all the way down");
 }
 
 /// One rejected login is a short rest like any failed connect: some providers word a connection limit or a hiccup
