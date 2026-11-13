@@ -82,7 +82,7 @@ fn native_catalog_walk_does_not_turn_query_or_identity_failure_into_empty_succes
     let error=walk.page(&view(&mut client,&schema.name),&destination.storage,&stop).unwrap_err();
     assert!(error.chain().any(|source|source.is::<postgres::Error>()));assert!(walk.finish(&stop).is_err());
     runtime.owner.with(|client|{client.batch_execute("alter table unavailable_releases rename to releases;
-        update native_catalog_identity set catalog_nonce=decode(repeat('11',32),'hex')")?;Ok(())}).unwrap();
+        update native_catalog_identity set header_root=header_root||'-drift'")?;Ok(())}).unwrap();
     assert!(Scan::begin(&view(&mut client,&schema.name),destination,&destination.storage,catalog,&stop).is_err());
     drop(client);runtime.owner.close();
 }
