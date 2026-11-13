@@ -26,6 +26,16 @@ fn native_web(storage: &crate::pg::StorageConfig) -> i32 {
 /// and cannot initialize a database, contact a provider, or create an asset.
 pub fn retired_storage_command(args: &[String]) -> Option<&str> {
     const RETIRED: &[&str] = &[
+        "--purge",
+        "--reprocess",
+        "--predb-import",
+        "--replay-raw-predb",
+        "--reflag-obfuscated",
+        "--unname",
+        "--recount-articles",
+        "--count-repair-candidates",
+        "--split-reposts",
+        "--undo-mojibake",
         "--convert",
         "--compact",
         "--reset-shards",
@@ -47,19 +57,7 @@ pub fn retired_storage_command(args: &[String]) -> Option<&str> {
 /// Maintenance contracts still awaiting native implementations. Keep their refusal
 /// explicit; dispatching their old implementations would open the retired catalog.
 pub fn unavailable_native_maintenance_command(args: &[String]) -> Option<&str> {
-    const PENDING: &[&str] = &[
-        "--purge",
-        "--reprocess",
-        "--predb-import",
-        "--replay-raw-predb",
-        "--reflag-obfuscated",
-        "--unname",
-        "--recount-articles",
-        "--count-repair-candidates",
-        "--split-reposts",
-        "--undo-mojibake",
-        "--crc-links",
-    ];
+    const PENDING: &[&str] = &["--crc-links"];
     args.iter().find(|arg| PENDING.contains(&arg.as_str())).map(String::as_str)
 }
 
@@ -79,6 +77,16 @@ mod native_cli_boundary_tests {
     #[test]
     fn retired_storage_commands_are_refused_even_with_a_native_command() {
         for command in [
+            "--purge",
+            "--reprocess",
+            "--predb-import",
+            "--replay-raw-predb",
+            "--reflag-obfuscated",
+            "--unname",
+            "--recount-articles",
+            "--count-repair-candidates",
+            "--split-reposts",
+            "--undo-mojibake",
             "--convert",
             "--compact",
             "--reset-shards",
@@ -98,20 +106,8 @@ mod native_cli_boundary_tests {
         }
     }
     #[test]
-    fn required_maintenance_is_not_mistaken_for_retired_storage_conversion() {
-        for command in [
-            "--purge",
-            "--reprocess",
-            "--predb-import",
-            "--replay-raw-predb",
-            "--reflag-obfuscated",
-            "--unname",
-            "--recount-articles",
-            "--count-repair-candidates",
-            "--split-reposts",
-            "--undo-mojibake",
-            "--crc-links",
-        ] {
+    fn crc_report_is_refused_before_the_retired_reader_can_open() {
+        for command in ["--crc-links"] {
             assert_eq!(retired_storage_command(&args(&[command])), None);
             assert_eq!(unavailable_native_maintenance_command(&args(&["--bg-indexer", command])), Some(command));
         }

@@ -43,7 +43,7 @@ Use Atlas from the terminal, browse its built-in Web UI, or point Prowlarr, NZBH
 > [!IMPORTANT]
 > Atlas is a single native binary written in **[Rust](https://www.rust-lang.org) 1.99.0**, edition 2024.
 
-The Rust version replaces the original Python version. This PostgreSQL cutover branch requires a checked PostgreSQL destination for product startup. SQLite conversion commands and the old terminal menu are retired; legacy modules and dependencies still await build-graph cleanup. See [current commands and remaining maintenance ports](docs/POSTGRES_FRONTDOORS.md). Service activation and deployment require their separate native qualification.
+The Rust version replaces the original Python version. This PostgreSQL cutover branch requires a checked PostgreSQL destination for product startup. SQLite conversion commands and the old terminal menu are retired; legacy modules and dependencies still await build-graph cleanup. See [current commands and graph qualification](docs/POSTGRES_FRONTDOORS.md). Service activation and deployment require their separate native qualification.
 
 | Component | Crate |
 |---|---|
@@ -110,7 +110,7 @@ Atlas was originally created in Python by [Eraxty](https://github.com/Eraxty) (`
 | **Web Interface** | None (terminal UI only) | Built-in **Oxide Web UI** (`src/web.rs`, `src/web_meta.rs`) with htmx, derived cookie auth, instant in-memory sorting, quality filter chips, field search, duplicates browser, 6 forensic panels, `+` inline drawers, video stills, cover art, and **Ask AI** (Google Gemini) |
 | **Release Grouping & Linking** | Basic subject grouping; per-article obfuscated spam created millions of 1-part rows | 1,154 per-group collection & naming regexes (ported from `newznab-tmux`), PAR2-set linking of fully obfuscated uploads, cross-group post folding, per-article obfuscated upload gathering/filtering, and automatic minor-labeled group blocking |
 | **Post-Processing & Probing** | Inline PAR2/NFO deobfuscation during save only | Persistent two-lane post-processing stage (`src/postprocess/`) with rate-budgeted article probes, 10-layer nested archive decompression (RAR4/5, 7z, ZIP, PPMd, LZMA2, bzip2, lz4), MKV/MP4 stream inspection, H.264/HEVC keyframe still extraction, and `pHash` same-film matching |
-| **PreDB & Naming** | None | Dedicated `atlas.predb.db` polling 30+ scene/P2P feeds (RSS, JSON APIs, dumps) plus `--predb-import`, strict name grading, `--reflag-obfuscated`, and `--unname` |
+| **PreDB & Naming** | None | Native PreDB polling and preserved external payload caches, strict name grading, and typed naming steps; one-off SQLite catalog maintenance commands are retired |
 | **Categories & Media IDs** | Hardcoded single category `7000` (`Other`) for all releases; no TV/movie IDs | Full Newznab category tree (`1000`–`8000`, with `7000` properly assigned to **Books** and `8000` to **Other**), TV/movie title parser, and ID resolution via TVMaze, TMDB, Trakt, TheTVDB, OMDb, and NFO IMDb IDs |
 | **Duplicate Detection** | None | Cryptographic fingerprinting of **Twins** (identical postings, and file twins by PAR2 hashes, that fill each other's missing articles in every NZB served) and **Alts** (same unpacked file sizes packed differently) |
 | **Observability** | Basic terminal progress screen | 6-page Ratatui **Stats Dashboard** (Overview, Backfill, Content, Servers, Bottleneck, Post-processing) + Prometheus `/metrics` & `/healthz` endpoints and 7 **Grafana dashboards** as code |
