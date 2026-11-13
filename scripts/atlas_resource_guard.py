@@ -169,10 +169,13 @@ def owned_group_states(child, *, leader_only=False, timeout=2):
     if not result.stdout or len(result.stdout) > 1 << 20:
         raise RuntimeError("empty or oversized process inventory")
     rows = {}
+    # Darwin can report ?Es while the run state is unavailable during exit.
+    # Preserve '?' as unknown/live; only a leading Z is terminal proof.
+    state_pattern = r"[A-Zt?][A-Za-z0-9+<>=-]*" if sys.platform == "darwin" else r"[A-Zt][A-Za-z0-9+<>=-]*"
     for row in result.stdout.splitlines():
         fields = row.split()
         if (len(fields) != 3 or not fields[0].isdigit() or not fields[1].isdigit()
-                or not re.fullmatch(r"[A-Zt][A-Za-z0-9+<>=-]*", fields[2])):
+                or not re.fullmatch(state_pattern, fields[2])):
             raise RuntimeError("unreadable process inventory")
         pid, pgid = int(fields[0]), int(fields[1])
         if pid in rows:
