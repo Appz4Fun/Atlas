@@ -3,6 +3,10 @@
 //! Fetched from TMDB and OMDb when someone opens a release, and in the background for every title with an id, and kept
 //! in `atlas.details.db`, soo a page costs a request only the first time, or once what's kept is old.
 
+pub(crate) mod native;
+#[cfg(test)]
+mod native_tests;
+
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -339,9 +343,15 @@ fn sources(cfg: &MediaConfig) -> Option<std::sync::Arc<Sources>> {
     {
         return Some(s.clone());
     }
+    let made = make_sources(cfg);
+    *held = Some(made.clone());
+    Some(made)
+}
+
+fn make_sources(cfg:&MediaConfig)->Arc<Sources> {
     let tmdb_base = cfg.tmdb.base_url.as_deref().unwrap_or(TMDB_BASE);
     let omdb_base = cfg.omdb.base_url.as_deref().unwrap_or(OMDB_BASE);
-    let made = std::sync::Arc::new(Sources {
+    std::sync::Arc::new(Sources {
         tvdb_config: cfg.tvdb.clone(),
         tvdb: (!cfg.tvdb.api_key.is_empty()).then(|| Tvdb::new(&cfg.tvdb)),
         tmdb_client: Client::new("tmdb", tmdb_base, cfg.tmdb.requests_per_minute),
@@ -354,9 +364,7 @@ fn sources(cfg: &MediaConfig) -> Option<std::sync::Arc<Sources>> {
             cfg.trakt.base_url.as_deref().unwrap_or(TRAKT_BASE),
             cfg.trakt.requests_per_minute,
         ),
-    });
-    *held = Some(made.clone());
-    Some(made)
+    })
 }
 
 impl Sources {

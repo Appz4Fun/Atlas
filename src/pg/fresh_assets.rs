@@ -40,6 +40,12 @@ fn physical_directory(path:&Path)->Result<File> {
         _=>bail!("retained asset root contains a relative component"),
     }}ensure!(current.metadata()?.is_dir(),"retained asset root is not a directory");Ok(current)
 }
+pub(super) struct Receipt {bytes:i64,digest:Vec<u8>,source:Vec<u8>}
+pub(super) fn receipt_in(client:&mut impl postgres::GenericClient,request:&AssetRequest)->Result<Option<Receipt>> {
+    cache_assets::filename(&request.name)?;
+    client.query_opt("select byte_length,digest,source_digest from ext_asset_files where kind=$1 and name=$2",&[&request.kind.directory(),&request.name])?
+        .map(|row|Ok(Receipt {bytes:row.try_get(0)?,digest:row.try_get(1)?,source:row.try_get(2)?})).transpose()
+}
 impl AssetManifest {
     pub(crate) fn from_selection(selection:&crate::config::NativeAssetsConfig)->Result<Self> {
         Self::open(Path::new(&selection.root),Path::new(&selection.manifest),digest(&selection.whole_sha256)?)
@@ -52,6 +58,32 @@ impl AssetManifest {
             Ok(digest.finalize().into())
         }
         #[cfg(not(unix))] {bail!("asset namespaces require Unix")}
+    }
+    pub(super) fn native_source(&self,kind:AssetKind,catalog:&super::stage::CatalogIdentity)->Result<[u8;32]> {
+        let domain=match kind {AssetKind::Covers=>b"atlas.native-cover-writer.v1\0".as_slice(),AssetKind::Posters=>b"atlas.native-poster-writer.v1\0".as_slice(),_=>bail!("dynamic writer evidence unavailable for this asset family")};
+        let mut digest=Sha256::new();digest.update(domain);digest.update(self.namespace()?);digest.update(catalog.nonce());Ok(digest.finalize().into())
+    }
+    pub(super) fn read_associated(&self,request:&AssetRequest,pool:&Arc<crate::nzb_spool::Pool>,catalog:&super::stage::CatalogIdentity,receipt:Option<&Receipt>)->Result<Option<crate::nzb_spool::Spool>> {
+        let limit=match request.kind {AssetKind::Covers=>crate::probe::media::MAX_COVER as u64,AssetKind::Posters=>8<<20,_=>256<<20};
+        if let Some(entry)=self.entries.get(&(request.kind,request.name.clone())) {ensure!(entry.bytes<=limit,"asset exceeds family byte admission");}
+        let Some(receipt)=receipt else{return self.read(request,pool)};
+        ensure!(receipt.bytes>=0&&receipt.bytes as u64<=limit,"asset receipt exceeds family byte admission");
+        ensure!((0..=256*1024*1024).contains(&receipt.bytes)&&receipt.digest.len()==32&&receipt.source.len()==32,"asset receipt admission mismatch");
+        let hash:[u8;32]=receipt.digest.as_slice().try_into()?;
+        if let Some(expected)=request.digest {ensure!(expected==hash,"PG asset association and writer descriptor disagree");}
+        if let Some(expected)=request.bytes {ensure!(expected==receipt.bytes as u64,"PG asset association and writer length disagree");}
+        let checked=AssetRequest {digest:Some(hash),bytes:Some(receipt.bytes as u64),..request.clone()};
+        if self.entries.get(&(request.kind,request.name.clone())).is_some_and(|entry|entry.digest==hash&&entry.bytes==receipt.bytes as u64) {return self.read(&checked,pool)}
+        ensure!(receipt.source.as_slice()==self.native_source(request.kind,catalog)?.as_slice(),"dynamic asset writer namespace mismatch");
+        self.read_recorded(&checked,pool)
+    }
+    /// Actual PG row and sealed catalog identity are read on the caller's
+    /// existing read transaction; no public request can supply writer evidence.
+    pub(crate) fn read_native(&self,request:&AssetRequest,pool:&Arc<crate::nzb_spool::Pool>,client:&mut impl postgres::GenericClient)->Result<Option<crate::nzb_spool::Spool>> {
+        let receipt=receipt_in(client,request)?;
+        if receipt.is_none() {return self.read(request,pool)}
+        let catalog=super::stage::CatalogIdentity::read_in(client)?;
+        self.read_associated(request,pool,&catalog,receipt.as_ref())
     }
     pub(super) fn check_root(&self)->Result<()> {
         let current=physical_directory(&self.path)?;
@@ -109,6 +141,9 @@ impl AssetManifest {
     }
     /// Only a checked PG writer-receipt consumer may use an unlisted descriptor.
     /// The file confinement/hash/copy operation is identical to manifest reads.
+    pub(super) fn has_entry(&self,request:&AssetRequest)->Result<bool> {
+        cache_assets::filename(&request.name)?;Ok(self.entries.contains_key(&(request.kind,request.name.clone())))
+    }
     pub(super) fn contains_cover(&self,name:&str)->Result<bool> {cache_assets::filename(name)?;Ok(self.entries.contains_key(&(AssetKind::Covers,name.into())))}
     pub(super) fn read_cover(&self,request:&AssetRequest,pool:&Arc<crate::nzb_spool::Pool>)->Result<Option<crate::nzb_spool::Spool>> {
         if let Some(entry)=self.entries.get(&(AssetKind::Covers,request.name.clone())) {ensure!(entry.bytes<=crate::probe::media::MAX_COVER as u64,"retained cover exceeds worker admission");}
@@ -137,16 +172,24 @@ impl AssetManifest {
         Ok(Some(output.finish()?))
     }
     pub(super) fn store_cover(&self,bytes:&[u8])->Result<(String,[u8;32])> {
-        ensure!(!bytes.is_empty()&&bytes.len()<=crate::probe::media::MAX_COVER,"native cover exceeds admission");
+        ensure!(!bytes.is_empty()&&bytes.len()<=crate::probe::media::MAX_COVER,"native cover exceeds byte admission");
+        let name=hex(&Sha256::digest(bytes));let value=self.store_named(AssetKind::Covers,&name,bytes,crate::probe::media::MAX_COVER as u64)?;Ok((name,value))
+    }
+    pub(super) fn store_poster(&self,name:&str,bytes:&[u8])->Result<[u8;32]> {
+        ensure!(bytes.starts_with(&[0xff,0xd8,0xff]),"native poster is not the existing JPEG representation");
+        self.store_named(AssetKind::Posters,name,bytes,8<<20)
+    }
+    fn store_named(&self,kind:AssetKind,name:&str,bytes:&[u8],limit:u64)->Result<[u8;32]> {
+        cache_assets::filename(name)?;ensure!(!bytes.is_empty()&&bytes.len() as u64<=limit,"native asset exceeds byte admission");
         self.check_root()?;
         #[cfg(unix)] {
             use std::os::fd::{AsRawFd,FromRawFd};
-            let covers=std::ffi::CString::new("covers")?;
+            let covers=std::ffi::CString::new(kind.directory())?;
             if unsafe{libc::mkdirat(self.root.as_raw_fd(),covers.as_ptr(),0o700)}<0 {
                 let error=std::io::Error::last_os_error();if error.kind()!=std::io::ErrorKind::AlreadyExists{return Err(error.into())}
             }
-            let directory=physical_child(&self.root,std::ffi::OsStr::new("covers"),true)?;
-            let value:[u8;32]=Sha256::digest(bytes).into();let name=hex(&value);let final_name=std::ffi::CString::new(name.clone())?;
+            let directory=physical_child(&self.root,std::ffi::OsStr::new(kind.directory()),true)?;
+            let value:[u8;32]=Sha256::digest(bytes).into();let final_name=std::ffi::CString::new(name)?;
             let mut nonce=[0u8;16];getrandom::fill(&mut nonce).map_err(|_|anyhow::anyhow!("native cover entropy unavailable"))?;
             let temporary=std::ffi::CString::new(format!(".atlas-cover-{}",hex(&nonce)))?;
             let fd=unsafe{libc::openat(directory.as_raw_fd(),temporary.as_ptr(),libc::O_WRONLY|libc::O_CREAT|libc::O_EXCL|libc::O_NOFOLLOW|libc::O_CLOEXEC,0o600)};
@@ -159,7 +202,7 @@ impl AssetManifest {
                 let error=std::io::Error::last_os_error();if error.kind()!=std::io::ErrorKind::AlreadyExists{return Err(error.into())}
             }
             drop(pending);directory.sync_all()?;self.root.sync_all()?;self.check_root()?;
-            Ok((name,value))
+            Ok(value)
         }
         #[cfg(not(unix))] {let _=bytes;bail!("native cover confinement requires Unix")}
     }
@@ -171,6 +214,9 @@ impl AssetManifest {
 mod tests;
 
 impl super::fresh_reader::ReadView<'_> {
+    pub(crate) fn read_asset(&self,manifest:&AssetManifest,request:&AssetRequest,pool:&Arc<crate::nzb_spool::Pool>)->Result<Option<crate::nzb_spool::Spool>> {
+        self.before_query()?;manifest.read_native(request,pool,&mut *self.tx.borrow_mut())
+    }
     pub(crate) fn asset_request(&self,path:&str,args:&std::collections::HashMap<String,String>)->Result<Option<AssetRequest>> {
         let number=|key:&str|args.get(key).and_then(|n|n.trim().parse::<i64>().ok()).unwrap_or(0);
         let (kind,name,mut sha,content_type)=if path=="/ui/poster" {

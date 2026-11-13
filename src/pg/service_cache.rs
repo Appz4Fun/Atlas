@@ -2,6 +2,7 @@
 //! reconnect, SQLite fallback or provider call exists in this storage layer.
 
 pub(crate) mod predb;
+pub(crate) mod details;
 mod predb_late;
 pub(crate) use predb_late::LateReport;
 

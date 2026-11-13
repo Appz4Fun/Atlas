@@ -7,7 +7,7 @@ use crate::nntp::{BlockingPool, NntpError};
 use crate::ui::{self, Column, Line, Table, prompt};
 
 const PAGE_SIZE: usize = 30;
-const CACHE_TTL: Duration = Duration::from_secs(600);
+const CACHE_TTL: Duration = crate::nntp::group_capture::REFRESH_TTL;
 
 type CacheKey = (String, Option<String>);
 type GroupsCache = HashMap<CacheKey, (Instant, Vec<String>)>;

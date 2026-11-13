@@ -15,6 +15,135 @@ do $$ declare relation text; occupied boolean; begin
  end loop;
 end $$;
 
+-- The opening fresh-catalog guard witnessed empty releases and chunk tables.
+-- Maintain only small per-group totals; observation never scans the catalog.
+create table native_metric_catalog_groups (
+ group_name text collate "C" primary key,
+ total bigint not null check(total>0),bytes bigint not null check(bytes>=0),
+ complete bigint not null check(complete between 0 and total),
+ nzb_ready bigint not null check(nzb_ready between 0 and total),
+ named bigint not null check(named between 0 and total),
+ still_obfuscated bigint not null check(still_obfuscated between 0 and total),
+ predb_matched bigint not null check(predb_matched between 0 and total)
+);
+create function atlas_native_catalog_metric_delta(g text,n bigint,b bigint,c boolean,p bigint,d text,o boolean,m boolean)
+returns void language plpgsql as $$
+declare remaining bigint;
+begin
+ if n=1 then
+  insert into native_metric_catalog_groups as old values(g,1,greatest(b,0),c::int,(p>0)::int,(d is not null)::int,(o and d is null)::int,m::int)
+  on conflict(group_name) do update set total=old.total+1,bytes=old.bytes+excluded.bytes,
+   complete=old.complete+excluded.complete,nzb_ready=old.nzb_ready+excluded.nzb_ready,
+   named=old.named+excluded.named,still_obfuscated=old.still_obfuscated+excluded.still_obfuscated,predb_matched=old.predb_matched+excluded.predb_matched;
+ elsif n=-1 then
+  -- Remove the last group row directly: the positive-total constraint also
+  -- refuses stale or invented zero summary rows.
+  delete from native_metric_catalog_groups where group_name=g and total=1;
+  if found then return; end if;
+  update native_metric_catalog_groups set total=total-1,bytes=bytes-greatest(b,0),
+   complete=complete-c::int,nzb_ready=nzb_ready-(p>0)::int,named=named-(d is not null)::int,
+   still_obfuscated=still_obfuscated-(o and d is null)::int,predb_matched=predb_matched-m::int
+   where group_name=g returning total into remaining;
+  if not found then raise exception 'native catalog summary is missing' using errcode='55000'; end if;
+ else raise exception 'invalid native catalog summary delta' using errcode='55000'; end if;
+end $$;
+create function atlas_native_catalog_metrics() returns trigger language plpgsql as $$
+begin
+ if tg_op='TRUNCATE' then delete from native_metric_catalog_groups;return null;end if;
+ if tg_op in('UPDATE','DELETE') then
+  perform atlas_native_catalog_metric_delta(old.group_name,-1,old.size,old.complete,old.parts,old.display_name,old.is_obfuscated,
+   exists(select 1 from predb_match where release_id=old.id));
+ end if;
+ if tg_op in('INSERT','UPDATE') then
+  perform atlas_native_catalog_metric_delta(new.group_name,1,new.size,new.complete,new.parts,new.display_name,new.is_obfuscated,
+   exists(select 1 from predb_match where release_id=new.id));
+ end if;
+ return coalesce(new,old);
+end $$;
+create trigger native_catalog_metric_insert after insert on releases for each row execute function atlas_native_catalog_metrics();
+create trigger native_catalog_metric_update after update of group_name,size,complete,parts,display_name,is_obfuscated on releases for each row execute function atlas_native_catalog_metrics();
+-- BEFORE DELETE observes the actual match before its FK cascade removes it.
+create trigger native_catalog_metric_delete before delete on releases for each row execute function atlas_native_catalog_metrics();
+create trigger native_catalog_metric_truncate after truncate on releases for each statement execute function atlas_native_catalog_metrics();
+create function atlas_native_catalog_match_metrics() returns trigger language plpgsql as $$
+begin
+ if tg_op='TRUNCATE' then update native_metric_catalog_groups set predb_matched=0;return null;end if;
+ if tg_op in('UPDATE','DELETE') then
+  update native_metric_catalog_groups s set predb_matched=s.predb_matched-1
+   from releases r where r.id=old.release_id and s.group_name=r.group_name;
+ end if;
+ if tg_op in('INSERT','UPDATE') then
+  update native_metric_catalog_groups s set predb_matched=s.predb_matched+1
+   from releases r where r.id=new.release_id and s.group_name=r.group_name;
+ end if;
+ return coalesce(new,old);
+end $$;
+create trigger native_catalog_match_metric_row after insert or update or delete on predb_match for each row execute function atlas_native_catalog_match_metrics();
+create trigger native_catalog_match_metric_truncate after truncate on predb_match for each statement execute function atlas_native_catalog_match_metrics();
+
+create table native_metric_chunk_groups (
+ grp text collate "C" primary key,total bigint not null check(total>0),done bigint not null check(done between 0 and total),
+ oldest_day bigint not null,newest_day bigint not null,oldest_done_day bigint
+);
+-- A statement may remove/move every row before queued AFTER ROW events run.
+-- Keep exact row deltas separate from final boundary reads. Only distinct
+-- touched keys are retained; no transition-table payload or global recount.
+create table native_metric_chunk_touched (
+ txid bigint not null,grp text collate "C" not null,primary key(txid,grp)
+);
+create function atlas_native_chunk_metric_delta(g text,n bigint,d bigint,s bigint) returns void language plpgsql as $$
+begin
+ insert into native_metric_chunk_touched(txid,grp) values(txid_current(),g) on conflict do nothing;
+ if n=1 then
+  insert into native_metric_chunk_groups as old values(g,1,(s=2)::int,d,d,case when s=2 then d end)
+  on conflict(grp) do update set total=old.total+1,done=old.done+excluded.done;
+ elsif n=-1 then
+  delete from native_metric_chunk_groups where grp=g and total=1;
+  if found then return;end if;
+  update native_metric_chunk_groups set total=total-1,done=done-(s=2)::int where grp=g;
+  if not found then raise exception 'native chunk summary is missing' using errcode='55000';end if;
+ else raise exception 'invalid native chunk summary delta' using errcode='55000';end if;
+end $$;
+create function atlas_native_chunk_metrics() returns trigger language plpgsql as $$
+begin
+ if tg_op='TRUNCATE' then delete from native_metric_chunk_groups;delete from native_metric_chunk_touched where txid=txid_current();return null;end if;
+ if tg_op in('UPDATE','DELETE') then perform atlas_native_chunk_metric_delta(old.grp,-1,old.day,old.state);end if;
+ if tg_op in('INSERT','UPDATE') then perform atlas_native_chunk_metric_delta(new.grp,1,new.day,new.state);end if;
+ return coalesce(new,old);
+end $$;
+create function atlas_native_chunk_metrics_finish() returns trigger language plpgsql as $$
+declare group_key text;first_day bigint;last_day bigint;done_day bigint;affected integer:=0;
+begin
+ for group_key in select grp from native_metric_chunk_touched where txid=txid_current() order by grp loop
+  affected:=affected+1;
+  if affected>10000 then raise exception 'native chunk boundary inventory exceeds admission' using errcode='55000';end if;
+  delete from native_metric_chunk_touched where txid=txid_current() and grp=group_key;
+  -- Existing (grp,day)/(grp,state,day) indexes supply bounded boundary seeks.
+  -- Do not install NULL or invented zero boundaries while row deltas drain.
+  select day into first_day from backfill_chunks where grp=group_key order by day limit 1;
+  if not found then
+   if exists(select 1 from native_metric_chunk_groups where grp=group_key) then
+    raise exception 'native chunk summary retained an empty group' using errcode='55000';
+   end if;
+  else
+   select day into last_day from backfill_chunks where grp=group_key order by day desc limit 1;
+   select day into done_day from backfill_chunks where grp=group_key and state=2 order by day limit 1;
+   update native_metric_chunk_groups set oldest_day=first_day,newest_day=last_day,oldest_done_day=done_day
+    where grp=group_key and ((done=0)=(done_day is null));
+   if not found then raise exception 'native chunk summary or done boundary is inconsistent' using errcode='55000';end if;
+  end if;
+ end loop;
+ return null;
+end $$;
+create trigger native_chunk_metric_row after insert or update or delete on backfill_chunks for each row execute function atlas_native_chunk_metrics();
+create trigger native_chunk_metric_finish after insert or update or delete on backfill_chunks for each statement execute function atlas_native_chunk_metrics_finish();
+create trigger native_chunk_metric_truncate after truncate on backfill_chunks for each statement execute function atlas_native_chunk_metrics();
+do $$ declare relation text;begin
+ foreach relation in array array['native_metric_catalog_groups','native_metric_chunk_groups','native_metric_chunk_touched'] loop
+  execute format('create trigger atlas_history_write_gate before insert or update or delete or truncate on %I for each statement execute function atlas_native_write_trigger()',relation);
+ end loop;
+end $$;
+
 -- Display strings can sanitize NUL for PostgreSQL text. Keep original bytes for
 -- exact natural-cache identities; missing originals never imply a cache miss.
 alter table releases add column original_name bytea;

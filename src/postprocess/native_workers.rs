@@ -58,7 +58,8 @@ impl Workers {
                     let dispatch=dispatch.clone();handles.push(spawn(&owner,format!("atlas-native-net-{id}"),move||dispatch.network())?);
                 }
             }
-            start_services(&owner,&dispatch.runner.config,Some(lanes.clone()),&mut handles)?;
+            let (pool,handle)=dispatch.runner.bodies.service_io();
+            start_services(&owner,&dispatch.runner.config,pool,handle,Some(lanes.clone()),&mut handles)?;
             Ok(())
         })();
         if let Err(error)=started {
@@ -125,10 +126,10 @@ impl Dispatch {
     }
 }
 
-fn start_services(owner:&Arc<Owner>,config:&crate::config::Config,lanes:Option<Arc<LaneCounters>>,handles:&mut Vec<Worker>)->Result<()> {
-    let predb=Arc::new(crate::pg::service_cache::predb::Service::new(owner)?);
+fn start_services(owner:&Arc<Owner>,config:&crate::config::Config,pool:Arc<crate::nntp::Pool>,handle:tokio::runtime::Handle,lanes:Option<Arc<LaneCounters>>,handles:&mut Vec<Worker>)->Result<()> {
+    let predb=if config.predb.enabled {Some(Arc::new(crate::pg::service_cache::predb::Service::new(owner)?))} else {None};
     let config=Arc::new(config.clone());
-    if config.predb.enabled {
+    if let Some(predb)=predb.as_ref() {
         let owner_work=owner.clone();let config=config.clone();let predb=predb.clone();
         handles.push(spawn(owner,"atlas-native-predb-feed".into(),move|| {
             let fetch=crate::predb::test_fetch().unwrap_or_else(||Arc::new(crate::predb::poll::UreqFetch::new(Duration::from_secs(config.predb.timeout_secs.max(1)))));
@@ -139,17 +140,25 @@ fn start_services(owner:&Arc<Owner>,config:&crate::config::Config,lanes:Option<A
         })?);
     }
     let owner_work=owner.clone();
+    let mut refresh=crate::pg::stage_group_refresh::Refresh::new(owner,pool,handle)?;
     handles.push(spawn(owner,"atlas-native-cache".into(),move|| {
         let mut observed=None;
         while !owner_work.stop.load(Ordering::Acquire) {
             if observed.is_none_or(|at:Instant|at.elapsed()>=Duration::from_secs(30)) {
                 crate::pg::stage_telemetry::capture(&owner_work,lanes.as_deref())?;observed=Some(Instant::now());
             }
+            match refresh.tick()? {
+                crate::pg::stage_group_refresh::Tick::Idle=>{},
+                crate::pg::stage_group_refresh::Tick::Stored(_capture)=>{},
+                // The actual pool already records transport failures. A
+                // refused LIST is not permission to replace the prior EOF.
+                crate::pg::stage_group_refresh::Tick::ProviderUnavailable(error)=>drop(error),
+            }
             // This lane never waits for feed HTTP. Its bounded transactions use
             // the same canonical owner; fanout still works with credentials off.
             if config.postprocess.enabled {
                 crate::media::native_fanout(&owner_work)?;
-                if config.predb.enabled {predb.maintenance(&config.predb,now())?;}
+                if let Some(predb)=&predb {predb.maintenance(&config.predb,now())?;}
             }
             nap(&owner_work,Duration::from_secs(1));
         }Ok(None)
@@ -165,9 +174,8 @@ pub(crate) async fn run(owner:Arc<Owner>,config:crate::config::Config,pool:Arc<c
     let worker_owner=owner.clone();let worker_end=ending.clone();
     let worker=std::thread::Builder::new().name("atlas-native-stage".into()).spawn(move||->Result<()> {
         if !config.postprocess.enabled {
-            ensure!(config.predb.enabled,"native worker services were not configured");
             let mut handles=Vec::new();
-            if let Err(error)=start_services(&worker_owner,&config,None,&mut handles) {
+            if let Err(error)=start_services(&worker_owner,&config,pool,handle,None,&mut handles) {
                 fail(&worker_owner,&error);let _=join_workers(&worker_owner,handles);return Err(error)
             }
             while !worker_end.load(Ordering::Acquire) && !worker_owner.stop.load(Ordering::Acquire) {std::thread::sleep(Duration::from_millis(25));}

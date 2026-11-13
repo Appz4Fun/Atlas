@@ -149,6 +149,7 @@ families! {
     BACKFILL_GROUPS "atlas_backfill_groups" Gauge &[], "Groups with day chunks: all, splitting.";
     FREEZE_PENDING "atlas_freeze_pending" Gauge &[], "Releases queued to freeze per shard (queued), and of them those past wait_hours (ready). Every 5 minutes.";
     FREEZE_PENDING_OLDEST "atlas_freeze_pending_oldest_timestamp_seconds" Gauge &[], "When each shard's longest queued release was queued.";
+    NATIVE_GROUP_PRESENT "atlas_native_group_present" Gauge &[], "Actual native catalog group identities, including rows whose progress marks are unknown.";
     GROUP_ARTICLE "atlas_group_article_number" Gauge &[], "Each group's article numbers: the server's first and last at its last pass, and the backfill and live cursors.";
     GROUP_BACKFILL "atlas_group_backfill_articles" Gauge &[], "Each group's article numbers on the server (total) and how many are indexed (covered); day chunks count for split groups.";
     GROUP_POSTED "atlas_group_posted_timestamp_seconds" Gauge &[], "When the oldest and newest article indexed in each group was posted.";

@@ -33,6 +33,9 @@ pub(crate) mod stage_words;
 pub(crate) mod content_id;
 pub mod stage_reads;
 pub(crate) mod stage_telemetry;
+pub(crate) mod stage_group_refresh;
+#[cfg(test)]
+mod stage_catalog_observation_tests;
 mod stage_mutations;
 pub(crate) mod stage_queue;
 pub(crate) mod fresh_reader;

@@ -6,6 +6,9 @@ use std::sync::{Arc,OnceLock,atomic::{AtomicBool,AtomicU64,Ordering}};
 use std::time::Instant;
 use super::indexer_runtime::Owner;
 
+#[path="stage_catalog_observation.rs"]
+mod catalog;
+
 const MAX_ROWS:usize=10000;
 const MAX_BYTES:usize=8*1024*1024;
 
@@ -66,13 +69,16 @@ fn process()->Result<&'static Process> {
 pub(crate) fn capture(owner:&Arc<Owner>,lanes:Option<&LaneCounters>)->Result<()> {
     ensure!(tokio::runtime::Handle::try_current().is_err(),"native observations require a standard owner lane");
     let process=process()?;let mut inventory=Inventory::new();
-    crate::metrics::visit(|family,labels,value|inventory.push(family,labels,value))?;
+    crate::metrics::visit(|family,labels,value|if catalog::owns(family) {Ok(())} else {inventory.push(family,labels,value)})?;
     let lane=lanes.map(LaneCounters::snapshot);
     let monotonic=i64::try_from(process.started.elapsed().as_nanos()).context("native observation clock overflow")?;
     let observed=chrono::Utc::now().timestamp_millis();
     let epoch=owner.epoch().context("native observation requires canonical owner")?;
     owner.with(|client| {
         let mut tx=client.transaction()?;super::history_gate::native(&mut tx)?;
+        epoch.verify(&mut tx)?;
+        tx.batch_execute("set local statement_timeout='10s';set local lock_timeout='5s'")?;
+        catalog::append(&mut tx,&mut inventory,&owner.stop)?;
         let row=tx.query_one("insert into native_runtime_observations(epoch,catalog_nonce,process_nonce,stage_instance_nonce,observed_at_ms,monotonic_ns,stage_running,enabled_mask,net_visits_bits,net_finished_bits,queue_taken_bits,walk_rows_bits)
             values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) returning observation_id",
             &[&&epoch.id()[..],&&epoch.catalog().nonce()[..],&&process.nonce[..],&lane.as_ref().map(|s|&s.instance[..]),&observed,&monotonic,
@@ -80,14 +86,17 @@ pub(crate) fn capture(owner:&Arc<Owner>,lanes:Option<&LaneCounters>)->Result<()>
                 &lane.as_ref().map(|s|s.net_finished),&lane.as_ref().map(|s|s.queue_taken),&lane.as_ref().map(|s|s.walk_rows)])?;
         let id:i64=row.try_get(0)?;
         let statement=tx.prepare("insert into native_metric_samples(observation_id,series_key,family,labels,kind,counter_bits,gauge_bits,histogram_count_bits,histogram_sum_bits) values($1,$2,$3,$4,$5,$6,$7,$8,$9)")?;
-        for sample in inventory.rows {
+        for sample in &inventory.rows {
             if owner.stop.load(Ordering::Acquire) {return Err(super::outage::AttemptEnded.into());}
             tx.execute(&statement,&[&id,&&sample.key[..],&sample.family,&sample.labels,&sample.kind,&sample.counter,&sample.gauge,&sample.count,&sample.sum])?;
         }
         tx.execute("insert into native_runtime_observation_current(singleton,observation_id) values(true,$1) on conflict(singleton) do update set observation_id=excluded.observation_id",&[&id])?;
         tx.execute("delete from native_runtime_observations where observation_id not in(select observation_id from native_runtime_observations order by observation_id desc limit 32)",&[])?;
-        tx.commit()?;Ok(())
-    })
+        epoch.verify(&mut tx)?;tx.commit()?;Ok(())
+    })?;
+    // Publish registry gauges only after the corresponding complete PG frame
+    // committed. Failed capture leaves both prior readings intact.
+    catalog::publish(&inventory.rows);Ok(())
 }
 
 #[cfg(test)]
