@@ -99,6 +99,8 @@ pub(crate) struct Stats {
     rate: std::collections::VecDeque<(i64, i64, i64)>,
     /// extra fields for stats.json (servers, groups configured, workers)
     extra: serde_json::Map<String, serde_json::Value>,
+    // Retained across index()'s later stop write, cleared at the next attempt.
+    final_services: Option<crate::postprocess::native::FinalCounters>,
 }
 
 /// headers/s is kept in buckets this many seconds wide...
@@ -121,6 +123,7 @@ impl Stats {
             group_stats: BTreeMap::new(),
             rate: std::collections::VecDeque::new(),
             extra: serde_json::Map::new(),
+            final_services: None,
         }
     }
 
@@ -191,6 +194,11 @@ impl Stats {
         (max(&a_speeds), max(&b_speeds), avg(&a_speeds), avg(&b_speeds))
     }
 
+    pub(crate) fn retain_final_services(&mut self,services:crate::postprocess::native::FinalCounters,pool:u64) {
+        crate::metrics::report_service_counters(services.stage.as_ref(),services.predb.as_ref(),pool);
+        self.final_services=Some(services);
+    }
+
     pub(crate) fn write(&self, group: &str, mode: &str, running: bool, idle: bool) {
         let (peak_a, peak_b, avg_a, avg_b) = self.speeds();
         let db_size = self.database_bytes;
@@ -228,7 +236,10 @@ impl Stats {
         let mut data = data;
         if let Some(map) = data.as_object_mut() {
             map.extend(self.extra.clone());
-            map.insert("postprocess".into(),crate::postprocess::native::stats_snapshot().unwrap_or(serde_json::Value::Null));
+            let stage=self.final_services.as_ref().map(|services|services.stage.as_ref().cloned().unwrap_or(serde_json::Value::Null))
+                .unwrap_or_else(||crate::postprocess::native::stats_snapshot().unwrap_or(serde_json::Value::Null));
+            map.insert("postprocess".into(),stage);
+            if let Some(services)=&self.final_services {map.insert("predb".into(),services.predb.as_ref().cloned().unwrap_or(serde_json::Value::Null));}
         }
 
         if let Ok(bytes)=crate::postprocess::native::stats_json(&data) {
@@ -1370,6 +1381,8 @@ async fn run_servers(
     native: &NativeRuntime,
 ) -> anyhow::Result<()> {
     let runtime = native;
+    stats.lock().unwrap().final_services=None;
+    let service_drain=Arc::new(crate::postprocess::native::Drain::new(&runtime.owner)?);
     let stop = runtime.owner.stop.clone();
     let servers = usable_servers(config);
     let groups = config.tracked_groups();
@@ -1433,12 +1446,13 @@ async fn run_servers(
     let s = sched.clone();
     tasks.spawn(named!(
         "native stage".into(),
-        crate::postprocess::native::run(
+        crate::postprocess::native::run_with_drain(
             runtime.owner.clone(),
             runtime.db.clone(),
             runtime.configured_headers(),
             config.clone(),
             sched.ctx.clone(),
+            Some(service_drain.clone()),
             move || s.stopping()
         )
     ));
@@ -1512,6 +1526,15 @@ async fn run_servers(
     };
     stop_log("workers, the stage and the other tasks done");
 
+    // Every task is joined. This reads retained in-memory event sources only;
+    // the stopped/failed owner is never used for a final queue/PreDB query.
+    {
+        let final_services=service_drain.take_after_join(&runtime.owner)?;
+        let mut stats=sched.stats.lock().unwrap();
+        if let Some(services)=final_services {stats.retain_final_services(services,sched.ctx.pool.id());}
+        stats.write("",&config.index_mode,false,true);
+    }
+
     // Native admission and service tasks have drained before the final Db clone goes away.
     let _ = tokio::task::spawn_blocking(move || drop(db)).await;
     stop_log("native writers drained");
@@ -1524,6 +1547,10 @@ async fn run_servers(
     anyhow::ensure!(!sched.fatal.load(Ordering::Relaxed), "indexer task or storage ownership failed");
     Ok(())
 }
+
+#[cfg(test)]
+#[path="bg_indexer_counter_drain_tests.rs"]
+mod counter_drain_tests;
 
 fn native_preflight_exit(
     result: Result<anyhow::Result<()>, tokio::task::JoinError>,

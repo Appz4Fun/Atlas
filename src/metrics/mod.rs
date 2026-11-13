@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::Instant;
 
-pub use report::{Live, report_errors, report_indexer, report_servers};
+pub use report::{Live, report_errors, report_indexer, report_servers, report_service_counters};
 pub use server::{Role, serve, serve_when_free, start};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

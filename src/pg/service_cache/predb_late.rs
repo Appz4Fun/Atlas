@@ -16,6 +16,14 @@ impl Service {
     /// monotonic time admits at most one configured title budget per second.
     /// The elapsed page budget never marks an incomplete title completed.
     pub(crate) fn maintenance(&self,cfg:&crate::config::PredbConfig,now:i64)->Result<LateReport> {
+        let result=self.maintenance_inner(cfg,now);self.late_result(&result);result
+    }
+    fn late_result(&self,result:&Result<LateReport>) {
+        if result.as_ref().is_err_and(|error|!crate::pg::outage::is_attempt_ended(error)) {
+            self.counters.late_errors.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    fn maintenance_inner(&self,cfg:&crate::config::PredbConfig,now:i64)->Result<LateReport> {
         if !cfg.enabled || cfg.late_per_second<=0 {return Ok(LateReport::default())}
         let started=std::time::Instant::now();
         {
@@ -23,10 +31,14 @@ impl Service {
             if at.is_some_and(|last|started.saturating_duration_since(last)<std::time::Duration::from_secs(1)) {return Ok(LateReport::default())}
             *at=Some(started);
         }
-        let mut report=self.late_tick(now,32)?;
+        let mut report=self.late_tick_inner(now,32)?;
         for _ in report.titles..usize::try_from(cfg.late_per_second.min(1000))? {
-            if report.pending || started.elapsed()>=std::time::Duration::from_millis(200) {break}
+            if report.pending {break}
+            if started.elapsed()>=std::time::Duration::from_millis(200) {
+                self.counters.out_of_budget.fetch_add(1,std::sync::atomic::Ordering::Relaxed);break
+            }
             let page=self.cache.with(|tx|late_page(tx,now))?;
+            self.counters.page(&page);
             report.titles+=page.titles;report.reruns+=page.reruns;report.overflow+=page.overflow;report.pending=page.pending;
             if page.titles==0 {break}
         }
@@ -35,12 +47,16 @@ impl Service {
     /// The standard worker calls this independently of network polling. Work is
     /// bounded to name_rows fresh names plus one <=64-candidate title page.
     pub(crate) fn late_tick(&self,now:i64,name_rows:u16)->Result<LateReport> {
+        let result=self.late_tick_inner(now,name_rows);self.late_result(&result);result
+    }
+    fn late_tick_inner(&self,now:i64,name_rows:u16)->Result<LateReport> {
         ensure!((1..=32).contains(&name_rows),"PreDB late name page admission");
         let mut report=LateReport::default();
         for _ in 0..name_rows {
             if !self.cache.with(index_one)? {break} report.indexed+=1;
         }
         let page=self.cache.with(|tx|late_page(tx,now))?;
+        self.counters.page(&page);
         report.titles=page.titles;report.reruns=page.reruns;report.overflow=page.overflow;report.pending=page.pending;
         Ok(report)
     }

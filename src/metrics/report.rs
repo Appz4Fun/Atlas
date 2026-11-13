@@ -190,29 +190,33 @@ fn report_stage(stage: &Value, pool: u64) {
     }
     STAGE_WALK.set(&[("state", "done")], int(&stage["walk"]["done"]) as f64);
     STAGE_WALK.set(&[("state", "total")], int(&stage["walk"]["total"]) as f64);
-    for key in ["steps_done", "matched", "unmatched", "retries", "errors"] {
-        grow(&STAGE_EVENTS, &[("kind", key)], pool, total(&stage[key]));
-    }
-    grow(&STAGE_EVENTS, &[("kind", "rows_walked")], pool, total(&stage["walk"]["rows"]));
-    if let Some(rejected) = stage["rejected"].as_object() {
-        for (reason, n) in rejected {
-            grow(&STAGE_REJECTED, &[("reason", reason)], pool, total(n));
-        }
-    }
-    for lane in LANES {
-        let Some(shards) = stage["lane_totals"][lane].as_array() else { continue };
-        for (shard, n) in shards.iter().enumerate() {
-            grow(&STAGE_LANE, &[("shard", &shard.to_string()), ("lane", lane)], pool, total(n));
-        }
-    }
+    report_stage_counters(stage,pool);
     if let Some(running) = stage["net_claims"]["running"].as_array() {
         let rows =
             running.iter().enumerate().map(|(shard, n)| (label_key(&[("shard", &shard.to_string())]), int(n) as f64));
         STAGE_NET_CLAIMS.replace(rows.collect::<Vec<_>>());
         STAGE_NET_CLAIMS_LIMIT.set(&[], int(&stage["net_claims"]["most"]) as f64);
     }
-    grow(&STAGE_BODIES, &[], pool, total(&stage["bodies"]));
-    grow(&STAGE_BODY_BYTES, &[], pool, total(&stage["body_bytes"]));
+}
+
+fn report_stage_counters(stage:&Value,pool:u64) {
+    for key in ["steps_done", "matched", "unmatched", "retries", "errors"] {
+        if let Some(n)=stage[key].as_u64() {grow(&STAGE_EVENTS,&[("kind",key)],pool,n);}
+    }
+    if let Some(n)=stage["walk"]["rows"].as_u64() {grow(&STAGE_EVENTS,&[("kind","rows_walked")],pool,n);}
+    if let Some(rejected) = stage["rejected"].as_object() {
+        for (reason, n) in rejected {
+            if let Some(n)=n.as_u64() {grow(&STAGE_REJECTED, &[("reason", reason)], pool, n);}
+        }
+    }
+    for lane in LANES {
+        let Some(shards) = stage["lane_totals"][lane].as_array() else { continue };
+        for (shard, n) in shards.iter().enumerate() {
+            if let Some(n)=n.as_u64() {grow(&STAGE_LANE, &[("shard", &shard.to_string()), ("lane", lane)], pool, n);}
+        }
+    }
+    if let Some(n)=stage["bodies"].as_u64() {grow(&STAGE_BODIES,&[],pool,n);}
+    if let Some(n)=stage["body_bytes"].as_u64() {grow(&STAGE_BODY_BYTES,&[],pool,n);}
 }
 
 fn report_predb(predb: &Value, pool: u64) {
@@ -222,9 +226,7 @@ fn report_predb(predb: &Value, pool: u64) {
     PREDB_TITLES.set(&[], int(&predb["titles"]) as f64);
     PREDB_FILE_BYTES.set(&[], int(&predb["file_bytes"]) as f64);
     PREDB_LATE_BEHIND.set(&[], int(&predb["late_behind"]) as f64);
-    for key in ["titles", "reruns", "overflow", "out_of_budget", "errors"] {
-        grow(&PREDB_LATE, &[("kind", key)], pool, total(&predb["late"][key]));
-    }
+    report_predb_counters(predb,pool);
     let Some(sources) = predb["sources"].as_array() else { return };
     for source in sources {
         let Some(feed) = source["key"].as_str() else { continue };
@@ -235,6 +237,19 @@ fn report_predb(predb: &Value, pool: u64) {
             PREDB_FEED_ROWS.set(&[("feed", feed), ("kind", kind)], int(&source[key]) as f64);
         }
     }
+}
+
+fn report_predb_counters(predb:&Value,pool:u64) {
+    for key in ["titles","reruns","overflow","out_of_budget","errors"] {
+        if let Some(n)=predb["late"][key].as_u64() {grow(&PREDB_LATE,&[("kind",key)],pool,n);}
+    }
+}
+
+/// Final monotonic service events use the SAME pool generation/growth as the
+/// periodic report, without turning unavailable DB gauges into zero readings.
+pub fn report_service_counters(stage:Option<&Value>,predb:Option<&Value>,pool:u64) {
+    if let Some(stage)=stage {report_stage_counters(stage,pool);}
+    if let Some(predb)=predb {report_predb_counters(predb,pool);}
 }
 
 #[cfg(test)]
@@ -249,5 +264,15 @@ mod tests {
         assert_eq!(growth(&mut seen, 2, 200), 200, "more than the old pool's last");
         assert_eq!(growth(&mut seen, 2, 210), 10);
         assert_eq!(growth(&mut seen, 3, 20), 20, "less than the old pool's last");
+    }
+
+    #[test]
+    fn final_subsecond_growth_counts_once_and_the_next_pool_keeps_its_own_events() {
+        let mut seen=Seen::default();
+        assert_eq!(growth(&mut seen,901,40),40);
+        assert_eq!(growth(&mut seen,901,43),3,"last events after the periodic sample");
+        assert_eq!(growth(&mut seen,901,43),0,"final file rewrite must not count twice");
+        assert_eq!(growth(&mut seen,902,2),2,"new service pool starts its real totals");
+        assert_eq!(growth(&mut seen,902,2),0);
     }
 }

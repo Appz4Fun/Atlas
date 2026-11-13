@@ -37,22 +37,27 @@ pub(super) fn spawn(owner:&Arc<Owner>,name:String,work:impl FnOnce()->Result<Opt
     })?)
 }
 impl Workers {
-    fn start(owner:&Arc<Owner>,config:&crate::config::Config,ctx:crate::indexer::PassContext,handle:tokio::runtime::Handle,db:crate::indexer::Db,headers:crate::config::HeaderStoreConfig)->Result<Self> {
+    fn start(owner:&Arc<Owner>,config:&crate::config::Config,ctx:crate::indexer::PassContext,handle:tokio::runtime::Handle,db:crate::indexer::Db,headers:crate::config::HeaderStoreConfig,drain:Option<Arc<super::telemetry::Drain>>)->Result<Self> {
         check_inferred_platform(config.inferred_parts)?;
         ensure!(config.postprocess.enabled,"native Stage was not configured");
-        Self::start_runner_context(Arc::new(Runner::new(owner,config,ctx.pool.clone(),handle)?),db,headers,Some(ctx))
+        Self::start_runner_context(Arc::new(Runner::new(owner,config,ctx.pool.clone(),handle)?),db,headers,Some(ctx),drain)
     }
     #[cfg(test)]
     pub(super) fn start_runner(runner:Arc<Runner>,db:crate::indexer::Db,headers:crate::config::HeaderStoreConfig)->Result<Self> {
-        Self::start_runner_context(runner,db,headers,None)
+        Self::start_runner_context(runner,db,headers,None,None)
     }
-    fn start_runner_context(runner:Arc<Runner>,db:crate::indexer::Db,headers:crate::config::HeaderStoreConfig,ctx:Option<crate::indexer::PassContext>)->Result<Self> {
+    #[cfg(test)]
+    pub(super) fn start_runner_with_drain(runner:Arc<Runner>,db:crate::indexer::Db,headers:crate::config::HeaderStoreConfig,drain:Arc<super::telemetry::Drain>)->Result<Self> {
+        Self::start_runner_context(runner,db,headers,None,Some(drain))
+    }
+    fn start_runner_context(runner:Arc<Runner>,db:crate::indexer::Db,headers:crate::config::HeaderStoreConfig,ctx:Option<crate::indexer::PassContext>,drain:Option<Arc<super::telemetry::Drain>>)->Result<Self> {
         ensure!(tokio::runtime::Handle::try_current().is_err(),"native workers must start on a standard thread");
         check_inferred_platform(runner.config.inferred_parts)?;
         let owner=runner.owner.clone();let queue=Queue::for_owner(&owner)?;
         let stamps=runner.steps.stamps.iter().copied().filter(|(_,bit,_)|runner.steps.enabled & bit!=0).collect::<Vec<_>>();
         queue.seed(runner.steps.enabled,&stamps,now())?;
         let lanes=Arc::new(LaneCounters::new(runner.steps.enabled as u64)?);
+        if let Some(drain)=&drain {drain.retain_stage(&runner,lanes.clone())?;}
         let dispatch=Arc::new(Dispatch {runner,lanes:lanes.clone(),walk:Mutex::new(super::super::bodies::TokenBucket::new()),database_turn:AtomicI64::new(0),network_turn:AtomicI64::new(0)});
         let mut handles=Vec::new();
         let started:Result<()>=(|| {
@@ -66,7 +71,7 @@ impl Workers {
             }
             let (pool,handle)=dispatch.runner.bodies.service_io();
             let telemetry=super::telemetry::Producer::new(&dispatch.runner,lanes.clone())?;
-            start_services(&owner,&dispatch.runner.config,pool,handle,Some(lanes.clone()),Some(telemetry),dispatch.runner.assets.clone(),db,headers,ctx,&mut handles)?;
+            start_services(&owner,&dispatch.runner.config,pool,handle,Some(lanes.clone()),Some(telemetry),dispatch.runner.assets.clone(),db,headers,ctx,drain,&mut handles)?;
             Ok(())
         })();
         if let Err(error)=started {
@@ -195,7 +200,7 @@ pub(super) fn start_inferred(owner:&Arc<Owner>,mut service:crate::inferred::nati
 
 // Every service receives the same actual runtime Db and canonical Owner.
 #[allow(clippy::too_many_arguments)]
-fn start_services(owner:&Arc<Owner>,config:&crate::config::Config,pool:Arc<crate::nntp::Pool>,handle:tokio::runtime::Handle,lanes:Option<Arc<LaneCounters>>,telemetry:Option<super::telemetry::Producer>,assets:Option<Arc<crate::pg::worker_assets::Grant>>,db:crate::indexer::Db,headers:crate::config::HeaderStoreConfig,ctx:Option<crate::indexer::PassContext>,handles:&mut Vec<Worker>)->Result<()> {
+fn start_services(owner:&Arc<Owner>,config:&crate::config::Config,pool:Arc<crate::nntp::Pool>,handle:tokio::runtime::Handle,lanes:Option<Arc<LaneCounters>>,telemetry:Option<super::telemetry::Producer>,assets:Option<Arc<crate::pg::worker_assets::Grant>>,db:crate::indexer::Db,headers:crate::config::HeaderStoreConfig,ctx:Option<crate::indexer::PassContext>,drain:Option<Arc<super::telemetry::Drain>>,handles:&mut Vec<Worker>)->Result<()> {
     check_inferred_platform(config.inferred_parts)?;
     db.check_native_owner(owner)?;
     if pool.indexing_servers().len()>1 {
@@ -221,6 +226,7 @@ fn start_services(owner:&Arc<Owner>,config:&crate::config::Config,pool:Arc<crate
         start_spotnet(owner,service,handles)?;
     }
     let predb=if config.predb.enabled {Some(Arc::new(crate::pg::service_cache::predb::Service::new(owner)?))} else {None};
+    if let (Some(drain),Some(predb))=(&drain,&predb) {drain.retain_predb(owner,predb.counters.clone())?;}
     let config=Arc::new(config.clone());
     if let Some(details)=details_service(owner,&config,assets)? {start_details(owner,details,handles)?;}
     if let Some(predb)=predb.as_ref() {
@@ -272,18 +278,22 @@ fn start_services(owner:&Arc<Owner>,config:&crate::config::Config,pool:Arc<crate
 /// standard threads. Entered Tokio's spawn_blocking lane is not treated as one.
 /// The existing native profile still refuses activation before this is called.
 pub(crate) async fn run(owner:Arc<Owner>,db:crate::indexer::Db,headers:crate::config::HeaderStoreConfig,config:crate::config::Config,ctx:crate::indexer::PassContext,stopping:impl Fn()->bool+Send+'static) {
+    run_with_drain(owner,db,headers,config,ctx,None,stopping).await;
+}
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_with_drain(owner:Arc<Owner>,db:crate::indexer::Db,headers:crate::config::HeaderStoreConfig,config:crate::config::Config,ctx:crate::indexer::PassContext,drain:Option<Arc<super::telemetry::Drain>>,stopping:impl Fn()->bool+Send+'static) {
     let handle=tokio::runtime::Handle::current();let ending=Arc::new(AtomicBool::new(false));
-    let worker_owner=owner.clone();let worker_end=ending.clone();
+    let worker_owner=owner.clone();let worker_end=ending.clone();let retained=drain.clone();
     let worker=std::thread::Builder::new().name("atlas-native-stage".into()).spawn(move||->Result<()> {
         if !config.postprocess.enabled {
             let mut handles=Vec::new();
-            if let Err(error)=start_services(&worker_owner,&config,ctx.pool.clone(),handle,None,None,None,db,headers,Some(ctx),&mut handles) {
+            if let Err(error)=start_services(&worker_owner,&config,ctx.pool.clone(),handle,None,None,None,db,headers,Some(ctx),retained,&mut handles) {
                 fail(&worker_owner,&error);let _=join_workers(&worker_owner,handles);return Err(error)
             }
             while !worker_end.load(Ordering::Acquire) && !worker_owner.stop.load(Ordering::Acquire) {std::thread::sleep(Duration::from_millis(25));}
             join_workers(&worker_owner,handles)?;return Ok(())
         }
-        let stage=Workers::start(&worker_owner,&config,ctx,handle,db,headers)?;
+        let stage=Workers::start(&worker_owner,&config,ctx,handle,db,headers,retained)?;
         while !worker_end.load(Ordering::Acquire) && !worker_owner.stop.load(Ordering::Acquire) {std::thread::sleep(Duration::from_millis(25));}
         stage.finish()
     });
@@ -293,7 +303,11 @@ pub(crate) async fn run(owner:Arc<Owner>,db:crate::indexer::Db,headers:crate::co
     owner.stop.store(true,Ordering::Release);
     let result=tokio::task::spawn_blocking(move||worker.join()).await;
     let result=match result {
-        Ok(Ok(result))=>result,
+        Ok(Ok(result))=>{
+            // A returned standard coordinator explicitly joined all workers,
+            // including ordinary partial-start/failure paths. Panic is not proof.
+            if let Some(drain)=&drain {drain.joined();}result
+        },
         Ok(Err(_))=>Err(anyhow::anyhow!("native Stage coordinator panicked")),
         Err(error)=>Err(anyhow::Error::new(error).context("native Stage join failed")),
     };

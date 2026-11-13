@@ -1,6 +1,6 @@
 //! Native PreDB polling. The legacy paging/backoff state machine is retained;
 //! every cache operation uses the original owner, while HTTP runs outside its mutex.
-use std::{io::Read, sync::Arc, time::{Duration,Instant}};
+use std::{io::Read, sync::{Arc,atomic::{AtomicU64,Ordering::Relaxed}}, time::{Duration,Instant}};
 use anyhow::{Result,ensure};
 use postgres::types::ToSql;
 use crate::{config::PredbConfig, predb::{feeds::{FeedSpec,Parser,ParseError,page_url}, import::{Counts,Entry}, poll::{Fetch,HttpReply,PollEnd,wait_seconds}}};
@@ -10,15 +10,49 @@ const MAX_BODY:usize=8<<20;
 const MAX_BACKOFF:i64=21_600;
 const RATE_LIMIT_DEFAULT:i64=60;
 
-pub(crate) struct Service { pub(super) cache:Cache, poll_busy:std::sync::Mutex<()>, pub(super) late_at:std::sync::Mutex<Option<Instant>> }
+pub(crate) struct Service { pub(super) cache:Cache, poll_busy:std::sync::Mutex<()>, pub(super) late_at:std::sync::Mutex<Option<Instant>>,pub(crate) counters:Arc<Counters> }
+struct FeedCounters {id:i64,key:&'static str,inserted:AtomicU64,updated:AtomicU64,skipped:AtomicU64}
+/// The finite canonical feed set bounds registration independently of config.
+/// These are this service's events, never persisted feed/catalog gauges.
+pub(crate) struct Counters {
+    feeds:Vec<FeedCounters>,pub(super) titles:AtomicU64,pub(super) reruns:AtomicU64,pub(super) overflow:AtomicU64,
+    pub(super) out_of_budget:AtomicU64,pub(super) late_errors:AtomicU64,poll_errors:AtomicU64,
+}
+impl Counters {
+    fn new()->Self {Self {feeds:crate::predb::feeds::SOURCES.iter().map(|spec|FeedCounters {id:spec.id,key:spec.key,
+        inserted:AtomicU64::new(0),updated:AtomicU64::new(0),skipped:AtomicU64::new(0)}).collect(),
+        titles:AtomicU64::new(0),reruns:AtomicU64::new(0),overflow:AtomicU64::new(0),out_of_budget:AtomicU64::new(0),late_errors:AtomicU64::new(0),poll_errors:AtomicU64::new(0)}}
+    fn imported(&self,source:i64,counts:Counts) {
+        if let Some(feed)=self.feeds.iter().find(|feed|feed.id==source) {
+            feed.inserted.fetch_add(counts.inserted,Relaxed);feed.updated.fetch_add(counts.updated,Relaxed);feed.skipped.fetch_add(counts.skipped,Relaxed);
+        }
+    }
+    pub(super) fn page(&self,page:&super::LateReport) {
+        self.titles.fetch_add(page.titles as u64,Relaxed);self.reruns.fetch_add(page.reruns as u64,Relaxed);self.overflow.fetch_add(page.overflow as u64,Relaxed);
+    }
+    pub(crate) fn snapshot(&self)->serde_json::Value {
+        let sources:Vec<_>=self.feeds.iter().map(|feed|serde_json::json!({"key":feed.key,"inserted":null,"updated":null,
+            "events":{"inserted":feed.inserted.load(Relaxed),"updated":feed.updated.load(Relaxed),"skipped":feed.skipped.load(Relaxed)},
+            "failures":null,"last_ok_at":null,"last_rows":null})).collect();
+        serde_json::json!({"titles":null,"file_bytes":null,"late_behind":null,"errors":self.poll_errors.load(Relaxed),
+            "late":{"titles":self.titles.load(Relaxed),"reruns":self.reruns.load(Relaxed),"overflow":self.overflow.load(Relaxed),
+                "out_of_budget":self.out_of_budget.load(Relaxed),"errors":self.late_errors.load(Relaxed)},"sources":sources})
+    }
+}
 pub(crate) enum Tick { NotDue, Pending, Polled(PollEnd) }
 #[derive(Debug)]
 struct Pending;
 impl std::fmt::Display for Pending {fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str("PreDB derived index pending")}}
 impl std::error::Error for Pending {}
 impl Service {
-    pub(crate) fn new(owner:&Arc<crate::pg::indexer_runtime::Owner>)->Result<Self> {Ok(Self {cache:Cache::new(owner)?,poll_busy:std::sync::Mutex::new(()),late_at:std::sync::Mutex::new(None)})}
+    pub(crate) fn new(owner:&Arc<crate::pg::indexer_runtime::Owner>)->Result<Self> {Ok(Self {cache:Cache::new(owner)?,poll_busy:std::sync::Mutex::new(()),late_at:std::sync::Mutex::new(None),counters:Arc::new(Counters::new())})}
     pub(crate) fn tick(&self,cfg:&PredbConfig,fetch:&dyn Fetch,now:i64,pause:&dyn Fn(Duration)->bool)->Result<Tick> {
+        let result=self.tick_inner(cfg,fetch,now,pause);
+        if result.as_ref().is_err_and(|error|!error.is::<Pending>()&&!crate::pg::outage::is_attempt_ended(error))
+            || matches!(&result,Ok(Tick::Polled(PollEnd::Failed(_)))) {self.counters.poll_errors.fetch_add(1,Relaxed);}
+        result
+    }
+    fn tick_inner(&self,cfg:&PredbConfig,fetch:&dyn Fetch,now:i64,pause:&dyn Fn(Duration)->bool)->Result<Tick> {
         if !cfg.enabled {return Ok(Tick::NotDue)}
         let _poll=match self.poll_busy.try_lock() {
             Ok(guard)=>guard,
@@ -44,6 +78,8 @@ impl Service {
     fn import(&self,source:i64,entries:&[Entry],now:i64,cursor:Option<(i64,i64)>)->Result<Counts> {
         let status=self.cache.with(|tx|crate::pg::predb_cache::import_page_in(tx,source,entries,now,cursor))?;
         let ImportStatus::Applied{counts,..}=status else {return Err(Pending.into())};
+        // Cache.with has committed. A failed later page cannot erase this one.
+        self.counters.imported(source,counts);
         Ok(counts)
     }
 
