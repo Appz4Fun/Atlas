@@ -1,7 +1,7 @@
 //! Async NNTP client (tokio): just what atlas needs (GROUP, XOVER, BODY, LIST),
 //! with a connection pool per usenet server soo many requests are in flight at once.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::io;
@@ -2269,6 +2269,11 @@ impl Pool {
 
     pub fn new(servers: &[UsenetServer]) -> Pool {
         let keys = server_keys(servers);
+        for server in keys.iter().collect::<HashSet<_>>() {
+            for kind in FAILURE_KINDS {
+                crate::metrics::names::NNTP_FAILURES.inc(&[("server", server.as_str()), ("kind", kind)], 0);
+            }
+        }
         let legacy = legacy_server_keys(servers);
         static POOLS: AtomicU64 = AtomicU64::new(1);
         Pool {
@@ -4679,6 +4684,9 @@ fn inflate_xzver(lines: &[Vec<u8>]) -> Result<Vec<u8>> {
     }
     Ok(inflated)
 }
+
+#[cfg(test)]
+mod failure_startup_tests;
 
 #[cfg(test)]
 mod yenc_decode_tests {
