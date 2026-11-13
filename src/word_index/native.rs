@@ -169,6 +169,23 @@ fn row_bytes(rows: &[Record], receipts: usize, budget: Budget) -> Result<u64> {
     Ok(bytes)
 }
 
+/// One committed Tantivy search snapshot for an entire PG descriptor walk.
+/// Catalog identity alone is deliberately insufficient to pin a reload.
+pub(crate) struct NativeMatches<'index> {
+    index:&'index WordIndex,searcher:Searcher,query:Box<dyn Query>,budget:Budget,
+}
+impl NativeMatches<'_> {
+    pub(crate) fn matching_ids(&self,ids:&[i64])->Result<Vec<i64>> {
+        ensure!(ids.len()<=100&&ids.len()<=self.budget.rows,"native membership batch exceeds admission");
+        if ids.is_empty(){return Ok(Vec::new());}
+        ensure!(WordIndex::numeric_workspace(&self.searcher,ids.len())?<=self.budget.bytes,"native membership collector exceeds admission");
+        let terms=ids.iter().map(|id|Term::from_field_u64(self.index.fields.id,*id as u64));
+        let query=BooleanQuery::new(vec![(Occur::Must,self.query.box_clone()),(Occur::Must,Box::new(TermSetQuery::new(terms)))]);
+        let (found,total)=self.index.top(&self.searcher,&query,By::Newest,true,0,ids.len())?;
+        ensure!(total<=ids.len(),"native membership has duplicate public IDs");Ok(found)
+    }
+}
+
 impl WordIndex {
     /// Request-side open is read-only. The legacy/create constructor can reset
     /// an incompatible directory; a public request must never use that repair
@@ -348,18 +365,29 @@ impl WordIndex {
         &self,source:&mut impl SearchSource,words:&str,filter:Option<&CatFilter>,tags:&[&str],group:Option<&str>,
         by:By,descending:bool,offset:usize,limit:usize,budget:Budget,
     )->Result<Hits> {
-        budget.check()?;
-        ensure!(words.trim().is_empty() || searchable(words), "query requires the native catalog matcher");
-        let stamp = source.stamp()?;
-        ensure!(self.native_ready(stamp)?, "native word index does not match its public source");
-        self.native_catch_up(source.pending()?);
-        let searcher = self.reader.searcher();
-        let mut query=self.query(words,filter,tags);
-        if let Some(group)=group {
-            let scoped=TermQuery::new(Term::from_field_text(self.fields.group,group),IndexRecordOption::Basic);
-            query=Box::new(BooleanQuery::new(vec![(Occur::Must,query),(Occur::Must,Box::new(scoped))]));
+        let stamp=source.stamp()?;
+        if matches!(by,By::Name|By::Group|By::Posted) {
+            // Small generic sources retain the existing oracle without using
+            // a String TopDocs collector. Public PG string sorts use the
+            // streaming membership reader and have no all-row hydration.
+            let (ids,total)=self.ranked_native_ids_in_group(source,words,filter,tags,group,By::Newest,true,0,budget.rows,budget)?;
+            ensure!(total<=budget.rows,"native string sort requires the bounded PG membership reader");
+            let rows=source.visible_rows(&ids,budget)?;
+            let extent=rows.iter().try_fold(self.ranked_workspace(0,budget.rows)?,|sum,row|->Result<u64>{
+                let strings=row.name.len()+row.group_name.len()+row.poster.as_ref().map_or(0,String::len)+row.posted_date.as_ref().map_or(0,String::len);
+                sum.checked_add((strings as u64).checked_mul(4).and_then(|n|n.checked_add(2048)).context("native string sort extent overflow")?).context("native string sort extent overflow")
+            })?;ensure!(extent<=budget.bytes,"native string sort exceeds admission");
+            let mut keyed=rows.into_iter().map(|row|{
+                let key=match by {By::Name=>Some(row.name.to_ascii_lowercase()),By::Group=>Some(row.group_name.clone()),_=>row.posted_date.clone().filter(|value|!value.is_empty())};(key,row)
+            }).collect::<Vec<_>>();
+            keyed.sort_unstable_by(|(a,x),(b,y)|match (a,b) {
+                (Some(a),Some(b))=>if descending{b.cmp(a)}else{a.cmp(b)},(None,None)=>std::cmp::Ordering::Equal,
+                (Some(_),None)=>std::cmp::Ordering::Less,(None,Some(_))=>std::cmp::Ordering::Greater,
+            }.then(y.id.cmp(&x.id)));
+            ensure!(source.stamp()?==stamp,"native string sort source changed");
+            return Ok(Hits {rows:keyed.into_iter().skip(offset).take(limit).map(|(_,row)|row).collect(),total});
         }
-        let (found, total) = self.top(&searcher,query.as_ref(),by,descending,offset,limit)?;
+        let (found,total)=self.ranked_native_ids_in_group(source,words,filter,tags,group,by,descending,offset,limit,budget)?;
         let rows = source.visible_rows(&found, budget)?;
         ensure!(rows.len() <= found.len() && source.stamp()? == stamp, "native index hydration source mismatch");
         let mut at = 0;
@@ -369,6 +397,79 @@ impl WordIndex {
             at += 1;
         }
         Ok(Hits { rows, total })
+    }
+
+    /// Numeric TopDocs keeps two limits per segment before merging. Include
+    /// simultaneous segment fruits, merge/output buffers and ID descriptors;
+    /// string collectors are deliberately excluded from this bounded API.
+    fn numeric_slot_bytes()->u64 {
+        // Largest key used below: shown-first, score and nullable native ID.
+        // Sixteen slots cover the 2*N segment buffer, harvested/converted
+        // fruits, merge buffer, sorted output, IDs and allocator slack.
+        (std::mem::size_of::<((u64,Score,Option<u64>),DocAddress)>() as u64)*16
+    }
+    fn numeric_workspace(searcher:&Searcher,span:usize)->Result<u64> {
+        let segments=u64::try_from(searcher.segment_readers().len())?.checked_add(1).context("native segment extent overflow")?;
+        segments.checked_mul((span.max(1) as u64).checked_mul(Self::numeric_slot_bytes()).and_then(|n|n.checked_add(65536)).context("native collector extent overflow")?)
+            .context("native collector extent overflow")
+    }
+    pub(crate) fn ranked_workspace(&self,offset:usize,limit:usize)->Result<u64> {
+        let span=if offset>=super::MAX_HITS{0}else{offset.checked_add(limit).context("native collector offset overflow")?.min(super::MAX_HITS)};
+        Self::numeric_workspace(&self.reader.searcher(),span)
+    }
+    pub(crate) fn ranked_capacity(&self,maximum:usize,available:u64)->Result<(usize,u64)> {
+        let searcher=self.reader.searcher();let fixed=Self::numeric_workspace(&searcher,0)?;
+        let segments=u64::try_from(searcher.segment_readers().len())?+1;
+        let per_id=segments.checked_mul(Self::numeric_slot_bytes()).and_then(|n|n.checked_add(40)).context("native collector extent overflow")?;
+        let limit=maximum.min(super::MAX_HITS).min(usize::try_from(searcher.num_docs()).unwrap_or(usize::MAX).max(1)).min(usize::try_from(available.saturating_sub(fixed)/per_id).unwrap_or(usize::MAX));
+        ensure!(limit>0,"native numeric collector exceeds request admission");
+        Ok((limit,Self::numeric_workspace(&searcher,limit)?))
+    }
+    /// String sorts are ordered by PG, then checked in fixed ID batches using
+    /// the original word/tag/category matcher and only numeric TopDocs keys.
+    pub(crate) fn membership_workspace(&self,rows:usize)->Result<u64> {
+        ensure!(rows>0&&rows<=100,"native membership batch exceeds admission");
+        Self::numeric_workspace(&self.reader.searcher(),rows)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn native_membership(&self,source:&mut impl SearchSource,words:&str,filter:Option<&CatFilter>,tags:&[&str],group:Option<&str>,budget:Budget)->Result<NativeMatches<'_>> {
+        budget.check()?;ensure!(budget.rows>0&&budget.rows<=100,"native membership batch exceeds admission");
+        ensure!(words.trim().is_empty()||searchable(words),"query requires the native catalog matcher");
+        let stamp=source.stamp()?;ensure!(self.native_ready(stamp)?,"native word index does not match its public source");
+        self.native_catch_up(source.pending()?);
+        let searcher=self.reader.searcher();
+        ensure!(Self::numeric_workspace(&searcher,budget.rows)?<=budget.bytes,"native membership collector exceeds admission");
+        let mut query=self.query_in(&searcher,words,filter,tags,PREFIX_POSTINGS);
+        if let Some(group)=group {query=Box::new(BooleanQuery::new(vec![(Occur::Must,query),(Occur::Must,Box::new(TermQuery::new(Term::from_field_text(self.fields.group,group),IndexRecordOption::Basic)))]));}
+        ensure!(source.stamp()?==stamp,"native membership source changed");
+        Ok(NativeMatches {index:self,searcher,query,budget})
+    }
+
+    /// The same matcher/ranking without display-row hydration. Native PG
+    /// facet readers can select actual scalar facts before decoding the final
+    /// page; queue delivery/commit/ACK and source-stamp contracts are unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn ranked_native_ids_in_group(
+        &self,source:&mut impl SearchSource,words:&str,filter:Option<&CatFilter>,tags:&[&str],group:Option<&str>,
+        by:By,descending:bool,offset:usize,limit:usize,budget:Budget,
+    )->Result<(Vec<i64>,usize)> {
+        budget.check()?;
+        ensure!(words.trim().is_empty() || searchable(words), "query requires the native catalog matcher");
+        let stamp = source.stamp()?;
+        ensure!(self.native_ready(stamp)?, "native word index does not match its public source");
+        self.native_catch_up(source.pending()?);
+        ensure!(!matches!(by,By::Name|By::Group|By::Posted),"native string sorting requires bounded PG membership");
+        let searcher = self.reader.searcher();
+        let span=if offset>=super::MAX_HITS{0}else{offset.checked_add(limit).context("native collector offset overflow")?.min(super::MAX_HITS)};
+        ensure!(Self::numeric_workspace(&searcher,span)?<=budget.bytes,"native numeric collector exceeds request admission");
+        let mut query=self.query_in(&searcher,words,filter,tags,PREFIX_POSTINGS);
+        if let Some(group)=group {
+            let scoped=TermQuery::new(Term::from_field_text(self.fields.group,group),IndexRecordOption::Basic);
+            query=Box::new(BooleanQuery::new(vec![(Occur::Must,query),(Occur::Must,Box::new(scoped))]));
+        }
+        let (found, total) = self.top(&searcher,query.as_ref(),by,descending,offset,limit)?;
+        ensure!(source.stamp()?==stamp,"native ranked source changed during query");
+        Ok((found,total))
     }
 
     pub(crate) fn count_native(
