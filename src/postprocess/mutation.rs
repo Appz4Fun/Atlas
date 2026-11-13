@@ -384,8 +384,7 @@ mod tests {
     #[test]
     fn closed_sidecar_unread_and_eviction_preserve_names_and_the_current_text() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("create table meta(key text primary key,value integer)").unwrap();
-        conn.execute_batch(crate::sidecar::SIDECARS.create).unwrap();
+        crate::store::build_shard(&conn).unwrap();
         let record = |kind: &str, text: Option<&str>, at| SidecarRecord {
             name: "Example.Release".into(),group: "example.group".into(),file: Some("example.nfo".into()),
             kind: kind.into(),release_name: Some("Example".into()),segment_uid: Some("0011".into()),
@@ -481,10 +480,7 @@ mod tests {
     #[test]
     fn closed_release_keys_preserve_signed_bits_nulls_and_targeted_clear() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(crate::keys::RELEASE_KEYS.create).unwrap();
-        for (column, declaration) in crate::keys::RELEASE_KEYS.added {
-            conn.execute_batch(&format!("alter table release_keys add column {column} {declaration}")).unwrap();
-        }
+        crate::store::build_shard(&conn).unwrap();
         let keys = crate::keys::Keys { account: Some(i64::MIN),file_crc: Some(-7),volumes: Some(i64::MAX),..Default::default() };
         StepMutation::KeepReleaseKeys { keys }.apply_sqlite(&conn,1).unwrap();
         StepMutation::KeepReleaseKeys { keys }.apply_sqlite(&conn,2).unwrap();
