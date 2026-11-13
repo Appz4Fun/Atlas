@@ -46,10 +46,13 @@ impl Service {
         self.db.check_native_owner(&self.owner)?;
         if self.owner.stop.load(Ordering::Acquire) {return Err(super::outage::AttemptEnded.into())}
         if self.scan.is_none()&&clock<self.next {return Ok(Tick::Idle)}
-        let began=Instant::now();let until=began+PAGE_DEADLINE;let owner=&self.owner;
+        let began=Instant::now();let owner=&self.owner;
         let epoch=owner.epoch().context("native media count original epoch ended")?;
         let table=&self.table;let headers=&self.headers;let scan=self.scan;
         let (next,stored)=owner.with(|client| {
+            // Waiting for the shared owner and its preflight is not page work.
+            // A healthy sibling worker must leave this page its full budget.
+            let until=Instant::now()+PAGE_DEADLINE;
             let mut tx=client.transaction()?;
             bound(&mut tx,owner,until)?;super::history_gate::native(&mut tx)?;
             bound(&mut tx,owner,until)?;epoch.verify(&mut tx)?;
