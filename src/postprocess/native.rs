@@ -14,6 +14,9 @@ pub(crate) use settings::ConfigPin;
 #[cfg(test)]
 #[path="native_provider_tests.rs"]
 mod provider_tests;
+#[cfg(all(test,unix))]
+#[path="native_inferred_tests.rs"]
+mod inferred_tests;
 #[cfg(test)]
 #[path="native_workers_tests.rs"]
 pub(crate) mod worker_tests;

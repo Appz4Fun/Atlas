@@ -27,6 +27,16 @@ impl ConfigPin {
 mod tests {
     use super::*;
     #[test]
+    fn native_reload_pins_inferred_lane_and_platform_refuses_instead_of_skipping() {
+        let config=Config::default();let pin=ConfigPin::capture(&config,&[],&[]);let mut changed=config.clone();
+        changed.inferred_parts=!changed.inferred_parts;
+        assert!(pin.check(&changed,&[],&[]).unwrap_err().to_string().contains("restart"));
+        assert!(super::super::workers::check_inferred_platform(false).is_ok());
+        #[cfg(unix)] assert!(super::super::workers::check_inferred_platform(true).is_ok());
+        #[cfg(not(unix))] assert!(super::super::workers::check_inferred_platform(true).unwrap_err().to_string().contains("Unix"));
+    }
+
+    #[test]
     fn native_reload_pins_both_spotnet_lanes_before_legacy_reconfiguration() {
         let config=Config::default();let pin=ConfigPin::capture(&config,&[],&[]);
         let edits:[fn(&mut Config);5]=[
