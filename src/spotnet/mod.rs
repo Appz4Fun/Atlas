@@ -16,6 +16,17 @@ pub mod full;
 pub mod header;
 pub mod ingest;
 pub mod names;
+pub(crate) mod native;
+#[path="native_plan.rs"]
+mod native_plan;
+#[path="native_store.rs"]
+mod native_store;
+#[cfg(test)]
+#[path="native_tests.rs"]
+mod native_tests;
+#[cfg(test)]
+#[path="native_peer_tests.rs"]
+mod native_peer_tests;
 pub mod release;
 pub mod sign;
 pub mod store;

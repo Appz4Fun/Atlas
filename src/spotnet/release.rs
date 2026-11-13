@@ -111,12 +111,12 @@ pub fn nzb_key(nzb: &Parsed) -> String {
 }
 
 /// A group of `file`'s that may be saved, the first one.
-fn allowed(file: &crate::archive::nzb::NzbFile) -> Option<&String> {
+pub(super) fn allowed(file: &crate::archive::nzb::NzbFile) -> Option<&String> {
     file.groups.iter().find(|g| !crate::filters::group_blocked(g))
 }
 
 /// The title as a release name: one line, no control characters, at most 255 characters.
-fn clean_title(title: &str) -> Option<String> {
+pub(super) fn clean_title(title: &str) -> Option<String> {
     let one_line: String = title
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
@@ -130,7 +130,7 @@ fn clean_title(title: &str) -> Option<String> {
 }
 
 /// Unix seconds as indexing stores a date: `%Y-%m-%d %H:%M:%S`, UTC.
-fn iso_date(unix: i64) -> String {
+pub(super) fn iso_date(unix: i64) -> String {
     chrono::DateTime::from_timestamp(unix, 0).unwrap_or_default().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 

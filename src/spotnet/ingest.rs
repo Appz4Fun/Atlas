@@ -22,22 +22,22 @@ use super::store::{self, SAVED, SKIPPED, Settled, SpotRow};
 use super::{MAX_XML_BYTES, SPOT_GROUP, binary, blacklist, comments, full, header, release, sign};
 
 /// Overview lines asked for in one XOVER.
-const XOVER_STEP: u64 = 5_000;
+pub(super) const XOVER_STEP: u64 = 5_000;
 /// The largest article of a spot's NZB read, as it comes off the wire: they are a few hundred KB.
-const MAX_NZB_ARTICLE: usize = 4 * 1024 * 1024;
+pub(super) const MAX_NZB_ARTICLE: usize = 4 * 1024 * 1024;
 /// A spot's NZB articles read at most, and their bytes together. A real spot names one or two; past these the
 /// spot is no real one, and nothing more is read.
 const MAX_NZB_ARTICLES: usize = 16;
-const MAX_NZB_POSTED: usize = 16 * 1024 * 1024;
+pub(super) const MAX_NZB_POSTED: usize = 16 * 1024 * 1024;
 /// What `body_capped` may read past its cap before it gives up: one long line.
-const CAP_OVERSHOOT: usize = 64 * 1024;
+pub(super) const CAP_OVERSHOOT: usize = 64 * 1024;
 /// Spots decoded and on their way to being saved at once. Each save waits behind indexing's on its shard's writer
 /// (seconds to minutes on a busy indexer), so one at a time was the pass's pace.
 const DECODING: usize = 4;
 /// NZB article bytes one pass reads at most; the spots left wait for the next pass.
-const MAX_PASS_POSTED: usize = 256 * 1024 * 1024;
+pub(super) const MAX_PASS_POSTED: usize = 256 * 1024 * 1024;
 /// Spots saved before their XML was kept, read again per pass (a HEAD each, a few KB).
-const XML_BACKFILL: usize = 50;
+pub(super) const XML_BACKFILL: usize = 50;
 
 /// What one pass did, for the log.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -222,13 +222,13 @@ enum Waited {
 }
 
 /// What a pass's spot tasks share.
-struct Shared {
+pub(super) struct Shared {
     /// NZB article bytes the pass may still read: each BODY reserves the most it can take first, and gives back
     /// what it didn't read
-    budget: AtomicUsize,
+    pub(super) budget: AtomicUsize,
     /// `DECODING` spots at a time from inflating their NZB to tagging their release: decoding is the memory a spot
     /// takes (an NZB of up to 64 MB, up to 300,000 articles), held until its save is done
-    decoding: tokio::sync::Semaphore,
+    pub(super) decoding: tokio::sync::Semaphore,
     /// one spot of a shard at a time through the copy checks, save and tag: spots of one title go to the same group,
     /// and so the same shard (copies of one NZB in other shards are kept apart by `claims`)
     saving: Vec<tokio::sync::Mutex<()>>,
@@ -240,7 +240,7 @@ struct Shared {
 }
 
 impl Shared {
-    fn new(budget: usize) -> Shared {
+    pub(super) fn new(budget: usize) -> Shared {
         Shared {
             budget: AtomicUsize::new(budget),
             decoding: tokio::sync::Semaphore::new(DECODING),
@@ -251,23 +251,23 @@ impl Shared {
     }
 
     /// Takes `n` bytes of the budget, or nothing when fewer are left.
-    fn reserve(&self, n: usize) -> bool {
+    pub(super) fn reserve(&self, n: usize) -> bool {
         self.budget.try_update(Ordering::Relaxed, Ordering::Relaxed, |left| left.checked_sub(n)).is_ok()
     }
 
-    fn give_back(&self, n: usize) {
+    pub(super) fn give_back(&self, n: usize) {
         self.budget.fetch_add(n, Ordering::Relaxed);
     }
 
     /// Claims an NZB key for this spot until the guard goes, or None when another spot holds it.
-    fn claim(self: &Arc<Self>, key: &str) -> Option<Claim> {
+    pub(super) fn claim(self: &Arc<Self>, key: &str) -> Option<Claim> {
         let mut claims = self.claims.lock().unwrap();
         claims.insert(key.to_string()).then(|| Claim { shared: self.clone(), key: key.to_string() })
     }
 }
 
 /// An NZB key claimed in `Shared::claims`, released when dropped.
-struct Claim {
+pub(super) struct Claim {
     shared: Arc<Shared>,
     key: String,
 }
@@ -530,7 +530,7 @@ async fn read_overview(
 
 /// The removal an overview line is, when it's a moderator's (or a spotter's own) `DISPOSE` whose signatures hold.
 /// A spotter's own needs their key to have signed its title and message-id: it removes only their posts.
-fn removal(r: &crate::nntp::Overview, now: i64) -> Option<store::Disposal> {
+pub(super) fn removal(r: &crate::nntp::Overview, now: i64) -> Option<store::Disposal> {
     let h = header::parse(&r.subject, &r.from)?;
     let message_id = h.removes()?;
     let verdict = sign::verify(&h.title, &r.from, &r.message_id);
@@ -628,7 +628,7 @@ async fn said(pool: &Arc<Pool>, db: &Db, config: &SpotsConfig, stopping: &impl F
 }
 
 /// Comments' texts read before they're written, together.
-const SETTLE_BATCH: usize = 200;
+pub(super) const SETTLE_BATCH: usize = 200;
 
 /// What came of reading these comments' texts, in one transaction, counted into `done`.
 async fn settle_comments(db: &Db, outcomes: Vec<(String, comments::Outcome)>, done: &mut Said) -> Result<()> {
@@ -839,7 +839,7 @@ async fn timed<T, E>(
 }
 
 /// Whether a spot's NZB articles can be read: at most `MAX_NZB_ARTICLES` of them, each named once.
-fn nzb_ids_usable(ids: &[String]) -> bool {
+pub(super) fn nzb_ids_usable(ids: &[String]) -> bool {
     let mut seen = std::collections::HashSet::new();
     ids.len() <= MAX_NZB_ARTICLES && ids.iter().all(|id| seen.insert(id.as_str()))
 }
