@@ -15,9 +15,8 @@
 //! place in the set: nothing to key a volume by, soo they are left alone.
 #![cfg_attr(not(test), deny(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
-use crate::postprocess::schema::ShardTable;
+use crate::catalog_facts::FileInfo;
 use crate::postprocess::step::{StepCtx, StepError, StepMutation, StepWrite};
-use crate::store::FileInfo;
 
 pub const SIGNATURE: &[u8; 8] = b"Rar!\x1aRev";
 /// The most data volumes a header is read for: as many files as a PAR2 read keeps.
@@ -96,27 +95,6 @@ pub fn parse(data: &[u8]) -> Option<Header> {
     Some(Header { data_count, rec_count, rec_num, volumes })
 }
 
-/// Each data volume's whole-file size and CRC32, as a release's first `.rev` file names them. Kept soo the same RAR
-/// volumes posted again, under any names, are found by `(size, crc32)` (`keys::crc_files`): candidates for a reader,
-/// never a merge.
-pub const REV_VOLUMES: ShardTable = ShardTable {
-    name: "rev_volumes",
-    create: "create table if not exists rev_volumes (
-        release_id INTEGER NOT NULL,
-        volume     INTEGER NOT NULL,
-        size       INTEGER NOT NULL,
-        crc32      INTEGER NOT NULL,
-        primary key (release_id, volume)
-    ) without rowid",
-    indexes: &[("rev_volumes_crc", "create index if not exists rev_volumes_crc on rev_volumes(size, crc32)")],
-    release_key: Some("release_id"),
-    added: &[],
-};
-
-pub const DELETE_REV_VOLUMES: &str = "delete from rev_volumes where release_id = ?1";
-pub const INSERT_REV_VOLUME: &str =
-    "insert or replace into rev_volumes (release_id, volume, size, crc32) values (?1, ?2, ?3, ?4)";
-
 /// The volumes worth storing: those big enough to look up by size and CRC32, at most `MAX_KEPT`.
 pub fn kept(volumes: &[Volume]) -> Vec<Volume> {
     let min = u64::try_from(crate::keys::CRC_MIN_SIZE).unwrap_or(u64::MAX);
@@ -140,7 +118,7 @@ pub fn sources(files: &[FileInfo]) -> Vec<&FileInfo> {
     found
 }
 
-/// The writes for a release's data volume table: from `atlas.raw.db` when it was read before for the same files,
+/// The writes for a release's data volume table: from the owned natural-key cache when it was read before for the same files,
 /// else from the first article of its first `.rev` file (the next when that one gives nothing). Empty, and the
 /// stored rows left as they are, when the release has no `.rev` file or none of them gave a table: no article is
 /// fetched for a release without one.
@@ -152,7 +130,10 @@ pub fn read(ctx: &mut StepCtx<'_>, files: &[FileInfo], explicit: bool) -> Result
     let rel = ctx.release();
     let (id, name, group) = (rel.id, rel.name.clone(), rel.group.clone());
     let content_id = ctx.data().release_content_id(id)?.unwrap_or_default();
-    if !explicit && let Some(saved) = crate::raw_store::get_rev_volumes_checked(&name, &group, &content_id).map_err(StepError::from_cache)? {
+    if !explicit
+        && let Some(saved) =
+            crate::raw_store::get_rev_volumes_checked(&name, &group, &content_id).map_err(StepError::from_cache)?
+    {
         return Ok(writes(id, &kept(&saved)));
     }
     for file in sources.into_iter().take(TRIES) {
@@ -163,7 +144,8 @@ pub fn read(ctx: &mut StepCtx<'_>, files: &[FileInfo], explicit: bool) -> Result
         if volumes.is_empty() {
             continue;
         }
-        crate::raw_store::put_rev_volumes_checked(&name, &group, &content_id, &volumes).map_err(StepError::from_cache)?;
+        crate::raw_store::put_rev_volumes_checked(&name, &group, &content_id, &volumes)
+            .map_err(StepError::from_cache)?;
         return Ok(writes(id, &volumes));
     }
     Ok(Vec::new())
@@ -259,8 +241,13 @@ mod tests {
         let h = parse(&header_bytes(&SET, 1, 3)).unwrap();
         let w = writes(9, &h.volumes);
         assert_eq!(w.len(), 4);
-        assert_eq!(w[0].sql, DELETE_REV_VOLUMES);
-        assert!(w[1..].iter().all(|x| x.sql == INSERT_REV_VOLUME));
+        assert!(matches!(w[0].native_mutation_for(9).unwrap(), StepMutation::ClearRevVolumes));
+        for (write, volume) in w[1..].iter().zip(&h.volumes) {
+            assert!(
+                matches!(write.native_mutation_for(9).unwrap(), StepMutation::KeepRevVolume(found) if found == volume)
+            );
+            assert!(write.native_mutation_for(10).is_err());
+        }
     }
 
     #[test]
