@@ -57,8 +57,8 @@ fn prepare_source_table<'source>(
     names: &[&str],
 ) -> Result<rusqlite::Statement<'source>> {
     let mut columns = source.prepare("select name from pragma_table_xinfo(?1, 'main')")?;
-    for column in columns.query_map([table], |row| row.get::<_, String>(0))? {
-        let column = column?;
+    let source_columns = columns.query_map([table], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    for column in &source_columns {
         ensure!(
             names.contains(&column.as_str()) && !(table == "meta" && column == "text_value"),
             "unsupported SQLite column {table}.{column} would be dropped"
@@ -70,6 +70,11 @@ fn prepare_source_table<'source>(
         .map(|name| match (table, name) {
             ("meta", "value") => "case when typeof(source.value) <> 'text' then source.value end".into(),
             ("meta", "text_value") => "case when typeof(source.value) = 'text' then source.value end".into(),
+            // Migration 11 keeps the exact original body beside display text.
+            // Older SQLite snapshots have only the original TEXT body. Derive
+            // this one absent target column without weakening storage typing.
+            ("spot_comments", "native_original_body") if !source_columns.iter().any(|column| column == name) =>
+                "cast(source.body as blob)".into(),
             _ => format!("source.{}", quote(name)),
         })
         .collect::<Vec<_>>()
@@ -101,6 +106,7 @@ fn source_tables(source: &Connection) -> Result<Vec<&'static str>> {
 enum Kind {
     Int,
     Text,
+    Blob,
 }
 
 impl Kind {
@@ -109,6 +115,8 @@ impl Kind {
             Ok(Self::Int)
         } else if *ty == Type::TEXT {
             Ok(Self::Text)
+        } else if *ty == Type::BYTEA {
+            Ok(Self::Blob)
         } else {
             bail!("unsupported PostgreSQL main-table type {ty}")
         }
@@ -120,6 +128,7 @@ enum Cell {
     Null,
     Int(i64),
     Text(String),
+    Blob(Vec<u8>),
 }
 
 impl Cell {
@@ -127,9 +136,11 @@ impl Cell {
         match self {
             Self::Int(value) => value,
             Self::Text(value) => value,
+            Self::Blob(value) => value,
             Self::Null => match kind {
                 Kind::Int => &None::<i64>,
                 Kind::Text => &None::<String>,
+                Kind::Blob => &None::<Vec<u8>>,
             },
         }
     }
@@ -146,6 +157,7 @@ fn read_source_row(row: &rusqlite::Row<'_>, kinds: &[Kind], values: &mut Vec<Cel
                 ensure!(!text.contains('\0'), "embedded NUL in SQLite text column {}", index + 1);
                 Cell::Text(text.to_owned())
             }
+            (ValueRef::Blob(value), Kind::Blob) => Cell::Blob(value.to_vec()),
             (other, _) => bail!("SQLite column {} has incompatible storage type {:?}", index + 1, other.data_type()),
         };
         values.push(value);
@@ -173,6 +185,11 @@ impl Tally {
                     hash.update([2]);
                     hash.update((value.len() as u64).to_le_bytes());
                     hash.update(value.as_bytes());
+                }
+                Cell::Blob(value) => {
+                    hash.update([3]);
+                    hash.update((value.len() as u64).to_le_bytes());
+                    hash.update(value);
                 }
             }
         }
@@ -213,6 +230,7 @@ fn copy_table(source: &Connection, target: &mut postgres::Transaction<'_>, schem
             let value = match kind {
                 Kind::Int => row.try_get::<Option<i64>>(index)?.map_or(Cell::Null, Cell::Int),
                 Kind::Text => row.try_get::<Option<String>>(index)?.map_or(Cell::Null, Cell::Text),
+                Kind::Blob => row.try_get::<Option<Vec<u8>>>(index)?.map_or(Cell::Null, Cell::Blob),
             };
             cells.push(value);
         }
@@ -366,6 +384,52 @@ pub(crate) mod tests {
         .unwrap();
         let error = prepare_source_table(&c, "groups", &["name", "live_cursor"]).err().unwrap();
         assert!(error.to_string().contains("future_cursor"));
+    }
+
+    #[test]
+    fn spot_comment_original_bytes_follow_the_source_body_without_text_coercion() {
+        let source = Connection::open_in_memory().unwrap();
+        source.execute_batch("create table spot_comments(body text); insert into spot_comments values('original café'),(null)").unwrap();
+        let mut statement = prepare_source_table(&source, "spot_comments", &["body", "native_original_body"]).unwrap();
+        let mut rows = statement.query([]).unwrap();
+        let mut cells = Vec::new();
+        read_source_row(rows.next().unwrap().unwrap(), &[Kind::Text, Kind::Blob], &mut cells).unwrap();
+        assert_eq!(cells, [Cell::Text("original café".into()), Cell::Blob(b"original caf\xc3\xa9".to_vec())]);
+        read_source_row(rows.next().unwrap().unwrap(), &[Kind::Text, Kind::Blob], &mut cells).unwrap();
+        assert_eq!(cells, [Cell::Null, Cell::Null]);
+        assert!(prepare_source_table(&source, "spot_comments", &["body", "invented_original_body"]).is_err());
+        drop(rows); drop(statement);
+        source.execute_batch("alter table spot_comments add column native_original_body blob; update spot_comments set native_original_body=x'00ff' where body is not null").unwrap();
+        let mut statement = prepare_source_table(&source, "spot_comments", &["body", "native_original_body"]).unwrap();
+        let mut rows = statement.query([]).unwrap();
+        read_source_row(rows.next().unwrap().unwrap(), &[Kind::Text, Kind::Blob], &mut cells).unwrap();
+        assert_eq!(cells[1], Cell::Blob(vec![0,255]), "an existing original-byte column must never be overwritten by display text");
+        let mut statement = source.prepare("select x'00ff', 'text'").unwrap();
+        let mut rows = statement.query([]).unwrap();
+        assert!(read_source_row(rows.next().unwrap().unwrap(), &[Kind::Blob, Kind::Blob], &mut cells).is_err(), "ordinary text is not silently accepted as a blob");
+        let mut blob = Tally::default(); blob.add(&[Cell::Blob(vec![0,255])]);
+        let mut null = Tally::default(); null.add(&[Cell::Null]);
+        assert_ne!(blob, null, "binary contents participate in parity");
+    }
+
+    #[test]
+    #[ignore = "requires explicit isolated PostgreSQL import qualification"]
+    fn postgres_import_preserves_spot_comment_original_body_bytes_and_null() {
+        let test = crate::pg::testing::Schema::empty().expect("explicit isolated PG required");
+        let dir = tempfile::tempdir().unwrap(); let path = sqlite_snapshot(dir.path());
+        let source = Connection::open(&path).unwrap();
+        source.execute_batch("insert into spot_comments(message_id,spot,at,body) values('with-body','spot',1,'original café'),('no-body','spot',2,null)").unwrap();
+        drop(source);
+        let schema = format!("{STAGING_PREFIX}{}", test.name);
+        let mut pg = test.pool.get().unwrap();
+        let database: String = pg.query_one("select current_database()", &[]).unwrap().get(0);
+        import_snapshot(&path, &mut pg, &database, &schema).unwrap();
+        let rows = pg.query(&format!("select message_id,body,native_original_body from {schema}.spot_comments order by at"), &[]).unwrap();
+        pg.batch_execute(&format!("drop schema {schema} cascade")).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get::<_, String>(1), "original café");
+        assert_eq!(rows[0].get::<_, Vec<u8>>(2), b"original caf\xc3\xa9");
+        assert_eq!(rows[1].get::<_, Option<Vec<u8>>>(2), None);
     }
 
     pub(crate) fn sqlite_snapshot(dir: &Path) -> std::path::PathBuf {
