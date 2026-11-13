@@ -25,6 +25,7 @@ struct ProviderFailure;
 impl std::fmt::Display for ProviderFailure {
     fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str("native Spotnet provider failure")}
 }
+fn binding_hex(bytes:&[u8;32])->String {bytes.iter().map(|byte|format!("{byte:02x}")).collect()}
 fn provider_error(error:crate::nntp::NntpError)->anyhow::Error {
     match error {
         crate::nntp::NntpError::HeaderStore(_)=>error.into(),
@@ -81,7 +82,7 @@ impl Service {
     }
     #[cfg(test)]
     pub(crate) fn network_for_test<T>(&self,future:impl Future<Output=crate::nntp::Result<T>>)->Result<T> {self.network(future)}
-    fn binding(&self,server:usize)->Result<String> {Ok(hex::encode(self.pool.provider_binding_on(server)?))}
+    fn binding(&self,server:usize)->Result<String> {Ok(binding_hex(&self.pool.provider_binding_on(server)?))}
 
     pub(crate) fn spots_tick(&self,now:i64)->Result<ingest::Pass> {
         let mut done=ingest::Pass::default();if !self.config.enabled {return Ok(done)}
@@ -332,3 +333,14 @@ impl Service {
     }
 }
 fn absent(error:&anyhow::Error)->bool {error.downcast_ref::<crate::nntp::NntpError>().is_some_and(says_absent)}
+
+#[cfg(test)]
+mod binding_hex_tests {
+    #[test]
+    fn provider_binding_hex_keeps_all_bytes_order_lowercase_and_leading_zeros() {
+        let mut bytes=[0u8;32];bytes[..8].copy_from_slice(&[0x00,0x01,0x0f,0x10,0xab,0xcd,0xef,0xff]);bytes[31]=0x09;
+        let encoded=super::binding_hex(&bytes);
+        assert_eq!(encoded.len(),64);
+        assert_eq!(encoded,concat!("00010f10abcdefff","0000000000000000","0000000000000000","00000000000000","09"));
+    }
+}
