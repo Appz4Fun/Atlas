@@ -931,6 +931,13 @@ fn respond_with_assets(mut request:Request,api_key:&str,fallback_host:&str,stora
     let _ = request.respond(response);
 }
 
+/// Called only after listener/runtime admission. A configured selection is
+/// verified against its actual root and whole manifest file before binding;
+/// missing configuration grants no file access and never fetches assets.
+fn selected_asset_manifest(selection:Option<&crate::config::NativeAssetsConfig>)->anyhow::Result<Option<Arc<crate::pg::fresh_assets::AssetManifest>>> {
+    selection.map(crate::pg::fresh_assets::AssetManifest::from_selection).transpose().map(|manifest|manifest.map(Arc::new))
+}
+
 /// Start the api on a few worker threads. Returns false when it couldnt bind.
 pub fn start(config: &mut Config) -> bool {
     let storage=match crate::config::checked_storage_config() {
@@ -957,6 +964,12 @@ pub(crate) fn start_for_storage_with_assets(config:&mut Config,storage:&crate::p
     if storage.is_postgres() {
         ui::print("[yellow]native Web UI is awaiting full reader and runtime qualification[/yellow]");return false;
     }
+    let assets=if storage.is_postgres()&&assets.is_none() {
+        match selected_asset_manifest(config.native_assets.as_ref()) {
+            Ok(assets)=>assets,
+            Err(_)=>{ui::print("[yellow]selected native asset root or manifest unavailable; API not started[/yellow]");return false;}
+        }
+    }else{assets};
     let (api_key, created) = get_api_key(config);
 
     if created {
@@ -1545,4 +1558,26 @@ mod native_form_body_tests {
         }
     }
 
+}
+
+#[cfg(all(test,unix))]
+mod native_asset_selection_tests {
+    use super::*;
+    use sha2::{Digest,Sha256};
+    #[test]
+    fn selected_manifest_is_verified_and_absence_grants_nothing() {
+        assert!(selected_asset_manifest(None).unwrap().is_none());
+        let root=tempfile::tempdir().unwrap();let evidence=tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("posters")).unwrap();std::fs::write(root.path().join("posters/original.jpg"),b"retained original bytes").unwrap();
+        let manifest=evidence.path().join("assets.jsonl");
+        crate::pg::cache_assets::capture_file(root.path(),&manifest,crate::pg::cache_assets::Limits {min_files:1,max_files:8,max_file_bytes:1<<20,max_total_bytes:8<<20,read_bytes_per_second:32<<20}).unwrap();
+        let digest=Sha256::digest(std::fs::read(&manifest).unwrap()).iter().map(|byte|format!("{byte:02x}")).collect::<String>();
+        let selection=crate::config::NativeAssetsConfig {root:root.path().canonicalize().unwrap().to_str().unwrap().into(),manifest:manifest.canonicalize().unwrap().to_str().unwrap().into(),whole_sha256:digest};
+        assert!(selected_asset_manifest(Some(&selection)).unwrap().is_some());
+        let mismatched=crate::config::NativeAssetsConfig {whole_sha256:"00".repeat(32),..selection.clone()};
+        assert!(selected_asset_manifest(Some(&mismatched)).is_err());
+        let missing=crate::config::NativeAssetsConfig {manifest:evidence.path().join("missing.jsonl").to_str().unwrap().into(),..selection};
+        assert!(selected_asset_manifest(Some(&missing)).is_err());
+        assert!(!root.path().join("posters/missing.jsonl").exists());
+    }
 }
