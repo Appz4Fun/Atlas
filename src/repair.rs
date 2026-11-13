@@ -587,71 +587,73 @@ fn windows_of(conn: &Connection, ids: &[i64]) -> rusqlite::Result<Vec<Window>> {
 mod tests {
     use super::*;
 
-    /// The main database's writes of a round and the group cursors it reads, alike on SQLite and Postgres.
+    /// A real migrated PostgreSQL round preserves its marks, cursors and atomic failure semantics.
     #[test]
-    fn marks_and_group_cursors_on_both_backends() {
+    #[ignore = "requires explicit isolated PostgreSQL for native repair marks and cursors"]
+    fn native_marks_group_cursors_and_failed_batch_keep_exact_postgres_facts() {
         use crate::db;
         use crate::pg::sql::vals;
-        crate::pg::testing::each(
-            |c| {
-                c.execute_batch(
-                    "create table groups (name TEXT PRIMARY KEY, live_cursor INTEGER, backfill_cursor INTEGER,
-                        first_article INTEGER, last_article INTEGER, low_article INTEGER, low_posted INTEGER,
-                        high_article INTEGER, high_posted INTEGER, start_posted INTEGER)",
-                )
-                .unwrap();
-                c.execute_batch(CREATE).unwrap();
-                crate::store::create_main(c).unwrap();
-            },
-            |c| {
-                // cursors: made, moved one at a time, and read back
-                assert_eq!(db::get_group_state(c, "g@a").unwrap(), None);
-                db::init_group_state(c, "g@a", 100).unwrap();
-                db::update_live_cursor(c, "g@a", 150).unwrap();
-                db::update_backfill_cursor(c, "g@a", 50).unwrap();
-                db::update_live_cursor(c, "g@b", 7).unwrap();
-                db::save_group_state(c, "g2@a", db::GroupState { live_cursor: 3, backfill_cursor: 1 }).unwrap();
-                assert_eq!(
-                    db::get_group_state(c, "g@a").unwrap(),
-                    Some(db::GroupState { live_cursor: 150, backfill_cursor: 50 })
-                );
-                db::save_group_bounds(c, "g@a", 10, 200).unwrap();
-                // each end widens alone
-                db::save_group_dates(c, "g@a", (60, 6000), (140, 14_000)).unwrap();
-                db::save_group_dates(c, "g@a", (70, 7000), (145, 14_500)).unwrap();
-                db::save_group_dates(c, "g@b", (1, 100), (7, 700)).unwrap();
-                db::set_start_posted(c, "g@b", 500).unwrap();
-                let rows = db::group_progress(c).unwrap();
-                let a = rows.iter().find(|r| r.key == "g@a").unwrap();
-                assert_eq!(
-                    (a.first, a.last, a.low, a.high),
-                    (Some(10), Some(200), Some((60, 6000)), Some((145, 14_500)))
-                );
-                // read through: g@a's newest saved slice is behind its live cursor, g@b's too; g2 isn't g's
-                assert_eq!(crate::indexer::read_through(c, "g", "g@a").unwrap(), (Some(700), Some(14_500)));
-                assert_eq!(crate::indexer::read_through_since(c, "g", "g@a", 400).unwrap(), None, "b began after");
-                assert_eq!(crate::indexer::read_through_since(c, "g", "g@a", 500).unwrap(), Some(700));
-                let mut from: Vec<String> = indexed_from(c, "g").unwrap().into_iter().collect();
-                from.sort();
-                assert_eq!(from, ["a", "b"]);
+        let schema = crate::pg::testing::Schema::new().expect("explicit isolated PostgreSQL required");
+        let mut client = schema.pool.get().unwrap();
+        let pg = crate::pg::sql::Pg::new(&mut client);
+        let c: &dyn crate::pg::sql::Sql = &pg;
+        // cursors: made, moved one at a time, and read back
+        assert_eq!(db::get_group_state(c, "g@a").unwrap(), None);
+        db::init_group_state(c, "g@a", 100).unwrap();
+        db::update_live_cursor(c, "g@a", 150).unwrap();
+        db::update_backfill_cursor(c, "g@a", 50).unwrap();
+        db::update_live_cursor(c, "g@b", 7).unwrap();
+        db::save_group_state(c, "g2@a", db::GroupState { live_cursor: 3, backfill_cursor: 1 }).unwrap();
+        assert_eq!(
+            db::get_group_state(c, "g@a").unwrap(),
+            Some(db::GroupState { live_cursor: 150, backfill_cursor: 50 })
+        );
+        db::save_group_bounds(c, "g@a", 10, 200).unwrap();
+        // each end widens alone
+        db::save_group_dates(c, "g@a", (60, 6000), (140, 14_000)).unwrap();
+        db::save_group_dates(c, "g@a", (70, 7000), (145, 14_500)).unwrap();
+        db::save_group_dates(c, "g@b", (1, 100), (7, 700)).unwrap();
+        db::set_start_posted(c, "g@b", 500).unwrap();
+        let rows = db::group_progress(c).unwrap();
+        let a = rows.iter().find(|r| r.key == "g@a").unwrap();
+        assert_eq!((a.first, a.last, a.low, a.high), (Some(10), Some(200), Some((60, 6000)), Some((145, 14_500))));
+        // read through: g@a's newest saved slice is behind its live cursor, g@b's too; g2 isn't g's
+        assert_eq!(crate::indexer::read_through(c, "g", "g@a").unwrap(), (Some(700), Some(14_500)));
+        assert_eq!(crate::indexer::read_through_since(c, "g", "g@a", 400).unwrap(), None, "b began after");
+        assert_eq!(crate::indexer::read_through_since(c, "g", "g@a", 500).unwrap(), Some(700));
+        let mut from: Vec<String> = indexed_from(c, "g").unwrap().into_iter().collect();
+        from.sort();
+        assert_eq!(from, ["a", "b"]);
 
-                // a round's marks: tried releases, the older sweeps, and the days asked for
-                crate::chunks::add(c, "g", 20_000, 19_990).unwrap();
-                mark_in(c, 1000, &[("g".into(), 19_995)], &[(5, 900), (6, 100)], &[(0, Some(42)), (1, None)]).unwrap();
-                mark_in(c, 2000, &[], &[(5, 950)], &[(0, Some(41))]).unwrap();
-                let tried: Vec<(i64, i64, i64)> = c
-                    .query("select release_id, at, permille from repair_tried order by release_id", vals![])
-                    .unwrap()
-                    .iter()
-                    .map(|r| (r.get(0).unwrap(), r.get(1).unwrap(), r.get(2).unwrap()))
-                    .collect();
-                assert_eq!(tried, [(5, 2000, 950), (6, 1000, 100)]);
-                let older: Vec<Option<i64>> =
-                    c.column("select before from repair_older order by shard", vals![]).unwrap();
-                assert_eq!(older, [Some(41), None]);
-                let k = crate::chunks::claim(c, &[("g".into(), i64::MIN)], "s", 3000).unwrap().unwrap();
-                assert_eq!(k.day, 19_995, "the day asked for first");
-            },
+        // a round's marks: tried releases, the older sweeps, and the days asked for
+        crate::chunks::add(c, "g", 20_000, 19_990).unwrap();
+        mark_in(c, 1000, &[("g".into(), 19_995)], &[(5, 900), (6, 100)], &[(0, Some(42)), (1, None)]).unwrap();
+        mark_in(c, 2000, &[], &[(5, 950)], &[(0, Some(41))]).unwrap();
+        let tried: Vec<(i64, i64, i64)> = c
+            .query("select release_id, at, permille from repair_tried order by release_id", vals![])
+            .unwrap()
+            .iter()
+            .map(|r| (r.get(0).unwrap(), r.get(1).unwrap(), r.get(2).unwrap()))
+            .collect();
+        assert_eq!(tried, [(5, 2000, 950), (6, 1000, 100)]);
+        let older: Vec<Option<i64>> = c.column("select before from repair_older order by shard", vals![]).unwrap();
+        assert_eq!(older, [Some(41), None]);
+        let k = crate::chunks::claim(c, &[("g".into(), i64::MIN)], "s", 3000).unwrap().unwrap();
+        assert_eq!(k.day, 19_995, "the day asked for first");
+        // The actual mark transaction must roll back its earlier wanted-day
+        // write when a later tried row is refused, retaining the driver cause.
+        c.batch("alter table repair_tried add constraint fixture_nonnegative_share check (permille >= 0) not valid")
+            .unwrap();
+        let error = mark_in(c, 4000, &[("g".into(), 19_996)], &[(7, -1)], &[(0, Some(12))]).unwrap_err();
+        assert_eq!(error.postgres().unwrap().code(), Some(&postgres::error::SqlState::CHECK_VIOLATION));
+        assert_eq!(c.one::<i64>("select count(*) from repair_tried where release_id=7", vals![]).unwrap(), 0);
+        assert_eq!(
+            c.one::<i64>("select count(*) from backfill_wanted where grp='g' and day=19996", vals![]).unwrap(),
+            0
+        );
+        assert_eq!(
+            c.opt::<Option<i64>>("select before from repair_older where shard=0", vals![]).unwrap(),
+            Some(Some(41))
         );
     }
 
@@ -778,41 +780,71 @@ mod tests {
     }
 
     #[test]
-    fn big_video_releases_are_counted_per_group() {
-        let dir = tempfile::tempdir().unwrap();
-        let main = dir.path().join("atlas.db");
-        db::create_db_at(&main).unwrap();
-        let release = |name: &str, group: &str, size: i64| {
-            let article = crate::parser::Article {
+    #[ignore = "requires explicit isolated PostgreSQL for the actual native daily media reducer"]
+    fn big_video_releases_are_counted_by_the_actual_native_media_service() {
+        let schema = crate::pg::testing::Schema::new().expect("explicit isolated PostgreSQL required");
+        let root = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config::default();
+        config.postprocess.enabled = false;
+        config.predb.enabled = false;
+        config.spots.enabled = false;
+        config.inferred_parts = false;
+        config.media.tvmaze.enabled = false;
+        config.media.allocine.enabled = false;
+        config.media.details_per_minute = 0;
+        let headers = crate::config::HeaderStoreConfig { enabled: true, dir: root.path().to_str().unwrap().into() };
+        let storage = crate::pg::StorageConfig {
+            backend: crate::pg::Backend::Postgres,
+            url: schema.url.clone(),
+            schema: schema.name.clone(),
+            max_connections: 1,
+            allow_plaintext: true,
+        };
+        let runtime =
+            crate::pg::indexer_runtime::Runtime::open(&config, storage, headers.clone(), &[], &mut None).unwrap();
+        let big = (4i64 << 30) + 1;
+        let release = |name: &str, group: &str, bytes: i64| crate::parser::Release {
+            name: name.into(),
+            group: group.into(),
+            articles: vec![crate::parser::Article {
                 message_id: format!("<{name}@x>"),
-                subject: format!("\"{name}\" yEnc (1/1)"),
-                author: "p <p@x>".into(),
                 filename: Some(format!("{name}.mkv")),
                 part: Some(1),
                 total_parts: Some(1),
-                bytes: 10,
+                bytes,
                 ..Default::default()
-            };
-            let r = crate::parser::Release {
-                name: name.into(),
-                group: group.into(),
-                articles: vec![article],
-                ..Default::default()
-            };
-            store::save(&main, &[r]).unwrap();
-            let shard = db::open_shard(&store::shard_path(&main, store::shard_of(group))).unwrap();
-            shard.execute("update releases set size = ?2 where name = ?1", rusqlite::params![name, size]).unwrap();
+            }],
+            ..Default::default()
         };
-        let big = MEDIA_BYTES + 1;
-        release("Film.2020.2160p.WEB-DL-X", "alt.binaries.a", big);
-        release("Film.2021.1080p.BluRay.REMUX-Y", "alt.binaries.a", big);
-        release("Film.2022.2160p.WEB-DL-Z", "alt.binaries.a", MEDIA_BYTES - 1);
-        release("Show.S01E01.DV.HDR.2160p-W", "alt.binaries.b", big);
-        release("Album.2020.FLAC-V", "alt.binaries.b", big);
-        let conn = db::open_with_shards(&main).unwrap();
-        let mut got = media_counts(&conn).unwrap();
-        got.sort();
-        assert_eq!(got, [("alt.binaries.a".to_string(), 2), ("alt.binaries.b".to_string(), 1)]);
+        let input = [
+            release("Film.2020.2160p.WEB-DL-X", "alt.binaries.a", big),
+            release("Film.2021.1080p.BluRay.REMUX-Y", "alt.binaries.a", big),
+            release("Film.2022.2160p.WEB-DL-Z", "alt.binaries.a", (4i64 << 30) - 1),
+            release("Show.S01E01.DV.HDR.2160p-W", "alt.binaries.b", big),
+            release("Album.2020.FLAC-V", "alt.binaries.b", big),
+        ];
+        runtime
+            .owner
+            .with(|client| {
+                crate::pg::release_writer::save(client, &input, 1)?;
+                Ok(())
+            })
+            .unwrap();
+        let mut service = crate::pg::media_counts::Service::new(&runtime.owner, runtime.db.clone(), &headers).unwrap();
+        assert!(matches!(service.tick().unwrap(), crate::pg::media_counts::Tick::Stored));
+        runtime
+            .owner
+            .with(|client| {
+                let got = client
+                    .query("select grp,releases from backfill_media order by grp", &[])?
+                    .into_iter()
+                    .map(|row| (row.get::<_, String>(0), row.get::<_, i64>(1)))
+                    .collect::<Vec<_>>();
+                assert_eq!(got, [("alt.binaries.a".to_string(), 2), ("alt.binaries.b".to_string(), 1)]);
+                Ok(())
+            })
+            .unwrap();
+        runtime.owner.close();
     }
 
     #[test]
