@@ -3,6 +3,8 @@
 //! isnt read into memory whole. Counts the live bytes of every allocation in
 //! this test binary (the mock server's included, it streams its replies).
 
+use atlas as atlas_api;
+#[path = "common/nntp.rs"]
 mod common;
 
 use std::alloc::{GlobalAlloc, Layout, System};

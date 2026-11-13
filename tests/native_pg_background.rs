@@ -1,4 +1,6 @@
 //! Native storage through the actual background-indexer entry point.
+use atlas as atlas_api;
+#[path = "common/nntp.rs"]
 mod common;
 #[path = "common/pg_outage.rs"]
 mod pg_outage;

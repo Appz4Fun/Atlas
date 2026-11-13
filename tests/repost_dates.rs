@@ -1,5 +1,7 @@
 //! The Dates of a release's articles, read from one server's overview between the release's first and last Date.
 
+use atlas as atlas_api;
+#[path = "common/nntp.rs"]
 mod common;
 
 use std::collections::HashSet;

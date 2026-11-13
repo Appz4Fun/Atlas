@@ -2,6 +2,8 @@
 //! configured, article only servers that reject GROUP, and empty ranges
 //! answered with 420.
 
+use atlas as atlas_api;
+#[path = "common/nntp.rs"]
 mod common;
 
 use std::sync::Arc;
