@@ -273,3 +273,6 @@ mod tests {
 
 #[cfg(test)]
 pub(crate) mod native_pg_opensubtitles_cache_tests;
+
+#[cfg(test)]
+mod native_pool_tests;
