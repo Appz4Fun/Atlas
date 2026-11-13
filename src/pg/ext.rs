@@ -50,11 +50,22 @@ fn sources() -> Vec<Source> {
         Source { ext: "ext_predb_pages", db: raw, table: "raw_predb_log" },
         Source { ext: "ext_predb_page_events", db: raw, table: "raw_predb_events" },
         Source { ext: "ext_http_cache", db: raw, table: "raw_http_cache" },
+        Source { ext: "ext_raw_probes", db: raw, table: "raw_probes" },
+        Source { ext: "ext_raw_covers", db: raw, table: "raw_covers" },
+        Source { ext: "ext_raw_archives", db: raw, table: "raw_archives" },
+        Source { ext: "ext_raw_archive_inner_files", db: raw, table: "raw_archive_inner_files" },
+        Source { ext: "ext_raw_par2", db: raw, table: "raw_par2" },
+        Source { ext: "ext_raw_par2_files", db: raw, table: "raw_par2_files" },
+        Source { ext: "ext_raw_rev_volumes", db: raw, table: "raw_rev_volumes" },
+        Source { ext: "ext_raw_nfo_passwords", db: raw, table: "raw_nfo_passwords" },
+        Source { ext: "ext_raw_stills", db: raw, table: "raw_stills" },
+        Source { ext: "ext_raw_audio_prints", db: raw, table: "raw_audio_prints" },
     ]
 }
 
 pub(crate) fn owns_table(table: &str) -> bool {
-    table == "ext_freeze_exempt" || sources().iter().any(|source| source.ext == table)
+    ["ext_freeze_exempt","ext_preserved_cache_rows","ext_cache_identity_keys","ext_segment_crc_cache","ext_cached_images","ext_asset_files"].contains(&table)
+        || sources().iter().any(|source| source.ext == table)
 }
 
 /// The `keep.*` snapshot table each `ext_*` table is topped up from (`--export-keep` named them).
@@ -70,6 +81,16 @@ fn keep_name(ext: &str) -> Option<&'static str> {
         "ext_predb_pages" => "predb_pages",
         "ext_predb_page_events" => "predb_page_events",
         "ext_http_cache" => "predb_snapshots",
+        "ext_raw_probes" => "raw_probes",
+        "ext_raw_covers" => "raw_covers",
+        "ext_raw_archives" => "raw_archives",
+        "ext_raw_archive_inner_files" => "raw_archive_inner_files",
+        "ext_raw_par2" => "raw_par2",
+        "ext_raw_par2_files" => "raw_par2_files",
+        "ext_raw_rev_volumes" => "raw_rev_volumes",
+        "ext_raw_nfo_passwords" => "raw_nfo_passwords",
+        "ext_raw_stills" => "raw_stills",
+        "ext_raw_audio_prints" => "raw_audio_prints",
         _ => return None,
     })
 }
@@ -172,12 +193,12 @@ fn check_keep_access(name: &str, required: bool, readable: impl FnOnce() -> Resu
 
 /// Explicit snapshots may omit entire tables and optional columns, but must not silently lose unsupported data.
 /// Compare with the migrated destination, including the renamed release id of hand thaws.
-fn validate_keep(tx: &mut postgres::Transaction<'_>, name: &str) -> Result<()> {
+fn validate_keep(tx: &mut postgres::Transaction<'_>, name: &str,include_manual:bool) -> Result<()> {
     let mut compatible = 0;
     let pairs = sources()
         .into_iter()
         .map(|s| (s.ext, keep_name(s.ext).unwrap()))
-        .chain(std::iter::once(("ext_freeze_exempt", "freeze_exempt")));
+        .chain(include_manual.then_some(("ext_freeze_exempt", "freeze_exempt")));
     for (ext, keep) in pairs {
         let relation = tx.query_opt(
             "select c.relkind::text, has_table_privilege(c.oid, 'SELECT')
@@ -258,8 +279,25 @@ pub fn copy_from_sqlite_with_keep(
     apply: bool,
     source: KeepSource<'_>,
 ) -> Result<Vec<Moved>> {
+    Ok(copy_external(c,main,schema,apply,source,ImportPolicy::Paired)?.copied)
+}
+
+/// Cache-only fresh-catalog conversion. No main/header/shard operational rows,
+/// hand-thaw state, full main-file witness or historical pairing receipt is
+/// imported. Exact cache copy checks run before the two explicit derived-state
+/// resets; `copied` reports those original source tallies, not a final receipt
+/// claiming the reset fields stayed unchanged.
+pub fn copy_caches_for_fresh_catalog(
+    c:&mut Client,main:&Path,schema:&str,apply:bool,source:KeepSource<'_>,
+) -> Result<FreshCacheImport> {
+    copy_external(c,main,schema,apply,source,ImportPolicy::Fresh)
+}
+#[derive(Debug)]
+pub struct FreshCacheImport {pub copied:Vec<Moved>,pub predb_late_reset:u64,pub media_fanout_reset:u64}
+#[derive(Clone,Copy,PartialEq,Eq)] enum ImportPolicy {Paired,Fresh}
+fn copy_external(c:&mut Client,main:&Path,schema:&str,apply:bool,source:KeepSource<'_>,policy:ImportPolicy)->Result<FreshCacheImport> {
     ensure!(super::valid_schema(schema),"invalid external conversion schema");
-    let witness=super::history_companion::Witness::capture(main)?;
+    let witness=if policy==ImportPolicy::Paired {super::history_companion::Witness::capture(main)?} else {None};
     let lite = Connection::open_in_memory()?;
     let mut tx = c.transaction()?;
     tx.query_one("select pg_advisory_xact_lock_shared(hashtext('atlas.indexer'),hashtext($1))",&[&schema])?;
@@ -267,7 +305,7 @@ pub fn copy_from_sqlite_with_keep(
     let keep_schema = resolve_keep(&mut tx, schema, source)?;
     super::migrate::run_in_transaction(&mut tx, schema)?;
     if let (KeepSource::Named(_), Some(name)) = (source, keep_schema) {
-        validate_keep(&mut tx, name)?;
+        validate_keep(&mut tx, name,policy==ImportPolicy::Paired)?;
     }
     for t in tables_of(&mut tx)? {
         let any: bool =
@@ -300,6 +338,11 @@ pub fn copy_from_sqlite_with_keep(
             if back != tally {
                 bail!("{}: Postgres holds something else than {} ({back:?} vs {tally:?})", s.ext, path.display());
             }
+            if s.ext.starts_with("ext_raw_") {
+                preserve_variants(&mut tx,s.ext,&keep_export::quoted(s.ext),
+                    &cols.iter().map(|column|column.name.clone()).collect::<Vec<_>>(),
+                    &format!("sqlite:{}:{}:{}",s.ext,tally.rows,tally.hex()))?;
+            }
             if let Some(name) = keep_schema
                 && let Some(k) = keep_name(s.ext)
             {
@@ -310,8 +353,13 @@ pub fn copy_from_sqlite_with_keep(
         println!("  {}: {} rows, digest {}{}", s.ext, tally.rows, tally.hex(), added(from_keep));
         moved.push(Moved { table: s.ext.into(), tally, from_keep });
     }
-    moved.push(freeze_exempt(&mut tx, &lite, main, apply, keep_schema)?);
+    if policy==ImportPolicy::Paired {moved.push(freeze_exempt(&mut tx, &lite, main, apply, keep_schema)?);}
+    let (mut predb_late_reset,mut media_fanout_reset)=(0,0);
     if apply {
+        if policy==ImportPolicy::Fresh {
+            predb_late_reset=tx.execute("update ext_predb_meta set value=0 where key='late_after_id' and value is distinct from 0",&[])?;
+            media_fanout_reset=tx.execute("update ext_media_titles set fanout_done=0 where fanout_done is distinct from 0",&[])?;
+        }
         advance_counters(&mut tx)?;
         if let Some(witness) = witness {
             witness.check(main)?;
@@ -341,7 +389,30 @@ pub fn copy_from_sqlite_with_keep(
         }
         tx.commit()?;
     }
-    Ok(moved)
+    Ok(FreshCacheImport {copied:moved,predb_late_reset,media_fanout_reset})
+}
+
+/// Inert original typed cache variants, not a reuse certificate or a source
+/// completeness receipt. The origin namespace identifies the preservation
+/// input; each canonical JSON row has its own SHA-256. PostgreSQL's bytea JSON
+/// spelling retains every byte, signed bigint/NULL/text retain their types via
+/// the descriptor. No aggregate of payloads is materialized on the client.
+fn preserve_variants(
+    tx:&mut postgres::Transaction<'_>,family:&str,relation:&str,columns:&[String],origin:&str,
+) -> Result<u64> {
+    ensure!(family.starts_with("ext_raw_") && sources().iter().any(|source|source.ext==family),"unowned cache preservation family");
+    ensure!(columns.len()<=64,"cache preservation column budget");
+    let list=columns.iter().map(|column|keep_export::quoted(column)).collect::<Vec<_>>().join(",");
+    let statement=tx.prepare(&format!("select {list} from {relation} limit 0"))?;
+    let schema=serde_json::to_string(&statement.columns().iter().map(|column|(column.name(),column.type_().name())).collect::<Vec<_>>())?;
+    let name=if family=="ext_raw_archive_inner_files" {"release_name"} else {"name"};
+    let content=if columns.iter().any(|column|column=="content_id") {"content_id"} else {"null::bytea"};
+    Ok(tx.execute(&format!("insert into ext_preserved_cache_rows
+      (family,source_digest,row_digest,name,group_name,content_id,schema_descriptor,row_format,row_bytes)
+      select $1,sha256(convert_to($2,'UTF8')),sha256(convert_to('atlas.cache-row-json.v1:'||row_json,'UTF8')),
+             {name},group_name,{content},$3,1,convert_to(row_json,'UTF8')
+      from (select q.*,to_jsonb(q)::text as row_json from (select {list} from {relation}) q) preserved
+      on conflict do nothing"),&[&family,&origin,&schema])?)
 }
 
 fn added(n: u64) -> String {
@@ -376,6 +447,13 @@ fn top_up(tx: &mut postgres::Transaction<'_>, schema: &str, ext: &str, keep: &st
     let both: Vec<&Column> = cols.iter().filter(|c| there.contains(&c.name)).collect();
     let list = both.iter().map(|c| keep_export::quoted(&c.name)).collect::<Vec<_>>().join(", ");
     let namespace = keep_export::quoted(schema);
+    if ext.starts_with("ext_raw_") {
+        let relation=format!("{namespace}.{}",keep_export::quoted(keep));
+        // Save every original variant BEFORE natural-key top-up skips a key
+        // occupied by a different/newer sidecar value. Never activate an old
+        // variant merely because its preservation record exists.
+        preserve_variants(tx,ext,&relation,&there,&format!("keep:{schema}:{keep}"))?;
+    }
     let total: i64 =
         tx.query_one(&format!("select count(*) from {namespace}.{}", keep_export::quoted(keep)), &[])?.get(0);
     let keep_pages: bool = tx
@@ -603,7 +681,7 @@ fn freeze_exempt(
     Ok(Moved { table: table.into(), tally: Tally { rows: rows.len() as u64, digest: 0 }, from_keep })
 }
 
-/// `atlas --move-ext [--apply] [--keep-schema NAME]`: `copy_from_sqlite` into the `[storage]` Postgres (migrated first, and only
+/// `atlas --move-ext [--fresh-catalog] [--apply] [--keep-schema NAME]`: `copy_from_sqlite` into the `[storage]` Postgres (migrated first, and only
 /// committed with `--apply`).
 pub fn run_move(args: &[String]) -> i32 {
     let apply = args.iter().any(|a| a == "--apply");
@@ -632,8 +710,12 @@ pub fn run_move(args: &[String]) -> i32 {
             if apply { "moving" } else { "checking (dry run)" },
             main.display()
         );
-        copy_from_sqlite_with_keep(&mut c, &main, pool.schema(), apply, source)?;
-        if apply && let Some(receipt)=super::history_companion::digest(&mut c,pool.schema(),"ext")? {
+        let fresh=args.iter().any(|arg|arg=="--fresh-catalog");
+        if fresh {
+            let imported=copy_caches_for_fresh_catalog(&mut c,&main,pool.schema(),apply,source)?;
+            println!("fresh cache import: {} tables; derived PreDB rows reset {}, media fanout rows reset {}",imported.copied.len(),imported.predb_late_reset,imported.media_fanout_reset);
+        } else {copy_from_sqlite_with_keep(&mut c, &main, pool.schema(), apply, source)?;}
+        if !fresh && apply && let Some(receipt)=super::history_companion::digest(&mut c,pool.schema(),"ext")? {
             println!("External source-pairing receipt: {}",receipt.iter().map(|byte|format!("{byte:02x}")).collect::<String>());
         }
         if !apply {
@@ -1325,6 +1407,80 @@ mod tests {
         d.execute_batch(crate::media::details::SCHEMA).unwrap();
         d.execute_batch("alter table details add column backdrop TEXT").unwrap();
         main
+    }
+
+    #[test]
+    fn external_copy_retains_costly_natural_caches_and_negative_sentinels() {
+        let Some(target)=super::super::testing::Schema::empty() else {return};
+        let root=tempfile::tempdir().unwrap();let main=sqlite_files(root.path());
+        let raw=Connection::open(crate::raw_store::path_for(&main)).unwrap();
+        raw.execute_batch("insert into raw_probes(name,group_name,info,content_id,probed_at) values('Kept','test.group','{}',x'0102',17);
+            insert into raw_covers(name,group_name,mime,sha256,content_id) values('Kept','test.group','image/jpeg','cover',x'0102');
+            insert into raw_archives(name,group_name,password,content_id,owner_key,key_salt) values('Kept','test.group',0,x'0102',-9,11);
+            insert into raw_archive_inner_files(release_name,group_name,seq,name,content_id) values('Kept','test.group',1,'inner',x'0102');
+            insert into raw_par2(name,group_name,posted,content_id) values('Kept','test.group',zeroblob(20),x'0102');
+            insert into raw_par2_files(name,group_name,content_id,file_id,set_id,md5,md5_16k,size,file_name,creator) values('Kept','test.group',x'0102',x'01',x'02',x'03',x'04',31,'inner','tool');
+            insert into raw_rev_volumes(name,group_name,content_id,volume,size,crc32) values('Kept','test.group',x'0102',1,41,4294967295);
+            insert into raw_nfo_passwords(name,group_name,password,content_id) values('Kept','test.group','',x'0102');
+            insert into raw_stills(name,group_name,position,content_id,sha256) values('Kept','test.group',1,x'0102','still');
+            insert into raw_audio_prints(name,group_name,position,content_id,at_ms,items) values('Kept','test.group',1,x'0102',23,x'0001')").unwrap();drop(raw);
+        let mut client=target.pool.get().unwrap();
+        let copied=copy_from_sqlite_with_keep(&mut client,&main,&target.name,true,KeepSource::Disabled).unwrap();
+        for table in ["ext_raw_probes","ext_raw_covers","ext_raw_archives","ext_raw_archive_inner_files","ext_raw_par2",
+            "ext_raw_par2_files","ext_raw_rev_volumes","ext_raw_nfo_passwords","ext_raw_stills","ext_raw_audio_prints"] {
+            let found=copied.iter().find(|entry|entry.table==table).unwrap_or_else(||panic!("valuable cache omitted from existing external converter: {table}"));
+            assert_eq!(found.tally.rows,1,"every original cache row must survive");
+        }
+        let row=client.query_one("select password,content_id from ext_raw_nfo_passwords",&[]).unwrap();
+        assert_eq!(row.get::<_,String>(0),"");assert_eq!(row.get::<_,Option<Vec<u8>>>(1),Some(vec![1,2]));
+        let row=client.query_one("select posted from ext_raw_par2",&[]).unwrap();
+        assert_eq!(row.get::<_,Vec<u8>>(0),vec![0;20],"preserve old raw evidence without declaring it eligible");
+        assert_eq!(client.query_one("select owner_key from ext_raw_archives",&[]).unwrap().get::<_,i64>(0),-9);
+    }
+
+    #[test]
+    fn fresh_cache_copy_ignores_main_catalog_and_resets_only_derived_cache_state() {
+        let Some(target)=super::super::testing::Schema::empty() else {return};
+        let root=tempfile::tempdir().unwrap();let main=sqlite_files(root.path());
+        let predb=Connection::open(crate::predb::db::path_for(&main)).unwrap();
+        predb.execute("insert or replace into meta(key,value) values('late_after_id',99)",[]).unwrap();drop(predb);
+        let media=Connection::open(crate::media::store::path_for(&main)).unwrap();
+        media.execute("insert into media_titles(title_key,kind,title,state,checked_mask,checked_at,fanout_done) values(7,1,'Negative',2,31,17,1)",[]).unwrap();drop(media);
+        // A trap directory proves the fresh path never opens/hashes main or
+        // discovers its old release/operational tables.
+        std::fs::remove_file(&main).unwrap();std::fs::create_dir(&main).unwrap();
+        let mut client=target.pool.get().unwrap();
+        let copied=copy_caches_for_fresh_catalog(&mut client,&main,&target.name,true,KeepSource::Disabled).unwrap();
+        assert_eq!((copied.predb_late_reset,copied.media_fanout_reset),(1,1));
+        assert!(!copied.copied.iter().any(|row|row.table=="ext_freeze_exempt"));
+        assert_eq!(client.query_one("select value from ext_predb_meta where key='late_after_id'",&[]).unwrap().get::<_,i64>(0),0);
+        let row=client.query_one("select state,checked_mask,checked_at,fanout_done from ext_media_titles where title_key=7",&[]).unwrap();
+        assert_eq!((row.get::<_,i64>(0),row.get::<_,i64>(1),row.get::<_,i64>(2),row.get::<_,i64>(3)),(2,31,17,0));
+        for table in ["groups","releases","ext_freeze_exempt","history_imports","history_companion_receipts"] {
+            assert_eq!(client.query_one(&format!("select count(*) from {table}"),&[]).unwrap().get::<_,i64>(0),0,"fresh cache import must not seed {table}");
+        }
+        let predb=Connection::open_with_flags(crate::predb::db::path_for(&main),rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert_eq!(predb.query_row("select value from meta where key='late_after_id'",[],|row|row.get::<_,i64>(0)).unwrap(),99,"source remains unchanged");
+    }
+
+    #[test]
+    fn conflicting_costly_keep_variants_are_preserved_before_natural_key_top_up() {
+        let Some(keep)=super::super::testing::Schema::empty() else {return};
+        let Some(target)=super::super::testing::Schema::empty() else {return};
+        let root=tempfile::tempdir().unwrap();let main=sqlite_files(root.path());
+        let raw=Connection::open(crate::raw_store::path_for(&main)).unwrap();
+        raw.execute("insert into raw_nfo_passwords(name,group_name,content_id,password) values('Kept','g',x'01','')",[]).unwrap();drop(raw);
+        let mut client=target.pool.get().unwrap();
+        client.batch_execute(&format!("create table \"{}\".raw_nfo_passwords(name text,group_name text,content_id bytea,password text);
+          insert into \"{}\".raw_nfo_passwords values('Kept','g',decode('02','hex'),'old-secret')",keep.name,keep.name)).unwrap();
+        copy_caches_for_fresh_catalog(&mut client,&main,&target.name,true,KeepSource::Named(&keep.name)).unwrap();
+        assert_eq!(client.query_one("select password from ext_raw_nfo_passwords",&[]).unwrap().get::<_,String>(0),"","sidecar's selected negative cache stays selected");
+        let rows=client.query("select row_bytes,content_id from ext_preserved_cache_rows where family='ext_raw_nfo_passwords' order by content_id",&[]).unwrap();
+        assert_eq!(rows.len(),2,"different valuable same-key originals must not disappear through ON CONFLICT");
+        let first:serde_json::Value=serde_json::from_slice(&rows[0].get::<_,Vec<u8>>(0)).unwrap();
+        let second:serde_json::Value=serde_json::from_slice(&rows[1].get::<_,Vec<u8>>(0)).unwrap();
+        assert_eq!(first["password"],"");assert_eq!(second["password"],"old-secret");
+        assert_eq!(rows[0].get::<_,Vec<u8>>(1),[1]);assert_eq!(rows[1].get::<_,Vec<u8>>(1),[2]);
     }
 
     /// SQLite files made with the providers' own schemas, a row or two each, moved, dumped, emptied and restored.

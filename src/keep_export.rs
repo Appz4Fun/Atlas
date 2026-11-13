@@ -1,7 +1,7 @@
 //! `atlas --export-keep [--apply]`: what re-indexing can't bring back, before the releases and articles are wiped
 //! and indexed again from scratch. That's what came from an external service (PreDB feeds, the media providers'
-//! lookups and details, OpenSubtitles) and what an operator decided by hand (releases thawed by hand), not anything
-//! read from Usenet headers or article bodies.
+//! lookups and details, OpenSubtitles), costly natural-key Usenet probe caches,
+//! and what an operator decided by hand (releases thawed by hand).
 //!
 //! The tables go into one SQLite file (`keep.db`, zstd compressed beside it) under `keep-export/<time>/` and, with
 //! `--apply`, into the shared Postgres's `keep` schema. Each copy is checked against its source by row count and an
@@ -44,14 +44,25 @@ fn kept() -> Vec<Kept> {
         Kept { db: raw, table: "raw_opensubtitles", name: "opensubtitles", filter: None, capped: true },
         Kept { db: raw, table: "raw_predb_log", name: "predb_pages", filter: None, capped: true },
         Kept { db: raw, table: "raw_predb_events", name: "predb_page_events", filter: None, capped: true },
-        // historical PreDB snapshots, downloaded once and pinned (the rest of the HTTP cache lives 12 hours)
+        // Preserve every stored response, including negative/API answers. The
+        // legacy export table name stays compatible with older keep schemas.
         Kept {
             db: raw,
             table: "raw_http_cache",
             name: "predb_snapshots",
-            filter: Some("source in ('nzedb_archive', 'dats_pciso_1998')"),
+            filter: None,
             capped: true,
         },
+        Kept { db: raw, table: "raw_probes", name: "raw_probes", filter: None, capped: true },
+        Kept { db: raw, table: "raw_covers", name: "raw_covers", filter: None, capped: true },
+        Kept { db: raw, table: "raw_archives", name: "raw_archives", filter: None, capped: true },
+        Kept { db: raw, table: "raw_archive_inner_files", name: "raw_archive_inner_files", filter: None, capped: true },
+        Kept { db: raw, table: "raw_par2", name: "raw_par2", filter: None, capped: true },
+        Kept { db: raw, table: "raw_par2_files", name: "raw_par2_files", filter: None, capped: true },
+        Kept { db: raw, table: "raw_rev_volumes", name: "raw_rev_volumes", filter: None, capped: true },
+        Kept { db: raw, table: "raw_nfo_passwords", name: "raw_nfo_passwords", filter: None, capped: true },
+        Kept { db: raw, table: "raw_stills", name: "raw_stills", filter: None, capped: true },
+        Kept { db: raw, table: "raw_audio_prints", name: "raw_audio_prints", filter: None, capped: true },
     ]
 }
 
@@ -454,10 +465,16 @@ fn verify_snapshot(dir: &Path, conn: &Connection) -> Result<Vec<Copied>> {
     let manifest: serde_json::Value =
         serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).context("reading manifest.json")?)?;
     let manifest = manifest.as_object().context("snapshot manifest must be an object")?;
-    let tables = kept();
+    // Old checked keep snapshots remain restorable under their original
+    // narrower scope. A new-format snapshot must include every new raw family;
+    // missing new tables cannot masquerade as a complete current snapshot.
+    let version=manifest.get("_format").map(serde_json::Value::as_u64);
+    anyhow::ensure!(matches!(version,None|Some(Some(2))),"unknown keep snapshot format");
+    let tables:Vec<Kept>=kept().into_iter().filter(|table|version.is_some() || !table.name.starts_with("raw_")).collect();
+    let extra=if version.is_some() {3} else {2};
     anyhow::ensure!(
         manifest.get("_left_out").and_then(serde_json::Value::as_array).is_some_and(Vec::is_empty)
-            && manifest.len() == tables.len() + 2,
+            && manifest.len() == tables.len() + extra,
         "snapshot is incomplete or has an unexpected table"
     );
     let mut copied = Vec::with_capacity(tables.len() + 1);
@@ -621,6 +638,7 @@ pub fn run(args: &[String]) -> i32 {
     }
     let left_out: Vec<&str> = kept().iter().map(|k| k.name).filter(|n| !copied.iter().any(|c| c.name == *n)).collect();
     manifest.insert("_left_out".into(), serde_json::json!(left_out));
+    manifest.insert("_format".into(),serde_json::json!(2));
     if let Err(e) = compress(&file) {
         println!("couldnt compress: {e:#}");
         return 1;
@@ -688,6 +706,7 @@ mod tests {
             expected.push(Copied { name: name.into(), columns: cols, tally, capped: false });
         }
         manifest.insert("_left_out".into(), serde_json::json!([]));
+        manifest.insert("_format".into(),serde_json::json!(2));
         std::fs::write(dir.join("manifest.json"), serde_json::Value::Object(manifest).to_string()).unwrap();
         expected
     }
@@ -712,6 +731,22 @@ mod tests {
         std::fs::write(manifest, json.to_string()).unwrap();
         let snapshot = Connection::open(dir.path().join("keep.db")).unwrap();
         assert!(verify_snapshot(dir.path(), &snapshot).is_err());
+    }
+
+    #[test]
+    fn old_checked_keep_snapshots_keep_their_original_restore_scope() {
+        let dir=tempfile::tempdir().unwrap();restore_fixture(dir.path());
+        let path=dir.path().join("manifest.json");
+        let mut manifest:serde_json::Map<String,serde_json::Value>=serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let conn=Connection::open(dir.path().join("keep.db")).unwrap();
+        for table in kept().into_iter().filter(|table|table.name.starts_with("raw_")) {
+            conn.execute_batch(&format!("drop table {}",quoted(table.name))).unwrap();manifest.remove(table.name);
+        }
+        manifest.remove("_format");std::fs::write(&path,serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let copied=verify_snapshot(dir.path(),&conn).unwrap();
+        assert_eq!(copied.len(),11);assert!(!copied.iter().any(|table|table.name.starts_with("raw_")));
+        manifest.insert("_format".into(),serde_json::json!(2));std::fs::write(&path,serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(verify_snapshot(dir.path(),&conn).is_err(),"old scope cannot claim complete current coverage");
     }
 
     #[test]
@@ -759,7 +794,7 @@ mod tests {
             to_postgres_in_schema(&mut pg, &file, &copied, "2", false, &test.name).is_ok(),
             "conversion must override asynchronous session durability"
         );
-        assert_eq!(pg.query_one("select count(*) from runs where stamp='2'", &[]).unwrap().get::<_, i64>(0), 11);
+        assert_eq!(pg.query_one("select count(*) from runs where stamp='2'", &[]).unwrap().get::<_, i64>(0), 21);
         assert_eq!(pg.query_one("show synchronous_commit", &[]).unwrap().get::<_, String>(0), "off");
     }
 

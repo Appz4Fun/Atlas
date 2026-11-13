@@ -12,6 +12,7 @@
 
 pub(crate) mod cache_actor;
 pub mod ext;
+pub(crate) mod cache_keys;
 pub mod header_blocks;
 mod history_gate;
 mod history_digest;
@@ -46,6 +47,7 @@ mod linker_source;
 mod linker_stage;
 pub mod main_import;
 pub mod migrate;
+pub(crate) mod natural_cache;
 pub mod release_queue;
 pub mod release_reader;
 pub mod release_writer;
