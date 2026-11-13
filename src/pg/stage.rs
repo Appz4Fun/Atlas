@@ -17,6 +17,9 @@ impl CatalogIdentity {
     }
     pub(crate) fn nonce(&self)->&[u8;32] {&self.nonce}
     pub(crate) fn codec_version(&self)->i32 {1}
+    pub(crate) fn word_index_root(&self,configured:&crate::config::HeaderStoreConfig)->Result<std::path::PathBuf> {
+        Ok(self.header_config(configured)?.root().join("words"))
+    }
     pub(crate) fn header_config(&self,configured:&crate::config::HeaderStoreConfig)->Result<crate::config::HeaderStoreConfig> {
         let expected=catalog_root(configured,&self.nonce)?;
         ensure!(expected==self.header_root,"native catalog header root changed");
