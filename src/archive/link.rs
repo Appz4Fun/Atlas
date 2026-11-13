@@ -59,8 +59,11 @@ const JOIN_GAP_SECS: f64 = 60.0;
 
 /// The steps a rename runs again, database ones and network ones.
 static ON_RENAME: LazyLock<(StepMask, StepMask)> = LazyLock::new(|| {
-    crate::postprocess::steps::all().iter().filter(|s| s.reruns().on_rename).fold((0, 0), |(db, net), s| {
-        if s.needs() == Needs::Database { (db | mask(s.id()), net) } else { (db, net | mask(s.id())) }
+    // The native registry's rename policy, without constructing service-backed steps.
+    crate::postprocess::steps::catalog().iter().filter(|s| matches!(s.name,
+        "upload_link" | "predb_match" | "category" | "media_parse" | "opensubtitles_imdb" | "media_lookup" | "media_nfo"
+    )).fold((0, 0), |(db, net), s| {
+        if s.needs == Needs::Database { (db | mask(s.id), net) } else { (db, net | mask(s.id)) }
     })
 });
 
