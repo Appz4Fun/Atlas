@@ -543,11 +543,18 @@ mod tests {
         let Some(schema)=crate::pg::testing::Schema::new() else {return};
         let mut client=schema.pool.get().unwrap();let key=Key {name:"Kept",group:"g",content_id:&[1]};
         let mut tx=client.transaction().unwrap();put_nfo_password(&mut tx,key,"original",BUDGET).unwrap();tx.commit().unwrap();
-        client.execute("delete from atlas_cache_key_formats where table_name='ext_raw_nfo_passwords' and column_name='name'",&[]).unwrap();
-        assert!(nfo_password(&mut *client,key,BUDGET).is_err(),"unknown encoding is not a miss");
-        let mut tx=client.transaction().unwrap();assert!(put_nfo_password(&mut tx,key,"replacement",BUDGET).is_err());tx.rollback().unwrap();
-        assert_eq!(client.query_one("select password from ext_raw_nfo_passwords",&[]).unwrap().get::<_,String>(0),"original");
-        assert_eq!(client.query_one("select count(*) from ext_preserved_cache_rows where family='ext_raw_nfo_passwords'",&[]).unwrap().get::<_,i64>(0),0);
+        for codec in [Some("atlas.nfo-name.v2:"),None] {
+            client.execute("delete from atlas_cache_key_formats where table_name='ext_raw_nfo_passwords' and column_name='name'",&[]).unwrap();
+            if let Some(codec)=codec {client.execute("insert into atlas_cache_key_formats values('ext_raw_nfo_passwords','name',$1)",&[&codec]).unwrap();}
+            assert!(nfo_password(&mut *client,key,BUDGET).is_err(),"unknown encoding is not a miss");
+            let mut tx=client.transaction().unwrap();assert!(put_nfo_password(&mut tx,key,"replacement",BUDGET).is_err());tx.rollback().unwrap();
+            assert_eq!(client.query_one("select password from ext_raw_nfo_passwords",&[]).unwrap().get::<_,String>(0),"original");
+            assert_eq!(client.query_one("select count(*) from ext_preserved_cache_rows where family='ext_raw_nfo_passwords'",&[]).unwrap().get::<_,i64>(0),0);
+        }
+        client.batch_execute("drop table atlas_cache_key_formats").unwrap();
+        assert!(nfo_password(&mut *client,key,BUDGET).unwrap_err().downcast_ref::<postgres::Error>().is_some());
+        let mut tx=client.transaction().unwrap();
+        assert!(put_nfo_password(&mut tx,key,"replacement",BUDGET).unwrap_err().downcast_ref::<postgres::Error>().is_some());tx.rollback().unwrap();
     }
 
     #[test]
