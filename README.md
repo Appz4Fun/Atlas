@@ -43,7 +43,7 @@ Use Atlas from the terminal, browse its built-in Web UI, or point Prowlarr, NZBH
 > [!IMPORTANT]
 > Atlas is a single native binary written in **[Rust](https://www.rust-lang.org) 1.99.0**, edition 2024.
 
-The Rust version replaces the original Python version. This PostgreSQL cutover branch requires a checked PostgreSQL destination for product startup. SQLite conversion commands and the old terminal menu are retired; legacy modules and dependencies still await build-graph cleanup. See [current commands and graph qualification](docs/POSTGRES_FRONTDOORS.md). Service activation and deployment require their separate native qualification.
+The Rust version replaces the original Python version. This PostgreSQL cutover branch requires a checked PostgreSQL destination for product startup. SQLite conversion commands and the old terminal menu are retired. The source cutover still requires guarded production builds, retained integration-test ports, and actual native qualification. See [current commands and graph qualification](docs/POSTGRES_FRONTDOORS.md). Service activation and deployment require their separate native qualification.
 
 | Component | Crate |
 |---|---|
@@ -77,7 +77,7 @@ rustup installs the pinned toolchain the first time you build, and the `just` re
 - **Serve a Newznab API** for Prowlarr, NZBHydra2, Sonarr, and Radarr: `search`, `tvsearch`, `movie`, `music`, `book`, `caps`, and `get`, which downloads an NZB (or a single file with `file=N`, listed by `t=files`), its gaps filled from any twin of the same bytes.
 - **Search from the terminal** in one group or all groups, or use **AI search**, which turns a request like `find me 4k hdr movies` into groups and keywords with a local [Ollama](https://ollama.com) model.
 - **Watch progress** on the live dashboard, dig into CPU, memory, backfill, content, post-processing, and per-server numbers on the 6-page terminal stats dashboard, or scrape Prometheus metrics with the 7 included Grafana dashboards.
-- **PostgreSQL catalog storage** with owned native transactions and NXV header files. The cutover branch still requires full worker, maintenance, and no-SQLite build qualification.
+- **PostgreSQL catalog storage** with owned native transactions and NXV header files. The cutover branch still requires full worker, integration-test, and no-SQLite build qualification.
 
 ![Atlas live dashboard](img/live-dashboard.png)
 
