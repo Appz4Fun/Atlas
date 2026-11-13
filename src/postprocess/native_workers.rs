@@ -25,7 +25,7 @@ fn nap(owner:&Owner,duration:Duration)->bool {
 // Feed polling's legacy callback returns true to continue after a delay.
 // The worker nap helper instead returns true when interrupted by shutdown.
 pub(super) fn predb_pause(owner:&Owner,duration:Duration)->bool {!nap(owner,duration)}
-fn spawn(owner:&Arc<Owner>,name:String,work:impl FnOnce()->Result<Option<Claim>>+Send+'static)->Result<Worker> {
+pub(super) fn spawn(owner:&Arc<Owner>,name:String,work:impl FnOnce()->Result<Option<Claim>>+Send+'static)->Result<Worker> {
     let owner=owner.clone();Ok(std::thread::Builder::new().name(name).spawn(move|| {
         let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
             .unwrap_or_else(|_|Err(anyhow::anyhow!("native worker panicked")));
@@ -154,7 +154,7 @@ pub(super) fn start_spotnet(owner:&Arc<Owner>,service:Arc<crate::spotnet::native
     let owner_work=owner.clone();let spots=service.clone();
     handles.push(spawn(owner,"atlas-native-spots".into(),move|| {
         while !owner_work.stop.load(Ordering::Acquire) {
-            spots.spots_tick(now())?;
+            let _=crate::spotnet::native::provider_pass(spots.spots_tick(now()))?;
             nap(&owner_work,spots.poll());
         }Ok(None)
     })?);
@@ -162,8 +162,8 @@ pub(super) fn start_spotnet(owner:&Arc<Owner>,service:Arc<crate::spotnet::native
         let owner_work=owner.clone();
         handles.push(spawn(owner,"atlas-native-spot-comments".into(),move|| {
             while !owner_work.stop.load(Ordering::Acquire) {
-                let pass=service.comments_tick(now())?;
-                if !pass.more {nap(&owner_work,service.poll());}
+                let more=crate::spotnet::native::provider_pass(service.comments_tick(now()))?.is_some_and(|pass|pass.more);
+                if !more {nap(&owner_work,service.poll());}
             }Ok(None)
         })?);
     }

@@ -17,6 +17,33 @@ pub(crate) struct CommentPass {
     pub(crate) gone:usize,pub(crate) retry:usize,pub(crate) more:bool,
 }
 enum Fetched { Pending, Settled(store::Settled), Skip(Option<String>) }
+
+// Only actual NNTP operations mint this context. Header/NXV storage failures
+// never carry it; text, SQL and other invariant errors cannot impersonate it.
+#[derive(Debug)]
+struct ProviderFailure;
+impl std::fmt::Display for ProviderFailure {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str("native Spotnet provider failure")}
+}
+fn provider_error(error:crate::nntp::NntpError)->anyhow::Error {
+    match error {
+        crate::nntp::NntpError::HeaderStore(_)=>error.into(),
+        _=>anyhow::Error::new(error).context(ProviderFailure),
+    }
+}
+fn is_provider_failure(error:&anyhow::Error)->bool {error.downcast_ref::<ProviderFailure>().is_some()}
+
+/// A typed provider failure is always a retry outcome, even if stop or a PG
+/// failure arrived after a caller's earlier live check. No owner state is
+/// cleared and no storage error is converted. The worker loop/backoff decides
+/// whether a still-live attempt polls again; an ended one simply drains.
+pub(crate) fn provider_pass<T>(result:Result<T>)->Result<Option<T>> {
+    match result {
+        Ok(value)=>Ok(Some(value)),
+        Err(error) if is_provider_failure(&error)=>Ok(None),
+        Err(error)=>Err(error),
+    }
+}
 impl Service {
     pub(crate) fn new(owner:&Arc<Owner>,db:Db,config:SpotsConfig,pool:Arc<Pool>,handle:tokio::runtime::Handle)->Result<Self> {
         ensure!(tokio::runtime::Handle::try_current().is_err(),"native Spotnet starts on a standard thread");
@@ -33,8 +60,10 @@ impl Service {
         // A lost PG session must be observed before launching more NNTP work.
         self.storage.check()?;
         self.handle.block_on(crate::nntp::unless_stopped(&self.storage.owner.stop,future))
-            .ok_or_else(||anyhow::Error::new(crate::pg::outage::AttemptEnded))?.map_err(Into::into)
+            .ok_or_else(||anyhow::Error::new(crate::pg::outage::AttemptEnded))?.map_err(provider_error)
     }
+    #[cfg(test)]
+    pub(crate) fn network_for_test<T>(&self,future:impl Future<Output=crate::nntp::Result<T>>)->Result<T> {self.network(future)}
     fn binding(&self,server:usize)->Result<String> {Ok(hex::encode(self.pool.provider_binding_on(server)?))}
 
     pub(crate) fn spots_tick(&self,now:i64)->Result<ingest::Pass> {
@@ -44,7 +73,7 @@ impl Service {
         // empty successful capture. Already committed stretches stay committed.
         match self.read_overview(now) {
             Ok((read,noted))=>{done.read=read;done.noted=noted;},
-            Err(error) if self.storage.owner.failure().is_none() && !self.stopped()=>eprintln!("native spots overview: {error:#}"),
+            Err(error) if is_provider_failure(&error) && self.storage.owner.failure().is_none() && !self.stopped()=>eprintln!("native spots overview: {error:#}"),
             Err(error)=>return Err(error),
         }
         self.storage.with(|tx| {
@@ -88,7 +117,7 @@ impl Service {
         let mut claims=Vec::new();
         let fetched=match self.fetch(id,shared,&mut claims) {
             Ok(value)=>value,
-            Err(error) if self.storage.owner.failure().is_none() && !self.stopped()=>{
+            Err(error) if is_provider_failure(&error) && self.storage.owner.failure().is_none() && !self.stopped()=>{
                 eprintln!("native spots {id}: {error:#}");
                 self.storage.settle(id,None,chrono::Utc::now().timestamp())?;return Ok(Some(None))
             }
@@ -208,7 +237,7 @@ impl Service {
             let xml=match self.network(self.pool.fetch_head(&format!("<{message_id}>"),MAX_XML_BYTES*4)) {
                 Ok(Some(head))=>full::xml_from_headers(&head).filter(|xml|full::parse(xml).is_some()).unwrap_or_default(),
                 Ok(None)=>String::new(),Err(error) if absent(&error)=>String::new(),
-                Err(error) if self.storage.owner.failure().is_none() && !self.stopped()=>{eprintln!("native spots XML: {error:#}");break},
+                Err(error) if is_provider_failure(&error) && self.storage.owner.failure().is_none() && !self.stopped()=>{eprintln!("native spots XML: {error:#}");break},
                 Err(error)=>return Err(error),
             };self.storage.set_xml(id,&message_id,&xml)?;
         }Ok(())
@@ -220,7 +249,7 @@ impl Service {
         for (group,reports) in [(comments::COMMENT_GROUP,false),(comments::REPORT_GROUP,true)] {
             match self.read_comments(group,reports,now) {
                 Ok(n) if reports=>done.reports=n,Ok(n)=>done.comments=n,
-                Err(error) if self.storage.owner.failure().is_none() && !self.stopped()=>eprintln!("native spots {group}: {error:#}"),
+                Err(error) if is_provider_failure(&error) && self.storage.owner.failure().is_none() && !self.stopped()=>eprintln!("native spots {group}: {error:#}"),
                 Err(error)=>return Err(error),
             }
         }
@@ -237,7 +266,7 @@ impl Service {
                         let outcome=match self.network(self.pool.fetch_body_capped(&format!("<{id}>"),comments::MAX_BODY)) {
                             Ok(Some(body))=>comments::Outcome::Read(comments::body_text(&body)),Ok(None)=>comments::Outcome::Gone,
                             Err(error) if absent(&error)=>comments::Outcome::Gone,
-                            Err(error) if self.storage.owner.failure().is_none() && !self.stopped()=> {
+                            Err(error) if is_provider_failure(&error) && self.storage.owner.failure().is_none() && !self.stopped()=> {
                                 eprintln!("native spots comment {id}: {error:#}");failed.store(true,Ordering::Release);comments::Outcome::Failed
                             }
                             Err(error)=>return Err(error),
