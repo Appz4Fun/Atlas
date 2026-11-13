@@ -302,3 +302,33 @@ fn passing_video_cleanup_and_no_video_pc_junk_keep_their_policies() {
         runtime.owner.close();
     }
 }
+
+#[test]
+#[ignore = "requires isolated PostgreSQL; rejected non-PC category must be retained"]
+fn rejected_video_retains_a_non_pc_category_without_a_cleanup_revision() {
+    let schema = pg::testing::Schema::new().expect("explicit isolated ATLAS_PG_TEST_URL required");
+    let runtime = pg::stage_queue_tests::runtime(&schema);
+    let (id, revision) = seed(&runtime, "video.mkv", 2000, false);
+    let (runner, runs, _handle) = runner(&runtime, 8, 1);
+    let queue = Queue::for_owner(&runtime.owner).unwrap();
+    let claim = queue.claim(NOW, 1, 60).unwrap().pop().unwrap();
+    assert_eq!(runner.database(&claim, 0, NOW).unwrap().settle(&queue, &claim, NOW + 1).unwrap(), Settlement::Applied);
+    runtime
+        .owner
+        .with(|client| {
+            assert_eq!(
+                client.query_one("select category from release_category where release_id=$1", &[&id])?.get::<_, i64>(0),
+                2000
+            );
+            assert_eq!(
+                client.query_one("select native_work_revision from releases where id=$1", &[&id])?.get::<_, i64>(0),
+                revision
+            );
+            assert_eq!(client.query_one("select count(*) from pp_state", &[])?.get::<_, i64>(0), 0);
+            assert_eq!(client.query_one("select count(*) from native_operations", &[])?.get::<_, i64>(0), 1);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(runs.load(Ordering::Relaxed), 0);
+    runtime.owner.close();
+}

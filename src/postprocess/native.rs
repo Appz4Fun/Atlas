@@ -203,25 +203,31 @@ impl Runner {
         let base=Applied::native_database(row.info.id,row.rerun_gen,claim.due_at(),self.steps.database,self.steps.network);
         let facts=RowFacts {group:&row.info.group,name:&row.info.name,size:row.info.size,parts:row.info.parts,complete:row.info.complete,file_total:row.info.file_total};
         let rules=Rules::new(&self.config.postprocess);
+        // A real video invalidates an old PC category even when this visit is
+        // too small or still settling. Carry cleanup through the same observed
+        // result/receipt; it is not permission to run or mark any rejected Step.
+        let stale_pc=reads.stale_pc(row.info.id,row.summary.has_video)?;
+        let cleanup=||->Vec<(StepMask,StepWrite)> {
+            if stale_pc {vec![(0,StepWrite::for_mutation(row.info.id,StepMutation::DropPcCategory))]} else {Vec::new()}
+        };
         let reject=|reason|->Result<(Applied,[u8;32])> {
             self.stats.rejected(reason);
             let junk=if reason==rules::Reason::Executable || row.summary.executable {Some(crate::junk::EXECUTABLE)} else {reads.inner_junk(row.info.id,row.summary.has_video)?};
-            Ok((Applied {junk,no_state:!row.has_state,..Applied::native_database(row.info.id,row.rerun_gen,claim.due_at(),self.steps.database,self.steps.network)},input))
+            Ok((Applied {junk,writes:cleanup(),no_state:!row.has_state,..Applied::native_database(row.info.id,row.rerun_gen,claim.due_at(),self.steps.database,self.steps.network)},input))
         };
         if let Some(reason)=rules::judge_row(&rules,&facts) {return reject(reason)}
         match rules::judge_files(&rules,&facts,&row.summary,now) {
             Verdict::Reject(reason)=>return reject(reason),
             Verdict::Wait(until)=>{
                 let clear=if row.has_state {redo}else{0};
-                return Ok((Applied {queue_at:Some(until),clear,no_state:clear==0,..base},input))
+                return Ok((Applied {queue_at:Some(until),clear,writes:cleanup(),no_state:clear==0,..base},input))
             }
             Verdict::Pass=>{}
         }
         if let Some(reason)=reads.inner_junk(row.info.id,row.summary.has_video)? {return Ok((Applied {junk:Some(reason),..base},input))}
-        let stale_pc=reads.stale_pc(row.info.id,row.summary.has_video)?;
         let mut clear=redo;if row.has_state && row.info.parts>row.parts_seen {clear|=self.steps.on_growth;}
         let (mut done,mut failed)=(row.done & !clear,row.failed & !clear);let mut a=base;
-        if stale_pc {a.writes.push((0,StepWrite::for_mutation(row.info.id,StepMutation::DropPcCategory)));}
+        a.writes=cleanup();
         a.parts_seen=Some(row.info.parts);
         let mut ctx=StepCtx {release:row.info.clone(),data:super::data::StepData::Native(reads),facts:Vec::new(),bodies:&self.bodies,
             used_bodies:0,deadline:Instant::now()+engine::STEP_DEADLINE,lane_can_fetch:false,crcs:Vec::new(),pictures:false};
