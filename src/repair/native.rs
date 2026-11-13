@@ -4,7 +4,7 @@ use std::{collections::{BTreeMap,BTreeSet,HashMap,HashSet},sync::{Arc,atomic::{A
 use anyhow::{Context,Result,ensure};
 use postgres::{GenericClient,IsolationLevel};
 use crate::{indexer::{Db,PassContext,PassSettings},pg::indexer_runtime::Owner,nxv_store::store::Store};
-use super::{Window,Looked,Found,Older,EVERY,MIN_BYTES,MIN_ROW_BYTES,MIN_PERMILLE,DAYS,SETTLED_SECS,CANDIDATES,OLDER_SCAN,OLDER_CANDIDATES,PER_ROUND,MARGIN,MAX_ARTICLES};
+use super::{Window,Looked,Found,Older,EVERY,MIN_BYTES,MIN_PERMILLE,DAYS,SETTLED_SECS,CANDIDATES,OLDER_SCAN,OLDER_CANDIDATES,PER_ROUND,MARGIN,MAX_ARTICLES};
 #[path="native_store.rs"]
 mod storage;
 #[path="native_posts.rs"]
@@ -16,7 +16,14 @@ impl std::fmt::Display for SourceChanged {fn fmt(&self,f:&mut std::fmt::Formatte
 impl std::error::Error for SourceChanged {}
 #[derive(Debug,Default)]
 pub(crate) struct Progress {pub waiting:Option<Duration>,pub posts:usize,pub headers:i64,pub deferred:usize,pub provider_failures:usize}
-struct Plan {found:Found,sources:HashMap<i64,Source>,deferred:usize}
+struct Plan {found:Found,sources:HashMap<i64,Source>,deferred:usize,recent:RecentProgress}
+#[derive(Default)]
+struct RecentProgress {keys:Vec<(i64,usize)>,end:Option<i64>}
+impl RecentProgress {
+    fn next(&self,done:&HashSet<usize>)->Option<i64> {
+        self.keys.iter().find(|(_,index)|!done.contains(index)).map(|(id,_)|id.saturating_add(1)).or(self.end)
+    }
+}
 pub(crate) struct Service {
     owner:Arc<Owner>,db:Db,ctx:PassContext,handle:tokio::runtime::Handle,store:Arc<Store>,settings:PassSettings,
     epoch:[u8;32],catalog:[u8;32],next:Instant,
@@ -44,42 +51,10 @@ impl Service {
     fn budget()->Budget {Budget {bytes:2*1024*1024,until:Instant::now()+Duration::from_secs(10)}}
     fn read<T>(&self,budget:&mut Budget,work:impl FnOnce(&mut Read<'_,'_>)->Result<T>)->Result<T> {
         self.stopped()?;
-        // An explicit bounded/deferred observation is returned outside with(),
-        // so it cannot poison the owner as an invariant/storage failure. Actual
-        // PG/protocol/local-store errors still cross the original classifier.
-        self.owner.with(|client| {
-            let mut tx=client.build_transaction().isolation_level(IsolationLevel::RepeatableRead).read_only(true).start()?;
-            let result=work(&mut Read {tx:&mut tx,budget,stop:&self.owner.stop});
-            match result {
-                Err(e) if e.is::<Deferred>()||e.is::<SourceChanged>()=>{tx.rollback()?;Ok(Err(e))},
-                Err(e)=>Err(e),Ok(value)=>{tx.commit()?;Ok(Ok(value))},
-            }
-        })?
-    }
-    fn observe(&self,id:i64,recent:bool,now:i64,budget:&mut Budget)->Result<(Looked,Vec<Source>)> {
-        self.read(budget,|r| {
-            let post=posts::post(r,id)?;let permille=r.union(&post.ids)?.permille();let all_windows=r.windows(&post.ids)?;
-            let worth=post.size>=MIN_BYTES&&(MIN_PERMILLE..1000).contains(&permille);
-            let days=if recent&&post.size>=MIN_BYTES&&permille<MIN_PERMILLE {super::days_of(&all_windows)}else{Vec::new()};
-            let name=r.head(id)?.ok_or(SourceChanged)?.name;let sources=r.sources(&post.ids)?;
-            let looked=Looked {ids:post.ids,permille,windows:if worth{all_windows}else{Vec::new()},days,media:super::is_media(&name),size:post.size};
-            r.budget.charge(512+looked.ids.len()*128+looked.windows.iter().map(|w|w.group.capacity()+128).sum::<usize>())?;
-            let _=now;Ok((looked,sources))
-        })
+        owned_read(&self.owner,budget,work)
     }
     fn plan(&self,now:i64)->Result<Plan> {
-        let mut budget=Self::budget();let (recent,older,end)=self.read(&mut budget,|r|candidate_ids(r,now))?;
-        let mut plan=Plan {found:Found::default(),sources:HashMap::new(),deferred:0};let mut seen=HashSet::new();
-        for id in recent {if seen.contains(&id){continue;}match self.observe(id,true,now,&mut budget) {
-            Ok((post,sources))=>{seen.extend(post.ids.iter().copied());for s in sources{plan.sources.insert(s.id,s);}plan.found.posts.push(post);},
-            Err(e) if e.is::<Deferred>()||e.is::<SourceChanged>()=>plan.deferred+=1,Err(e)=>return Err(e),
-        }}
-        super::by_worth(&mut plan.found.posts);let first=plan.found.posts.len();let mut keys=Vec::new();let mut end=end;
-        for id in older {if seen.contains(&id){continue;}match self.observe(id,false,now,&mut budget) {
-            Ok((post,sources))=>{seen.extend(post.ids.iter().copied());for s in sources{plan.sources.insert(s.id,s);}keys.push(id);plan.found.posts.push(post);},
-            Err(e) if e.is::<Deferred>()||e.is::<SourceChanged>()=>{plan.deferred+=1;end=Some(id.saturating_add(1));break;},Err(e)=>return Err(e),
-        }}
-        plan.found.older.push(Older {shard:0,first,keys,end});Ok(plan)
+        self.stopped()?;let plan=storage::candidate_plan(&self.owner,now,&mut Self::budget())?;self.stopped()?;Ok(plan)
     }
     fn still_current(&self,sources:&[Source])->Result<bool> {
         self.read(&mut Self::budget(),|r| {for s in sources {if !r.source_matches(s)?{return Ok(false)}}Ok(true)})
@@ -90,6 +65,9 @@ impl Service {
             Ok(sources)})
     }
     fn mark(&self,sources:&[Source],now:i64,days:&[(String,i64)],tried:&[(i64,i64)],older:&[(usize,Option<i64>)])->Result<()> {
+        self.mark_progress(sources,now,days,tried,older,None)
+    }
+    fn mark_progress(&self,sources:&[Source],now:i64,days:&[(String,i64)],tried:&[(i64,i64)],older:&[(usize,Option<i64>)],recent:Option<Option<i64>>)->Result<()> {
         self.stopped()?;
         let result=self.owner.with(|client| {
             let mut tx=client.build_transaction().isolation_level(IsolationLevel::ReadCommitted).start()?;
@@ -100,6 +78,9 @@ impl Service {
             for s in sorted {if !storage::source_matches(&mut tx,s,true)? {tx.rollback()?;return Ok(false)}}
             if self.owner.stop.load(Ordering::Acquire)||self.ctx.stop.load(Ordering::Acquire){return Err(crate::pg::outage::AttemptEnded.into())}
             super::mark_in(&crate::pg::sql::Pg::new(&mut tx),now,days,tried,older)?;
+            if let Some(before)=recent {
+                tx.execute("insert into meta(key,value) values('native_repair_recent_before',$1) on conflict(key) do update set value=excluded.value",&[&before])?;
+            }
             tx.commit()?;Ok(true)
         })?;
         if !result{return Err(SourceChanged.into())}Ok(())
@@ -166,7 +147,7 @@ impl Service {
             post.ids.iter().map(move|&id|(id,permille))
         }).collect::<Vec<_>>();
         let sweeps=|done:&HashSet<usize>|plan.found.older.iter().map(|o|(o.shard,o.next(done))).collect::<Vec<_>>();
-        if let Err(e)=self.mark(&sources,now,&days,&tried,&sweeps(&done)){if e.is::<SourceChanged>(){progress.deferred+=1;return Ok(progress)}return Err(e)}
+        if let Err(e)=self.mark_progress(&sources,now,&days,&tried,&sweeps(&done),Some(plan.recent.next(&done))){if e.is::<SourceChanged>(){progress.deferred+=1;return Ok(progress)}return Err(e)}
         for i in to_read {
             self.stopped()?;let post=&plan.found.posts[i];let observed=post.ids.iter().filter_map(|id|plan.sources.get(id).cloned()).collect::<Vec<_>>();
             if !self.still_current(&observed)?{progress.deferred+=1;continue;}
@@ -207,21 +188,43 @@ impl Service {
             }
         }
         self.stopped()?;let ids=plan.sources.keys().copied().collect::<Vec<_>>();let current=match self.current_sources(&ids,&plan.sources){Ok(s)=>s,Err(e)if e.is::<SourceChanged>()=>{progress.deferred+=1;return Ok(progress)},Err(e)=>return Err(e)};
-        if let Err(e)=self.mark(&current,now,&[],&[],&sweeps(&done)){if e.is::<SourceChanged>(){progress.deferred+=1}else{return Err(e)}}Ok(progress)
+        if let Err(e)=self.mark_progress(&current,now,&[],&[],&sweeps(&done),Some(plan.recent.next(&done))){if e.is::<SourceChanged>(){progress.deferred+=1}else{return Err(e)}}Ok(progress)
     }
 }
-// Exactly one production selection query implementation; test fixtures call
-// it under the same original-owner RR/budget instead of reproducing its SQL.
-fn candidate_ids(r:&mut Read<'_,'_>,now:i64)->Result<(Vec<i64>,Vec<i64>,Option<i64>)> {
-            let recent=r.query("select id from releases where not complete and size>=$1 and posted_clock>=$2 and posted_clock<$3 and not exists(select 1 from repair_tried t where t.release_id=releases.id) order by id desc limit $4",&[&MIN_ROW_BYTES,&(now-DAYS*86400),&(now-SETTLED_SECS),&CANDIDATES])?.into_iter().map(|r|r.try_get::<_,i64>(0)).collect::<std::result::Result<Vec<_>,_>>()?;
-            let before=r.query("select before from repair_older where shard=0",&[])?.first().map(|r|r.try_get::<_,Option<i64>>(0)).transpose()?.flatten().unwrap_or(i64::MAX);
-            let low=r.query("select min(id) from(select id from releases where id<$1 order by id desc limit $2) scanned",&[&before,&OLDER_SCAN])?[0].try_get::<_,Option<i64>>(0)?;
-            let older=if let Some(low)=low {r.query("select id from releases where id>=$1 and id<$2 and not complete and size>=$3 and posted_clock<$4 and not exists(select 1 from repair_tried t where t.release_id=releases.id) order by id desc limit $5",&[&low,&before,&MIN_ROW_BYTES,&(now-DAYS*86400),&OLDER_CANDIDATES])?.into_iter().map(|r|r.try_get::<_,i64>(0)).collect::<std::result::Result<Vec<_>,_>>()?}else{Vec::new()};
-            let end=if older.len()==OLDER_CANDIDATES as usize {older.last().copied()}else{low};Ok((recent,older,end))
+// Same original-owner RR/deadline contract as Service::read. Each bounded
+// observation ends its transaction before the next starts, so a deferred query
+// can roll back without losing the already classified prefix's continuation.
+fn owned_read<T>(owner:&Arc<Owner>,budget:&mut Budget,work:impl FnOnce(&mut Read<'_,'_>)->Result<T>)->Result<T> {
+        // An explicit bounded/deferred observation is returned outside with(),
+        // so it cannot poison the owner as an invariant/storage failure. Actual
+        // PG/protocol/local-store errors still cross the original classifier.
+        owner.with(|client| {
+            let mut tx=client.build_transaction().isolation_level(IsolationLevel::RepeatableRead).read_only(true).start()?;
+            let result=work(&mut Read {tx:&mut tx,budget,stop:&owner.stop});
+            match result {
+                Err(e) if e.is::<Deferred>()||e.is::<SourceChanged>()=>{tx.rollback()?;Ok(Err(e))},
+                Err(e)=>Err(e),Ok(value)=>{tx.commit()?;Ok(Ok(value))},
+            }
+        })?
+}
+fn observe_in(r:&mut Read<'_,'_>,id:i64,recent:bool)->Result<Option<(Looked,Vec<Source>)>> {
+    let post=posts::post(r,id)?;
+    // Only the actual assembled identity/size qualifies a candidate. A small
+    // observed post is revisitable; it never enters permanent repair_tried.
+    if post.size<MIN_BYTES {return Ok(None)}
+    let permille=r.union(&post.ids)?.permille();let all_windows=r.windows(&post.ids)?;
+    let worth=(MIN_PERMILLE..1000).contains(&permille);
+    let days=if recent&&permille<MIN_PERMILLE {super::days_of(&all_windows)}else{Vec::new()};
+    let name=r.head(id)?.ok_or(SourceChanged)?.name;let sources=r.sources(&post.ids)?;
+    let looked=Looked {ids:post.ids,permille,windows:if worth{all_windows}else{Vec::new()},days,media:super::is_media(&name),size:post.size};
+    r.budget.charge(512+looked.ids.len()*128+looked.windows.iter().map(|w|w.group.capacity()+128).sum::<usize>())?;
+    Ok(Some((looked,sources)))
 }
 #[cfg(test)]
 pub(super) fn selected_older_for_test(owner:&Arc<Owner>,now:i64)->Result<(Vec<i64>,Option<i64>)> {
-    test_snapshot(owner,|r|{let (_,older,end)=candidate_ids(r,now)?;Ok((older,end))})
+    ensure!(owner.epoch().is_some(),"native candidate fixture requires an actual Runtime owner");
+    let plan=storage::candidate_plan(owner,now,&mut Service::budget())?;
+    let older=&plan.found.older[0];Ok((older.keys.clone(),older.end))
 }
 // Closed fixture reads of the actual native resolver. No generic callback or
 // production service capability is exposed, and no live singleton is needed
@@ -245,3 +248,7 @@ pub(crate) fn test_whole(owner:&Arc<Owner>,ids:&[i64])->Result<bool> {test_snaps
 #[cfg(all(test,unix))]
 #[path="native_tests.rs"]
 mod tests;
+
+#[cfg(all(test,unix))]
+#[path="native_candidates_tests.rs"]
+mod candidate_tests;

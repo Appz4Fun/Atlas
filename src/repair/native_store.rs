@@ -123,3 +123,71 @@ pub(super) fn source_matches(tx:&mut impl GenericClient,s:&Source,lock:bool)->Re
     let sql=if lock {"select native_work_revision=$2 and group_name=$3 and is_collection=$4 and identity_key=$5 from releases where id=$1 for update"}else{SOURCE_MATCH};
     Ok(tx.query_opt(sql,&[&s.id,&s.revision,&s.group,&s.collection,&&s.identity[..]])?.map(|r|r.try_get(0)).transpose()?.unwrap_or(false))
 }
+
+const RECENT_CURSOR:&str="native_repair_recent_before";
+const CANDIDATE_PAGE:i64=32;
+struct CandidatePhase {recent:bool,low:i64,before:i64,raw_limit:usize,qualified_limit:usize}
+
+/// Selection retains only genuinely assembled qualifying posts. Raw IDs are
+/// paged and negative observations remain revisitable rather than repair_tried.
+pub(super) fn candidate_plan(owner:&Arc<Owner>,now:i64,budget:&mut Budget)->Result<Plan> {
+    ensure!(owner.epoch().is_some(),"native candidates require the original catalog owner");
+    let (recent_before,older_before,older_low)=owned_read(owner,budget,|r| {
+        let recent=r.query("select value,text_value is null from meta where key=$1",&[&RECENT_CURSOR])?;
+        let recent=if let Some(row)=recent.first(){ensure!(row.try_get::<_,bool>(1)?,"native repair recent cursor has invalid text state");row.try_get::<_,Option<i64>>(0)?}else{None};
+        let older=r.query("select before from repair_older where shard=0",&[])?.first().map(|r|r.try_get::<_,Option<i64>>(0)).transpose()?.flatten();
+        ensure!(recent.is_none_or(|n|n>=0)&&older.is_none_or(|n|n>=0),"native repair cursor is malformed");
+        let before=older.unwrap_or(i64::MAX);
+        let low=r.query("select min(id) from(select id from releases where id<$1 order by id desc limit $2) scanned",&[&before,&OLDER_SCAN])?[0].try_get::<_,Option<i64>>(0)?;
+        Ok((recent,older,low))
+    })?;
+    let mut plan=Plan {found:Found::default(),sources:HashMap::new(),deferred:0,recent:RecentProgress {keys:Vec::new(),end:recent_before}};
+    let (recent,end)=scan_candidates(owner,now,budget,CandidatePhase {recent:true,low:0,before:recent_before.unwrap_or(i64::MAX),raw_limit:CANDIDATES as usize,qualified_limit:CANDIDATES as usize},&mut plan)?;
+    super::super::by_worth(&mut plan.found.posts);
+    let positions=plan.found.posts.iter().enumerate().map(|(index,post)|(post.ids[0],index)).collect::<BTreeMap<_,_>>();
+    plan.recent=RecentProgress {keys:recent.into_iter().map(|(anchor,representative)|(anchor,positions[&representative])).collect(),end};
+    let first=plan.found.posts.len();
+    let (older,end)=if let Some(low)=older_low {
+        scan_candidates(owner,now,budget,CandidatePhase {recent:false,low,before:older_before.unwrap_or(i64::MAX),raw_limit:OLDER_SCAN as usize,qualified_limit:OLDER_CANDIDATES as usize},&mut plan)?
+    }else{(Vec::new(),None)};
+    plan.found.older.push(Older {shard:0,first,keys:older.into_iter().map(|(anchor,_)|anchor).collect(),end});
+    Ok(plan)
+}
+
+fn scan_candidates(owner:&Arc<Owner>,now:i64,budget:&mut Budget,phase:CandidatePhase,plan:&mut Plan)->Result<(Vec<(i64,i64)>,Option<i64>)> {
+    let mut before=phase.before;let mut end=Some(before);let mut anchors=Vec::new();let mut raw=0usize;
+    while raw<phase.raw_limit&&anchors.len()<phase.qualified_limit {
+        let limit=CANDIDATE_PAGE.min((phase.raw_limit-raw) as i64);
+        let page=owned_read(owner,budget,|r| {
+            let rows=if phase.recent {
+                r.query("select id from releases where id>=$1 and id<$2 and not complete and posted_clock>=$3 and posted_clock<$4 and not exists(select 1 from repair_tried t where t.release_id=releases.id) order by id desc limit $5",&[&phase.low,&before,&(now-DAYS*86400),&(now-SETTLED_SECS),&limit])?
+            }else{
+                r.query("select id from releases where id>=$1 and id<$2 and not complete and posted_clock<$3 and not exists(select 1 from repair_tried t where t.release_id=releases.id) order by id desc limit $4",&[&phase.low,&before,&(now-DAYS*86400),&limit])?
+            };
+            rows.into_iter().map(|r|r.try_get::<_,i64>(0)).collect::<std::result::Result<Vec<_>,_>>().map_err(Into::into)
+        });
+        let page=match page {Ok(page)=>page,Err(e)if e.is::<Deferred>()||e.is::<SourceChanged>()=>{plan.deferred+=1;break},Err(e)=>return Err(e)};
+        if page.is_empty(){end=if phase.recent{None}else{Some(phase.low)};break}
+        for id in page {
+            if !plan.sources.contains_key(&id) {
+                match owned_read(owner,budget,|r|observe_in(r,id,phase.recent)) {
+                    Ok(Some((post,sources)))=>{
+                        ensure!(!post.ids.is_empty(),"native candidate assembled an empty identity");
+                        if sources.iter().any(|source|plan.sources.contains_key(&source.id)) {
+                            // A concurrently expanded identity may not replace
+                            // the earlier observation's revision evidence.
+                            plan.deferred+=1;return Ok((anchors,Some(id.saturating_add(1))))
+                        }
+                        anchors.push((id,post.ids[0]));for source in sources{plan.sources.insert(source.id,source);}plan.found.posts.push(post);
+                    },
+                    Ok(None)=>{},
+                    Err(e)if e.is::<Deferred>()||e.is::<SourceChanged>()=>{plan.deferred+=1;return Ok((anchors,Some(id.saturating_add(1))))},
+                    Err(e)=>return Err(e),
+                }
+            }
+            raw+=1;before=id;end=Some(id);
+            if raw==phase.raw_limit||anchors.len()==phase.qualified_limit {return Ok((anchors,end))}
+        }
+    }
+    Ok((anchors,end))
+}
