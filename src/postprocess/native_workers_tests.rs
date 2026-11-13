@@ -89,6 +89,7 @@ fn native_predb_worker_runs_with_postprocess_off_without_creating_step_state() {
 
 pub(crate) fn run_predb_only(runtime:&crate::pg::indexer_runtime::Runtime) {
     let mut config=crate::config::Config::default();config.postprocess.enabled=false;
+    config.spots.enabled=false;
     config.predb.enabled=true;config.predb.sources.clear();
     let ending=Arc::new(std::sync::atomic::AtomicBool::new(false));
     let end=ending.clone();let owner=runtime.owner.clone();let db=runtime.db.clone();
@@ -191,6 +192,7 @@ fn native_header_only_attempt_observes_real_registry_and_joins_without_step_or_p
 
 pub(crate) fn run_header_only(runtime:&crate::pg::indexer_runtime::Runtime) {
     let mut config=crate::config::Config::default();config.postprocess.enabled=false;config.predb.enabled=false;
+    config.spots.enabled=false;
     // A genuine process counter, observed through the existing producer; no
     // fabricated Stage lane or manually inserted telemetry completion row.
     crate::metrics::names::API_REQUESTS.inc(&[("endpoint","native-header-control"),("status","200")],7);
