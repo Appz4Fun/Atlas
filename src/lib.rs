@@ -27,7 +27,6 @@ pub mod filters;
 pub mod frozen;
 pub mod gemini;
 pub mod gf2;
-pub mod groups_menu;
 pub mod history_stream;
 pub mod history_identity;
 pub mod indexer;
