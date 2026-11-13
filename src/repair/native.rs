@@ -161,7 +161,10 @@ impl Service {
         let mut progress=Progress {deferred:plan.deferred,..Default::default()};
         let (to_read,looked)=super::plan(&plan.found.posts,PER_ROUND);let mut done=looked.iter().copied().collect::<HashSet<_>>();
         let sources=plan.sources.values().cloned().collect::<Vec<_>>();let days=plan.found.posts.iter().flat_map(|p|p.days.iter().cloned()).collect::<Vec<_>>();
-        let tried=looked.iter().flat_map(|&i|plan.found.posts[i].ids.iter().map(move|&id|(id,plan.found.posts[i].permille))).collect::<Vec<_>>();
+        let tried=looked.iter().flat_map(|&i| {
+            let post=&plan.found.posts[i];let permille=post.permille;
+            post.ids.iter().map(move|&id|(id,permille))
+        }).collect::<Vec<_>>();
         let sweeps=|done:&HashSet<usize>|plan.found.older.iter().map(|o|(o.shard,o.next(done))).collect::<Vec<_>>();
         if let Err(e)=self.mark(&sources,now,&days,&tried,&sweeps(&done)){if e.is::<SourceChanged>(){progress.deferred+=1;return Ok(progress)}return Err(e)}
         for i in to_read {
