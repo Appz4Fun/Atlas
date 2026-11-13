@@ -144,3 +144,48 @@ fn oversized_overview_frame_is_retried_as_owned_leaves_with_exact_coverage() {
         assert_eq!(*asked.lock().unwrap(),[(1,4),(1,2),(3,4)]);
     });
 }
+
+#[test]
+fn paged_xzver_continuations_keep_one_fetch_budget_and_retry_exact_leaves() {
+    runtime().block_on(async {
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut cfg=UsenetServer::new("127.0.0.1","","",listener.local_addr().unwrap().port());
+        cfg.ssl=Some(false);cfg.compress=Some(true);cfg.connections=Some(1);
+        let asked=Arc::new(Mutex::new(Vec::new()));let log=asked.clone();
+        let peer=tokio::spawn(async move {
+            loop {
+                let (socket,_)=listener.accept().await.unwrap();let mut socket=BufReader::new(socket);
+                if socket.get_mut().write_all(b"200 owned\r\n").await.is_err(){continue}
+                loop {
+                    let mut command=String::new();if socket.read_line(&mut command).await.unwrap_or(0)==0 {break}
+                    let response=if command=="GROUP g\r\n" {b"211 4 1 4 g\r\n".to_vec()}
+                    else if command.starts_with("XFEATURE "){b"500 unavailable\r\n".to_vec()}
+                    else if let Some(range)=command.strip_prefix("XZVER ") {
+                        let (a,b)=range.trim().split_once('-').unwrap();let (a,b)=(a.parse::<u64>().unwrap(),b.parse::<u64>().unwrap());
+                        {let mut log=log.lock().unwrap();assert!(log.len()<16);log.push((a,b));}
+                        // A genuine provider-style truncated compressed page:
+                        // every separately bounded answer returns just one row.
+                        let mut compressor=flate2::write::ZlibEncoder::new(Vec::new(),flate2::Compression::default());
+                        compressor.write_all(format!("{a}\t{}\tp\tdate\t<m{a}@owned.test>\t\t1\t1\r\n","s".repeat(600_000)).as_bytes()).unwrap();
+                        let mut out=b"224 follows\r\n".to_vec();
+                        for b in compressor.finish().unwrap(){let b=b.wrapping_add(42);if [0,10,13,61].contains(&b){out.extend_from_slice(&[b'=',b.wrapping_add(64)])}else{out.push(b)}}
+                        out.extend_from_slice(b"\r\n.\r\n");out
+                    } else {panic!("unexpected paged XZVER command: {command}")};
+                    if socket.get_mut().write_all(&response).await.is_err(){break}
+                }
+            }
+        });
+        let pool=Arc::new(Pool::new(&[cfg]).with_max_unsaved(4));
+        let error=pool.xover_on(0,"g",1,4).await.unwrap_err();
+        assert!(error.is_overview_budget(),"individually admitted pages cannot accumulate beyond one fetch");
+        asked.lock().unwrap().clear();
+        let mut replies=pool.stream_headers("g",0,vec![(1,4)],1,false,Arc::new(AtomicBool::new(false)));
+        let mut ranges=Vec::new();let mut numbers=Vec::new();
+        while let Some(slice)=tokio::time::timeout(Duration::from_secs(5),replies.recv()).await.unwrap() {
+            ranges.push((slice.start,slice.end));numbers.extend(slice.result.unwrap().into_iter().map(|r|r.number));drop(slice.unsaved);
+        }
+        peer.abort();let _=peer.await;
+        assert_eq!(ranges,[(1,2),(3,4)]);assert_eq!(numbers,[1,2,3,4]);
+        assert_eq!(*asked.lock().unwrap(),[(1,4),(2,4),(3,4),(4,4),(1,2),(2,2),(3,4),(4,4)]);
+    });
+}

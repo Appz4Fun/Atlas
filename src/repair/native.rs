@@ -68,13 +68,7 @@ impl Service {
         })
     }
     fn plan(&self,now:i64)->Result<Plan> {
-        let mut budget=Self::budget();let (recent,older,end)=self.read(&mut budget,|r| {
-            let recent=r.query("select id from releases where not complete and size>=$1 and posted_clock>=$2 and posted_clock<$3 and not exists(select 1 from repair_tried t where t.release_id=releases.id) order by id desc limit $4",&[&MIN_ROW_BYTES,&(now-DAYS*86400),&(now-SETTLED_SECS),&CANDIDATES])?.into_iter().map(|r|r.try_get::<_,i64>(0)).collect::<std::result::Result<Vec<_>,_>>()?;
-            let before=r.query("select before from repair_older where shard=0",&[])?.first().map(|r|r.try_get::<_,Option<i64>>(0)).transpose()?.flatten().unwrap_or(i64::MAX);
-            let low=r.query("select min(id) from(select id from releases where id<$1 order by id desc limit $2) scanned",&[&before,&OLDER_SCAN])?[0].try_get::<_,Option<i64>>(0)?;
-            let older=if let Some(low)=low {r.query("select id from releases where id>=$1 and id<$2 and not complete and size>=$3 and posted_clock<$4 and not exists(select 1 from repair_tried t where t.release_id=releases.id) order by id desc limit $5",&[&low,&before,&MIN_ROW_BYTES,&(now-DAYS*86400),&OLDER_CANDIDATES])?.into_iter().map(|r|r.try_get::<_,i64>(0)).collect::<std::result::Result<Vec<_>,_>>()?}else{Vec::new()};
-            let end=if older.len()==OLDER_CANDIDATES as usize {older.last().copied()}else{low};Ok((recent,older,end))
-        })?;
+        let mut budget=Self::budget();let (recent,older,end)=self.read(&mut budget,|r|candidate_ids(r,now))?;
         let mut plan=Plan {found:Found::default(),sources:HashMap::new(),deferred:0};let mut seen=HashSet::new();
         for id in recent {if seen.contains(&id){continue;}match self.observe(id,true,now,&mut budget) {
             Ok((post,sources))=>{seen.extend(post.ids.iter().copied());for s in sources{plan.sources.insert(s.id,s);}plan.found.posts.push(post);},
@@ -88,7 +82,7 @@ impl Service {
         plan.found.older.push(Older {shard:0,first,keys,end});Ok(plan)
     }
     fn still_current(&self,sources:&[Source])->Result<bool> {
-        self.read(&mut Self::budget(),|r| {for s in sources {if !storage::source_matches(r.tx,s,false)?{return Ok(false)}}Ok(true)})
+        self.read(&mut Self::budget(),|r| {for s in sources {if !r.source_matches(s)?{return Ok(false)}}Ok(true)})
     }
     fn current_sources(&self,ids:&[i64],expected:&HashMap<i64,Source>)->Result<Vec<Source>> {
         self.read(&mut Self::budget(),|r| {let sources=r.sources(ids)?;for s in &sources {let prior=expected.get(&s.id).context("native overview unobserved source")?;
@@ -212,6 +206,19 @@ impl Service {
         self.stopped()?;let ids=plan.sources.keys().copied().collect::<Vec<_>>();let current=match self.current_sources(&ids,&plan.sources){Ok(s)=>s,Err(e)if e.is::<SourceChanged>()=>{progress.deferred+=1;return Ok(progress)},Err(e)=>return Err(e)};
         if let Err(e)=self.mark(&current,now,&[],&[],&sweeps(&done)){if e.is::<SourceChanged>(){progress.deferred+=1}else{return Err(e)}}Ok(progress)
     }
+}
+// Exactly one production selection query implementation; test fixtures call
+// it under the same original-owner RR/budget instead of reproducing its SQL.
+fn candidate_ids(r:&mut Read<'_,'_>,now:i64)->Result<(Vec<i64>,Vec<i64>,Option<i64>)> {
+            let recent=r.query("select id from releases where not complete and size>=$1 and posted_clock>=$2 and posted_clock<$3 and not exists(select 1 from repair_tried t where t.release_id=releases.id) order by id desc limit $4",&[&MIN_ROW_BYTES,&(now-DAYS*86400),&(now-SETTLED_SECS),&CANDIDATES])?.into_iter().map(|r|r.try_get::<_,i64>(0)).collect::<std::result::Result<Vec<_>,_>>()?;
+            let before=r.query("select before from repair_older where shard=0",&[])?.first().map(|r|r.try_get::<_,Option<i64>>(0)).transpose()?.flatten().unwrap_or(i64::MAX);
+            let low=r.query("select min(id) from(select id from releases where id<$1 order by id desc limit $2) scanned",&[&before,&OLDER_SCAN])?[0].try_get::<_,Option<i64>>(0)?;
+            let older=if let Some(low)=low {r.query("select id from releases where id>=$1 and id<$2 and not complete and size>=$3 and posted_clock<$4 and not exists(select 1 from repair_tried t where t.release_id=releases.id) order by id desc limit $5",&[&low,&before,&MIN_ROW_BYTES,&(now-DAYS*86400),&OLDER_CANDIDATES])?.into_iter().map(|r|r.try_get::<_,i64>(0)).collect::<std::result::Result<Vec<_>,_>>()?}else{Vec::new()};
+            let end=if older.len()==OLDER_CANDIDATES as usize {older.last().copied()}else{low};Ok((recent,older,end))
+}
+#[cfg(test)]
+pub(super) fn selected_older_for_test(owner:&Arc<Owner>,now:i64)->Result<(Vec<i64>,Option<i64>)> {
+    test_snapshot(owner,|r|{let (_,older,end)=candidate_ids(r,now)?;Ok((older,end))})
 }
 // Closed fixture reads of the actual native resolver. No generic callback or
 // production service capability is exposed, and no live singleton is needed

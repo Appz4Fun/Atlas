@@ -310,9 +310,9 @@ mod tests {
                 let mut cfg=crate::config::UsenetServer::new("127.0.0.1","","",address.port());cfg.ssl=Some(false);cfg.compress=Some(false);cfg.connections=Some(1);
                 let task=tokio::spawn(async move {
                     let(socket,_)=listener.accept().await.unwrap();let mut socket=BufReader::new(socket);socket.get_mut().write_all(b"200 fixture\r\n").await.unwrap();
-                    for pass in 0..2 {
+                    for pass in 0..3 {
                         let mut command=String::new();socket.read_line(&mut command).await.unwrap();assert_eq!(command,"LIST ACTIVE\r\n");
-                        let response=format!("215 {}\r\nalt.binaries.test 30 10 y\r\n.\r\n",if pass==1{"x".repeat(8192)}else{"fixture".into()});
+                        let response=format!("215 {}\r\nalt.binaries.test 30 10 y\r\n.\r\n",if pass==2{"x".repeat(8192)}else{"fixture".into()});
                         if socket.get_mut().write_all(response.as_bytes()).await.is_err(){break;}
                     }
                 });
@@ -320,9 +320,11 @@ mod tests {
                 if capture_first {
                     let first=pool.capture_active_groups(None,Limits::default()).await.unwrap();assert_eq!(first.rows().count(),1);drop(first);
                     assert_eq!(pool.list_groups(None).await.unwrap(),vec![("alt.binaries.test".into(),20)]);
+                    assert!(matches!(pool.list_groups(None).await,Err(NntpError::Protocol(_))),"normal reuse keeps the universal512-byte control-line bound");
                 }else{
                     assert_eq!(pool.list_groups(None).await.unwrap(),vec![("alt.binaries.test".into(),20)]);
-                    assert!(matches!(pool.capture_active_groups(None,Limits::default()).await,Err(NntpError::Protocol(_))),"a reused legacy connection must receive the capture-only bound");
+                    let next=pool.capture_active_groups(None,Limits::default()).await.unwrap();assert_eq!(next.rows().count(),1);drop(next);
+                    assert!(matches!(pool.capture_active_groups(None,Limits::default()).await,Err(NntpError::Protocol(_))),"capture reuse keeps the same512-byte control-line bound");
                 }
                 task.await.unwrap();
             }
