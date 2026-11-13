@@ -538,11 +538,6 @@ fn groups_section(cfg: &Config, managed: &Managed, token: &str) -> String {
     out
 }
 
-pub(crate) fn group_search(args: &HashMap<String, String>, api_key: &str) -> String {
-    let query = args.get("q").map_or("", String::as_str);
-    let cfg = current();
-    group_results(crate::groups_menu::search_groups(&cfg, query),api_key)
-}
 
 /// Render the existing group picker from an already selected data source.
 pub(crate) fn group_results(result:Result<Vec<String>,String>,api_key:&str)->String {
