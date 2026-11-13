@@ -3,23 +3,78 @@
 
 #[test]
 fn fresh_stage_preserves_every_registered_added_column() {
-    let Some(schema)=super::testing::Schema::new() else {return};
-    let mut client=schema.pool.get().unwrap();
-    let mut checked=0;
-    for table in crate::postprocess::schema::SHARD_TABLES {
-        for (column,declaration) in table.added {
-            let row=client.query_one("select data_type,is_nullable,column_default from information_schema.columns where table_schema=$1 and table_name=$2 and column_name=$3",
-                &[&schema.name,&table.name,column]).unwrap();
-            let expected=declaration.split_whitespace().next().unwrap();
-            let expected=match expected {"INTEGER"=>"bigint","BLOB"=>"bytea","TEXT"=>"text",other=>panic!("unmapped original column type {other}")};
-            assert_eq!(row.get::<_,String>(0),expected,"{}.{} type",table.name,column);
-            assert_eq!(row.get::<_,String>(1),if declaration.contains("NOT NULL") {"NO"} else {"YES"},"{}.{} nullability",table.name,column);
-            let default:Option<String>=row.get(2);
-            assert_eq!(default.as_deref(),if declaration.contains("DEFAULT 0") {Some("0")} else {None},"{}.{} default",table.name,column);
-            checked+=1;
-        }
+    let Some(schema) = super::testing::Schema::new() else { return };
+    let mut client = schema.pool.get().unwrap();
+    // Independent baseline vector: the original 40 SHARD_TABLES additions
+    // and RELEASE_COLUMNS' releases.name_source make all 41 contracts.
+    // The retired registry is no longer needed to exercise the real PG schema.
+    const COLUMNS: &[(&str, &str, &str)] = &[
+        ("pp_state", "net_transient", "INTEGER"),
+        ("pp_state", "net_rank", "INTEGER"),
+        ("pp_state", "net_left", "INTEGER"),
+        ("archive_inner_files", "crc32", "INTEGER"),
+        ("archive_inner_files", "mtime", "INTEGER"),
+        ("archive_inner_files", "host_os", "INTEGER"),
+        ("archive_release", "encryption", "INTEGER"),
+        ("archive_release", "names_hidden", "INTEGER"),
+        ("archive_release", "password_check", "BLOB"),
+        ("archive_release", "packer", "TEXT"),
+        ("archive_release", "twin_key", "INTEGER"),
+        ("archive_release", "owner_key", "INTEGER"),
+        ("archive_release", "zone_key", "INTEGER"),
+        ("archive_release", "facts", "INTEGER"),
+        ("release_fingerprint", "par2_block", "INTEGER"),
+        ("release_fingerprint", "par2_blocks", "INTEGER"),
+        ("release_fingerprint", "posted_names", "BLOB"),
+        ("release_probe", "moviehash", "TEXT"),
+        ("release_stills", "phash", "INTEGER"),
+        ("media_release", "tmdb_from_tag", "INTEGER NOT NULL DEFAULT 0"),
+        ("media_release", "tvdb_from_tag", "INTEGER NOT NULL DEFAULT 0"),
+        ("file_timing", "tool", "INTEGER"),
+        ("file_timing", "clock_first", "INTEGER"),
+        ("file_timing", "clock_last", "INTEGER"),
+        ("file_timing", "hw_host", "TEXT"),
+        ("file_timing", "hw_key", "TEXT"),
+        ("file_timing", "hw_n_first", "INTEGER"),
+        ("file_timing", "hw_n_last", "INTEGER"),
+        ("release_keys", "file_crc", "INTEGER"),
+        ("release_keys", "body_crc", "INTEGER"),
+        ("release_keys", "video", "INTEGER"),
+        ("release_keys", "audio", "INTEGER"),
+        ("release_keys", "mux", "INTEGER"),
+        ("release_keys", "encode", "INTEGER"),
+        ("release_keys", "thread", "INTEGER"),
+        ("release_keys", "subs", "INTEGER"),
+        ("release_keys", "fonts", "INTEGER"),
+        ("release_keys", "chapters", "INTEGER"),
+        ("release_keys", "volumes", "INTEGER"),
+        ("spots", "xml", "TEXT"),
+        ("releases", "name_source", "INTEGER"),
+    ];
+    for &(table, column, declaration) in COLUMNS {
+        let row=client.query_one("select data_type,is_nullable,column_default from information_schema.columns where table_schema=$1 and table_name=$2 and column_name=$3",
+            &[&schema.name,&table,&column]).unwrap();
+        let expected = declaration.split_whitespace().next().unwrap();
+        let expected = match expected {
+            "INTEGER" => "bigint",
+            "BLOB" => "bytea",
+            "TEXT" => "text",
+            other => panic!("unmapped original column type {other}"),
+        };
+        assert_eq!(row.get::<_, String>(0), expected, "{table}.{column} type");
+        assert_eq!(
+            row.get::<_, String>(1),
+            if declaration.contains("NOT NULL") { "NO" } else { "YES" },
+            "{table}.{column} nullability"
+        );
+        let default: Option<String> = row.get(2);
+        assert_eq!(
+            default.as_deref(),
+            if declaration.contains("DEFAULT 0") { Some("0") } else { None },
+            "{table}.{column} default"
+        );
     }
-    assert_eq!(checked,41,"all original added columns remain covered");
+    assert_eq!(COLUMNS.len(), 41, "all original added columns remain covered");
 }
 
 #[test]
