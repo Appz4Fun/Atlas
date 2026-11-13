@@ -216,7 +216,8 @@ fn native_spot_cursor_uses_actual_selected_account_binding() {
     let (schema,runtime,_dir)=fixture();let primary=Peer::new(Mode::RejectGroup);let actual=Peer::new(Mode::Good);
     let handle=tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
     let pool=Arc::new(crate::nntp::Pool::new(&[primary.server.clone(),actual.server.clone()]));
-    let primary_key=hex::encode(pool.provider_binding_on(0).unwrap());let actual_key=hex::encode(pool.provider_binding_on(1).unwrap());assert_ne!(primary_key,actual_key);
+    let hex=|bytes:&[u8;32]|bytes.iter().map(|byte|format!("{byte:02x}")).collect::<String>();
+    let primary_key=hex(&pool.provider_binding_on(0).unwrap());let actual_key=hex(&pool.provider_binding_on(1).unwrap());assert_ne!(primary_key,actual_key);
     let service=service(&runtime,pool,handle.handle().clone());service.spots_tick(1793000000).unwrap();
     let storage=native_store::Store::new(&runtime.owner).unwrap();
     assert_eq!(storage.with(|tx|Ok(store::cursor(&crate::pg::sql::Pg::new(&mut *tx),&primary_key)?)).unwrap(),None);
