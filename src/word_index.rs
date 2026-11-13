@@ -973,7 +973,7 @@ mod tests {
             .unwrap();
         assert_eq!(ids(&by_name), [newer[0], newer[1]]);
         // words with nothing the index keeps match nothing here, and go to the database instead
-        assert_eq!(index.count_native(&mut source, "---", Some(&movies), &[]).unwrap(), 0);
+        assert!(index.count_native(&mut source, "---", Some(&movies), &[]).is_err(), "punctuation-only queries use the bounded PG catalog matcher");
         assert!(!searchable("---") && !searchable("") && !searchable(&"a".repeat(64)));
         assert!(searchable("batman 1080p") && searchable(&"a".repeat(63)));
         // a start too common to read every word of is the word alone: `bat` starts 31 releases' words and is none
