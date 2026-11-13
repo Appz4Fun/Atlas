@@ -76,7 +76,8 @@ mod tests {
         let storage=StorageConfig {backend:Backend::Postgres,url:schema.url.clone(),schema:schema.name.clone(),max_connections:4,allow_plaintext:true};
         // Actual original-backend bootstrap, not hand-inserted nonce/epoch or
         // a caller readiness flag. This test never opens a public listener.
-        let epoch=pg::stage::open_epoch(&mut owner,&storage,&headers,9).unwrap();
+        let version=pg::migrate::version(&mut owner,&schema.name).unwrap();
+        let epoch=pg::stage::open_epoch(&mut owner,&storage,&headers,version).unwrap();
         let release=crate::parser::Release {name:"Processing.Example.Release".into(),group:"alt.binaries.test".into(),poster:"poster".into(),date:"2020-01-01".into(),..Default::default()};
         pg::release_writer::save(&mut owner,&[release],1).unwrap();
         let id:i64=owner.query_one("select id from releases",&[]).unwrap().get(0);
