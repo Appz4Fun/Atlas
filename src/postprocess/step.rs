@@ -342,6 +342,10 @@ pub struct StepWrite {
 impl StepWrite {
     pub fn for_mutation(release_id:i64,mutation:StepMutation)->Self {Self {release_id,mutation}}
 
+    /// Read-only result data for step composition, never a target/lease grant.
+    /// Native effects still require the actor's Claim and Observed validation.
+    pub fn mutation(&self)->&StepMutation {&self.mutation}
+
     pub(crate) fn native_mutation_for(&self,release_id:i64)->Result<&StepMutation,StepError> {
         if self.release_id!=release_id {return Err(StepError::Retry("native Step result targets another release".into()));}
         self.native_mutation()
