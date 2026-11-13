@@ -2644,8 +2644,8 @@ mod tests {
     use super::*;
     use crate::parser::Article;
 
-    fn native_fixture() -> Option<(crate::pg::testing::Schema, Db)> {
-        let schema = crate::pg::testing::Schema::native_writer()?;
+    fn native_fixture() -> (crate::pg::testing::Schema, Db) {
+        let schema = crate::pg::testing::Schema::native_writer().expect("explicit isolated ATLAS_PG_TEST_URL required");
         let database: String = schema.pool.get().unwrap().query_one("select current_database()", &[]).unwrap().get(0);
         let db = shared_postgres_db(
             &crate::pg::StorageConfig {
@@ -2659,7 +2659,7 @@ mod tests {
             PgWriteLimits::default(),
         )
         .unwrap();
-        Some((schema, db))
+        (schema, db)
     }
 
     #[test]
@@ -2786,8 +2786,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an explicit isolated ATLAS_PG_TEST_URL"]
     fn each_speculative_window_has_to_hold_enough_on_its_own() {
-        let Some((schema, db)) = native_fixture() else { return };
+        let (schema, db) = native_fixture();
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         rt.block_on(each_speculative_window(&db));
         drop(db);
@@ -2811,8 +2812,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an explicit isolated ATLAS_PG_TEST_URL"]
     fn a_speculative_window_is_judged_once_every_day_of_it_is_done() {
-        let Some((schema, db)) = native_fixture() else { return };
+        let (schema, db) = native_fixture();
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         rt.block_on(a_window_judged_when_done(&db));
         drop(db);
@@ -2856,8 +2858,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an explicit isolated ATLAS_PG_TEST_URL"]
     fn a_chunk_taken_over_leaves_the_older_days_and_the_window_alone() {
-        let Some((schema, db)) = native_fixture() else { return };
+        let (schema, db) = native_fixture();
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         rt.block_on(a_chunk_taken_over(&db));
         drop(db);
@@ -2944,8 +2947,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an explicit isolated ATLAS_PG_TEST_URL"]
     fn cursors_saved_under_a_servers_old_key_are_adopted_once() {
-        let Some(schema) = crate::pg::testing::Schema::new() else { return };
+        let schema = crate::pg::testing::Schema::new().expect("explicit isolated ATLAS_PG_TEST_URL required");
         let conn = crate::pg::sql::Pg::new(schema.pool.get().unwrap());
         let state = db::GroupState { live_cursor: 900, backfill_cursor: 500 };
         db::save_group_state(&conn, "g@x@a.example:563", state).unwrap();
@@ -2963,8 +2967,9 @@ mod tests {
     /// a lone server's plain cursors are its own: adding a server that sorts
     /// before it doesnt hand them to the new one
     #[test]
+    #[ignore = "requires an explicit isolated ATLAS_PG_TEST_URL"]
     fn plain_cursors_stay_with_the_server_that_kept_them() {
-        let Some(schema) = crate::pg::testing::Schema::new() else { return };
+        let schema = crate::pg::testing::Schema::new().expect("explicit isolated ATLAS_PG_TEST_URL required");
         let conn = crate::pg::sql::Pg::new(schema.pool.get().unwrap());
         let state = db::GroupState { live_cursor: 900, backfill_cursor: 500 };
         db::save_group_state(&conn, "g", state).unwrap();
