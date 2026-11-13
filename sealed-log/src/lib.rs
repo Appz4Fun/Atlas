@@ -9,8 +9,8 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Error, ErrorKind, Read, Write};
-use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::io::{self, Error, ErrorKind, Read, Write};
+use std::net::TcpListener;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::Relaxed;
@@ -18,6 +18,13 @@ use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::time::{Duration, Instant};
 
 pub mod metrics;
+mod transport;
+pub use transport::{CertificateGrant, ClientTls, Permissions, ServerTls, TransportLimits};
+#[cfg(test)]
+#[path = "integrity_tests.rs"]
+mod integrity_regressions;
+#[cfg(test)]
+use integrity_regressions::test_io;
 use metrics::STATS;
 
 const MAGIC: [u8; 4] = *b"SLG1";
@@ -123,33 +130,102 @@ pub struct Log {
     /// how far each segment may be read, the last one moving as it's written
     tail: Arc<RwLock<(u32, u64)>>,
     files: RwLock<HashMap<u32, Arc<File>>>,
-    writer: Mutex<mpsc::Sender<Group>>,
+    writer: Mutex<Option<mpsc::Sender<Group>>>,
+    failure: Arc<Mutex<Option<Arc<io::Error>>>>,
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
-/// The end of the good records of a segment, looking from `from`.
-fn scan_end(file: &File, from: u64) -> io::Result<u64> {
+/// Only complete checksum-valid records and a verified all-zero reservation
+/// suffix are safe. Legacy checkpoints are hints, not acknowledgement proofs.
+fn scan_end(file: &File) -> io::Result<u64> {
     let size = file.metadata()?.len();
-    let mut pos = from;
+    let mut pos = 0u64;
     let mut header = [0u8; HEADER];
-    while pos + HEADER as u64 <= size {
+    let mut scratch = [0u8; 64 * 1024];
+    while pos < size {
+        let available = size - pos;
+        if available < HEADER as u64 {
+            if zero_suffix(file, pos, size, &mut scratch)? {
+                return Ok(pos);
+            }
+            return Err(invalid("ambiguous nonzero partial record header"));
+        }
         file.read_exact_at(&mut header, pos)?;
+        if header.iter().all(|byte| *byte == 0) {
+            if zero_suffix(file, pos, size, &mut scratch)? {
+                return Ok(pos);
+            }
+            return Err(invalid("nonzero bytes after a zero record boundary"));
+        }
         if header[..4] != MAGIC {
-            break;
+            return Err(invalid("invalid committed record magic"));
         }
-        let crc = u32::from_be_bytes(header[4..8].try_into().unwrap());
-        let key = u64::from_be_bytes(header[8..16].try_into().unwrap());
-        let len = u32::from_be_bytes(header[16..20].try_into().unwrap()) as u64;
-        if len as usize > MAX_FRAME || pos + HEADER as u64 + len > size {
-            break;
+        let len = u32::from_be_bytes(header[16..20].try_into().unwrap()) as usize;
+        if len > MAX_FRAME {
+            return Err(invalid("record length exceeds admission"));
         }
-        let mut value = vec![0u8; len as usize];
-        file.read_exact_at(&mut value, pos + HEADER as u64)?;
-        if crc_of(key, &value) != crc {
-            break;
+        let end = pos
+            .checked_add(HEADER as u64)
+            .and_then(|at| at.checked_add(len as u64))
+            .ok_or_else(|| invalid("record extent overflow"))?;
+        if end > size {
+            return Err(invalid("ambiguous nonzero partial record payload"));
         }
-        pos += HEADER as u64 + len;
+        let mut crc = crc32fast::Hasher::new();
+        crc.update(&header[8..]);
+        let mut at = pos + HEADER as u64;
+        while at < end {
+            let take = usize::try_from((end - at).min(scratch.len() as u64)).unwrap();
+            file.read_exact_at(&mut scratch[..take], at)?;
+            crc.update(&scratch[..take]);
+            at += take as u64;
+        }
+        if crc.finalize() != u32::from_be_bytes(header[4..8].try_into().unwrap()) {
+            return Err(invalid("committed record checksum failure"));
+        }
+        pos = end;
     }
     Ok(pos)
+}
+
+fn zero_suffix(file: &File, mut at: u64, end: u64, scratch: &mut [u8]) -> io::Result<bool> {
+    while at < end {
+        let take = usize::try_from((end - at).min(scratch.len() as u64)).unwrap();
+        file.read_exact_at(&mut scratch[..take], at)?;
+        if scratch[..take].iter().any(|byte| *byte != 0) {
+            return Ok(false);
+        }
+        at += take as u64;
+    }
+    Ok(true)
+}
+
+/// A failed writer cannot publish another location. The original I/O error
+/// remains the source for every rejected current, queued or future append.
+#[derive(Debug)]
+pub struct WriterFenced {
+    cause: Arc<io::Error>,
+}
+impl std::fmt::Display for WriterFenced {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "sealed-log writer is fenced: {}", self.cause)
+    }
+}
+impl std::error::Error for WriterFenced {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.cause.as_ref())
+    }
+}
+fn fenced(cause: &Arc<io::Error>) -> io::Error {
+    io::Error::new(cause.kind(), WriterFenced { cause: cause.clone() })
+}
+fn writer_error(failure: &Mutex<Option<Arc<io::Error>>>) -> io::Error {
+    failure
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(fenced)
+        .unwrap_or_else(|| Error::new(ErrorKind::BrokenPipe, "sealed-log writer stopped"))
 }
 
 impl Log {
@@ -158,23 +234,49 @@ impl Log {
     }
 
     pub fn open_with(dir: &Path, segment_bytes: u64) -> io::Result<Arc<Log>> {
+        if segment_bytes < HEADER as u64 {
+            return Err(invalid("segment size is smaller than a record header"));
+        }
         fs::create_dir_all(dir)?;
-        let last = fs::read_dir(dir)?
-            .filter_map(|e| e.ok()?.file_name().to_str()?.strip_prefix("segment-")?.strip_suffix(".log")?.parse().ok())
-            .max()
-            .unwrap_or(0u32);
-        let file = Arc::new(open_segment(dir, last)?);
-        // a checkpoint saves reading the whole of the last segment after a restart
-        let checkpoint = fs::read_to_string(dir.join("tail")).ok().and_then(|t| {
-            let (s, o) = t.trim().split_once(' ')?;
-            Some((s.parse::<u32>().ok()?, o.parse::<u64>().ok()?))
+        let mut last = None;
+        let mut count = 0u64;
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(number) = name.to_str().and_then(|name| name.strip_prefix("segment-")?.strip_suffix(".log"))
+            else {
+                continue;
+            };
+            let segment = number.parse::<u32>().map_err(|_| invalid("malformed segment filename"))?;
+            let expected = format!("segment-{segment:08}.log");
+            if name.to_str() != Some(expected.as_str()) {
+                return Err(invalid("noncanonical segment filename"));
+            }
+            count += 1;
+            last = Some(last.map_or(segment, |old: u32| old.max(segment)));
+        }
+        if last.is_some_and(|last| u64::from(last) + 1 != count) {
+            return Err(invalid("segment inventory contains a gap"));
+        }
+        let existing = last.is_some();
+        if !existing && (dir.join("tail").try_exists()? || dir.join("tail.tmp").try_exists()?) {
+            return Err(invalid("checkpoint exists without its segment inventory"));
+        }
+        let last = last.unwrap_or(0);
+        let file = Arc::new(if existing {
+            OpenOptions::new().read(true).write(true).open(segment_path(dir, last))?
+        } else {
+            open_segment(dir, last)?
         });
-        let from = checkpoint.filter(|c| c.0 == last).map_or(0, |c| c.1);
-        let pos = scan_end(&file, from)?;
+        // A checkpoint cannot certify skipped bytes. Validate the complete last
+        // active segment in bounded memory; older immutable records are checked
+        // again when read. No archive-wide health claim follows from this scan.
+        let pos = scan_end(&file)?;
         sync_dir(dir)?;
         let reserved = file.metadata()?.len();
         let tail = Arc::new(RwLock::new((last, pos)));
         let (tx, rx) = mpsc::channel::<Group>();
+        let failure = Arc::new(Mutex::new(None));
         let mut files = HashMap::new();
         files.insert(last, file.clone());
         let log = Arc::new(Log {
@@ -182,25 +284,56 @@ impl Log {
             segment_bytes,
             tail: tail.clone(),
             files: RwLock::new(files),
-            writer: Mutex::new(tx),
+            writer: Mutex::new(Some(tx)),
+            failure: failure.clone(),
+            worker: Mutex::new(None),
         });
         let state = Tail { segment: last, file, pos, reserved };
         let (d, shared) = (dir.to_path_buf(), tail);
-        std::thread::Builder::new()
-            .name("sealed-log-writer".into())
-            .spawn(move || write_loop(d, segment_bytes, state, shared, rx))?;
+        #[cfg(test)]
+        let fixture_writer = test_io::skip_reservation(dir);
+        #[cfg(test)]
+        let fixture_fault = test_io::registered_fault(dir);
+        let worker = std::thread::Builder::new().name("sealed-log-writer".into()).spawn(move || {
+            #[cfg(test)]
+            let _fixture = fixture_writer.then(|| test_io::Scope::enter(&d, fixture_fault));
+            write_loop(d, segment_bytes, state, shared, failure, rx)
+        })?;
+        *log.worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(worker);
         Ok(log)
     }
 
-    /// Stores values, returning where each went once they are on disk.
+    /// Stores admitted values, returning locations only after durable commit.
     pub fn append(&self, values: Vec<(u64, Vec<u8>)>) -> io::Result<Vec<Locator>> {
+        let mut bytes = 0usize;
+        for (_, value) in &values {
+            if value.len() > MAX_FRAME {
+                return Err(invalid("value exceeds admission"));
+            }
+            bytes = bytes
+                .checked_add(value.len())
+                .and_then(|n| n.checked_add(12))
+                .ok_or_else(|| invalid("append extent overflow"))?;
+            if bytes > MAX_FRAME {
+                return Err(invalid("append exceeds frame admission"));
+            }
+        }
+        let failure = self.failure.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(cause) = failure {
+            return Err(fenced(&cause));
+        }
         let (done, wait) = mpsc::channel();
-        self.writer
+        let sent = self
+            .writer
             .lock()
-            .unwrap()
-            .send(Group { values, done, queued: Instant::now() })
-            .map_err(|_| Error::other("writer stopped"))?;
-        wait.recv().map_err(|_| Error::other("writer stopped"))?
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .ok_or_else(|| writer_error(&self.failure))?
+            .send(Group { values, done, queued: Instant::now() });
+        if sent.is_err() {
+            return Err(writer_error(&self.failure));
+        }
+        wait.recv().unwrap_or_else(|_| Err(writer_error(&self.failure)))
     }
 
     fn file(&self, segment: u32) -> io::Result<Arc<File>> {
@@ -225,26 +358,39 @@ impl Log {
     }
 
     fn read_unmeasured(&self, at: Locator) -> io::Result<Vec<u8>> {
-        let (seg, pos) = *self.tail.read().unwrap();
-        let end = at.offset + HEADER as u64 + at.len as u64;
-        if at.segment > seg || (at.segment == seg && end > pos) {
-            return Err(invalid(format!("{at:?} is past the end of the log")));
+        if at.len as usize > MAX_FRAME {
+            return Err(invalid("locator length exceeds record admission"));
         }
-        let mut raw = vec![0u8; HEADER + at.len as usize];
-        self.file(at.segment)?.read_exact_at(&mut raw, at.offset)?;
-        if raw[..4] != MAGIC {
-            return Err(invalid(format!("{at:?} is not the start of a record")));
+        let end = at
+            .offset
+            .checked_add(HEADER as u64)
+            .and_then(|n| n.checked_add(u64::from(at.len)))
+            .ok_or_else(|| invalid("locator extent overflow"))?;
+        let (segment, committed) = *self.tail.read().unwrap_or_else(|e| e.into_inner());
+        if at.segment > segment || (at.segment == segment && end > committed) {
+            return Err(invalid("locator is past the committed log boundary"));
         }
-        let crc = u32::from_be_bytes(raw[4..8].try_into().unwrap());
-        let key = u64::from_be_bytes(raw[8..16].try_into().unwrap());
-        let len = u32::from_be_bytes(raw[16..20].try_into().unwrap());
-        if len != at.len {
-            return Err(invalid(format!("{at:?} holds {len} bytes")));
+        let file = self.file(at.segment)?;
+        if end > file.metadata()?.len() {
+            return Err(invalid("locator is past the physical segment boundary"));
         }
-        let value = raw.split_off(HEADER);
-        if crc_of(key, &value) != crc {
+        let mut header = [0u8; HEADER];
+        file.read_exact_at(&mut header, at.offset)?;
+        if header[..4] != MAGIC {
+            return Err(invalid("locator is not a record boundary"));
+        }
+        let len = u32::from_be_bytes(header[16..20].try_into().unwrap());
+        if len != at.len || len as usize > MAX_FRAME {
+            return Err(invalid("locator and record lengths differ"));
+        }
+        #[cfg(test)]
+        test_io::before_payload_allocation(&self.dir, len as usize)?;
+        let mut value = vec![0u8; len as usize];
+        file.read_exact_at(&mut value, at.offset + HEADER as u64)?;
+        let key = u64::from_be_bytes(header[8..16].try_into().unwrap());
+        if crc_of(key, &value) != u32::from_be_bytes(header[4..8].try_into().unwrap()) {
             STATS.checksum_failures.fetch_add(1, Relaxed);
-            return Err(invalid(format!("{at:?} failed its checksum")));
+            return Err(invalid("record failed its checksum"));
         }
         Ok(value)
     }
@@ -269,14 +415,23 @@ impl Log {
     }
 }
 
+impl Drop for Log {
+    fn drop(&mut self) {
+        self.writer.get_mut().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(worker) = self.worker.get_mut().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = worker.join();
+        }
+    }
+}
+
 fn write_loop(
     dir: PathBuf,
     segment_bytes: u64,
     mut t: Tail,
     shared: Arc<RwLock<(u32, u64)>>,
+    failure: Arc<Mutex<Option<Arc<io::Error>>>>,
     rx: mpsc::Receiver<Group>,
 ) {
-    let mut last_checkpoint = Instant::now();
     while let Ok(first) = rx.recv() {
         let mut groups = vec![first];
         let mut total: usize = groups[0].values.iter().map(|v| v.1.len()).sum();
@@ -285,7 +440,6 @@ fn write_loop(
             total += more.values.iter().map(|v| v.1.len()).sum::<usize>();
             groups.push(more);
         }
-        let before = (t.segment, t.pos);
         let started = Instant::now();
         for g in &groups {
             STATS.queue_seconds.observe(started.saturating_duration_since(g.queued));
@@ -305,23 +459,15 @@ fn write_loop(
                 }
             }
             Err(e) => {
-                // nobody got these places, so they're written over: a gap here
-                // would end the scan of a restart early and lose what follows
-                if t.segment == before.0 {
-                    t.pos = before.1;
-                }
+                let cause = Arc::new(e);
+                *failure.lock().unwrap_or_else(|e| e.into_inner()) = Some(cause.clone());
                 STATS.commit_failures.fetch_add(1, Relaxed);
-                eprintln!("sealed-log: write failed: {e}");
-                for g in &groups {
-                    let _ = g.done.send(Err(Error::new(e.kind(), e.to_string())));
+                for group in &groups {
+                    let _ = group.done.send(Err(fenced(&cause)));
                 }
-            }
-        }
-        if last_checkpoint.elapsed() > Duration::from_secs(5) {
-            last_checkpoint = Instant::now();
-            let tmp = dir.join("tail.tmp");
-            if fs::write(&tmp, format!("{} {}", t.segment, t.pos)).is_ok() {
-                let _ = fs::rename(&tmp, dir.join("tail"));
+                // Dropping rx rejects every queued sender; append returns this
+                // same retained cause. Neither failed tail nor checkpoint moves.
+                return;
             }
         }
     }
@@ -334,24 +480,38 @@ fn write_group(dir: &Path, segment_bytes: u64, t: &mut Tail, groups: &[Group]) -
     for g in groups {
         let mut places = Vec::with_capacity(g.values.len());
         for (key, value) in &g.values {
-            let size = (HEADER + value.len()) as u64;
-            if t.pos > 0 && t.pos + size > segment_bytes {
+            let size = u64::try_from(HEADER.checked_add(value.len()).ok_or_else(|| invalid("record size overflow"))?)
+                .map_err(|_| invalid("record size overflow"))?;
+            let end = t.pos.checked_add(size).ok_or_else(|| invalid("segment position overflow"))?;
+            if t.pos > 0 && end > segment_bytes {
                 t.file.write_all_at(&buf, buf_at)?;
                 buf.clear();
                 sync(&t.file)?;
                 STATS.segments_rolled.fetch_add(1, Relaxed);
                 // the unused rest of the reservation goes back
                 t.file.set_len(t.pos)?;
-                t.segment += 1;
+                t.segment = t.segment.checked_add(1).ok_or_else(|| invalid("segment index exhausted"))?;
+                #[cfg(test)]
+                test_io::before_rollover_open(dir)?;
                 t.file = Arc::new(open_segment(dir, t.segment)?);
                 sync_dir(dir)?;
                 t.pos = 0;
                 t.reserved = 0;
                 buf_at = 0;
             }
-            if t.pos + size > t.reserved {
-                t.reserved = (t.pos + size).div_ceil(ALLOCATE_BYTES) * ALLOCATE_BYTES;
-                reserve(&t.file, t.reserved);
+            let end = t.pos.checked_add(size).ok_or_else(|| invalid("segment position overflow"))?;
+            if end > t.reserved {
+                t.reserved = end
+                    .checked_add(ALLOCATE_BYTES - 1)
+                    .and_then(|n| (n / ALLOCATE_BYTES).checked_mul(ALLOCATE_BYTES))
+                    .ok_or_else(|| invalid("reservation extent overflow"))?;
+                #[cfg(test)]
+                let reserve_here = !test_io::skip_reservation(dir);
+                #[cfg(not(test))]
+                let reserve_here = true;
+                if reserve_here {
+                    reserve(&t.file, t.reserved);
+                }
             }
             places.push(Locator { segment: t.segment, offset: t.pos, len: value.len() as u32 });
             buf.extend_from_slice(&MAGIC);
@@ -359,11 +519,15 @@ fn write_group(dir: &Path, segment_bytes: u64, t: &mut Tail, groups: &[Group]) -
             buf.extend_from_slice(&key.to_be_bytes());
             buf.extend_from_slice(&(value.len() as u32).to_be_bytes());
             buf.extend_from_slice(value);
-            t.pos += size;
+            t.pos = end;
         }
         out.push(places);
     }
+    #[cfg(test)]
+    test_io::before_final_write(dir, &t.file, &buf, buf_at)?;
     t.file.write_all_at(&buf, buf_at)?;
+    #[cfg(test)]
+    test_io::before_final_sync(dir)?;
     sync(&t.file)?;
     Ok(out)
 }
@@ -388,6 +552,9 @@ fn read_frame(r: &mut impl Read) -> io::Result<(u8, Vec<u8>)> {
 }
 
 fn write_frame(w: &mut impl Write, tag: u8, body: &[u8]) -> io::Result<()> {
+    if body.len() > MAX_FRAME {
+        return Err(invalid("frame too big"));
+    }
     w.write_all(&[tag])?;
     w.write_all(&(body.len() as u32).to_be_bytes())?;
     w.write_all(body)?;
@@ -433,6 +600,18 @@ fn handle_unmeasured(log: &Log, op: u8, body: &[u8]) -> io::Result<Vec<u8>> {
             Ok(log.append(values)?.into_iter().flat_map(Locator::to_ref).collect())
         }
         OP_READ => {
+            if !body.len().is_multiple_of(REF_BYTES) {
+                return Err(invalid("read request is not whole locators"));
+            }
+            let mut response = 0usize;
+            for bytes in body.chunks_exact(REF_BYTES) {
+                let at = Locator::from_ref(bytes).ok_or_else(|| invalid("not a place"))?;
+                response = response
+                    .checked_add(4)
+                    .and_then(|n| n.checked_add(at.len as usize))
+                    .filter(|n| *n <= MAX_FRAME)
+                    .ok_or_else(|| invalid("read response exceeds frame admission"))?;
+            }
             let mut out = Vec::new();
             while !b.is_empty() {
                 let at = Locator::from_ref(take(&mut b, REF_BYTES)?).ok_or_else(|| invalid("not a place"))?;
@@ -442,7 +621,8 @@ fn handle_unmeasured(log: &Log, op: u8, body: &[u8]) -> io::Result<Vec<u8>> {
             }
             Ok(out)
         }
-        OP_STATS => Ok(log.stats().into_bytes()),
+        OP_STATS if body.is_empty() => Ok(log.stats().into_bytes()),
+        OP_STATS => Err(invalid("stats request must be empty")),
         _ => Err(invalid("unknown request")),
     }
 }
@@ -463,59 +643,26 @@ impl Drop for Open {
     }
 }
 
-fn serve_one(log: &Log, s: TcpStream) -> io::Result<()> {
-    let _open = Open::new();
-    s.set_nodelay(true)?;
-    let mut r = BufReader::with_capacity(1 << 20, s.try_clone()?);
-    let mut w = BufWriter::with_capacity(1 << 20, s);
-    loop {
-        let (op, body) = read_frame(&mut r)?;
-        STATS.network_received.fetch_add(5 + body.len() as u64, Relaxed);
-        let sent = match handle(log, op, &body) {
-            Ok(out) => {
-                write_frame(&mut w, 0, &out)?;
-                out.len()
-            }
-            Err(e) => {
-                let text = e.to_string();
-                write_frame(&mut w, 1, text.as_bytes())?;
-                text.len()
-            }
-        };
-        STATS.network_sent.fetch_add(5 + sent as u64, Relaxed);
-    }
-}
-
-/// Answers requests on `listener` until the process ends.
-pub fn serve(log: Arc<Log>, listener: TcpListener) -> io::Result<()> {
-    for s in listener.incoming() {
-        let (log, s) = (log.clone(), s?);
-        std::thread::Builder::new().name("sealed-log-conn".into()).spawn(move || {
-            let _ = serve_one(&log, s);
-        })?;
-    }
-    Ok(())
+/// Answers only mutually authenticated, explicitly authorized clients.
+pub fn serve(log: Arc<Log>, listener: TcpListener, tls: Arc<ServerTls>) -> io::Result<()> {
+    transport::serve(log, listener, tls, false)
 }
 
 /// A connection to the store.
 pub struct Client {
-    r: BufReader<TcpStream>,
-    w: BufWriter<TcpStream>,
+    stream: transport::ClientStream,
 }
 
 impl Client {
-    pub fn connect(addr: &str) -> io::Result<Client> {
-        let at = addr.to_socket_addrs()?.next().ok_or_else(|| invalid("no address"))?;
-        let s = TcpStream::connect_timeout(&at, Duration::from_secs(5))?;
-        s.set_nodelay(true)?;
-        s.set_read_timeout(Some(IO_TIMEOUT))?;
-        s.set_write_timeout(Some(IO_TIMEOUT))?;
-        Ok(Client { r: BufReader::with_capacity(1 << 20, s.try_clone()?), w: BufWriter::with_capacity(1 << 20, s) })
+    pub fn connect(addr: &str, tls: &ClientTls) -> io::Result<Client> {
+        Ok(Client { stream: transport::connect(addr, tls)? })
     }
 
     fn call(&mut self, op: u8, body: &[u8]) -> io::Result<Vec<u8>> {
-        write_frame(&mut self.w, op, body)?;
-        let (status, out) = read_frame(&mut self.r)?;
+        self.stream.sock.reset(IO_TIMEOUT);
+        write_frame(&mut self.stream, op, body)?;
+        let (status, out) = read_frame(&mut self.stream)?;
+        self.stream.sock.check()?;
         if status != 0 {
             return Err(Error::other(String::from_utf8_lossy(&out).into_owned()));
         }
@@ -523,13 +670,24 @@ impl Client {
     }
 
     pub fn append(&mut self, values: &[(u64, &[u8])]) -> io::Result<Vec<Locator>> {
-        let mut body = Vec::with_capacity(values.iter().map(|v| v.1.len() + 12).sum());
+        let size = values.iter().try_fold(0usize, |sum, (_, value)| {
+            sum.checked_add(12)
+                .and_then(|n| n.checked_add(value.len()))
+                .filter(|n| *n <= MAX_FRAME)
+                .ok_or_else(|| invalid("append exceeds frame admission"))
+        })?;
+        let mut body = Vec::with_capacity(size);
         for (key, value) in values {
             body.extend_from_slice(&key.to_be_bytes());
             body.extend_from_slice(&(value.len() as u32).to_be_bytes());
             body.extend_from_slice(value);
         }
         let out = self.call(OP_APPEND, &body)?;
+        if out.len()
+            != values.len().checked_mul(REF_BYTES).ok_or_else(|| invalid("locator response extent overflow"))?
+        {
+            return Err(invalid("answer has a partial or wrong number of places"));
+        }
         let places: Vec<Locator> = out.chunks(REF_BYTES).filter_map(Locator::from_ref).collect();
         if places.len() != values.len() {
             return Err(invalid("answer has the wrong number of places"));
@@ -538,16 +696,33 @@ impl Client {
     }
 
     pub fn read(&mut self, places: &[Locator]) -> io::Result<Vec<Vec<u8>>> {
-        let body: Vec<u8> = places.iter().flat_map(|p| p.to_ref()).collect();
+        let request = places
+            .len()
+            .checked_mul(REF_BYTES)
+            .filter(|n| *n <= MAX_FRAME)
+            .ok_or_else(|| invalid("read request exceeds frame admission"))?;
+        places.iter().try_fold(0usize, |sum, at| {
+            sum.checked_add(4)
+                .and_then(|n| n.checked_add(at.len as usize))
+                .filter(|n| *n <= MAX_FRAME)
+                .ok_or_else(|| invalid("read response exceeds frame admission"))
+        })?;
+        let mut body = Vec::with_capacity(request);
+        for place in places {
+            body.extend_from_slice(&place.to_ref());
+        }
         let out = self.call(OP_READ, &body)?;
         let mut b = &out[..];
         let mut values = Vec::with_capacity(places.len());
-        while !b.is_empty() {
+        for place in places {
             let len = u32::from_be_bytes(take(&mut b, 4)?.try_into().unwrap()) as usize;
+            if len != place.len as usize {
+                return Err(invalid("answer differs from requested record length"));
+            }
             values.push(take(&mut b, len)?.to_vec());
         }
-        if values.len() != places.len() {
-            return Err(invalid("answer has the wrong number of values"));
+        if !b.is_empty() {
+            return Err(invalid("answer has extra values"));
         }
         Ok(values)
     }
@@ -569,17 +744,13 @@ mod tests {
 
     #[test]
     fn what_goes_in_comes_back_over_the_network() {
-        let log = Log::open(&dir("net")).unwrap();
-        let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = l.local_addr().unwrap().to_string();
-        std::thread::spawn(move || serve(log, l));
-        let mut c = Client::connect(&addr).unwrap();
-        let places = c.append(&[(1, b"first"), (2, b""), (3, b"third")]).unwrap();
-        assert_eq!(c.read(&places).unwrap(), vec![b"first".to_vec(), vec![], b"third".to_vec()]);
-        assert!(c.stats().unwrap().contains("segment"));
-        // the connection outlives an error
-        assert!(c.read(&[Locator { segment: 9, offset: 0, len: 1 }]).is_err());
-        assert_eq!(c.read(&places[..1]).unwrap(), vec![b"first".to_vec()]);
+        let log = transport::tests::open_log(&dir("net"));
+        let mut client = transport::tests::peer(log, Permissions::ALL);
+        let places = client.append(&[(1, b"first"), (2, b""), (3, b"third")]).unwrap();
+        assert_eq!(client.read(&places).unwrap(), vec![b"first".to_vec(), vec![], b"third".to_vec()]);
+        assert!(client.stats().unwrap().contains("segment"));
+        assert!(client.read(&[Locator { segment: 9, offset: 0, len: 1 }]).is_err());
+        assert_eq!(client.read(&places[..1]).unwrap(), vec![b"first".to_vec()]);
     }
 
     #[test]
@@ -591,23 +762,26 @@ mod tests {
     }
 
     #[test]
-    fn a_restart_finds_the_end_and_drops_a_torn_write() {
+    fn a_restart_refuses_ambiguous_torn_bytes_without_changing_the_prefix() {
         let d = dir("torn");
         let log = Log::open(&d).unwrap();
         let places = log.append(vec![(1, b"keep".to_vec()), (2, b"also".to_vec())]).unwrap();
         drop(log);
-        // half a record, as a crash leaves it
         let path = segment_path(&d, 0);
         let good = places[1].offset + (HEADER + 4) as u64;
-        let f = OpenOptions::new().write(true).open(&path).unwrap();
-        f.write_all_at(&MAGIC, good).unwrap();
-        f.write_all_at(&[9u8; 30], good + 4).unwrap();
-        drop(f);
-        let log = Log::open(&d).unwrap();
-        let more = log.append(vec![(3, b"next".to_vec())]).unwrap();
-        assert_eq!(more[0].offset, good, "the torn record is written over");
-        assert_eq!(log.read(places[0]).unwrap(), b"keep");
-        assert_eq!(log.read(more[0]).unwrap(), b"next");
+        let file = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        file.write_all_at(&MAGIC, good).unwrap();
+        file.write_all_at(&[9u8; 30], good + 4).unwrap();
+        let length = file.metadata().unwrap().len();
+        let mut prefix = vec![0; good as usize + 34];
+        file.read_exact_at(&mut prefix, 0).unwrap();
+        for _ in 0..2 {
+            assert!(matches!(Log::open(&d),Err(error) if error.kind()==ErrorKind::InvalidData));
+            let mut after = vec![0; prefix.len()];
+            file.read_exact_at(&mut after, 0).unwrap();
+            assert_eq!(after, prefix);
+            assert_eq!(file.metadata().unwrap().len(), length);
+        }
     }
 
     #[test]
