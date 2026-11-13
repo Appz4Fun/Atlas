@@ -142,4 +142,32 @@ mod tests {
         let applied: usize = threads.into_iter().map(|h| h.join().unwrap()).sum();
         assert_eq!(applied, MIGRATIONS.len(), "each version applied by exactly one of them");
     }
+
+    #[test]
+    #[ignore="requires isolated PostgreSQL; verifies migrated ASCII sidecar index and real lookup/rollback"]
+    fn native_sidecar_ascii_lookup_has_matching_ordered_migration_index() {
+        let schema=crate::pg::testing::Schema::new().expect("explicit isolated PostgreSQL required");
+        let mut client=schema.pool.get().unwrap();
+        let index=client.query_one("select i.indisvalid,i.indisready from pg_index i join pg_class c on c.oid=i.indexrelid join pg_namespace n on n.oid=c.relnamespace where n.nspname=$1 and c.relname='native_sidecars_ascii_name'",&[&schema.name]).unwrap();
+        assert!(index.get::<_,bool>(0)&&index.get::<_,bool>(1),"migration must install a usable index");
+        let mut tx=client.transaction().unwrap();
+        for (id,name,at) in [(1i64,Some("Ascii.Title"),10i64),(2,Some("ASCII.TITLE"),20),(3,Some("ascii.title"),20),(4,Some("ÄSCII.TITLE"),30),(5,Some("äscii.title"),40),(6,None,50)] {
+            tx.execute("insert into sidecars(release_id,name,group_name,kind,release_name,at) values($1,'info','alt.binaries.test','nfo',$2,$3)",&[&id,&name,&at]).unwrap();
+        }
+        let query="select release_id from sidecars where translate(release_name,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz') collate \"C\"=translate($1,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz') collate \"C\" and release_id<>$2 and octet_length(group_name)<=$3 order by at desc,release_id desc";
+        let lookup=|tx:&mut postgres::Transaction<'_>,name:&str|->Vec<i64> {tx.query(query,&[&name,&99i64,&512i32]).unwrap().iter().map(|row|row.get(0)).collect()};
+        assert_eq!(lookup(&mut tx,"aScIi.TiTlE"),vec![3,2,1]);
+        assert_eq!(lookup(&mut tx,"Äscii.Title"),vec![4],"ASCII NOCASE must not fold non-ASCII letters");
+        assert_eq!(lookup(&mut tx,"äscii.Title"),vec![5]);
+        tx.batch_execute("savepoint changed; update sidecars set release_name='other' where release_id=3").unwrap();
+        assert_eq!(lookup(&mut tx,"ascii.title"),vec![2,1]);
+        tx.batch_execute("rollback to changed").unwrap();
+        assert_eq!(lookup(&mut tx,"ascii.title"),vec![3,2,1]);
+        // This small fixture proves predicate/order index eligibility, not production-scale plan qualification.
+        tx.batch_execute("set local enable_seqscan=off; set local enable_bitmapscan=off").unwrap();
+        let plan=tx.query(&format!("explain {query}"),&[&"ascii.title",&99i64,&512i32]).unwrap().iter().map(|row|row.get::<_,String>(0)).collect::<Vec<_>>().join("\n");
+        assert!(plan.contains("native_sidecars_ascii_name"),"{plan}");
+        assert!(!plan.contains("Sort"),"index must also provide the exact newest/tie ordering: {plan}");
+    }
+
 }
