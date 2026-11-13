@@ -65,7 +65,8 @@ impl Workers {
                 }
             }
             let (pool,handle)=dispatch.runner.bodies.service_io();
-            start_services(&owner,&dispatch.runner.config,pool,handle,Some(lanes.clone()),dispatch.runner.assets.clone(),db,headers,ctx,&mut handles)?;
+            let telemetry=super::telemetry::Producer::new(&dispatch.runner,lanes.clone())?;
+            start_services(&owner,&dispatch.runner.config,pool,handle,Some(lanes.clone()),Some(telemetry),dispatch.runner.assets.clone(),db,headers,ctx,&mut handles)?;
             Ok(())
         })();
         if let Err(error)=started {
@@ -194,7 +195,7 @@ pub(super) fn start_inferred(owner:&Arc<Owner>,mut service:crate::inferred::nati
 
 // Every service receives the same actual runtime Db and canonical Owner.
 #[allow(clippy::too_many_arguments)]
-fn start_services(owner:&Arc<Owner>,config:&crate::config::Config,pool:Arc<crate::nntp::Pool>,handle:tokio::runtime::Handle,lanes:Option<Arc<LaneCounters>>,assets:Option<Arc<crate::pg::worker_assets::Grant>>,db:crate::indexer::Db,headers:crate::config::HeaderStoreConfig,ctx:Option<crate::indexer::PassContext>,handles:&mut Vec<Worker>)->Result<()> {
+fn start_services(owner:&Arc<Owner>,config:&crate::config::Config,pool:Arc<crate::nntp::Pool>,handle:tokio::runtime::Handle,lanes:Option<Arc<LaneCounters>>,telemetry:Option<super::telemetry::Producer>,assets:Option<Arc<crate::pg::worker_assets::Grant>>,db:crate::indexer::Db,headers:crate::config::HeaderStoreConfig,ctx:Option<crate::indexer::PassContext>,handles:&mut Vec<Worker>)->Result<()> {
     check_inferred_platform(config.inferred_parts)?;
     db.check_native_owner(owner)?;
     if pool.indexing_servers().len()>1 {
@@ -236,7 +237,15 @@ fn start_services(owner:&Arc<Owner>,config:&crate::config::Config,pool:Arc<crate
     let mut refresh=crate::pg::stage_group_refresh::Refresh::new(owner,pool,handle)?;
     handles.push(spawn(owner,"atlas-native-cache".into(),move|| {
         let mut observed=None;
+        let mut next_stats=Instant::now();
         while !owner_work.stop.load(Ordering::Acquire) {
+            if let Some(telemetry)=&telemetry && Instant::now()>=next_stats {
+                let rest=match telemetry.refresh()? {
+                    super::telemetry::Refresh::Published=>Duration::from_secs(1),
+                    super::telemetry::Refresh::Deferred(cause)=>{drop(cause);Duration::from_secs(5)},
+                };
+                next_stats=Instant::now()+rest;
+            }
             if observed.is_none_or(|at:Instant|at.elapsed()>=Duration::from_secs(30)) {
                 crate::pg::stage_telemetry::capture(&owner_work,lanes.as_deref())?;observed=Some(Instant::now());
             }
@@ -268,7 +277,7 @@ pub(crate) async fn run(owner:Arc<Owner>,db:crate::indexer::Db,headers:crate::co
     let worker=std::thread::Builder::new().name("atlas-native-stage".into()).spawn(move||->Result<()> {
         if !config.postprocess.enabled {
             let mut handles=Vec::new();
-            if let Err(error)=start_services(&worker_owner,&config,ctx.pool.clone(),handle,None,None,db,headers,Some(ctx),&mut handles) {
+            if let Err(error)=start_services(&worker_owner,&config,ctx.pool.clone(),handle,None,None,None,db,headers,Some(ctx),&mut handles) {
                 fail(&worker_owner,&error);let _=join_workers(&worker_owner,handles);return Err(error)
             }
             while !worker_end.load(Ordering::Acquire) && !worker_owner.stop.load(Ordering::Acquire) {std::thread::sleep(Duration::from_millis(25));}

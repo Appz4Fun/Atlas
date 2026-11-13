@@ -7,6 +7,9 @@ use super::step::{Step,StepMask,Needs,mask};
 mod net;
 #[path="native_workers.rs"]
 mod workers;
+#[path="native_telemetry.rs"]
+mod telemetry;
+pub(crate) use telemetry::{snapshot as stats_snapshot,backlog as backlog_snapshot,stats_json};
 pub(crate) use workers::run;
 #[path="native_config.rs"]
 mod settings;
