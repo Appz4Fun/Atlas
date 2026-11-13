@@ -211,6 +211,10 @@ pub(crate) struct DestinationIdentity {
 }
 
 pub(crate) fn destination_identity(client: &mut postgres::Client, schema: &str) -> Result<DestinationIdentity> {
+    destination_identity_in(client, schema)
+}
+
+pub(crate) fn destination_identity_in(client: &mut impl postgres::GenericClient, schema: &str) -> Result<DestinationIdentity> {
     let row = client.query_one(
         "select current_database(),current_user,session_user,d.oid,r.oid,s.oid,n.oid,n.nspowner,c.oid
          from pg_database d join pg_roles r on r.rolname=current_user
