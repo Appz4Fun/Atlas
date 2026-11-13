@@ -24,10 +24,6 @@ fn main() -> ExitCode {
         eprintln!("{command} is retired from the PostgreSQL product; no storage was opened");
         return ExitCode::from(1);
     }
-    if let Some(command) = app::unavailable_native_maintenance_command(&args) {
-        eprintln!("{command} requires a native PostgreSQL maintenance implementation; no storage was opened");
-        return ExitCode::from(1);
-    }
     if app::replay_requires_postgres(&args) {
         eprintln!("--save-replay requires --pg-database and --pg-schema; no storage was opened");
         return ExitCode::from(1);

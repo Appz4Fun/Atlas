@@ -26,6 +26,7 @@ fn native_web(storage: &crate::pg::StorageConfig) -> i32 {
 /// and cannot initialize a database, contact a provider, or create an asset.
 pub fn retired_storage_command(args: &[String]) -> Option<&str> {
     const RETIRED: &[&str] = &[
+        "--crc-links",
         "--purge",
         "--reprocess",
         "--predb-import",
@@ -54,13 +55,6 @@ pub fn retired_storage_command(args: &[String]) -> Option<&str> {
     args.iter().find(|arg| RETIRED.contains(&arg.as_str())).map(String::as_str)
 }
 
-/// Maintenance contracts still awaiting native implementations. Keep their refusal
-/// explicit; dispatching their old implementations would open the retired catalog.
-pub fn unavailable_native_maintenance_command(args: &[String]) -> Option<&str> {
-    const PENDING: &[&str] = &["--crc-links"];
-    args.iter().find(|arg| PENDING.contains(&arg.as_str())).map(String::as_str)
-}
-
 /// The product replay entry point requires an explicit native staging destination.
 /// The replay parser validates the flag values before opening its writer.
 pub fn replay_requires_postgres(args: &[String]) -> bool {
@@ -70,13 +64,14 @@ pub fn replay_requires_postgres(args: &[String]) -> bool {
 
 #[cfg(test)]
 mod native_cli_boundary_tests {
-    use super::{replay_requires_postgres, retired_storage_command, unavailable_native_maintenance_command};
+    use super::{replay_requires_postgres, retired_storage_command};
     fn args(words: &[&str]) -> Vec<String> {
         words.iter().map(|word| (*word).into()).collect()
     }
     #[test]
     fn retired_storage_commands_are_refused_even_with_a_native_command() {
         for command in [
+            "--crc-links",
             "--purge",
             "--reprocess",
             "--predb-import",
@@ -106,13 +101,6 @@ mod native_cli_boundary_tests {
         }
     }
     #[test]
-    fn crc_report_is_refused_before_the_retired_reader_can_open() {
-        for command in ["--crc-links"] {
-            assert_eq!(retired_storage_command(&args(&[command])), None);
-            assert_eq!(unavailable_native_maintenance_command(&args(&["--bg-indexer", command])), Some(command));
-        }
-    }
-    #[test]
     fn replay_and_pure_readers_preserve_their_native_or_independent_destinations() {
         assert!(replay_requires_postgres(&args(&["--save-replay", "--store", "fixture", "--db", "scratch"])));
         assert!(replay_requires_postgres(&args(&["--save-replay", "--pg-schema", "atlas_replay_fixture"])));
@@ -125,7 +113,6 @@ mod native_cli_boundary_tests {
         ])));
         for command in ["--dump-ext", "--restore-ext", "--header-store", "--overview", "--selftest", "--bg-indexer"] {
             assert_eq!(retired_storage_command(&args(&[command])), None);
-            assert_eq!(unavailable_native_maintenance_command(&args(&[command])), None);
         }
     }
 }

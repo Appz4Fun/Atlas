@@ -21,7 +21,7 @@ production migration, a working-preview claim, or deployment evidence.
 | `--save-replay` | Requires both `--pg-database` and `--pg-schema`; its own parser checks the isolated staging destination and scratch paths |
 | `--header-store`, `--overview` | Independent NXV/overview tools; no product catalog configuration is required |
 
-Every command line is checked for retired operations or the unavailable CRC report before tool
+Every command line is checked for retired operations before tool
 dispatch. Mixing one with a backup, replay, or pure reader cannot bypass refusal.
 
 ## Retired storage commands
@@ -47,7 +47,7 @@ The fresh PostgreSQL catalog does not upgrade the discarded SQLite header/releas
 state. Its one-off tools are also retired and rejected before any database or
 provider work: `--purge`, `--reprocess`, `--predb-import`, `--replay-raw-predb`,
 `--reflag-obfuscated`, `--unname`, `--undo-mojibake`, `--recount-articles`,
-`--count-repair-candidates`, and `--split-reposts`. No command is a successful
+`--count-repair-candidates`, `--split-reposts`, and the standalone SQLite CRC report `--crc-links`. No command is a successful
 no-op, and this retirement is not a claim that the old CLI operations were ported.
 
 Current naming, PreDB, media, repair and other configured native workers retain
@@ -55,8 +55,8 @@ their actual typed mutations, ownership and outage behavior. Native external-cac
 backup/restore protects valuable PreDB/API/costly caches; this source change does
 not authorize deleting original data, caches, assets or recovery copies. Old
 converter/maintenance source remains recoverable in the frozen pre-cutover Git
-history. The old CRC association CLI `--crc-links` remains explicitly unavailable;
-the retired SQLite report cannot be opened through the product.
+history. Current native CRC/key/file associations retain their algorithms and typed steps;
+retiring the standalone report does not retire those pipeline behaviors.
 
 ## Remaining build-graph closure
 

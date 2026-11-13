@@ -3,7 +3,7 @@
 The fresh PostgreSQL catalog does not upgrade the old header/release catalog.
 Product admission therefore retires the old bulk purge/reprocess, PreDB file-import
 and raw replay CLI, naming normalization/undo/recount, repair-count migration and
-repost-splitting command paths. They are rejected before configuration migration,
+repost-splitting and standalone SQLite CRC report command paths. They are rejected before configuration migration,
 provider connections or database setup, including mixed command lines. No command
 succeeds without doing its work. This is retirement of old product commands, not
 native maintenance parity or authorization to delete old data.
