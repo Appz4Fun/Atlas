@@ -185,7 +185,12 @@ impl Tally {
             && self.groups.get(row.group).is_none_or(|group| group.bytes.checked_add(size).is_some())
             && self.categories.get(&category).is_none_or(|(_, bytes)| bytes.checked_add(size).is_some()),
             "native catalog byte total overflow");
-        self.add(row);
+        // Native SQL stores kind as an unconstrained bigint. Unknown kinds
+        // share one label and one retained key; otherwise each raw value grows
+        // the map and publishing duplicate "other" labels loses their sum.
+        let native=Row {predb:row.predb.map(|(kind,category,title)|
+            (if predb_kind_label(kind)=="other" {0}else{kind},category,title)),..*row};
+        self.add(&native);
         // Native pages join the retained PreDB feed directly in their RR
         // snapshot, so no title IDs escape the page or await a SQLite lookup.
         self.predb_titles.clear();
@@ -412,6 +417,19 @@ mod tests {
         tally.add_native(&row,None).unwrap();tally.add_native(&row,None).unwrap();
         assert!(tally.add_native(&row,None).is_err());assert_eq!(tally.rows,2);
         assert_eq!(tally.bytes,18_446_744_073_709_551_614);
+    }
+
+    #[test]
+    fn native_unknown_predb_kinds_share_one_bounded_other_bucket() {
+        let mut tally=Tally::default();
+        for kind in 100..200 {
+            let row=Row {group:"alt.binaries.test",size:1,complete:false,parts:0,
+                obfuscated:false,named:false,name_source:None,name:"Example",category:None,
+                predb:Some((kind,None,1))};
+            tally.add_native(&row,Some("feed")).unwrap();
+        }
+        assert_eq!(tally.predb_kinds.len(),1);assert_eq!(tally.predb_kinds[&0],100);
+        assert_eq!(tally.feeds["feed"],100);assert_eq!(tally.rows,100);
     }
 
     #[test]
