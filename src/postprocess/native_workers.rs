@@ -59,7 +59,7 @@ impl Workers {
                 }
             }
             let (pool,handle)=dispatch.runner.bodies.service_io();
-            start_services(&owner,&dispatch.runner.config,pool,handle,Some(lanes.clone()),&mut handles)?;
+            start_services(&owner,&dispatch.runner.config,pool,handle,Some(lanes.clone()),dispatch.runner.assets.clone(),&mut handles)?;
             Ok(())
         })();
         if let Err(error)=started {
@@ -126,9 +126,34 @@ impl Dispatch {
     }
 }
 
-fn start_services(owner:&Arc<Owner>,config:&crate::config::Config,pool:Arc<crate::nntp::Pool>,handle:tokio::runtime::Handle,lanes:Option<Arc<LaneCounters>>,handles:&mut Vec<Worker>)->Result<()> {
+pub(super) fn details_service(owner:&Arc<Owner>,config:&crate::config::Config,assets:Option<Arc<crate::pg::worker_assets::Grant>>)->Result<Option<crate::media::details::native::Service>> {
+    if !crate::media::details::native::Service::enabled(&config.media) {return Ok(None)}
+    let assets=match assets {Some(assets)=>Some(assets),None=>crate::pg::worker_assets::Grant::open(owner,config.native_assets.as_ref())?};
+    Ok(Some(crate::media::details::native::Service::new(owner,&config.media,assets)?))
+}
+
+pub(super) fn start_details(owner:&Arc<Owner>,mut service:crate::media::details::native::Service,handles:&mut Vec<Worker>)->Result<()> {
+    let owner_work=owner.clone();
+    handles.push(spawn(owner,"atlas-native-details".into(),move|| {
+        while !owner_work.stop.load(Ordering::Acquire) {
+            match service.tick(now())? {
+                crate::media::details::native::Progress::Disabled=>break,
+                crate::media::details::native::Progress::Waiting(wait)=>{nap(&owner_work,wait);},
+                // Tick retains its actual provider/rate/page deadline. The next
+                // call returns Waiting rather than adding a second throttle.
+                crate::media::details::native::Progress::Idle
+                |crate::media::details::native::Progress::Visited
+                |crate::media::details::native::Progress::ArtworkUnavailable
+                |crate::media::details::native::Progress::Deferred=>{},
+            }
+        }Ok(None)
+    })?);Ok(())
+}
+
+fn start_services(owner:&Arc<Owner>,config:&crate::config::Config,pool:Arc<crate::nntp::Pool>,handle:tokio::runtime::Handle,lanes:Option<Arc<LaneCounters>>,assets:Option<Arc<crate::pg::worker_assets::Grant>>,handles:&mut Vec<Worker>)->Result<()> {
     let predb=if config.predb.enabled {Some(Arc::new(crate::pg::service_cache::predb::Service::new(owner)?))} else {None};
     let config=Arc::new(config.clone());
+    if let Some(details)=details_service(owner,&config,assets)? {start_details(owner,details,handles)?;}
     if let Some(predb)=predb.as_ref() {
         let owner_work=owner.clone();let config=config.clone();let predb=predb.clone();
         handles.push(spawn(owner,"atlas-native-predb-feed".into(),move|| {
@@ -175,7 +200,7 @@ pub(crate) async fn run(owner:Arc<Owner>,config:crate::config::Config,pool:Arc<c
     let worker=std::thread::Builder::new().name("atlas-native-stage".into()).spawn(move||->Result<()> {
         if !config.postprocess.enabled {
             let mut handles=Vec::new();
-            if let Err(error)=start_services(&worker_owner,&config,pool,handle,None,&mut handles) {
+            if let Err(error)=start_services(&worker_owner,&config,pool,handle,None,None,&mut handles) {
                 fail(&worker_owner,&error);let _=join_workers(&worker_owner,handles);return Err(error)
             }
             while !worker_end.load(Ordering::Acquire) && !worker_owner.stop.load(Ordering::Acquire) {std::thread::sleep(Duration::from_millis(25));}
