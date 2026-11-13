@@ -53,6 +53,20 @@ impl OverviewBudget {
     }
 }
 
+/// Retained parsed pages share one response/fetch envelope, including actual
+/// String capacities and both page vectors before their rows can be moved.
+fn admit_overview_append(rows:&Vec<Overview>,more:&Vec<Overview>)->Result<()> {
+    let count=rows.len().checked_add(more.len()).ok_or_else(overview_budget)?;
+    let capacity=rows.capacity().max(count).checked_add(more.capacity()).ok_or_else(overview_budget)?;
+    let mut bytes=capacity.checked_mul(std::mem::size_of::<Overview>()).ok_or_else(overview_budget)?;
+    for row in rows.iter().chain(more) {
+        for field in [&row.subject,&row.from,&row.date,&row.message_id,&row.references] {
+            bytes=bytes.checked_add(field.capacity()).ok_or_else(overview_budget)?;
+        }
+    }
+    if bytes>OVERVIEW_TEXT {return Err(overview_budget())}Ok(())
+}
+
 #[derive(Debug)]
 pub enum NntpError {
     Io(io::Error),
@@ -3938,15 +3952,8 @@ impl Pool {
             for (from, to) in [(start, mid), (mid + 1, end)] {
                 match self.xover_on_in(i, group, from, to, fetch).await {
                     Ok(half) => {
-                        // Split wire requests must not recombine into an
-                        // oversized retained response. Let stream_headers
-                        // deliver smaller leaves to the writer instead.
-                        let bytes=rows.iter().chain(half.iter()).try_fold(0usize,|n,row:&Overview| {
-                            [row.subject.len(),row.from.len(),row.date.len(),row.message_id.len(),row.references.len()]
-                                .into_iter().try_fold(n,|n,len|n.checked_add(len))
-                                .and_then(|n|n.checked_add(2*std::mem::size_of::<Overview>()))
-                        });
-                        if bytes.is_none_or(|n|n>OVERVIEW_CHARGE/4) {return Err(overview_budget())}
+                        admit_overview_append(&rows,&half)?;
+                        rows.reserve_exact(half.len());
                         rows.extend(half);
                     },
                     Err(e) if e.is_empty_range() => {}
@@ -4034,6 +4041,9 @@ impl Pool {
                     // where it works, a wide slice that times out is halved like an XOVER's (see `xover_on`)
                     Err(e) if !probing && e.is_timeout() && wide => ("xzver", Err(e)),
                     Err(e @ NntpError::HeaderStore(_)) => ("xzver", Err(e)),
+                    // Local ownership admission is neither a compression
+                    // refusal nor permission for an unbounded plain retry.
+                    Err(e) if e.is_overview_budget() => ("xzver", Err(e)),
                     // hung, hung up on, or garbled: the slice again with plain XOVER on another connection (this one
                     // may still have the reply coming). A wide probe that timed out may only have been slow: it
                     // counts toward `GROUP_REFUSALS` (see `xzver_failed`), and XOVER is halved in turn if it times out too
@@ -4073,13 +4083,16 @@ impl Pool {
         fetch: &HeaderFetch,
     ) -> (Result<Vec<Overview>>, u64) {
         let mut asked = 0;
+        if let Err(error)=admit_overview_append(&rows,&Vec::new()){return(Err(error),asked)}
         while let Some(last) = rows.iter().map(|o| o.number).max().filter(|&n| n < end) {
             lease.busy = false;
             asked += 1;
             match lease.begin().xzver_timed(last + 1, end, Some(deadline), fetch).await {
-                Ok(more) => {
+                Ok(mut more) => {
+                    more.retain(|o|o.number>last);
+                    if let Err(error)=admit_overview_append(&rows,&more){return(Err(error),asked)}
                     let before = rows.len();
-                    rows.extend(more.into_iter().filter(|o| o.number > last));
+                    rows.reserve_exact(more.len());rows.extend(more);
                     if rows.len() == before {
                         break;
                     }

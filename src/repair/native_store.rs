@@ -112,9 +112,14 @@ impl Read<'_,'_> {
             }}
         self.budget.charge(groups.len()*256)?;Ok(groups.into_iter().filter(|(g,_)|!g.is_empty()).map(|(group,(from,to))|Window {group,from:from.saturating_sub(MARGIN),to:to.saturating_add(MARGIN)}).collect())
     }
-    pub fn sources(&mut self,ids:&[i64])->Result<Vec<Source>> {ids.iter().map(|&id|self.head(id)?.map(|h|h.source).context("native overview source disappeared")).collect()}
+    pub fn source_matches(&mut self,s:&Source)->Result<bool> {
+        Ok(self.query(SOURCE_MATCH,&[&s.id,&s.revision,&s.group,&s.collection,&&s.identity[..]])?
+            .first().map(|r|r.try_get(0)).transpose()?.unwrap_or(false))
+    }
+    pub fn sources(&mut self,ids:&[i64])->Result<Vec<Source>> {ids.iter().map(|&id|self.head(id)?.map(|h|h.source).ok_or_else(||anyhow::Error::new(SourceChanged))).collect()}
 }
+const SOURCE_MATCH:&str="select native_work_revision=$2 and group_name=$3 and is_collection=$4 and identity_key=$5 from releases where id=$1";
 pub(super) fn source_matches(tx:&mut impl GenericClient,s:&Source,lock:bool)->Result<bool> {
-    let sql=if lock {"select native_work_revision=$2 and group_name=$3 and is_collection=$4 and identity_key=$5 from releases where id=$1 for update"}else{"select native_work_revision=$2 and group_name=$3 and is_collection=$4 and identity_key=$5 from releases where id=$1"};
+    let sql=if lock {"select native_work_revision=$2 and group_name=$3 and is_collection=$4 and identity_key=$5 from releases where id=$1 for update"}else{SOURCE_MATCH};
     Ok(tx.query_opt(sql,&[&s.id,&s.revision,&s.group,&s.collection,&&s.identity[..]])?.map(|r|r.try_get(0)).transpose()?.unwrap_or(false))
 }

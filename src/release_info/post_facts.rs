@@ -549,7 +549,7 @@ impl UnionFiles {
     }
 
     /// Whether every file the post's counter says it has is here, whole or not (`complete` also wants them whole).
-    pub(super) fn every_file_here(&self) -> bool {
+    pub(crate) fn every_file_here(&self) -> bool {
         if self.file_totals.len() > 1 {
             return false;
         }

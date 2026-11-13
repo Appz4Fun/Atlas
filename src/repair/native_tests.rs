@@ -120,3 +120,28 @@ fn ended_original_owner_cannot_probe_or_mark_a_native_repair() {isolated("repair
     let after=observer.query("select name,live_cursor,backfill_cursor from groups order by name",&[]).unwrap().into_iter().map(|r|(r.get(0),r.get(1),r.get(2))).collect::<Vec<(String,Option<i64>,Option<i64>)>>();
     assert_eq!(after,before);
 });}
+#[test]
+#[ignore="explicit isolated PG/NXV; observed source then real concurrent deletion"]
+fn deleted_observed_source_defers_without_marking_or_poisoning_the_owner() {isolated("repair::native::tests::deleted_observed_source_defers_without_marking_or_poisoning_the_owner",|| {
+    let f=Fixture::new();f.seed();let service=f.service();let plan=service.plan(f.now).unwrap();let sources=plan.sources.values().cloned().collect::<Vec<_>>();
+    let ids=sources.iter().map(|s|s.id).collect::<Vec<_>>();assert_eq!(ids.len(),1);
+    let mut concurrent=postgres::Client::connect(&f._schema.url,postgres::NoTls).unwrap();
+    concurrent.batch_execute(&format!("set search_path to {}",f._schema.name)).unwrap();
+    let mut tx=concurrent.build_transaction().isolation_level(IsolationLevel::ReadCommitted).start().unwrap();
+    crate::pg::guard_native_transaction(&mut tx).unwrap();
+    assert_eq!(tx.execute("delete from releases where id=$1",&[&ids[0]]).unwrap(),1);tx.commit().unwrap();
+    let error=service.current_sources(&ids,&plan.sources).err().expect("deleted observation must be stale");assert!(error.is::<SourceChanged>(),"{error:#}");
+    let error=service.mark(&sources,f.now,&[],&[(ids[0],900)],&[]).unwrap_err();assert!(error.is::<SourceChanged>());
+    assert_eq!(f.runtime.owner.failure(),None,"legitimate deletion cannot poison the original owner");
+    f.runtime.owner.with(|c|{assert_eq!(c.query_one("select count(*) from repair_tried",&[])?.get::<_,i64>(0),0);Ok(())}).unwrap();
+});}
+#[test]
+#[ignore="explicit isolated PG/NXV; actual revalidation query deadline and stop"]
+fn source_revalidation_obeys_read_admission_before_querying() {isolated("repair::native::tests::source_revalidation_obeys_read_admission_before_querying",|| {
+    let f=Fixture::new();f.seed();let service=f.service();let plan=service.plan(f.now).unwrap();let source=plan.sources.values().next().unwrap();
+    let mut expired=Service::budget();expired.until=Instant::now();
+    let error=service.read(&mut expired,|r|r.source_matches(source)).err().expect("expired read must defer before the source query");
+    assert!(error.is::<Deferred>());assert_eq!(f.runtime.owner.failure(),None);
+    f.runtime.owner.stop.store(true,Ordering::Release);
+    assert!(crate::pg::outage::is_attempt_ended(&service.still_current(std::slice::from_ref(source)).unwrap_err()));
+});}
