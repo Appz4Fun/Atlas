@@ -174,4 +174,90 @@ mod tests {
     fn a_size_that_is_no_number_has_no_range() {
         assert_eq!(size_range("abc"), None);
     }
+
+    #[test]
+    fn team_patterns_escape_like_metacharacters_without_changing_literal_punctuation() {
+        for (team, expected) in [
+            ("SubsPlease", "SubsPlease"),
+            ("100%_TEAM", r"100\%\_TEAM"),
+            (r"A\B", r"A\\B"),
+            (r"A%_B\C/'D", r"A\%\_B\\C/'D"),
+            ("x' OR true --", "x' OR true --"),
+        ] {
+            assert_eq!(team_pattern(team), expected, "literal team {team:?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly admitted isolated PostgreSQL schema"]
+    fn native_team_filter_matches_the_parsed_bracket_prefix_and_literal_suffixes() {
+        use crate::{parser::{Article, Release}, pg};
+        use std::time::{Duration, Instant};
+        let schema = pg::testing::Schema::native_writer().expect("explicit isolated ATLAS_PG_TEST_URL required");
+        let mut client = schema.pool.get().unwrap();
+        let names = [
+            "[SubsPlease] Some Anime - 05 (1080p) [ABCDEF12].mkv",
+            "[subsplease] Second Anime.mkv",
+            "[SubsPlease]Adjacent.Title.mkv",
+            "Film.One-SubsPlease",
+            "Film.Two- SubsPlease",
+            "Film.Three-SubsPlease.mkv",
+            "Film.Four- SubsPlease.mkv",
+            "Film.Five-SubsPlease bonus",
+            "Film.Six- SubsPlease bonus",
+            "Film.Seven-SubsPlease[ABCDEF12]",
+            "Film.Eight- SubsPlease[ABCDEF12]",
+            "[SubsPlease2] Wrong.Team.mkv",
+            "[Subs] Wrong.Partial.mkv",
+            "Title [SubsPlease] Wrong.Position.mkv",
+            "[SubsPlease Missing.Closing.Bracket.mkv",
+            "Film.Nine-SubsPlease2.mkv",
+            r"[A%_B\C/'D] Literal.Prefix.mkv",
+            r"Film.Ten-A%_B\C/'D.mkv",
+            r"[AxxzB\C/'D] Wrong.Wildcard.mkv",
+            "[A%_BC/'D] Wrong.Escape.mkv",
+            "[ÄBC] Upper.NonASCII.mkv",
+            "[äbc] Lower.NonASCII.mkv",
+            "[x' OR true --] Literal.Quote.mkv",
+        ];
+        let mut ids = Vec::new();
+        for (index, name) in names.iter().enumerate() {
+            let saved = pg::release_writer::save(&mut client, &[Release {
+                name: (*name).into(), group: "alt.binaries.test".into(), poster: format!("poster-{index}"),
+                date: "Wed, 01 Jan 2020 00:00:00 +0000".into(),
+                articles: vec![Article {
+                    filename: Some("video.mkv".into()), subject: "video.mkv yEnc (1/1)".into(),
+                    message_id: format!("<team-filter-{index}@example.invalid>"),
+                    part: Some(1), total_parts: Some(1), bytes: 64, ..Default::default()
+                }], ..Default::default()
+            }], 1).unwrap();
+            assert_eq!((saved.releases, saved.files, saved.parts), (1, 1, 1));
+            ids.push(client.query_one("select id from releases where name=$1", &[name]).unwrap().get::<_,i64>(0));
+        }
+        // This is the same parser group used to build the release's team link.
+        let parsed_team = crate::release_tags::parse(names[0]).group.unwrap();
+        assert_eq!(parsed_team, "SubsPlease");
+        for (team, wanted) in [
+            (parsed_team.as_str(), vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
+            ("SUBSPLEASE", vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
+            (r"A%_B\C/'D", vec![16, 17]),
+            ("Äbc", vec![20]),
+            ("x' OR true --", vec![22]),
+        ] {
+            let fields = Fields { team: team.into(), ..Default::default() };
+            let view = pg::fresh_reader::ReadView::open(&mut client, &schema.name, Default::default(), Instant::now() + Duration::from_secs(10)).unwrap();
+            let (rows, total) = view.field_search(&fields, "", None, 0, 50).unwrap();
+            assert_eq!(total, wanted.len() as u64, "team {team:?}");
+            let expected = wanted.into_iter().rev().map(|index| ids[index]).collect::<Vec<_>>();
+            assert_eq!(rows.iter().map(|row| row.id).collect::<Vec<_>>(), expected, "team {team:?}");
+        }
+        // Team shares one bound parameter after other fields and before words.
+        let fields = Fields { group: "alt.binaries.test".into(), poster: "poster-0".into(), size: "64".into(),
+            team: parsed_team, ..Default::default() };
+        let view = pg::fresh_reader::ReadView::open(&mut client, &schema.name, Default::default(), Instant::now() + Duration::from_secs(10)).unwrap();
+        let (rows, total) = view.field_search(&fields, "Anime", None, 0, 50).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(rows.iter().map(|row| row.id).collect::<Vec<_>>(), [ids[0]]);
+    }
+
 }
