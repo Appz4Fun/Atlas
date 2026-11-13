@@ -181,9 +181,6 @@ pub async fn dates_on(
     Ok(Some(out))
 }
 
-/// The most overview lines `--split-reposts` reads for one release.
-const MAX_NUMBERS: u64 = 5_000_000;
-
 /// Whether a row could be several uploads, without the network: its files hold `k` articles for each part they
 /// have seen, `k` between 2 and 20 (within 2%), over at least 50 parts. Rows whose files share part numbers for other
 /// reasons pass too; `decide` tells them apart once it has the Dates.
