@@ -9,7 +9,12 @@ const FROM:&str="Wasbeertje <r2ceRUXK82cxSlhCLnbGXUVIA6-srpbJJqYqtJfXLdubdAMMD6T
 const COMMENT:&str="vKCGetIwSd0z2PcagDlUt.8.one.two@spot.net";
 const XML:&str="<Spotnet><Posting><Key>1</Key><Created>1792828369</Created><Category>0<SubCat>01z01</SubCat></Category><Title>Hitster.S01E01.DUTCH.1080p.WEB.h264-TRIPEL</Title><Poster>Actual Spot Poster</Poster><Description>Password is supplied: alpha&#0;beta</Description><NZB><Segment>nzb@fixture.test</Segment></NZB></Posting></Spotnet>";
 #[derive(Clone,Copy)]
-pub(crate) enum Mode { Good, Forged, Missing, Transient, Held, RejectGroup }
+pub(crate) enum Mode {
+    Good, Forged, Missing, Transient, Held, RejectGroup,
+    PayloadBlocked, PayloadNoGroups, PayloadWrongMid, PayloadGroupMismatch,
+    PayloadGroupConflict, PayloadTooBig, PayloadSecondBlocked, PayloadInvalidMid,
+    PayloadTransient, PayloadMissing, PayloadRevoked,
+}
 pub(crate) struct Peer {
     pub(crate) server:crate::config::UsenetServer,stop:Arc<AtomicBool>,release:Arc<AtomicBool>,body_entered:Arc<AtomicBool>,
     log:Arc<Mutex<Vec<String>>>,worker:Option<std::thread::JoinHandle<()>>,
@@ -79,6 +84,25 @@ fn serve(mut stream:TcpStream,mode:Mode,stop:&AtomicBool,release:&AtomicBool,ent
                 };
                 format!("224 overview\r\n1\t{subject}\t{from}\tSat, 24 Oct 2026 12:00:00 +0000\t<{id}>\t{references}\t100\t1\r\n.\r\n").into_bytes()
             }
+            "HEAD" if line.contains("actual-part@fixture.test")||line.contains("actual-second@fixture.test")=> {
+                if matches!(mode,Mode::PayloadMissing) {b"430 No Such Article\r\n".to_vec()}
+                else if matches!(mode,Mode::PayloadTransient) {b"431 temporarily unavailable\r\n".to_vec()} else {
+                    let requested=line.strip_prefix("HEAD ").unwrap();
+                    let revoked=matches!(mode,Mode::PayloadRevoked)&&log.lock().unwrap().iter()
+                        .filter(|line|line.starts_with("HEAD ")&&line.contains("actual-part@fixture.test")).count()>1;
+                    let blocked=matches!(mode,Mode::PayloadBlocked)||revoked
+                        ||(matches!(mode,Mode::PayloadSecondBlocked)&&line.contains("actual-second@fixture.test"));
+                    let mid=if matches!(mode,Mode::PayloadWrongMid) {"<wrong@fixture.test>"} else {requested};
+                    let groups=if blocked {"Newsgroups: alt.binaries.preteen\r\nXref: fixture alt.binaries.preteen:1\r\n"}
+                        else if matches!(mode,Mode::PayloadNoGroups) {""}
+                        else if matches!(mode,Mode::PayloadGroupMismatch) {"Newsgroups: another.allowed.group\r\n"}
+                        else if matches!(mode,Mode::PayloadGroupConflict) {"Newsgroups: example.spot\r\nXref: fixture another.allowed.group:1\r\n"}
+                        else {"Newsgroups: example.spot\r\nXref: fixture example.spot:1\r\n"};
+                    let mut head=format!("221 1 {requested}\r\nMessage-ID: {mid}\r\n{groups}").into_bytes();
+                    if matches!(mode,Mode::PayloadTooBig) {head.extend(b"X-Large: ");head.extend(vec![b'x';70*1024]);head.extend(b"\r\n");}
+                    head.extend(b".\r\n");head
+                }
+            }
             "HEAD"=>format!("221 1 <{ID}>\r\nSubject: {TITLE}\r\nFrom: {FROM}\r\nX-XML: {XML}\r\n.\r\n").into_bytes(),
             "BODY" if line.contains(COMMENT)=> {
                 let mut reply=b"222 body\r\nPassword: alpha\0beta\r\nKeep every word\r\n.\r\n".to_vec();
@@ -93,8 +117,13 @@ fn serve(mut stream:TcpStream,mode:Mode,stop:&AtomicBool,release:&AtomicBool,ent
                     if stop.load(Ordering::Acquire){return}
                 }
                 if matches!(mode,Mode::Missing) {b"430 No Such Article\r\n".to_vec()} else if matches!(mode,Mode::Transient) {b"431 temporarily unavailable\r\n".to_vec()} else {
-                    let nzb=br#"<nzb><file poster="Actual NZB Poster" date="1792828369" subject="&quot;actual.mkv&quot; yEnc (1/1)"><groups><group>example.spot</group></groups><segments><segment bytes="123" number="1">actual-part@fixture.test</segment></segments></file></nzb>"#;
-                    let mut encoder=flate2::write::DeflateEncoder::new(Vec::new(),flate2::Compression::default());encoder.write_all(nzb).unwrap();
+                    let mut nzb=br#"<nzb><file poster="Actual NZB Poster" date="1792828369" subject="&quot;actual.mkv&quot; yEnc (1/1)"><groups><group>example.spot</group></groups><segments><segment bytes="123" number="1">actual-part@fixture.test</segment></segments></file></nzb>"#.to_vec();
+                    if matches!(mode,Mode::PayloadSecondBlocked) {
+                        nzb=br#"<nzb><file poster="Actual NZB Poster" date="1792828369" subject="&quot;actual.mkv&quot; yEnc (1/2)"><groups><group>example.spot</group></groups><segments><segment bytes="123" number="1">actual-part@fixture.test</segment><segment bytes="123" number="2">actual-second@fixture.test</segment></segments></file></nzb>"#.to_vec();
+                    } else if matches!(mode,Mode::PayloadInvalidMid) {
+                        nzb=String::from_utf8(nzb).unwrap().replace("actual-part@fixture.test","not-a-message-id").into_bytes();
+                    }
+                    let mut encoder=flate2::write::DeflateEncoder::new(Vec::new(),flate2::Compression::default());encoder.write_all(&nzb).unwrap();
                     let mut reply=b"222 body\r\n".to_vec();
                     for chunk in binary::escape(&encoder.finish().unwrap()).chunks(128) {
                         if chunk.first()==Some(&b'.'){reply.push(b'.');}reply.extend_from_slice(chunk);reply.extend_from_slice(b"\r\n");
@@ -206,6 +235,7 @@ fn native_spot_pg_loss_after_body_stops_original_owner_and_further_provider_work
         peer.release.store(true,Ordering::Release);assert!(child.join().unwrap().is_err());
     });
     assert_eq!(runtime.owner.failure(),Some(crate::pg::outage::Failure::Unavailable));
+    assert_eq!(peer.count("HEAD"),1,"lost ownership cannot launch a payload HEAD after the held NZB BODY");
     let before=peer.log.lock().unwrap().len();assert!(service.comments_tick(1793000000).is_err());assert_eq!(peer.log.lock().unwrap().len(),before);
     let mut observer=schema.pool.get().unwrap();assert_eq!(observer.query_one("select count(*) from releases",&[]).unwrap().get::<_,i64>(0),0);runtime.owner.close();
 }

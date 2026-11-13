@@ -8,6 +8,10 @@ use super::{MAX_XML_BYTES,SPOT_GROUP,binary,blacklist,comments,full,header,inges
 use super::native_plan::Plan;
 use super::native_store::Store;
 
+// Existing Pool::background_head cap; its possible last line uses the same
+// posted-byte overshoot admission as the Spot NZB BODY reader.
+const PAYLOAD_HEAD_BYTES:usize=64*1024;
+
 pub(crate) struct Service {
     storage:Store,db:Db,config:SpotsConfig,pool:Arc<Pool>,handle:tokio::runtime::Handle,
 }
@@ -169,8 +173,11 @@ impl Service {
         let row=|key:String|store::SpotRow {message_id:id.to_owned(),kind,spot:spot.clone(),spotter_id:verdict.spotter_id.clone(),nzb_key:key,xml:xml.clone()};
         let nzb_ref=release::ids_key(&spot.nzb);
         let Some(claim)=shared.claim(&format!("ref:{nzb_ref}")) else {return Ok(Fetched::Pending)};claims.push(claim);
-        match self.storage.with(|tx|Ok(store::known_ref(&Pg::new(tx),&nzb_ref)?))? {
-            Some((store::SAVED,Some(release_id)))=>return Ok(Fetched::Settled(self.storage.copy_of(release_id,&row(String::new()),&nzb_ref,chrono::Utc::now().timestamp())?)),
+        let known_ref=self.storage.with(|tx|Ok(store::known_ref(&Pg::new(tx),&nzb_ref)?))?;
+        match known_ref {
+            // Even a repeated reference must corroborate all payload groups
+            // before its old release can receive this Spot's tag.
+            Some((store::SAVED,Some(_)))=>{},
             Some(_)=>return Ok(Fetched::Skip(Some(nzb_ref))),None=>{},
         }
         let mut bodies=Vec::<Vec<u8>>::with_capacity(spot.nzb.len());
@@ -194,7 +201,13 @@ impl Service {
         let parsed=crate::archive::nzb::parse_keeping(&nzb,release::MAX_SEGMENTS);drop(nzb);
         let Some(mut plan)=Plan::new(&spot,&parsed)? else {return Ok(Fetched::Skip(Some(nzb_ref)))};
         let Some(claim)=shared.claim(plan.key()) else {return Ok(Fetched::Pending)};claims.push(claim);
+        match self.verify_payloads(&plan,shared)? {
+            Some(true)=>{},Some(false)=>return Ok(Fetched::Skip(Some(nzb_ref))),None=>return Ok(Fetched::Pending),
+        }
         self.storage.check()?;
+        if let Some((store::SAVED,Some(release_id)))=known_ref {
+            return Ok(Fetched::Settled(self.storage.copy_of(release_id,&row(plan.key().to_owned()),&nzb_ref,chrono::Utc::now().timestamp())?))
+        }
         // Resource-only token from the SAME Db/Native, not a replacement
         // semaphore, session, write authority or independent memory budget.
         let permit=self.handle.block_on(crate::nntp::unless_stopped(&self.storage.owner.stop,
@@ -202,6 +215,25 @@ impl Service {
             .ok_or_else(||anyhow::Error::new(crate::pg::outage::AttemptEnded))??;
         let row=row(plan.key().to_owned());
         Ok(Fetched::Settled(self.storage.publish(&mut plan,&row,&nzb_ref,&permit,chrono::Utc::now().timestamp())?))
+    }
+    /// Every MID is checked on the supplied shared provider pool, before any
+    /// native publication. None means this pass cannot admit another HEAD.
+    fn verify_payloads(&self,plan:&Plan<'_>,shared:&ingest::Shared)->Result<Option<bool>> {
+        self.storage.check()?;
+        let most=PAYLOAD_HEAD_BYTES+ingest::CAP_OVERSHOOT;
+        for (_,mid) in plan.identities() {
+            if !shared.reserve(most) {return Ok(None)}
+            match self.network(self.pool.background_head(&format!("<{mid}>"))) {
+                Ok(crate::nntp::HeadAnswer::Found(reply))=> {
+                    shared.give_back(most.saturating_sub(reply.bytes().len()));
+                    if !super::native_plan::payload_head_matches(&plan.metadata().group,mid,reply.bytes()) {return Ok(Some(false))}
+                }
+                Ok(crate::nntp::HeadAnswer::Missing)=>{shared.give_back(most);return Ok(Some(false))},
+                Ok(crate::nntp::HeadAnswer::TooBig)=>return Ok(Some(false)),
+                Err(error)=>{shared.give_back(most);if absent(&error) {return Ok(Some(false))}return Err(error)},
+            }
+        }
+        Ok(Some(true))
     }
     fn read_overview(&self,now:i64)->Result<(u64,usize)> {
         let prefer=self.pool.indexing_tier().first().copied().unwrap_or(0);
@@ -332,6 +364,10 @@ impl Service {
         }Ok(added)
     }
 }
+
+#[cfg(test)]
+#[path="native_payload_tests.rs"]
+mod payload_tests;
 fn absent(error:&anyhow::Error)->bool {error.downcast_ref::<crate::nntp::NntpError>().is_some_and(says_absent)}
 
 #[cfg(test)]
