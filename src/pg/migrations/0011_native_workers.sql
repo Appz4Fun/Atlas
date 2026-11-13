@@ -8,12 +8,19 @@ do $$ declare relation text; occupied boolean; begin
  foreach relation in array array['releases','files','segments','header_blocks','pp_queue','pp_state','pp_walks',
   'native_operations','word_queue','release_writer_junk','junk_releases','junk_collections',
   'groups','backfill_chunks','backfill_deepest','backfill_media','backfill_speculative','backfill_sweep_gen',
-  'backfill_sweeps','backfill_wanted','spot_comments','spot_disposals','spot_reports','spots_seen',
+  'backfill_sweeps','backfill_wanted','spots','spot_comments','spot_disposals','spot_reports','spots_seen',
   'inferred_asked','inferred_ids','repair_tried','repair_older','history_imports'] loop
   execute format('select exists(select 1 from %I)',relation) into occupied;
   if occupied then raise exception 'full native workers require a fresh release and operational catalog; retain valuable caches separately' using errcode='55000'; end if;
  end loop;
 end $$;
+
+-- Spotnet originals are bytes: display-safe text never replaces XML/body evidence.
+alter table spots add column native_original_xml bytea;
+alter table spot_comments add column native_original_body bytea;
+create index spots_message_id on spots(message_id);
+create index spots_nzb_key on spots(nzb_key);
+create index spots_xml_missing on spots(release_id) where xml is null;
 
 -- The opening fresh-catalog guard witnessed empty releases and chunk tables.
 -- Maintain only small per-group totals; observation never scans the catalog.

@@ -3,7 +3,7 @@ use anyhow::{Result,ensure};
 use crate::config::Config;
 
 pub(crate) struct ConfigPin {
-    assets:Option<crate::config::NativeAssetsConfig>,
+    assets:Option<crate::config::NativeAssetsConfig>,spots:crate::config::SpotsConfig,
     postprocess:crate::config::PostprocessConfig,archive:crate::config::ArchiveConfig,
     naming:crate::config::NamingConfig,predb:crate::config::PredbConfig,
     category:crate::config::CategoryConfig,media:crate::config::MediaConfig,
@@ -11,12 +11,12 @@ pub(crate) struct ConfigPin {
 }
 impl ConfigPin {
     pub(crate) fn capture(config:&Config,servers:&[crate::config::UsenetServer],plan:&[(usize,usize)])->Self {
-        Self {assets:config.native_assets.clone(),postprocess:config.postprocess.clone(),archive:config.archive.clone(),naming:config.naming.clone(),
+        Self {assets:config.native_assets.clone(),spots:config.spots.clone(),postprocess:config.postprocess.clone(),archive:config.archive.clone(),naming:config.naming.clone(),
             predb:config.predb.clone(),category:config.category.clone(),media:config.media.clone(),
             servers:servers.to_vec(),plan:plan.to_vec(),unsaved:config.max_unsaved_headers()}
     }
     pub(crate) fn check(&self,config:&Config,servers:&[crate::config::UsenetServer],plan:&[(usize,usize)])->Result<()> {
-        ensure!(self.assets==config.native_assets && self.postprocess==config.postprocess && self.archive==config.archive && self.naming==config.naming
+        ensure!(self.assets==config.native_assets && self.spots==config.spots && self.postprocess==config.postprocess && self.archive==config.archive && self.naming==config.naming
             && self.predb==config.predb && self.category==config.category && self.media==config.media
             && self.servers==servers && self.plan==plan && self.unsaved==config.max_unsaved_headers(),
             "native worker configuration changed; restart with the intended worker settings");Ok(())

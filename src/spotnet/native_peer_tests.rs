@@ -9,13 +9,13 @@ const FROM:&str="Wasbeertje <r2ceRUXK82cxSlhCLnbGXUVIA6-srpbJJqYqtJfXLdubdAMMD6T
 const COMMENT:&str="vKCGetIwSd0z2PcagDlUt.8.one.two@spot.net";
 const XML:&str="<Spotnet><Posting><Key>1</Key><Created>1792828369</Created><Category>0<SubCat>01z01</SubCat></Category><Title>Hitster.S01E01.DUTCH.1080p.WEB.h264-TRIPEL</Title><Poster>Actual Spot Poster</Poster><Description>Password is supplied: alpha&#0;beta</Description><NZB><Segment>nzb@fixture.test</Segment></NZB></Posting></Spotnet>";
 #[derive(Clone,Copy)]
-enum Mode { Good, Forged, Missing, Transient, Held, RejectGroup }
-struct Peer {
-    server:crate::config::UsenetServer,stop:Arc<AtomicBool>,release:Arc<AtomicBool>,body_entered:Arc<AtomicBool>,
+pub(crate) enum Mode { Good, Forged, Missing, Transient, Held, RejectGroup }
+pub(crate) struct Peer {
+    pub(crate) server:crate::config::UsenetServer,stop:Arc<AtomicBool>,release:Arc<AtomicBool>,body_entered:Arc<AtomicBool>,
     log:Arc<Mutex<Vec<String>>>,worker:Option<std::thread::JoinHandle<()>>,
 }
 impl Peer {
-    fn new(mode:Mode)->Self {
+    pub(crate) fn new(mode:Mode)->Self {
         let listener=TcpListener::bind("127.0.0.1:0").unwrap();listener.set_nonblocking(true).unwrap();
         let mut server=crate::config::UsenetServer::new("127.0.0.1","fixture","fixture",listener.local_addr().unwrap().port());
         server.ssl=Some(false);server.compress=Some(false);server.connections=Some(4);
@@ -39,11 +39,11 @@ impl Peer {
         });
         Self {server,stop,release,body_entered,log,worker:Some(worker)}
     }
-    fn wait_body(&self) {
+    pub(crate) fn wait_body(&self) {
         let deadline=Instant::now()+Duration::from_secs(5);
         while !self.body_entered.load(Ordering::Acquire) {assert!(Instant::now()<deadline,"actual BODY not entered");std::thread::sleep(Duration::from_millis(2));}
     }
-    fn count(&self,verb:&str)->usize {self.log.lock().unwrap().iter().filter(|line|line.starts_with(verb)).count()}
+    pub(crate) fn count(&self,verb:&str)->usize {self.log.lock().unwrap().iter().filter(|line|line.starts_with(verb)).count()}
 }
 impl Drop for Peer {
     fn drop(&mut self) {self.stop.store(true,Ordering::Release);self.release.store(true,Ordering::Release);if let Some(worker)=self.worker.take(){worker.join().unwrap();}}

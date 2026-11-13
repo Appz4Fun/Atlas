@@ -3,7 +3,7 @@ use super::*;
 use std::{sync::{Mutex,mpsc},time::{Duration,Instant}};
 
 fn fixture(runtime:&crate::pg::indexer_runtime::Runtime,handle:tokio::runtime::Handle,step:Arc<dyn Step>)->Arc<Runner> {
-    let mut config=crate::config::Config::default();config.predb.enabled=false;
+    let mut config=crate::config::Config::default();config.predb.enabled=false;config.spots.enabled=false;
     let mut runner=Runner::new(&runtime.owner,&config,Arc::new(crate::nntp::Pool::new(&[])),handle).unwrap();
     let bit=mask(step.id());let id=step.id().0;let stamp=step.config_stamp() as i64;
     runner.steps=Steps {ordered:vec![step],enabled:bit,database:bit,network:0,on_growth:0,stamps:vec![(id,bit,stamp)]};
@@ -19,7 +19,7 @@ pub(crate) fn run_category_loop(runtime:&crate::pg::indexer_runtime::Runtime) {
     crate::pg::stage_queue_tests::push(runtime);
     let handle=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     let runner=fixture(runtime,handle.handle().clone(),Arc::new(crate::category::CategoryStep::new()));let bit=runner.steps.enabled;
-    let stage=workers::Workers::start_runner(runner).unwrap();
+    let stage=workers::Workers::start_runner(runner,runtime.db.clone()).unwrap();
     let deadline=Instant::now()+Duration::from_secs(5);
     loop {
         if runtime.owner.with(|client|Ok(client.query_one("select exists(select 1 from pp_state where done & $1<>0)",&[&bit])?.get::<_,bool>(0))).unwrap() {break}
@@ -51,7 +51,7 @@ pub(crate) fn run_held_drain(runtime:&crate::pg::indexer_runtime::Runtime) {
     let handle=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     let (entered_tx,entered_rx)=mpsc::channel();let (release_tx,release_rx)=mpsc::channel();
     let runner=fixture(runtime,handle.handle().clone(),Arc::new(HeldStep {entered:entered_tx,release:Mutex::new(release_rx)}));
-    let stage=workers::Workers::start_runner(runner).unwrap();entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let stage=workers::Workers::start_runner(runner,runtime.db.clone()).unwrap();entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     let (done_tx,done_rx)=mpsc::channel();let owner=runtime.owner.clone();
     let finish=std::thread::spawn(move|| {let answer=stage.finish();done_tx.send(answer).unwrap();});
     let deadline=Instant::now()+Duration::from_secs(5);while !owner.stop.load(std::sync::atomic::Ordering::Acquire) {assert!(Instant::now()<deadline);std::thread::yield_now();}
@@ -129,7 +129,7 @@ pub(crate) fn run_held_feed(runtime:&crate::pg::indexer_runtime::Runtime) {
     let mut runner=fixture(runtime,handle.handle().clone(),Arc::new(crate::category::CategoryStep::new()));
     let config=&mut Arc::get_mut(&mut runner).unwrap().config;
     config.predb.enabled=true;config.predb.sources=vec!["predb_club".into()];
-    let stage=workers::Workers::start_runner(runner).unwrap();
+    let stage=workers::Workers::start_runner(runner,runtime.db.clone()).unwrap();
     entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     // Create the obligation AFTER the actual feed Fetch has entered. Finishing
     // it proves maintenance did not merely run once before the blocking call.
@@ -254,4 +254,27 @@ pub(crate) fn run_details_held(runtime:&crate::pg::indexer_runtime::Runtime) {
     assert!(matches!(done_rx.recv_timeout(Duration::from_millis(30)),Err(mpsc::RecvTimeoutError::Timeout)),"shutdown detached the live details HTTP worker");
     release_tx.send(()).unwrap();server.join().unwrap();let joined=done_rx.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();finish.join().unwrap();
     assert!(joined.pending().is_empty());assert!(joined.for_owner(&runtime.owner));assert_eq!(runtime.owner.failure(),None);runtime.owner.close();
+}
+
+#[test]
+#[ignore="requires isolated PostgreSQL and owned NNTP for actual two-lane Spotnet drain"]
+fn native_spotnet_lanes_cancel_actual_body_and_join_before_owner_close() {
+    use crate::spotnet::native_peer_tests::{Peer,Mode};
+    let schema=crate::pg::testing::Schema::new().expect("explicit isolated PostgreSQL required");
+    let runtime=crate::pg::stage_queue_tests::runtime(&schema);let peer=Peer::new(Mode::Held);
+    let handle=tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    let mut config=crate::config::SpotsConfig::default();config.blacklist_url.clear();
+    let service=Arc::new(crate::spotnet::native::Service::new(&runtime.owner,runtime.db.clone(),config,
+        Arc::new(crate::nntp::Pool::new(&[peer.server.clone()])),handle.handle().clone()).unwrap());
+    let mut handles=Vec::new();workers::start_spotnet(&runtime.owner,service,&mut handles).unwrap();
+    assert_eq!(handles.len(),2,"both actual configured lanes are retained");peer.wait_body();
+    runtime.owner.with(|client| {assert_eq!(client.query_one("select count(*) from releases",&[])?.get::<_,i64>(0),0);Ok(())}).unwrap();
+    let before=peer.count("BODY");let started=Instant::now();
+    let joined=join_workers(&runtime.owner,handles).unwrap();assert!(joined.for_owner(&runtime.owner));
+    assert!(started.elapsed()<Duration::from_secs(5),"actual cancellation must join both lanes without waiting for a poll or held provider");
+    assert_eq!(peer.count("BODY"),before);assert_eq!(runtime.owner.failure(),None);
+    let mut observer=schema.pool.get().unwrap();
+    assert_eq!(observer.query_one("select count(*) from releases",&[]).unwrap().get::<_,i64>(0),0);
+    assert_eq!(observer.query_one("select count(*) from spots_seen where state=$1",&[&crate::spotnet::store::SAVED]).unwrap().get::<_,i64>(0),0,"canceled raw body never receives saved acceptance");
+    runtime.owner.close();
 }
