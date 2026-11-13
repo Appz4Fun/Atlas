@@ -6,7 +6,6 @@
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
-use rusqlite::Connection;
 
 use crate::pg::sql::{Sql, vals};
 
@@ -18,11 +17,6 @@ pub const REFRESH_SECS: i64 = 86_400;
 const MAX_BYTES: u64 = 4 * 1024 * 1024;
 /// When the list was last read, in the main database's `meta`.
 const READ_AT: &str = "spot_blacklist_at";
-
-/// The main database's table, if missing.
-pub fn create(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch("create table if not exists spot_blacklist (spotter TEXT PRIMARY KEY) without rowid")
-}
 
 /// The spotter ids a blacklist names, each once. Spotweb takes ids of 3 to 6 characters, and so does this.
 pub fn parse(xml: &str) -> Vec<String> {
@@ -120,27 +114,21 @@ mod tests {
 
     #[test]
     fn replaces_the_list_and_keeps_it_on_an_empty_one() {
-        crate::pg::testing::each(
-            |c| {
-                c.execute_batch("create table meta (key TEXT PRIMARY KEY, value INTEGER)").unwrap();
-                create(c).unwrap();
-            },
-            |db| {
-                assert!(due(db, 100).unwrap());
-                assert_eq!(replace(db, &["abc".into(), "def".into(), "abc".into()], 100).unwrap(), 3);
-                assert!(!due(db, 100 + REFRESH_SECS - 1).unwrap());
-                assert!(due(db, 100 + REFRESH_SECS).unwrap());
-                assert!(replace(db, &[], 200).is_err());
-                assert_eq!(replace(db, &["xyz".into()], 300).unwrap(), 1);
-                let left: Vec<String> = db.column("select spotter from spot_blacklist", vals![]).unwrap();
-                assert_eq!(left, ["xyz"]);
-                tried(db, 400).unwrap();
-                assert!(!due(db, 401).unwrap());
-                // turned off: nothing left, and turned on again it's read at once
-                assert_eq!(clear(db).unwrap(), 1);
-                assert_eq!(clear(db).unwrap(), 0);
-                assert!(due(db, 402).unwrap());
-            },
-        );
+        crate::pg::testing::each(|db| {
+            assert!(due(db, 100).unwrap());
+            assert_eq!(replace(db, &["abc".into(), "def".into(), "abc".into()], 100).unwrap(), 3);
+            assert!(!due(db, 100 + REFRESH_SECS - 1).unwrap());
+            assert!(due(db, 100 + REFRESH_SECS).unwrap());
+            assert!(replace(db, &[], 200).is_err());
+            assert_eq!(replace(db, &["xyz".into()], 300).unwrap(), 1);
+            let left: Vec<String> = db.column("select spotter from spot_blacklist", vals![]).unwrap();
+            assert_eq!(left, ["xyz"]);
+            tried(db, 400).unwrap();
+            assert!(!due(db, 401).unwrap());
+            // turned off: nothing left, and turned on again it's read at once
+            assert_eq!(clear(db).unwrap(), 1);
+            assert_eq!(clear(db).unwrap(), 0);
+            assert!(due(db, 402).unwrap());
+        });
     }
 }

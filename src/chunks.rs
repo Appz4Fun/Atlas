@@ -1,10 +1,8 @@
 //! Day chunks of a group's backfill that any server carrying the group can
 //! take (see docs/superpowers/specs/2026-10-05-faster-backfill-smaller-storage-design.md).
-//! Lives in the main database, SQLite's or Postgres's: every query is written once for both (`pg::sql`).
+//! Lives in the native PostgreSQL catalog; migrations own the schema.
 
-use rusqlite::Connection;
-
-use crate::pg::sql::{Dialect, Result, Sql, vals};
+use crate::pg::sql::{Result, Sql, vals};
 
 /// a claim older than this is taken over (its worker died or was stopped)
 pub const CLAIM_TIMEOUT: i64 = 30 * 60;
@@ -44,86 +42,6 @@ const PENDING: i64 = 0;
 const CLAIMED: i64 = 1;
 const DONE: i64 = 2;
 
-/// Initialize the backfill_chunks table if it doesn't exist, and give one
-/// made before chunks kept their finish time its done_at column. Also the
-/// server that goes back furthest, by split group (see `deepest`), and the
-/// servers whose sweep of a split group is done (see `swept`). SQLite only: Postgres's tables come from its
-/// migrations (`pg::migrate`).
-pub fn create(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(
-        "create table if not exists backfill_chunks (
-            grp TEXT NOT NULL,
-            day INTEGER NOT NULL,
-            state INTEGER NOT NULL,
-            server TEXT,
-            claimed_at INTEGER,
-            done_at INTEGER,
-            primary key (grp, day)
-        ) without rowid;
-        create table if not exists backfill_deepest (
-            grp TEXT PRIMARY KEY,
-            server TEXT NOT NULL,
-            oldest_at INTEGER,
-            runner_up_at INTEGER
-        ) without rowid;
-        create table if not exists backfill_sweeps (
-            grp TEXT NOT NULL,
-            server TEXT NOT NULL,
-            primary key (grp, server)
-        ) without rowid;
-        create table if not exists backfill_sweep_gen (
-            grp TEXT PRIMARY KEY,
-            gen INTEGER NOT NULL
-        ) without rowid;
-        create table if not exists backfill_speculative (
-            grp TEXT PRIMARY KEY,
-            runner_up_day INTEGER NOT NULL,
-            reach INTEGER NOT NULL,
-            days INTEGER NOT NULL,
-            articles INTEGER NOT NULL
-        ) without rowid;
-        create table if not exists backfill_media (
-            grp TEXT PRIMARY KEY,
-            releases INTEGER NOT NULL
-        ) without rowid;
-        create table if not exists backfill_wanted (
-            grp TEXT NOT NULL,
-            day INTEGER NOT NULL,
-            at INTEGER NOT NULL,
-            primary key (grp, day)
-        ) without rowid;
-        create index if not exists idx_backfill_chunks_grp_state_day
-            on backfill_chunks (grp, state, day desc, claimed_at);
-        -- whether any group still has a day to read (the header store linker's readiness)
-        create index if not exists idx_backfill_chunks_day_state on backfill_chunks (day, state);",
-    )?;
-    add_column(conn, "backfill_chunks", "done_at")?;
-    add_column(conn, "backfill_chunks", "failures")?;
-    add_column(conn, "backfill_chunks", "failed_at")?;
-    add_column(conn, "backfill_chunks", "reread")?;
-    add_column(conn, "backfill_deepest", "oldest_at")?;
-    add_column(conn, "backfill_deepest", "runner_up_at")
-}
-
-/// Give `table` the INTEGER column `column` if a table made before it lacks it.
-fn add_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<()> {
-    add_column_as(conn, table, column, "INTEGER")
-}
-
-/// Adds `column` of `kind` to `table` when it's missing.
-pub(crate) fn add_column_as(conn: &Connection, table: &str, column: &str, kind: &str) -> rusqlite::Result<()> {
-    let has =
-        || conn.prepare(&format!("select 1 from pragma_table_info('{table}') where name = '{column}'"))?.exists([]);
-    if has()? {
-        return Ok(());
-    }
-    match conn.execute_batch(&format!("alter table {table} add column {column} {kind}")) {
-        // the indexer and the menu can both add it at once
-        Err(_) if has()? => Ok(()),
-        r => r,
-    }
-}
-
 /// days since 1970-01-01 UTC
 pub fn unix_day(t: i64) -> i64 {
     t.div_euclid(86_400)
@@ -159,7 +77,6 @@ pub fn reach_back(db: &dyn Sql, group: &str, oldest_day: i64, oldest_at: i64) ->
     db.tx(|tx| {
         // what's added depends on the window's floor: read as it is, not as it was before a change to it commits
         tx.lock(&speculative_lock(group))?;
-        tx.write_first("backfill_chunks", "state")?;
         let Some(old) = self::oldest_day(tx, group)? else { return Ok(0) };
         // never past the window of days only the deepest server has
         let spec = speculative(tx, group)?;
@@ -462,7 +379,7 @@ fn frontier_by(db: &dyn Sql, groups: &[(String, i64)], now: i64, newest: bool) -
         return Ok(None);
     }
     let (order, most) = if newest { ("desc", "max") } else { ("asc", "min") };
-    let rows = values_rows(db.dialect(), groups.len(), &["text", "bigint"], 0);
+    let rows = values_rows(groups.len(), &["text", "bigint"], 0);
     let sql = format!(
         "with wanted (g, oldest) as (values {rows}),
               days (day, stale) as (
@@ -532,7 +449,6 @@ fn claim_wanted(db: &dyn Sql, groups: &[(String, i64)], host: &str, now: i64) ->
     let stale = now - CLAIM_TIMEOUT;
     let row = db.tx(|tx| {
         tx.lock("atlas.backfill_claim")?;
-        tx.write_first("backfill_chunks", "state")?;
         // the days asked for alone, each claimed by its key below: joined to the chunks, SQLite's plan (no stats for
         // the small table) scanned all of backfill_chunks by its day index first
         let asked = tx.query("select grp, day from backfill_wanted order by day desc, grp", vals![])?;
@@ -588,7 +504,7 @@ fn claim_ordered(
 ) -> Result<Option<Claim>> {
     let (order, pick, best) = if oldest_first { ("asc", "<=", "asc") } else { ("desc", ">=", "desc") };
     let n = ranges.len() * 4;
-    let rows = values_rows(db.dialect(), ranges.len(), &["text", "bigint", "bigint", "bigint"], 0);
+    let rows = values_rows(ranges.len(), &["text", "bigint", "bigint", "bigint"], 0);
     let sql = format!(
         "with wanted (g, oldest, newest, media) as (values {rows}),
               candidates (grp, media, p_day, s_day) as materialized (
@@ -653,10 +569,9 @@ fn first(rows: Vec<crate::pg::sql::Row>) -> Result<Option<crate::pg::sql::Row>> 
     }
 }
 
-/// SQL: `n` rows of a `values` list of parameters cast to `types`, numbered on from `$first + 1`. Cast on Postgres,
-/// which can't tell a parameter's type in a `values` list; not on SQLite, where thousands of casts slowed every claim
-/// down by about half (the values bind as their own type there anyway).
-fn values_rows(dialect: Dialect, n: usize, types: &[&str], first: usize) -> String {
+/// SQL: `n` rows of parameters cast to `types`, numbered from `$first + 1`.
+/// PostgreSQL needs explicit types in a `values` list.
+fn values_rows(n: usize, types: &[&str], first: usize) -> String {
     let mut p = first;
     (0..n)
         .map(|_| {
@@ -664,10 +579,7 @@ fn values_rows(dialect: Dialect, n: usize, types: &[&str], first: usize) -> Stri
                 .iter()
                 .map(|t| {
                     p += 1;
-                    match dialect {
-                        Dialect::Postgres => format!("cast(${p} as {t})"),
-                        Dialect::Sqlite => format!("${p}"),
-                    }
+                    format!("cast(${p} as {t})")
                 })
                 .collect();
             format!("({})", cols.join(", "))
@@ -676,19 +588,16 @@ fn values_rows(dialect: Dialect, n: usize, types: &[&str], first: usize) -> Stri
         .join(", ")
 }
 
-/// The parameters of `values_rows(_, groups.len(), &["text", "bigint"], 0)`.
+/// The parameters of `values_rows(groups.len(), &["text", "bigint"], 0)`.
 fn group_values(groups: &[(String, i64)]) -> Vec<crate::pg::sql::Value> {
     groups.iter().flat_map(|(g, oldest)| [g.into(), (*oldest).into()]).collect()
 }
 
 /// SQL: the groups a reopen takes in, as the CTE `staged (name)`: its parameters from `$3` on (see `staged_values`).
 /// A group no chunk has stands for nothing, soo none makes it an empty list.
-fn staged(dialect: Dialect, groups: &[String]) -> String {
-    let rows = if groups.is_empty() {
-        "(cast(null as text))".to_string()
-    } else {
-        values_rows(dialect, groups.len(), &["text"], 2)
-    };
+fn staged(groups: &[String]) -> String {
+    let rows =
+        if groups.is_empty() { "(cast(null as text))".to_string() } else { values_rows(groups.len(), &["text"], 2) };
     format!("with staged (name) as (values {rows})")
 }
 
@@ -719,7 +628,7 @@ pub fn reopen_done(db: &dyn Sql, since: i64, done_before: Option<i64>, groups: &
              update backfill_chunks set state = {PENDING}, server = null, claimed_at = null, done_at = null,
                     failures = null, failed_at = null, reread = 1
              where {reopens}",
-            staged = staged(db.dialect(), groups),
+            staged = staged(groups),
             reopens = reopens(),
         ),
         &staged_values(since, done_before, groups),
@@ -730,7 +639,7 @@ pub fn reopen_done(db: &dyn Sql, since: i64, done_before: Option<i64>, groups: &
 /// same days are left alone for being of a group not in `groups`.
 pub fn done_since(db: &dyn Sql, since: i64, done_before: Option<i64>, groups: &[String]) -> Result<(i64, i64, i64)> {
     let values = staged_values(since, done_before, groups);
-    let staged = staged(db.dialect(), groups);
+    let staged = staged(groups);
     let r = first(db.query_uncached(
         &format!(
             "{staged} select count(*), count(distinct grp) from backfill_chunks where {reopens}",
@@ -1025,9 +934,8 @@ mod tests {
 
     #[test]
     fn per_group_counts_and_spans_each_groups_chunks() {
-        let conn = Connection::open_in_memory().unwrap();
-        assert!(per_group(&conn).unwrap().is_empty(), "no table: nothing");
         both(|c| {
+            assert!(per_group(c).unwrap().is_empty(), "fresh catalog has no chunks");
             add(c, "g", 100, 97).unwrap();
             let claim = claim(c, &[("g".to_string(), i64::MIN)], "s", 1000).unwrap().unwrap();
             assert!(finish(c, &claim, 1100).unwrap());
@@ -1037,9 +945,9 @@ mod tests {
         });
     }
 
-    /// `body` on a fresh SQLite database and a fresh Postgres schema (when there's a test server)
+    /// `body` on a freshly migrated PostgreSQL schema.
     fn both(body: impl Fn(&dyn Sql)) {
-        crate::pg::testing::each(|c| create(c).unwrap(), body);
+        crate::pg::testing::each(body);
     }
 
     /// every chunk and note gone, as in a new database
@@ -1440,23 +1348,6 @@ mod tests {
     }
 
     #[test]
-    fn a_table_from_before_done_at_gets_the_column() {
-        let c = Connection::open_in_memory().unwrap();
-        c.execute_batch(
-            "create table backfill_chunks (grp TEXT NOT NULL, day INTEGER NOT NULL, state INTEGER NOT NULL,
-                 server TEXT, claimed_at INTEGER, primary key (grp, day)) without rowid;
-             insert into backfill_chunks values ('g', 5, 1, 'a', 1000);",
-        )
-        .unwrap();
-        create(&c).unwrap();
-        create(&c).unwrap();
-        let a = Claim { group: "g".into(), day: 5, server: "a".into(), claimed_at: 1000, reread: false };
-        assert!(finish(&c, &a, 1100).unwrap(), "the chunk claimed before is still there");
-        let done_at: Option<i64> = c.query_row("select done_at from backfill_chunks", [], |r| r.get(0)).unwrap();
-        assert_eq!(done_at, Some(1100));
-    }
-
-    #[test]
     fn only_listed_groups_and_unsplit_groups() {
         both(|c| {
             add(c, "g", 5, 5).unwrap();
@@ -1526,9 +1417,6 @@ mod tests {
     #[test]
     fn the_forward_start_is_worked_out_once_and_kept() {
         both(|c| {
-            if c.dialect() == crate::pg::sql::Dialect::Sqlite {
-                c.execute("create table if not exists meta (key TEXT PRIMARY KEY, value INTEGER)", vals![]).unwrap();
-            }
             let day = |d: i64| d * 86_400 + 5;
             // the global isn't touched here: other tests claim in parallel
             assert_eq!(forward_start_day(c, Some(30), day(20_100)).unwrap(), 20_070);
@@ -1618,33 +1506,22 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires explicitly admitted isolated PostgreSQL"]
     fn claim_is_atomic_with_concurrent_connections() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("test.db");
-
-        // create db and add chunks
-        let c1 = Connection::open(&db_path).unwrap();
-        create(&c1).unwrap();
-        add(&c1, "g", 20, 19).unwrap();
-        c1.close().ok();
-
-        // open two connections and claim
-        let c_a = Connection::open(&db_path).unwrap();
-        let c_b = Connection::open(&db_path).unwrap();
-
+        use crate::pg::sql::Pg;
+        let schema = crate::pg::testing::Schema::new().expect("explicit ATLAS_PG_TEST_URL is required");
+        let seed = Pg::new(schema.pool.get().unwrap());
+        add(&seed, "g", 20, 19).unwrap();
+        drop(seed);
+        let a = Pg::new(schema.pool.get().unwrap());
+        let b = Pg::new(schema.pool.get().unwrap());
         let groups = vec![("g".to_string(), i64::MIN)];
-        let a_claim = claim(&c_a, &groups, "a", 1000).unwrap();
-        let b_claim = claim(&c_b, &groups, "b", 1000).unwrap();
-
-        // they should get different days (newest first, then next)
-        assert!(a_claim.is_some() && b_claim.is_some());
-        assert_ne!(a_claim.as_ref().map(|c| c.day), b_claim.as_ref().map(|c| c.day));
-        assert_eq!(a_claim.as_ref().map(|c| c.day), Some(20));
-        assert_eq!(b_claim.as_ref().map(|c| c.day), Some(19));
-
-        // third claim should get None
-        let c_c = Connection::open(&db_path).unwrap();
-        assert_eq!(claim(&c_c, &groups, "c", 1000).unwrap(), None);
+        let a_claim = claim(&a, &groups, "a", 1000).unwrap().unwrap();
+        let b_claim = claim(&b, &groups, "b", 1000).unwrap().unwrap();
+        assert_ne!(a_claim.day, b_claim.day);
+        assert_eq!((a_claim.day, b_claim.day), (20, 19));
+        let c = Pg::new(schema.pool.get().unwrap());
+        assert_eq!(claim(&c, &groups, "c", 1000).unwrap(), None);
     }
 
     /// Claims on Postgres take turns (`Sql::lock`): workers claiming at once on their own connections each get a day of
