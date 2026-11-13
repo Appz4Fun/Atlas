@@ -78,8 +78,12 @@ mod tests {
         // a caller readiness flag. This test never opens a public listener.
         let version=pg::migrate::version(&mut owner,&schema.name).unwrap();
         let epoch=pg::stage::open_epoch(&mut owner,&storage,&headers,version).unwrap();
-        let release=crate::parser::Release {name:"Processing.Example.Release".into(),group:"alt.binaries.test".into(),poster:"poster".into(),date:"2020-01-01".into(),..Default::default()};
-        pg::release_writer::save(&mut owner,&[release],1).unwrap();
+        let release=crate::parser::Release {name:"Processing.Example.Release".into(),group:"alt.binaries.test".into(),poster:"poster".into(),date:"Wed, 01 Jan 2020 00:00:00 +0000".into(),
+            articles:vec![crate::parser::Article {message_id:"processing-owner@example.invalid".into(),
+                subject:"\"Processing.Example.Release.mkv\" yEnc (1/1)".into(),filename:Some("Processing.Example.Release.mkv".into()),
+                part:Some(1),total_parts:Some(1),bytes:64,..Default::default()}],..Default::default()};
+        let saved=pg::release_writer::save(&mut owner,&[release],1).unwrap();
+        assert_eq!(saved,pg::release_writer::SaveStats {releases:1,files:1,parts:1});
         let id:i64=owner.query_one("select id from releases",&[]).unwrap().get(0);
         owner.execute("insert into pp_state(release_id,done,failed,net_wanted,net_left,net_attempts,last_error)
             values($1,8,16,true,32,3,'kept <error>')",&[&id]).unwrap();
