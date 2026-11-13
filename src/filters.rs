@@ -7,7 +7,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use regex::Regex;
-use rusqlite::{Connection, Result, functions::FunctionFlags};
 
 use crate::parser::{Article, Release, parse_subject};
 
@@ -113,7 +112,7 @@ pub fn group_blocked(name: &str) -> bool {
     if name.len() > MAX_GROUP_NAME {
         return true;
     }
-    // asked once per row by sql and per release by a save, of a few thousand
+    // asked per native read descriptor and per release save, of a few thousand
     // names at most: each thread remembers its answers
     thread_local! {
         static SEEN: std::cell::RefCell<HashMap<String, bool>> = std::cell::RefCell::new(HashMap::new());
@@ -369,19 +368,6 @@ fn near(word: &str, target: &str, max: usize) -> bool {
         }
     }
     d[a.len()][b.len()] <= max
-}
-
-/// Lets sql ask `atlas_blocked(group_name)`, and `atlas_file_whole(seen, expected)`: whether a file's `seen` bitmap
-/// has exactly its parts (`store::is_exactly`). Every connection has them (`db::set_up`).
-/// NULL, or anything that isnt text, isnt blocked; a NULL or non-blob bitmap isnt whole.
-pub fn register_sql(conn: &Connection) -> Result<()> {
-    let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC | FunctionFlags::SQLITE_INNOCUOUS;
-    conn.create_scalar_function("atlas_blocked", 1, flags, |ctx| Ok(ctx.get_raw(0).as_str().is_ok_and(group_blocked)))?;
-    conn.create_scalar_function("atlas_file_whole", 2, flags, |ctx| {
-        let Ok(seen) = ctx.get_raw(0).as_blob() else { return Ok(false) };
-        let Ok(expected) = ctx.get_raw(1).as_i64() else { return Ok(false) };
-        Ok(crate::store::is_exactly(seen, expected))
-    })
 }
 
 // ---------------------------------------------------------------- articles obfuscated per article
@@ -969,52 +955,29 @@ mod tests {
     }
 
     #[test]
-    fn a_sealed_fragment_reads_the_same_as_a_loose_one() {
-        use crate::parser::Release;
-        let dir = tempfile::tempdir().unwrap();
-        let main = dir.path().join("atlas.db");
-        crate::db::create_db_at(&main).unwrap();
-        let group = "alt.binaries.test";
-        let article = Article {
-            subject: format!(r#""{TOKEN}" yEnc (5/9)"#),
-            filename: Some(TOKEN.into()),
-            part: Some(5),
-            total_parts: Some(9),
-            message_id: "<a@x>".into(),
-            bytes: 700_000,
-            ..Default::default()
-        };
-        let release =
-            Release { name: TOKEN.into(), group: group.into(), articles: vec![article], ..Default::default() };
-        crate::store::save(&main, &[release]).unwrap();
-        let conn = crate::db::open_shard(&crate::store::shard_path(&main, crate::store::shard_of(group))).unwrap();
-
-        let read = || {
-            conn.query_row(
-                "select r.name, r.parts, f.subject_part, f.expected, f.subject,
-                     (select count(*) from files x where x.release_id = r.id)
-                 from releases r join files f on f.release_id = r.id",
-                [],
-                |r| {
-                    let (name, subject): (String, String) = (r.get(0)?, r.get(4)?);
-                    Ok(stored_fragment(&StoredPost {
-                        name: &name,
-                        parts: r.get(1)?,
-                        files: r.get::<_, i64>(5)? as usize,
-                        part: r.get(2)?,
-                        expected: r.get(3)?,
-                        subject: Some(&subject),
-                    }))
-                },
-            )
-            .unwrap()
-        };
-        assert!(read(), "loose");
-        let file: i64 = conn.query_row("select id from files", [], |r| r.get(0)).unwrap();
-        crate::store::seal_file(&conn, file).unwrap();
-        let rows: i64 = conn.query_row("select count(*) from segments", [], |r| r.get(0)).unwrap();
-        assert_eq!(rows, 0, "sealed: its article is only in the blob");
-        assert!(read(), "sealed");
+    #[ignore="Root-only isolated PostgreSQL and native StepReads admission"]
+    fn a_native_snapshot_preserves_fragment_subject_and_part_facts() {
+        let schema=crate::pg::testing::Schema::new().expect("explicit isolated native PG admission");
+        let runtime=crate::pg::stage_queue_tests::runtime(&schema);
+        let subject=format!(r#""{TOKEN}" yEnc (5/9)"#);
+        let release=Release {name:TOKEN.into(),group:"alt.binaries.test".into(),articles:vec![Article {
+            subject:subject.clone(),filename:Some(TOKEN.into()),part:Some(5),total_parts:Some(9),
+            message_id:"<fragment@native.test>".into(),bytes:700_000,..Default::default()
+        }],..Default::default()};
+        let id=runtime.owner.with(|client| {
+            crate::pg::release_writer::save(client,&[release],1)?;
+            Ok(client.query_one("select id from releases",&[])?.get::<_,i64>(0))
+        }).unwrap();
+        let reads=crate::pg::stage_reads::StepReads::for_owner(&runtime.owner).unwrap();
+        let snapshot=reads.snapshot(id).unwrap().expect("actual native release snapshot");
+        assert_eq!(snapshot.info.name,TOKEN);assert_eq!(snapshot.info.parts,1);
+        assert_eq!(snapshot.summary.files,1);assert_eq!(snapshot.summary.present,1);assert_eq!(snapshot.summary.wanted,9);
+        assert_eq!(snapshot.summary.single_part,Some(5));assert_eq!(snapshot.summary.single_expected,Some(9));
+        assert_eq!(snapshot.summary.single_subject.as_deref(),Some(subject.as_str()));
+        assert!(stored_fragment(&StoredPost {name:&snapshot.info.name,parts:snapshot.info.parts,
+            files:snapshot.summary.files as usize,part:snapshot.summary.single_part,expected:snapshot.summary.single_expected,
+            subject:snapshot.summary.single_subject.as_deref()}));
+        runtime.owner.close();
     }
 
     fn obfuscated_article(part: usize, token: &str, counter: &str, author: &str) -> Article {
