@@ -1075,3 +1075,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "search/native_sort_transfer_tests.rs"]
+mod native_sort_transfer_tests;
