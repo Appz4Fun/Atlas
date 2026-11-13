@@ -11,6 +11,7 @@ pub(crate) mod engine;
 pub(crate) mod mutation;
 pub(crate) mod native;
 pub mod result_value;
+mod result_v1_tags;
 mod legacy_result_value;
 pub mod purge;
 pub mod reprocess;

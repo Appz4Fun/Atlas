@@ -2,8 +2,6 @@
 
 use std::time::Instant;
 
-use rusqlite::Connection;
-use super::result_value::Value;
 
 #[cfg(test)]
 #[path = "result_envelope_tests.rs"]
@@ -14,7 +12,7 @@ use crate::nntp::BackgroundRead;
 use crate::store;
 
 use super::bodies::BodyFetcher;
-pub use super::mutation::{DeferredLegacyStepMutation, ImageRecord, SidecarRecord, StepMutation};
+pub use super::mutation::{ImageRecord, SidecarRecord, StepMutation};
 
 /// Never reused, 1..=62.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -65,12 +63,6 @@ pub trait Step: Send + Sync + 'static {
     }
     fn reruns(&self) -> Reruns {
         Reruns::default()
-    }
-    /// Asked for by hand on release `release_id`, as a picture on its page: a body step runs past the body gate's
-    /// size and type bounds then, which would otherwise mark it done unrun. Only called for a release outside them.
-    fn asked_for(&self, conn: &rusqlite::Connection, release_id: i64) -> bool {
-        let _ = (conn, release_id);
-        false
     }
     /// Inputs that can change while `enabled` stays true, one bit each. A bit
     /// that wasnt there before redoes this step on existing releases. Cheap, no I/O.
@@ -127,18 +119,12 @@ impl StepCtx<'_> {
     }
 
     /// capped at 5,000
-    pub fn files(&self) -> rusqlite::Result<Vec<store::FileInfo>> {
+    pub fn files(&self) -> anyhow::Result<Vec<store::FileInfo>> {
         self.data.release_files(self.release.id)
     }
 
-    pub fn segments(&self, file_id: i64, pick: &store::SegmentPick) -> rusqlite::Result<Vec<store::SegmentRef>> {
+    pub fn segments(&self, file_id: i64, pick: &store::SegmentPick) -> anyhow::Result<Vec<store::SegmentRef>> {
         self.data.file_segments(file_id, pick)
-    }
-
-    /// The legacy shard, opened `query_only`; unavailable native data returns an error.
-    /// Do not keep a statement open across `fetch_bodies`: it pins the WAL.
-    pub fn conn(&self) -> Result<&Connection, StepError> {
-        self.data.legacy_connection()
     }
 
     /// A value an earlier step in this run left, see `Outcome::facts`.
@@ -347,85 +333,37 @@ pub struct Outcome {
     pub junk: Option<&'static str>,
 }
 
+/// Closed native result data. Construction grants neither a lease nor target authority.
 pub struct StepWrite {
-    pub sql: &'static str,
-    pub params: Vec<Value>,
-    /// Legacy writer-time callback. Never admitted by the native envelope.
-    pub late_params: Option<Box<dyn FnOnce() -> Vec<Value> + Send>>,
-    /// Public fields are compatibility shadows; only this private closed value
-    /// supplies native mutation data, after the shadows have been checked.
-    native: Option<NativeEnvelope>,
-}
-
-struct NativeEnvelope {
     release_id: i64,
     mutation: StepMutation,
 }
 
 impl StepWrite {
-    pub fn new(sql: &'static str, params: Vec<Value>) -> StepWrite {
-        StepWrite { sql, params, late_params: None, native: None }
-    }
+    pub fn for_mutation(release_id:i64,mutation:StepMutation)->Self {Self {release_id,mutation}}
 
-    pub fn with_late_params(mut self, late: Box<dyn FnOnce() -> Vec<Value> + Send>) -> Self {
-        self.late_params = Some(late);
-        self
-    }
-
-    /// Keeps legacy late-cache timing without admitting that cache or callback to the native writer.
-    pub fn for_deferred_legacy(release_id: i64, mutation: DeferredLegacyStepMutation) -> Self {
-        let sql = mutation.sqlite_sql();
-        Self { sql,params: Vec::new(),late_params: Some(Box::new(move || mutation.sqlite_parameters(release_id))),native: None }
-    }
-
-    pub fn for_mutation(release_id: i64, mutation: StepMutation) -> Self {
-        let (sql, params) = mutation.v1_fields(release_id);
-        Self { sql, params, late_params: None, native: Some(NativeEnvelope {release_id, mutation}) }
-    }
-
-    pub(crate) fn legacy_allowed(&self)->bool {
-        !self.native.as_ref().is_some_and(|envelope|matches!(envelope.mutation,StepMutation::ParseMedia {..}|StepMutation::PredbRead {..}))
-    }
-
-    fn checked_envelope(&self)->Result<&NativeEnvelope,StepError> {
-        let envelope=self.native.as_ref().ok_or_else(||StepError::Retry("Step mutation is not ported to native storage".into()))?;
-        let (tag,values)=envelope.mutation.v1_fields(envelope.release_id);
-        if self.sql!=tag || self.params!=values || self.late_params.is_some() {
-            return Err(StepError::Retry("Step mutation representation changed".into()));
-        }
-        Ok(envelope)
-    }
-
-    /// The queue actor checks the retained target as well as the closed
-    /// representation. A result for another release cannot borrow its lease.
-    pub(crate) fn native_mutation_for(&self, release_id:i64)->Result<&StepMutation,StepError> {
-        if self.native.as_ref().is_none_or(|envelope|envelope.release_id!=release_id) {
-            return Err(StepError::Retry("native Step result targets another release".into()));
-        }
+    pub(crate) fn native_mutation_for(&self,release_id:i64)->Result<&StepMutation,StepError> {
+        if self.release_id!=release_id {return Err(StepError::Retry("native Step result targets another release".into()));}
         self.native_mutation()
     }
     pub(crate) fn native_observed_for(&self,release_id:i64,targets:&crate::pg::stage_queue::participants::Observed)->Result<&StepMutation,StepError> {
-        let envelope=self.checked_envelope()?;
-        if envelope.release_id!=release_id || !targets.permits(release_id,&envelope.mutation) {
+        if self.release_id!=release_id || !targets.permits(release_id,&self.mutation) {
             return Err(StepError::Retry("native result has no observed target".into()));
         }
-        Ok(&envelope.mutation)
+        Ok(&self.mutation)
     }
 
-    /// Caller SQL and numeric targets alone cannot supply native authority.
-    pub fn native_mutation(&self) -> Result<&StepMutation, StepError> {
-        let envelope=self.checked_envelope()?;
-        if envelope.mutation.requires_target_resolution() {
+    pub fn native_mutation(&self)->Result<&StepMutation,StepError> {
+        if self.mutation.requires_target_resolution() {
             return Err(StepError::Retry("Step targets require the native resolver".into()));
         }
-        Ok(&envelope.mutation)
+        Ok(&self.mutation)
     }
 
-    /// Encoding is data, never a lease. Visit still validates its Claim and
-    /// Observed participants before this call and again at actual settlement.
+    /// Retained v1 tags and fields are digest data. Only Stage's original
+    /// Claim/Observed/settlement protocol admits these effects.
     pub(crate) fn encode_native_v1(&self,step:StepMask,bytes:&mut usize,sink:&mut impl FnMut(&[u8]))->anyhow::Result<()> {
-        let envelope=self.checked_envelope().map_err(|_|anyhow::anyhow!("native result is not a closed mutation"))?;
-        let (tag,values)=envelope.mutation.v1_fields(envelope.release_id);
+        let (tag,values)=self.mutation.v1_fields(self.release_id);
         super::result_value::encode_write_v1(step,tag,&values,bytes,sink)
     }
 }
@@ -460,10 +398,7 @@ pub enum StepError {
 
 impl StepError {
     pub fn from_cache(error:anyhow::Error)->Self {Self::Native(error)}
-    pub fn from_inventory(error:rusqlite::Error)->Self {
-        if matches!(error,rusqlite::Error::UserFunctionError(_)) {Self::Native(error.into())}
-        else {Self::Retry(error.to_string())}
-    }
+    pub fn from_inventory(error:anyhow::Error)->Self {Self::Native(error)}
 }
 
 #[cfg(test)]
@@ -480,7 +415,7 @@ mod tests {
         let context = StepCtx { release: ReleaseInfo::default(),data: super::super::data::StepData::NativeUnavailable,
             facts: Vec::new(),bodies: &bodies,used_bodies: 0,deadline: Instant::now(),lane_can_fetch: false,
             crcs: Vec::new(),pictures: false };
-        assert!(matches!(context.conn(),Err(StepError::Retry(_))));
+        assert!(context.files().unwrap_err().is::<crate::postprocess::data::NativeReadUnavailable>());
         assert!(context.files().is_err());
         assert!(context.segments(1,&store::SegmentPick::First(1)).is_err());
     }
