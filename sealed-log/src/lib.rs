@@ -305,19 +305,7 @@ impl Log {
 
     /// Stores admitted values, returning locations only after durable commit.
     pub fn append(&self, values: Vec<(u64, Vec<u8>)>) -> io::Result<Vec<Locator>> {
-        let mut bytes = 0usize;
-        for (_, value) in &values {
-            if value.len() > MAX_FRAME {
-                return Err(invalid("value exceeds admission"));
-            }
-            bytes = bytes
-                .checked_add(value.len())
-                .and_then(|n| n.checked_add(12))
-                .ok_or_else(|| invalid("append extent overflow"))?;
-            if bytes > MAX_FRAME {
-                return Err(invalid("append exceeds frame admission"));
-            }
-        }
+        append_extent(values.iter().map(|(_, value)| value.len()), MAX_FRAME)?;
         let failure = self.failure.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some(cause) = failure {
             return Err(fenced(&cause));
@@ -570,6 +558,65 @@ fn take<'a>(b: &mut &'a [u8], n: usize) -> io::Result<&'a [u8]> {
     Ok(head)
 }
 
+#[derive(Default)]
+struct AppendExtent {
+    request: usize,
+    response: usize,
+    count: usize,
+}
+
+impl AppendExtent {
+    fn include(&mut self, value: usize, limit: usize) -> io::Result<()> {
+        let request = self
+            .request
+            .checked_add(12)
+            .and_then(|n| n.checked_add(value))
+            .filter(|n| *n <= limit)
+            .ok_or_else(|| invalid("append request exceeds frame admission"))?;
+        let count = self.count.checked_add(1).ok_or_else(|| invalid("append count overflow"))?;
+        let response = count
+            .checked_mul(REF_BYTES)
+            .filter(|n| *n <= limit)
+            .ok_or_else(|| invalid("append response exceeds frame admission"))?;
+        *self = Self { request, response, count };
+        Ok(())
+    }
+}
+
+fn append_extent(lengths: impl IntoIterator<Item = usize>, limit: usize) -> io::Result<AppendExtent> {
+    let mut extent = AppendExtent::default();
+    for len in lengths {
+        extent.include(len, limit)?;
+    }
+    Ok(extent)
+}
+
+fn handle_append(log: &Log, body: &[u8], limit: usize) -> io::Result<Vec<u8>> {
+    // Admit both wire directions using borrowed bytes before owning any values.
+    let mut b = body;
+    let mut extent = AppendExtent::default();
+    while !b.is_empty() {
+        take(&mut b, 8)?;
+        let len = u32::from_be_bytes(take(&mut b, 4)?.try_into().unwrap()) as usize;
+        extent.include(len, limit)?;
+        take(&mut b, len)?;
+    }
+    let mut values = Vec::new();
+    values.try_reserve_exact(extent.count).map_err(Error::other)?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(extent.response).map_err(Error::other)?;
+    b = body;
+    while !b.is_empty() {
+        let key = u64::from_be_bytes(take(&mut b, 8)?.try_into().unwrap());
+        let len = u32::from_be_bytes(take(&mut b, 4)?.try_into().unwrap()) as usize;
+        values.push((key, take(&mut b, len)?.to_vec()));
+    }
+    for at in log.append(values)? {
+        out.extend_from_slice(&at.to_ref());
+    }
+    Ok(out)
+}
+
 fn handle(log: &Log, op: u8, body: &[u8]) -> io::Result<Vec<u8>> {
     let started = Instant::now();
     let answer = handle_unmeasured(log, op, body);
@@ -590,15 +637,7 @@ fn handle(log: &Log, op: u8, body: &[u8]) -> io::Result<Vec<u8>> {
 fn handle_unmeasured(log: &Log, op: u8, body: &[u8]) -> io::Result<Vec<u8>> {
     let mut b = body;
     match op {
-        OP_APPEND => {
-            let mut values = Vec::new();
-            while !b.is_empty() {
-                let key = u64::from_be_bytes(take(&mut b, 8)?.try_into().unwrap());
-                let len = u32::from_be_bytes(take(&mut b, 4)?.try_into().unwrap()) as usize;
-                values.push((key, take(&mut b, len)?.to_vec()));
-            }
-            Ok(log.append(values)?.into_iter().flat_map(Locator::to_ref).collect())
-        }
+        OP_APPEND => handle_append(log, body, MAX_FRAME),
         OP_READ => {
             if !body.len().is_multiple_of(REF_BYTES) {
                 return Err(invalid("read request is not whole locators"));
@@ -648,49 +687,79 @@ pub fn serve(log: Arc<Log>, listener: TcpListener, tls: Arc<ServerTls>) -> io::R
     transport::serve(log, listener, tls, false)
 }
 
-/// A connection to the store.
+/// A connection to the store. An incomplete exchange permanently fences it.
 pub struct Client {
-    stream: transport::ClientStream,
+    stream: Option<transport::ClientStream>,
+    failure: Option<Arc<io::Error>>,
+}
+
+#[derive(Debug)]
+struct ClientFenced(Arc<io::Error>);
+impl std::fmt::Display for ClientFenced {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "sealed-log client is fenced: {}", self.0)
+    }
+}
+impl std::error::Error for ClientFenced {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
 }
 
 impl Client {
     pub fn connect(addr: &str, tls: &ClientTls) -> io::Result<Client> {
-        Ok(Client { stream: transport::connect(addr, tls)? })
+        Ok(Client { stream: Some(transport::connect(addr, tls)?), failure: None })
+    }
+
+    fn fence(&mut self, error: io::Error) -> io::Error {
+        self.stream.take();
+        let cause = self.failure.get_or_insert_with(|| Arc::new(error));
+        Error::new(cause.kind(), ClientFenced(cause.clone()))
     }
 
     fn call(&mut self, op: u8, body: &[u8]) -> io::Result<Vec<u8>> {
-        self.stream.sock.reset(IO_TIMEOUT);
-        write_frame(&mut self.stream, op, body)?;
-        let (status, out) = read_frame(&mut self.stream)?;
-        self.stream.sock.check()?;
-        if status != 0 {
-            return Err(Error::other(String::from_utf8_lossy(&out).into_owned()));
+        self.call_with_timeout(op, body, IO_TIMEOUT)
+    }
+
+    fn call_with_timeout(&mut self, op: u8, body: &[u8], timeout: Duration) -> io::Result<Vec<u8>> {
+        if let Some(cause) = &self.failure {
+            return Err(Error::new(cause.kind(), ClientFenced(cause.clone())));
         }
-        Ok(out)
+        let result = (|| {
+            let stream = self.stream.as_mut().expect("unfenced client owns its stream");
+            stream.sock.reset(timeout);
+            write_frame(stream, op, body)?;
+            let reply = read_frame(stream)?;
+            stream.sock.check()?;
+            Ok(reply)
+        })();
+        let (status, out) = result.map_err(|error| self.fence(error))?;
+        match status {
+            0 => Ok(out),
+            1 => match String::from_utf8(out) {
+                Ok(message) => Err(Error::other(message)),
+                Err(_) => Err(self.fence(invalid("application error is not UTF-8"))),
+            },
+            _ => Err(self.fence(invalid("unknown response status"))),
+        }
     }
 
     pub fn append(&mut self, values: &[(u64, &[u8])]) -> io::Result<Vec<Locator>> {
-        let size = values.iter().try_fold(0usize, |sum, (_, value)| {
-            sum.checked_add(12)
-                .and_then(|n| n.checked_add(value.len()))
-                .filter(|n| *n <= MAX_FRAME)
-                .ok_or_else(|| invalid("append exceeds frame admission"))
-        })?;
-        let mut body = Vec::with_capacity(size);
+        let extent = append_extent(values.iter().map(|(_, value)| value.len()), MAX_FRAME)?;
+        let mut body = Vec::new();
+        body.try_reserve_exact(extent.request).map_err(Error::other)?;
         for (key, value) in values {
             body.extend_from_slice(&key.to_be_bytes());
             body.extend_from_slice(&(value.len() as u32).to_be_bytes());
             body.extend_from_slice(value);
         }
         let out = self.call(OP_APPEND, &body)?;
-        if out.len()
-            != values.len().checked_mul(REF_BYTES).ok_or_else(|| invalid("locator response extent overflow"))?
-        {
-            return Err(invalid("answer has a partial or wrong number of places"));
+        if out.len() != extent.response {
+            return Err(self.fence(invalid("answer has a partial or wrong number of places")));
         }
         let places: Vec<Locator> = out.chunks(REF_BYTES).filter_map(Locator::from_ref).collect();
         if places.len() != values.len() {
-            return Err(invalid("answer has the wrong number of places"));
+            return Err(self.fence(invalid("answer has the wrong number of places")));
         }
         Ok(places)
     }
@@ -712,23 +781,27 @@ impl Client {
             body.extend_from_slice(&place.to_ref());
         }
         let out = self.call(OP_READ, &body)?;
-        let mut b = &out[..];
-        let mut values = Vec::with_capacity(places.len());
-        for place in places {
-            let len = u32::from_be_bytes(take(&mut b, 4)?.try_into().unwrap()) as usize;
-            if len != place.len as usize {
-                return Err(invalid("answer differs from requested record length"));
+        let parsed = (|| {
+            let mut b = &out[..];
+            let mut values = Vec::with_capacity(places.len());
+            for place in places {
+                let len = u32::from_be_bytes(take(&mut b, 4)?.try_into().unwrap()) as usize;
+                if len != place.len as usize {
+                    return Err(invalid("answer differs from requested record length"));
+                }
+                values.push(take(&mut b, len)?.to_vec());
             }
-            values.push(take(&mut b, len)?.to_vec());
-        }
-        if !b.is_empty() {
-            return Err(invalid("answer has extra values"));
-        }
-        Ok(values)
+            if !b.is_empty() {
+                return Err(invalid("answer has extra values"));
+            }
+            Ok(values)
+        })();
+        parsed.map_err(|error| self.fence(error))
     }
 
     pub fn stats(&mut self) -> io::Result<String> {
-        Ok(String::from_utf8_lossy(&self.call(OP_STATS, &[])?).into_owned())
+        let out = self.call(OP_STATS, &[])?;
+        String::from_utf8(out).map_err(|_| self.fence(invalid("stats answer is not UTF-8")))
     }
 }
 

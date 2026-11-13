@@ -323,3 +323,63 @@ fn unauthenticated_stalled_handshake_has_a_finite_deadline_and_releases_its_slot
     assert_eq!(inspected.active.load(Ordering::Acquire), 0);
     assert_eq!(f.log().tail().1, 0);
 }
+
+#[test]
+fn a_delayed_append_reply_cannot_be_reused_by_a_later_append() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let (release, delayed) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (socket, _) = listener.accept().unwrap();
+        let (mut stream, _) = accept(socket, &security(Permissions::ALL)).unwrap();
+        let (op, request) = read_frame(&mut stream).unwrap();
+        assert_eq!(op, OP_APPEND);
+        assert_eq!(request.len(), 13);
+        delayed.recv_timeout(Duration::from_secs(5)).unwrap();
+        // A's answer becomes available only after the client's first deadline.
+        let old = Locator { segment: 0, offset: 0, len: 1 };
+        let _ = write_frame(&mut stream, 0, &old.to_ref());
+        assert!(read_frame(&mut stream).is_err(), "a fenced client must not send append B");
+    });
+    let mut client = Client::connect(&addr, &identity("client")).unwrap();
+    let request = [1u64.to_be_bytes().as_slice(), &1u32.to_be_bytes(), b"A"].concat();
+    let first = client.call_with_timeout(OP_APPEND, &request, Duration::from_millis(30)).unwrap_err();
+    assert!(matches!(first.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock));
+    let cause = client.failure.as_ref().unwrap().clone();
+    assert!(client.stream.is_none());
+    release.send(()).unwrap();
+    let second = client.append(&[(2, b"B")]).unwrap_err();
+    assert_eq!(second.kind(), first.kind());
+    assert!(Arc::ptr_eq(&cause, client.failure.as_ref().unwrap()), "the original exchange cause must survive");
+    assert!(std::error::Error::source(second.get_ref().unwrap()).is_some());
+    drop(client);
+    server.join().unwrap();
+}
+
+#[test]
+fn malformed_success_reply_fences_client_but_complete_application_error_allows_reuse() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let server = std::thread::spawn(move || {
+        let (socket, _) = listener.accept().unwrap();
+        let (mut stream, _) = accept(socket, &security(Permissions::ALL)).unwrap();
+        assert_eq!(read_frame(&mut stream).unwrap().0, OP_APPEND);
+        write_frame(&mut stream, 0, &[0; REF_BYTES]).unwrap();
+        assert!(read_frame(&mut stream).is_err());
+    });
+    let mut client = Client::connect(&addr, &identity("client")).unwrap();
+    assert_eq!(client.append(&[(1, b"A")]).unwrap_err().kind(), ErrorKind::InvalidData);
+    assert!(client.stream.is_none());
+    assert_eq!(client.stats().unwrap_err().kind(), ErrorKind::InvalidData);
+    drop(client);
+    server.join().unwrap();
+
+    let fixture = Fixture::new();
+    let mut client = peer(fixture.log(), Permissions::ALL);
+    let missing = Locator { segment: 9, offset: 0, len: 1 };
+    assert!(client.read(&[missing]).is_err(), "server returns a complete application-error frame");
+    assert!(client.failure.is_none());
+    assert!(client.stream.is_some());
+    let at = client.append(&[(7, b"after-error")]).unwrap();
+    assert_eq!(client.read(&at).unwrap(), [b"after-error".to_vec()]);
+}
