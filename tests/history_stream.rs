@@ -3,10 +3,11 @@ use std::{cell::Cell, rc::Rc};
 
 use atlas::{
     blob,
-    frozen::payload,
     history_stream::{self as stream, BytesKind, Config, Event, Source},
 };
-use rusqlite::types::Value;
+#[path = "common/history_payload_oracle.rs"]
+mod payload;
+use payload::Value;
 use sha2::{Digest, Sha256};
 
 // Test-only Rust allocator accounting. Zstd allocates through C and is NOT included;
@@ -628,6 +629,6 @@ fn test_only_payload_oracle_preserves_literal_frozen_v1_wire_bytes() {
     assert_eq!(payload::decode(&packed(expected)).unwrap(), oracle);
     assert_eq!(frozen_rows(&packed(expected)).unwrap(), oracle);
     let decoded = payload::decode(&encoded).unwrap();
-    let Value::Real(real) = decoded.tables[0].rows[3][0] else { panic!("expected real") };
+    let Value::Real(real) = &decoded.tables[0].rows[3][0] else { panic!("expected real") };
     assert_eq!(real.to_bits(), (-0.0f64).to_bits());
 }
