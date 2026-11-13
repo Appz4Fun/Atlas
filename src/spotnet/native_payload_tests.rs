@@ -215,3 +215,47 @@ fn known_nzb_reference_rechecks_payload_headers_before_reusing_a_release() {
         runtime.owner.close();
     }
 }
+
+#[test]
+#[ignore = "explicit isolated PG and actual changed NZB reference payload"]
+fn changed_reference_publishes_the_verified_plan_instead_of_copying_prior_payload() {
+    let (schema, runtime, _dir) = fixture();
+    let peer = Peer::new(Mode::PayloadChangedReference);
+    let net = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    let service = service(&runtime, &peer, net.handle().clone());
+    assert_eq!(service.spots_tick(1793000000).unwrap().saved, 1);
+    let mut observer = schema.pool.get().unwrap();
+    let prior =
+        observer.query_one("select release_id,nzb_key from spots_seen where message_id=$1", &[&SPOT_ID]).unwrap();
+    let prior_id = prior.get::<_, i64>(0);
+    let prior_key = prior.get::<_, String>(1);
+
+    assert_eq!(
+        service.fetch_and_settle(SPOT_ID, &Arc::new(ingest::Shared::new(ingest::MAX_PASS_POSTED))).unwrap(),
+        Some(Some(store::SAVED))
+    );
+    let current =
+        observer.query_one("select release_id,nzb_key from spots_seen where message_id=$1", &[&SPOT_ID]).unwrap();
+    let current_id = current.get::<_, i64>(0);
+    assert_ne!(current_id, prior_id, "new HEAD-verified MID/group cannot copy the old reference's release");
+    assert_ne!(current.get::<_, String>(1), prior_key, "bookkeeping retains the newly parsed payload key");
+    let row = observer.query_one("select r.group_name,s.message_id,s.part,s.bytes from releases r join segments s on s.release_id=r.id where r.id=$1", &[&current_id]).unwrap();
+    assert_eq!(
+        (row.get::<_, String>(0), row.get::<_, Vec<u8>>(1), row.get::<_, i64>(2), row.get::<_, i64>(3)),
+        ("another.allowed.group".into(), b"<changed-part@fixture.test>".to_vec(), 1, 123)
+    );
+    let old = observer
+        .query_one(
+            "select r.group_name,s.message_id from releases r join segments s on s.release_id=r.id where r.id=$1",
+            &[&prior_id],
+        )
+        .unwrap();
+    assert_eq!(
+        (old.get::<_, String>(0), old.get::<_, Vec<u8>>(1)),
+        ("example.spot".into(), b"<actual-part@fixture.test>".to_vec())
+    );
+    assert_eq!(peer.count("HEAD"), 4, "both actual payloads were HEAD checked");
+    assert_eq!(peer.count("BODY"), 2);
+    assert_eq!(runtime.owner.failure(), None);
+    runtime.owner.close();
+}

@@ -13,7 +13,7 @@ pub(crate) enum Mode {
     Good, Forged, Missing, Transient, Held, RejectGroup,
     PayloadBlocked, PayloadNoGroups, PayloadWrongMid, PayloadGroupMismatch,
     PayloadGroupConflict, PayloadTooBig, PayloadSecondBlocked, PayloadInvalidMid,
-    PayloadTransient, PayloadMissing, PayloadRevoked,
+    PayloadTransient, PayloadMissing, PayloadRevoked, PayloadChangedReference,
 }
 pub(crate) struct Peer {
     pub(crate) server:crate::config::UsenetServer,stop:Arc<AtomicBool>,release:Arc<AtomicBool>,body_entered:Arc<AtomicBool>,
@@ -84,7 +84,7 @@ fn serve(mut stream:TcpStream,mode:Mode,stop:&AtomicBool,release:&AtomicBool,ent
                 };
                 format!("224 overview\r\n1\t{subject}\t{from}\tSat, 24 Oct 2026 12:00:00 +0000\t<{id}>\t{references}\t100\t1\r\n.\r\n").into_bytes()
             }
-            "HEAD" if line.contains("actual-part@fixture.test")||line.contains("actual-second@fixture.test")=> {
+            "HEAD" if line.contains("actual-part@fixture.test")||line.contains("actual-second@fixture.test")||line.contains("changed-part@fixture.test")=> {
                 if matches!(mode,Mode::PayloadMissing) {b"430 No Such Article\r\n".to_vec()}
                 else if matches!(mode,Mode::PayloadTransient) {b"431 temporarily unavailable\r\n".to_vec()} else {
                     let requested=line.strip_prefix("HEAD ").unwrap();
@@ -97,6 +97,7 @@ fn serve(mut stream:TcpStream,mode:Mode,stop:&AtomicBool,release:&AtomicBool,ent
                         else if matches!(mode,Mode::PayloadNoGroups) {""}
                         else if matches!(mode,Mode::PayloadGroupMismatch) {"Newsgroups: another.allowed.group\r\n"}
                         else if matches!(mode,Mode::PayloadGroupConflict) {"Newsgroups: example.spot\r\nXref: fixture another.allowed.group:1\r\n"}
+                        else if line.contains("changed-part@fixture.test") {"Newsgroups: another.allowed.group\r\nXref: fixture another.allowed.group:1\r\n"}
                         else {"Newsgroups: example.spot\r\nXref: fixture example.spot:1\r\n"};
                     let mut head=format!("221 1 {requested}\r\nMessage-ID: {mid}\r\n{groups}").into_bytes();
                     if matches!(mode,Mode::PayloadTooBig) {head.extend(b"X-Large: ");head.extend(vec![b'x';70*1024]);head.extend(b"\r\n");}
@@ -122,6 +123,9 @@ fn serve(mut stream:TcpStream,mode:Mode,stop:&AtomicBool,release:&AtomicBool,ent
                         nzb=br#"<nzb><file poster="Actual NZB Poster" date="1792828369" subject="&quot;actual.mkv&quot; yEnc (1/2)"><groups><group>example.spot</group></groups><segments><segment bytes="123" number="1">actual-part@fixture.test</segment><segment bytes="123" number="2">actual-second@fixture.test</segment></segments></file></nzb>"#.to_vec();
                     } else if matches!(mode,Mode::PayloadInvalidMid) {
                         nzb=String::from_utf8(nzb).unwrap().replace("actual-part@fixture.test","not-a-message-id").into_bytes();
+                    } else if matches!(mode,Mode::PayloadChangedReference)&&log.lock().unwrap().iter().filter(|line|line.as_str()=="BODY <nzb@fixture.test>").count()>1 {
+                        nzb=String::from_utf8(nzb).unwrap().replace("actual-part@fixture.test","changed-part@fixture.test")
+                            .replace("example.spot","another.allowed.group").into_bytes();
                     }
                     let mut encoder=flate2::write::DeflateEncoder::new(Vec::new(),flate2::Compression::default());encoder.write_all(&nzb).unwrap();
                     let mut reply=b"222 body\r\n".to_vec();

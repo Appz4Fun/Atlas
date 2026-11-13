@@ -173,10 +173,9 @@ impl Service {
         let row=|key:String|store::SpotRow {message_id:id.to_owned(),kind,spot:spot.clone(),spotter_id:verdict.spotter_id.clone(),nzb_key:key,xml:xml.clone()};
         let nzb_ref=release::ids_key(&spot.nzb);
         let Some(claim)=shared.claim(&format!("ref:{nzb_ref}")) else {return Ok(Fetched::Pending)};claims.push(claim);
-        let known_ref=self.storage.with(|tx|Ok(store::known_ref(&Pg::new(tx),&nzb_ref)?))?;
-        match known_ref {
-            // Even a repeated reference must corroborate all payload groups
-            // before its old release can receive this Spot's tag.
+        match self.storage.with(|tx|Ok(store::known_ref(&Pg::new(tx),&nzb_ref)?))? {
+            // A successful reference is no substitute for the current NZB:
+            // only its actual HEAD-verified Plan can select a publication.
             Some((store::SAVED,Some(_)))=>{},
             Some(_)=>return Ok(Fetched::Skip(Some(nzb_ref))),None=>{},
         }
@@ -205,9 +204,6 @@ impl Service {
             Some(true)=>{},Some(false)=>return Ok(Fetched::Skip(Some(nzb_ref))),None=>return Ok(Fetched::Pending),
         }
         self.storage.check()?;
-        if let Some((store::SAVED,Some(release_id)))=known_ref {
-            return Ok(Fetched::Settled(self.storage.copy_of(release_id,&row(plan.key().to_owned()),&nzb_ref,chrono::Utc::now().timestamp())?))
-        }
         // Resource-only token from the SAME Db/Native, not a replacement
         // semaphore, session, write authority or independent memory budget.
         let permit=self.handle.block_on(crate::nntp::unless_stopped(&self.storage.owner.stop,
