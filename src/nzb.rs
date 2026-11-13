@@ -1077,3 +1077,7 @@ mod tests {
         assert_eq!(listed(&articles).iter().map(|f| f.articles).sum::<usize>(), 4);
     }
 }
+
+#[cfg(test)]
+#[path = "nzb/native_pg_wrapper_tests.rs"]
+mod native_pg_wrapper_tests;
