@@ -110,11 +110,11 @@ fn search(view:&ReadView<'_>,kind:&str,args:&HashMap<String,String>,base:&str,ke
         rows.extend(page.rows.into_iter().filter(|row|all||row.complete).take(limit-rows.len()));
         if read<limit||rows.len()>=limit{break;}
     }
-    let ids:Vec<_>=rows.iter().map(|row|row.id).collect();let mut facts=view.api_facts(&ids)?;let mut items=String::new();
+    let ids:Vec<_>=rows.iter().map(|row|row.id).collect();let mut facts=view.api_facts(&ids)?;let spots=view.spot_tags(&ids)?;let mut items=String::new();
     for row in rows {
         let facts=facts.remove(&row.id).context("native API result facts disappeared")?;
         items.push_str(&rss_item(base,key,&row,&on,RssItemFacts {size:row.size.unwrap_or(0),complete:row.complete,repair:false,category:facts.category,
-            password:facts.password.as_ref(),media:facts.media.as_ref(),copies:None,spot:None}));
+            password:facts.password.as_ref(),media:facts.media.as_ref(),copies:None,spot:spots.get(&row.id)}));
     }
     let reached=offset.checked_add(i64::try_from(ids.len())?).context("native API total overflow")?;
     let total=total.map(i64::try_from).transpose()?.unwrap_or(reached).max(reached);
