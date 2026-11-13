@@ -163,17 +163,21 @@ mod tests {
             }
         });
         let mut config = postgres::Config::new();
-        config.host("127.0.0.1").port(address.port()).ssl_mode(postgres::config::SslMode::Disable)
-            .dbname("example").user("example").connect_timeout(Duration::from_secs(1));
+        config
+            .host("127.0.0.1")
+            .port(address.port())
+            .ssl_mode(postgres::config::SslMode::Disable)
+            .dbname("example")
+            .user("example")
+            .connect_timeout(Duration::from_secs(1));
         let error = config.connect(postgres::NoTls).err();
         peer.join().unwrap();
         let error = error.expect("owned peer closes before PostgreSQL startup");
         assert!(std::error::Error::source(&error).is_some_and(|source| source.is::<std::io::Error>()));
-        let wrapped = rusqlite::Error::UserFunctionError(Box::new(crate::pg::sql::Error::Postgres(error)));
+        let wrapped = crate::pg::sql::Error::Postgres(error);
         assert_eq!(classify(&anyhow::Error::new(wrapped).context("native SQL callback")), Failure::Unavailable);
         let file = std::io::Error::from(std::io::ErrorKind::NotFound);
-        let wrapped = rusqlite::Error::UserFunctionError(Box::new(file));
-        assert_eq!(classify(&anyhow::Error::new(wrapped).context("NXV callback")), Failure::Fatal);
+        assert_eq!(classify(&anyhow::Error::new(file).context("NXV callback")), Failure::Fatal);
     }
 
     #[test]
