@@ -301,7 +301,7 @@ impl Step for AudioPrintStep {
     }
     /// A film or an episode: small posts have no sound worth a print
     fn applies(&self, release: &ReleaseInfo) -> bool {
-        release.size >= crate::postprocess::schema::SMALL_VIDEO
+        release.size >= crate::postprocess::rules::SMALL_VIDEO
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let id = ctx.release().id;

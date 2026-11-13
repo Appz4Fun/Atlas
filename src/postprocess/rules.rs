@@ -4,14 +4,15 @@
 //! `CollectionReleasePolicy`). Size, file type and completeness never reject here:
 //! upstream's 1 MiB and 100 GiB gate only its body pass, and so they do in `body_gate`.
 
-use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use regex::Regex;
-use rusqlite::{Connection, params};
 
 use crate::config::PostprocessConfig;
 use crate::filters::{self, StoredPost};
+
+/// Minimum release size for video-specific body processing, including audio prints.
+pub const SMALL_VIDEO: i64 = 50 << 20;
 
 pub(crate) static PAR2: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\.(vol[0-9]+[+-][0-9]+\.par2|par2)$").unwrap());
@@ -119,48 +120,6 @@ pub fn judge_row(rules: &Rules, row: &RowFacts<'_>) -> Option<Reason> {
     } else {
         None
     }
-}
-
-/// Each release's files, streamed with no limit: a cap would make a big album
-/// read as half complete, and `--dead` would delete it.
-pub fn file_summaries(conn: &Connection, ids: &[i64]) -> rusqlite::Result<HashMap<i64, FileSummary>> {
-    let mut stmt = conn.prepare_cached(
-        "select filename, subject_part, expected, seen, touched_at, subject from files where release_id = ?",
-    )?;
-    let mut all = HashMap::with_capacity(ids.len());
-    for id in ids {
-        let mut s = FileSummary { all_par2: true, all_images: true, ..Default::default() };
-        let mut rows = stmt.query(params![id])?;
-        while let Some(r) = rows.next()? {
-            let (filename, part, expected): (String, Option<i64>, Option<i64>) = (r.get(0)?, r.get(1)?, r.get(2)?);
-            s.files += 1;
-            s.last_touch = s.last_touch.max(r.get::<_, Option<i64>>(4)?.unwrap_or(0));
-            let seen = crate::store::seen_count(r.get_ref(3)?.as_blob()?);
-            match expected {
-                Some(e) if e > 0 => {
-                    s.present += seen.min(e);
-                    s.wanted += e;
-                }
-                _ => {
-                    s.present += 1;
-                    s.wanted += 1;
-                }
-            }
-            s.all_par2 &= PAR2.is_match(&filename);
-            s.all_images &= IMAGE.is_match(&filename);
-            s.executable |= crate::junk::is_executable(&filename);
-            s.has_video |= crate::junk::is_video(&filename);
-            if s.files == 1 {
-                s.single_part = part;
-                s.single_expected = expected;
-                s.single_subject = r.get(5)?;
-            } else {
-                s.single_subject = None;
-            }
-        }
-        all.insert(*id, s);
-    }
-    Ok(all)
 }
 
 /// The tests that read `files`. The settling wait is the only `Wait`, soo no
@@ -393,31 +352,33 @@ mod tests {
     }
 
     #[test]
-    fn over_a_thousand_files_one_article_short_is_not_dead() {
-        let dir = tempfile::tempdir().unwrap();
-        let main = dir.path().join("atlas.db");
-        crate::db::create_db_at(&main).unwrap();
-        let articles: Vec<Article> = (0..1500)
-            .map(|f| Article {
-                message_id: format!("<{f}@x>"),
-                subject: format!("[{}/1500] \"f{f}.bin\" yEnc (1/1)", f + 1),
-                filename: Some(format!("f{f}.bin")),
-                part: Some(if f == 0 { 2 } else { 1 }),
-                total_parts: Some(if f == 0 { 2 } else { 1 }),
-                file_total: Some(1500),
-                bytes: 10,
-                ..Default::default()
-            })
-            .collect();
-        let release = Release { name: "Album".into(), group: G.into(), articles, ..Default::default() };
-        crate::store::save(&main, &[release]).unwrap();
-        let conn = crate::db::open_shard(&crate::store::shard_path(&main, crate::store::shard_of(G))).unwrap();
-        let (id, complete): (i64, bool) =
-            conn.query_row("select id, complete from releases", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
-        assert!(!complete);
-        let s = file_summaries(&conn, &[id]).unwrap().remove(&id).unwrap();
-        assert_eq!(s.files, 1500);
-        let facts = RowFacts { file_total: Some(1500), ..row(10, 1500, false) };
-        assert!(permille(&facts, &s) >= 950, "{}", permille(&facts, &s));
+    fn the_small_video_threshold_remains_fifty_mib() {
+        assert_eq!(SMALL_VIDEO,52_428_800);
+    }
+
+    #[test]
+    #[ignore="Root-only isolated PostgreSQL and native StepReads admission"]
+    fn over_a_thousand_native_files_one_article_short_is_not_dead() {
+        let schema=crate::pg::testing::Schema::new().expect("explicit isolated native PG admission");
+        let runtime=crate::pg::stage_queue_tests::runtime(&schema);
+        let articles:Vec<Article>=(0..1500).map(|f|Article {
+            message_id:format!("<{f}@native.test>"),subject:format!("[{}/1500] \"f{f}.bin\" yEnc (1/1)",f+1),
+            filename:Some(format!("f{f}.bin")),part:Some(if f==0 {2}else{1}),total_parts:Some(if f==0 {2}else{1}),
+            file_total:Some(1500),bytes:10,..Default::default()
+        }).collect();
+        let release=Release {name:"Album".into(),group:G.into(),articles,..Default::default()};
+        let id=runtime.owner.with(|client| {
+            crate::pg::release_writer::save(client,&[release],1)?;
+            Ok(client.query_one("select id from releases",&[])?.get::<_,i64>(0))
+        }).unwrap();
+        let reads=crate::pg::stage_reads::StepReads::for_owner(&runtime.owner).unwrap();
+        let snapshot=reads.snapshot(id).unwrap().expect("actual native album snapshot");
+        assert!(!snapshot.info.complete);assert_eq!(snapshot.summary.files,1500);
+        assert_eq!(snapshot.summary.present,1500);assert_eq!(snapshot.summary.wanted,1501);
+        let facts=RowFacts {group:&snapshot.info.group,name:&snapshot.info.name,size:snapshot.info.size,
+            parts:snapshot.info.parts,complete:snapshot.info.complete,file_total:snapshot.info.file_total};
+        assert_eq!(permille(&facts,&snapshot.summary),999,"all files must contribute beyond the first page");
+        assert_eq!(judge_files(&rules(),&facts,&snapshot.summary,NOW),Verdict::Pass);
+        runtime.owner.close();
     }
 }
