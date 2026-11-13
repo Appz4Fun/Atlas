@@ -287,6 +287,13 @@ fn say_blocked(blocked: &[String]) {
     }
 }
 
+/// Per-server round-robin position and the one-worker priority obligation.
+#[derive(Clone,Copy,Default)]
+struct GroupTurn {
+    next:usize,
+    ordinary_due:bool,
+}
+
 /// State shared by the scheduler's workers for one set of servers.
 struct Scheduler {
     native: Option<NativeProfile>,
@@ -304,7 +311,7 @@ struct Scheduler {
     plan: Vec<(usize, usize)>,
     workers: usize,
     /// round robin position in `groups`, per server
-    next: Mutex<HashMap<usize, usize>>,
+    next: Mutex<HashMap<usize, GroupTurn>>,
     /// the groups big releases come from (`chunks::media_groups`), taken before the round robin's next
     media: RwLock<Vec<String>>,
     /// groups a worker is on right now, and whose worker (the server it was taken for)
@@ -495,9 +502,11 @@ impl Scheduler {
     /// Next group due on `server`: one that maps to this server and isnt being
     /// indexed, resting or parked. Each server pulls its own groups soo every
     /// server's connections stay busy.
-    /// How many of `server`'s workers may be on the groups big releases come from at once: half, and one at least.
-    fn media_share(&self, server: usize) -> usize {
-        (self.workers_of(server) / 2).max(1)
+    /// Half the workers may take media priority. A lone worker alternates
+    /// priority with round robin instead of reserving its only slot forever.
+    fn media_share(&self, server: usize, turn:&GroupTurn) -> usize {
+        let workers=self.workers_of(server);
+        if workers==1&&turn.ordinary_due {0}else{(workers/2).max(1)}
     }
 
     /// workers of `server` that run day chunks ahead of its due groups at once (`next_work`): one per
@@ -569,7 +578,7 @@ impl Scheduler {
         let mut wait = self.wait_until.lock().unwrap();
         let mut failed = self.failed.lock().unwrap();
         let mut next = self.next.lock().unwrap();
-        let next = next.entry(server).or_insert(0);
+        let turn = next.entry(server).or_default();
 
         failed.retain(|_, parked| parked.since.elapsed() < FAILED_RETRY);
         // thousands of groups can be resting: the ones done resting are let go of once a second, not on every call
@@ -582,7 +591,7 @@ impl Scheduler {
         }
         let resting = |g: &str| wait.get(g).is_some_and(|until| *until > now);
         if let Some(cache) = ranked {
-            return self.take_ranked(server, &groups, &tier, &cache, &mut busy, &resting, &failed, next);
+            return self.take_ranked(server, &groups, &tier, &cache, &mut busy, &resting, &failed, turn);
         }
 
         // the server a group's passes go to: a parked one's stand-in. none when config bans it from every server left
@@ -597,22 +606,23 @@ impl Scheduler {
         // server's workers on them, so the round robin always moves
         let media = self.media.read().unwrap();
         let on_media = media.iter().filter(|g| busy.contains_key(*g) && on(g) == Some(server)).count();
-        if on_media < self.media_share(server)
+        if on_media < self.media_share(server,turn)
             && let Some(g) = media.iter().find(|g| groups.contains(g) && free(g))
         {
+            turn.ordinary_due=self.workers_of(server)==1;
             busy.insert(g.clone(), server);
             return Some(g.clone());
         }
 
         for step in 0..groups.len() {
-            let idx = (*next + step) % groups.len();
+            let idx = (turn.next + step) % groups.len();
             let g = &groups[idx];
 
             if !free(g) {
                 continue;
             }
 
-            *next = idx + 1;
+            turn.next = idx + 1;turn.ordinary_due=false;
             busy.insert(g.clone(), server);
             return Some(g.clone());
         }
@@ -652,7 +662,7 @@ impl Scheduler {
         busy: &mut HashMap<String, usize>,
         resting: &dyn Fn(&str) -> bool,
         failed: &HashMap<String, Parked>,
-        next: &mut usize,
+        turn: &mut GroupTurn,
     ) -> Option<String> {
         let pool = &self.ctx.pool;
         let mut view = pool.rank_view();
@@ -673,12 +683,13 @@ impl Scheduler {
         // a group big releases come from goes as soon as it's due, like `take_group` says
         let media = self.media.read().unwrap();
         let on_media = media.iter().filter(|g| busy.contains_key(*g) && on(g, &view) == Some(server)).count();
-        if on_media < self.media_share(server)
+        if on_media < self.media_share(server,turn)
             && let Some(g) = media.iter().find(|g| cache.idx.contains_key(*g) && free(g, &view))
         {
             if !failed.contains_key(g) {
                 view.keep(cache.order(g), g, server);
             }
+            turn.ordinary_due=self.workers_of(server)==1;
             busy.insert(g.clone(), server);
             return Some(g.clone());
         }
@@ -698,13 +709,13 @@ impl Scheduler {
         } else {
             cache.home_of(server, groups.len(), &extra)
         };
-        let start = candidates.partition_point(|&i| (i as usize) < *next % groups.len());
+        let start = candidates.partition_point(|&i| (i as usize) < turn.next % groups.len());
         for &i in candidates[start..].iter().chain(&candidates[..start]) {
             let g = &groups[i as usize];
             if !free(g, &view) {
                 continue;
             }
-            *next = i as usize + 1;
+            turn.next = i as usize + 1;turn.ordinary_due=false;
             if !failed.contains_key(g) {
                 view.keep(cache.order_at(i as usize), g, server);
             }
@@ -737,7 +748,7 @@ impl Scheduler {
             },
             &extra,
         );
-        let start = candidates.partition_point(|&i| (i as usize) < *next % groups.len());
+        let start = candidates.partition_point(|&i| (i as usize) < turn.next % groups.len());
         for &i in candidates[start..].iter().chain(&candidates[..start]) {
             let g = &groups[i as usize];
             if busy.contains_key(g) || resting(g) || failed.contains_key(g) {
@@ -749,7 +760,7 @@ impl Scheduler {
             if !order[..at].iter().all(|&s| s == now_on || full(s)) {
                 continue;
             }
-            *next = i as usize + 1;
+            turn.next = i as usize + 1;turn.ordinary_due=false;
             view.assign(g, server);
             busy.insert(g.clone(), server);
             return Some(g.clone());
@@ -2525,7 +2536,8 @@ mod tests {
             let busy = sched.busy.lock().unwrap();
             let wait = sched.wait_until.lock().unwrap();
             let failed = sched.failed.lock().unwrap();
-            let next = sched.next.lock().unwrap().get(&server).copied().unwrap_or(0);
+            let turn = sched.next.lock().unwrap().get(&server).copied().unwrap_or_default();
+            let next=turn.next;
             let view = pool.rank_view();
             let now = Instant::now();
             let resting = |g: &String| wait.get(g).is_some_and(|u| *u > now);
@@ -2538,7 +2550,7 @@ mod tests {
             let free = |g: &String| !busy.contains_key(g) && !resting(g) && on(g) == Some(server);
             let media = sched.media.read().unwrap();
             let on_media = media.iter().filter(|g| busy.contains_key(*g) && on(g) == Some(server)).count();
-            if on_media < sched.media_share(server)
+            if on_media < sched.media_share(server,&turn)
                 && let Some(g) = media.iter().find(|g| groups.contains(g) && free(g))
             {
                 return Some(g.clone());
@@ -2643,6 +2655,69 @@ mod tests {
         assert_eq!(take().as_deref(), Some("b"));
         assert_eq!(take().as_deref(), Some("c"));
         assert_eq!(take(), None, "a group no longer indexed is never taken");
+    }
+
+    fn media_fair_scheduler(ranked:bool,workers:usize)->Scheduler {
+        let pool=Pool::new(&[UsenetServer::new("owned-scheduler.test","fixture","fixture",119)])
+            .with_ranking(&crate::config::IndexingConfig {ranked,..Default::default()},None);
+        let groups=["a","m0","b","m1","c"].into_iter().map(str::to_owned).collect();
+        let mut sched=scheduler(pool,groups);sched.plan=vec![(0,workers)];
+        *sched.media.write().unwrap()=vec!["m0".into(),"m1".into()];
+        for group in ["a","m0","b","m1","c"] {sched.ctx.states.with(group,|state|state.backfilling=true);}
+        sched
+    }
+
+    fn lone_media_rotation(ranked:bool) {
+        let sched=media_fair_scheduler(ranked,1);let mut picked=Vec::new();
+        for _ in 0..30 {
+            let group=sched.take_group(0).expect("every fixture group remains due");
+            sched.finish(&group,0,false,Ok(Progress {articles:1,..Default::default()}));picked.push(group);
+        }
+        assert_eq!(picked[0],"m0","a lone worker still gives priority media the first turn");
+        for window in picked.chunks_exact(10) {
+            let ordinary=window.iter().filter(|g|matches!(g.as_str(),"a"|"b"|"c")).map(String::as_str).collect::<Vec<_>>();
+            assert_eq!(ordinary,["a","b","c"],"always-due priority work cannot starve or reorder ordinary round robin");
+            assert!(window.iter().any(|g|g=="m1"),"lower-priority media also receives a round-robin pass");
+            assert!(window.iter().filter(|g|g.as_str()=="m0").count()>1,"priority remains active");
+        }
+    }
+    #[test]
+    fn unranked_lone_worker_rotates_ordinary_groups_under_continuous_media_backfill() {lone_media_rotation(false);}
+    #[test]
+    fn ranked_lone_worker_rotates_ordinary_groups_under_continuous_media_backfill() {lone_media_rotation(true);}
+
+    fn concurrent_media_rotation(ranked:bool) {
+        for workers in [2,3,4] {
+            let sched=media_fair_scheduler(ranked,workers);
+            let mut held=(0..workers).map(|_|sched.take_group(0).expect("configured worker has due work")).collect::<Vec<_>>();
+            assert_eq!(held[0],"m0");assert!(held.iter().any(|g|matches!(g.as_str(),"a"|"b"|"c")));
+            let mut ordinary=HashSet::new();let mut media=HashSet::new();
+            for _ in 0..20 {for slot in &mut held {
+                if matches!(slot.as_str(),"m0"|"m1"){media.insert(slot.clone());}else{ordinary.insert(slot.clone());}
+                sched.finish(slot,0,false,Ok(Progress {articles:1,..Default::default()}));
+                *slot=sched.take_group(0).expect("completed slots keep serving real due groups");
+            }}
+            assert_eq!(ordinary,HashSet::from(["a".to_owned(),"b".to_owned(),"c".to_owned()]));
+            assert_eq!(media,HashSet::from(["m0".to_owned(),"m1".to_owned()]));
+        }
+    }
+    #[test]
+    fn unranked_multiple_workers_keep_media_priority_and_ordinary_rotation() {concurrent_media_rotation(false);}
+    #[test]
+    fn ranked_multiple_workers_keep_media_priority_and_ordinary_rotation() {concurrent_media_rotation(true);}
+
+    #[test]
+    fn blocked_scheduler_look_does_not_spend_a_lone_workers_round_robin_turn() {
+        for ranked in [false,true] {
+            let sched=media_fair_scheduler(ranked,1);let priority=sched.take_group(0).unwrap();assert_eq!(priority,"m0");
+            // An ineligible look starts nothing. Simulate other in-flight groups
+            // with actual scheduler busy markers, without clocks or SQL facts.
+            {let groups=sched.groups.read().unwrap();let mut busy=sched.busy.lock().unwrap();for g in groups.iter(){busy.insert(g.clone(),0);}}
+            assert_eq!(sched.take_group(0),None);
+            sched.busy.lock().unwrap().retain(|g,_|g=="m0");
+            sched.finish(&priority,0,false,Ok(Progress {articles:1,..Default::default()}));
+            assert_eq!(sched.take_group(0).as_deref(),Some("a"),"the owed ordinary turn survives an unsuccessful look");
+        }
     }
 
     /// a group that failed 3 times in a row on its server has its passes on the next one meanwhile, the first of them
