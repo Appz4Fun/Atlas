@@ -153,3 +153,60 @@ mod tests {
         assert!(view.nzb_own(id+1,Pick::Whole,&pool).unwrap().is_none());
     }
 }
+
+#[cfg(test)]
+mod sparse_nameless_tests {
+    use super::*;
+    use crate::{parser::{Article,Release},search::{ArticleRow,ReleaseRow},pg::fresh_reader::Budget};
+    use std::time::{Duration,Instant};
+    #[test]
+    #[ignore="requires explicit isolated PostgreSQL and bounded native spool admission"]
+    fn sparse_nameless_envelopes_are_distinct_files_with_matching_list_and_get_ordinals() {
+        let schema=crate::pg::testing::Schema::new().expect("explicit isolated PostgreSQL");let mut client=schema.pool.get().unwrap();
+        let first_subject=format!("{}tail", "α & \"original\" ".repeat(800));
+        let first=Release {name:"Sparse.Envelope.Release".into(),group:"alt.binaries.test".into(),poster:"first & poster".into(),date:"Wed, 01 Jan 2020 00:00:00 +0000".into(),
+            articles:vec![Article {filename:None,subject:first_subject.clone(),message_id:"<alpha@example.invalid>".into(),part:Some(1),total_parts:Some(1),bytes:17,..Default::default()}],..Default::default()};
+        let mut second=first.clone();second.poster="second <poster>".into();second.date="Thu, 02 Jan 2020 00:00:00 +0000".into();
+        second.articles[0].subject="second independent subject".into();second.articles[0].message_id="<beta@example.invalid>".into();second.articles[0].bytes=23;
+        let mut named=first.clone();named.poster="current named poster".into();named.date="Fri, 03 Jan 2020 00:00:00 +0000".into();
+        named.articles=vec![Article {filename:Some("z.mkv".into()),subject:"z.mkv yEnc (1/1)".into(),message_id:"<named-a@example.invalid>".into(),part:Some(1),total_parts:Some(1),bytes:31,..Default::default()},
+            Article {filename:Some("z.mkv".into()),subject:"z.mkv yEnc (1/1)".into(),message_id:"<named-b@example.invalid>".into(),part:Some(1),total_parts:Some(1),bytes:37,..Default::default()}];
+        let stats=crate::pg::release_writer::save(&mut client,&[first.clone(),second.clone(),named.clone()],1).unwrap();
+        assert_eq!(stats,crate::pg::release_writer::SaveStats {releases:1,files:2,parts:4});
+        let id:i64=client.query_one("select id from releases where name='Sparse.Envelope.Release'",&[]).unwrap().get(0);
+        let row=ReleaseRow {id,name:first.name.clone(),group_name:first.group.clone(),complete:true,..Default::default()};
+        let articles=vec![
+            ArticleRow {message_id:first.articles[0].message_id.clone(),filename:None,part:Some(1),total_parts:Some(1),bytes:Some(17),subject:Some(first_subject),poster:Some(first.poster.clone()),posted_date:Some(first.date.clone())},
+            ArticleRow {message_id:second.articles[0].message_id.clone(),filename:None,part:Some(1),total_parts:Some(1),bytes:Some(23),subject:Some(second.articles[0].subject.clone()),poster:Some(second.poster.clone()),posted_date:Some(second.date.clone())},
+            ArticleRow {message_id:named.articles[0].message_id.clone(),filename:Some("z.mkv".into()),part:Some(1),total_parts:Some(1),bytes:Some(31),subject:Some(named.articles[0].subject.clone()),poster:Some(named.poster.clone()),posted_date:Some(named.date.clone())},
+            ArticleRow {message_id:named.articles[1].message_id.clone(),filename:Some("z.mkv".into()),part:Some(1),total_parts:Some(1),bytes:Some(37),subject:Some(named.articles[1].subject.clone()),poster:Some(named.poster.clone()),posted_date:Some(named.date.clone())}];
+        let root=tempfile::tempdir().unwrap();
+        #[cfg(unix)] {use std::os::unix::fs::PermissionsExt;std::fs::set_permissions(root.path(),std::fs::Permissions::from_mode(0o700)).unwrap();}
+        let pool=Pool::new(root.path().into(),crate::nzb_spool::Limits {requests:6,per_request_bytes:1<<20,total_bytes:6<<20,free_bytes:0}).unwrap();
+        let view=ReadView::open(&mut client,&schema.name,Budget::default(),Instant::now()+Duration::from_secs(10)).unwrap();
+        for (pick,expected) in [(Pick::Whole,articles.as_slice()),(Pick::Ordinal(1),&articles[0..1]),(Pick::Ordinal(2),&articles[1..2]),(Pick::Ordinal(3),&articles[2..4]),(Pick::Name("z.mkv"),&articles[2..4])] {
+            let mut actual=view.nzb_own(id,pick,&pool).unwrap().unwrap();let mut xml=String::new();actual.body.read_to_string(&mut xml).unwrap();
+            let expected=crate::nzb::render_checked(&row,expected,std::slice::from_ref(&row.group_name),matches!(pick,Pick::Whole));
+            assert_eq!(xml,expected.xml);assert_eq!(actual.gaps,0);
+        }
+        let mut files=String::new();view.file_list(id,&pool).unwrap().unwrap().read_to_string(&mut files).unwrap();
+        assert_eq!(files,format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<files id=\"{id}\" count=\"3\">\n  <file n=\"1\" size=\"17\" articles=\"1\"/>\n  <file n=\"2\" size=\"23\" articles=\"1\"/>\n  <file n=\"3\" name=\"z.mkv\" size=\"68\" articles=\"2\"/>\n</files>\n"));
+        assert!(view.nzb_own(id,Pick::Ordinal(4),&pool).unwrap().is_none());
+        assert!(view.nzb_own(id,Pick::Name(""),&pool).unwrap().is_none());
+    }
+    #[test]
+    #[ignore="requires explicit isolated PostgreSQL and bounded native spool admission"]
+    fn uncaptured_empty_filename_cannot_be_relabelled_as_a_literal_none_envelope() {
+        let schema=crate::pg::testing::Schema::new().expect("explicit isolated PostgreSQL");let mut client=schema.pool.get().unwrap();
+        let release=Release {name:"Empty.Filename.Control".into(),group:"alt.binaries.test".into(),poster:"poster".into(),date:"Wed, 01 Jan 2020 00:00:00 +0000".into(),
+            articles:vec![Article {filename:Some(String::new()),subject:"empty filename input".into(),message_id:"empty@example.invalid".into(),part:Some(1),total_parts:Some(1),bytes:17,..Default::default()}],..Default::default()};
+        assert_eq!(crate::pg::release_writer::save(&mut client,&[release],1).unwrap().parts,1);
+        assert_eq!(client.query_one("select count(*) from segment_nzb_metadata",&[]).unwrap().get::<_,i64>(0),0);
+        let id:i64=client.query_one("select id from releases",&[]).unwrap().get(0);
+        let root=tempfile::tempdir().unwrap();
+        #[cfg(unix)] {use std::os::unix::fs::PermissionsExt;std::fs::set_permissions(root.path(),std::fs::Permissions::from_mode(0o700)).unwrap();}
+        let pool=Pool::new(root.path().into(),crate::nzb_spool::Limits {requests:6,per_request_bytes:1<<20,total_bytes:6<<20,free_bytes:0}).unwrap();
+        let view=ReadView::open(&mut client,&schema.name,Budget::default(),Instant::now()+Duration::from_secs(10)).unwrap();
+        assert!(view.nzb_own(id,Pick::Whole,&pool).is_err(),"missing original metadata is unavailable, not a representative fallback");
+    }
+}
