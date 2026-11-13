@@ -210,6 +210,26 @@ impl WordIndex {
         Ok(self.ready() && marker(self, stamp)?)
     }
 
+    /// A new RR source transaction has a new input snapshot even when this
+    /// catalog/codec stamp is unchanged. Never resume its predecessor's base
+    /// cursor; concurrent writes remain in the durable delivery queue.
+    pub(crate) fn restart_native_build(&self,stamp:[u8;32])->Result<()> {
+        ensure!(!self.native_ready(stamp)?,"a ready native index must use queue delivery, not base restart");
+        self.native_writer()?;
+        let mut guard=lock(&self.writer);
+        let writer=guard.as_mut().context("native word-index writer missing")?;
+        writer.rollback()?;
+        match std::fs::remove_file(self.dir.join(BUILT)) {
+            Ok(())=>{},Err(error) if error.kind()==std::io::ErrorKind::NotFound=>{},Err(error)=>return Err(error.into()),
+        }
+        self.ready.store(false,Ordering::Release);
+        writer.delete_all_documents()?;
+        commit_with(writer,&building(stamp,0,0))?;
+        self.reader.reload()?;
+        ensure!(self.reader.searcher().num_docs()==0,"native base restart retained old source documents");
+        Ok(())
+    }
+
     pub(crate) fn build_native(
         &self, source: &mut impl BuildSource, budget: Budget, mut go_on: impl FnMut() -> bool,
     ) -> Result<Progress> {

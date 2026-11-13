@@ -1139,6 +1139,28 @@ mod tests {
     }
 
     #[test]
+    fn native_new_read_snapshot_restarts_unfinished_base_and_preserves_ready_index() {
+        let f=fixture();
+        for i in 0..5 {f.add(&format!("Alpha.Movie.202{i}.1080p-X"),"alt.binaries.a",10+i,Some(HD));}
+        let conn=f.conn();let mut first=NativeFixtureSource::from_legacy(&conn);
+        let directory=f.dir.path().join("native.words");let stamp=[7;32];
+        let index=WordIndex::open_native(&directory,stamp).unwrap();
+        let budget=native::Budget {rows:1,bytes:512,commit_bytes:512};
+        let partial=index.build_native(&mut first,budget,||false).unwrap();
+        assert!(!partial.complete);assert_eq!(partial.documents,1);
+        let removed=first.rows[0].id;drop(first);
+        f.shard("alt.binaries.a").execute("delete from releases where id=?1",[removed]).unwrap();
+        let mut changed=NativeFixtureSource::from_legacy(&conn);
+        assert_eq!(changed.rows.len(),4);
+        index.restart_native_build(stamp).unwrap();
+        assert_eq!(index.build_native(&mut changed,budget,||true).unwrap().documents,4);
+        let found=index.search_native(&mut changed,"alpha",None,&[],By::Newest,true,0,10,native::Budget::default()).unwrap();
+        assert_eq!(found.rows.len(),4);assert!(!found.rows.iter().any(|row|row.id==removed));
+        assert!(index.restart_native_build(stamp).is_err(),"ready indexes catch up through the durable queue");
+        assert!(index.native_ready(stamp).unwrap());
+    }
+
+    #[test]
     fn native_tantivy_resume_and_ack_replay_never_duplicate_public_ids() {
         let f = fixture();
         for i in 0..5 { f.add(&format!("Alpha.Movie.202{i}.1080p-X"), "alt.binaries.a", 10 + i, Some(HD)); }
