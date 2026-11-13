@@ -3366,6 +3366,10 @@ fn nzb_files_html(
     pictures: &HashMap<String, PictureState>,
     csrf: &str,
 ) -> String {
+    nzb_files_html_with(id,contents,pictures,csrf,picture_state_html)
+}
+fn nzb_files_html_with(id:i64,contents:&release_info::Contents,pictures:&HashMap<String,PictureState>,csrf:&str,
+    render_picture:fn(i64,&str,&PictureState,&str)->String)->String {
     if contents.list.is_empty() {
         return String::new();
     }
@@ -3391,7 +3395,7 @@ fn nzb_files_html(
                 escape(&f.name)
             };
             let picture = if picture_column {
-                let cell = pictures.get(&f.name).map(|p| picture_state_html(id, &f.name, p, csrf)).unwrap_or_default();
+                let cell = pictures.get(&f.name).map(|p| render_picture(id, &f.name, p, csrf)).unwrap_or_default();
                 format!("<td class=\"col-picture\">{cell}</td>")
             } else {
                 String::new()

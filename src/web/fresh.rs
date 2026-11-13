@@ -92,6 +92,14 @@ fn dispatch_with_assets(view:&ReadView<'_>,path:&str,args:&HashMap<String,String
             let body=crate::web_pending::native_with_pace(&current.state,&pace,&waits,&rules,current.now)?;
             view.verify_runtime(current.owner.as_ref())?;Ok(html(200,body))
         }
+        "/ui/picture"=>{
+            let id=args.get("id").and_then(|id|id.trim().parse().ok()).unwrap_or(0);let name=args.get("name").map(String::as_str).unwrap_or_default();
+            if !crate::images::is_image_name(name){return Ok(html(400,r#"<div class="picture-state">Not a picture.</div>"#.into()));}
+            if !view.has_own_picture(id,name)? {return Ok(html(404,r#"<div class="picture-state">No such picture in this release.</div>"#.into()));}
+            let pictures=view.own_pictures(id)?;let etas=native_picture_etas(view,&pictures,[name])?;let state=native_picture_state(name,&pictures,&etas);
+            if state==PictureState::Shown {return Ok(html(200,format!(r#"<div class="picture-state">{} <a href="/ui/release?id={id}#pictures">reload to see it</a></div>"#,tag("tag-ok","SHOWN"))));}
+            Ok(html(200,native_picture_state_html(id,name,&state,"")))
+        }
         "/ui/poster"|"/ui/cover"|"/ui/still"|"/ui/image"=>{
             asset_fragment(view,path,args,assets,&crate::api::fresh::spools()?)
         }
@@ -163,6 +171,39 @@ fn asset_fragment(view:&ReadView<'_>,path:&str,args:&HashMap<String,String>,asse
         ("Content-Security-Policy".into(),"default-src 'none'; img-src 'self'; sandbox".into())];Ok(response)
 }
 
+fn native_picture_etas<'name>(view:&ReadView<'_>,pictures:&pg::fresh_pictures::Pictures,names:impl IntoIterator<Item=&'name str>)->Result<HashMap<i64,String>> {
+    let names:HashSet<_>=names.into_iter().collect();let mut effective:HashMap<&str,&crate::images::step::Request>=HashMap::new();
+    for request in pictures.requests.iter().filter(|request|names.contains(request.file.as_str())) {
+        // The request reader is ordered after the own row, as in the legacy
+        // request list; equal timestamps retain the same last-row precedence.
+        effective.entry(request.file.as_str()).and_modify(|old|{if request.requested_at>=old.requested_at{*old=request;}}).or_insert(request);
+    }
+    let mut etas=HashMap::new();
+    for request in effective.into_values().filter(|request|request.done_at.is_none()&&!request.passed_over
+        &&!pictures.images.iter().any(|(_,image)|image.file==request.file)) {
+        if let std::collections::hash_map::Entry::Vacant(entry)=etas.entry(request.release_id) {
+            entry.insert(view.picture_eta(request.release_id)?.unwrap_or_else(||"native processing status is unavailable".into()));
+        }
+    }Ok(etas)
+}
+fn native_picture_state(name:&str,pictures:&pg::fresh_pictures::Pictures,etas:&HashMap<i64,String>)->PictureState {
+    if pictures.images.iter().any(|(_,image)|image.file==name){return PictureState::Shown;}
+    match pictures.requests.iter().filter(|request|request.file==name).max_by_key(|request|request.requested_at) {
+        Some(request) if request.done_at.is_none()&&request.passed_over=>PictureState::Failed("the pictures step isn't reading this release".into()),
+        Some(request) if request.done_at.is_none()=>PictureState::Queued(etas.get(&request.release_id).cloned().unwrap_or_else(||"native processing status is unavailable".into())),
+        Some(request) if request.outcome.as_deref().is_some_and(|outcome|outcome!=crate::images::step::Answer::Shown.word())=>PictureState::Failed(request.outcome.clone().unwrap_or_default()),
+        _=>PictureState::Offer,
+    }
+}
+fn native_picture_state_html(id:i64,name:&str,state:&PictureState,csrf:&str)->String {
+    let unavailable="Picture requests are unavailable while native request handling is being qualified.";
+    match state {
+        PictureState::Shown|PictureState::Queued(_)=>picture_state_html(id,name,state,csrf),
+        PictureState::Failed(why)=>format!(r#"<div class="picture-state">{} <span class="dim">{}</span> <span class="dim">{unavailable}</span></div>"#,tag("tag-bad","NOT SHOWN"),escape(why)),
+        PictureState::Offer=>format!(r#"<div class="picture-state dim">{unavailable}</div>"#),
+    }
+}
+
 fn own_release_page(view:&ReadView<'_>,id:i64,key:&str)->Result<String> {
     let row=view.release(id)?.context("native release disappeared")?;
     let names=view.own_names(id)?.context("native release name disappeared")?;
@@ -183,14 +224,19 @@ fn own_release_page(view:&ReadView<'_>,id:i64,key:&str)->Result<String> {
     // Full-page relationship/asset qualification is deliberately separate
     // from these real own facts. Unavailability is visible, never absence.
     let warning=diag("note","Additional release panels unavailable",
-        "Related postings, password hints, retained artwork and related metadata lookups are unavailable in the native reader.");
+        "Related postings and sidecar lookups, password hints and borrowed artwork are unavailable in the native reader. Own picture bytes require the selected asset root and manifest.");
     let inputs=crate::web_meta::MetaInputs {release:&row,names:Some(&names),inner:&inner,contents:&contents,probe:found.as_ref()};
     let metadata=view.own_metadata(&inputs)?;
     let meta=crate::web_meta::meta_from_facts(&inputs,&metadata);
-    let nzb_files=nzb_files_html(id,&contents,&HashMap::new(),&crate::web_settings::csrf_token(key));
+    let pictures=view.own_pictures(id)?;view.admit_picture_cells(&contents)?;let etas=native_picture_etas(view,&pictures,contents.list.iter().filter(|file|crate::images::is_image_name(&file.name)).map(|file|file.name.as_str()))?;
+    let mut states=HashMap::new();
+    for file in contents.list.iter().filter(|file|crate::images::is_image_name(&file.name)) {
+        states.insert(file.name.clone(),native_picture_state(&file.name,&pictures,&etas));
+    }
+    let nzb_files=nzb_files_html_with(id,&contents,&states,&crate::web_settings::csrf_token(key),native_picture_state_html);
     let files=inner_files_html(&inner,false);
     Ok(release_page_from_facts(&row,&shown,raw.as_deref(),&tags,&facts,listing.category,
-        ReleaseSections {fill:String::new(),warning,spot:String::new(),nfo,images:String::new(),stills:String::new(),copies:String::new(),meta,probe,nzb_files,files}))
+        ReleaseSections {fill:String::new(),warning,spot:String::new(),nfo,images:images_html(id,&pictures.images),stills:stills_html(id,&pictures.stills,None),copies:String::new(),meta,probe,nzb_files,files}))
 }
 
 fn query(view:&ReadView<'_>,search:&Search)->Result<(Vec<ReleaseRow>,crate::field_search::Total)> {
@@ -819,5 +865,86 @@ mod native_asset_route_tests {
         let view=ReadView::open(&mut client,&schema.name,pg::fresh_reader::Budget::default(),Instant::now()+Duration::from_secs(10)).unwrap();
         assert!(asset_fragment(&view,"/ui/poster",&args,Some(&assets),&pool).is_err(),"an unbound PG receipt cannot grant file access");
         drop(view);runtime.owner.close();
+    }
+}
+
+#[cfg(test)]
+mod native_own_picture_tests {
+    use super::*;
+    use crate::parser::{Article,Release};
+    use std::time::{Instant,Duration};
+    #[test]
+    #[ignore="requires explicit isolated PG, genuine empty-catalog owner bootstrap and own picture status rows"]
+    fn own_picture_panels_and_status_read_actual_pg_rows_without_creating_requests() {
+        let schema=pg::testing::Schema::new().expect("explicit isolated PG required");let runtime=pg::stage_queue_tests::runtime(&schema);
+        let names=["cover.jpg","queued.jpg","failed.jpg","offer.jpg"];
+        let id=runtime.owner.with(|client|{
+            let saved=pg::release_writer::save(client,&[Release {name:"Native.Picture.Release".into(),poster:"poster".into(),group:"alt.binaries.test".into(),date:"Wed, 01 Jan 2020 00:00:00 +0000".into(),
+                articles:names.iter().enumerate().map(|(n,name)|Article {filename:Some((*name).into()),subject:format!("{name} yEnc (1/1)"),message_id:format!("<picture-{n}@example.invalid>"),part:Some(1),total_parts:Some(1),bytes:17,..Default::default()}).collect(),..Default::default()}],1)?;
+            assert_eq!((saved.releases,saved.files,saved.parts),(1,4,4));
+            let id:i64=client.query_one("select id from releases",&[])?.try_get(0)?;
+            let metadata=serde_json::to_string(&crate::images::jpeg::JpegInfo {comment:Some("kept <comment>".into()),..Default::default()})?;
+            client.execute("insert into release_images(release_id,position,file,sha256,format,width,height,bytes,meta) values($1,1,'cover.jpg',$2,'jpeg',640,360,17,$3)",&[&id,&"a1".repeat(32),&metadata])?;
+            client.execute("insert into release_stills(release_id,position,at_ms,sha256,width,height) values($1,10,12345,$2,640,360)",&[&id,&"b2".repeat(32)])?;
+            let bit=crate::postprocess::step::mask(crate::images::step::IMAGES_STEP);
+            client.execute("insert into pp_state(release_id,net_wanted,net_left) values($1,true,$2)",&[&id,&bit])?;
+            client.execute("insert into picture_requests(release_id,file,requested_at,done_at,outcome) values($1,'queued.jpg',1,null,null),($1,'failed.jpg',2,3,'not a picture <bad>')",&[&id])?;Ok(id)
+        }).unwrap();
+        {
+            let mut client=schema.pool.get().unwrap();let view=ReadView::open(&mut client,&schema.name,pg::fresh_reader::Budget {rows:100,..Default::default()},Instant::now()+Duration::from_secs(10)).unwrap();
+            let response=dispatch(&view,"/ui/picture",&HashMap::from([("id".into(),id.to_string()),("name".into(),"cover.jpg".into())]),"http://example.invalid","fixture-key").unwrap();
+            assert_eq!(response.status,200);assert!(response.body.contains("SHOWN"),"a shown image needs no unrelated unavailable live ETA");
+        }
+        runtime.owner.close();let mut client=schema.pool.get().unwrap();
+        for (name,expected) in [("cover.jpg","SHOWN"),("queued.jpg","QUEUED"),("failed.jpg","NOT SHOWN"),("offer.jpg","Picture requests are unavailable")] {
+            let view=ReadView::open(&mut client,&schema.name,pg::fresh_reader::Budget {rows:100,..Default::default()},Instant::now()+Duration::from_secs(10)).unwrap();
+            let response=dispatch(&view,"/ui/picture",&HashMap::from([("id".into(),id.to_string()),("name".into(),name.into())]),"http://example.invalid","fixture-key").unwrap();
+            assert_eq!(response.status,200);assert!(response.body.contains(expected),"{}",response.body);assert!(!response.body.contains("hx-post="));
+            if name=="queued.jpg" {assert!(response.body.contains("on hold: native processing"),"{}",response.body);}
+            if name=="failed.jpg" {assert!(response.body.contains("&lt;bad&gt;")&&!response.body.contains("<bad>"));}
+        }
+        {
+            let view=ReadView::open(&mut client,&schema.name,pg::fresh_reader::Budget {rows:100,..Default::default()},Instant::now()+Duration::from_secs(10)).unwrap();
+            let response=dispatch(&view,"/ui/release",&HashMap::from([("id".into(),id.to_string())]),"http://example.invalid","fixture-key").unwrap();
+            assert_eq!(response.status,200);for expected in ["<h2>Pictures</h2>","<h2>Stills</h2>","/ui/image?id=","/ui/still?id=","kept &lt;comment&gt;","SHOWN","QUEUED"] {assert!(response.body.contains(expected),"missing {expected}: {}",response.body);}
+            assert!(!response.body.contains(r#"hx-post="/ui/picture""#));
+            let missing=dispatch(&view,"/ui/picture",&HashMap::from([("id".into(),id.to_string()),("name".into(),"missing.jpg".into())]),"http://example.invalid","fixture-key").unwrap();assert_eq!(missing.status,404);
+        }
+        assert_eq!(client.query_one("select count(*) from picture_requests where release_id=$1",&[&id]).unwrap().get::<_,i64>(0),2,"readonly GET never enqueues");
+        client.execute("update pp_state set net_left=0 where release_id=$1",&[&id]).unwrap();
+        let view=ReadView::open(&mut client,&schema.name,pg::fresh_reader::Budget {rows:100,..Default::default()},Instant::now()+Duration::from_secs(10)).unwrap();
+        let response=dispatch(&view,"/ui/picture",&HashMap::from([("id".into(),id.to_string()),("name".into(),"queued.jpg".into())]),"http://example.invalid","fixture-key").unwrap();
+        assert!(response.body.contains("NOT SHOWN")&&response.body.contains("isn't reading"),"{}",response.body);
+        drop(view);
+        let oversized=serde_json::to_string(&crate::images::jpeg::JpegInfo {comment:Some("x".repeat(256*1024)),..Default::default()}).unwrap();
+        client.execute("update release_images set meta=$2 where release_id=$1",&[&id,&oversized]).unwrap();
+        let view=ReadView::open(&mut client,&schema.name,pg::fresh_reader::Budget {rows:100,..Default::default()},Instant::now()+Duration::from_secs(10)).unwrap();
+        assert!(dispatch(&view,"/ui/picture",&HashMap::from([("id".into(),id.to_string()),("name".into(),"cover.jpg".into())]),"http://example.invalid","fixture-key").is_err(),"metadata allocation is admitted before JSON decode");
+        drop(view);
+        let live=pg::stage_queue_tests::runtime(&schema);
+        let bit=crate::postprocess::step::mask(crate::images::step::IMAGES_STEP);
+        let reader=live.owner.with(|client|{
+            let saved=pg::release_writer::save(client,&[Release {name:"Native.Picture.Reader".into(),poster:"poster".into(),group:"alt.binaries.test".into(),date:"Wed, 01 Jan 2020 00:00:00 +0000".into(),
+                articles:vec![Article {filename:Some("other.jpg".into()),subject:"other.jpg yEnc (1/1)".into(),message_id:"<picture-reader@example.invalid>".into(),part:Some(1),total_parts:Some(1),bytes:17,..Default::default()}],..Default::default()}],1)?;
+            assert_eq!((saved.releases,saved.files,saved.parts),(1,1,1));
+            let reader:i64=client.query_one("select id from releases where name='Native.Picture.Reader'",&[])?.try_get(0)?;
+            client.execute("update release_images set meta=null where release_id=$1",&[&id])?;
+            client.execute("update pp_state set net_left=$2 where release_id=$1",&[&id,&bit])?;
+            client.execute("insert into pp_state(release_id,net_wanted,net_left) values($1,true,$2)",&[&reader,&bit])?;
+            client.execute("insert into upload_link(release_id,lead_id) values($1,$2)",&[&id,&reader])?;
+            client.execute("insert into picture_requests(release_id,file,requested_at,done_at,outcome) values($1,'queued.jpg',10,11,'new final <reason>'),($1,'unrelated.jpg',12,null,null)",&[&reader])?;Ok(reader)
+        }).unwrap();assert_ne!(reader,id);
+        {
+            let view=ReadView::open(&mut client,&schema.name,pg::fresh_reader::Budget {rows:100,..Default::default()},Instant::now()+Duration::from_secs(10)).unwrap();
+            let read=view.processing(id).unwrap().unwrap();assert!(view.processing_pace(read.owner.as_ref(),read.now).is_err(),"original older request has deliberately unavailable live observation");
+        }
+        {
+            let view=ReadView::open(&mut client,&schema.name,pg::fresh_reader::Budget {rows:100,..Default::default()},Instant::now()+Duration::from_secs(10)).unwrap();
+            let response=dispatch(&view,"/ui/picture",&HashMap::from([("id".into(),id.to_string()),("name".into(),"queued.jpg".into())]),"http://example.invalid","fixture-key").unwrap();
+            assert_eq!(response.status,200);assert!(response.body.contains("NOT SHOWN")&&response.body.contains("new final &lt;reason&gt;"),"{}",response.body);
+            let response=dispatch(&view,"/ui/release",&HashMap::from([("id".into(),id.to_string())]),"http://example.invalid","fixture-key").unwrap();
+            assert_eq!(response.status,200);assert!(response.body.contains("new final &lt;reason&gt;"));assert!(!response.body.contains("QUEUED"));
+        }
+        live.owner.close();
     }
 }
