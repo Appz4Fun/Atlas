@@ -3124,3 +3124,7 @@ mod native_per_article_contract;
 #[cfg(test)]
 #[path = "../tests/common/native_collection_paths.rs"]
 mod native_collection_paths;
+
+#[cfg(test)]
+#[path = "../tests/common/native_multi_server_contract.rs"]
+mod native_multi_server_contract;
