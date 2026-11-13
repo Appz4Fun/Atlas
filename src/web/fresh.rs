@@ -4,6 +4,10 @@ use super::*;
 use anyhow::{Result,ensure,Context};
 use crate::{pg::{self,fresh_reader::ReadView},word_index::native::SearchSource};
 
+// Preserve the original ranked/rating admission, now owned by the native reader.
+const GROW_WITH_RATING: i64 = 8_000;
+const MAX_WINDOW: i64 = 100_000;
+
 pub(super) fn get(path:&str,args:&HashMap<String,String>,base:&str,key:&str,storage:&pg::StorageConfig)->Option<ApiResponse> {
     get_with_assets(path,args,base,key,storage,None)
 }
