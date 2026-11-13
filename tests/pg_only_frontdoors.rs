@@ -43,6 +43,16 @@ fn run(home: &std::path::Path, args: &[&str]) -> Output {
 #[test]
 fn retired_storage_commands_refuse_before_any_configuration_or_storage() {
     for command in [
+        "--purge",
+        "--reprocess",
+        "--predb-import",
+        "--replay-raw-predb",
+        "--reflag-obfuscated",
+        "--unname",
+        "--recount-articles",
+        "--count-repair-candidates",
+        "--split-reposts",
+        "--undo-mojibake",
         "--convert",
         "--compact",
         "--reset-shards",
@@ -123,9 +133,9 @@ fn selected_toml_failure_cannot_fall_back_to_valid_postgres_json() {
 }
 
 #[test]
-fn required_maintenance_refusal_is_distinct_from_storage_retirement() {
+fn crc_report_is_refused_without_opening_the_old_catalog() {
     let home = tempfile::tempdir().unwrap();
-    for command in ["--purge", "--reprocess", "--predb-import", "--replay-raw-predb"] {
+    for command in ["--crc-links"] {
         let output = run(home.path(), &[command, "--apply"]);
         assert_eq!(output.status.code(), Some(1));
         assert!(

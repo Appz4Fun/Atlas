@@ -63,7 +63,6 @@ pub mod raw_store;
 pub mod release_info;
 pub mod release_tags;
 pub mod repair;
-pub mod repair_counts;
 pub mod repost_split;
 pub mod sab;
 pub mod sealed_store;
