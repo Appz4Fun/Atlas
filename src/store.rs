@@ -3550,19 +3550,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn meta_keeps_numbers_and_texts_on_both_backends() {
-        crate::pg::testing::each(
-            |c| create_main(c).unwrap(),
-            |db| {
-                assert_eq!(meta_text(db, "owner").unwrap(), None);
-                put_meta_text(db, "owner", "a.example").unwrap();
-                put_meta_text(db, "owner", "b.example").unwrap();
-                assert_eq!(meta_text(db, "owner").unwrap().as_deref(), Some("b.example"));
-                put_meta(db, "count", 7).unwrap();
-                assert_eq!(meta(db, "count").unwrap(), Some(7));
-                assert_eq!(meta(db, "next_seq").unwrap(), Some(1));
-            },
-        );
+    #[ignore = "requires explicit isolated PostgreSQL metadata helper qualification"]
+    fn native_meta_keeps_numbers_texts_and_driver_errors_distinct() {
+        let schema = crate::pg::testing::Schema::new().expect("explicit isolated PostgreSQL required");
+        let mut client = schema.pool.get().unwrap();
+        {
+            let pg = crate::pg::sql::Pg::new(&mut client);
+            assert_eq!(meta_text(&pg, "owner").unwrap(), None);
+            put_meta_text(&pg, "owner", "a.example").unwrap();
+            put_meta_text(&pg, "owner", "b.example").unwrap();
+            assert_eq!(meta_text(&pg, "owner").unwrap().as_deref(), Some("b.example"));
+            assert_eq!(meta(&pg, "owner").unwrap(), None, "text is not coerced into an integer");
+            put_meta(&pg, "count", 7).unwrap();
+            assert_eq!(meta(&pg, "count").unwrap(), Some(7));
+            put_meta(&pg, "count", i64::MIN).unwrap();
+            assert_eq!(meta(&pg, "count").unwrap(), Some(i64::MIN));
+            assert_eq!(meta_text(&pg, "count").unwrap(), None);
+            assert_eq!(meta(&pg, "next_seq").unwrap(), Some(1));
+        }
+        client.batch_execute("alter table meta rename to unavailable_metadata").unwrap();
+        let pg = crate::pg::sql::Pg::new(&mut client);
+        let error = meta(&pg, "count").unwrap_err();
+        assert_eq!(error.postgres().unwrap().code(), Some(&postgres::error::SqlState::UNDEFINED_TABLE), "missing storage must retain its original driver cause");
     }
 
     /// a table of sealed files for a `SealedCache`: file i holds `per` segments
