@@ -2,25 +2,17 @@ use std::time::Duration;
 
 use anyhow::Result;
 
-use crate::nzb::{generate_nzb, nzb_filename};
+use crate::nzb::nzb_filename;
 use crate::sab;
-use crate::search::{get_articles, get_release};
 use crate::ui;
 
 /// Hand a release to SABnzbd via its watched folder. true when it got queued.
 pub fn download_release(release_id: i64) -> Result<bool> {
     let storage=crate::config::checked_storage_config().map_err(anyhow::Error::msg)?;
-    if storage.is_postgres() {
-        return after_native_preflight(||crate::pg::fresh_nzb_tools::download_metadata(&storage,release_id),|(name,first,download)|{
-            anyhow::ensure!(crate::config::checked_storage_config().map_err(anyhow::Error::msg)?==storage,"storage destination changed during download preparation");
-            send_to_sab(release_id,&storage,name,first,Some(download))
-        });
-    }
-    let Some(release)=get_release(release_id)? else{ui::error("Release not found");return Ok(false)};
-    let articles=get_articles(release_id)?;
-    if articles.is_empty(){ui::error("No articles found");return Ok(false);}
-    let first=articles.iter().find_map(|article|article.filename.as_deref().filter(|name|!name.is_empty())).map(str::to_owned);
-    send_to_sab(release_id,&storage,release.name,first,None)
+    after_native_preflight(||crate::pg::fresh_nzb_tools::download_metadata(&storage,release_id),|(name,first,download)|{
+        anyhow::ensure!(crate::config::checked_storage_config().map_err(anyhow::Error::msg)?==storage,"storage destination changed during download preparation");
+        send_to_sab(release_id,&storage,name,first,download)
+    })
 }
 
 fn after_native_preflight(
@@ -31,8 +23,7 @@ fn after_native_preflight(
     handoff(download)
 }
 
-fn send_to_sab(release_id:i64,storage:&crate::pg::StorageConfig,release_name:String,first_file:Option<String>,prepared:Option<crate::pg::fresh_nzb::Download>)->Result<bool> {
-    anyhow::ensure!(storage.is_postgres()==prepared.is_some(),"download source does not match the selected backend");
+fn send_to_sab(release_id:i64,storage:&crate::pg::StorageConfig,release_name:String,first_file:Option<String>,prepared:crate::pg::fresh_nzb::Download)->Result<bool> {
     let complete_dir=sab::get_complete_dir();
     if first_file.as_deref().is_some_and(|name|complete_dir.join(name).exists()) {
         ui::warn("already downloaded");return Ok(false);
@@ -63,8 +54,7 @@ fn send_to_sab(release_id:i64,storage:&crate::pg::StorageConfig,release_name:Str
     }
 
     anyhow::ensure!(&crate::config::checked_storage_config().map_err(anyhow::Error::msg)?==storage,"storage destination changed during download preparation");
-    if let Some(download)=prepared {crate::pg::fresh_nzb_tools::publish_download(&release_name,release_id,Some(&watched_dir),download)?;}
-    else{generate_nzb(release_id,Some(&watched_dir))?;}
+    crate::pg::fresh_nzb_tools::publish_download(&release_name,release_id,Some(&watched_dir),prepared)?;
 
     match sab::job_in_sab(filename.strip_suffix(".nzb").unwrap_or(&filename), Duration::from_secs(10)).as_deref() {
         Some("queued") => {
