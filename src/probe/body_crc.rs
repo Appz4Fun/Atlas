@@ -1,13 +1,15 @@
 //! The server's body CRC for probes made before the probe kept it: one HEAD of the probed article, for the movie
-//! and TV releases a one-off seed names (`seed`), and for a video probe put back from `atlas.raw.db` without it
+//! and TV releases explicitly requested, and for a video probe restored from the native cache without it
 //! (`wants_backfill`). A probe since keeps `X-Received-Body-CRC` itself, soo this step does nothing for a release
 //! nobody asked it about.
 //!
 //! The header is stamped by the server an article was posted through (Highwinds-family servers and eweka), soo most
 //! articles have none: a HEAD that finds none still marks the step done, and the probe is left as it was.
 
-use crate::postprocess::step::{BodyRequest, Got, Needs, Outcome, Step, StepCtx, StepError, StepId, StepMutation, StepWrite, mask};
-use crate::store;
+use crate::catalog_facts::SegmentPick;
+use crate::postprocess::step::{
+    BodyRequest, Got, Needs, Outcome, Step, StepCtx, StepError, StepId, StepMutation, StepWrite, mask,
+};
 
 use super::{BODY_CRC_HEADER, ProbeInfo};
 
@@ -20,24 +22,8 @@ const WANTED: [&str; 2] = [BODY_CRC_HEADER, "X-Received-Bytes"];
 /// A HEAD is a few KiB; anything past this is not one worth reading.
 const HEAD_CAP: usize = 64 * 1024;
 
-/// The probes this step is for: a movie or TV release whose probe read an article but kept no body CRC.
-const WANTING: &str = "select p.release_id from release_probe p join release_category c on c.release_id = p.release_id
-     where (c.category between 2000 and 2999 or c.category between 5000 and 5999)
-       and json_extract(p.info, '$.file') is not null
-       and json_extract(p.info, '$.headers.\"X-Received-Body-CRC\"') is null";
-
 #[derive(Default)]
 pub struct BodyCrcStep;
-
-/// Asks the step about every probe `WANTING` names, once per shard. The step is marked seen in `pp_steps_seen` by
-/// the caller, soo no walk over every release starts for it. Returns how many.
-pub(crate) fn seed(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<usize> {
-    let ids: Vec<i64> = conn.prepare(WANTING)?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
-    for id in &ids {
-        crate::postprocess::rerun_on(conn, *id, mask(BODY_CRC_STEP), now)?;
-    }
-    Ok(ids.len())
-}
 
 /// Whether a probe put back from the raw cache should ask this step: it read a video and kept no body CRC.
 pub(crate) fn wants_backfill(info: &str) -> bool {
@@ -85,7 +71,7 @@ fn probed_article(ctx: &StepCtx<'_>, probe: &ProbeInfo) -> Result<Option<(String
     let segment = if part <= 1 {
         crate::archive::steps::first_article(ctx, file)?
     } else {
-        ctx.segments(file.id, &store::SegmentPick::Parts(vec![part])).map_err(StepError::from_inventory)?.into_iter().next()
+        ctx.segments(file.id, &SegmentPick::Parts(vec![part])).map_err(StepError::from_inventory)?.into_iter().next()
     };
     Ok(segment.map(|s| (s.message_id, file.filename.clone())))
 }
@@ -177,37 +163,5 @@ mod tests {
         assert!(!wants_backfill(&info(true, true)), "it has it");
         assert!(!wants_backfill(&info(false, false)), "no video");
         assert!(!wants_backfill("not json"));
-    }
-
-    #[test]
-    fn the_seed_names_movie_and_tv_probes_without_the_header() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch(super::super::PROBE.create).unwrap();
-        conn.execute_batch(crate::category::RELEASE_CATEGORY.create).unwrap();
-        let probe = |file: Option<&str>, crc: bool| {
-            let mut p = ProbeInfo { file: file.map(str::to_string), ..ProbeInfo::default() };
-            if crc {
-                p.headers.insert(BODY_CRC_HEADER.into(), "1".into());
-            }
-            serde_json::to_string(&p).unwrap()
-        };
-        // 1 wants it; 2 has it; 3 is music; 4 read no article; 5 is TV
-        for (id, cat, file, crc) in [
-            (1, 2040, Some("a.mkv"), false),
-            (2, 2040, Some("a.mkv"), true),
-            (3, 3010, Some("a.flac"), false),
-            (4, 2040, None, false),
-            (5, 5040, Some("b.mkv"), false),
-        ] {
-            conn.execute(
-                "insert into release_probe (release_id, info) values (?1, ?2)",
-                rusqlite::params![id, probe(file, crc)],
-            )
-            .unwrap();
-            conn.execute("insert into release_category values (?1, ?2)", rusqlite::params![id, cat]).unwrap();
-        }
-        let ids: Vec<i64> =
-            conn.prepare(WANTING).unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
-        assert_eq!(ids, vec![1, 5]);
     }
 }

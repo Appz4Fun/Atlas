@@ -13,16 +13,13 @@
 //! A print is a candidate for a reader, never a merge.
 
 use std::cell::Cell;
-use std::path::{Path, PathBuf};
-
-use rusqlite::Connection;
 
 use crate::audio::{self, decode, mkv};
+use crate::catalog_facts::FileInfo;
 use crate::config::Config;
-use crate::keys::{self, Kind};
-use crate::postprocess::schema::ShardTable;
-use crate::postprocess::step::{Needs, Outcome, ReleaseInfo, Reruns, Step, StepCtx, StepError, StepId, StepMutation, StepWrite};
-use crate::store::{self, FileInfo};
+use crate::postprocess::step::{
+    Needs, Outcome, ReleaseInfo, Reruns, Step, StepCtx, StepError, StepId, StepMutation, StepWrite,
+};
 
 use super::ProbeInfo;
 use super::step::main_file;
@@ -50,65 +47,12 @@ const ARTICLES: i64 = 60;
 const FRONT_BYTES: u64 = 1 << 20;
 /// A film or episode shorter than this has too little sound between its titles.
 const MIN_SECS: f64 = 120.0;
-/// The other releases a print looks at, at most, per shard, before it compares their prints.
-const CANDIDATES: i64 = 200;
 /// Bytes read again from before a read's end, for a cluster's header cut in two by it.
 const OVERLAP: usize = 64;
 /// The most sound between two cluster starts looked through for one: muxers start one every 5 s at most.
 const CLUSTER_MS: i64 = 7_000;
 
-pub const AUDIO_PRINTS: ShardTable = ShardTable {
-    name: "release_audio_print",
-    create: "create table if not exists release_audio_print (
-        release_id INTEGER NOT NULL,
-        position   INTEGER NOT NULL,
-        at_ms      INTEGER NOT NULL,
-        items      BLOB NOT NULL,
-        PRIMARY KEY (release_id, position)
-    )",
-    indexes: &[],
-    release_key: Some("release_id"),
-    added: &[],
-};
-
-/// The index the prints are found by: a few items of each, by value (`audio::anchors`).
-pub const AUDIO_ANCHORS: ShardTable = ShardTable {
-    name: "release_audio_anchor",
-    create: "create table if not exists release_audio_anchor (
-        release_id INTEGER NOT NULL,
-        anchor     INTEGER NOT NULL,
-        PRIMARY KEY (release_id, anchor)
-    ) without rowid",
-    indexes: &[(
-        "release_audio_anchor_anchor",
-        "create index if not exists release_audio_anchor_anchor on release_audio_anchor(anchor)",
-    )],
-    release_key: Some("release_id"),
-    added: &[],
-};
-
-/// Kinds that say who posted or packed it, not what: one uploader's account, host, archive owner or clock zone ties
-/// together every film they post, soo sharing one doesn't make a print needless.
-const WHO_POSTED: [Kind; 4] = [Kind::Account, Kind::Host, Kind::Owner, Kind::Zone];
-
 // ---------------------------------------------------------------- finding the same sound
-
-/// A release's prints, by position: (time in ms, items). `schema` is its shard as `conn` names it.
-fn prints_in(conn: &Connection, schema: &str, id: i64) -> Vec<(i64, Vec<u32>)> {
-    let sql = format!("select at_ms, items from {schema}.release_audio_print where release_id = ?1 order by position");
-    let Ok(mut q) = conn.prepare_cached(&sql) else { return Vec::new() };
-    q.query_map([id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))
-        .map(|rows| rows.filter_map(Result::ok).map(|(at, blob)| (at, audio::from_blob(&blob))).collect())
-        .unwrap_or_default()
-}
-
-/// Whether a release has a print, read from its own shard (`shard`, on its own or as `main`).
-pub fn has_print(shard: &Connection, id: i64) -> bool {
-    shard
-        .prepare_cached("select 1 from release_audio_print where release_id = ?1 limit 1")
-        .and_then(|mut q| q.exists([id]))
-        .unwrap_or(false)
-}
 
 /// Two releases' prints are the same sound: as many windows as can be (two, or one when either has only one) each the
 /// same sound as a different window of the other's, soo a tune heard twice in one release can't stand for two
@@ -133,71 +77,6 @@ fn pairs(same: &[Vec<bool>], i: usize, taken: &mut Vec<bool>) -> usize {
         }
     }
     best
-}
-
-/// The releases other than `own` with the same sound, over every shard of `conn` (the main database with the shards
-/// attached), newest first, at most `limit`. Found by the anchor index, then each confirmed by comparing the prints.
-/// Only releases the pages would show: none deleted or in a blocked group.
-pub fn others(conn: &Connection, own: i64, limit: i64) -> Vec<i64> {
-    let s = store::shard_of_id(own);
-    let mine = prints_in(conn, &format!("s{s}"), own);
-    if mine.is_empty() || limit <= 0 {
-        return Vec::new();
-    }
-    let anchors: Vec<i64> = conn
-        .prepare_cached(&format!("select anchor from s{s}.release_audio_anchor where release_id = ?1"))
-        .and_then(|mut q| q.query_map([own], |r| r.get(0))?.collect())
-        .unwrap_or_default();
-    if anchors.is_empty() {
-        return Vec::new();
-    }
-    let marks: Vec<String> = (0..anchors.len()).map(|i| format!("?{}", i + 3)).collect();
-    let mut found = Vec::new();
-    for shard in 0..store::SHARDS {
-        let sql = format!(
-            "select distinct a.release_id from s{shard}.release_audio_anchor a join s{shard}.releases r on r.id = a.release_id
-             where a.anchor in ({}) and a.release_id != ?1 and not atlas_blocked(r.group_name)
-             order by a.release_id desc limit ?2",
-            marks.join(", ")
-        );
-        // a shard without the table yet has none
-        let Ok(mut q) = conn.prepare(&sql) else { continue };
-        let args = [own, CANDIDATES].into_iter().chain(anchors.iter().copied());
-        let Ok(rows) = q.query_map(rusqlite::params_from_iter(args), |r| r.get::<_, i64>(0)) else { continue };
-        let candidates: Vec<i64> = rows.filter_map(Result::ok).collect();
-        for id in candidates {
-            if prints_match(&mine, &prints_in(conn, &format!("s{shard}"), id)) {
-                found.push(id);
-            }
-        }
-    }
-    // ids grow with time, within a shard and across them closely enough
-    found.sort_unstable_by(|a, b| b.cmp(a));
-    found.dedup();
-    found.truncate(usize::try_from(limit).unwrap_or(0));
-    found
-}
-
-/// Kinds too common to say a print is needless: a stock subtitle header (ffmpeg's or HandBrake's ASS for a converted
-/// SRT), a series' fonts or one volume cut ties releases that are not the same film.
-const TOO_COMMON: [Kind; 3] = [Kind::Subs, Kind::Fonts, Kind::Volumes];
-
-/// The first key that already ties a release to another one, other than who posted it, the too common ones and its
-/// own print: a print is only made when there's none. `conn` has every shard attached.
-pub fn linked_by(conn: &Connection, own: i64, lookup: &keys::Lookup) -> Option<Kind> {
-    Kind::ALL
-        .into_iter()
-        .filter(|k| *k != Kind::AudioPrint && !WHO_POSTED.contains(k) && !TOO_COMMON.contains(k) && lookup.has(*k))
-        .find(|k| !keys::others(conn, own, lookup, *k, 1).is_empty())
-}
-
-/// The main database beside a shard's file (`atlas.s3.db` gives `atlas.db`): `store::shard_path`'s names.
-pub(crate) fn main_of(shard: &str) -> Option<PathBuf> {
-    let path = Path::new(shard);
-    let stem = path.file_name()?.to_str()?.strip_suffix(".db")?;
-    let (base, n) = stem.rsplit_once(".s")?;
-    n.parse::<usize>().ok()?;
-    Some(path.with_file_name(format!("{base}.db")))
 }
 
 // ---------------------------------------------------------------- reading the sound
@@ -503,15 +382,23 @@ impl Step for AudioPrintStep {
 
 /// The writes that keep a release's prints, in place of any it had, and their anchors, made from the items.
 fn print_writes(id: i64, prints: &Prints) -> Vec<StepWrite> {
-    let mut writes = vec![StepWrite::for_mutation(id, StepMutation::ClearAudioPrints), StepWrite::for_mutation(id, StepMutation::ClearAudioAnchors)];
+    let mut writes = vec![
+        StepWrite::for_mutation(id, StepMutation::ClearAudioPrints),
+        StepWrite::for_mutation(id, StepMutation::ClearAudioAnchors),
+    ];
     let mut anchors: Vec<i64> = Vec::new();
     for (position, at, items) in prints {
         anchors.extend(audio::anchors(items));
-        writes.push(StepWrite::for_mutation(id, StepMutation::KeepAudioPrint { position: *position,at_ms: *at,items: items.clone() }));
+        writes.push(StepWrite::for_mutation(
+            id,
+            StepMutation::KeepAudioPrint { position: *position, at_ms: *at, items: items.clone() },
+        ));
     }
     anchors.sort_unstable();
     anchors.dedup();
-    writes.extend(anchors.into_iter().map(|anchor| StepWrite::for_mutation(id, StepMutation::KeepAudioAnchor { anchor })));
+    writes.extend(
+        anchors.into_iter().map(|anchor| StepWrite::for_mutation(id, StepMutation::KeepAudioAnchor { anchor })),
+    );
     writes
 }
 
@@ -673,53 +560,121 @@ mod tests {
     }
 
     #[test]
-    fn the_main_database_sits_beside_its_shards() {
-        let main = Path::new("/data/atlas.db");
-        for n in 0..store::SHARDS {
-            assert_eq!(main_of(store::shard_path(main, n).to_str().unwrap()).as_deref(), Some(main));
-        }
-        assert_eq!(main_of("/data/atlas.db"), None);
-        assert_eq!(main_of(""), None);
-    }
-
-    /// The main database in memory with shard 0 attached: releases, keys and prints.
-    fn shards() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        crate::filters::register_sql(&conn).unwrap();
-        conn.execute("attach ':memory:' as s0", []).unwrap();
-        conn.execute_batch("create table s0.releases (id integer primary key, group_name text not null)").unwrap();
-        for table in [&keys::RELEASE_KEYS, &AUDIO_PRINTS, &AUDIO_ANCHORS] {
-            let create = table.create.replacen("exists ", "exists s0.", 1);
-            conn.execute_batch(&create).unwrap();
-            for (column, kind) in table.added {
-                // some are in `create` too
-                let _ = conn.execute_batch(&format!("alter table s0.{} add column {column} {kind}", table.name));
-            }
-        }
-        conn
-    }
-
-    fn print_rows(conn: &Connection, id: i64, prints: &[(u8, Vec<u32>)]) {
-        conn.execute("insert into s0.releases (id, group_name) values (?1, 'a.b.c')", [id]).unwrap();
-        for (position, items) in prints {
-            conn.execute(
-                "insert into s0.release_audio_print (release_id, position, at_ms, items) values (?1, ?2, 0, ?3)",
-                rusqlite::params![id, position, audio::to_blob(items)],
-            )
+    #[ignore = "requires isolated PostgreSQL test database"]
+    fn native_audio_links_require_content_keys_and_preserve_database_errors() {
+        use crate::keys::{Kind, Lookup};
+        use crate::pg::stage_reads::StepReads;
+        let schema = crate::pg::testing::Schema::new().expect("PostgreSQL fixture required");
+        let runtime = crate::pg::stage_queue_tests::runtime(&schema);
+        let ids = runtime
+            .owner
+            .with(|client| {
+                for n in 0..3 {
+                    crate::pg::release_writer::save(
+                        client,
+                        &[crate::parser::Release {
+                            name: format!("Audio.Example.{n}"),
+                            group: "example.group".into(),
+                            articles: vec![crate::parser::Article {
+                                filename: Some("sound.mkv".into()),
+                                message_id: format!("<audio-{n}@example.test>"),
+                                part: Some(1),
+                                total_parts: Some(1),
+                                bytes: 1,
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        }],
+                        -10000,
+                    )?;
+                }
+                Ok(client
+                    .query("select id from releases order by name", &[])?
+                    .into_iter()
+                    .map(|r| r.get::<_, i64>(0))
+                    .collect::<Vec<_>>())
+            })
             .unwrap();
-            for a in audio::anchors(items) {
-                conn.execute(
-                    "insert or ignore into s0.release_audio_anchor (release_id, anchor) values (?1, ?2)",
-                    rusqlite::params![id, a],
-                )
-                .unwrap();
-            }
-        }
+        assert_eq!(ids.len(), 3);
+        runtime
+            .owner
+            .with(|client| {
+                client.execute(
+                    "insert into release_keys(release_id,video,account) values($1,5,7),($2,5,null),($3,null,7)",
+                    &[&ids[0], &ids[1], &ids[2]],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let reads = StepReads::for_owner(&runtime.owner).unwrap();
+        let mut lookup = Lookup::default();
+        lookup.keys.video = Some(5);
+        lookup.keys.account = Some(7);
+        assert_eq!(reads.audio_linked_by(ids[0], &lookup).unwrap(), Some(Kind::Video));
+        lookup.keys.video = None;
+        assert_eq!(reads.audio_linked_by(ids[0], &lookup).unwrap(), None, "same account is not same content");
+        lookup.keys.video = Some(6);
+        assert_eq!(reads.audio_linked_by(ids[0], &lookup).unwrap(), None);
+        runtime
+            .owner
+            .with(|client| {
+                client.execute(
+                    "update releases set group_name='alt.binaries.pictures.erotica.teen' where id=$1",
+                    &[&ids[1]],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        lookup.keys.video = Some(5);
+        assert_eq!(reads.audio_linked_by(ids[0], &lookup).unwrap(), None, "blocked content is excluded");
+        runtime
+            .owner
+            .with(|client| {
+                client.batch_execute("drop table release_keys")?;
+                Ok(())
+            })
+            .unwrap();
+        let error = reads.audio_linked_by(ids[0], &lookup).expect_err("missing relation is not no link");
+        assert!(error.chain().any(|e| e.is::<postgres::Error>()));
+        runtime.owner.close();
     }
-
     #[test]
-    fn the_same_sound_is_found_through_the_anchors() {
-        let conn = shards();
+    #[ignore = "requires isolated PostgreSQL test database"]
+    fn native_same_sound_is_found_through_real_anchors_and_checked_prints() {
+        use crate::pg::fresh_reader::{Budget, ReadView};
+        use std::time::{Duration, Instant};
+        let schema = crate::pg::testing::Schema::new().expect("PostgreSQL fixture required");
+        let runtime = crate::pg::stage_queue_tests::runtime(&schema);
+        let ids = runtime
+            .owner
+            .with(|client| {
+                for n in 0..4 {
+                    crate::pg::release_writer::save(
+                        client,
+                        &[crate::parser::Release {
+                            name: format!("Sound.Example.{n}"),
+                            group: "example.group".into(),
+                            articles: vec![crate::parser::Article {
+                                filename: Some("sound.mkv".into()),
+                                message_id: format!("<sound-{n}@example.test>"),
+                                part: Some(1),
+                                total_parts: Some(1),
+                                bytes: 1,
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        }],
+                        -10000,
+                    )?;
+                }
+                Ok(client
+                    .query("select id from releases order by name", &[])?
+                    .into_iter()
+                    .map(|r| r.get::<_, i64>(0))
+                    .collect::<Vec<_>>())
+            })
+            .unwrap();
+        assert_eq!(ids.len(), 4);
         let rate = 44_100;
         let sound = tune(7, 60.0, rate);
         let other = tune(8, 60.0, rate);
@@ -727,43 +682,57 @@ mod tests {
             let a = (secs * f64::from(rate)) as usize;
             audio::fingerprint(&s[a..a + 12 * rate as usize], rate).unwrap()
         };
-        // 8 and 16 have the same sound as 0, read a little later; 24 has other sound
-        print_rows(&conn, 0, &[(25, at(&sound, 10.0)), (50, at(&sound, 30.0))]);
-        print_rows(&conn, 8, &[(25, at(&sound, 10.3)), (50, at(&sound, 30.7))]);
-        print_rows(&conn, 16, &[(25, at(&sound, 9.8)), (50, at(&sound, 31.0))]);
-        print_rows(&conn, 24, &[(25, at(&other, 10.0)), (50, at(&other, 30.0))]);
-        assert_eq!(others(&conn, 0, 10), vec![16, 8]);
-        assert_eq!(others(&conn, 0, 1), vec![16]);
-        assert_eq!(others(&conn, 24, 10), Vec::<i64>::new());
-        assert_eq!(others(&conn, 99, 10), Vec::<i64>::new(), "no print, no list");
-        let lookup = keys::Lookup { audio_print: true, ..Default::default() };
-        assert_eq!(keys::count_others(&conn, 0, &lookup, Kind::AudioPrint), 2);
-        assert_eq!(keys::others(&conn, 8, &lookup, Kind::AudioPrint, 10), vec![16, 0]);
-        // a release in a blocked group isn't listed
-        conn.execute("update s0.releases set group_name = 'alt.binaries.pictures.erotica.teen' where id = 16", [])
+        let prints = [
+            [(25, at(&sound, 10.0)), (50, at(&sound, 30.0))],
+            [(25, at(&sound, 10.3)), (50, at(&sound, 30.7))],
+            [(25, at(&sound, 9.8)), (50, at(&sound, 31.0))],
+            [(25, at(&other, 10.0)), (50, at(&other, 30.0))],
+        ];
+        runtime.owner.with(|client| {
+            for (id,windows) in ids.iter().zip(&prints) {
+                for (position,items) in windows {
+                    client.execute("insert into release_audio_print(release_id,position,at_ms,items) values($1,$2,0,$3)",&[id,&i64::from(*position),&audio::to_blob(items)])?;
+                    for anchor in audio::anchors(items) {
+                        client.execute("insert into release_audio_anchor(release_id,anchor) values($1,$2) on conflict do nothing",&[id,&anchor])?;
+                    }
+                }
+            } Ok(())
+        }).unwrap();
+        let related = |own: i64| {
+            runtime
+                .owner
+                .with(|client| {
+                    let view = ReadView::open(
+                        client,
+                        &schema.name,
+                        Budget::default(),
+                        Instant::now() + Duration::from_secs(10),
+                    )?;
+                    Ok(view
+                        .same_key(own, crate::keys::Kind::AudioPrint)?
+                        .expect("own release")
+                        .rows
+                        .into_iter()
+                        .map(|r| r.id)
+                        .collect::<Vec<_>>())
+                })
+                .unwrap()
+        };
+        let mut expected = vec![ids[1], ids[2]];
+        expected.sort_unstable_by(|a, b| b.cmp(a));
+        assert_eq!(related(ids[0]), expected);
+        assert!(related(ids[3]).is_empty(), "another tune is not a matching release");
+        runtime
+            .owner
+            .with(|client| {
+                client.execute(
+                    "update releases set group_name='alt.binaries.pictures.erotica.teen' where id=$1",
+                    &[&ids[2]],
+                )?;
+                Ok(())
+            })
             .unwrap();
-        assert_eq!(others(&conn, 0, 10), vec![8]);
-    }
-
-    #[test]
-    fn a_release_another_key_links_is_not_printed() {
-        let conn = shards();
-        for id in [0, 8, 16] {
-            conn.execute("insert into s0.releases (id, group_name) values (?1, 'a.b.c')", [id]).unwrap();
-        }
-        // 0 and 8 have the same video stream; 0 and 16 the same posting account
-        conn.execute("insert into s0.release_keys (release_id, video, account) values (0, 5, 7), (8, 5, null)", [])
-            .unwrap();
-        conn.execute("insert into s0.release_keys (release_id, account) values (16, 7)", []).unwrap();
-        let mut lookup = keys::Lookup::default();
-        lookup.keys.video = Some(5);
-        lookup.keys.account = Some(7);
-        assert_eq!(linked_by(&conn, 0, &lookup), Some(Kind::Video));
-        // the account alone doesn't count: it is who posted, not what
-        lookup.keys.video = None;
-        assert_eq!(linked_by(&conn, 0, &lookup), None);
-        // nor does a video key nobody else has
-        lookup.keys.video = Some(6);
-        assert_eq!(linked_by(&conn, 0, &lookup), None);
+        assert_eq!(related(ids[0]), vec![ids[1]]);
+        runtime.owner.close();
     }
 }
