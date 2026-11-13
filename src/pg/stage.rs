@@ -190,6 +190,35 @@ mod tests {
     }
 
     #[test]
+    fn canonical_bootstrap_meta_allows_first_native_owner_without_relabeling_rows() {
+        let Some(schema)=crate::pg::testing::Schema::new() else {return};
+        let mut client=schema.pool.get().unwrap();
+        assert_eq!(client.query_one("select value from meta where key='next_seq'",&[]).unwrap().get::<_,i64>(0),1);
+        assert!(require_pristine_catalog(&mut *client).is_ok());
+        for (value,text) in [(Some(0i64),None),(Some(2),None),(None,None),(Some(1),Some("stale"))] {
+            client.execute("update meta set value=$1,text_value=$2 where key='next_seq'",&[&value,&text]).unwrap();
+            assert!(require_pristine_catalog(&mut *client).is_err());
+        }
+        client.execute("update meta set value=1,text_value=null where key='next_seq'",&[]).unwrap();
+        client.execute("insert into meta(key,value) values('worker_cursor',0)",&[]).unwrap();
+        assert!(require_pristine_catalog(&mut *client).is_err());
+        client.execute("delete from meta where key='worker_cursor'",&[]).unwrap();
+        let dir=tempfile::tempdir().unwrap();
+        let headers=crate::config::HeaderStoreConfig {enabled:true,dir:dir.path().join("headers").to_str().unwrap().into()};
+        let mut config=crate::config::Config::default();
+        config.postprocess.enabled=false;config.predb.enabled=false;config.spots.enabled=false;config.inferred_parts=false;
+        config.media.tvmaze.enabled=false;config.media.allocine.enabled=false;config.media.details_per_minute=0;
+        config.auto_run_compact=false;config.shared_catalog.enabled=false;config.overview_archive.enabled=false;config.sealed_log.addr.clear();
+        let storage=super::super::StorageConfig {backend:super::super::Backend::Postgres,url:schema.url.clone(),schema:schema.name.clone(),max_connections:1,allow_plaintext:true};
+        let runtime=super::super::indexer_runtime::Runtime::open(&config,storage,headers,&[],&mut None).unwrap();
+        assert!(runtime.owner.epoch().is_some());
+        runtime.owner.with(|client| {
+            assert_eq!(client.query_one("select value from meta where key='next_seq'",&[])?.get::<_,i64>(0),1);
+            assert_eq!(client.query_one("select count(*) from releases",&[])?.get::<_,i64>(0),0);Ok(())
+        }).unwrap();runtime.owner.close();
+    }
+
+    #[test]
     fn canonical_fresh_stage_starts_empty_and_rejects_orphan_results() {
         let Some(schema)=crate::pg::testing::Schema::new() else {return};
         let mut client=schema.pool.get().unwrap();
