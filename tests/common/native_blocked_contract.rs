@@ -200,10 +200,12 @@ fn blocked_readers() {
                 assert!(view.release(id)?.is_none());
                 assert!(view.nzb_listed_files(id)?.is_none());
             }
-            let (rows, count) =
-                view.field_search(&Fields { group: BLOCKED.into(), ..Default::default() }, "findable", None, 0, 10)?;
-            assert!(rows.is_empty());
-            assert_eq!(count, 0);
+            for words in ["findable", ""] {
+                let (rows, count) =
+                    view.field_search(&Fields { group: BLOCKED.into(), ..Default::default() }, words, None, 0, 10)?;
+                assert!(rows.is_empty());
+                assert_eq!(count, 0, "blocked scoped search/recent counts remain zero");
+            }
             let (rows, count) =
                 view.field_search(&Fields { group: OPEN.into(), ..Default::default() }, "findable", None, 0, 10)?;
             assert_eq!(rows.iter().map(|row| row.id).collect::<Vec<_>>(), [ids.shown]);
@@ -214,10 +216,17 @@ fn blocked_readers() {
             Ok(())
         })
         .expect("actual native blocked reader oracles");
-    for hidden in [ids.hidden, ids.hidden_obf] {
+    for hidden in [ids.hidden, ids.hidden_obf, ids.shown_obf] {
         assert!(crate::nzb::build_nzb(hidden).expect("public native blocked NZB").is_none());
         assert!(crate::nzb::generate_nzb(hidden, Some(&crate::paths::app_dir())).is_err());
         assert_eq!(api(&format!("t=get&id={hidden}")).status, 404);
+        let files = api(&format!("t=files&id={hidden}"));
+        assert_eq!(files.status, 200);
+        let error = body(files);
+        assert!(
+            error.contains("code=\"300\"") && !error.contains("<segment"),
+            "blocked file listing is an explicit missing-item response"
+        );
     }
     let xml = crate::nzb::build_nzb(ids.shown).expect("public native shown NZB").expect("shown own payload");
     assert!(xml.contains("Findable.Thing.Shown") && !xml.contains("Findable.Thing.Hidden"));
