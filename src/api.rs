@@ -17,10 +17,6 @@ use crate::search::{all_releases, get_release, newest_in_categories, search_all_
 use crate::ui;
 pub(crate) mod fresh;
 
-#[cfg(test)]
-#[path = "api/native_pg_readers.rs"]
-mod native_pg_readers;
-
 const WORKERS: usize = 4;
 /// Reads several GB when little is cached, which on a machine short of memory is every pass, soo not often.
 const WARM_EVERY: Duration = Duration::from_secs(3600);
