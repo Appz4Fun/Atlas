@@ -99,3 +99,6 @@ fn authenticated_dynamic_posters_and_covers_use_literal_http_routes() {
     runtime.owner.close();assert!(status.is_some_and(|status|status.success()),"owned asset HTTP child failed or exceeded its deadline; no environment or credentials captured");
     assert_eq!(std::fs::read(&manifest).unwrap(),original_manifest,"new writer receipts must not rewrite the selected original manifest");
 }
+
+#[path="native_image_asset_http_tests.rs"]
+mod image_tests;

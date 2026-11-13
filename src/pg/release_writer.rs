@@ -689,3 +689,7 @@ mod posted_at_tests {
 #[cfg(test)]
 #[path="release_writer_inferred_tests.rs"]
 mod inferred_tests;
+
+#[cfg(test)]
+#[path="release_writer_timing_tests.rs"]
+mod accepted_timing_regressions;
