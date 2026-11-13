@@ -37,12 +37,14 @@ pub(super) fn spawn(owner:&Arc<Owner>,name:String,work:impl FnOnce()->Result<Opt
     })?)
 }
 impl Workers {
-    fn start(owner:&Arc<Owner>,config:&crate::config::Config,pool:Arc<crate::nntp::Pool>,handle:tokio::runtime::Handle,db:crate::indexer::Db)->Result<Self> {
+    fn start(owner:&Arc<Owner>,config:&crate::config::Config,pool:Arc<crate::nntp::Pool>,handle:tokio::runtime::Handle,db:crate::indexer::Db,headers:crate::config::HeaderStoreConfig)->Result<Self> {
+        check_inferred_platform(config.inferred_parts)?;
         ensure!(config.postprocess.enabled,"native Stage was not configured");
-        Self::start_runner(Arc::new(Runner::new(owner,config,pool,handle)?),db)
+        Self::start_runner(Arc::new(Runner::new(owner,config,pool,handle)?),db,headers)
     }
-    pub(super) fn start_runner(runner:Arc<Runner>,db:crate::indexer::Db)->Result<Self> {
+    pub(super) fn start_runner(runner:Arc<Runner>,db:crate::indexer::Db,headers:crate::config::HeaderStoreConfig)->Result<Self> {
         ensure!(tokio::runtime::Handle::try_current().is_err(),"native workers must start on a standard thread");
+        check_inferred_platform(runner.config.inferred_parts)?;
         let owner=runner.owner.clone();let queue=Queue::for_owner(&owner)?;
         let stamps=runner.steps.stamps.iter().copied().filter(|(_,bit,_)|runner.steps.enabled & bit!=0).collect::<Vec<_>>();
         queue.seed(runner.steps.enabled,&stamps,now())?;
@@ -59,7 +61,7 @@ impl Workers {
                 }
             }
             let (pool,handle)=dispatch.runner.bodies.service_io();
-            start_services(&owner,&dispatch.runner.config,pool,handle,Some(lanes.clone()),dispatch.runner.assets.clone(),db,&mut handles)?;
+            start_services(&owner,&dispatch.runner.config,pool,handle,Some(lanes.clone()),dispatch.runner.assets.clone(),db,headers,&mut handles)?;
             Ok(())
         })();
         if let Err(error)=started {
@@ -170,12 +172,35 @@ pub(super) fn start_spotnet(owner:&Arc<Owner>,service:Arc<crate::spotnet::native
     Ok(())
 }
 
+pub(super) fn check_inferred_platform(enabled:bool)->Result<()> {
+    #[cfg(not(unix))] ensure!(!enabled,"native inferred repair requires Unix durable HEAD confinement");
+    #[cfg(unix)] let _=enabled;
+    Ok(())
+}
+#[cfg(unix)]
+pub(super) fn start_inferred(owner:&Arc<Owner>,mut service:crate::inferred::native::Service,handle:tokio::runtime::Handle,handles:&mut Vec<Worker>)->Result<()> {
+    let owner_work=owner.clone();
+    handles.push(spawn(owner,"atlas-native-inferred".into(),move|| {
+        while !owner_work.stop.load(Ordering::Acquire) {
+            let progress=service.tick(&handle,now())?;
+            if let Some(wait)=progress.waiting {nap(&owner_work,wait);}
+        }Ok(None)
+    })?);Ok(())
+}
+
 // Every service receives the same actual runtime Db and canonical Owner.
 #[allow(clippy::too_many_arguments)]
-fn start_services(owner:&Arc<Owner>,config:&crate::config::Config,pool:Arc<crate::nntp::Pool>,handle:tokio::runtime::Handle,lanes:Option<Arc<LaneCounters>>,assets:Option<Arc<crate::pg::worker_assets::Grant>>,db:crate::indexer::Db,handles:&mut Vec<Worker>)->Result<()> {
+fn start_services(owner:&Arc<Owner>,config:&crate::config::Config,pool:Arc<crate::nntp::Pool>,handle:tokio::runtime::Handle,lanes:Option<Arc<LaneCounters>>,assets:Option<Arc<crate::pg::worker_assets::Grant>>,db:crate::indexer::Db,headers:crate::config::HeaderStoreConfig,handles:&mut Vec<Worker>)->Result<()> {
+    check_inferred_platform(config.inferred_parts)?;
     db.check_native_owner(owner)?;
+    #[cfg(unix)] if config.inferred_parts {
+        let store=crate::nxv_store::live::handle().ok_or_else(||anyhow::anyhow!("native inferred repair requires the existing catalog header store"))?;
+        let service=crate::inferred::native::Service::new(owner,&db,pool.clone(),store,&headers)?;
+        start_inferred(owner,service,handle.clone(),handles)?;
+    }
+    #[cfg(not(unix))] let _=&headers;
     if config.spots.enabled {
-        let service=Arc::new(crate::spotnet::native::Service::new(owner,db,config.spots.clone(),pool.clone(),handle.clone())?);
+        let service=Arc::new(crate::spotnet::native::Service::new(owner,db.clone(),config.spots.clone(),pool.clone(),handle.clone())?);
         start_spotnet(owner,service,handles)?;
     }
     let predb=if config.predb.enabled {Some(Arc::new(crate::pg::service_cache::predb::Service::new(owner)?))} else {None};
@@ -221,19 +246,19 @@ fn start_services(owner:&Arc<Owner>,config:&crate::config::Config,pool:Arc<crate
 /// Bridge only: all PG/cache factories and worker work happen on actual
 /// standard threads. Entered Tokio's spawn_blocking lane is not treated as one.
 /// The existing native profile still refuses activation before this is called.
-pub(crate) async fn run(owner:Arc<Owner>,db:crate::indexer::Db,config:crate::config::Config,pool:Arc<crate::nntp::Pool>,stopping:impl Fn()->bool+Send+'static) {
+pub(crate) async fn run(owner:Arc<Owner>,db:crate::indexer::Db,headers:crate::config::HeaderStoreConfig,config:crate::config::Config,pool:Arc<crate::nntp::Pool>,stopping:impl Fn()->bool+Send+'static) {
     let handle=tokio::runtime::Handle::current();let ending=Arc::new(AtomicBool::new(false));
     let worker_owner=owner.clone();let worker_end=ending.clone();
     let worker=std::thread::Builder::new().name("atlas-native-stage".into()).spawn(move||->Result<()> {
         if !config.postprocess.enabled {
             let mut handles=Vec::new();
-            if let Err(error)=start_services(&worker_owner,&config,pool,handle,None,None,db,&mut handles) {
+            if let Err(error)=start_services(&worker_owner,&config,pool,handle,None,None,db,headers,&mut handles) {
                 fail(&worker_owner,&error);let _=join_workers(&worker_owner,handles);return Err(error)
             }
             while !worker_end.load(Ordering::Acquire) && !worker_owner.stop.load(Ordering::Acquire) {std::thread::sleep(Duration::from_millis(25));}
             join_workers(&worker_owner,handles)?;return Ok(())
         }
-        let stage=Workers::start(&worker_owner,&config,pool,handle,db)?;
+        let stage=Workers::start(&worker_owner,&config,pool,handle,db,headers)?;
         while !worker_end.load(Ordering::Acquire) && !worker_owner.stop.load(Ordering::Acquire) {std::thread::sleep(Duration::from_millis(25));}
         stage.finish()
     });

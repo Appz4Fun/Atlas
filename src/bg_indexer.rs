@@ -1473,7 +1473,7 @@ async fn run_servers(
     if let Some(runtime)=native {
         let s=sched.clone();
         tasks.spawn(named!("native stage".into(),crate::postprocess::native::run(
-            runtime.owner.clone(),runtime.db.clone(),config.clone(),sched.ctx.pool.clone(),move||s.stopping())));
+            runtime.owner.clone(),runtime.db.clone(),runtime.configured_headers(),config.clone(),sched.ctx.pool.clone(),move||s.stopping())));
     } else if config.postprocess.enabled {
         let stage = Stage::start(StageParams {
             main: paths::database(),
@@ -1553,7 +1553,7 @@ async fn run_servers(
         ));
     }
     // parts no listing showed, asked for on every server by the ids their files' other parts name (see `inferred`)
-    if config.inferred_parts {
+    if native.is_none() && config.inferred_parts {
         let s = sched.clone();
         tasks.spawn(named!(
             "inferred parts".into(),

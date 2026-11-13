@@ -30,6 +30,8 @@ impl Service {
         owner.with(|_|Ok(()))?;let journal=Journal::open(store.root(),*epoch.catalog().nonce())?;
         Ok(Self {owner:owner.clone(),db:db.clone(),pool,store,epoch:*epoch.id(),catalog:*epoch.catalog().nonce(),journal,next:Instant::now()+super::EVERY})
     }
+    #[cfg(test)]
+    pub(crate) fn start_without_delay_for_test(&mut self) {self.next=Instant::now();}
     fn binding(&self,source:&Source)->Result<()> {
         ensure!(source.epoch==self.epoch&&source.catalog==self.catalog,"inferred source belongs to another original attempt");
         ensure!(self.owner.epoch().is_some_and(|epoch|epoch.id()==&self.epoch&&epoch.catalog().nonce()==&self.catalog),"inferred owner binding changed");Ok(())
@@ -353,4 +355,4 @@ impl Service {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

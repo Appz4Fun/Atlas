@@ -8,6 +8,9 @@ fn joined_inferred_lane_cancels_actual_head_before_owner_and_store_close() {
     let now=chrono::Utc::now().timestamp();crate::inferred::native::tests::seed(&runtime,now,&[1,2,4]);
     let (entered_tx,entered_rx)=mpsc::channel();let (release_tx,release_rx)=mpsc::channel();
     let peer=crate::inferred::native::tests::peer(now,false,Some((entered_tx,release_rx)));
+    struct Release(Option<mpsc::Sender<()>>);
+    impl Drop for Release {fn drop(&mut self) {if let Some(sender)=self.0.take() {let _=sender.send(());}}}
+    let mut release=Release(Some(release_tx));
     let net=crate::inferred::native::tests::net();
     assert_eq!(runtime.configured_headers(),headers,"use the captured ORIGINAL base, not an already qualified catalog root");
     let mut service=crate::inferred::native::Service::new(&runtime.owner,&runtime.db,
@@ -26,5 +29,5 @@ fn joined_inferred_lane_cancels_actual_head_before_owner_and_store_close() {
     let mut observer=schema.pool.get().unwrap();
     assert_eq!(observer.query_one("select count(*) from segments",&[]).unwrap().get::<_,i64>(0),3);
     assert_eq!(observer.query_one("select count(*) from inferred_ids",&[]).unwrap().get::<_,i64>(0),0,"unfinished HEAD cannot gain Found acknowledgement");
-    release_tx.send(()).unwrap();runtime.owner.close();store.close().unwrap();
+    release.0.take().unwrap().send(()).unwrap();runtime.owner.close();store.close().unwrap();
 }
