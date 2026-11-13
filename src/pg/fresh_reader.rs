@@ -184,3 +184,36 @@ mod tests {
         assert!(view.release(1).unwrap().is_none());
     }
 }
+
+#[cfg(test)]
+mod recent_pagination_tests {
+    use super::*;
+    use crate::{parser::{Article,Release},pg};
+    #[test]
+    #[ignore="requires explicit isolated PostgreSQL and bounded native reader admission"]
+    fn deep_recent_pages_skip_descriptors_without_spending_returned_value_budget() {
+        let schema=pg::testing::Schema::new().expect("explicit isolated PostgreSQL");let mut client=schema.pool.get().unwrap();
+        let releases=(0..2305).map(|n|Release {name:format!("Recent.Visible.{n:04}"),group:"alt.binaries.test".into(),poster:"p".into(),date:"Wed, 01 Jan 2020 00:00:00 +0000".into(),
+            articles:vec![Article {filename:Some("f.bin".into()),subject:"f.bin yEnc (1/1)".into(),message_id:format!("recent-{n}@example.invalid"),part:Some(1),total_parts:Some(1),bytes:1,..Default::default()}],..Default::default()}).collect::<Vec<_>>();
+        assert_eq!(pg::release_writer::save(&mut client,&releases,1).unwrap().releases,2305);
+        let all=client.query("select id from releases order by id desc",&[]).unwrap().into_iter().map(|row|row.get::<_,i64>(0)).collect::<Vec<_>>();
+        // A stored group can become blocked after ingestion. Offset is over
+        // visible rows, so these descriptors must not consume visible places.
+        let blocked=vec![all[10],all[1500],all[1650],all[2100]];
+        client.execute("update releases set group_name='alt.binaries.pictures.erotica.teen' where id=any($1)",&[&blocked]).unwrap();
+        let expected=all.into_iter().filter(|id|!blocked.contains(id)).collect::<Vec<_>>();
+        let view=ReadView::open(&mut client,&schema.name,Budget::default(),Instant::now()+Duration::from_secs(10)).unwrap();
+        let first=view.recent(1600,50).unwrap();let second=view.recent(1650,50).unwrap();let third=view.recent(2000,50).unwrap();
+        assert_eq!(first.iter().map(|row|row.id).collect::<Vec<_>>(),expected[1600..1650]);
+        assert_eq!(second.iter().map(|row|row.id).collect::<Vec<_>>(),expected[1650..1700]);
+        assert_eq!(third.iter().map(|row|row.id).collect::<Vec<_>>(),expected[2000..2050]);
+        assert!(first.iter().chain(&second).chain(&third).all(|row|row.name.starts_with("Recent.Visible.")&&row.group_name=="alt.binaries.test"));
+        drop(view);
+        // Retained results remain charged: a fix that clears all ownership at
+        // page return would incorrectly admit the second hydration below.
+        let view=ReadView::open(&mut client,&schema.name,Budget {bytes:220000,..Budget::default()},Instant::now()+Duration::from_secs(10)).unwrap();
+        let retained=view.recent(0,50).unwrap();assert_eq!(retained.len(),50);
+        assert!(view.recent(50,1).is_err(),"live returned values must retain their ownership charges");
+        assert_eq!(retained[0].id,expected[0]);
+    }
+}
