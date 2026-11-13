@@ -211,12 +211,12 @@ class ResourceGuardTests(unittest.TestCase):
             [sys.executable, "-c", parent], start_new_session=True,
             stdout=subprocess.PIPE, text=True)
         descendant = int(child.stdout.readline())
-        if leader_exits:
-            deadline = time.monotonic() + 5
-            while not guard.leader_has_exited(child):
-                self.assertLess(time.monotonic(), deadline, "leader did not exit while held")
-                time.sleep(0.01)
         try:
+            if leader_exits:
+                deadline = time.monotonic() + 5
+                while not guard.leader_has_exited(child):
+                    self.assertLess(time.monotonic(), deadline, "leader did not exit while held")
+                    time.sleep(0.01)
             guard.stop_child(child, grace_seconds=0.05)
             deadline = time.monotonic() + 2
             while time.monotonic() < deadline:
@@ -285,6 +285,30 @@ class ResourceGuardTests(unittest.TestCase):
             self.assertNotIn("environ", text)
             self.assertNotIn("command", text)
             self.assertEqual(marker.stat().st_mode & 0o777, 0o600)
+
+
+class DescendantFixtureCleanupTests(unittest.TestCase):
+    def test_failed_leader_status_wait_still_cleans_up_the_fixture(self):
+        from io import StringIO
+        from unittest.mock import Mock
+        for failure in ("probe-error", "deadline"):
+            with self.subTest(failure=failure):
+                child = Mock(returncode=None)
+                child.stdout = StringIO("124\n")
+                def stop(owned, *, grace_seconds):
+                    self.assertIs(owned, child)
+                    self.assertEqual(grace_seconds, 0.05)
+                    owned.returncode = 0
+                error = OSError("status probe failed")
+                with patch.object(subprocess, "Popen", return_value=child), \
+                        patch.object(guard, "stop_child", side_effect=stop), \
+                        patch.object(guard, "leader_has_exited", side_effect=error if failure == "probe-error" else None,
+                                     return_value=False), \
+                        patch.object(time, "monotonic", side_effect=[0, 6]):
+                    with self.assertRaises(OSError if failure == "probe-error" else AssertionError):
+                        ResourceGuardTests().assert_stops_descendant(True)
+                self.assertEqual(child.returncode, 0, "failed readiness must still stop the held fixture")
+                self.assertTrue(child.stdout.closed, "failed readiness must close the fixture pipe")
 
 
 class OwnedGroupLifetimeTests(unittest.TestCase):
