@@ -573,7 +573,7 @@ pub(crate) fn start_for_storage(config: &mut Config, storage: &crate::pg::Storag
     start_for_storage_with_assets(config, storage, None)
 }
 /// The bootstrap may supply a real root/manifest-checked retained-asset reader.
-/// Its presence never bypasses native listener/runtime qualification.
+/// Its presence never bypasses selected-storage or asset namespace validation.
 pub(crate) fn start_for_storage_with_assets(
     config: &mut Config,
     storage: &crate::pg::StorageConfig,
@@ -587,9 +587,11 @@ pub(crate) fn start_for_storage_with_assets(
         ui::print("[yellow]storage backend or destination changed; restart Atlas before starting the API[/yellow]");
         return false;
     }
-    // Activation remains closed before binding or any legacy initializer.
-    if storage.is_postgres() {
-        ui::print("[yellow]native Web UI is awaiting full reader and runtime qualification[/yellow]");
+    // Listener startup admits only the native backend and its static connection
+    // policy. Catalog/bootstrap/index availability is checked by real requests;
+    // an outage remains an explicit 503 instead of preventing the login service.
+    if !storage.is_postgres() || crate::pg::Pool::new(storage).is_err() {
+        ui::print("[yellow]native Web UI requires valid PostgreSQL storage; API not started[/yellow]");
         return false;
     }
     let assets = if assets.is_none() {
