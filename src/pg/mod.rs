@@ -19,6 +19,7 @@ pub(crate) mod predb_cache;
 pub(crate) mod natural_cache;
 pub mod header_blocks;
 mod history_gate;
+pub(crate) use history_gate::native as guard_native_transaction;
 mod history_digest;
 mod history_validator;
 pub mod history_import;
