@@ -1,6 +1,7 @@
 //! Test-only adapter to the original native runtime; no alternate database API.
 
 use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -39,7 +40,7 @@ impl Drop for ParentSchema {
         if self.client.batch_execute(&format!("drop schema if exists \"{}\" cascade", self.name)).is_err() {
             // This generated identifier is nonsecret; no connection error is
             // interpolated into output, even during another assertion unwind.
-            eprintln!("native provider fixture cleanup failed for {}", self.name);
+            eprintln!("native mixed fixture cleanup failed for {}", self.name);
         }
     }
 }
@@ -56,14 +57,14 @@ impl Drop for ChildGuard {
 
 pub fn mark_finished(case: &str) {
     let home = PathBuf::from(std::env::var_os("ATLAS_HOME").expect("isolated fixture home"));
-    std::fs::write(home.join(COMPLETED), case).expect("record completed native provider oracles");
+    std::fs::write(home.join(COMPLETED), case).expect("record completed native mixed oracles");
 }
 
 fn required_url() -> String {
     std::env::var("ATLAS_PG_TEST_URL")
         .ok()
         .filter(|url| !url.trim().is_empty())
-        .expect("selected native provider test requires explicit ATLAS_PG_TEST_URL")
+        .expect("selected native mixed test requires explicit ATLAS_PG_TEST_URL")
 }
 
 /// Run one fixture in a clean process before any live NXV global is initialized.
@@ -96,15 +97,15 @@ pub fn run_child(case: &str) {
             .stdout(Stdio::from(log.try_clone().expect("private log clone")))
             .stderr(Stdio::from(log))
             .spawn()
-            .expect("start isolated native provider child"),
+            .expect("start isolated native mixed child"),
     );
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
-        if let Some(status) = child.0.try_wait().expect("observe native provider child") {
+        if let Some(status) = child.0.try_wait().expect("observe native mixed child") {
             if !status.success() || std::fs::read(home.path().join(COMPLETED)).ok().as_deref() != Some(case.as_bytes())
             {
                 let retained = home.keep();
-                panic!("native provider child failed; private fixture retained at {}", retained.display());
+                panic!("native mixed child failed; private fixture retained at {}", retained.display());
             }
             return;
         }
@@ -112,7 +113,7 @@ pub fn run_child(case: &str) {
             let _ = child.0.kill();
             let _ = child.0.wait();
             let retained = home.keep();
-            panic!("native provider child timed out; private fixture retained at {}", retained.display());
+            panic!("native mixed child timed out; private fixture retained at {}", retained.display());
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -147,6 +148,24 @@ impl Fixture {
         let home = PathBuf::from(std::env::var_os("ATLAS_HOME").expect("private native fixture home"));
         let storage =
             StorageConfig { backend: Backend::Postgres, url, schema, max_connections: 2, allow_plaintext: true };
+        // The real cache actor rechecks selected storage on every command.
+        // Give it this fixture's exact destination, never an ambient config.
+        let selected = serde_json::json!({"storage": {"backend":"postgres", "url":&storage.url,
+            "schema":&storage.schema, "max_connections":storage.max_connections, "allow_plaintext":true}});
+        let text = toml_edit::ser::to_string_pretty(&selected)
+            .unwrap_or_else(|_| panic!("serialize private selected storage"));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options
+            .open(home.join("config.toml"))
+            .expect("private selected fixture configuration")
+            .write_all(text.as_bytes())
+            .expect("write private selected fixture configuration");
         let observer = crate::pg::Pool::new(&storage).unwrap_or_else(|_| panic!("native fixture observer"));
         let mut config = Config::default();
         config.postprocess.enabled = false;
