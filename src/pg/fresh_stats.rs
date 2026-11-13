@@ -62,7 +62,7 @@ mod posting_clock_tests {
     #[test]
     #[ignore="requires explicit isolated PostgreSQL and the actual posted_clock/posted_at writer"]
     fn day_statistics_use_poster_wall_clock_across_opposite_offsets() {
-        let schema=pg::testing::Schema::new().expect("explicit isolated PostgreSQL");let mut client=schema.pool.get().unwrap();
+        let schema=pg::testing::Schema::native_writer().expect("explicit isolated PostgreSQL");let mut client=schema.pool.get().unwrap();
         {
             let view=ReadView::open(&mut client,&schema.name,Budget::default(),Instant::now()+Duration::from_secs(10)).unwrap();
             let empty=view.stored_statistics(1577923200).unwrap();assert_eq!(empty.day_total,0);assert!(empty.day.is_empty()&&empty.predb.is_empty());

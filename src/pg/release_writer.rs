@@ -17,6 +17,9 @@ use crate::parser::{Article, Release};
 const MAX_BATCH_ROWS: usize = 16_384;
 const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
 
+#[path = "release_writer_timing.rs"]
+mod timing;
+
 /// Rows newly created by this save. A retry of an already committed save
 /// returns zero for the rows its previous attempt committed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -48,7 +51,10 @@ impl Incoming<'_> {
             .map_or(0, |a| a.filename.as_deref().map_or(0, str::len) + a.subject.len() + a.message_id.len());
         let rare = self.article.filter(|a| a.filename.is_none())
             .map_or(0, |a| a.subject.len() + r.poster.len() + r.date.len() + 32);
-        304 + 2*r.name.len() + r.poster.len() + r.date.len() + r.display_name.as_deref().map_or(0, str::len) + article + rare
+        // Include the extra scalar timing fields and the possible ID-derived
+        // host/key text, whose combined length cannot exceed the original MID.
+        400 + self.article.map_or(0, |a| a.message_id.len())
+            + 2*r.name.len() + r.poster.len() + r.date.len() + r.display_name.as_deref().map_or(0, str::len) + article + rare
             + self.article.and_then(|a|a.filename.as_deref()).map_or(0,str::len)
     }
 }
@@ -93,6 +99,7 @@ fn save_grouped(tx:&mut Transaction<'_>,groups:BTreeMap<&str,Vec<&Release>>,now:
     super::history_gate::native(tx)?;
     tx.batch_execute(CREATE_STAGE)?;
     let mut stats = SaveStats::default();
+    let mut timing_key = None;
     for (group, releases) in groups {
         tx.query_one("select pg_advisory_xact_lock(hashtextextended(current_schema() || ':' || $1, 7936))", &[&group])?;
         // A junk marker applies to all fragments with this identity, including
@@ -129,7 +136,7 @@ fn save_grouped(tx:&mut Transaction<'_>,groups:BTreeMap<&str,Vec<&Release>>,now:
                 let row = Incoming { release, release_key: key.1, original_name_key, posted_at, posted_clock, article };
                 let size = row.approx_bytes();
                 if batch.len() == MAX_BATCH_ROWS || (!batch.is_empty() && bytes + size > MAX_BATCH_BYTES) {
-                    flush(tx, group, &batch, now, &mut stats)?;
+                    flush(tx, group, &batch, now, &mut stats, &mut timing_key)?;
                     batch.clear();
                     bytes = 0;
                 }
@@ -138,7 +145,7 @@ fn save_grouped(tx:&mut Transaction<'_>,groups:BTreeMap<&str,Vec<&Release>>,now:
             }
         }
         if !batch.is_empty() {
-            flush(tx, group, &batch, now, &mut stats)?;
+            flush(tx, group, &batch, now, &mut stats, &mut timing_key)?;
         }
     }
     Ok(stats)
@@ -148,9 +155,12 @@ fn pg_text(value: &str) -> Cow<'_, str> {
     if value.as_bytes().contains(&0) { Cow::Owned(value.replace('\0', "\u{fffd}")) } else { Cow::Borrowed(value) }
 }
 
-fn flush(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], now: i64, stats: &mut SaveStats) -> Result<()> {
+fn flush(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], now: i64, stats: &mut SaveStats, timing_key: &mut Option<i64>) -> Result<()> {
     tx.batch_execute("truncate pg_temp.atlas_release_input")?;
-    copy_input(tx, batch)?;
+    if timing_key.is_none() && batch.iter().any(|row| row.article.is_some()) {
+        *timing_key = Some(timing::key(tx)?);
+    }
+    copy_input(tx, batch, *timing_key)?;
     let release = tx.query_one(WRITE_RELEASES, &[&group])?;
     stats.releases += release.get::<_, i64>(0) as u64;
     let articles = tx.query_one(WRITE_ARTICLES, &[&group])?;
@@ -158,6 +168,7 @@ fn flush(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], now: i64
     let parts = articles.get::<_, i64>(1) as u64;
     stats.parts += parts;
     if parts > 0 {
+        timing::write(tx, parts)?;
         tx.execute(UPDATE_FILES, &[&now, &crate::parser::MAX_PARTS])?;
         let complete_due = now.saturating_add(crate::store::COMPLETE_SETTLE_SECS.load(Ordering::Relaxed).max(1));
         let incomplete_due = now.saturating_add(crate::store::SETTLE_SECS.load(Ordering::Relaxed).max(1));
@@ -166,13 +177,15 @@ fn flush(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], now: i64
     Ok(())
 }
 
-fn copy_input(tx: &mut Transaction<'_>, batch: &[Incoming<'_>]) -> Result<()> {
+fn copy_input(tx: &mut Transaction<'_>, batch: &[Incoming<'_>], timing_key: Option<i64>) -> Result<()> {
     let input = tx.copy_in(
         "copy pg_temp.atlas_release_input (
             ordinal, identity_key, is_collection, name, poster, posted_date, display_name, is_obfuscated,
             junk, filename_key, filename, message_key, message_id, subject, part, expected, file_total,
             zero_file_index, bytes, original_name, original_filename, file_index, original_name_key, posted_at, posted_clock,
-            nzb_subject, nzb_poster, nzb_posted_date, nzb_timestamp, nzb_file_index
+            nzb_subject, nzb_poster, nzb_posted_date, nzb_timestamp, nzb_file_index,
+            t_date, t_number, t_lines, t_references, t_xref, t_from, t_encoded, t_tool, t_clock,
+            t_hw_host, t_hw_key, t_hw_n
          ) from stdin binary",
     )?;
     use Type as T;
@@ -209,6 +222,8 @@ fn copy_input(tx: &mut Transaction<'_>, batch: &[Incoming<'_>]) -> Result<()> {
             T::BYTEA,
             T::INT8,
             T::INT8,
+            T::INT8, T::INT8, T::INT8, T::INT8, T::INT8, T::INT8, T::INT8, T::INT8, T::INT8,
+            T::TEXT, T::TEXT, T::INT8,
         ],
     );
     for (i, row) in batch.iter().enumerate() {
@@ -225,6 +240,17 @@ fn copy_input(tx: &mut Transaction<'_>, batch: &[Incoming<'_>]) -> Result<()> {
         // Sparse original NZB metadata belongs only to literal None inputs,
         // and later only to the MID that actually wins segment acceptance.
         let nameless = a.filter(|article| article.filename.is_none());
+        // Only one article's parsing scratch is live. No parallel Timing map
+        // or clone of the original batch is retained beside the COPY input.
+        let facts = a.map(crate::store::ArticleFacts::of);
+        let id = facts.as_ref().map(|facts| &facts.id);
+        let hardware = id.filter(|id| id.hw_host.is_some() && id.hw_key.is_some() && id.hw_n.is_some());
+        let number = a.filter(|article| article.number > 0)
+            .map(|article| i64::try_from(article.number)).transpose()?;
+        let from = a.map(|article| {
+            timing_key.map(|key| crate::store::keyed_hash(key as u64, 0, &article.author))
+                .ok_or_else(|| anyhow::anyhow!("native writer timing has no catalog key"))
+        }).transpose()?;
         writer.write(&[
             &(i as i64),
             &&row.release_key[..],
@@ -258,6 +284,18 @@ fn copy_input(tx: &mut Transaction<'_>, batch: &[Incoming<'_>]) -> Result<()> {
             &nameless.map(|_|r.date.as_bytes()),
             &nameless.map(|_|crate::dates::article_timestamp(&r.date)),
             &nameless.and_then(|article|article.file_index),
+            &facts.as_ref().and_then(|facts| facts.date),
+            &number,
+            &a.map(|article| article.lines.max(0)),
+            &a.map(|article| i64::from(!article.references.trim().is_empty())),
+            &a.and_then(|article| article.xref_groups.map(i64::from)),
+            &from,
+            &a.map(|article| i64::from(article.subject.contains("=?") && article.subject.contains("?="))),
+            &id.and_then(|id| id.tool.map(|tool| tool.code())),
+            &id.and_then(|id| id.clock_ms),
+            &hardware.and_then(|id| id.hw_host.as_deref()),
+            &hardware.and_then(|id| id.hw_key.as_deref()),
+            &hardware.and_then(|id| id.hw_n),
         ])?;
     }
     writer.finish()?;
@@ -299,6 +337,18 @@ const CREATE_STAGE: &str = "
         nzb_posted_date bytea,
         nzb_timestamp bigint,
         nzb_file_index bigint,
+        t_date bigint,
+        t_number bigint,
+        t_lines bigint,
+        t_references bigint,
+        t_xref bigint,
+        t_from bigint,
+        t_encoded bigint,
+        t_tool bigint,
+        t_clock bigint,
+        t_hw_host text,
+        t_hw_key text,
+        t_hw_n bigint,
         release_id bigint,
         file_id bigint
     ) on commit delete rows";
@@ -470,7 +520,7 @@ mod tests {
 
     #[test]
     fn late_parts_complete_a_release_and_replayed_ids_do_not_requeue_it() {
-        let Some(test) = crate::pg::testing::Schema::new() else { return };
+        let Some(test) = crate::pg::testing::Schema::native_writer() else { return };
         let mut client = test.pool.get().unwrap();
 
         let first = release("sample", "sample.rar", "<first@example.test>", 1);
@@ -504,7 +554,7 @@ mod tests {
 
     #[test]
     fn later_unnamed_fragments_keep_the_last_display_name_in_a_batch() {
-        let Some(test) = crate::pg::testing::Schema::new() else { return };
+        let Some(test) = crate::pg::testing::Schema::native_writer() else { return };
         let mut client = test.pool.get().unwrap();
         let first = release("sample", "sample.rar", "<first@example.test>", 1);
         let mut named = release("sample", "sample.rar", "<named@example.test>", 1);
@@ -517,7 +567,7 @@ mod tests {
 
     #[test]
     fn malformed_text_preserves_message_ids_and_distinct_file_identity() {
-        let Some(test) = crate::pg::testing::Schema::new() else { return };
+        let Some(test) = crate::pg::testing::Schema::native_writer() else { return };
         let mut client = test.pool.get().unwrap();
 
         let mut first = release("sample", "a\0.rar", "abc\0def", 1);
@@ -530,7 +580,7 @@ mod tests {
 
     #[test]
     fn late_executable_retracts_release_and_cannot_be_revived_by_replay() {
-        let Some(test) = crate::pg::testing::Schema::new() else { return };
+        let Some(test) = crate::pg::testing::Schema::native_writer() else { return };
         let mut client = test.pool.get().unwrap();
 
         let good = release("sample", "sample.rar", "<first@example.test>", 1);
@@ -546,7 +596,7 @@ mod tests {
 
     #[test]
     fn collection_keys_group_late_files_without_merging_another_collection() {
-        let Some(test) = crate::pg::testing::Schema::new() else { return };
+        let Some(test) = crate::pg::testing::Schema::native_writer() else { return };
         let mut client = test.pool.get().unwrap();
 
         let mut first = release("sample", "first.rar", "<first@example.test>", 1);
@@ -567,7 +617,7 @@ mod tests {
 
     #[test]
     fn a_failed_second_group_rolls_back_the_entire_save() {
-        let Some(test) = crate::pg::testing::Schema::new() else { return };
+        let Some(test) = crate::pg::testing::Schema::native_writer() else { return };
         let mut client = test.pool.get().unwrap();
 
         let first = release("sample", "sample.rar", "<first@example.test>", 1);
@@ -588,7 +638,7 @@ mod sparse_nzb_metadata_tests {
     #[test]
     #[ignore="requires explicit fresh schema9 sparse metadata and canonical writer admission"]
     fn only_accepted_none_filename_messages_keep_raw_envelope_and_cascade_with_the_segment() {
-        let schema=crate::pg::testing::Schema::new().expect("explicit sparse fresh schema");let mut client=schema.pool.get().unwrap();
+        let schema=crate::pg::testing::Schema::native_writer().expect("explicit sparse fresh schema");let mut client=schema.pool.get().unwrap();
         let subject=format!("rare{}é&subject",char::from(0));let poster=format!("poster{}原",char::from(0));
         let release=|name:&str,file:Option<&str>,mid:&str|crate::parser::Release {name:name.into(),poster:poster.clone(),date:"Wed, 01 Jan 2020 00:00:00 +0000".into(),group:"alt.binaries.test".into(),
             articles:vec![crate::parser::Article {filename:file.map(str::to_owned),subject:subject.clone(),message_id:mid.into(),part:Some(1),total_parts:Some(1),bytes:17,..Default::default()}],..Default::default()};
@@ -622,7 +672,7 @@ mod native_subject_counter_tests {
     #[test]
     #[ignore="requires explicit fresh schema9 representative-column admission"]
     fn representative_counters_follow_subject_winner_not_aggregate_maxima_or_replay() {
-        let schema=crate::pg::testing::Schema::new().expect("explicit fresh PostgreSQL schema9");let mut client=schema.pool.get().unwrap();
+        let schema=crate::pg::testing::Schema::native_writer().expect("explicit fresh PostgreSQL schema9");let mut client=schema.pool.get().unwrap();
         let release=|mid:&str,part:Option<i64>,index:Option<i64>,files:Option<i64>,parts:Option<i64>|Release {
             name:"Counters.Example.Release".into(),group:"alt.binaries.test".into(),poster:"poster".into(),date:"2020-01-01".into(),
             articles:vec![Article {filename:Some("sample.bin".into()),subject:format!("subject of {mid}"),message_id:mid.into(),part,file_index:index,file_total:files,total_parts:parts,bytes:17,..Default::default()}],..Default::default()
@@ -651,7 +701,7 @@ mod original_name_key_tests {
     #[test]
     #[ignore="requires isolated fresh PostgreSQL with the owner-approved original_name_key schema"]
     fn original_name_key_hashes_accepted_raw_name_and_keeps_first_collection_identity() {
-        let schema=crate::pg::testing::Schema::new().expect("explicit isolated PostgreSQL schema");let mut client=schema.pool.get().unwrap();
+        let schema=crate::pg::testing::Schema::native_writer().expect("explicit isolated PostgreSQL schema");let mut client=schema.pool.get().unwrap();
         let mut release=Release {name:"Original\0.Movie".into(),collection:Some("Shared.Collection".into()),group:"alt.binaries.test".into(),poster:"poster".into(),
             date:"Wed, 01 Jan 2020 00:00:00 +0000".into(),articles:vec![Article {filename:Some("video.mkv".into()),subject:"video.mkv yEnc (1/2)".into(),
                 message_id:"name-key-first@example.invalid".into(),part:Some(1),total_parts:Some(2),bytes:13,..Default::default()}],..Default::default()};
@@ -671,7 +721,7 @@ mod posted_at_tests {
     #[test]
     #[ignore="requires isolated fresh PostgreSQL with the owner-approved posted_at schema"]
     fn parsed_posted_time_follows_the_same_accepted_envelope_and_ignores_replay() {
-        let schema=crate::pg::testing::Schema::new().expect("explicit isolated PostgreSQL schema");let mut client=schema.pool.get().unwrap();
+        let schema=crate::pg::testing::Schema::native_writer().expect("explicit isolated PostgreSQL schema");let mut client=schema.pool.get().unwrap();
         let mut first=Release {name:"Envelope.Date.Release".into(),group:"alt.binaries.test".into(),poster:"first".into(),date:"Wed, 01 Jan 2020 00:00:00 +0000".into(),
             articles:vec![Article {filename:Some("video.mkv".into()),subject:"video.mkv yEnc (1/3)".into(),message_id:"date-first@example.invalid".into(),part:Some(1),total_parts:Some(3),bytes:13,..Default::default()}],..Default::default()};
         let mut second=first.clone();second.poster="second".into();second.date="Thu, 02 Jan 2020 00:00:00 +0000".into();second.articles[0].message_id="date-second@example.invalid".into();second.articles[0].part=Some(2);second.articles[0].subject="video.mkv yEnc (2/3)".into();
@@ -693,3 +743,7 @@ mod inferred_tests;
 #[cfg(test)]
 #[path="release_writer_timing_tests.rs"]
 mod accepted_timing_regressions;
+
+#[cfg(test)]
+#[path="release_writer_timing_controls.rs"]
+mod timing_controls;

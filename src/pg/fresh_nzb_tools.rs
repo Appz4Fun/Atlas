@@ -95,7 +95,7 @@ mod listed_file_tests {
     #[test]
     #[ignore="requires explicit isolated fresh PostgreSQL schema and bounded native read admission"]
     fn cli_file_inventory_keeps_original_nameless_ordinals_and_refuses_uncaptured_empty_names() {
-        let schema=pg::testing::Schema::new().expect("explicit isolated fresh schema");let mut client=schema.pool.get().unwrap();
+        let schema=pg::testing::Schema::native_writer().expect("explicit isolated fresh schema");let mut client=schema.pool.get().unwrap();
         let articles=[(None,"<none-a@example.invalid>",2,17),(None,"<none-b@example.invalid>",1,23),
             (Some("movie.bin"),"<named-a@example.invalid>",1,19),(Some("movie.bin"),"<named-b@example.invalid>",1,29)].into_iter()
             .map(|(file,mid,part,bytes)|Article {filename:file.map(str::to_owned),subject:format!("original {mid}"),message_id:mid.into(),part:Some(part),total_parts:Some(2),bytes,..Default::default()}).collect();

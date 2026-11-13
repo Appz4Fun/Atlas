@@ -27,6 +27,28 @@ const MAX_RECORD: usize = 2 * MAX_METADATA + 4096;
 // these literal ceilings in sync with MAX_METADATA and MAX_RECORD.
 const CHECKPOINT_SQL: &str = "case when octet_length(checkpoint)<=49152 then checkpoint end";
 const RECORD_SQL: &str = "case when octet_length(bookmark)<=102400 then bookmark end";
+
+/// Rows installed by migrations 9..11, before any native owner or cache write.
+/// Full-row equality also refuses extra columns and any noncanonical NULL/value.
+fn pristine_migration_seed(table: &str) -> Option<&'static str> {
+    match table {
+        "atlas_cache_key_formats" => {
+            Some(r#"{"table_name":"ext_raw_nfo_passwords","column_name":"name","codec":"atlas.nfo-name.v1:"}"#)
+        }
+        "native_runtime_current" => Some(r#"{"singleton":true,"epoch":null}"#),
+        "native_catalog_revision" => Some(r#"{"singleton":true,"revision":0}"#),
+        "atlas_par2_cache_usage" => Some(
+            r#"{"singleton":true,"retained_rows":0,"retained_bytes":0,"pending_xid":0,
+                "phase":"ready","scan_relation":4,"after_a":null,"after_b":null,"after_c":null,
+                "maintenance_xid":0,"evict_key":null,"evict_relation":0,
+                "evict_after_a":null,"evict_after_b":null,"evict_after_c":null,
+                "evict_total_rows":0,"evict_total_bytes":0,"evict_removed_rows":0,"evict_removed_bytes":0,
+                "evicted_inventories":0,"evicted_rows":0,"evicted_bytes":0}"#,
+        ),
+        _ => None,
+    }
+}
+
 fn checkpoint_payload(row: &postgres::Row, column: usize) -> Result<Vec<u8>> {
     row.get::<_, Option<Vec<u8>>>(column)
         .context(HistoryError::new(ErrorCode::CorruptObject, "checkpoint payload admission"))
@@ -546,6 +568,22 @@ impl ImportOwner {
                 super::valid_schema(&table),
                 HistoryError::new(ErrorCode::DestinationMismatch, "unexpected relation name")
             );
+            if let Some(seed) = pristine_migration_seed(&table) {
+                let pristine: bool = tx
+                    .query_one(
+                        &format!(
+                            "select exists(select 1 from \"{table}\" s where to_jsonb(s)=$1::text::jsonb)
+                             and not exists(select 1 from \"{table}\" s where to_jsonb(s) is distinct from $1::text::jsonb)"
+                        ),
+                        &[&seed],
+                    )?
+                    .get(0);
+                ensure!(
+                    pristine,
+                    HistoryError::new(ErrorCode::DestinationMismatch, "exact pristine migration seed required")
+                );
+                continue;
+            }
             let predicate = if table == "meta" { " where key<>'next_seq' or value<>1" } else { "" };
             let nonempty: bool =
                 tx.query_one(&format!("select exists(select 1 from \"{table}\"{predicate})"), &[])?.get(0);
@@ -2278,6 +2316,24 @@ mod tests {
         if case == "unknown" {
             c.batch_execute("create table unexpected(value bigint);insert into unexpected values(7)").unwrap();
         }
+        match case {
+            "changed_seed_codec" => {
+                c.execute("update atlas_cache_key_formats set codec='unexpected'", &[]).unwrap();
+            }
+            "extra_seed_format" => {
+                c.execute("insert into atlas_cache_key_formats values('unexpected','name','unexpected')", &[]).unwrap();
+            }
+            "missing_seed_runtime" => {
+                c.execute("delete from native_runtime_current", &[]).unwrap();
+            }
+            "changed_seed_revision" => {
+                c.execute("update native_catalog_revision set revision=1", &[]).unwrap();
+            }
+            "changed_seed_accounting" => {
+                c.execute("update atlas_par2_cache_usage set retained_rows=1", &[]).unwrap();
+            }
+            _ => {}
+        }
         manifest.source_uuid = "test-source".into();
         crate::history_source::tests::refresh(&mut manifest);
         let source = Source::open(manifest, 1 << 20).unwrap();
@@ -2343,6 +2399,29 @@ mod tests {
                 assert!(owner.begin(source).is_err(), "{case} target must fail closed");
                 let imports: i64 = c.query_one("select count(*) from history_imports", &[]).unwrap().get(0);
                 assert_eq!(imports, 0);
+            });
+        }
+    }
+    #[test]
+    fn changed_missing_or_extra_migration_seeds_are_rejected() {
+        for case in [
+            "changed_seed_codec",
+            "extra_seed_format",
+            "missing_seed_runtime",
+            "changed_seed_revision",
+            "changed_seed_accounting",
+        ] {
+            paired_main_fixture(case, |owner, source, c| {
+                let error = owner.begin(source).unwrap_err();
+                assert_eq!(error.downcast_ref::<HistoryError>().unwrap().code, ErrorCode::DestinationMismatch);
+                assert!(error.to_string().contains("migration seed"), "{case}: {error:#}");
+                let imports: i64 = c.query_one("select count(*) from history_imports", &[]).unwrap().get(0);
+                assert_eq!(imports, 0, "{case} must fail before import registration");
+                let dirty: bool = c
+                    .query_one("select dirty from history_companion_receipts where owner_code='main_import'", &[])
+                    .unwrap()
+                    .get(0);
+                assert!(!dirty, "{case} must be refused independently of the paired receipt");
             });
         }
     }

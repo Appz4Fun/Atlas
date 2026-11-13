@@ -17,6 +17,17 @@ pub struct Schema {
 }
 
 impl Schema {
+    /// A direct-writer fixture without Runtime::open still needs a real
+    /// catalog privacy key. Opt in here; ordinary empty/migration/read-only
+    /// fixtures remain pristine and missing-key refusal remains testable.
+    pub fn native_writer() -> Option<Schema> {
+        let s = Self::new()?;
+        let mut key = [0; 8];
+        getrandom::fill(&mut key).expect("native writer fixture key entropy");
+        s.pool.get().unwrap().execute("insert into meta(key,value) values('key_salt',$1)", &[&i64::from_le_bytes(key)]).unwrap();
+        Some(s)
+    }
+
     /// A fresh schema, migrated. None without a test server.
     pub fn new() -> Option<Schema> {
         let s = Schema::empty()?;

@@ -69,7 +69,7 @@ pub(crate) fn read(client:&mut impl GenericClient,release:i64,stop:&AtomicBool)-
 mod tests {
     #[test]
     fn native_content_identity_matches_the_legacy_cache_encoding() {
-        let Some(schema)=crate::pg::testing::Schema::new() else {return};
+        let Some(schema)=crate::pg::testing::Schema::native_writer() else {return};
         let release=crate::parser::Release {name:"Example.Release".into(),group:"example.group".into(),
             articles:vec![
                 crate::parser::Article {filename:Some("a\0.bin".into()),message_id:"<one@example.test>".into(),

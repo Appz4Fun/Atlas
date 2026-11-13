@@ -130,7 +130,7 @@ mod tests {
         let (id,file)=runtime.owner.with(|client| {
             let row=client.query_one("select release_id,id from files",&[])?;let id:i64=row.get(0);let file:i64=row.get(1);
             client.execute("insert into release_probe(release_id,info,moviehash) values($1,$2,'')",&[&id,&info])?;
-            client.execute("insert into file_timing(file_id,release_id,lines,articles) values($1,$2,7,1)",&[&file,&id])?;
+            assert_eq!(client.execute("update file_timing set lines=7,articles=1 where file_id=$1 and release_id=$2",&[&file,&id])?,1,"the real accepted header must already own its timing row");
             client.execute("insert into release_keys(release_id,account,video) values($1,-1,99)",&[&id])?;
             client.execute("insert into archive_inner_files(release_id,seq,name,size,crc32,source) values($1,0,'excluded',2097152,1,1),($1,1,'kept',2097152,4294967295,2)",&[&id])?;
             client.execute("insert into segment_crc(release_id,message_id,decoded,crc32) values($1,$2,2097152,4294967295)",&[&id,&b"<part@example.test>".as_slice()])?;

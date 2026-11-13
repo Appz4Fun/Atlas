@@ -94,7 +94,7 @@ mod tests {
     #[test]
     #[ignore="requires explicit isolated migrated fresh PostgreSQL schema9"]
     fn fresh_recent_category_and_id_pages_use_actual_writer_ids_and_readonly_facts() {
-        let schema=pg::testing::Schema::new().expect("explicit isolated PG schema9");let mut client=schema.pool.get().unwrap();
+        let schema=pg::testing::Schema::native_writer().expect("explicit isolated PG schema9");let mut client=schema.pool.get().unwrap();
         let releases=["Alpha.Movie.2020.1080p","Beta.Movie.2021.2160p"].into_iter().enumerate().map(|(n,name)|Release {
             name:name.into(),group:"alt.binaries.test".into(),poster:"poster".into(),date:"2020-01-01".into(),
             articles:vec![Article {filename:Some("sample.bin".into()),subject:"sample.bin yEnc (1/1)".into(),message_id:format!("<part{n}@example.test>"),
@@ -126,7 +126,7 @@ mod descriptor_page_tests {
     #[test]
     #[ignore="requires isolated PostgreSQL and actual bounded native API-page admission"]
     fn newest_category_and_media_id_offsets_do_not_charge_discarded_release_values() {
-        let schema=pg::testing::Schema::new().expect("explicit isolated PostgreSQL");let mut client=schema.pool.get().unwrap();
+        let schema=pg::testing::Schema::native_writer().expect("explicit isolated PostgreSQL");let mut client=schema.pool.get().unwrap();
         let releases=(0..2305).map(|n|Release {name:format!("Api.Visible.{n:04}"),group:"alt.binaries.test".into(),poster:"p".into(),date:"Wed, 01 Jan 2020 00:00:00 +0000".into(),
             articles:vec![Article {filename:Some("f.bin".into()),subject:"f.bin yEnc (1/1)".into(),message_id:format!("api-page-{n}@example.invalid"),part:Some(1),total_parts:Some(1),bytes:1,..Default::default()}],..Default::default()}).collect::<Vec<_>>();
         assert_eq!(pg::release_writer::save(&mut client,&releases,1).unwrap().releases,2305);

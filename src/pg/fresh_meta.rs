@@ -100,6 +100,7 @@ mod tests {
     #[ignore="requires explicit isolated schema9 and bounded native metadata admission"]
     fn real_native_metadata_keeps_header_privacy_part_copies_and_exact_hash_bytes() {
         let schema=pg::testing::Schema::new().expect("explicit isolated PG schema9");let mut client=schema.pool.get().unwrap();
+        client.execute("insert into meta(key,value) values('key_salt',7)",&[]).unwrap();
         let articles=["<b@example.test>","<a@example.test>"].into_iter().map(|mid|Article {filename:Some("sample.bin".into()),subject:"sample.bin yEnc (1/1)".into(),
             message_id:mid.into(),part:Some(1),total_parts:Some(1),bytes:17,..Default::default()}).collect();
         pg::release_writer::save(&mut client,&[Release {name:"Metadata.Example.Release".into(),group:"alt.binaries.test".into(),poster:"poster".into(),date:"2020-01-01".into(),articles,..Default::default()}],1).unwrap();
@@ -108,7 +109,6 @@ mod tests {
         probe.headers.insert("Injection-Info".into(),"posting-account=\"private-account\"; logging-data=\"secret\"".into());
         probe.headers.insert("X-Ordinary".into(),"<kept & escaped>".into());
         client.execute("insert into release_probe(release_id,info) values($1,$2)",&[&id,&serde_json::to_string(&probe).unwrap()]).unwrap();
-        client.execute("insert into meta(key,value) values('key_salt',7)",&[]).unwrap();
         let root=tempfile::tempdir().unwrap();
         #[cfg(unix)]{use std::os::unix::fs::PermissionsExt;std::fs::set_permissions(root.path(),std::fs::Permissions::from_mode(0o700)).unwrap();}
         let pool=Pool::new(root.path().into(),Limits {requests:3,per_request_bytes:1<<20,total_bytes:3<<20,free_bytes:0}).unwrap();

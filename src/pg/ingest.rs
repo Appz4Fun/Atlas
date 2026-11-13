@@ -350,7 +350,7 @@ mod tests {
 
     #[test]
     fn a_large_upload_is_saved_in_bounded_jobs_and_retries_do_not_requeue_it() {
-        let Some(schema) = crate::pg::testing::Schema::new() else { return };
+        let Some(schema) = crate::pg::testing::Schema::native_writer() else { return };
         let pool = Arc::new(
             super::super::Pool::new(&super::super::StorageConfig {
                 backend: super::super::Backend::Postgres,
@@ -399,7 +399,7 @@ mod tests {
 
     #[test]
     fn a_late_executable_prevents_earlier_pieces_from_becoming_visible() {
-        let Some(schema) = crate::pg::testing::Schema::new() else { return };
+        let Some(schema) = crate::pg::testing::Schema::native_writer() else { return };
         let pool = Arc::new(
             super::super::Pool::new(&super::super::StorageConfig {
                 backend: super::super::Backend::Postgres,
@@ -464,7 +464,7 @@ mod tests {
 
     #[test]
     fn cancelled_callers_do_not_release_inflight_admission() {
-        let Some(schema) = crate::pg::testing::Schema::new() else { return };
+        let Some(schema) = crate::pg::testing::Schema::native_writer() else { return };
         let pool = Arc::new(
             super::super::Pool::new(&super::super::StorageConfig {
                 backend: super::super::Backend::Postgres,
