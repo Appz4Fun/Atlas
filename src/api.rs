@@ -814,7 +814,7 @@ mod tests {
 
         assert_eq!(selected_handle("/nope", "t=caps", "http://x", "key").status, 404);
         assert!(
-            caps_body("http://192.168.1.172:9091", &Default::default()).contains(r#"url="http://192.168.1.172:9091""#)
+            caps_body("http://192.0.2.172:9091", &Default::default()).contains(r#"url="http://192.0.2.172:9091""#)
         );
         let unknown = selected_handle("/api", "t=wat&apikey=key", "http://x", "key");
         assert_eq!(unknown.status, 200);
