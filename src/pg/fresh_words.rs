@@ -11,6 +11,15 @@ const JOINS:&str="from releases r left join release_category c on c.release_id=r
     left join ext_media_titles t on t.title_key=m.title_key
         and (r.name collate \"C\" ~ '^AC[0-9]{4}' or r.display_name collate \"C\" ~ '^AC[0-9]{4}')";
 
+/// Shared catalog/codec namespace for the readonly builder and the sole-owner
+/// delivery lane. It derives from an actual typed catalog identity, not a raw
+/// caller nonce or a mutable revision/ready flag.
+pub(crate) fn catalog_stamp(identity:&CatalogIdentity)->[u8;32] {
+    let mut digest=Sha256::new();digest.update(b"atlas.fresh.word.source.v1\0");
+    digest.update(identity.nonce());digest.update(identity.codec_version().to_le_bytes());
+    digest.update(native::codec_stamp().as_bytes());digest.finalize().into()
+}
+
 pub(crate) struct Search<'view,'client> { view:&'view ReadView<'client>,stamp:[u8;32] }
 impl<'view,'client> Search<'view,'client> {
     pub(crate) fn open(view:&'view ReadView<'client>)->Result<Self> {
@@ -18,10 +27,7 @@ impl<'view,'client> Search<'view,'client> {
         let identity=CatalogIdentity::read_in(&mut *view.tx.borrow_mut())?;
         // Revision is intentionally excluded: newly indexed rows queue normal
         // catch-up instead of invalidating/rebuilding the entire catalog.
-        let mut digest=Sha256::new();digest.update(b"atlas.fresh.word.source.v1\0");
-        digest.update(identity.nonce());digest.update(identity.codec_version().to_le_bytes());
-        digest.update(native::codec_stamp().as_bytes());
-        Ok(Self {view,stamp:digest.finalize().into()})
+        Ok(Self {view,stamp:catalog_stamp(&identity)})
     }
     pub(crate) fn page(&self,after:i64,budget:Budget)->Result<Vec<Record>> {
         budget.check()?;
