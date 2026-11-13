@@ -347,3 +347,7 @@ mod tests {
             crate::raw_store::native_pg_opensubtitles_cache_tests::WorkerCase::Factory);
     }
 }
+
+#[cfg(all(test,unix))]
+#[path="native_image_asset_tests.rs"]
+pub(crate) mod image_asset_tests;
