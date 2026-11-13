@@ -151,7 +151,7 @@ fn normal_binary_starts_configured_native_services_without_disabling_them() {
         (1..=2).map(|n| nntp::post(n, &format!("\"Enabled.Startup.fixture.bin\" yEnc ({n}/2)"), 100, vec![])).collect(),
     );
     let port = nntp::spawn_server(server.clone());
-    let provider = |key: &str| serde_json::json!({(key):"fixture", "base_url":http.url, "requests_per_minute":1});
+    let provider = |key: &str| serde_json::json!({(key):"fixture", "base_url":http.url, "image_base_url":http.url, "requests_per_minute":1});
     let config = serde_json::json!({
         "usenet_servers":[{"host":"127.0.0.1","port":port,"username":"bob","password":"secret",
             "ssl":false,"connections":2,"priority":1}],
