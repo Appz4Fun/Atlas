@@ -57,8 +57,9 @@ pub fn mpeg_ps(data: &[u8]) -> MediaInfo {
             break;
         }
     }
-    // a video stream named from a cut header, or one without its sequence header yet, wants more of the front
-    info.header_complete = !info.video.is_empty() && info.video.iter().all(|v| v.width.is_some());
+    // Dimensions can precede the sequence extension: that stream still wants more of the front.
+    info.header_complete =
+        !info.video.is_empty() && info.video.iter().all(|v| v.width.is_some()) && seen.iter().all(|s| s.seq.is_none());
     info
 }
 
@@ -118,8 +119,9 @@ fn stream(id: u8, payload: &[u8], seen: &mut Vec<Seen>, info: &mut MediaInfo) {
             Place::Video(n) => {
                 let Some(v) = info.video.get_mut(n) else { return };
                 if v.width.is_none() {
-                    known.seq = video(&[known.carry.as_slice(), es].concat(), v);
-                    known.carry = if v.width.is_none() { tail(es) } else { Vec::new() };
+                    let joined = [known.carry.as_slice(), es].concat();
+                    known.seq = video(&joined, v);
+                    known.carry = if v.width.is_none() || known.seq.is_some() { tail(&joined) } else { Vec::new() };
                 } else if let Some(h) = known.seq {
                     // the carried bytes may hold the header itself: what counts is what comes after it
                     let joined = [known.carry.as_slice(), es].concat();
@@ -131,7 +133,7 @@ fn stream(id: u8, payload: &[u8], seen: &mut Vec<Seen>, info: &mut MediaInfo) {
                             known.seq = None;
                         }
                         Some(_) => known.seq = None,
-                        None => known.carry = tail(es),
+                        None => known.carry = tail(&joined),
                     }
                 }
             }
@@ -191,7 +193,10 @@ fn audio(id: u8, sub: u8, payload: &[u8], es: &[u8]) -> Option<AudioTrack> {
 /// The first start code in `b` and the byte after it.
 fn first_start_code(b: &[u8]) -> Option<(u8, u8)> {
     let at = b.windows(3).position(|w| w == [0, 0, 1])?;
-    Some((*b.get(at + 3)?, *b.get(at + 4).unwrap_or(&0)))
+    let id = *b.get(at + 3)?;
+    // An extension is undecided until its ID byte arrives. Other start codes already rule it out.
+    let next = if id == 0xB5 { *b.get(at + 4)? } else { *b.get(at + 4).unwrap_or(&0) };
+    Some((id, next))
 }
 
 /// An MPEG-1/2 video stream's size, frame rate and aspect from its first sequence header in `es`.
@@ -484,6 +489,117 @@ mod tests {
         assert_eq!(info.video[0].display_width, Some(1024), "16:9 by MPEG-2's table");
         assert_eq!((info.audio[0].codec.as_str(), info.audio[0].sample_rate), ("mp2", Some(48000.0)));
         assert_eq!(info.audio.len(), 1);
+    }
+
+    // 720x576, 25 fps: aspect code 2 means 4:3 only once MPEG-2 is known.
+    const PAL_SEQUENCE: [u8; 12] = [0, 0, 1, 0xB3, 0x2D, 0x02, 0x40, 0x23, 0xFF, 0xFF, 0xE0, 0x18];
+    const PAL_EXTENSION: [u8; 10] = [0, 0, 1, 0xB5, 0x14, 0x8A, 0, 1, 0, 0];
+
+    #[test]
+    fn a_pending_extension_keeps_the_article_prefix_eligible_for_more_bytes() {
+        let mut data = pack();
+        data.extend(pes(0xE0, &PAL_SEQUENCE));
+        let partial = mpeg_ps(&data);
+        let v = &partial.video[0];
+        assert_eq!((v.width, v.height, v.frame_rate), (Some(720), Some(576), Some(25.0)));
+        assert_eq!((v.codec.as_str(), v.display_width), ("mpeg1video", Some(1069)), "provisional MPEG-1 aspect");
+        assert!(!partial.header_complete, "the next article can still supply the sequence extension");
+
+        data.extend(pes(0xE0, &PAL_EXTENSION));
+        data.extend(pes(0xC0, &[0xFF, 0xFD, 0x84, 0x04]));
+        let complete = mpeg_ps(&data);
+        assert!(complete.header_complete);
+        let v = &complete.video[0];
+        assert_eq!(
+            (v.codec.as_str(), v.width, v.height, v.frame_rate),
+            ("mpeg2video", Some(720), Some(576), Some(25.0))
+        );
+        assert_eq!((v.display_width, v.display_height), (Some(768), Some(576)), "4:3 MPEG-2 aspect");
+        assert_eq!((complete.audio[0].sample_rate, complete.audio[0].channels), (Some(48000.0), Some(2)));
+    }
+
+    #[test]
+    fn a_truncated_extension_start_code_waits_for_its_discriminator() {
+        let mut whole = pack();
+        whole.extend(pes(0xE0, &[PAL_SEQUENCE.as_slice(), PAL_EXTENSION.as_slice()].concat()));
+        let extension_at = pack().len() + 9 + PAL_SEQUENCE.len();
+        for cut in 0..5 {
+            let partial = mpeg_ps(&whole[..extension_at + cut]);
+            assert_eq!(partial.video[0].width, Some(720), "extension prefix length {cut}");
+            assert!(!partial.header_complete, "extension prefix length {cut}");
+        }
+        let complete = mpeg_ps(&whole);
+        assert!(complete.header_complete);
+        assert_eq!(complete.video[0].codec, "mpeg2video");
+        assert_eq!(complete.video[0].display_width, Some(768));
+    }
+
+    #[test]
+    fn completing_dimensions_keeps_the_next_start_code_fragment() {
+        for cut in 0..=PAL_SEQUENCE.len() {
+            let mut data = pack();
+            data.extend(pes(0xE0, &PAL_SEQUENCE[..cut]));
+            data.extend(pes(0xE0, &[&PAL_SEQUENCE[cut..], &PAL_EXTENSION[..2]].concat()));
+            let partial = mpeg_ps(&data);
+            assert_eq!(partial.video[0].width, Some(720), "sequence split {cut}");
+            assert!(!partial.header_complete, "sequence split {cut}");
+            data.extend(pes(0xE0, &PAL_EXTENSION[2..]));
+            let complete = mpeg_ps(&data);
+            assert!(complete.header_complete, "sequence split {cut}");
+            assert_eq!(complete.video[0].codec, "mpeg2video", "sequence split {cut}");
+            assert_eq!(complete.video[0].display_width, Some(768), "sequence split {cut}");
+        }
+    }
+
+    #[test]
+    fn a_sequence_and_extension_can_span_several_tiny_packets() {
+        let mut data = pack();
+        for byte in PAL_SEQUENCE.into_iter().chain(PAL_EXTENSION) {
+            data.extend(pes(0xE0, &[byte]));
+        }
+        let info = mpeg_ps(&data);
+        assert!(info.header_complete);
+        let v = &info.video[0];
+        assert_eq!(
+            (v.codec.as_str(), v.width, v.height, v.frame_rate),
+            ("mpeg2video", Some(720), Some(576), Some(25.0))
+        );
+        assert_eq!((v.display_width, v.display_height), (Some(768), Some(576)));
+    }
+
+    #[test]
+    fn a_definitive_non_sequence_extension_keeps_mpeg1_metadata() {
+        // A sequence end needs no following payload byte; another extension's ID is definitive too.
+        for next in [&[0, 0, 1, 0xB7][..], &[0, 0, 1, 0x00], &[0, 0, 1, 0xB5, 0x20]] {
+            for split in [false, true] {
+                let mut data = pack();
+                if split {
+                    data.extend(pes(0xE0, &PAL_SEQUENCE));
+                    data.extend(pes(0xE0, next));
+                } else {
+                    data.extend(pes(0xE0, &[PAL_SEQUENCE.as_slice(), next].concat()));
+                }
+                let info = mpeg_ps(&data);
+                assert!(info.header_complete, "next code {next:02X?}, split {split}");
+                let v = &info.video[0];
+                assert_eq!(
+                    (v.codec.as_str(), v.width, v.height, v.frame_rate),
+                    ("mpeg1video", Some(720), Some(576), Some(25.0))
+                );
+                assert_eq!((v.display_width, v.display_height), (Some(1069), Some(576)));
+            }
+        }
+    }
+
+    #[test]
+    fn an_extension_past_the_walk_bound_does_not_complete_the_header() {
+        let mut data = pack();
+        data.extend(pes(0xE0, &PAL_SEQUENCE));
+        data.resize(MAX_WALK, 0xFF);
+        data.extend(pes(0xE0, &PAL_EXTENSION));
+        let info = mpeg_ps(&data);
+        assert_eq!(info.video[0].width, Some(720));
+        assert!(!info.header_complete, "bytes beyond the walk bound cannot settle the pending sequence");
     }
 
     #[test]
