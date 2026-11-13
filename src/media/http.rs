@@ -146,11 +146,10 @@ impl Client {
                 if status==200 {
                     match serde_json::from_str::<Value>(&body) {
                         Ok(json)=>return Ok(Reply::Json(json)),
-                        Err(_) if self.backend.is_native()=>return Err(Trouble::Cache(super::resolve::CacheFailure::new(anyhow::anyhow!("cached media response is not valid JSON")))),
-                        Err(_)=>{},
+                        Err(_)=>return Err(Trouble::Cache(super::resolve::CacheFailure::new(anyhow::anyhow!("cached media response is not valid JSON")))),
                     }
                 }
-                if status==404 && self.backend.is_native() {return Ok(Reply::NotFound)}
+                if status==404 {return Ok(Reply::NotFound)}
             }
         } else {
             self.backend.check().map_err(Trouble::Cache)?;

@@ -1,8 +1,4 @@
-//! `atlas.predb.db`: the catalogue of titles, next to the shards and never part of them.
-
-use std::path::{Path, PathBuf};
-
-use rusqlite::Connection;
+//! Retained schema spelling for the private version-one result contract snapshot.
 
 const SCHEMA: &str = "
 create table if not exists titles (
@@ -41,28 +37,3 @@ create table if not exists feeds (
 create table if not exists meta (key TEXT PRIMARY KEY, value INTEGER);
 insert or ignore into meta (key, value) values ('titles', 0), ('late_after_id', 0);
 ";
-
-/// `atlas.db` -> `atlas.predb.db`
-pub fn path_for(main: &Path) -> PathBuf {
-    crate::compact::with_suffix(main, "predb")
-}
-
-/// The file, made if it's missing.
-pub fn create(path: &Path) -> rusqlite::Result<Connection> {
-    let conn = crate::db::create_at(path)?;
-    conn.query_row("pragma journal_mode = wal", [], |_| Ok(()))?;
-    conn.execute_batch(SCHEMA)?;
-    let has_rows: bool =
-        conn.prepare("select 1 from pragma_table_info('feeds') where name = 'last_rows'")?.exists([])?;
-    if !has_rows {
-        conn.execute_batch("alter table feeds add column last_rows INTEGER")?;
-    }
-    Ok(conn)
-}
-
-/// The file as it is: a missing one is an error, never a new empty one.
-pub fn open_reader(path: &Path) -> rusqlite::Result<Connection> {
-    let conn = crate::db::open_at(path)?;
-    conn.execute_batch("pragma query_only = on")?;
-    Ok(conn)
-}

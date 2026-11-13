@@ -1,25 +1,17 @@
 //! The step that gives a release its catalogue title.
 
-use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex};
-
-use rusqlite::Connection;
-
 use crate::config::Config;
 use crate::naming::{
     Grade, NameSource, best_from_paths, clean_candidate, current_name, is_image_name, judge, renames_pack_to_episode,
 };
 use crate::postprocess::schema::ShardTable;
 use crate::postprocess::step::{
-    NameChange, Needs, Outcome, ReleaseInfo, Reruns, Step, StepCtx, StepError, StepId, StepMask, StepMutation, StepWrite,
+    NameChange, Needs, Outcome, ReleaseInfo, Reruns, Step, StepCtx, StepError, StepId, StepMask, StepMutation,
+    StepWrite,
 };
 
-use super::db;
 use super::keys::{hash_key, name_key};
-use super::matcher::{Evidence, find};
+use super::matcher::Evidence;
 
 pub const MATCH: ShardTable = ShardTable {
     name: "predb_match",
@@ -76,77 +68,6 @@ pub fn worth_looking_up(r: &ReleaseInfo) -> bool {
     judge(name) != Grade::Junk
 }
 
-/// `…/atlas.s3.db` -> `…/atlas.predb.db`. Checked legacy Step data supplies the shard path.
-pub fn db_path_from_shard(shard: &Path) -> Option<PathBuf> {
-    let file = shard.file_name()?.to_str()?;
-    let stem = file.strip_suffix(".db")?;
-    let (base, shard_no) = stem.rsplit_once(".s")?;
-    if shard_no.is_empty() || !shard_no.bytes().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    Some(shard.with_file_name(format!("{base}.predb.db")))
-}
-
-thread_local! {
-    static READERS: RefCell<HashMap<PathBuf, Connection>> = RefCell::new(HashMap::new());
-}
-
-/// One `query_only` connection per thread and file. A missing file is an error, even with a connection open on it.
-fn with_reader<T>(path: &Path, read: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> rusqlite::Result<T> {
-    READERS.with_borrow_mut(|readers| {
-        if !path.exists() {
-            readers.remove(path);
-            return Err(rusqlite::Error::InvalidPath(path.to_path_buf()));
-        }
-        if !readers.contains_key(path) {
-            readers.insert(path.to_path_buf(), db::open_reader(path)?);
-        }
-        match readers.get(path) {
-            Some(conn) => read(conn),
-            None => Err(rusqlite::Error::InvalidPath(path.to_path_buf())),
-        }
-    })
-}
-
-type Reads = BTreeMap<u64, i64>;
-static IN_FLIGHT: LazyLock<Mutex<HashMap<PathBuf, Reads>>> = LazyLock::new(Default::default);
-static NEXT_READ: AtomicU64 = AtomicU64::new(0);
-
-/// A step read `titles` up to this id and its keys aren't committed: a newer title has to wait.
-struct InFlight {
-    path: PathBuf,
-    token: u64,
-}
-
-impl Drop for InFlight {
-    fn drop(&mut self) {
-        let mut all = IN_FLIGHT.lock().unwrap();
-        if let Some(reads) = all.get_mut(&self.path) {
-            reads.remove(&self.token);
-            if reads.is_empty() {
-                all.remove(&self.path);
-            }
-        }
-    }
-}
-
-fn record_read(path: &Path, top: i64) -> InFlight {
-    let token = NEXT_READ.fetch_add(1, Ordering::Relaxed);
-    IN_FLIGHT.lock().unwrap().entry(path.to_path_buf()).or_default().insert(token, top);
-    InFlight { path: path.to_path_buf(), token }
-}
-
-/// what a run holds while its batch is uncommitted, for a test
-#[doc(hidden)]
-pub fn hold_for_test(path: &Path, predb: &Connection, top: i64) -> impl Sized + use<> {
-    record_read(predb.path().map_or(path, Path::new), top)
-}
-
-/// the lowest id any uncommitted step has read up to
-pub(crate) fn lowest_in_flight(path: &Path) -> Option<i64> {
-    IN_FLIGHT.lock().unwrap().get(path).and_then(|reads| reads.values().min().copied())
-}
-
 pub struct PredbMatch;
 
 impl Step for PredbMatch {
@@ -172,7 +93,6 @@ impl Step for PredbMatch {
         Reruns { on_rename: true, on_growth: true }
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
-        let retry = |e: rusqlite::Error| StepError::Retry(e.to_string());
         let id = ctx.release().id;
         let files = ctx.files().map_err(StepError::from_inventory)?;
         let inner = ctx.data().archive_inner_files(id)?;
@@ -185,31 +105,21 @@ impl Step for PredbMatch {
             files: files.iter().map(|f| f.filename.as_str()).collect(),
             inner: inner.iter().map(|f| f.name.as_str()).collect(),
         };
-        let (hold, found, revision): (Option<Box<dyn std::any::Any + Send>>, _, _) = match ctx.data() {
-            crate::postprocess::data::StepData::Native(_) => {
-                match ctx.data().predb_find(&evidence)? {
-                    crate::pg::predb_cache::LookupStatus::Pending => return Err(StepError::Transient("PreDB matcher index is rebuilding".into())),
-                    crate::pg::predb_cache::LookupStatus::Ready(lookup) => (None, lookup.found, Some(lookup.revision)),
-                }
+        let lookup = match ctx.data().predb_find(&evidence)? {
+            crate::pg::predb_cache::LookupStatus::Pending => {
+                return Err(StepError::Transient("PreDB matcher index is rebuilding".into()));
             }
-            _ => {
-                let path = ctx.data().predb_catalog_path()?;
-                // A late title waits until this legacy run's inner keys commit.
-                let (hold, found) = with_reader(&path, |c| {
-                    let top: i64 = c.query_row("select coalesce(max(id), 0) from titles", [], |r| r.get(0))?;
-                    let hold = record_read(&path, top);
-                    Ok((hold, find(c, &evidence)?))
-                }).map_err(retry)?;
-                (Some(Box::new(hold)), found, None)
-            }
+            crate::pg::predb_cache::LookupStatus::Ready(lookup) => lookup,
         };
-        let guard = || revision.map(|revision| StepWrite::for_mutation(id, StepMutation::PredbRead { revision }));
+        let found = lookup.found;
+        let revision = lookup.revision;
+        let guard = || StepWrite::for_mutation(id, StepMutation::PredbRead { revision });
 
         let hit = found.filter(|m| !renames_pack_to_episode(current_name(r), &m.title.title));
         let lookup = if hit.is_some() { "matched" } else { "no_match" };
         crate::metrics::names::PREDB_LOOKUPS.inc(&[("result", lookup)], 1);
         let Some(m) = hit else {
-            let mut writes: Vec<_> = guard().into_iter().collect();
+            let mut writes: Vec<_> = vec![guard()];
             if !inner.is_empty() {
                 writes.push(StepWrite::for_mutation(id, StepMutation::ClearPredbInnerKeys));
                 let paths = inner.iter().map(|f| (f.name.as_str(), f.size.unwrap_or(1).max(1) as u64));
@@ -217,7 +127,7 @@ impl Step for PredbMatch {
                     writes.push(StepWrite::for_mutation(id, StepMutation::AddPredbInnerKey { key: name_key(&name) }));
                 }
             }
-            return Ok(Outcome { writes, hold, ..Outcome::default() });
+            return Ok(Outcome { writes, ..Outcome::default() });
         };
 
         let t = m.title;
@@ -235,11 +145,19 @@ impl Step for PredbMatch {
         if let Some(category) = &t.category {
             facts.push(("predb.category", category.clone()));
         }
-        let mut writes: Vec<_> = guard().into_iter().collect();
+        let mut writes: Vec<_> = vec![guard()];
         writes.extend([
-            StepWrite::for_mutation(id, StepMutation::KeepPredbMatch {
-                title_id: t.id,kind: m.kind,category: t.category.clone(),pre_at: t.pre_at,nuked: t.nuked,matched_at: now,
-            }),
+            StepWrite::for_mutation(
+                id,
+                StepMutation::KeepPredbMatch {
+                    title_id: t.id,
+                    kind: m.kind,
+                    category: t.category.clone(),
+                    pre_at: t.pre_at,
+                    nuked: t.nuked,
+                    matched_at: now,
+                },
+            ),
             StepWrite::for_mutation(id, StepMutation::ClearPredbInnerKeys),
         ]);
         Ok(Outcome {
@@ -254,20 +172,8 @@ impl Step for PredbMatch {
             rerun: if known == Some(t.id) { 0 } else { LATER_PARTS },
             facts,
             wait_until: None,
-            hold,
             junk: None,
+            ..Outcome::default()
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn db_path_from_shard_table() {
-        assert_eq!(db_path_from_shard(Path::new("/x/atlas.s3.db")), Some(PathBuf::from("/x/atlas.predb.db")));
-        assert_eq!(db_path_from_shard(Path::new("/x/other.s0.db")), Some(PathBuf::from("/x/other.predb.db")));
-        assert_eq!(db_path_from_shard(Path::new("/x/atlas.db")), None);
     }
 }

@@ -66,15 +66,31 @@ pub enum Trouble {
     Cache(CacheFailure),
 }
 
-#[derive(Clone,Debug)]
+#[derive(Clone, Debug)]
 pub struct CacheFailure(std::sync::Arc<anyhow::Error>);
 impl CacheFailure {
-    pub(crate) fn new(error:anyhow::Error)->Self {Self(std::sync::Arc::new(error))}
-    pub(crate) fn into_error(self)->anyhow::Error {anyhow::Error::new(self)}
+    pub(crate) fn new(error: anyhow::Error) -> Self {
+        Self(std::sync::Arc::new(error))
+    }
+    pub(crate) fn into_error(self) -> anyhow::Error {
+        anyhow::Error::new(self)
+    }
 }
-impl PartialEq for CacheFailure {fn eq(&self,other:&Self)->bool {std::sync::Arc::ptr_eq(&self.0,&other.0)}}
-impl std::fmt::Display for CacheFailure {fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str("native service cache failed")}}
-impl std::error::Error for CacheFailure {fn source(&self)->Option<&(dyn std::error::Error+'static)> {Some(self.0.as_ref().as_ref())}}
+impl PartialEq for CacheFailure {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl std::fmt::Display for CacheFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("native service cache failed")
+    }
+}
+impl std::error::Error for CacheFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref().as_ref())
+    }
+}
 
 pub trait Provider: Send + Sync {
     fn bit(&self) -> u8;
@@ -117,53 +133,44 @@ pub(crate) fn year_of(v: &Value) -> Option<i32> {
 const MAX_NEGATIVE_DAYS: i64 = 180;
 
 #[derive(Debug)]
-pub(crate) enum ResolveFailure {Cache(anyhow::Error),Provider(String)}
+pub(crate) enum ResolveFailure {
+    Cache(anyhow::Error),
+    Provider(String),
+}
 impl std::fmt::Display for ResolveFailure {
-    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {match self {Self::Cache(error)=>write!(f,"{error}"),Self::Provider(error)=>f.write_str(error)}}
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cache(error) => write!(f, "{error}"),
+            Self::Provider(error) => f.write_str(error),
+        }
+    }
 }
 
 impl Media {
-    /// What's known of this title, asking whichever providers are still owed an answer.
-    pub fn resolve(&self, q: &TitleQuery<'_>, key: i64, now: i64) -> Result<Resolved, String> {
-        self.resolve_until(q, key, now, &|| false)
-    }
-
-    /// `stopping` is checked before each provider. Stopped is `Later(now)`, with what was answered kept.
-    pub(crate) fn resolve_until(
-        &self,
-        q: &TitleQuery<'_>,
-        key: i64,
-        now: i64,
-        stopping: &dyn Fn() -> bool,
-    ) -> Result<Resolved, String> {
-        self.resolve_seeded(q, key, now, stopping, None)
-    }
-
-    /// As `resolve_until`, with ids already known some other way, as an AlloCiné id's from Wikidata. They come first,
-    /// soo a provider's answer for another title of the same name is passed over.
-    pub(crate) fn resolve_seeded(
+    pub(crate) fn resolve_seeded_checked(
         &self,
         q: &TitleQuery<'_>,
         key: i64,
         now: i64,
         stopping: &dyn Fn() -> bool,
         seed: Option<(&Ids, &str)>,
-    ) -> Result<Resolved, String> {
-        self.resolve_seeded_checked(q,key,now,stopping,seed).map_err(|error|error.to_string())
-    }
-
-    pub(crate) fn resolve_seeded_checked(
-        &self,q:&TitleQuery<'_>,key:i64,now:i64,stopping:&dyn Fn()->bool,seed:Option<(&Ids,&str)>,
-    )->Result<Resolved,ResolveFailure> {
+    ) -> Result<Resolved, ResolveFailure> {
         let providers = self.providers();
         let existing = self.title_get_checked(key).map_err(ResolveFailure::Cache)?;
-        if self.is_native() && let Some(row)=&existing {
-            if row.kind!=q.kind as i64 || row.year!=q.year || super::title::normalize(&row.title)!=super::title::normalize(q.title) {
+        if let Some(row) = &existing {
+            if row.kind != q.kind as i64
+                || row.year != q.year
+                || super::title::normalize(&row.title) != super::title::normalize(q.title)
+            {
                 return Err(ResolveFailure::Cache(anyhow::anyhow!("media query/cache identity mismatch")));
             }
         }
-        if self.is_native() && existing.is_none() && self.titles.load(std::sync::atomic::Ordering::Relaxed)>=u64::try_from(self.config.read().unwrap().max_titles).unwrap_or(0) {
-            self.titles_full.fetch_add(1,std::sync::atomic::Ordering::Relaxed);return Ok(Resolved::Later(now+30));
+        if existing.is_none()
+            && self.titles.load(std::sync::atomic::Ordering::Relaxed)
+                >= u64::try_from(self.config.read().unwrap().max_titles).unwrap_or(0)
+        {
+            self.titles_full.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(Resolved::Later(now + 30));
         }
         let mut row = existing.clone().unwrap_or(TitleRow {
             key,
@@ -213,7 +220,7 @@ impl Media {
                 Ok(Answer::NotFound) => row.checked_mask |= i64::from(provider.bit()),
                 Err(Trouble::Paused(t) | Trouble::BadKey(t)) => later = Some(later.map_or(t, |l: i64| l.min(t))),
                 Err(Trouble::Bad(e)) => bad = Some(e),
-                Err(Trouble::Cache(error))=>return Err(ResolveFailure::Cache(error.into_error())),
+                Err(Trouble::Cache(error)) => return Err(ResolveFailure::Cache(error.into_error())),
             }
         }
 

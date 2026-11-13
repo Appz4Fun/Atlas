@@ -60,7 +60,7 @@ fn configured_native_media_child() {
     assert!(config.media.tvmaze.base_url.as_ref().unwrap().starts_with("http://127.0.0.1:"));
     config.media.allocine.enabled=false;config.media.details_per_minute=0;config.postprocess.body_fetches_per_minute=1;
     let configured=native_steps(&runtime.owner,&config).unwrap();assert_eq!(configured.map(|step|step.name()),["media_parse","media_lookup","media_nfo"]);
-    let media=native_service(&runtime.owner,&config).unwrap();assert!(media.is_native());
+    let media=native_service(&runtime.owner,&config).unwrap();media.cache.check().unwrap();
     let key=title::title_key(Kind::Tv,"some show",None);let now=http::now_secs();
     match action.as_str() {
         "negative"=>{
@@ -77,4 +77,18 @@ fn configured_native_media_child() {
         _=>panic!("unknown owned media child action"),
     }
     println!("native media child completed: {action}; Root OS observer remains required");
+}
+
+#[test]
+fn native_title_claims_keep_capacity_and_release_on_guard_drop() {
+    let Some(schema)=crate::pg::testing::Schema::new() else {eprintln!("skipping PostgreSQL test: ATLAS_PG_TEST_URL is required");return};
+    let runtime=crate::pg::stage_queue_tests::runtime(&schema);
+    let media=native_service(&runtime.owner,&Config::default()).unwrap();media.with_max_claims(1);
+    let first=media.claim_native(11,1,10).expect("first title claim");
+    assert!(media.claim_native(11,1,10).is_none());
+    assert!(media.claim_native(12,2,10).is_none());
+    drop(first);
+    let second=media.claim_native(12,2,11).expect("guard drop releases capacity");
+    assert!(media.claim_native(11,1,11).is_none());drop(second);
+    assert!(media.claim_native(11,1,12).is_some());
 }

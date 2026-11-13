@@ -6,7 +6,6 @@ use std::collections::HashSet;
 use std::sync::LazyLock;
 
 use regex::Regex;
-use rusqlite::Connection;
 
 use crate::naming::{
     basename, clean_candidate, distinct_episodes, identity_key, is_episode_name, parent_dir, strip_file_suffixes,
@@ -46,23 +45,6 @@ pub struct Evidence<'a> {
     pub inner: Vec<&'a str>,
 }
 
-pub fn rows_for_key(conn: &Connection, key: i64) -> rusqlite::Result<Vec<TitleRow>> {
-    conn.prepare_cached(
-        "select t.id, t.title, t.category, t.size_bytes, t.pre_at, t.nuked
-         from title_keys k join titles t on t.id = k.title_id where k.key = ?1 order by t.id limit 17",
-    )?
-    .query_map([key], |r| {
-        Ok(TitleRow {
-            id: r.get(0)?,
-            title: r.get(1)?,
-            category: r.get(2)?,
-            size_bytes: r.get(3)?,
-            pre_at: r.get(4)?,
-            nuked: r.get(5)?,
-        })
-    })?
-    .collect()
-}
 /// Strong enough that folding separators can't be a coincidence: 15+ bytes, 3+ words and a -GROUP.
 pub fn is_full_title(title: &str) -> bool {
     title.len() >= 15 && FULL_TITLE.is_match(title)
@@ -99,12 +81,12 @@ fn unique(mut found: Vec<TitleRow>) -> Result<Option<TitleRow>, ()> {
         }
     }
 }
-pub fn find(conn: &Connection, e: &Evidence<'_>) -> rusqlite::Result<Option<Match>> {
-    find_with(e, |key| rows_for_key(conn, key))
-}
 
 /// Storage supplies checked candidates; literal/hash/ambiguity rules stay identical.
-pub(crate) fn find_with<E>(e: &Evidence<'_>, mut rows_for_key: impl FnMut(i64) -> Result<Vec<TitleRow>, E>) -> Result<Option<Match>, E> {
+pub(crate) fn find_with<E>(
+    e: &Evidence<'_>,
+    mut rows_for_key: impl FnMut(i64) -> Result<Vec<TitleRow>, E>,
+) -> Result<Option<Match>, E> {
     // hash-named posts: the full digest has to agree, a key only nominates, and all of them have to point at one title
     let mut hashed = Vec::new();
     for raw in std::iter::once(e.name).chain(e.files.iter().copied()).take(MAX_NAMES) {
@@ -112,9 +94,8 @@ pub(crate) fn find_with<E>(e: &Evidence<'_>, mut rows_for_key: impl FnMut(i64) -
         let Some(name) = clean_candidate(raw) else { continue };
         let Some(key) = hash_key(&name) else { continue };
         let want = name.to_ascii_lowercase();
-        hashed.extend(
-            rows_for_key(key)?.into_iter().filter(|t| md5_hex(&t.title) == want || sha1_hex(&t.title) == want),
-        );
+        hashed
+            .extend(rows_for_key(key)?.into_iter().filter(|t| md5_hex(&t.title) == want || sha1_hex(&t.title) == want));
     }
     match unique(hashed) {
         Ok(Some(t)) => return Ok(Some(Match { title: t, kind: Kind::Hash })),
@@ -177,36 +158,48 @@ pub(crate) fn find_with<E>(e: &Evidence<'_>, mut rows_for_key: impl FnMut(i64) -
 
 #[cfg(test)]
 mod tests {
-    use super::super::import::{Entry, import};
     use super::*;
-    use crate::predb::db;
 
     const T: &str = "Alpha.Beta.Gamma.2024.1080p.WEB-DL.H.264-TESTGRP";
     const SECOND: &str = "Second.Title.Name.2023.720p.WEB-OTHER";
     const GIB5: i64 = 5 << 30;
 
-    fn fixture(titles: &[&str]) -> (tempfile::TempDir, Connection) {
-        let dir = tempfile::tempdir().unwrap();
-        let mut conn = db::create(&dir.path().join("atlas.predb.db")).unwrap();
-        let entries: Vec<Entry> = titles
-            .iter()
-            .map(|t| Entry { title: t.to_string(), size_bytes: Some(GIB5), ..Default::default() })
-            .collect();
-        import(&mut conn, 1, &entries, 5, None).unwrap();
-        (dir, conn)
+    type Candidates = std::collections::BTreeMap<i64, Vec<TitleRow>>;
+    fn fixture(titles: &[&str]) -> Candidates {
+        let mut rows = Candidates::new();
+        for (index, title) in titles.iter().enumerate() {
+            let row = TitleRow {
+                id: index as i64 + 1,
+                title: (*title).into(),
+                category: None,
+                size_bytes: Some(GIB5),
+                pre_at: None,
+                nuked: 0,
+            };
+            for key in super::super::keys::title_keys(title) {
+                rows.entry(key).or_default().push(row.clone());
+            }
+        }
+        rows
     }
 
     fn evidence(name: &str) -> Evidence<'_> {
         Evidence { name, display_name: None, size: GIB5, files: Vec::new(), inner: Vec::new() }
     }
 
-    fn found(conn: &Connection, e: &Evidence<'_>) -> Option<(Kind, String)> {
-        find(conn, e).unwrap().map(|m| (m.kind, m.title.title))
+    fn found(candidates: &Candidates, e: &Evidence<'_>) -> Option<(Kind, String)> {
+        find_with(e, |key| {
+            Ok::<_, std::convert::Infallible>(
+                candidates.get(&key).into_iter().flatten().take(MAX_ROWS_PER_KEY + 1).cloned().collect(),
+            )
+        })
+        .unwrap()
+        .map(|m| (m.kind, m.title.title))
     }
 
     fn check(name: &str, want: Option<Kind>) {
-        let (_dir, conn) = fixture(&[T, SECOND]);
-        assert_eq!(found(&conn, &evidence(name)), want.map(|k| (k, T.to_string())), "{name}");
+        let candidates = fixture(&[T, SECOND]);
+        assert_eq!(found(&candidates, &evidence(name)), want.map(|k| (k, T.to_string())), "{name}");
     }
 
     #[test]
@@ -225,16 +218,16 @@ mod tests {
 
     #[test]
     fn folded_but_sizes_disagree() {
-        let (_dir, conn) = fixture(&[T]);
+        let candidates = fixture(&[T]);
         let e = Evidence { size: 500, ..evidence("Alpha_Beta Gamma_2024_1080p_WEB-DL_H_264-TESTGRP") };
-        assert_eq!(found(&conn, &e), None);
+        assert_eq!(found(&candidates, &e), None);
     }
 
     #[test]
     fn display_name_counts() {
-        let (_dir, conn) = fixture(&[T]);
+        let candidates = fixture(&[T]);
         let e = Evidence { display_name: Some(T), ..evidence("Xk3Mz9PqL") };
-        assert_eq!(found(&conn, &e), Some((Kind::Exact, T.to_string())));
+        assert_eq!(found(&candidates, &e), Some((Kind::Exact, T.to_string())));
     }
 
     #[test]
@@ -244,21 +237,21 @@ mod tests {
         check(&sha1.to_uppercase(), Some(Kind::Hash));
         check(&format!("{sha1}.mkv"), Some(Kind::Hash));
         check(&format!("{md5} [12345678]"), Some(Kind::Hash));
-        let (_dir, conn) = fixture(&[T]);
+        let candidates = fixture(&[T]);
         let file = format!("{md5}.rar");
         let e = Evidence { files: vec![&file], ..evidence("Xk3Mz9PqL") };
-        assert_eq!(found(&conn, &e), Some((Kind::Hash, T.to_string())));
+        assert_eq!(found(&candidates, &e), Some((Kind::Hash, T.to_string())));
     }
 
     #[test]
     fn hash_files_of_two_titles_are_no_match() {
-        let (_dir, conn) = fixture(&[T, SECOND]);
+        let candidates = fixture(&[T, SECOND]);
         let (one, two) = (format!("{}.rar", md5_hex(T)), format!("{}.rar", md5_hex(SECOND)));
         let e = Evidence { files: vec![&one, &two], ..evidence("Xk3Mz9PqL") };
-        assert_eq!(found(&conn, &e), None);
+        assert_eq!(found(&candidates, &e), None);
         let again = format!("{}.r00", sha1_hex(T));
         let e = Evidence { files: vec![&one, &again], ..evidence("Xk3Mz9PqL") };
-        assert_eq!(found(&conn, &e), Some((Kind::Hash, T.to_string())), "two hashes of one title agree");
+        assert_eq!(found(&candidates, &e), Some((Kind::Hash, T.to_string())), "two hashes of one title agree");
     }
 
     #[test]
@@ -266,9 +259,9 @@ mod tests {
         let mut md5 = md5_hex(T);
         md5.pop();
         md5.push(if md5_hex(T).ends_with('0') { '1' } else { '0' });
-        let (_dir, conn) = fixture(&[T]);
-        assert!(!rows_for_key(&conn, hash_key(&md5).unwrap()).unwrap().is_empty(), "the key finds it");
-        assert_eq!(found(&conn, &evidence(&md5)), None);
+        let candidates = fixture(&[T]);
+        assert!(!candidates.get(&hash_key(&md5).unwrap()).unwrap().is_empty(), "the key finds it");
+        assert_eq!(found(&candidates, &evidence(&md5)), None);
     }
 
     fn with_inner<'a>(inner: Vec<&'a str>) -> Evidence<'a> {
@@ -277,12 +270,12 @@ mod tests {
 
     #[test]
     fn inner_files() {
-        let (_dir, conn) = fixture(&[T, SECOND]);
+        let candidates = fixture(&[T, SECOND]);
         let (dir_path, file) = (format!("{T}/x.mkv"), format!("{T}.mkv"));
-        assert_eq!(found(&conn, &with_inner(vec![&dir_path])), Some((Kind::InnerFile, T.to_string())));
-        assert_eq!(found(&conn, &with_inner(vec![&file])), Some((Kind::InnerFile, T.to_string())));
+        assert_eq!(found(&candidates, &with_inner(vec![&dir_path])), Some((Kind::InnerFile, T.to_string())));
+        assert_eq!(found(&candidates, &with_inner(vec![&file])), Some((Kind::InnerFile, T.to_string())));
         let second = format!("{SECOND}.mkv");
-        assert_eq!(found(&conn, &with_inner(vec![&file, &second])), None, "two titles are no match");
+        assert_eq!(found(&candidates, &with_inner(vec![&file, &second])), None, "two titles are no match");
     }
 
     #[test]
@@ -294,35 +287,36 @@ mod tests {
     #[test]
     fn episodes() {
         let e3 = "Show.Name.S02E03.1080p.WEB-DL.x264-GRP";
-        let (_dir, conn) = fixture(&[e3]);
+        let candidates = fixture(&[e3]);
         let (three, four) = (format!("{e3}.mkv"), "Show.Name.S02E04.1080p.WEB-DL.x264-GRP.mkv");
-        assert_eq!(found(&conn, &with_inner(vec![&three, four])), None);
+        assert_eq!(found(&candidates, &with_inner(vec![&three, four])), None);
         let e = Evidence { files: vec![&three, four], ..evidence("Xk3Mz9PqL") };
-        assert_eq!(found(&conn, &e), None, "posted files of many episodes name nothing");
-        assert_eq!(found(&conn, &with_inner(vec![&three])), Some((Kind::InnerFile, e3.to_string())));
+        assert_eq!(found(&candidates, &e), None, "posted files of many episodes name nothing");
+        assert_eq!(found(&candidates, &with_inner(vec![&three])), Some((Kind::InnerFile, e3.to_string())));
     }
 
     #[test]
     fn a_short_title_needs_exact() {
-        let (_dir, conn) = fixture(&["Foo.Bar-GRP"]);
-        assert_eq!(found(&conn, &evidence("foo_bar-grp")), None);
-        assert_eq!(found(&conn, &evidence("foo.bar-grp")), Some((Kind::Exact, "Foo.Bar-GRP".to_string())));
+        let candidates = fixture(&["Foo.Bar-GRP"]);
+        assert_eq!(found(&candidates, &evidence("foo_bar-grp")), None);
+        assert_eq!(found(&candidates, &evidence("foo.bar-grp")), Some((Kind::Exact, "Foo.Bar-GRP".to_string())));
     }
 
     #[test]
     fn too_many_rows_is_no_match() {
-        let (_dir, conn) = fixture(&[T]);
+        let mut candidates = fixture(&[T]);
         let key = name_key(T);
         for i in 0..16 {
-            conn.execute(
-                "insert into titles (title, source, added_at) values (?1, 1, 5)",
-                [format!("Forced.Title.Number.{i:02}-GRP")],
-            )
-            .unwrap();
-            let id = conn.last_insert_rowid();
-            conn.execute("insert into title_keys (key, title_id) values (?1, ?2)", rusqlite::params![key, id]).unwrap();
+            candidates.entry(key).or_default().push(TitleRow {
+                id: i + 2,
+                title: format!("Forced.Title.Number.{i:02}-GRP"),
+                category: None,
+                size_bytes: None,
+                pre_at: None,
+                nuked: 0,
+            });
         }
-        assert_eq!(found(&conn, &evidence(T)), None);
+        assert_eq!(found(&candidates, &evidence(T)), None);
     }
 
     #[test]
