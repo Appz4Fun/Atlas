@@ -1,5 +1,5 @@
 //! Pure admission checks; the normal-binary fixture separately exercises startup.
-use super::indexer_runtime::Profile;
+use super::Profile;
 use crate::config::{Config, HeaderStoreConfig};
 
 fn headers() -> HeaderStoreConfig {

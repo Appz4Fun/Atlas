@@ -10,6 +10,33 @@ pub(crate) struct ConfigPin {
     servers:Vec<crate::config::UsenetServer>,plan:Vec<(usize,usize)>,unsaved:usize,repair_request:u64,
 }
 impl ConfigPin {
+    /// Validate construction constraints without starting a worker, connecting
+    /// to PostgreSQL, or changing any configured service. This is not a total
+    /// heap reservation: each live decoder, queue and request keeps its limits.
+    pub(crate) fn validate(config:&Config)->Result<()> {
+        super::workers::check_inferred_platform(config.inferred_parts)?;
+        if config.postprocess.enabled {
+            let settings=&config.postprocess;
+            let lanes=settings.body_connections.max(1);
+            ensure!(lanes<=tokio::sync::Semaphore::MAX_PERMITS,
+                "native BODY concurrency exceeds semaphore representation");
+            ensure!(settings.workers.max(1).checked_add(lanes).is_some(),
+                "native worker count exceeds representation");
+            let bytes=usize::try_from(settings.body_max_bytes)
+                .ok().filter(|n|*n>0 && *n<=isize::MAX as usize)
+                .ok_or_else(||anyhow::anyhow!("native BODY byte limit exceeds buffer representation"))?;
+            ensure!(lanes.checked_mul(bytes).is_some(),
+                "native concurrent BODY byte limits exceed representation");
+        }
+        if config.spots.enabled {
+            let settings=&config.spots;
+            ensure!((1..=64).contains(&settings.concurrency)
+                && (1..=10_000).contains(&settings.per_pass)
+                && (1..=1440).contains(&settings.poll_minutes),
+                "native Spotnet configuration was not clamped");
+        }
+        Ok(())
+    }
     pub(crate) fn capture(config:&Config,servers:&[crate::config::UsenetServer],plan:&[(usize,usize)])->Self {
         Self {assets:config.native_assets.clone(),spots:config.spots.clone(),inferred_parts:config.inferred_parts,postprocess:config.postprocess.clone(),archive:config.archive.clone(),naming:config.naming.clone(),
             predb:config.predb.clone(),category:config.category.clone(),media:config.media.clone(),

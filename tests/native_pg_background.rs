@@ -163,12 +163,12 @@ fn background_entrypoint_persists_postgres_and_nxv_without_sqlite() {
     let server = Server::new(posts);
     let port = spawn_server(Arc::clone(&server));
     let config = configuration(&url, &schema.name, port);
-    for case in ["headers_disabled", "postprocessing_enabled", "missing_schema"] {
+    for case in ["headers_disabled", "retired_compaction", "missing_schema"] {
         let invalid_home = tempfile::tempdir().unwrap();
         let mut invalid = config.clone();
         match case {
             "headers_disabled" => invalid["header_store"]["enabled"] = false.into(),
-            "postprocessing_enabled" => invalid["postprocess"]["enabled"] = true.into(),
+            "retired_compaction" => invalid["auto_run_compact"] = true.into(),
             "missing_schema" => invalid["storage"]["schema"] = format!("{}_missing", schema.name).into(),
             _ => unreachable!(),
         }
@@ -256,7 +256,7 @@ fn background_entrypoint_persists_postgres_and_nxv_without_sqlite() {
     edit_config(home.path(), |document| document["postprocess"]["enabled"] = toml_edit::value(true));
     assert!(
         !wait_for_exit(&mut restarted, Duration::from_secs(7)).success(),
-        "unsupported service activation was not refused"
+        "changed worker settings require a fresh native attempt"
     );
     assert_no_sqlite(home.path());
     edit_config(home.path(), |document| document["postprocess"]["enabled"] = toml_edit::value(false));
