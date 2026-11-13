@@ -274,8 +274,9 @@ mod sparse_nameless_tests {
     fn uncaptured_empty_filename_cannot_be_relabelled_as_a_literal_none_envelope() {
         let schema=crate::pg::testing::Schema::new().expect("explicit isolated PostgreSQL");let mut client=schema.pool.get().unwrap();
         let release=Release {name:"Empty.Filename.Control".into(),group:"alt.binaries.test".into(),poster:"poster".into(),date:"Wed, 01 Jan 2020 00:00:00 +0000".into(),
-            articles:vec![Article {filename:Some(String::new()),subject:"empty filename input".into(),message_id:"empty@example.invalid".into(),part:Some(1),total_parts:Some(1),bytes:17,..Default::default()}],..Default::default()};
-        assert_eq!(crate::pg::release_writer::save(&mut client,&[release],1).unwrap().parts,1);
+            articles:vec![Article {filename:Some(String::new()),subject:"empty filename input".into(),message_id:"empty@example.invalid".into(),part:Some(1),total_parts:Some(1),bytes:17,..Default::default()},
+                Article {filename:Some(String::new()),subject:"another empty filename input".into(),message_id:"another-empty@example.invalid".into(),part:Some(1),total_parts:Some(1),bytes:23,..Default::default()}],..Default::default()};
+        assert_eq!(crate::pg::release_writer::save(&mut client,&[release],1).unwrap().parts,2);
         assert_eq!(client.query_one("select count(*) from segment_nzb_metadata",&[]).unwrap().get::<_,i64>(0),0);
         let id:i64=client.query_one("select id from releases",&[]).unwrap().get(0);
         let root=tempfile::tempdir().unwrap();
@@ -283,5 +284,6 @@ mod sparse_nameless_tests {
         let pool=Pool::new(root.path().into(),crate::nzb_spool::Limits {requests:6,per_request_bytes:1<<20,total_bytes:6<<20,free_bytes:0}).unwrap();
         let view=ReadView::open(&mut client,&schema.name,Budget::default(),Instant::now()+Duration::from_secs(10)).unwrap();
         assert!(view.nzb_own(id,Pick::Whole,&pool).is_err(),"missing original metadata is unavailable, not a representative fallback");
+        assert!(view.file_list(id,&pool).is_err(),"uncaptured empty filenames cannot invent unnamed list ordinals");
     }
 }
