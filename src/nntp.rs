@@ -6511,3 +6511,7 @@ mod ranked_tests {
         assert!(!p.banned("g", 0));
     }
 }
+
+#[cfg(test)]
+#[path = "nntp/body_wire_tests.rs"]
+mod body_wire_tests;
