@@ -14,6 +14,8 @@ pub const MIGRATIONS: &[(i32, &str, &str)] = &[
     (6, "linker", include_str!("migrations/0006_linker.sql")),
     (7, "ext", include_str!("migrations/0007_ext.sql")),
     (8, "history_catalog", include_str!("migrations/0008_history_catalog.sql")),
+    (9, "native_stage", include_str!("migrations/0009_native_stage.sql")),
+    (10, "valuable_caches", include_str!("migrations/0010_valuable_caches.sql")),
 ];
 
 /// Bring the schema `schema` up to the last migration. Returns the versions applied now.
@@ -95,6 +97,33 @@ mod tests {
         // the main tables are there, constraints included
         c.execute("insert into groups (name) values ('a.b.c')", &[]).unwrap();
         assert!(c.execute("insert into groups (name) values ('a.b.c')", &[]).is_err(), "a group's name is unique");
+    }
+
+    #[test]
+    fn fresh_stage_migration_refuses_nondefault_meta_and_occupied_workers() {
+        let Some(t)=crate::pg::testing::Schema::empty() else {return};
+        let mut c=t.pool.get().unwrap();
+        c.batch_execute("create table schema_migrations(version integer primary key,name text not null,applied_at timestamptz not null default now())").unwrap();
+        for &(version,name,sql) in MIGRATIONS.iter().filter(|migration|migration.0<9) {
+            let mut tx=c.transaction().unwrap();tx.batch_execute(sql).unwrap();
+            tx.execute("insert into schema_migrations(version,name) values($1,$2)",&[&version,&name]).unwrap();tx.commit().unwrap();
+        }
+        for (value,text) in [(Some(0i64),None),(Some(2),None),(None,None),(Some(1),Some("stale"))] {
+            c.execute("update meta set value=$1,text_value=$2 where key='next_seq'",&[&value,&text]).unwrap();
+            let error=run(&mut c,&t.name).expect_err("only canonical bootstrap meta is harmless");
+            assert_eq!(error.code().map(|code|code.code()),Some("55000"));
+            assert_eq!(version(&mut c,&t.name).unwrap(),8);
+        }
+        c.execute("update meta set value=1,text_value=null where key='next_seq'",&[]).unwrap();
+        c.execute("insert into meta(key,value) values('worker_cursor',0)",&[]).unwrap();
+        assert_eq!(run(&mut c,&t.name).unwrap_err().code().map(|code|code.code()),Some("55000"));
+        c.execute("delete from meta where key='worker_cursor'",&[]).unwrap();
+        c.execute("insert into groups(name) values('example.group')",&[]).unwrap();
+        assert_eq!(run(&mut c,&t.name).unwrap_err().code().map(|code|code.code()),Some("55000"));
+        c.execute("delete from groups where name='example.group'",&[]).unwrap();
+        let remaining=MIGRATIONS.iter().filter(|migration|migration.0>=9).map(|migration|migration.0).collect::<Vec<_>>();
+        assert_eq!(run(&mut c,&t.name).unwrap(),remaining);
+        assert_eq!(c.query_one("select value from meta where key='next_seq'",&[]).unwrap().get::<_,i64>(0),1);
     }
 
     #[test]

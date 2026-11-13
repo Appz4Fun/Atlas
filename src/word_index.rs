@@ -28,6 +28,7 @@ use tantivy::{
 use crate::category::{CatFilter, TABLE, UNCATEGORIZED, label};
 use crate::search::{ReleaseRow, VISIBLE_RELEASE, visible_release};
 use crate::store;
+pub(crate) mod native;
 
 /// Bumped whenever what's in a document changes: an index made by another version is built again.
 const VERSION: u32 = 1;
@@ -511,6 +512,11 @@ impl WordIndex {
                 Ok(())
             });
         }
+        self.count_indexed(words, filter, tags)
+    }
+
+    fn count_indexed(&self, words: &str, filter: Option<&CatFilter>, tags: &[&str]) -> anyhow::Result<usize> {
+        let browsing = words.trim().is_empty();
         let searcher = self.reader.searcher();
         if browsing && filter.is_none() && tags.is_empty() {
             // every release: what the index holds, with no document read
@@ -809,11 +815,7 @@ fn known_as(conn: &Connection, rows: &mut [Indexed]) {
             stmt.query_row([key], |r| Ok((r.get(0)?, r.get(1)?))).optional().ok().flatten();
         let Some((found, asked)) = titles else { continue };
         // a title cached before ids were decoded is the id itself, which the name already has
-        row.known_as = [found, Some(asked)]
-            .into_iter()
-            .flatten()
-            .map(|t| t.trim().to_string())
-            .find(|t| !t.is_empty() && crate::media::allocine::allocine_id(t).is_none());
+        row.known_as = native::decoded_title(found.as_deref(), &asked);
     }
 }
 
@@ -1045,6 +1047,164 @@ mod tests {
 
     const UHD: i64 = 2045;
     const HD: i64 = 2040;
+
+    struct NativeFixtureSource {
+        rows: Vec<native::Record>,
+        releases: Vec<ReleaseRow>,
+        queued: Vec<native::Changed>,
+        fail_ack: bool,
+        expected_extra: u64,
+    }
+    impl NativeFixtureSource {
+        fn from_legacy(conn: &Connection) -> Self {
+            let mut rows = read_rows(conn, 0, "r.id > ?1 order by r.id", 0).unwrap();
+            known_as(conn, &mut rows);
+            let releases = rows.iter().map(|row| visible_release(conn, row.id).unwrap().unwrap()).collect();
+            let rows = rows.into_iter().map(|row| native::Record {
+                id: row.id, name: row.name, display_name: row.display_name, group: row.group,
+                posted: row.posted, size: row.size, category: row.category, known_as: row.known_as,
+            }).collect();
+            Self { rows, releases, queued: Vec::new(), fail_ack: false, expected_extra: 0 }
+        }
+    }
+    impl native::SearchSource for NativeFixtureSource {
+        fn stamp(&mut self) -> anyhow::Result<[u8; 32]> { Ok([7; 32]) }
+        fn pending(&mut self) -> anyhow::Result<bool> { Ok(!self.queued.is_empty()) }
+        fn visible_rows(&mut self, ids: &[i64], _budget: native::Budget) -> anyhow::Result<Vec<ReleaseRow>> {
+            Ok(ids.iter().filter_map(|id| self.releases.iter().find(|row| row.id == *id).cloned()).collect())
+        }
+    }
+    impl native::BuildSource for NativeFixtureSource {
+        fn expected_documents(&mut self) -> anyhow::Result<u64> { Ok(self.rows.len() as u64 + self.expected_extra) }
+        fn build_page(&mut self, after: i64, budget: native::Budget) -> anyhow::Result<Vec<native::Record>> {
+            Ok(self.rows.iter().filter(|row| row.id > after).take(budget.rows).cloned().collect())
+        }
+    }
+    impl native::Source for NativeFixtureSource {
+        fn changes(&mut self, budget: native::Budget) -> anyhow::Result<native::Changes> {
+            let receipts: Vec<_> = self.queued.iter().take(budget.rows).copied().collect();
+            let rows = self.rows.iter().filter(|row| receipts.iter().any(|receipt| receipt.id == row.id)).cloned().collect();
+            Ok(native::Changes { receipts, rows })
+        }
+        fn acknowledge(&mut self, commit: &native::IndexCommitReceipt, receipts: &[native::Changed]) -> anyhow::Result<()> {
+            assert_eq!(commit.stamp(), &[7;32]);
+            assert_eq!(*commit.batch_digest(), native::batch_digest([7;32], receipts, &self.rows.iter().filter(|row| receipts.iter().any(|claim| claim.id == row.id)).cloned().collect::<Vec<_>>())?);
+            if self.fail_ack { self.fail_ack = false; anyhow::bail!("synthetic lost acknowledgment"); }
+            self.queued.retain(|queued| !receipts.contains(queued));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn native_tantivy_keeps_the_existing_prefix_rank_tag_and_sort_oracle() {
+        let f = fixture();
+        f.add("Café.Alpha.Movie.2020.2160p.UHD.BluRay.REMUX-X", "alt.binaries.a", 61_000, Some(UHD));
+        let renamed = f.add("Alpha.Movie.2021.1080p.WEB-DL-Y", "alt.binaries.b", 500, Some(HD));
+        f.add("Alpha.Show.S01E01.1080p.WEB-DL-Y", "alt.binaries.c", 400, Some(HD));
+        f.add("Unrelated.2025.1080p-W", "alt.binaries.d", 900, None);
+        f.shard("alt.binaries.b").execute("update releases set display_name='Beta.Alpha.2021.1080p.WEB-DL-Y' where id=?1", [renamed]).unwrap();
+        let conn = f.conn();
+        let legacy = f.index();
+        legacy.build(&conn).unwrap();
+        let mut source = NativeFixtureSource::from_legacy(&conn);
+        let index = WordIndex::open_native(&f.dir.path().join("native.words"), [7; 32]).unwrap();
+        assert!(index.build_native(&mut source, native::Budget::default(), || true).unwrap().complete);
+        let hd = crate::category::parse_filter("2040").unwrap();
+        for words in ["", "alpha", "alph", "cafe", "beta"] {
+            for by in [By::Relevance, By::Newest, By::Size, By::Posted, By::Name, By::Group, By::Category] {
+                for descending in [false, true] {
+                    for (filter, tags) in [(None, Vec::new()), (Some(&hd), Vec::new()), (None, vec!["2160p"])] {
+                        let expected = legacy.search(&conn, words, filter, &tags, by, descending, 0, 10).unwrap();
+                        let actual = index.search_native(&mut source, words, filter, &tags, by, descending, 0, 10, native::Budget::default()).unwrap();
+                        assert_eq!((ids(&actual), actual.total), (ids(&expected), expected.total), "{words} {descending}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_request_open_cannot_create_or_reset_an_index() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("missing");
+        assert!(WordIndex::read_native(&missing, [7; 32]).is_err());
+        assert!(!missing.exists());
+        let old = root.path().join("different-codec");
+        std::fs::create_dir(&old).unwrap();
+        std::fs::write(old.join("atlas-version"), b"another-codec").unwrap();
+        std::fs::write(old.join("keep"), b"preserve-existing-index-bytes").unwrap();
+        assert!(WordIndex::read_native(&old, [7; 32]).is_err());
+        assert_eq!(std::fs::read(old.join("atlas-version")).unwrap(), b"another-codec");
+        assert_eq!(std::fs::read(old.join("keep")).unwrap(), b"preserve-existing-index-bytes");
+    }
+
+    #[test]
+    fn native_new_read_snapshot_restarts_unfinished_base_and_preserves_ready_index() {
+        let f=fixture();
+        for i in 0..5 {f.add(&format!("Alpha.Movie.202{i}.1080p-X"),"alt.binaries.a",10+i,Some(HD));}
+        let conn=f.conn();let mut first=NativeFixtureSource::from_legacy(&conn);
+        let directory=f.dir.path().join("native.words");let stamp=[7;32];
+        let index=WordIndex::open_native(&directory,stamp).unwrap();
+        let budget=native::Budget {rows:1,bytes:512,commit_bytes:512};
+        let partial=index.build_native(&mut first,budget,||false).unwrap();
+        assert!(!partial.complete);assert_eq!(partial.documents,1);
+        let removed=first.rows[0].id;drop(first);
+        f.shard("alt.binaries.a").execute("delete from releases where id=?1",[removed]).unwrap();
+        let mut changed=NativeFixtureSource::from_legacy(&conn);
+        assert_eq!(changed.rows.len(),4);
+        index.restart_native_build(stamp).unwrap();
+        assert_eq!(index.build_native(&mut changed,budget,||true).unwrap().documents,4);
+        let found=index.search_native(&mut changed,"alpha",None,&[],By::Newest,true,0,10,native::Budget::default()).unwrap();
+        assert_eq!(found.rows.len(),4);assert!(!found.rows.iter().any(|row|row.id==removed));
+        assert!(index.restart_native_build(stamp).is_err(),"ready indexes catch up through the durable queue");
+        assert!(index.native_ready(stamp).unwrap());
+    }
+
+    #[test]
+    fn native_tantivy_resume_and_ack_replay_never_duplicate_public_ids() {
+        let f = fixture();
+        for i in 0..5 { f.add(&format!("Alpha.Movie.202{i}.1080p-X"), "alt.binaries.a", 10 + i, Some(HD)); }
+        let conn = f.conn();
+        let mut source = NativeFixtureSource::from_legacy(&conn);
+        let directory = f.dir.path().join("native.words");
+        let budget = native::Budget { rows: 1, bytes: 512, commit_bytes: 512 };
+        {
+            let index = WordIndex::open_native(&directory, [7; 32]).unwrap();
+            let progress = index.build_native(&mut source, budget, || false).unwrap();
+            assert!(!progress.complete && progress.documents == 1 && progress.after == source.rows[0].id);
+            assert!(!index.native_ready([7; 32]).unwrap());
+        }
+        let index = WordIndex::open_native(&directory, [7; 32]).unwrap();
+        assert_eq!(index.build_native(&mut source, budget, || true).unwrap().documents, 5);
+        let request_index = WordIndex::read_native(&directory, [7; 32]).unwrap();
+        assert_eq!(request_index.count_native(&mut source, "alpha", None, &[]).unwrap(), 5);
+        assert!(WordIndex::read_native(&directory, [8; 32]).is_err());
+        assert!(!index.native_ready([8; 32]).unwrap(), "another generation cannot reuse saved public IDs");
+        let changed = source.rows[0].id;
+        source.rows[0].name = "Gamma.Movie.2020.1080p-X".into();
+        source.releases.iter_mut().find(|row| row.id == changed).unwrap().name = source.rows[0].name.clone();
+        source.queued.push(native::Changed { id: changed, version: 1 });
+        source.fail_ack = true;
+        assert!(index.drain_native(&mut source, native::Budget::default()).is_err());
+        assert_eq!(source.queued.len(), 1);
+        assert_eq!(index.drain_native(&mut source, native::Budget::default()).unwrap(), 1);
+        assert!(source.queued.is_empty());
+        let hits = index.search_native(&mut source, "", None, &[], By::Newest, true, 0, 10, native::Budget::default()).unwrap();
+        assert_eq!(hits.rows.len(), 5);
+        assert_eq!(ids(&hits).into_iter().collect::<std::collections::HashSet<_>>().len(), 5);
+        assert_eq!(index.count_native(&mut source, "gamma", None, &[]).unwrap(), 1);
+    }
+
+    #[test]
+    fn native_tantivy_cannot_mark_incomplete_source_coverage_ready() {
+        let f = fixture();
+        f.add("Alpha.Movie.2020.1080p-X", "alt.binaries.a", 10, Some(HD));
+        let mut source = NativeFixtureSource::from_legacy(&f.conn());
+        source.expected_extra = 1;
+        let index = WordIndex::open_native(&f.dir.path().join("native.words"), [7; 32]).unwrap();
+        assert!(index.build_native(&mut source, native::Budget::default(), || true).is_err());
+        assert!(!index.native_ready([7; 32]).unwrap());
+    }
 
     #[test]
     fn names_without_a_tag_word_skip_parsing_and_lose_no_tag() {

@@ -6,16 +6,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 
-use crate::archive;
 use crate::config::Config;
 use crate::naming::{
     Grade, NameSource, best_from_paths, clean_candidate, current_name, is_image_name, judge, renames_pack_to_episode,
 };
 use crate::postprocess::schema::ShardTable;
 use crate::postprocess::step::{
-    NameChange, Needs, Outcome, ReleaseInfo, Reruns, Step, StepCtx, StepError, StepId, StepMask, StepWrite,
+    NameChange, Needs, Outcome, ReleaseInfo, Reruns, Step, StepCtx, StepError, StepId, StepMask, StepMutation, StepWrite,
 };
 
 use super::db;
@@ -52,12 +51,6 @@ pub const INNER_KEY: ShardTable = ShardTable {
     added: &[],
 };
 
-const MATCH_UPSERT: &str =
-    "insert or replace into predb_match (release_id, title_id, kind, category, pre_at, nuked, matched_at)
-    values (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
-const KEYS_CLEAR: &str = "delete from predb_inner_key where release_id = ?1";
-const KEY_ADD: &str = "insert or ignore into predb_inner_key (key, release_id) values (?1, ?2)";
-
 const KEYS_KEPT: usize = 4;
 
 pub const PREDB_MATCH: StepId = StepId(16);
@@ -83,7 +76,7 @@ pub fn worth_looking_up(r: &ReleaseInfo) -> bool {
     judge(name) != Grade::Junk
 }
 
-/// `…/atlas.s3.db` -> `…/atlas.predb.db`. `StepCtx` has no main path, and `ctx.conn().path()` is the shard's.
+/// `…/atlas.s3.db` -> `…/atlas.predb.db`. Checked legacy Step data supplies the shard path.
 pub fn db_path_from_shard(shard: &Path) -> Option<PathBuf> {
     let file = shard.file_name()?.to_str()?;
     let stem = file.strip_suffix(".db")?;
@@ -182,12 +175,8 @@ impl Step for PredbMatch {
         let retry = |e: rusqlite::Error| StepError::Retry(e.to_string());
         let id = ctx.release().id;
         let files = ctx.files().map_err(retry)?;
-        let inner = archive::store::inner_files(ctx.conn(), id).map_err(retry)?;
-        let path = ctx
-            .conn()
-            .path()
-            .and_then(|p| db_path_from_shard(Path::new(p)))
-            .ok_or_else(|| StepError::Retry("this shard's PreDB file cant be worked out".into()))?;
+        let inner = ctx.data().archive_inner_files(id)?;
+        let path = ctx.data().predb_catalog_path()?;
 
         let r = ctx.release();
         let evidence = Evidence {
@@ -211,10 +200,10 @@ impl Step for PredbMatch {
         let Some(m) = hit else {
             let mut writes = Vec::new();
             if !inner.is_empty() {
-                writes.push(StepWrite::new(KEYS_CLEAR, vec![id.into()]));
+                writes.push(StepWrite::for_mutation(id, StepMutation::ClearPredbInnerKeys));
                 let paths = inner.iter().map(|f| (f.name.as_str(), f.size.unwrap_or(1).max(1) as u64));
                 for name in best_from_paths(paths, Grade::Weak).into_iter().take(KEYS_KEPT) {
-                    writes.push(StepWrite::new(KEY_ADD, vec![name_key(&name).into(), id.into()]));
+                    writes.push(StepWrite::for_mutation(id, StepMutation::AddPredbInnerKey { key: name_key(&name) }));
                 }
             }
             return Ok(Outcome { writes, hold: Some(Box::new(hold)), ..Outcome::default() });
@@ -229,30 +218,17 @@ impl Step for PredbMatch {
         };
         let predb_category = crate::metrics::predb_category_label(t.category.as_deref().unwrap_or("none"));
         crate::metrics::names::PREDB_MATCHES.inc(&[("kind", how), ("category", &predb_category)], 1);
-        let known: Option<i64> = ctx
-            .conn()
-            .prepare_cached("select title_id from predb_match where release_id = ?1")
-            .and_then(|mut stmt| stmt.query_row([id], |r| r.get(0)).optional())
-            .map_err(retry)?;
+        let known = ctx.data().prior_predb_match(id)?;
         let now = chrono::Utc::now().timestamp();
         let mut facts = vec![("predb.title", t.title.clone())];
         if let Some(category) = &t.category {
             facts.push(("predb.category", category.clone()));
         }
         let writes = vec![
-            StepWrite::new(
-                MATCH_UPSERT,
-                vec![
-                    id.into(),
-                    t.id.into(),
-                    (m.kind as i64).into(),
-                    t.category.clone().into(),
-                    t.pre_at.into(),
-                    t.nuked.into(),
-                    now.into(),
-                ],
-            ),
-            StepWrite::new(KEYS_CLEAR, vec![id.into()]),
+            StepWrite::for_mutation(id, StepMutation::KeepPredbMatch {
+                title_id: t.id,kind: m.kind,category: t.category.clone(),pre_at: t.pre_at,nuked: t.nuked,matched_at: now,
+            }),
+            StepWrite::for_mutation(id, StepMutation::ClearPredbInnerKeys),
         ];
         Ok(Outcome {
             matched: true,

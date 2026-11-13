@@ -893,6 +893,45 @@ pub fn storage_config() -> crate::pg::StorageConfig {
         .map_or_else(crate::pg::StorageConfig::default, |v| crate::pg::StorageConfig::from_value(v.get("storage")))
 }
 
+/// Checked backend selection never treats an unreadable or malformed config
+/// as SQLite. The binary uses this same boundary before catalog maintenance.
+pub fn checked_storage_config() -> Result<crate::pg::StorageConfig, String> {
+    checked_storage_config_in(&crate::paths::app_dir())
+}
+
+fn checked_storage_config_in(dir: &Path) -> Result<crate::pg::StorageConfig, String> {
+    // symlink_metadata observes the selected entry itself. A dangling TOML
+    // symlink must not silently select JSON/default SQLite instead.
+    for name in ["config.toml", "config.json"] {
+        let path = dir.join(name);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => return checked_storage_config_at(&path),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return Err("storage configuration unavailable".into()),
+        }
+    }
+    Ok(crate::pg::StorageConfig::default())
+}
+
+fn checked_storage_config_at(path: &Path) -> Result<crate::pg::StorageConfig, String> {
+    // Once an entry was observed, even its disappearance is an error. Only
+    // the genuinely absent initial configuration above gets legacy defaults.
+    let text = fs::read_to_string(path).map_err(|_| "storage configuration unavailable".to_string())?;
+    let value = parse_config(path, &text).map_err(|_| "storage configuration unavailable".to_string())?;
+    if !value.is_object() { return Err("storage configuration unavailable".into()); }
+    if let Some(storage) = value.get("storage") {
+        if !storage.is_object()
+            || ["backend", "url", "schema"].iter().any(|key| storage.get(*key).is_some_and(|value| !value.is_string()))
+            || storage.get("max_connections").is_some_and(|value| value.as_i64().is_none())
+            || storage.get("allow_plaintext").is_some_and(|value| !value.is_boolean()) {
+            return Err("storage configuration unavailable".into());
+        }
+    }
+    let storage = crate::pg::StorageConfig::from_value(value.get("storage"));
+    storage.check().map_err(|_| "storage configuration unavailable".to_string())?;
+    Ok(storage)
+}
+
 /// The file's `shared_catalog` object, for the fill and check commands: no keyring.
 pub fn shared_catalog_config() -> SharedCatalogConfig {
     read_file().map_or_else(SharedCatalogConfig::default, |v| SharedCatalogConfig::from_value(v.get("shared_catalog")))
@@ -1852,6 +1891,39 @@ pub mod keyring {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checked_storage_selection_refuses_invalid_selected_files_without_fallback() {
+        let dir=tempfile::tempdir().unwrap();
+        let json=dir.path().join("config.json");let toml=dir.path().join("config.toml");
+        fs::write(&json,r#"{"storage":{"backend":"sqlite"}}"#).unwrap();
+        for invalid in ["[storage", "[storage]\nbackend=42", "[storage]\nbackend='postgres'", "storage='postgres'", "[storage]\nbackend='unknown'"] {
+            fs::write(&toml,invalid).unwrap();assert!(checked_storage_config_in(dir.path()).is_err());
+        }
+        fs::remove_file(&toml).unwrap();fs::create_dir(&toml).unwrap();
+        assert!(checked_storage_config_in(dir.path()).is_err(),"selected unreadable-as-config entry cannot use JSON");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checked_storage_selection_refuses_dangling_toml_but_reads_explicit_postgres() {
+        let dir=tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.json"),r#"{"storage":{"backend":"sqlite"}}"#).unwrap();
+        let toml=dir.path().join("config.toml");
+        std::os::unix::fs::symlink(dir.path().join("missing"),&toml).unwrap();
+        assert!(checked_storage_config_in(dir.path()).is_err());
+        fs::remove_file(&toml).unwrap();
+        fs::write(&toml,"[storage]\nbackend='postgres'\nurl='host=127.0.0.1 dbname=fixture'\nschema='fixture'").unwrap();
+        assert_eq!(checked_storage_config_in(dir.path()).unwrap().backend,crate::pg::Backend::Postgres);
+    }
+
+    #[test]
+    fn checked_storage_selection_preserves_defaults_only_for_a_genuinely_absent_config() {
+        let dir=tempfile::tempdir().unwrap();
+        assert_eq!(checked_storage_config_in(dir.path()).unwrap().backend,crate::pg::Backend::Sqlite);
+        fs::write(dir.path().join("config.json"),b"{broken").unwrap();
+        assert!(checked_storage_config_in(dir.path()).is_err());
+    }
 
     #[test]
     fn tvmaze_is_on_when_absent_as_it_needs_no_key() {

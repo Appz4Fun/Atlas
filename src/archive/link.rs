@@ -15,7 +15,7 @@ use crate::par2::{self, Par2File};
 use crate::postprocess::bodies::PAST_BUDGET;
 use crate::postprocess::schema::ShardTable;
 use crate::postprocess::step::{
-    BodyRequest, Got, Needs, Outcome, ReleaseInfo, Reruns, Step, StepCtx, StepError, StepId, StepMask, StepWrite, mask,
+    BodyRequest, Got, Needs, Outcome, ReleaseInfo, Reruns, Step, StepCtx, StepError, StepId, StepMask, StepMutation, StepWrite, mask,
 };
 use crate::store::{FileInfo, SegmentPick, SegmentRef};
 
@@ -81,7 +81,7 @@ pub const BESIDE_FILES: ShardTable = ShardTable {
 };
 
 /// ?1 the small file's row, ?2 the release it was found beside, ?3 its file id in the set
-pub(super) const SET_BESIDE: &str = "insert into beside_files (row_id, release_id, par2_file) values (?1, ?2, ?3)
+pub(crate) const SET_BESIDE: &str = "insert into beside_files (row_id, release_id, par2_file) values (?1, ?2, ?3)
     on conflict(row_id) do update set release_id = excluded.release_id, par2_file = excluded.par2_file";
 
 /// The release a small file's row was found beside, if any.
@@ -131,21 +131,19 @@ pub const LINK_RECOVERY: &str = concat!(
     on conflict(release_id) do update set lead_id = excluded.lead_id, recovery = 1, wanted = excluded.wanted,
         set_id = excluded.set_id"
 );
-const TRIED: &str = "insert into upload_link_tried (release_id, candidate_id) values (?1, ?2) on conflict do nothing";
-/// A recovery volume isn't a copy of the files it repairs, whatever its set's list made it look like.
-const CLEAR_CONTENT: &str = crate::duplicates::CLEAR_CONTENT;
+pub(crate) const TRIED: &str = "insert into upload_link_tried (release_id, candidate_id) values (?1, ?2) on conflict do nothing";
 /// The lead's name, from the set, unless something better named it.
-const NAME_LEAD: &str = "update releases set display_name = ?2, name_source = ?3
+pub(crate) const NAME_LEAD: &str = "update releases set display_name = ?2, name_source = ?3
     where id = ?1 and display_name is null and coalesce(name_source, 0) <= ?3";
 /// The lead's steps that go by its name, to run again now it has one.
-const RERUN_LEAD: &str = "insert into pp_state (release_id, net_wanted, rerun_gen, rerun_mask, net_left)
+pub(crate) const RERUN_LEAD: &str = "insert into pp_state (release_id, net_wanted, rerun_gen, rerun_mask, net_left)
         values (?1, case when ?3 != 0 then 1 end, 1, ?2, nullif(?3, 0))
     on conflict(release_id) do update set done = done & ~?2, failed = failed & ~?2,
         net_wanted = case when ?3 != 0 then 1 else net_wanted end,
         net_left = case when ?3 != 0 then coalesce(net_left, 0) | ?3 else net_left end,
         net_next_at = case when ?3 != 0 then 0 else net_next_at end,
         rerun_gen = rerun_gen + 1, rerun_mask = rerun_mask | ?2";
-const QUEUE_LEAD: &str = "insert into pp_queue (release_id, due_at) values (?1, ?2)
+pub(crate) const QUEUE_LEAD: &str = "insert into pp_queue (release_id, due_at) values (?1, ?2)
     on conflict(release_id) do update set due_at = min(due_at, excluded.due_at)";
 
 /// Files smaller than this aren't looked for: an NFO or a sample says too little, and costs a fetch all the same.
@@ -321,7 +319,7 @@ impl Clock {
 
 /// A row that may hold one of the set's files.
 #[derive(Clone, Debug)]
-struct Candidate {
+pub(crate) struct Candidate {
     id: i64,
     bytes: i64,
     parts: i64,
@@ -332,13 +330,8 @@ struct Candidate {
 }
 
 /// A file's clock, from its timing row.
-fn clock_of(ctx: &StepCtx<'_>, file_id: i64) -> Option<Clock> {
-    ctx.conn()
-        .prepare_cached("select first_date, last_date, clock_first, clock_last from file_timing where file_id = ?")
-        .ok()?
-        .query_row([file_id], |r| Ok(Clock::of(r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
-        .ok()
-        .flatten()
+fn clock_of(ctx: &StepCtx<'_>, file_id: i64) -> Result<Option<Clock>, StepError> {
+    ctx.data().file_clock(file_id)
 }
 
 #[derive(Default)]
@@ -355,11 +348,7 @@ impl LinkStep {
         if files.len() != 1 {
             return Ok(None);
         }
-        let listed: bool = ctx
-            .conn()
-            .prepare_cached("select exists (select 1 from archive_inner_files where release_id = ? and source = ?)")
-            .and_then(|mut stmt| stmt.query_row(params![ctx.release().id, SOURCE_PAR2], |r| r.get(0)))
-            .unwrap_or(false);
+        let listed = ctx.data().archive_source_exists(ctx.release().id, SOURCE_PAR2)?;
         Ok(listed.then(|| files[0].clone()))
     }
 
@@ -378,19 +367,15 @@ impl LinkStep {
             return Ok(Outcome::default());
         }
         // a row of an upload linked by its set is that upload's to look after
-        let lead: Option<i64> = query_one(ctx, "select lead_id from upload_link where release_id = ?", me.id)?;
+        let lead = ctx.data().upload_lead(me.id)?;
         if lead.is_some() {
             return Ok(Outcome::default());
         }
         // only a set the PAR2 step read and kept: nothing is fetched to find out whether there's anything to look for.
         // In the visit that reads it, its writes aren't in yet: this looks again once they are, while the PAR2 step
         // hasn't finished with the release
-        let Some(inventory) = super::store::par2_inventory(ctx.conn(), "main", me.id) else {
-            let par2_done: i64 = ctx
-                .conn()
-                .prepare_cached("select coalesce((select done | failed from pp_state where release_id = ?1), 0) & ?2")
-                .and_then(|mut stmt| stmt.query_row(params![me.id, mask(super::steps::PAR2_STEP)], |r| r.get(0)))
-                .map_err(retry)?;
+        let Some(inventory) = ctx.data().par2_inventory(me.id)? else {
+            let par2_done = ctx.data().finished_step_bits(me.id, mask(super::steps::PAR2_STEP))?;
             // the PAR2 step finishes or gives up on every release it applies to; one it passes over isn't waited on
             let wait_until = (par2_done == 0).then(|| chrono::Utc::now().timestamp() + RESUME_SECS);
             return Ok(Outcome { wait_until, ..Default::default() });
@@ -406,15 +391,7 @@ impl LinkStep {
         if outside.is_empty() {
             return Ok(Outcome::default());
         }
-        let mut have: HashSet<Vec<u8>> = HashSet::new();
-        {
-            let mut stmt =
-                ctx.conn().prepare_cached("select par2_file from beside_files where release_id = ?1").map_err(retry)?;
-            let rows = stmt.query_map([me.id], |r| r.get::<_, Option<Vec<u8>>>(0)).map_err(retry)?;
-            for row in rows {
-                have.extend(row.map_err(retry)?);
-            }
-        }
+        let have = ctx.data().beside_par2_files(me.id)?;
         let mut missing: Vec<&Par2File> = outside.iter().copied().filter(|f| !have.contains(&f.file_id[..])).collect();
         let mut found: Vec<(i64, [u8; 16])> = Vec::new();
         let mut tried: Vec<i64> = Vec::new();
@@ -429,7 +406,7 @@ impl LinkStep {
             let mut order = missing.clone();
             order.sort_by_key(|f| !crate::images::is_image_name(&f.name));
             'files: for want in order.into_iter().take(BESIDE_LOOKUPS) {
-                for candidate in Self::beside_candidates(ctx.conn(), me.id, &want.name, (&from, &to, &posted))? {
+                for candidate in ctx.data().link_beside_candidates(me.id, &want.name, (&from, &to, &posted))? {
                     if checks >= BESIDE_CHECKS {
                         break 'files;
                     }
@@ -467,13 +444,13 @@ impl LinkStep {
         // good. A release that grows is looked at again
         let wait_until = (out_of_bodies && found.is_empty() && !missing.is_empty()).then_some(now + RESUME_SECS);
         let mut writes: Vec<StepWrite> =
-            tried.iter().map(|other| StepWrite::new(TRIED, vec![me.id.into(), (*other).into()])).collect();
+            tried.iter().map(|other| StepWrite::for_mutation(me.id, StepMutation::RememberUploadCandidate { candidate_id: *other })).collect();
         if found.is_empty() {
             let matched = !have.is_empty();
             return Ok(Outcome { matched, writes, wait_until, ..Default::default() });
         }
         for (row, file_id) in &found {
-            writes.push(StepWrite::new(SET_BESIDE, vec![(*row).into(), me.id.into(), file_id.to_vec().into()]));
+            writes.push(StepWrite::for_mutation(me.id, StepMutation::PlaceBesideFile { row_id: *row,owner_id: me.id,par2_file: Some(file_id.to_vec()) }));
         }
         // the pictures step reads what's linked in: run again, now there's more
         let rerun = mask(crate::images::step::IMAGES_STEP);
@@ -485,7 +462,7 @@ impl LinkStep {
     /// every thumbnail the same posts dozens an hour. Such a row is named after its file (with ` [N]` after it when the
     /// name is taken), soo the name's index finds them (the date is kept off its own index, which would read the whole
     /// hour), not a scan of every file. The name is matched as the set spells it.
-    fn beside_candidates(
+    pub(crate) fn beside_candidates(
         conn: &rusqlite::Connection,
         me: i64,
         name: &str,
@@ -540,7 +517,7 @@ impl LinkStep {
         file: &FileInfo,
     ) -> Result<(par2::Inventory, Vec<StepWrite>), StepError> {
         let id = ctx.release().id;
-        if let Some(kept) = super::store::par2_inventory(ctx.conn(), "main", id) {
+        if let Some(kept) = ctx.data().par2_inventory(id)? {
             return Ok((kept, Vec::new()));
         }
         let mut body = Vec::new();
@@ -570,18 +547,16 @@ impl LinkStep {
     /// whoever posted it and under whatever subject. What the article count must be for those sizes is weighed here
     /// too, roughly, soo a busy shard's other rows don't crowd the real one out of the limit; `parts_fit` then weighs
     /// each closely.
-    fn candidates(
-        &self,
-        ctx: &StepCtx<'_>,
+    pub(crate) fn candidates_legacy(
+        conn: &rusqlite::Connection,
+        me: &ReleaseInfo,
         sizes: (u64, u64),
         set: Option<[u8; 16]>,
     ) -> Result<Vec<Candidate>, StepError> {
-        let me = ctx.release();
         let Some(posted) = me.posted_date.clone() else { return Ok(Vec::new()) };
         // `ID_WINDOW` saves either way of this one
         let (low, high) = id_window(me.id, ID_WINDOW);
-        let mut stmt = ctx
-            .conn()
+        let mut stmt = conn
             .prepare_cached(
                 "select r.id, coalesce(r.size, 0), coalesce(r.parts, 0), f.id, f.filename, f.expected,
                         abs(julianday(r.posted_date) - julianday(?4)),
@@ -679,34 +654,30 @@ impl LinkStep {
 
     /// How many rows this volume has checked and found none of its files in, over its earlier runs.
     fn tried(&self, ctx: &StepCtx<'_>, id: i64) -> Result<i64, StepError> {
-        Ok(query_one(ctx, "select count(*) from upload_link_tried where release_id = ?", id)?.unwrap_or(0))
+        ctx.data().upload_tried_count(id)
     }
 
     /// The lead's name, if it has none: the volume's own, or the set's best.
-    fn lead_writes(&self, ctx: &StepCtx<'_>, lead: i64, files: &[Par2File]) -> Vec<StepWrite> {
-        let named: Option<Option<String>> = ctx
-            .conn()
-            .prepare_cached("select display_name from releases where id = ?")
-            .and_then(|mut stmt| stmt.query_row([lead], |r| r.get(0)).optional())
-            .unwrap_or(None);
-        let Some(None) = named else { return Vec::new() };
+    fn lead_writes(&self, ctx: &StepCtx<'_>, lead: i64, files: &[Par2File]) -> Result<Vec<StepWrite>, StepError> {
+        let named = ctx.data().release_name_marker(lead)?;
+        let Some(None) = named else { return Ok(Vec::new()) };
         let me = ctx.release();
         let name = me.display_name.clone().or_else(|| best_name(files.iter().map(|f| (f.name.as_str(), f.size))));
-        let Some(name) = name else { return Vec::new() };
+        let Some(name) = name else { return Ok(Vec::new()) };
         let (db, net) = *ON_RENAME;
         let now = chrono::Utc::now().timestamp();
-        vec![
-            StepWrite::new(NAME_LEAD, vec![lead.into(), name.into(), i64::from(NAME_SOURCE_PAR2).into()]),
-            StepWrite::new(RERUN_LEAD, vec![lead.into(), (db | net).into(), net.into()]),
-            StepWrite::new(QUEUE_LEAD, vec![lead.into(), now.into()]),
-        ]
+        Ok(vec![
+            StepWrite::for_mutation(me.id, StepMutation::NameUploadLead { lead_id: lead,name,source: NAME_SOURCE_PAR2 }),
+            StepWrite::for_mutation(me.id, StepMutation::RerunUploadLead { lead_id: lead,clear: db | net,net }),
+            StepWrite::for_mutation(me.id, StepMutation::QueueUploadLead { lead_id: lead,due_at: now }),
+        ])
     }
 }
 
 /// Days since a `posted_date`, by SQLite's reading of it.
-fn age_days(ctx: &StepCtx<'_>, release: &ReleaseInfo) -> Option<f64> {
-    let posted = release.posted_date.as_deref()?;
-    ctx.conn().query_row("select julianday('now') - julianday(?)", [posted], |r| r.get(0)).ok().flatten()
+fn age_days(ctx: &StepCtx<'_>, release: &ReleaseInfo) -> Result<Option<f64>, StepError> {
+    let Some(posted) = release.posted_date.as_deref() else { return Ok(None) };
+    ctx.data().posted_age_days(posted)
 }
 
 impl Step for LinkStep {
@@ -754,25 +725,17 @@ impl Step for LinkStep {
             return Ok(merged(by_set, by_name));
         };
         // the upload this row is in already, and which of its set's files that has
-        let mine: Option<i64> = query_one(ctx, "select lead_id from upload_link where release_id = ?", id)?;
+        let mine = ctx.data().upload_lead(id)?;
         let mut members = HashSet::new();
         let mut have: HashSet<Vec<u8>> = HashSet::new();
         if let Some(lead) = mine {
-            let mut stmt = ctx
-                .conn()
-                .prepare_cached("select release_id, par2_file from upload_link where lead_id = ?")
-                .map_err(retry)?;
-            let rows = stmt
-                .query_map([lead], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<Vec<u8>>>(1)?)))
-                .map_err(retry)?;
-            for row in rows {
-                let (member, file) = row.map_err(retry)?;
+            for (member, file) in ctx.data().upload_members(lead)? {
                 members.insert(member);
                 have.extend(file);
             }
         }
         let (inventory, kept) = self.inventory(ctx, &par2_file)?;
-        let young = age_days(ctx, ctx.release()).is_some_and(|days| days < LOOK_AGAIN_FOR_DAYS);
+        let young = age_days(ctx, ctx.release())?.is_some_and(|days| days < LOOK_AGAIN_FOR_DAYS);
         let now = chrono::Utc::now().timestamp();
         let wanted = wanted(&inventory.files);
         if wanted.is_empty() {
@@ -788,7 +751,7 @@ impl Step for LinkStep {
         let (mut found, mut tried, mut more) = (Vec::new(), Vec::new(), false);
         if !missing.is_empty() {
             let sizes = missing.iter().fold((u64::MAX, 0), |(least, most), f| (least.min(f.size), most.max(f.size)));
-            let mut candidates = self.candidates(ctx, sizes, set)?;
+            let mut candidates = ctx.data().link_candidates(ctx.release(), sizes, set)?;
             candidates.retain(|c| {
                 !members.contains(&c.id)
                     && c.file.expected.is_some_and(|expected| {
@@ -798,7 +761,7 @@ impl Step for LinkStep {
             // rows whose first article is indexed go first: those can tell apart files of the same size, where a later
             // article only gives the size. Among those, the files posted right before or after this volume, by the
             // best clock there is: an upload's files go up one after the other
-            let my_clock = clock_of(ctx, par2_file.id);
+            let my_clock = clock_of(ctx, par2_file.id)?;
             let mut ordered = Vec::with_capacity(candidates.len());
             for candidate in candidates {
                 let later = first_article(ctx, &candidate.file)?.is_none();
@@ -859,16 +822,13 @@ impl Step for LinkStep {
         // a row that isn't one of the files read so far may be one of those not read yet
         let tried = if unknown == 0 { tried } else { Vec::new() };
         let mut writes: Vec<StepWrite> = kept;
-        writes.extend(tried.iter().map(|other| StepWrite::new(TRIED, vec![id.into(), (*other).into()])));
+        writes.extend(tried.iter().map(|other| StepWrite::for_mutation(id, StepMutation::RememberUploadCandidate { candidate_id: *other })));
         // every file of the set, the ones too small or too alike to look for too: the upload isn't whole without them
         let looks_for = inventory.files.len() as i64 + unknown;
         if found.is_empty() {
             // what it looks for may be known better now
             if let Some(lead) = mine {
-                writes.push(StepWrite::new(
-                    LINK_RECOVERY,
-                    vec![id.into(), lead.into(), looks_for.into(), set.map(|id| id.to_vec()).into()],
-                ));
+                writes.push(StepWrite::for_mutation(id, StepMutation::LinkUploadRecovery { lead_id: lead,wanted: looks_for,set_id: set }));
             }
             return Ok(Outcome { matched: mine.is_some(), writes, wait_until, ..Default::default() });
         }
@@ -877,13 +837,12 @@ impl Step for LinkStep {
         if let Some(lead) = mine {
             uploads.push((
                 lead,
-                query_one(ctx, "select coalesce(size, 0) from releases where id = ?", lead)?.unwrap_or(0),
+                ctx.data().release_size(lead)?.unwrap_or(0),
             ));
         }
         for (candidate, _) in &found {
-            let leads: Option<i64> =
-                query_one(ctx, "select 1 from upload_link where release_id = ?1 and lead_id = ?1", candidate.id)?;
-            if leads.is_some() {
+            let leads = ctx.data().upload_is_lead(candidate.id)?;
+            if leads {
                 uploads.push((candidate.id, candidate.bytes));
             }
         }
@@ -894,18 +853,15 @@ impl Step for LinkStep {
             .max_by_key(|&(_, bytes)| bytes)
             .map_or(id, |(lead, _)| lead);
         for (old, _) in uploads.iter().filter(|(old, _)| *old != lead) {
-            writes.push(StepWrite::new(MOVE_UPLOAD, vec![(*old).into(), lead.into()]));
+            writes.push(StepWrite::for_mutation(id, StepMutation::MoveUpload { from_id: *old,to_id: lead }));
         }
         for (candidate, file) in &found {
             writes
-                .push(StepWrite::new(LINK_DATA, vec![candidate.id.into(), lead.into(), file.file_id.to_vec().into()]));
+                .push(StepWrite::for_mutation(id, StepMutation::LinkUploadData { member_id: candidate.id,lead_id: lead,par2_file: file.file_id }));
         }
-        writes.push(StepWrite::new(
-            LINK_RECOVERY,
-            vec![id.into(), lead.into(), looks_for.into(), set.map(|id| id.to_vec()).into()],
-        ));
-        writes.push(StepWrite::new(CLEAR_CONTENT, vec![id.into()]));
-        writes.extend(self.lead_writes(ctx, lead, &inventory.files));
+        writes.push(StepWrite::for_mutation(id, StepMutation::LinkUploadRecovery { lead_id: lead,wanted: looks_for,set_id: set }));
+        writes.push(StepWrite::for_mutation(id, StepMutation::ClearContentFingerprint));
+        writes.extend(self.lead_writes(ctx, lead, &inventory.files)?);
         Ok(Outcome { matched: true, writes, wait_until, ..Default::default() })
     }
 }
@@ -950,11 +906,6 @@ fn merged(mut a: Outcome, b: Outcome) -> Outcome {
         (x, y) => x.or(y),
     };
     a
-}
-
-/// The one value a query of one id gives, if it gives a row.
-fn query_one<T: rusqlite::types::FromSql>(ctx: &StepCtx<'_>, sql: &str, id: i64) -> Result<Option<T>, StepError> {
-    ctx.conn().prepare_cached(sql).and_then(|mut stmt| stmt.query_row([id], |r| r.get(0)).optional()).map_err(retry)
 }
 
 #[cfg(test)]

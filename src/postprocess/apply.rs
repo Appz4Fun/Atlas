@@ -257,7 +257,7 @@ mod tests {
     use super::*;
     use crate::db;
     use crate::parser::{Article, Release};
-    use crate::postprocess::step::{StepId, mask};
+    use crate::postprocess::step::{StepId, StepMutation, mask};
     use crate::store;
 
     const G: &str = "alt.binaries.t";
@@ -448,6 +448,54 @@ mod tests {
         assert_eq!(state(&conn, id).0, B, "A stays clear, B wasnt in the mask");
         let queued: i64 = conn.query_row("select count(*) from pp_queue", [], |r| r.get(0)).unwrap();
         assert_eq!(queued, 1, "the row stays, though its due_at equals the claim");
+    }
+
+    #[test]
+    fn a_stale_closed_mutation_is_dropped_with_its_done_bit() {
+        let (_dir, conn, id) = shard();
+        conn.execute("insert into pp_state(release_id) values(?)", [id]).unwrap();
+        rerun(&conn, id, A);
+        run(&conn, Applied { release_id: id, claimed_gen: 0, set_done: A,
+            writes: vec![(A, StepWrite::for_mutation(id, StepMutation::OpenSubtitlesMatch {
+                moviehash: "stale".into(), feature: None, checked_at: NOW,
+            }))], ..Default::default() });
+        let matches: i64 = conn.query_row("select count(*) from release_opensubtitles", [], |row| row.get(0)).unwrap();
+        assert_eq!(matches, 0);
+        assert_eq!(state(&conn, id).0 & A, 0);
+        let queued: i64 = conn.query_row("select count(*) from pp_queue where release_id=?", [id], |row| row.get(0)).unwrap();
+        assert_eq!(queued, 1);
+    }
+
+    #[test]
+    fn a_failed_closed_mutation_rolls_back_its_whole_release() {
+        let (_dir, conn, id) = shard();
+        conn.execute_batch("drop table media_release").unwrap();
+        assert!(!run(&conn, Applied { release_id: id, set_done: A,
+            writes: vec![
+                (A, StepWrite::for_mutation(id, StepMutation::OpenSubtitlesMatch { moviehash: "rollback".into(), feature: None, checked_at: NOW })),
+                (A, StepWrite::for_mutation(id, StepMutation::PinOpenSubtitlesMovieImdb { imdb_id: 101 })),
+            ], ..Default::default() }));
+        let matches: i64 = conn.query_row("select count(*) from release_opensubtitles", [], |row| row.get(0)).unwrap();
+        assert_eq!(matches, 0);
+        assert_eq!(state(&conn, id).0 & A, 0);
+        assert_eq!(state(&conn, id).3, 1);
+    }
+
+    #[test]
+    fn a_closed_mutation_keeps_its_position_between_legacy_writes() {
+        let (_dir, conn, id) = shard();
+        conn.execute_batch("create table mutation_order(n integer)").unwrap();
+        let observe = || StepWrite::new("insert into mutation_order select count(*) from release_opensubtitles", vec![]);
+        run(&conn, Applied { release_id: id, set_done: A, writes: vec![
+            (A, observe()),
+            (A, StepWrite::for_mutation(id, StepMutation::OpenSubtitlesMatch {
+                moviehash: "ordered".into(), feature: None, checked_at: NOW,
+            })),
+            (A, observe()),
+        ], ..Default::default() });
+        let values = conn.prepare("select n from mutation_order order by rowid").unwrap()
+            .query_map([], |row| row.get::<_, i64>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        assert_eq!(values, vec![0, 1]);
     }
 
     #[test]

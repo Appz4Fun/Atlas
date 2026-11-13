@@ -15,6 +15,7 @@ use crate::db;
 use crate::nzb::{build_nzb_checked, build_nzb_file_checked, nzb_filename};
 use crate::search::{all_releases, get_release, newest_in_categories, search_all_releases, search_in_categories};
 use crate::ui;
+pub(crate) mod fresh;
 
 const WORKERS: usize = 4;
 /// Reads several GB when little is cached, which on a machine short of memory is every pass, soo not often.
@@ -46,13 +47,15 @@ pub struct ApiResponse {
     pub headers: Vec<(String, String)>,
     /// sent in place of `body`, for what isn't text
     pub bytes: Option<Vec<u8>>,
+    pub spool: Option<crate::nzb_spool::Spool>,
+    pub disposition: Option<crate::nzb_http::Disposition>,
     /// atlas itself failed, whatever the status says: Newznab errors go out as 200
     pub failed: bool,
 }
 
 impl ApiResponse {
     fn xml(status: u16, body: String) -> Self {
-        ApiResponse { status, content_type: Some(XML), body, headers: Vec::new(), bytes: None, failed: false }
+        ApiResponse { status, content_type: Some(XML), body, headers: Vec::new(), bytes: None, spool: None, disposition: None, failed: false }
     }
 
     pub(crate) fn not_found() -> Self {
@@ -62,6 +65,8 @@ impl ApiResponse {
             body: String::new(),
             headers: Vec::new(),
             bytes: None,
+            spool: None,
+            disposition: None,
             failed: false,
         }
     }
@@ -136,6 +141,17 @@ pub fn handle(path: &str, query: &str, base: &str, api_key: &str) -> ApiResponse
 
     let args = parse_query(query);
     let t = args.get("t").map(String::as_str);
+
+    let storage = match crate::config::checked_storage_config() {
+        Ok(storage) => storage,
+        Err(_) => return fresh::unavailable(),
+    };
+    if storage.is_postgres() {
+        if t != Some("caps") && args.get("apikey").map(String::as_str) != Some(api_key) {
+            return ApiResponse::xml(401, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<error code=\"100\" description=\"Invalid API Key\"/>".into());
+        }
+        return fresh::handle(&storage, &args, base, api_key);
+    }
 
     if t == Some("caps") {
         // advertise the address the client actually used
@@ -648,6 +664,11 @@ fn rss_listed(
         })
         .collect();
 
+    rss_document(base,offset,total,&items)
+}
+
+/// Rendering only: all storage and relationship loading precedes this call.
+fn rss_document(base:&str,offset:i64,total:i64,items:&str)->ApiResponse {
     let xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0"
@@ -746,6 +767,8 @@ fn nzb_response(
         body: content,
         headers,
         bytes: None,
+        spool: None,
+        disposition: None,
         failed: false,
     }
 }
@@ -815,6 +838,8 @@ fn respond(mut request: Request, api_key: &str, fallback_host: &str) {
                 body: String::new(),
                 headers: Vec::new(),
                 bytes: None,
+                spool: None,
+                disposition: None,
                 failed: false,
             }
         } else {
@@ -828,6 +853,8 @@ fn respond(mut request: Request, api_key: &str, fallback_host: &str) {
             body: String::new(),
             headers: Vec::new(),
             bytes: None,
+            spool: None,
+            disposition: None,
             failed: false,
         }
     };
@@ -835,13 +862,18 @@ fn respond(mut request: Request, api_key: &str, fallback_host: &str) {
         span.failed();
     }
     drop(span);
-    let sent = resp.bytes.as_ref().map_or(resp.body.len(), Vec::len) as u64;
+    let sent = resp.spool.as_ref().map_or_else(||resp.bytes.as_ref().map_or(resp.body.len(), Vec::len) as u64, crate::nzb_spool::Spool::len);
     let status = resp.status.to_string();
     let labels = [("endpoint", endpoint.label), ("status", status.as_str())];
     crate::metrics::names::API_REQUESTS.inc(&labels, 1);
     crate::metrics::names::API_BYTES.inc(&[("endpoint", endpoint.label)], sent);
     crate::metrics::function_bytes(endpoint.function, "sent", sent);
 
+    if let Some(spool) = resp.spool {
+        let _ = crate::nzb_http::send(request, spool, resp.disposition, resp.status,
+            resp.content_type.unwrap_or("text/html; charset=utf-8"), resp.headers);
+        return;
+    }
     let mut response = match resp.bytes {
         Some(bytes) => Response::from_data(bytes),
         None => Response::from_string(resp.body),
@@ -862,6 +894,12 @@ fn respond(mut request: Request, api_key: &str, fallback_host: &str) {
 
 /// Start the api on a few worker threads. Returns false when it couldnt bind.
 pub fn start(config: &mut Config) -> bool {
+    // Activation remains closed while the full fresh native UI/cache/runtime
+    // qualification is incomplete. Do this before binding or legacy warmers.
+    if match crate::config::checked_storage_config() { Ok(storage) => storage.is_postgres(), Err(_) => true } {
+        ui::print("[yellow]native Web UI is awaiting full reader and runtime qualification[/yellow]");
+        return false;
+    }
     let (api_key, created) = get_api_key(config);
 
     if created {

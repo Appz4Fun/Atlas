@@ -97,7 +97,7 @@ fn with_no_fetch<T>(parts: i64, run: impl FnOnce(&mut StepCtx<'_>, &FileInfo) ->
     );
     let mut ctx = StepCtx {
         release: ReleaseInfo { id: 1, group: "alt.binaries.fixture".into(), ..Default::default() },
-        conn: &conn, facts: Vec::new(), bodies: &bodies, used_bodies: 0,
+        data: crate::postprocess::data::StepData::LegacySqlite(&conn), facts: Vec::new(), bodies: &bodies, used_bodies: 0,
         deadline: Instant::now() + Duration::from_secs(5), lane_can_fetch: false,
         crcs: Vec::new(), pictures: false,
     };

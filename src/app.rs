@@ -753,6 +753,42 @@ fn status_line(config: &Config, indexing: bool) -> Line {
     line
 }
 
+/// Tools whose implementation still targets the legacy default catalog.
+/// Classification opens no config, database, asset, or provider. Callers must
+/// check it before dispatch, including when multiple command flags are given.
+pub fn legacy_catalog_command(args: &[String]) -> Option<&str> {
+    const LEGACY: &[&str] = &[
+        "--convert", "--compact", "--purge", "--reprocess", "--predb-import",
+        "--replay-raw-predb", "--reset-shards", "--reflag-obfuscated", "--unname",
+        "--recount-articles", "--count-repair-candidates", "--split-reposts",
+        "--undo-mojibake", "--sealed-log-move", "--shared-catalog-fill",
+        "--shared-catalog-check", "--search-indexes", "--thaw", "--frozen-stats", "--crc-links",
+    ];
+    args.iter().find(|arg| LEGACY.contains(&arg.as_str()) ||
+        (arg.as_str() == "--save-replay" && !args.iter().any(|value| value == "--pg-schema")))
+        .map(String::as_str)
+}
+
+#[cfg(test)]
+mod native_cli_boundary_tests {
+    use super::legacy_catalog_command;
+    fn args(words:&[&str])->Vec<String> {words.iter().map(|word|(*word).into()).collect()}
+    #[test]
+    fn mixed_command_flags_cannot_hide_legacy_catalog_maintenance() {
+        assert_eq!(legacy_catalog_command(&args(&["--export-keep","--reset-shards","--apply"])),Some("--reset-shards"));
+        assert_eq!(legacy_catalog_command(&args(&["--bg-indexer","--purge"])),Some("--purge"));
+        assert_eq!(legacy_catalog_command(&args(&["--frozen-stats"])),Some("--frozen-stats"));
+    }
+    #[test]
+    fn replay_requires_an_explicit_native_destination_and_cache_tools_keep_their_own_admission() {
+        assert_eq!(legacy_catalog_command(&args(&["--save-replay","--store","fixture","--db","fixture-db"])),Some("--save-replay"));
+        assert_eq!(legacy_catalog_command(&args(&["--save-replay","--pg-database","fixture","--pg-schema","atlas_replay_fixture"])),None);
+        assert_eq!(legacy_catalog_command(&args(&["--move-ext","--apply","--keep-schema","keep_restore_fixture"])),None);
+        assert_eq!(legacy_catalog_command(&args(&["--restore-keep","--snapshot","fixture","--apply"])),None);
+        assert_eq!(legacy_catalog_command(&args(&[])),None);
+    }
+}
+
 pub fn main_menu() -> i32 {
     // compaction is held off only while setting up: the menu itself doesnt
     // write (its saves hold it off for themselves)

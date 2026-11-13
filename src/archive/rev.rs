@@ -16,7 +16,7 @@
 #![cfg_attr(not(test), deny(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 use crate::postprocess::schema::ShardTable;
-use crate::postprocess::step::{StepCtx, StepError, StepWrite};
+use crate::postprocess::step::{StepCtx, StepError, StepMutation, StepWrite};
 use crate::store::FileInfo;
 
 pub const SIGNATURE: &[u8; 8] = b"Rar!\x1aRev";
@@ -125,17 +125,9 @@ pub fn kept(volumes: &[Volume]) -> Vec<Volume> {
 
 /// The writes that keep a set's data volumes in place of what the release had.
 pub fn writes(release_id: i64, volumes: &[Volume]) -> Vec<StepWrite> {
-    let mut out = vec![StepWrite::new(DELETE_REV_VOLUMES, vec![release_id.into()])];
+    let mut out = vec![StepWrite::for_mutation(release_id, StepMutation::ClearRevVolumes)];
     for v in volumes {
-        out.push(StepWrite::new(
-            INSERT_REV_VOLUME,
-            vec![
-                release_id.into(),
-                i64::from(v.index).into(),
-                i64::try_from(v.size).unwrap_or(i64::MAX).into(),
-                i64::from(v.crc32).into(),
-            ],
-        ));
+        out.push(StepWrite::for_mutation(release_id, StepMutation::KeepRevVolume(*v)));
     }
     out
 }
@@ -159,7 +151,7 @@ pub fn read(ctx: &mut StepCtx<'_>, files: &[FileInfo], explicit: bool) -> Result
     }
     let rel = ctx.release();
     let (id, name, group) = (rel.id, rel.name.clone(), rel.group.clone());
-    let content_id = crate::raw_store::release_content_id(ctx.conn(), id).unwrap_or_default();
+    let content_id = ctx.data().release_content_id(id)?.unwrap_or_default();
     if !explicit && let Some(saved) = crate::raw_store::get_rev_volumes(&name, &group, &content_id) {
         return Ok(writes(id, &kept(&saved)));
     }

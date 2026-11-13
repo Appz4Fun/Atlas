@@ -6,9 +6,7 @@
 //! The header is stamped by the server an article was posted through (Highwinds-family servers and eweka), soo most
 //! articles have none: a HEAD that finds none still marks the step done, and the probe is left as it was.
 
-use rusqlite::OptionalExtension;
-
-use crate::postprocess::step::{BodyRequest, Got, Needs, Outcome, Step, StepCtx, StepError, StepId, StepWrite, mask};
+use crate::postprocess::step::{BodyRequest, Got, Needs, Outcome, Step, StepCtx, StepError, StepId, StepMutation, StepWrite, mask};
 use crate::store;
 
 use super::{BODY_CRC_HEADER, ProbeInfo};
@@ -21,8 +19,6 @@ const WANTED: [&str; 2] = [BODY_CRC_HEADER, "X-Received-Bytes"];
 
 /// A HEAD is a few KiB; anything past this is not one worth reading.
 const HEAD_CAP: usize = 64 * 1024;
-
-const SET_INFO: &str = "update release_probe set info = ?2 where release_id = ?1";
 
 /// The probes this step is for: a movie or TV release whose probe read an article but kept no body CRC.
 const WANTING: &str = "select p.release_id from release_probe p join release_category c on c.release_id = p.release_id
@@ -111,15 +107,10 @@ impl Step for BodyCrcStep {
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let release_id = ctx.release().id;
-        if !crate::raw_store::is_explicit_rerun(ctx.conn(), release_id, BODY_CRC_STEP) {
+        if !ctx.data().explicit_rerun(release_id, BODY_CRC_STEP)? {
             return Ok(Outcome::default());
         }
-        let retry = |e: rusqlite::Error| StepError::Retry(e.to_string());
-        let info: Option<String> = ctx
-            .conn()
-            .prepare_cached("select info from release_probe where release_id = ?1")
-            .and_then(|mut q| q.query_row([release_id], |r| r.get(0)).optional())
-            .map_err(retry)?;
+        let info = ctx.data().probe_info(release_id)?;
         let Some(mut probe) = info.and_then(|i| serde_json::from_str::<ProbeInfo>(&i).ok()) else {
             return Ok(Outcome::default());
         };
@@ -144,7 +135,7 @@ impl Step for BodyCrcStep {
         let json = serde_json::to_string(&probe).map_err(|e| StepError::Permanent(e.to_string()))?;
         Ok(Outcome {
             matched: true,
-            writes: vec![StepWrite::new(SET_INFO, vec![release_id.into(), json.into()])],
+            writes: vec![StepWrite::for_mutation(release_id, StepMutation::SetProbeInfo { json })],
             // the first-article key comes from what the probe holds
             rerun: mask(crate::keys::KEYS_STEP),
             ..Outcome::default()

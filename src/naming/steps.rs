@@ -1,13 +1,11 @@
 //! The processing steps that name a release.
 
-use rusqlite::{Connection, OptionalExtension};
-
 use crate::archive::steps::{fetch_one, first_article};
 use crate::archive::{self, Password};
 use crate::config::Config;
 use crate::nfo;
 use crate::postprocess::step::{
-    NameChange, Needs, Outcome, ReleaseInfo, Reruns, Step, StepCtx, StepError, StepId, StepWrite, mask,
+    NameChange, Needs, Outcome, ReleaseInfo, Reruns, Step, StepCtx, StepError, StepId, StepMutation, StepWrite, mask,
 };
 use crate::release_info;
 
@@ -42,32 +40,23 @@ impl Step for Naming {
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let retry = |e: rusqlite::Error| StepError::Retry(e.to_string());
         let id = ctx.release().id;
-        let inner = archive::store::inner_files(ctx.conn(), id).map_err(retry)?;
+        let inner = ctx.data().archive_inner_files(id)?;
         // new inner files reach PreDB matching too, renamed or not. Bit 16 is its step: unregistered bits are ignored
         let rerun = if inner.is_empty() { 0 } else { mask(StepId(16)) };
         let r = ctx.release();
         let cleared = r.name_source == Some(NameSource::Cleared as i64);
         let inline = r.display_name.is_some() && r.name_source.is_none();
-        let opted_in = (cleared || inline) && rename_named_is_on(ctx.conn(), &r.group).map_err(retry)?;
+        let opted_in = (cleared || inline) && ctx.data().rename_named(&r.group)?;
         // an inline name stays as it is until the user opts in with --reprocess
         if inline && !opted_in {
             return Ok(Outcome { rerun, ..Outcome::default() });
         }
         // and a name the user cleared came from subject text, soo only what's inside the post can name it again
         let files = if cleared && !opted_in { Vec::new() } else { ctx.files().map_err(retry)? };
-        let passworded = archive::store::password(ctx.conn(), id).map_err(retry)? == Some(Password::Yes);
+        let passworded = ctx.data().archive_password(id)? == Some(Password::Yes);
         let name = decide(ctx.release(), &files, &inner, passworded);
         Ok(Outcome { matched: name.is_some(), name, rerun, ..Outcome::default() })
     }
-}
-
-/// A row means the user opted in, by `atlas --reprocess --step naming --apply`, for the whole shard or for this group.
-fn rename_named_is_on(conn: &Connection, group: &str) -> rusqlite::Result<bool> {
-    let row: Option<i64> = conn
-        .prepare_cached("select value from meta where key in ('naming_rename_named', ?1) limit 1")?
-        .query_row([crate::postprocess::reprocess::rename_named_key(group)], |r| r.get(0))
-        .optional()?;
-    Ok(row.is_some())
 }
 
 pub struct NfoName;
@@ -109,41 +98,9 @@ impl Step for NfoName {
         let rel_id = ctx.release().id;
         let rel_name = ctx.release().name.clone();
         let rel_group = ctx.release().group.clone();
-        let content_id = crate::raw_store::release_content_id(ctx.conn(), rel_id).unwrap_or_default();
-        let existing_db_pw = archive::store::nfo_password(ctx.conn(), rel_id);
-        let names_hidden: bool = ctx
-            .conn()
-            .query_row(
-                "select 1 from archive_release ar
-                 where ar.release_id = ?1
-                   and (
-                       (ar.names_hidden = 1
-                        and not exists (
-                            select 1 from archive_inner_files f
-                            where f.release_id = ar.release_id and f.source in (1, 2, 3)
-                        ))
-                       or (ar.password = 1
-                           and exists (
-                               select 1 from archive_inner_files f
-                               where f.release_id = ar.release_id and f.source in (1, 2, 3) and lower(f.name) like '%.nzb'
-                           )
-                           and not exists (
-                               select 1 from archive_inner_files f
-                               where f.release_id = ar.release_id and f.source = 5
-                           ))
-                   )",
-                [rel_id],
-                |_| Ok(true),
-            )
-            .unwrap_or(false);
-        let probe_encrypted: bool = ctx
-            .conn()
-            .query_row(
-                "select 1 from release_probe where release_id = ?1 and info like '%\"encrypted\":true%'",
-                [rel_id],
-                |_| Ok(true),
-            )
-            .unwrap_or(false);
+        let content_id = ctx.data().release_content_id(rel_id)?.unwrap_or_default();
+        let existing_db_pw = ctx.data().nfo_password(rel_id)?;
+        let (names_hidden, probe_encrypted) = ctx.data().nfo_password_rerun_flags(rel_id)?;
         let mut writes = Vec::new();
         let mut rerun = 0;
         if let Some(saved_pw) = crate::raw_store::get_nfo_password(&rel_name, &rel_group, &content_id) {
@@ -155,22 +112,22 @@ impl Step for NfoName {
                     rerun |= mask(crate::probe::step::PROBE_STEP);
                 }
             }
-            writes.push(StepWrite::new(archive::store::SET_NFO_PASSWORD, vec![rel_id.into(), saved_pw.into()]));
+            writes.push(StepWrite::for_mutation(rel_id, StepMutation::SetNfoPassword { password: saved_pw }));
         }
         // an inline name stays as it is until the user opts in, as in the naming step. `applies` can't read this
         let r = ctx.release();
         if r.display_name.is_some()
             && r.name_source.is_none()
-            && !rename_named_is_on(ctx.conn(), &r.group).map_err(retry)?
+            && !ctx.data().rename_named(&r.group)?
         {
             return Ok(Outcome { writes, rerun, ..Outcome::default() });
         }
         let files = ctx.files().map_err(retry)?;
-        let par2_names = archive::select::par2_name_map(ctx.conn(), rel_id, &files);
-        let check = archive::store::local_password_check(ctx.conn(), rel_id);
+        let par2_names = ctx.data().par2_names(rel_id, &files)?;
+        let check = ctx.data().local_password_check(rel_id)?;
         let mut pw_known = !writes.is_empty();
         // an NFO the probe or another step read is used as it was kept, not fetched again
-        let mut kept = crate::probe::nfo_store::stored(ctx.conn(), rel_id);
+        let mut kept = ctx.data().stored_nfo(rel_id)?;
         for file in archive::select::nfo_sources_with_par2(&files, &par2_names) {
             let par2_name = par2_names.get(&file.filename).map(String::as_str);
             let reused = match &kept {
@@ -200,8 +157,7 @@ impl Step for NfoName {
                         rerun |= mask(crate::probe::step::PROBE_STEP);
                     }
                 }
-                let params = vec![rel_id.into(), password.into()];
-                writes.push(StepWrite::new(archive::store::SET_NFO_PASSWORD, params));
+                writes.push(StepWrite::for_mutation(rel_id, StepMutation::SetNfoPassword { password }));
             }
             let bytes = body.as_deref().unwrap_or(decoded.as_bytes());
             let found = nfo::name_candidates(bytes).into_iter().find(|n| improves(ctx.release(), n, NameSource::Nfo));

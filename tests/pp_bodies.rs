@@ -354,7 +354,7 @@ fn begin_counts_before_the_step_runs() {
     let seen = Arc::new(Mutex::new(None));
     let s = seen.clone();
     let step = TestStep::new(1, "body", 100, Needs::External, &log).runs(move |ctx| {
-        let attempts: i64 = ctx.conn().query_row("select net_attempts from pp_state", [], |r| r.get(0)).unwrap();
+        let attempts: i64 = ctx.conn().unwrap().query_row("select net_attempts from pp_state", [], |r| r.get(0)).unwrap();
         *s.lock().unwrap() = Some(attempts);
         Ok(Outcome::default())
     });

@@ -15,7 +15,7 @@ use sha2::Digest;
 
 use crate::config::Config;
 use crate::postprocess::schema::ShardTable;
-use crate::postprocess::step::{Needs, Outcome, Reruns, Step, StepCtx, StepError, StepId, StepWrite};
+use crate::postprocess::step::{ImageRecord, Needs, Outcome, Reruns, Step, StepCtx, StepError, StepId, StepMutation, StepWrite};
 use crate::store::{self, FileInfo};
 
 use super::{is_image_name, jpeg, sniff};
@@ -91,14 +91,6 @@ pub const PICTURE_REQUESTS: ShardTable = ShardTable {
     release_key: Some("release_id"),
     added: &[],
 };
-
-/// ?1 release, ?2 file, ?3 when, ?4 how it went (`Answer::word`)
-const ANSWER: &str = "update picture_requests set done_at = ?3, outcome = ?4 where release_id = ?1 and file = ?2";
-
-const DROP_IMAGES: &str = "delete from release_images where release_id = ?1";
-const SET_IMAGE: &str = "insert or replace into release_images
-    (release_id, position, file, sha256, format, width, height, bytes, meta, exif_id, document_id)
-    values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)";
 
 fn image_dir() -> std::path::PathBuf {
     crate::paths::app_dir().join("images")
@@ -434,7 +426,7 @@ fn posted_bytes(ctx: &StepCtx<'_>, file: &FileInfo) -> rusqlite::Result<i64> {
 }
 
 /// The pictures a release kept on its last run, by file: read from the folder again rather than fetched.
-fn kept_before(
+pub(crate) fn kept_before(
     conn: &rusqlite::Connection,
     release_id: i64,
 ) -> rusqlite::Result<std::collections::HashMap<String, String>> {
@@ -445,7 +437,7 @@ fn kept_before(
 
 /// The files of the rows linked into the upload `lead` leads, its own left out, and of the small files found beside
 /// it, up to 50 a row.
-fn linked_files(conn: &rusqlite::Connection, lead: i64) -> rusqlite::Result<Vec<FileInfo>> {
+pub(crate) fn linked_files(conn: &rusqlite::Connection, lead: i64) -> rusqlite::Result<Vec<FileInfo>> {
     let members: Vec<i64> = conn
         .prepare_cached("select release_id from upload_link where lead_id = ?1 and release_id != ?1 limit 16")?
         .query_map([lead], |r| r.get(0))?
@@ -464,7 +456,7 @@ fn linked_files(conn: &rusqlite::Connection, lead: i64) -> rusqlite::Result<Vec<
 }
 
 /// File `name` of a row linked into the upload `lead` leads, or found beside it.
-fn asked_linked_file(conn: &rusqlite::Connection, lead: i64, name: &str) -> rusqlite::Result<Option<FileInfo>> {
+pub(crate) fn asked_linked_file(conn: &rusqlite::Connection, lead: i64, name: &str) -> rusqlite::Result<Option<FileInfo>> {
     let row: Option<i64> = rusqlite::OptionalExtension::optional(
         conn.prepare_cached(
             "select f.release_id from files f
@@ -511,6 +503,10 @@ fn is_telling_document_id(id: &str) -> bool {
 
 /// What's kept of one picture read: its row's values after the release id and position.
 pub fn row_values(file: &str, bytes: &[u8], sha256: &str) -> Option<Vec<rusqlite::types::Value>> {
+    image_record(file,bytes,sha256).map(|record| record.sqlite_values())
+}
+
+fn image_record(file: &str, bytes: &[u8], sha256: &str) -> Option<ImageRecord> {
     // a JPEG's headers read once: its size comes from them too
     let (sniffed, info) = if jpeg::is_jpeg(bytes) {
         let info = jpeg::read(bytes)?;
@@ -526,17 +522,8 @@ pub fn row_values(file: &str, bytes: &[u8], sha256: &str) -> Option<Vec<rusqlite
         .as_ref()
         .and_then(|i| i.xmp.original_document_id.clone().or_else(|| i.xmp.document_id.clone()))
         .filter(|id| is_telling_document_id(id));
-    Some(vec![
-        file.to_string().into(),
-        sha256.to_string().into(),
-        sniffed.format.to_string().into(),
-        i64::from(sniffed.width).into(),
-        i64::from(sniffed.height).into(),
-        (bytes.len() as i64).into(),
-        meta.into(),
-        exif_id.into(),
-        document_id.into(),
-    ])
+    Some(ImageRecord { file: file.to_string(),sha256: sha256.to_string(),format: sniffed.format.to_string(),
+        width: sniffed.width,height: sniffed.height,bytes: bytes.len() as i64,meta,exif_id,document_id })
 }
 
 #[derive(Default)]
@@ -582,23 +569,17 @@ impl Step for ImagesStep {
         let mut files = ctx.files().map_err(|e| StepError::Retry(e.to_string()))?;
         // the small files found beside this release, as a thumbnail posted under a subject of its own, and the rows
         // of an upload it leads (`archive::link`)
-        files.extend(linked_files(ctx.conn(), ctx.release().id).map_err(|e| StepError::Retry(e.to_string()))?);
+        files.extend(ctx.data().linked_image_files(ctx.release().id)?);
         let release_id = ctx.release().id;
         // what's still owed an answer, and what was shown (kept again from the folder); one that came to nothing waits
         // for "Try again" on the page, which clears its answer
-        let asked: Vec<String> = ctx
-            .conn()
-            .prepare_cached(
-                "select file from picture_requests where release_id = ?1 and (done_at is null or outcome = 'shown')",
-            )
-            .and_then(|mut q| q.query_map([release_id], |r| r.get(0))?.collect())
-            .map_err(|e| StepError::Retry(e.to_string()))?;
+        let asked = ctx.data().image_requests(release_id)?;
         // one asked for that the rows read above don't reach (a member past the first few, a file past a row's first
         // fifty): looked for in the upload's rows by its name
         for name in &asked {
             if !files.iter().any(|f| f.filename == *name) {
                 files.extend(
-                    asked_linked_file(ctx.conn(), release_id, name).map_err(|e| StepError::Retry(e.to_string()))?,
+                    ctx.data().requested_image_file(release_id, name)?,
                 );
             }
         }
@@ -620,10 +601,7 @@ impl Step for ImagesStep {
         let now = chrono::Utc::now().timestamp();
         let mut answers: Vec<StepWrite> = Vec::new();
         let answer = |file: &str, a: Answer, answers: &mut Vec<StepWrite>| {
-            answers.push(StepWrite::new(
-                ANSWER,
-                vec![release_id.into(), file.to_string().into(), now.into(), a.word().to_string().into()],
-            ));
+            answers.push(StepWrite::for_mutation(release_id, StepMutation::AnswerImageRequest { file: file.to_string(),done_at: now,answer: a }));
         };
         // asked for, but no longer among its files, or past what one may take
         for name in &asked {
@@ -638,21 +616,19 @@ impl Step for ImagesStep {
         if wanted.is_empty() && books.is_empty() {
             return Ok(Outcome { writes: answers, ..Outcome::default() });
         }
-        let before = kept_before(ctx.conn(), release_id).map_err(|e| StepError::Retry(e.to_string()))?;
+        let before = ctx.data().kept_images(release_id)?;
         // room for the biggest picture one may ask for, whatever `picture_max_parts` says
         let mut left = RUN_PARTS.max(limits.picture_max_parts.max(1) as usize);
-        let mut writes = vec![StepWrite::new(DROP_IMAGES, vec![release_id.into()])];
+        let mut writes = vec![StepWrite::for_mutation(release_id, StepMutation::ClearImages)];
         let mut kept = 0i64;
         let mut row = |name: &str, body: &[u8], writes: &mut Vec<StepWrite>| -> bool {
             // read before it's kept: a file named .jpg that isn't a picture never reaches the folder
             let sha256 = sha256_hex(body);
-            let Some(values) = row_values(name, body, &sha256) else { return false };
+            let Some(image) = image_record(name, body, &sha256) else { return false };
             if keep(body).is_none() {
                 return false;
             }
-            let mut params = vec![release_id.into(), kept.into()];
-            params.extend(values);
-            writes.push(StepWrite::new(SET_IMAGE, params));
+            writes.push(StepWrite::for_mutation(release_id, StepMutation::KeepImage { position: kept,image }));
             kept += 1;
             true
         };

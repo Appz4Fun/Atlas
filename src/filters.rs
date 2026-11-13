@@ -91,7 +91,7 @@ const NOT_A_TITLE: [&str; 15] = [
     "hd", "sd", "dvd", "xvid", "divx", "x264", "x265", "hevc", "high", "res", "hot", "sweet", "cute", "little", "tiny",
 ];
 /// longer than this, a name isnt a real group: it counts as blocked, and costs nothing to judge
-const MAX_GROUP_NAME: usize = 512;
+pub(crate) const MAX_GROUP_NAME: usize = 512;
 /// no term that pieces can spell is longer than this
 const MAX_JOINED: usize = 32;
 /// tokens that say nothing about a group

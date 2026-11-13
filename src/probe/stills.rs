@@ -8,7 +8,7 @@ use sha2::Digest;
 use crate::config::Config;
 use crate::keys;
 use crate::postprocess::schema::ShardTable;
-use crate::postprocess::step::{Got, Needs, Outcome, Reruns, Step, StepCtx, StepError, StepId, StepWrite, mask};
+use crate::postprocess::step::{Got, Needs, Outcome, Reruns, Step, StepCtx, StepError, StepId, StepMutation, StepWrite, mask};
 use crate::store::{self, FileInfo, SegmentPick};
 use crate::video::mkv::{self, Codec, Found, VideoTrack};
 use crate::video::mp4;
@@ -46,11 +46,6 @@ pub const STILLS: ShardTable = ShardTable {
     // a 64-bit perceptual hash, stored as its bits in an i64: "the same film" across releases
     added: &[("phash", "INTEGER")],
 };
-
-const DROP_STILLS: &str = "delete from release_stills where release_id = ?1";
-const SET_STILL: &str =
-    "insert or replace into release_stills (release_id, position, at_ms, sha256, width, height, phash)
-    values (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
 
 /// Past this, the oldest stills go. One is 50 to 150 KB.
 const MAX_STILL_CACHE: u64 = 2 << 30;
@@ -886,11 +881,7 @@ impl Step for StillsStep {
         let release_id = ctx.release().id;
         // a release whose stills are all still on disk, and hashed, keeps them: the walk for a new stamp bit fetches
         // nothing. One trimmed from the folder, or from before hashes, is made again.
-        let kept: Vec<(String, bool)> = ctx
-            .conn()
-            .prepare("select sha256, phash is not null from release_stills where release_id = ?1")
-            .and_then(|mut q| q.query_map([release_id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect())
-            .map_err(retry)?;
+        let kept = ctx.data().kept_stills(release_id)?;
         if kept.len() == POSITIONS.len()
             && kept.iter().all(|(h, hashed)| *hashed && still_file(h).is_some_and(|f| f.exists()))
         {
@@ -898,33 +889,19 @@ impl Step for StillsStep {
         }
         let rel_name = ctx.release().name.clone();
         let rel_group = ctx.release().group.clone();
-        let content_id = crate::raw_store::release_content_id(ctx.conn(), release_id).unwrap_or_default();
+        let content_id = ctx.data().release_content_id(release_id)?.unwrap_or_default();
         let saved_stills = crate::raw_store::get_stills(&rel_name, &rel_group, &content_id);
-        if !crate::raw_store::is_explicit_rerun(ctx.conn(), release_id, STILLS_STEP)
+        if !ctx.data().explicit_rerun(release_id, STILLS_STEP)?
             && saved_stills.len() == POSITIONS.len()
             && saved_stills.iter().all(|s| s.phash.is_some() && still_file(&s.sha256).is_some_and(|f| f.exists()))
         {
-            let mut writes = vec![StepWrite::new(DROP_STILLS, vec![release_id.into()])];
+            let mut writes = vec![StepWrite::for_mutation(release_id, StepMutation::ClearStills)];
             for s in saved_stills {
-                writes.push(StepWrite::new(
-                    SET_STILL,
-                    vec![
-                        release_id.into(),
-                        i64::from(s.position).into(),
-                        s.at_ms.into(),
-                        s.sha256.into(),
-                        i64::from(s.width).into(),
-                        i64::from(s.height).into(),
-                        s.phash.into(),
-                    ],
-                ));
+                writes.push(StepWrite::for_mutation(release_id, StepMutation::KeepStill(s)));
             }
             return Ok(Outcome { matched: true, writes, ..Outcome::default() });
         }
-        let info: Option<String> = ctx
-            .conn()
-            .query_row("select info from release_probe where release_id = ?1", [release_id], |r| r.get(0))
-            .ok();
+        let info = ctx.data().probe_info_best_effort(release_id)?;
         let Some(info) = info.and_then(|i| serde_json::from_str::<ProbeInfo>(&i).ok()) else {
             return Ok(Outcome::default());
         };
@@ -942,20 +919,16 @@ impl Step for StillsStep {
         }
         // the same video file in another release that already has its stills: they are shown from there, soo nothing
         // is read from the server or kept a second time
-        if !crate::raw_store::is_explicit_rerun(ctx.conn(), release_id, STILLS_STEP) {
-            let lookup = file_lookup(ctx.conn(), "main", release_id);
+        if !ctx.data().explicit_rerun(release_id, STILLS_STEP)? {
+            let lookup = ctx.data().stills_lookup(release_id)?;
             if SAME_FILE.iter().any(|k| lookup.has(*k)) {
-                let main = ctx
-                    .conn()
-                    .path()
-                    .and_then(super::audio_print::main_of)
-                    .ok_or_else(|| StepError::Retry("no main database".into()))?;
+                let main = ctx.data().legacy_main_path()?;
                 let all = crate::db::open_with_shards(&main).map_err(retry)?;
                 if let Some((_, kind)) = same_file_stills(&all, release_id, &lookup) {
                     crate::metrics::names::STILLS_SHARED.inc(&[("key", kind.word())], 1);
                     return Ok(Outcome {
                         matched: true,
-                        writes: vec![StepWrite::new(DROP_STILLS, vec![release_id.into()])],
+                        writes: vec![StepWrite::for_mutation(release_id, StepMutation::ClearStills)],
                         ..Outcome::default()
                     });
                 }
@@ -978,7 +951,7 @@ impl Step for StillsStep {
             mp4_frames(&mut |file: &FileInfo, part: i64| read(ctx, file, part), volumes, stored)?
         };
         let Some((track, frames)) = found else { return Ok(Outcome::default()) };
-        let mut writes = vec![StepWrite::new(DROP_STILLS, vec![release_id.into()])];
+        let mut writes = vec![StepWrite::for_mutation(release_id, StepMutation::ClearStills)];
         let mut made = 0;
         let mut raw_saved = Vec::new();
         for (percent, frame, at_ms) in frames {
@@ -986,26 +959,16 @@ impl Step for StillsStep {
             let Some(sha256) = keep(&jpeg) else { continue };
             let phash_i64 = phash.map(|p| p as i64);
             made += 1;
-            raw_saved.push(crate::raw_store::SavedStill {
+            let still = crate::raw_store::SavedStill {
                 position: percent,
                 at_ms: Some(at_ms),
                 sha256: sha256.clone(),
                 width: w,
                 height: h,
                 phash: phash_i64,
-            });
-            writes.push(StepWrite::new(
-                SET_STILL,
-                vec![
-                    release_id.into(),
-                    i64::from(percent).into(),
-                    at_ms.into(),
-                    sha256.into(),
-                    i64::from(w).into(),
-                    i64::from(h).into(),
-                    phash_i64.into(),
-                ],
-            ));
+            };
+            raw_saved.push(still.clone());
+            writes.push(StepWrite::for_mutation(release_id, StepMutation::KeepStill(still)));
         }
         // fewer than it has already (a run asked for again whose reads came to less): what it has stays
         if made < kept.iter().filter(|(h, _)| still_file(h).is_some_and(|f| f.exists())).count() {

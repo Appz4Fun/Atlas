@@ -3,15 +3,14 @@
 use std::sync::{Arc, LazyLock};
 
 use regex::bytes::RegexBuilder;
-use rusqlite::types::Value;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 
 use crate::archive::select::nfo_sources;
 use crate::category::{self, Decision};
 use crate::config::Config;
 use crate::postprocess::schema::ShardTable;
 use crate::postprocess::step::{
-    BodyRequest, Got, Needs, Outcome, ReleaseInfo, Reruns, Step, StepCtx, StepError, StepId, StepWrite,
+    BodyRequest, DeferredLegacyStepMutation, Got, Needs, Outcome, ReleaseInfo, Reruns, Step, StepCtx, StepError, StepId, StepMutation, StepWrite,
 };
 use crate::probe::nfo_store;
 use crate::store::SegmentPick;
@@ -81,7 +80,7 @@ pub const MEDIA_RELEASE: ShardTable = ShardTable {
 };
 
 /// The same title keeps IDs already on the row, soo a late article cant lose them. A new title starts clean.
-const UPSERT: &str = "insert into media_release (release_id, kind, title_key, season, episode, episode_last, air_date, year, quality,
+pub(crate) const UPSERT: &str = "insert into media_release (release_id, kind, title_key, season, episode, episode_last, air_date, year, quality,
                            tvdb_id, tvmaze_id, trakt_id, tmdb_id, imdb_id, tvrage_id)
 values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
 on conflict(release_id) do update set
@@ -96,20 +95,11 @@ on conflict(release_id) do update set
     tvdb_from_tag = iif(media_release.title_key = excluded.title_key, media_release.tvdb_from_tag, 0),
     kind = excluded.kind, title_key = excluded.title_key, season = excluded.season, episode = excluded.episode,
     episode_last = excluded.episode_last, air_date = excluded.air_date, year = excluded.year, quality = excluded.quality";
-const DELETE: &str = "delete from media_release where release_id = ?1";
-
-/// A release named by an AlloCiné id read again into the word index, which finds it by the decoded title
-/// (`word_index::known_as`): a title with no ids writes nothing to `media_release` for its triggers to see.
-const WORD_QUEUE: &str =
-    "insert into word_queue (release_id) values (?1) on conflict (release_id) do update set n = n + 1";
 /// only while it's still this title: a rename while the lookup ran mustn't take the old title's IDs
-const FOUND: &str = "update media_release
+pub(crate) const FOUND: &str = "update media_release
     set tvdb_id = iif(tvdb_from_tag = 1, tvdb_id, ?3), tvmaze_id = ?4, trakt_id = ?5, tmdb_id = iif(tmdb_from_tag = 1, tmdb_id, ?6),
         imdb_id = iif(imdb_from_nfo = 1, imdb_id, ?7), tvrage_id = ?8
     where release_id = ?1 and title_key = ?2";
-const NFO_IMDB: &str =
-    "update media_release set imdb_id = ?2, imdb_from_nfo = 1 where release_id = ?1 and imdb_id is null";
-
 pub const NFO_READ: usize = 65_536;
 
 static IMDB_IN_NFO: LazyLock<regex::bytes::Regex> =
@@ -159,22 +149,6 @@ fn target_of(media: &Media, r: &ReleaseInfo) -> Option<(Kind, Parsed)> {
     media_target(d.category, d.rule, name_of(r))
 }
 
-fn id_value(id: Option<i64>) -> Value {
-    id.map_or(Value::Null, Value::Integer)
-}
-
-fn int_value(n: Option<i32>) -> Value {
-    n.map_or(Value::Null, |v| Value::Integer(i64::from(v)))
-}
-
-fn has_row(conn: &Connection, id: i64) -> rusqlite::Result<bool> {
-    let found: Option<i64> = conn
-        .prepare_cached("select 1 from media_release where release_id = ?1")?
-        .query_row([id], |r| r.get(0))
-        .optional()?;
-    Ok(found.is_some())
-}
-
 pub struct MediaParse(pub Arc<Media>);
 
 impl Step for MediaParse {
@@ -206,44 +180,24 @@ impl Step for MediaParse {
             None => target_of(&self.0, r),
         };
         let Some((kind, p)) = target else {
-            let stale = has_row(ctx.conn(), id).map_err(|e| StepError::Retry(e.to_string()))?;
-            let writes = if stale { vec![StepWrite::new(DELETE, vec![id.into()])] } else { Vec::new() };
+            let stale = ctx.data().media_exists(id)?;
+            let writes = if stale { vec![StepWrite::for_mutation(id, StepMutation::ClearMedia)] } else { Vec::new() };
             return Ok(Outcome { writes, ..Outcome::default() });
         };
         let key = key_of(kind, &p);
-        let media = self.0.clone();
-        let late = Box::new(move || {
-            // on the shard's writer, as the row is written: a fan-out pass is a job on the same writer
-            let ids = media.cached_ids(key).unwrap_or_default();
-            vec![
-                Value::Integer(id),
-                Value::Integer(kind as i64),
-                Value::Integer(key),
-                int_value(p.season),
-                int_value(p.episode),
-                int_value(p.episode_last),
-                int_value(p.air_date),
-                int_value(p.year),
-                Value::Integer(i64::from(p.quality)),
-                id_value(ids.tvdb),
-                id_value(ids.tvmaze),
-                id_value(ids.trakt),
-                id_value(ids.tmdb),
-                id_value(ids.imdb),
-                id_value(ids.tvrage),
-            ]
+        let write = StepWrite::for_deferred_legacy(id,DeferredLegacyStepMutation::MediaParse {
+            media: self.0.clone(),kind,title_key: key,parsed: p,
         });
-        let write = StepWrite { sql: UPSERT, params: Vec::new(), late_params: Some(late) };
         let mut writes = vec![write];
         // the title a probed file's own tags name, put on the row as it's made: a release named only after its probe
         // ran had no row for the probe to pin them on, and the probe isn't run again for a rename
-        writes.extend(crate::probe::step::title_writes(id, saved_media(ctx.conn(), id).as_ref()));
+        writes.extend(crate::probe::step::title_writes(id, ctx.data().saved_probe_media(id)?.as_ref()));
         Ok(Outcome { matched: true, writes, ..Outcome::default() })
     }
 }
 
 /// The media facts of the release's saved probe, when it has one that decodes.
-fn saved_media(conn: &Connection, id: i64) -> Option<crate::probe::media::MediaInfo> {
+pub(crate) fn saved_media(conn: &Connection, id: i64) -> Option<crate::probe::media::MediaInfo> {
     let info: String = conn
         .prepare_cached("select info from release_probe where release_id = ?1")
         .ok()?
@@ -253,7 +207,7 @@ fn saved_media(conn: &Connection, id: i64) -> Option<crate::probe::media::MediaI
 }
 
 /// Whether rows of this title in this shard hold IDs. The newest few are enough: a fan-out reaches them all alike.
-fn stale_ids(conn: &Connection, key: i64) -> rusqlite::Result<bool> {
+pub(crate) fn stale_ids(conn: &Connection, key: i64) -> rusqlite::Result<bool> {
     conn.prepare_cached(
         "select 1 from (select tvdb_id, tvmaze_id, trakt_id, tmdb_id, imdb_id, tvrage_id, imdb_from_nfo, tmdb_from_tag, tvdb_from_tag
            from media_release indexed by media_release_title where title_key = ?1 order by release_id desc limit 100)
@@ -266,19 +220,7 @@ fn stale_ids(conn: &Connection, key: i64) -> rusqlite::Result<bool> {
 }
 
 fn found_write(id: i64, key: i64, ids: &Ids) -> StepWrite {
-    StepWrite::new(
-        FOUND,
-        vec![
-            id.into(),
-            key.into(),
-            id_value(ids.tvdb),
-            id_value(ids.tvmaze),
-            id_value(ids.trakt),
-            id_value(ids.tmdb),
-            id_value(ids.imdb),
-            id_value(ids.tvrage),
-        ],
-    )
+    StepWrite::for_mutation(id, StepMutation::FoundMediaIds { title_key: key, ids: *ids })
 }
 
 pub struct MediaLookup(pub Arc<Media>);
@@ -352,7 +294,7 @@ impl Step for MediaLookup {
             let ctx_ref = &*ctx;
             self.0.resolve_seeded(&q, key, now_secs(), &|| ctx_ref.stopping(), seed)
         };
-        let reindex = || decoded.as_ref().map(|_| StepWrite::new(WORD_QUEUE, vec![id.into()]));
+        let reindex = || decoded.as_ref().map(|_| StepWrite::for_mutation(id, StepMutation::ReindexWords));
         match resolved.map_err(StepError::Retry)? {
             Resolved::Found(ids) => {
                 let writes = std::iter::once(found_write(id, key, &ids)).chain(reindex()).collect();
@@ -360,10 +302,9 @@ impl Step for MediaLookup {
             }
             Resolved::NotFound => {
                 // nothing asked a title with IDs in the cache, soo these are from a row deleted by hand: a wrong match
-                let conn = ctx.conn();
                 // and a title decoded from an AlloCiné id: its other releases are found by it too, once fan-out
                 // queues them for the word index
-                if decoded.is_some() || stale_ids(conn, key).map_err(|e| StepError::Retry(e.to_string()))? {
+                if decoded.is_some() || ctx.data().stale_media_ids(key)? {
                     self.0.fan_out_again(key).map_err(StepError::Retry)?;
                 }
                 Ok(Outcome { writes: reindex().into_iter().collect(), ..Outcome::default() })
@@ -410,22 +351,18 @@ impl Step for MediaNfo {
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let retry = |e: rusqlite::Error| StepError::Retry(e.to_string());
         let id = ctx.release().id;
-        let current: Option<Option<i64>> = ctx
-            .conn()
-            .prepare_cached("select imdb_id from media_release where release_id = ?1")
-            .and_then(|mut stmt| stmt.query_row([id], |r| r.get(0)).optional())
-            .map_err(retry)?;
+        let current = ctx.data().media_imdb_marker(id)?;
         if !matches!(current, Some(None)) {
             return Ok(Outcome::default());
         }
         let files = ctx.files().map_err(retry)?;
         let Some(file) = nfo_sources(&files).into_iter().next() else { return Ok(Outcome::default()) };
-        let par2_names = crate::archive::select::par2_name_map(ctx.conn(), id, &files);
+        let par2_names = ctx.data().par2_names(id, &files)?;
         let par2_name = par2_names.get(&file.filename).map(String::as_str);
         // an NFO the probe or another step read is used as it was kept, not fetched again
-        if let Some(kept) = nfo_store::stored(ctx.conn(), id).filter(|k| k.is_of(&file.filename, par2_name)) {
+        if let Some(kept) = ctx.data().stored_nfo(id)?.filter(|k| k.is_of(&file.filename, par2_name)) {
             let Some(imdb) = imdb_in_nfo(kept.text.as_bytes()) else { return Ok(Outcome::default()) };
-            let write = StepWrite::new(NFO_IMDB, vec![id.into(), imdb.into()]);
+            let write = StepWrite::for_mutation(id, StepMutation::PinNfoMovieImdb { imdb_id: imdb });
             return Ok(Outcome { matched: true, writes: vec![write], ..Outcome::default() });
         }
         let segment = ctx.segments(file.id, &SegmentPick::First(1)).map_err(retry)?.into_iter().next();
@@ -440,7 +377,7 @@ impl Step for MediaNfo {
             .into_iter()
             .collect();
         let Some(imdb) = imdb_in_nfo(&body) else { return Ok(Outcome { writes, ..Outcome::default() }) };
-        writes.push(StepWrite::new(NFO_IMDB, vec![id.into(), imdb.into()]));
+        writes.push(StepWrite::for_mutation(id, StepMutation::PinNfoMovieImdb { imdb_id: imdb }));
         Ok(Outcome { matched: true, writes, ..Outcome::default() })
     }
 }

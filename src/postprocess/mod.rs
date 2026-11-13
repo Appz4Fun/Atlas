@@ -6,7 +6,9 @@
 pub(crate) mod apply;
 pub mod batch;
 pub mod bodies;
+pub mod data;
 pub(crate) mod engine;
+pub(crate) mod mutation;
 pub mod purge;
 pub mod reprocess;
 pub mod rules;
@@ -77,6 +79,14 @@ pub(crate) fn rerun_on(conn: &Connection, release_id: i64, clear: StepMask, now:
     Ok(())
 }
 
+fn scoped_lane(db: Db, work: impl FnOnce(Db)) {
+    let _scope = match db.bind_native_cache_scope() {
+        Ok(scope) => scope,
+        Err(_) => { db.fail_native(crate::pg::outage::Failure::Fatal); return; }
+    };
+    work(db);
+}
+
 impl Stage {
     /// Calls `enabled` on every step, seeds the first walk and `pp_steps_seen`, starts the threads.
     pub fn start(p: StageParams) -> Arc<Stage> {
@@ -88,7 +98,7 @@ impl Stage {
             threads.push(
                 std::thread::Builder::new()
                     .name(format!("atlas-pp-db-{i}"))
-                    .spawn(move || inner.db_lane(db))
+                    .spawn(move || scoped_lane(db, |db| inner.db_lane(db)))
                     .expect("couldnt start a processing thread"),
             );
         }
@@ -98,7 +108,7 @@ impl Stage {
                 threads.push(
                     std::thread::Builder::new()
                         .name(format!("atlas-pp-net-{i}"))
-                        .spawn(move || inner.net_lane(db))
+                        .spawn(move || scoped_lane(db, |db| inner.net_lane(db)))
                         .expect("couldnt start a processing thread"),
                 );
             }
@@ -107,7 +117,7 @@ impl Stage {
                 threads.push(
                     std::thread::Builder::new()
                         .name(format!("atlas-pp-rank-{shard}"))
-                        .spawn(move || inner.rank_lane(db, shard))
+                        .spawn(move || scoped_lane(db, |db| inner.rank_lane(db, shard)))
                         .expect("couldnt start a processing thread"),
                 );
             }

@@ -137,17 +137,38 @@ mod tests {
 
     #[test]
     fn nested_driver_io_is_transient_but_storage_io_is_not() {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        // Exercise driver transport provenance inside the same loopback-only
+        // sandbox as the LIB suite, without requiring a host Unix socket.
+        let peer = std::thread::spawn(move || {
+            let until = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+                        // Leave the rest of the startup packet unread so closing
+                        // the owned peer produces a transport reset, not SQL.
+                        stream.read_exact(&mut [0]).unwrap();
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(std::time::Instant::now() < until, "owned driver peer was not connected");
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("owned driver peer failed: {error}"),
+                }
+            }
+        });
         let mut config = postgres::Config::new();
-        #[cfg(unix)]
-        {
-            let missing = std::path::PathBuf::from(format!("/tmp/atlas-outage-{}-missing", std::process::id()));
-            assert!(!missing.exists());
-            config.host_path(missing);
-        }
-        #[cfg(not(unix))]
-        config.host("127.0.0.1").port(1);
-        config.dbname("example").user("example").connect_timeout(Duration::from_secs(1));
-        let error = config.connect(postgres::NoTls).err().expect("no owned test socket");
+        config.host("127.0.0.1").port(address.port()).ssl_mode(postgres::config::SslMode::Disable)
+            .dbname("example").user("example").connect_timeout(Duration::from_secs(1));
+        let error = config.connect(postgres::NoTls).err();
+        peer.join().unwrap();
+        let error = error.expect("owned peer closes before PostgreSQL startup");
+        assert!(std::error::Error::source(&error).is_some_and(|source| source.is::<std::io::Error>()));
         let wrapped = rusqlite::Error::UserFunctionError(Box::new(crate::pg::sql::Error::Postgres(error)));
         assert_eq!(classify(&anyhow::Error::new(wrapped).context("native SQL callback")), Failure::Unavailable);
         let file = std::io::Error::from(std::io::ErrorKind::NotFound);

@@ -43,7 +43,9 @@ impl Incoming<'_> {
         let article = self
             .article
             .map_or(0, |a| a.filename.as_deref().map_or(0, str::len) + a.subject.len() + a.message_id.len());
-        256 + r.name.len() + r.poster.len() + r.date.len() + r.display_name.as_deref().map_or(0, str::len) + article
+        let rare = self.article.filter(|a| a.filename.is_none())
+            .map_or(0, |a| a.subject.len() + r.poster.len() + r.date.len() + 32);
+        256 + r.name.len() + r.poster.len() + r.date.len() + r.display_name.as_deref().map_or(0, str::len) + article + rare
     }
 }
 
@@ -143,7 +145,7 @@ fn copy_input(tx: &mut Transaction<'_>, batch: &[Incoming<'_>]) -> Result<()> {
         "copy pg_temp.atlas_release_input (
             ordinal, identity_key, is_collection, name, poster, posted_date, display_name, is_obfuscated,
             junk, filename_key, filename, message_key, message_id, subject, part, expected, file_total,
-            zero_file_index, bytes
+            zero_file_index, bytes, nzb_subject, nzb_poster, nzb_posted_date, nzb_timestamp, nzb_file_index
          ) from stdin binary",
     )?;
     use Type as T;
@@ -169,6 +171,11 @@ fn copy_input(tx: &mut Transaction<'_>, batch: &[Incoming<'_>]) -> Result<()> {
             T::INT8,
             T::BOOL,
             T::INT8,
+            T::BYTEA,
+            T::BYTEA,
+            T::BYTEA,
+            T::INT8,
+            T::INT8,
         ],
     );
     for (i, row) in batch.iter().enumerate() {
@@ -181,6 +188,9 @@ fn copy_input(tx: &mut Transaction<'_>, batch: &[Incoming<'_>]) -> Result<()> {
         let filename = filename.map(pg_text);
         let subject = a.map(|article| pg_text(&article.subject));
         let display_name = r.display_name.as_deref().map(pg_text);
+        // Sparse original NZB metadata belongs only to literal None inputs,
+        // and later only to the MID that actually wins segment acceptance.
+        let nameless = a.filter(|article| article.filename.is_none());
         writer.write(&[
             &(i as i64),
             &&row.release_key[..],
@@ -203,6 +213,11 @@ fn copy_input(tx: &mut Transaction<'_>, batch: &[Incoming<'_>]) -> Result<()> {
                 article.subject.contains('[') && crate::parser::has_zero_file_index(&article.subject)
             }),
             &a.map_or(0, |article| article.bytes),
+            &nameless.map(|article|article.subject.as_bytes()),
+            &nameless.map(|_|r.poster.as_bytes()),
+            &nameless.map(|_|r.date.as_bytes()),
+            &nameless.map(|_|crate::dates::article_timestamp(&r.date)),
+            &nameless.and_then(|article|article.file_index),
         ])?;
     }
     writer.finish()?;
@@ -233,6 +248,11 @@ const CREATE_STAGE: &str = "
         file_total bigint,
         zero_file_index boolean not null,
         bytes bigint not null,
+        nzb_subject bytea,
+        nzb_poster bytea,
+        nzb_posted_date bytea,
+        nzb_timestamp bigint,
+        nzb_file_index bigint,
         release_id bigint,
         file_id bigint
     ) on commit delete rows";
@@ -267,7 +287,8 @@ const WRITE_RELEASES: &str = "
 const WRITE_ARTICLES: &str = "
     with candidates as materialized (
         select distinct on (r.id, s.message_key)
-            r.id as release_id, s.ordinal, s.filename_key, s.filename, s.message_key, s.message_id, s.part, s.bytes
+            r.id as release_id, s.ordinal, s.filename_key, s.filename, s.message_key, s.message_id, s.part, s.bytes,
+            s.nzb_subject,s.nzb_poster,s.nzb_posted_date,s.nzb_timestamp,s.expected,s.nzb_file_index,s.file_total
         from pg_temp.atlas_release_input s
         join releases r on r.group_name = $1 and (r.is_collection, r.identity_key) = (s.is_collection, s.identity_key)
         where not s.junk and not exists (
@@ -291,6 +312,12 @@ const WRITE_ARTICLES: &str = "
         from candidates c join file_map f using (release_id, filename_key)
         on conflict (release_id, message_key) do nothing
         returning release_id, file_id, message_key
+    ), sparse_nzb as (
+        insert into segment_nzb_metadata (release_id,message_key,subject,poster,posted_date,nzb_timestamp,expected,subject_file_index,subject_file_total)
+        select a.release_id,a.message_key,c.nzb_subject,c.nzb_poster,c.nzb_posted_date,c.nzb_timestamp,c.expected,c.nzb_file_index,c.file_total
+        from added a join candidates c using(release_id,message_key) where c.nzb_subject is not null
+        on conflict(release_id,message_key) do nothing
+        returning 1
     ), accepted as (
         update pg_temp.atlas_release_input s set release_id = a.release_id, file_id = a.file_id
         from added a join candidates c using (release_id, message_key) where s.ordinal = c.ordinal
@@ -393,9 +420,8 @@ mod tests {
 
     #[test]
     fn late_parts_complete_a_release_and_replayed_ids_do_not_requeue_it() {
-        let Some(test) = crate::pg::testing::Schema::empty() else { return };
+        let Some(test) = crate::pg::testing::Schema::new() else { return };
         let mut client = test.pool.get().unwrap();
-        client.batch_execute(include_str!("migrations/0003_release_writer.sql")).unwrap();
 
         let first = release("sample", "sample.rar", "<first@example.test>", 1);
         let duplicate = release("sample", "other.rar", "<first@example.test>", 1);
@@ -441,9 +467,8 @@ mod tests {
 
     #[test]
     fn malformed_text_preserves_message_ids_and_distinct_file_identity() {
-        let Some(test) = crate::pg::testing::Schema::empty() else { return };
+        let Some(test) = crate::pg::testing::Schema::new() else { return };
         let mut client = test.pool.get().unwrap();
-        client.batch_execute(include_str!("migrations/0003_release_writer.sql")).unwrap();
 
         let mut first = release("sample", "a\0.rar", "abc\0def", 1);
         first.articles[0].subject = "a\0.rar".into();
@@ -455,9 +480,8 @@ mod tests {
 
     #[test]
     fn late_executable_retracts_release_and_cannot_be_revived_by_replay() {
-        let Some(test) = crate::pg::testing::Schema::empty() else { return };
+        let Some(test) = crate::pg::testing::Schema::new() else { return };
         let mut client = test.pool.get().unwrap();
-        client.batch_execute(include_str!("migrations/0003_release_writer.sql")).unwrap();
 
         let good = release("sample", "sample.rar", "<first@example.test>", 1);
         let executable = release("sample", "sample.exe", "<exe@example.test>", 1);
@@ -472,9 +496,8 @@ mod tests {
 
     #[test]
     fn collection_keys_group_late_files_without_merging_another_collection() {
-        let Some(test) = crate::pg::testing::Schema::empty() else { return };
+        let Some(test) = crate::pg::testing::Schema::new() else { return };
         let mut client = test.pool.get().unwrap();
-        client.batch_execute(include_str!("migrations/0003_release_writer.sql")).unwrap();
 
         let mut first = release("sample", "first.rar", "<first@example.test>", 1);
         first.collection = Some("first collection".into());
@@ -494,9 +517,8 @@ mod tests {
 
     #[test]
     fn a_failed_second_group_rolls_back_the_entire_save() {
-        let Some(test) = crate::pg::testing::Schema::empty() else { return };
+        let Some(test) = crate::pg::testing::Schema::new() else { return };
         let mut client = test.pool.get().unwrap();
-        client.batch_execute(include_str!("migrations/0003_release_writer.sql")).unwrap();
 
         let first = release("sample", "sample.rar", "<first@example.test>", 1);
         let mut failing = release("sample", "sample.rar", "<other@example.test>", 1);
@@ -507,5 +529,39 @@ mod tests {
         let row = client.query_one("select count(*) from releases", &[]).unwrap();
         assert_eq!(row.get::<_, i64>(0), 0);
         assert_eq!(save(&mut client, &[first], 101).unwrap(), SaveStats { releases: 1, files: 1, parts: 1 });
+    }
+}
+
+#[cfg(test)]
+mod sparse_nzb_metadata_tests {
+    use super::*;
+    #[test]
+    #[ignore="requires explicit fresh schema9 sparse metadata and canonical writer admission"]
+    fn only_accepted_none_filename_messages_keep_raw_envelope_and_cascade_with_the_segment() {
+        let schema=crate::pg::testing::Schema::new().expect("explicit sparse fresh schema");let mut client=schema.pool.get().unwrap();
+        let subject=format!("rare{}é&subject",char::from(0));let poster=format!("poster{}原",char::from(0));
+        let release=|name:&str,file:Option<&str>,mid:&str|crate::parser::Release {name:name.into(),poster:poster.clone(),date:"Wed, 01 Jan 2020 00:00:00 +0000".into(),group:"alt.binaries.test".into(),
+            articles:vec![crate::parser::Article {filename:file.map(str::to_owned),subject:subject.clone(),message_id:mid.into(),part:Some(1),total_parts:Some(1),bytes:17,..Default::default()}],..Default::default()};
+        let mut rare=release("Rare.Meta.Example",None,"<rare@example.test>");
+        rare.articles[0].total_parts=Some(3);rare.articles[0].file_index=Some(2);rare.articles[0].file_total=Some(7);
+        let named=release("Named.Meta.Example",Some("file.bin"),"<named@example.test>");
+        let empty=release("Empty.Meta.Example",Some(""),"<empty@example.test>");
+        let mut duplicate=rare.clone();duplicate.poster="same-batch replacement".into();duplicate.date="2021-01-01 00:00:00".into();duplicate.articles[0].subject="same-batch replacement".into();
+        save(&mut client,&[rare.clone(),duplicate,named,empty],1).unwrap();
+        assert_eq!(client.query_one("select count(*) from segments",&[]).unwrap().get::<_,i64>(0),3);
+        assert_eq!(client.query_one("select count(*) from segment_nzb_metadata",&[]).unwrap().get::<_,i64>(0),1);
+        let row=client.query_one("select m.subject,m.poster,m.posted_date,m.nzb_timestamp,m.expected,m.subject_file_index,m.subject_file_total from segment_nzb_metadata m join releases r on r.id=m.release_id where r.name='Rare.Meta.Example'",&[]).unwrap();
+        assert_eq!(row.get::<_,Vec<u8>>(0),subject.as_bytes());assert_eq!(row.get::<_,Vec<u8>>(1),poster.as_bytes());
+        assert_eq!(row.get::<_,Vec<u8>>(2),b"Wed, 01 Jan 2020 00:00:00 +0000");assert_eq!(row.get::<_,i64>(3),1577836800);assert_eq!(row.get::<_,Option<i64>>(4),Some(3));assert_eq!(row.get::<_,Option<i64>>(5),Some(2));assert_eq!(row.get::<_,Option<i64>>(6),Some(7));
+        let mut replay=rare;replay.poster="changed poster".into();replay.date="2022-01-01 00:00:00".into();replay.articles[0].subject="changed subject".into();
+        replay.articles[0].total_parts=Some(99);replay.articles[0].file_index=Some(98);replay.articles[0].file_total=Some(99);
+        assert_eq!(save(&mut client,&[replay],2).unwrap().parts,0);
+        let kept=client.query_one("select subject,poster,posted_date,nzb_timestamp,expected,subject_file_index,subject_file_total from segment_nzb_metadata",&[]).unwrap();
+        assert_eq!(kept.get::<_,Vec<u8>>(0),subject.as_bytes());assert_eq!(kept.get::<_,Vec<u8>>(1),poster.as_bytes());
+        assert_eq!(kept.get::<_,Vec<u8>>(2),b"Wed, 01 Jan 2020 00:00:00 +0000");assert_eq!(kept.get::<_,i64>(3),1577836800);
+        assert_eq!(kept.get::<_,Option<i64>>(4),Some(3));assert_eq!(kept.get::<_,Option<i64>>(5),Some(2));assert_eq!(kept.get::<_,Option<i64>>(6),Some(7));
+        client.execute("delete from releases where name='Rare.Meta.Example'",&[]).unwrap();
+        assert_eq!(client.query_one("select count(*) from segment_nzb_metadata",&[]).unwrap().get::<_,i64>(0),0);
+        assert_eq!(client.query_one("select count(*) from segments",&[]).unwrap().get::<_,i64>(0),2);
     }
 }

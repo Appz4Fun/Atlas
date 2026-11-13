@@ -52,13 +52,13 @@ fn now() -> f64 {
 // ---------------------------------------------------------------------------------------------------------------
 // reading /metrics
 
-type Labels = Vec<(String, String)>;
+pub(crate) type Labels = Vec<(String, String)>;
 
 /// One read of `/metrics`: every series but histogram buckets, by metric name.
 #[derive(Debug, Default)]
-struct Scrape {
-    at: f64,
-    series: HashMap<String, Vec<(Labels, f64)>>,
+pub(crate) struct Scrape {
+    pub(crate) at: f64,
+    pub(crate) series: HashMap<String, Vec<(Labels, f64)>>,
 }
 
 fn label<'a>(labels: &'a Labels, key: &str) -> Option<&'a str> {
@@ -151,11 +151,36 @@ impl Scrape {
 
 /// The newest read, the oldest kept inside the rate window to measure from, and every read in between.
 #[derive(Clone, Default)]
-struct Window {
-    now: Option<Arc<Scrape>>,
-    then: Option<Arc<Scrape>>,
+pub(crate) struct Window {
+    pub(crate) now: Option<Arc<Scrape>>,
+    pub(crate) then: Option<Arc<Scrape>>,
     /// the reads from `then` to `now`, oldest first; empty means just those two
-    chain: Vec<Arc<Scrape>>,
+    pub(crate) chain: Vec<Arc<Scrape>>,
+    /// Native rates are reduced only AFTER each original series' reset-aware
+    /// deltas have been measured. They are rates, never invented then/now values.
+    pub(crate) computed: Option<ComputedWindow>,
+}
+
+/// Bounded native view projection. The loader authenticates the complete
+/// original-series observation manifest at the same live head before accepting
+/// these reductions. Missing data is not a zero, empty vector or legacy fallback.
+#[derive(Clone)]
+pub(crate) struct ComputedWindow {
+    pub(crate) from: Option<f64>,
+    pub(crate) to: f64,
+    pub(crate) rates: Arc<Scrape>,
+    pub(crate) changes: HashMap<String, f64>,
+    pub(crate) lag: Option<LagFacts>,
+}
+
+#[derive(Clone)]
+pub(crate) struct LagFacts {
+    pub(crate) groups: usize,
+    pub(crate) behind: usize,
+    pub(crate) late: usize,
+    pub(crate) articles: f64,
+    /// Exactly the original top15 by lag DESC, group ASC, with raw group names.
+    pub(crate) rows: Vec<(String, f64, Option<f64>)>,
 }
 
 impl Window {
@@ -168,17 +193,23 @@ impl Window {
             Some(t) => samples.iter().filter(|s| s.at >= t.at).cloned().collect(),
             None => Vec::new(),
         };
-        Window { now, then, chain }
+        Window { now, then, chain, computed: None }
     }
 
     fn secs(&self) -> Option<f64> {
-        Some(self.now.as_ref()?.at - self.then.as_ref()?.at)
+        match &self.computed {
+            Some(window) => Some(window.to - window.from?),
+            None => Some(self.now.as_ref()?.at - self.then.as_ref()?.at),
+        }
     }
 
     /// Per second, over the window, of the counter series `keep` takes, added up read to read the way `rate` does:
     /// a series that went down between two reads started over with its process and counts from zero there, and a
     /// series counts only between reads that both have it.
     fn rate_where(&self, name: &str, keep: impl Fn(&Labels) -> bool) -> Option<f64> {
+        if let Some(window) = &self.computed {
+            return ((window.to - window.from?) >= MIN_WINDOW_SECS).then(|| window.rates.sum_where(name, keep)).flatten();
+        }
         let (now, then) = (self.now.as_ref()?, self.then.as_ref()?);
         let secs = now.at - then.at;
         if secs < MIN_WINDOW_SECS {
@@ -207,6 +238,9 @@ impl Window {
 
     /// A gauge's change per second over the window (`deriv`, from two points).
     fn change(&self, name: &str) -> Option<f64> {
+        if let Some(window) = &self.computed {
+            return ((window.to - window.from?) >= MIN_WINDOW_SECS).then(|| window.changes.get(name).copied()).flatten();
+        }
         let (now, then) = (self.now.as_ref()?, self.then.as_ref()?);
         let secs = now.at - then.at;
         if secs < MIN_WINDOW_SECS {
@@ -307,44 +341,44 @@ fn window() -> (Window, Option<String>) {
 
 /// Releases of one category posted in the last day.
 #[derive(Clone, Debug, Default, PartialEq)]
-struct DayRow {
-    count: i64,
-    complete: i64,
-    bytes: i64,
+pub(crate) struct DayRow {
+    pub(crate) count: i64,
+    pub(crate) complete: i64,
+    pub(crate) bytes: i64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-struct PredbRow {
-    id: i64,
-    name: String,
-    kind: i64,
-    category: Option<String>,
-    matched_at: i64,
-    pre_at: Option<i64>,
-    size: Option<i64>,
-    complete: bool,
-    atlas_category: i64,
+pub(crate) struct PredbRow {
+    pub(crate) id: i64,
+    pub(crate) name: String,
+    pub(crate) kind: i64,
+    pub(crate) category: Option<String>,
+    pub(crate) matched_at: i64,
+    pub(crate) pre_at: Option<i64>,
+    pub(crate) size: Option<i64>,
+    pub(crate) complete: bool,
+    pub(crate) atlas_category: i64,
 }
 
 #[derive(Debug, Default)]
-struct Stored {
+pub(crate) struct Stored {
     /// when it was read, unix seconds
-    at: f64,
+    pub(crate) at: f64,
     /// how long the reads took
-    secs: f64,
+    pub(crate) secs: f64,
     /// by stored category, scaled up where a shard was sampled; uncategorized is `UNCATEGORIZED`
-    day: BTreeMap<i64, DayRow>,
+    pub(crate) day: BTreeMap<i64, DayRow>,
     /// releases posted in the day, counted exactly
-    day_total: i64,
+    pub(crate) day_total: i64,
     /// the widest sample step a shard used: 1 when every release was looked at
-    day_every: i64,
+    pub(crate) day_every: i64,
     /// when the day was read, and how long that took
-    day_at: f64,
-    day_secs: f64,
+    pub(crate) day_at: f64,
+    pub(crate) day_secs: f64,
     /// shards that couldn't answer the last day's count: no posted-date index there yet
-    day_unindexed: usize,
-    predb: Vec<PredbRow>,
-    errors: Vec<String>,
+    pub(crate) day_unindexed: usize,
+    pub(crate) predb: Vec<PredbRow>,
+    pub(crate) errors: Vec<String>,
 }
 
 static STORED: Mutex<Option<(Instant, Arc<Stored>)>> = Mutex::new(None);
@@ -709,12 +743,7 @@ fn in_progress(w: &Window, function: &str) -> Option<f64> {
 /// The steps of the processing stage, as the metrics name them, in the order they run.
 fn step_names() -> Vec<(&'static str, bool)> {
     use crate::postprocess::step::Needs;
-    let mut steps: Vec<_> = crate::postprocess::steps::all()
-        .into_iter()
-        .map(|s| (s.rank(), s.name(), s.needs() != Needs::Database))
-        .collect();
-    steps.sort_by_key(|s| s.0);
-    steps.into_iter().map(|(_, name, net)| (name, net)).collect()
+    crate::postprocess::steps::catalog().iter().map(|s| (s.name, s.needs != Needs::Database)).collect()
 }
 
 fn pipelines(w: &Window, stats: &Value) -> String {
@@ -880,6 +909,9 @@ fn net_shards(w: &Window, stats: &Value) -> String {
 
 /// Groups furthest behind the server, from `atlas_group_article_number` and `atlas_group_posted_timestamp_seconds`.
 fn lag(w: &Window, now: f64) -> String {
+    if let Some(window) = &w.computed {
+        return window.lag.as_ref().map_or_else(String::new, |facts| lag_from_facts(facts, now));
+    }
     const SHOWN: usize = 15;
     const LATE_SECS: f64 = 30.0 * 60.0;
     let Some(n) = w.now.as_deref() else { return String::new() };
@@ -914,9 +946,15 @@ fn lag(w: &Window, now: f64) -> String {
     let late = rows.iter().filter(|r| r.2.is_some_and(|t| now - t > LATE_SECS)).count();
     let total_lag: f64 = rows.iter().map(|r| r.1).sum();
     rows.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(b.0)));
-    let table: String = rows
+    let facts = LagFacts { groups: rows.len(), behind, late, articles: total_lag,
+        rows: rows.into_iter().take(SHOWN).map(|(group, lag, newest)| (group.to_owned(), lag, newest)).collect() };
+    lag_from_facts(&facts, now)
+}
+
+fn lag_from_facts(facts: &LagFacts, now: f64) -> String {
+    let table: String = facts.rows
         .iter()
-        .take(SHOWN)
+        .take(15)
         .filter(|r| r.1 > 0.0)
         .map(|(g, articles, newest)| {
             format!(
@@ -929,9 +967,9 @@ fn lag(w: &Window, now: f64) -> String {
         })
         .collect();
     let tiles = [
-        tile("Articles behind", &short(total_lag), "server's last article minus the live cursor, summed"),
-        tile("Groups behind", &thousands(behind as i64), &format!("of {}", thousands(rows.len() as i64))),
-        tile("Quiet over 30 minutes", &thousands(late as i64), "newest article indexed is older than that"),
+        tile("Articles behind", &short(facts.articles), "server's last article minus the live cursor, summed"),
+        tile("Groups behind", &thousands(facts.behind as i64), &format!("of {}", thousands(facts.groups as i64))),
+        tile("Quiet over 30 minutes", &thousands(facts.late as i64), "newest article indexed is older than that"),
     ];
     let table = if table.is_empty() {
         "<p class=\"sort\">Every group is caught up with its server.</p>".to_string()
@@ -1098,7 +1136,7 @@ fn predb_feeds(w: &Window, stats: &Value, now: f64) -> String {
 }
 
 /// The part that refreshes itself: everything but the shard reads.
-fn live_html(w: &Window, error: Option<&str>, stats: &Value, now: f64) -> String {
+pub(crate) fn live_html(w: &Window, error: Option<&str>, stats: &Value, now: f64) -> String {
     let problem = match (w.now.as_ref(), error) {
         (None, Some(e)) => crate::web::diag("note", "the indexer's metrics could not be read", e),
         (Some(s), Some(e)) => {
@@ -1268,7 +1306,7 @@ fn predb_html(s: &Stored, now: f64) -> String {
     )
 }
 
-fn stored_html(s: &Stored, now: f64) -> String {
+pub(crate) fn stored_html(s: &Stored, now: f64) -> String {
     let errors = if s.errors.is_empty() {
         String::new()
     } else {
@@ -1288,13 +1326,16 @@ fn stored_html(s: &Stored, now: f64) -> String {
 
 pub fn page() -> ApiResponse {
     let (w, error) = window();
-    let now = now();
+    html(200, page_from_facts(&w, error.as_deref(), &stats_json(), now()))
+}
+
+pub(crate) fn page_from_facts(w: &Window, error: Option<&str>, stats: &Value, now: f64) -> String {
     let content = format!(
         "{masthead}<div class=\"release stats\"><main><h1>Stats</h1>{live}<div id=\"stats-stored\" hx-get=\"/ui/stats/stored\" hx-trigger=\"load\" hx-swap=\"outerHTML\"><h2>Last 24 hours</h2><p class=\"sort\">Reading the shards…</p></div></main></div>",
         masthead = crate::web::masthead(true),
-        live = live_html(&w, error.as_deref(), &stats_json(), now),
+        live = live_html(w, error, stats, now),
     );
-    html(200, crate::web::page("Stats · Atlas", &content))
+    crate::web::page("Stats · Atlas", &content)
 }
 
 pub fn live() -> ApiResponse {
@@ -1310,6 +1351,24 @@ pub fn stored_fragment() -> ApiResponse {
 mod tests {
     use super::*;
     use rusqlite::params;
+
+    #[test]
+    fn native_rate_and_lag_facts_keep_reset_semantics_without_fake_samples() {
+        let then = Arc::new(parse("atlas_articles_total{group=\"a\"} 100\natlas_articles_total{group=\"b\"} 500\n", 0.0));
+        let now = Arc::new(parse("atlas_articles_total{group=\"a\"} 160\natlas_articles_total{group=\"b\"} 30\natlas_articles_total{group=\"new\"} 9999\natlas_group_article_number{group=\"a\",mark=\"last\"} 100\natlas_group_article_number{group=\"a\",mark=\"live_cursor\"} 50\natlas_group_article_number{group=\"b\",mark=\"last\"} 10\natlas_group_article_number{group=\"b\",mark=\"live_cursor\"} 10\natlas_group_article_number{group=\"c\",mark=\"last\"} 50\natlas_group_article_number{group=\"c\",mark=\"live_cursor\"} 25\natlas_group_posted_timestamp_seconds{group=\"a\",end=\"newest\"} 1\natlas_group_posted_timestamp_seconds{group=\"b\",end=\"newest\"} 1900\natlas_group_posted_timestamp_seconds{group=\"c\",end=\"newest\"} 1990\n", 60.0));
+        let original = Window { then: Some(then), now: Some(now.clone()), ..Default::default() };
+        let native = Window { now: Some(now), computed: Some(ComputedWindow {
+            from: Some(0.0), to: 60.0,
+            rates: Arc::new(Scrape { at: 60.0, series: HashMap::from([("atlas_articles_total".into(), vec![(Vec::new(), 1.5)])]) }),
+            changes: HashMap::new(), lag: Some(LagFacts { groups: 3, behind: 2, late: 1, articles: 75.0,
+                rows: vec![("a".into(), 50.0, Some(1.0)), ("c".into(), 25.0, Some(1990.0)), ("b".into(), 0.0, Some(1900.0))] }),
+        }), ..Default::default() };
+        // +60 on a, +30 after b reset; a new series contributes no rate.
+        assert_eq!(original.rate_where("atlas_articles_total", |_| true), Some(1.5));
+        assert_eq!(native.rate_where("atlas_articles_total", |_| true), Some(1.5));
+        assert!(native.then.is_none() && native.chain.is_empty());
+        assert_eq!(lag(&original, 2000.0), lag(&native, 2000.0));
+    }
 
     const TEXT: &str = r#"# HELP atlas_articles_total Articles indexed, per group.
 # TYPE atlas_articles_total counter

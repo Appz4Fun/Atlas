@@ -21,10 +21,10 @@ use std::sync::LazyLock;
 
 use rusqlite::{OptionalExtension, params};
 
-use crate::postprocess::step::{BodyRequest, Got, Outcome, StepCtx, StepError, StepWrite, mask};
+use crate::postprocess::step::{BodyRequest, Got, Outcome, StepCtx, StepError, StepMutation, StepWrite, mask};
 use crate::store::{FileInfo, SegmentPick};
 
-use super::link::{BESIDE_SECS, ID_WINDOW, RESUME_SECS, SET_BESIDE, beside_window, id_window, retry};
+use super::link::{BESIDE_SECS, ID_WINDOW, RESUME_SECS, beside_window, id_window, retry};
 
 /// How far apart an NFO posted on its own and its release can say they were posted: it's often posted once the upload
 /// is up, which for a big one is hours after its first file.
@@ -70,23 +70,23 @@ pub fn by_name(ctx: &mut StepCtx<'_>, files: &[FileInfo], picture_found: bool) -
     }
     let me = ctx.release().clone();
     let stem = crate::release_info::post_stem(&me.name);
-    let beside = own_beside(ctx, me.id)?;
+    let beside = ctx.data().beside_rows_with_files(me.id)?;
     let mut out = Outcome::default();
     // the NFO: one found already is read when it hasn't been; one posted on its own is looked for when there's none
     let own_nfo = files.iter().any(|f| is_nfo(&f.filename));
     let found_nfo = match beside.iter().find(|(_, f)| is_nfo(&f.filename)) {
         Some((row, file)) => Some((*row, file.clone(), false)),
         None if !own_nfo && !stem.is_empty() => {
-            nfo_beside(ctx.conn(), me.id, &stem, me.posted_date.as_deref())?.map(|(row, file)| (row, file, true))
+            ctx.data().find_beside_nfo(me.id, &stem, me.posted_date.as_deref())?.map(|(row, file)| (row, file, true))
         }
         None => None,
     };
     if let Some((row, file, new)) = found_nfo {
         if new {
-            out.writes.push(StepWrite::new(SET_BESIDE, vec![row.into(), me.id.into(), rusqlite::types::Value::Null]));
+            out.writes.push(StepWrite::for_mutation(me.id, StepMutation::PlaceBesideFile { row_id: row,owner_id: me.id,par2_file: None }));
         }
         out.matched = true;
-        if crate::probe::nfo_store::stored(ctx.conn(), me.id).is_none() {
+        if ctx.data().stored_nfo(me.id)?.is_none() {
             // one that can't be read now (out of budget, a server down) is read on a later run: the step waits, which
             // holds back none of the release's later steps, and keeps the reruns this run asks for
             match read_nfo(ctx, &file)? {
@@ -104,20 +104,20 @@ pub fn by_name(ctx: &mut StepCtx<'_>, files: &[FileInfo], picture_found: bool) -
         && let Some(total) = me.file_total.filter(|n| *n >= 2)
         && let Some(posted) = me.posted_date.as_deref()
     {
-        let (posters, rows) = post_posters(ctx.conn(), &me.name, &stem, me.poster.as_deref(), posted)?;
+        let (posters, rows) = ctx.data().post_posters(&me.name, &stem, me.poster.as_deref(), posted)?;
         // the slots the whole post holds, across its groups' rows: only a post a file or two short is looked at
         let mut slots: HashSet<i64> =
             files.iter().filter_map(|f| counter(f.subject.as_deref()?)).map(|(k, _)| k).collect();
         for row in rows {
-            for f in crate::store::release_files(ctx.conn(), row, 64).map_err(retry)? {
+            for f in ctx.data().counter_files(row)? {
                 slots.extend(f.subject.as_deref().and_then(counter).map(|(k, _)| k));
             }
         }
         let short = (1..=total).filter(|k| !slots.contains(k)).count();
         if (1..=MAX_SHORT).contains(&short)
-            && let Some(row) = thumbnail_beside(ctx.conn(), me.id, total, &slots, &posters, posted)?
+            && let Some(row) = ctx.data().find_thumbnail(me.id, total, &slots, &posters, posted)?
         {
-            out.writes.push(StepWrite::new(SET_BESIDE, vec![row.into(), me.id.into(), rusqlite::types::Value::Null]));
+            out.writes.push(StepWrite::for_mutation(me.id, StepMutation::PlaceBesideFile { row_id: row,owner_id: me.id,par2_file: None }));
             out.matched = true;
             out.rerun |= mask(crate::images::step::IMAGES_STEP);
         }
@@ -131,25 +131,23 @@ fn nfo_row(ctx: &mut StepCtx<'_>, file: &FileInfo) -> Result<Outcome, StepError>
         return Ok(Outcome::default());
     }
     let me = ctx.release().clone();
-    let known: Option<i64> = ctx
-        .conn()
-        .prepare_cached("select release_id from beside_files where row_id = ?1")
-        .and_then(|mut stmt| stmt.query_row([me.id], |r| r.get(0)).optional())
-        .map_err(retry)?;
+    let known = ctx.data().beside_owner_local(me.id)?;
     let mut out = Outcome::default();
     let owner = match known {
         Some(owner) => owner,
         None => {
             let Some(stem) = strip_nfo(&file.filename) else { return Ok(out) };
-            let Some(owner) = nfo_owner(ctx.conn(), me.id, stem, me.posted_date.as_deref())? else { return Ok(out) };
-            out.writes.push(StepWrite::new(SET_BESIDE, vec![me.id.into(), owner.into(), rusqlite::types::Value::Null]));
+            let Some(owner) = ctx.data().find_nfo_owner(me.id, stem, me.posted_date.as_deref())? else { return Ok(out) };
+            out.writes.push(StepWrite::for_mutation(me.id, StepMutation::PlaceBesideFile { row_id: me.id,owner_id: owner,par2_file: None }));
             owner
         }
     };
     out.matched = true;
-    if crate::probe::nfo_store::stored(ctx.conn(), owner).is_none() {
+    if ctx.data().stored_nfo(owner)?.is_none() {
         match read_nfo(ctx, file)? {
-            NfoRead::Text(text) => out.writes.push(crate::probe::nfo_store::keep(owner, &file.filename, &text)),
+            NfoRead::Text(text) => out.writes.push(StepWrite::for_mutation(me.id, StepMutation::KeepNfoForLegacyTarget {
+                target_id: owner,file: file.filename.clone(),text,
+            })),
             // this row's own later steps are all it holds back
             NfoRead::Later => out.wait_until = Some(chrono::Utc::now().timestamp() + RESUME_SECS),
             NfoRead::Never => {}
@@ -200,15 +198,14 @@ fn read_nfo(ctx: &mut StepCtx<'_>, file: &FileInfo) -> Result<NfoRead, StepError
 }
 
 /// The rows already found beside a release, with their one file each.
-fn own_beside(ctx: &StepCtx<'_>, id: i64) -> Result<Vec<(i64, FileInfo)>, StepError> {
-    let rows: Vec<i64> = ctx
-        .conn()
+pub(crate) fn own_beside_legacy(conn: &rusqlite::Connection, id: i64) -> Result<Vec<(i64, FileInfo)>, StepError> {
+    let rows: Vec<i64> = conn
         .prepare_cached("select row_id from beside_files where release_id = ?1 limit 16")
         .and_then(|mut stmt| stmt.query_map([id], |r| r.get(0))?.collect())
         .map_err(retry)?;
     let mut out = Vec::new();
     for row in rows {
-        for file in crate::store::release_files(ctx.conn(), row, 2).map_err(retry)? {
+        for file in crate::store::release_files(conn, row, 2).map_err(retry)? {
             out.push((row, file));
         }
     }
@@ -218,7 +215,7 @@ fn own_beside(ctx: &StepCtx<'_>, id: i64) -> Result<Vec<(i64, FileInfo)>, StepEr
 /// The release a row holding only `stem.nfo` was posted beside: a row of that name (or the name and a video's
 /// extension, as a group's row of a post can be named by its video), in any group, holding files that aren't side
 /// files, posted within `NFO_SECS`, nearest first.
-fn nfo_owner(conn: &rusqlite::Connection, me: i64, stem: &str, posted: Option<&str>) -> Result<Option<i64>, StepError> {
+pub(crate) fn nfo_owner(conn: &rusqlite::Connection, me: i64, stem: &str, posted: Option<&str>) -> Result<Option<i64>, StepError> {
     let Some(posted) = posted else { return Ok(None) };
     let Some((from, to)) = beside_window(posted, NFO_SECS) else { return Ok(None) };
     let rows = named_rows(conn, me, stem, (&from, &to, posted))?;
@@ -239,7 +236,7 @@ fn nfo_owner(conn: &rusqlite::Connection, me: i64, stem: &str, posted: Option<&s
 
 /// A row of nothing but `stem.nfo`, in at most two articles, posted within `NFO_SECS` of the release, that nothing
 /// else has taken, nearest first: (its id, its file).
-fn nfo_beside(
+pub(crate) fn nfo_beside(
     conn: &rusqlite::Connection,
     me: i64,
     stem: &str,
@@ -308,7 +305,7 @@ fn named_rows(
 
 /// The posters of a release's post, and its rows in other groups: its own poster, and those of the rows of its name
 /// posted within a day, as a post cut across groups gives each group's row a poster of its own.
-fn post_posters(
+pub(crate) fn post_posters(
     conn: &rusqlite::Connection,
     name: &str,
     stem: &str,
@@ -340,7 +337,7 @@ fn post_posters(
 /// that nothing else has taken. Nearest in time first. Looked for by poster, not by name: every upload's thumbnail
 /// is named alike, but a poster's rows (or those of a prefix a tool makes up per upload) are few, and the poster
 /// index holds the id, which bounds them to the ids near this release's without reading a row.
-fn thumbnail_beside(
+pub(crate) fn thumbnail_beside(
     conn: &rusqlite::Connection,
     me: i64,
     total: i64,

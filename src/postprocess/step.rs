@@ -10,6 +10,7 @@ use crate::nntp::BackgroundRead;
 use crate::store;
 
 use super::bodies::BodyFetcher;
+pub use super::mutation::{DeferredLegacyStepMutation, ImageRecord, SidecarRecord, StepMutation};
 
 /// Never reused, 1..=62.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -98,7 +99,7 @@ pub struct ReleaseInfo {
 /// What a step gets for one release.
 pub struct StepCtx<'a> {
     pub(crate) release: ReleaseInfo,
-    pub(crate) conn: &'a Connection,
+    pub(crate) data: super::data::StepData<'a>,
     pub(crate) facts: Vec<(&'static str, String)>,
     pub(crate) bodies: &'a BodyFetcher,
     pub(crate) used_bodies: i64,
@@ -111,6 +112,11 @@ pub struct StepCtx<'a> {
 }
 
 impl StepCtx<'_> {
+    /// Native reads remain unavailable until the resolver, snapshots and admission have been reviewed.
+    pub fn data(&self) -> &super::data::StepData<'_> {
+        &self.data
+    }
+
     /// shows a rename made earlier in this run
     pub fn release(&self) -> &ReleaseInfo {
         &self.release
@@ -118,17 +124,17 @@ impl StepCtx<'_> {
 
     /// capped at 5,000
     pub fn files(&self) -> rusqlite::Result<Vec<store::FileInfo>> {
-        store::release_files(self.conn, self.release.id, 5_000)
+        self.data.release_files(self.release.id)
     }
 
     pub fn segments(&self, file_id: i64, pick: &store::SegmentPick) -> rusqlite::Result<Vec<store::SegmentRef>> {
-        store::file_segments(self.conn, file_id, pick)
+        self.data.file_segments(file_id, pick)
     }
 
-    /// This shard, opened `query_only`. For reading your own tables. Do not keep
-    /// a statement open across `fetch_bodies`: it pins the WAL.
-    pub fn conn(&self) -> &Connection {
-        self.conn
+    /// The legacy shard, opened `query_only`; unavailable native data returns an error.
+    /// Do not keep a statement open across `fetch_bodies`: it pins the WAL.
+    pub fn conn(&self) -> Result<&Connection, StepError> {
+        self.data.legacy_connection()
     }
 
     /// A value an earlier step in this run left, see `Outcome::facts`.
@@ -254,10 +260,9 @@ impl StepCtx<'_> {
 
     /// An article's CRC, kept with this run's writes.
     fn keep_crc(&mut self, message_id: &str, decoded: usize, crc: u32) {
-        self.crcs.push(StepWrite::new(
-            crate::archive::store::SET_SEGMENT_CRC,
-            vec![self.release.id.into(), message_id.to_string().into(), (decoded as i64).into(), i64::from(crc).into()],
-        ));
+        self.crcs.push(StepWrite::for_mutation(self.release.id, StepMutation::RecordSegmentCrc {
+            message_id: message_id.to_string(),decoded: decoded as i64,crc32: crc,
+        }));
     }
 
     /// Whether a server still has an article, with nothing transferred. None: it wasn't asked.
@@ -344,11 +349,44 @@ pub struct StepWrite {
     /// Called on the shard's writer just before this write, in place of `params`, for a
     /// value that must be current then and not when the step ran. It must be quick.
     pub late_params: Option<Box<dyn FnOnce() -> Vec<Value> + Send>>,
+    /// Closed result data is independent of its legacy SQL representation.
+    mutation: Option<(i64, StepMutation)>,
 }
 
 impl StepWrite {
     pub fn new(sql: &'static str, params: Vec<Value>) -> StepWrite {
-        StepWrite { sql, params, late_params: None }
+        StepWrite { sql, params, late_params: None, mutation: None }
+    }
+
+    pub fn with_late_params(mut self, late: Box<dyn FnOnce() -> Vec<Value> + Send>) -> Self {
+        self.late_params = Some(late);
+        self
+    }
+
+    /// Keeps legacy late-cache timing without admitting that cache or callback to the native writer.
+    pub fn for_deferred_legacy(release_id: i64, mutation: DeferredLegacyStepMutation) -> Self {
+        let sql = mutation.sqlite_sql();
+        Self { sql,params: Vec::new(),late_params: Some(Box::new(move || mutation.sqlite_parameters(release_id))),mutation: None }
+    }
+
+    pub fn for_mutation(release_id: i64, mutation: StepMutation) -> Self {
+        let (sql, params) = mutation.sqlite_statement(release_id);
+        Self { sql, params, late_params: None, mutation: Some((release_id, mutation)) }
+    }
+
+    /// Legacy SQL cannot be submitted as a native mutation. The retained legacy ID is not native authority;
+    /// native application still requires a reference from the future reviewed resolver and its live epoch gate.
+    pub fn native_mutation(&self) -> Result<&StepMutation, StepError> {
+        let (legacy_id, mutation) = self.mutation.as_ref()
+            .ok_or_else(|| StepError::Retry("Step mutation is not ported to native storage".into()))?;
+        if mutation.requires_target_resolution() {
+            return Err(StepError::Retry("Step targets require the native resolver".into()));
+        }
+        let (sql, params) = mutation.sqlite_statement(*legacy_id);
+        if self.sql != sql || self.params != params || self.late_params.is_some() {
+            return Err(StepError::Retry("Step mutation representation changed".into()));
+        }
+        Ok(mutation)
     }
 }
 
@@ -375,4 +413,24 @@ pub enum StepError {
     OutOfBudget,
     /// shutting down
     Stopped,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, atomic::AtomicBool};
+
+    #[test]
+    fn a_context_without_native_authority_needs_no_sqlite_connection() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let bodies = BodyFetcher::new(Arc::new(crate::nntp::Pool::new(&[])),runtime.handle().clone(),
+            Arc::new(AtomicBool::new(false)),crate::config::PostprocessConfig::default(),
+            Arc::new(crate::postprocess::stats::Stats::default()));
+        let context = StepCtx { release: ReleaseInfo::default(),data: super::super::data::StepData::NativeUnavailable,
+            facts: Vec::new(),bodies: &bodies,used_bodies: 0,deadline: Instant::now(),lane_can_fetch: false,
+            crcs: Vec::new(),pictures: false };
+        assert!(matches!(context.conn(),Err(StepError::Retry(_))));
+        assert!(context.files().is_err());
+        assert!(context.segments(1,&store::SegmentPick::First(1)).is_err());
+    }
 }
