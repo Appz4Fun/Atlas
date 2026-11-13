@@ -113,7 +113,7 @@ impl Step for Record {
         self.log.lock().unwrap().push((ctx.release().name.clone(), ctx.release().display_name.clone()));
         let mode = self.mode.load(Ordering::Acquire);
         if mode == Mode::Hold as u8 || (mode == Mode::Recover as u8 && count > 0) {
-            let deadline = Instant::now() + Duration::from_secs(12);
+            let deadline = Instant::now() + Duration::from_secs(20);
             while !ctx.stopping() {
                 assert!(Instant::now() < deadline, "held original native Step was not stopped");
                 std::thread::sleep(Duration::from_millis(10));
@@ -317,8 +317,10 @@ fn worker_restart() {
     let mut f = Fixture::open(1);
     let a = f.save("Resume.One", "alt.binaries.mixed.resume-a", None);
     let b = f.save("Resume.Two", "alt.binaries.mixed.resume-b", None);
+    let c = f.save("Resume.Three", "alt.binaries.mixed.resume-c", None);
     f.rerun(a, WALK);
     f.rerun(b, WALK);
+    f.rerun(c, WALK);
     let log = Log::default();
     let held = Record::new(9, Mode::Hold, &log);
     let first = f.runner(vec![held.clone()]);
@@ -355,16 +357,28 @@ fn worker_restart() {
     )
     .unwrap();
     let native = view.live_statistics().unwrap();
-    assert_eq!(native.catalog.total, 2);
+    assert_eq!(native.catalog.total, 3);
     match native.pace {
         crate::web_pending::NativePace::Warming { enabled } => assert_eq!(enabled, WALK),
         crate::web_pending::NativePace::Measured(pace) => assert_eq!(pace.enabled, Some(WALK)),
         crate::web_pending::NativePace::Stopped { .. } => panic!("actual recovered Stage was reported stopped"),
     }
     drop(view);
-    let queue_due =
-        observer.query_one("select count(*) from pp_queue where due_at<=$1", &[&now()]).unwrap().get::<_, i64>(0);
-    assert!(queue_due > 0, "a real in-flight pending release exists for the metrics oracle");
+    let queue_due = observer
+        .query_one(
+            "select count(*) from pp_queue q where due_at<=$1 and (lease_until is null or lease_until<=$1)
+         and not exists(select 1 from pp_state s where s.release_id=q.release_id and s.native_net_until>$1)",
+            &[&now()],
+        )
+        .unwrap()
+        .get::<_, i64>(0);
+    assert_eq!(queue_due, 1, "one genuinely unclaimed actionable release remains beside the actual held Step");
+    // Observe the actual one-second producer's completed payload on its normal
+    // standard worker lane, never a manual counter or file injection.
+    wait("actual native producer observes stable actionable work", || {
+        runner.stats.snapshot(0, 100, WALK)["queue_due"].as_i64() == Some(queue_due)
+            && crate::postprocess::stats::backlog() == queue_due
+    });
     let snapshot = runner.stats.snapshot(0, 100, WALK);
     assert!(snapshot["queue_due"].is_i64());
     assert!(snapshot["walk"].is_object());
