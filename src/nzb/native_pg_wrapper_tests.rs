@@ -52,8 +52,19 @@ fn posting(name: &str, articles: &[(&str, i64)], complete: bool) -> crate::parse
 fn child() {
     let home = crate::paths::app_dir();
     let storage = crate::config::checked_storage_config().unwrap();
-    let pool = pg::Pool::new(&storage).unwrap();
-    let runtime = pg::indexer_runtime::Runtime::open(&pool).unwrap();
+    // The actual owner uses the existing admitted header-only test profile.
+    // No worker/provider service or public listener starts in this fixture.
+    let mut config = crate::config::Config::default();
+    config.postprocess.enabled = false;
+    config.predb.enabled = false;
+    config.spots.enabled = false;
+    config.inferred_parts = false;
+    config.media.tvmaze.enabled = false;
+    config.media.allocine.enabled = false;
+    config.media.details_per_minute = 0;
+    let runtime =
+        pg::indexer_runtime::Runtime::open(&config, storage, crate::config::header_store_config(), &[], &mut None)
+            .unwrap();
     let (whole, partial) = runtime
         .owner
         .with(|client| {
@@ -99,7 +110,7 @@ fn child() {
     let ordinal = build_nzb_file_checked(whole, 1).unwrap().unwrap();
     let named = build_nzb_named_checked(whole, FILE).unwrap().unwrap();
     let listed = file_list(whole).unwrap().unwrap();
-    let partial_whole_refused = build_nzb_checked(partial).unwrap().is_none();
+    let partial_whole_refused = build_nzb_checked(partial).is_err();
     let own = build_nzb_file_checked(partial, 1).unwrap().unwrap();
     let exports = home.join("exports");
     fs::create_dir(&exports).unwrap();
