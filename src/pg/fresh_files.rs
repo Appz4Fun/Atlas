@@ -67,10 +67,16 @@ impl ReadView<'_> {
         let mut descriptors=pool.open()?;
         self.before_query()?;
         let mut tx=self.tx.borrow_mut();
-        let mut rows=tx.query_raw("select f.id,octet_length(f.filename)::bigint,
-            count(s.message_key),coalesce(sum(s.bytes),0)::bigint
+        let mut rows=tx.query_raw("with inventory as(
+            select f.id,f.filename,count(s.message_key) articles,coalesce(sum(s.bytes),0)::bigint bytes,null::bigint singleton_part,null::bytea singleton_mid
             from files f join segments s on s.file_id=f.id and s.release_id=f.release_id
-            where f.release_id=$1 group by f.id order by f.filename collate \"C\",f.id",[&id])?;
+            where f.release_id=$1 and f.filename<>'' group by f.id
+            union all
+            select f.id,f.filename,1::bigint,s.bytes,s.part,s.message_id
+            from files f join segments s on s.file_id=f.id and s.release_id=f.release_id
+            where f.release_id=$1 and f.filename='')
+            select id,octet_length(filename)::bigint,articles,bytes from inventory
+            order by filename collate \"C\",id,singleton_part nulls first,singleton_mid",[&id])?;
         let mut count=0u64;
         while let Some(row)=rows.next()? {
             self.check_deadline()?;

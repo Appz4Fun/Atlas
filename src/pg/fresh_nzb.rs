@@ -48,34 +48,105 @@ fn segment(input:&mut impl Read)->Result<([u8;32],Option<i64>,i64,i64)>{
     let mut key=[0;32];input.read_exact(&mut key)?;let tag=number(input)?;let part=number(input)?;
     ensure!(tag==0||tag==1,"invalid native segment optional tag");Ok((key,(tag==1).then_some(part),number(input)?,number(input)?))
 }
+#[derive(Clone,Copy)]
+struct SparseHeader {key:[u8;32],subject_bytes:i64,poster_bytes:i64,timestamp:i64}
+struct FileDescriptor {file:i64,expected:Option<i64>,name_bytes:i64,count:i64,sparse:Option<SparseHeader>}
+impl FileDescriptor {
+    fn read(input:&mut impl Read)->Result<Self> {
+        let file=number(input)?;let tag=number(input)?;let expected=number(input)?;let name_bytes=number(input)?;let count=number(input)?;
+        let sparse_tag=number(input)?;let mut key=[0;32];input.read_exact(&mut key)?;
+        let subject_bytes=number(input)?;let poster_bytes=number(input)?;let timestamp=number(input)?;
+        ensure!(file>0&&count>0&&name_bytes>=0&&(tag==0||tag==1)&&(sparse_tag==0||sparse_tag==1),"invalid native file descriptor");
+        let sparse=if sparse_tag==1 {
+            ensure!(name_bytes==0&&count==1&&subject_bytes>=0&&poster_bytes>=0,"invalid native sparse header extent");
+            Some(SparseHeader {key,subject_bytes,poster_bytes,timestamp})
+        }else{ensure!(key==[0;32]&&subject_bytes==0&&poster_bytes==0&&timestamp==0,"unexpected native sparse header");None};
+        Ok(Self {file,expected:(tag==1).then_some(expected),name_bytes,count,sparse})
+    }
+    fn write(&self,out:&mut impl Write)->Result<()> {
+        for value in [self.file,i64::from(self.expected.is_some()),self.expected.unwrap_or(0),self.name_bytes,self.count,i64::from(self.sparse.is_some())]{put(out,value)?;}
+        out.write_all(&self.sparse.map_or([0;32],|header|header.key))?;
+        let (subject,poster,timestamp)=self.sparse.map_or((0,0,0),|header|(header.subject_bytes,header.poster_bytes,header.timestamp));
+        for value in [subject,poster,timestamp]{put(out,value)?;}Ok(())
+    }
+}
+#[derive(Clone,Copy)]
+enum SparseField {Subject,Poster}
+struct SparseText<'view,'client> {view:&'view ReadView<'client>,release:i64,key:[u8;32],field:SparseField,at:i64,end:i64,buffer:Vec<u8>,used:usize}
+impl<'view,'client> SparseText<'view,'client> {
+    fn new(view:&'view ReadView<'client>,release:i64,header:SparseHeader,field:SparseField)->Self {
+        let end=match field {SparseField::Subject=>header.subject_bytes,SparseField::Poster=>header.poster_bytes};
+        Self {view,release,key:header.key,field,at:0,end,buffer:Vec::new(),used:0}
+    }
+}
+impl Read for SparseText<'_,'_> {
+    fn read(&mut self,out:&mut[u8])->io::Result<usize> {
+        if out.is_empty(){return Ok(0);}
+        if self.used==self.buffer.len()&&self.at<self.end {
+            let fill=||->Result<Vec<u8>> {
+                self.view.before_query()?;
+                let query=match self.field {
+                    SparseField::Subject=>"select substring(subject from $3::integer for $4::integer) from segment_nzb_metadata where release_id=$1 and message_key=$2",
+                    SparseField::Poster=>"select substring(poster from $3::integer for $4::integer) from segment_nzb_metadata where release_id=$1 and message_key=$2",
+                };
+                let count=i32::try_from((self.end-self.at).min(8192))?;let start=i32::try_from(self.at+1)?;
+                let row=self.view.tx.borrow_mut().query_opt(query,&[&self.release,&&self.key[..],&start,&count])?.context("native sparse header disappeared")?;
+                let bytes:Vec<u8>=row.try_get(0)?;ensure!(bytes.len()==count as usize,"native sparse header range changed");Ok(bytes)
+            };
+            self.buffer=fill().map_err(io::Error::other)?;self.at+=self.buffer.len() as i64;self.used=0;
+        }
+        let count=out.len().min(self.buffer.len()-self.used);out[..count].copy_from_slice(&self.buffer[self.used..self.used+count]);self.used+=count;Ok(count)
+    }
+}
 impl ReadView<'_> {
     pub(crate) fn nzb_own(&self,id:i64,pick:Pick<'_>,pool:&Arc<Pool>)->Result<Option<Download>> {
         let Some((group,posted,complete))=self.download_head(id)? else{return Ok(None)};
         let mut files=pool.open()?;self.before_query()?;
         let mut tx=self.tx.borrow_mut();
-        let mut rows=tx.query_raw("select f.id,f.expected,octet_length(f.filename)::bigint,count(s.message_key)
+        let mut rows=tx.query_raw("with inventory as(
+            select f.id,f.expected,f.filename,count(s.message_key) articles,null::bytea singleton_key,null::bigint singleton_part,null::bytea singleton_mid,
+                null::bigint subject_bytes,null::bigint poster_bytes,null::bigint original_timestamp,false sparse_present
             from files f join segments s on s.file_id=f.id and s.release_id=f.release_id
-            where f.release_id=$1 and ($2::text is null or f.filename=$2)
-            group by f.id order by f.filename collate \"C\",f.id",[&id as &(dyn postgres::types::ToSql+Sync),&match pick{Pick::Name(name)=>Some(name),_=>None}])?;
+            where f.release_id=$1 and f.filename<>'' group by f.id
+            union all
+            select f.id,m.expected,f.filename,1::bigint,s.message_key,s.part,s.message_id,
+                octet_length(m.subject)::bigint,octet_length(m.poster)::bigint,m.nzb_timestamp,m.message_key is not null
+            from files f join segments s on s.file_id=f.id and s.release_id=f.release_id
+            left join segment_nzb_metadata m on m.release_id=s.release_id and m.message_key=s.message_key
+            where f.release_id=$1 and f.filename='')
+            select id,expected,octet_length(filename)::bigint,articles,substring(singleton_key from 1 for 33),octet_length(singleton_key)::bigint,
+                subject_bytes,poster_bytes,original_timestamp,sparse_present from inventory
+            where($2::text is null or(filename<>'' and filename=$2))
+            order by filename collate \"C\",id,singleton_part nulls first,singleton_mid",[&id as &(dyn postgres::types::ToSql+Sync),&match pick{Pick::Name(name)=>Some(name),_=>None}])?;
         let mut ordinal=0u64;let mut selected=0u64;
         while let Some(row)=rows.next()? {
             self.check_deadline()?;ordinal=ordinal.checked_add(1).context("native file ordinal overflow")?;
             if matches!(pick,Pick::Ordinal(wanted) if ordinal!=wanted){continue;}
             let file:i64=row.try_get(0)?;let expected:Option<i64>=row.try_get(1)?;let length:i64=row.try_get(2)?;let count:i64=row.try_get(3)?;
             ensure!(file>0&&length>=0&&count>0,"invalid native file descriptor");
-            for value in [file,i64::from(expected.is_some()),expected.unwrap_or(0),length,count]{put(&mut files,value)?;}
+            let key:Option<Vec<u8>>=row.try_get(4)?;let key_length:Option<i64>=row.try_get(5)?;
+            let sparse=if let Some(key)=key {
+                ensure!(key.len()==32&&key_length==Some(32)&&row.try_get::<_,bool>(9)?,"native original nameless metadata unavailable");
+                let subject_bytes=row.try_get::<_,Option<i64>>(6)?.context("native original subject extent missing")?;
+                let poster_bytes=row.try_get::<_,Option<i64>>(7)?.context("native original poster extent missing")?;
+                let timestamp=row.try_get::<_,Option<i64>>(8)?.context("native original timestamp missing")?;
+                ensure!(subject_bytes>=0&&poster_bytes>=0,"negative original nameless header extent");
+                Some(SparseHeader {key:key.try_into().map_err(|_|anyhow::anyhow!("native sparse key extent changed"))?,subject_bytes,poster_bytes,timestamp})
+            }else{ensure!(key_length.is_none()&&!row.try_get::<_,bool>(9)?,"native named identity changed");None};
+            FileDescriptor {file,expected,name_bytes:length,count,sparse}.write(&mut files)?;
             selected=selected.checked_add(1).context("native selected file count overflow")?;
         }
         drop(rows);drop(tx);
         if selected==0 && !matches!(pick,Pick::Whole){return Ok(None);}
         let mut files=files.finish()?;let mut plan=pool.open()?;
         for _ in 0..selected {
-            let file=number(&mut files)?;let tag=number(&mut files)?;let total=number(&mut files)?;let length=number(&mut files)?;let count=number(&mut files)?;
-            for value in [file,tag,total,length,count]{put(&mut plan,value)?;}
+            let descriptor=FileDescriptor::read(&mut files)?;let file=descriptor.file;let count=descriptor.count;
+            let singleton=descriptor.sparse.as_ref().map(|header|&header.key[..]);descriptor.write(&mut plan)?;
             self.before_query()?;let mut tx=self.tx.borrow_mut();
+            let params:[&(dyn postgres::types::ToSql+Sync);3]=[&id,&file,&singleton];
             let mut rows=tx.query_raw("select substring(message_key from 1 for 33),octet_length(message_key)::bigint,
                 part,bytes,octet_length(message_id)::bigint from segments where release_id=$1 and file_id=$2
-                order by part nulls first,message_id",&[&id,&file])?;
+                and($3::bytea is null or message_key=$3) order by part nulls first,message_id",params)?;
             let mut seen=0i64;
             while let Some(row)=rows.next()? {
                 self.check_deadline()?;let key:Vec<u8>=row.try_get(0)?;
@@ -89,8 +160,8 @@ impl ReadView<'_> {
         drop(files);let mut plan=plan.finish()?;
         let mut xml=XmlWriter::new(pool.open()?,group.as_bytes())?;let mut gaps=0u64;
         for _ in 0..selected {
-            let file=number(&mut plan)?;let tag=number(&mut plan)?;let total=number(&mut plan)?;let _length=number(&mut plan)?;let count=number(&mut plan)?;
-            let mut check=GapCheck::new((tag==1).then_some(total));for _ in 0..count{let (_,part,_,_)=segment(&mut plan)?;check.push(part)?;}
+            let descriptor=FileDescriptor::read(&mut plan)?;let file=descriptor.file;let count=descriptor.count;
+            let mut check=GapCheck::new(descriptor.expected);for _ in 0..count{let (_,part,_,_)=segment(&mut plan)?;check.push(part)?;}
             if let Some(gap)=check.finish(){
                 gaps=gaps.checked_add(1).context("native gap count overflow")?;
                 let more=if(gap.total.unwrap_or(0)-gap.have) as usize>gap.missing.len(){",..."}else{""};
@@ -106,8 +177,12 @@ impl ReadView<'_> {
         ensure!(!matches!(pick,Pick::Whole)||complete,"native incomplete whole-post derivation is not yet connected");
         xml.end_head()?;plan.rewind()?;
         for _ in 0..selected {
-            let file=number(&mut plan)?;let _tag=number(&mut plan)?;let _total=number(&mut plan)?;let _length=number(&mut plan)?;let count=number(&mut plan)?;
-            xml.file(Text::new(self,TextField::ReleasePoster(id)),crate::dates::article_timestamp(&posted),Text::new(self,TextField::FileSubject(file)))?;
+            let descriptor=FileDescriptor::read(&mut plan)?;let count=descriptor.count;
+            if let Some(header)=descriptor.sparse {
+                xml.file(SparseText::new(self,id,header,SparseField::Poster),header.timestamp,SparseText::new(self,id,header,SparseField::Subject))?;
+            }else{
+                xml.file(Text::new(self,TextField::ReleasePoster(id)),crate::dates::article_timestamp(&posted),Text::new(self,TextField::FileSubject(descriptor.file)))?;
+            }
             xml.group(group.as_bytes())?;xml.segments()?;
             for _ in 0..count{let(key,part,bytes,length)=segment(&mut plan)?;xml.segment(bytes,part,Message::new(self,id,key,length)?)?;}
             xml.end_file()?;
