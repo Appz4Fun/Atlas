@@ -5,20 +5,18 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, LazyLock};
 
 use sha1::{Digest, Sha1};
 
-use crate::api::{ApiResponse, escape, find_releases, get_nzb, parse_query};
+use crate::api::{ApiResponse, escape, parse_query};
 use crate::archive::Password;
 use crate::category::{TABLE, UNCATEGORIZED, label, parse_filter};
 use crate::field_search::{self, Fields};
 use crate::gemini;
 use crate::media::query::MediaAttrs;
 use crate::media::title::Kind;
-use crate::search::{ReleaseRow, get_release};
+use crate::search::ReleaseRow;
 use crate::ui::{fmt_date, fmt_size};
 use crate::{release_info, release_tags, word_index};
 
@@ -66,17 +64,35 @@ const HTMX_CONFIG: &str =
 
 /// A GET the ui answers. None: not ours, the api decides.
 pub fn get(path: &str, query: &str, cookies: Option<&str>, base: &str, api_key: &str) -> Option<ApiResponse> {
-    let storage=match crate::config::checked_storage_config() {
-        Ok(storage)=>storage,Err(_)=>return Some(html(503,diag("caution","catalog unavailable","Storage configuration could not be read."))),
+    let storage = match crate::config::checked_storage_config() {
+        Ok(storage) => storage,
+        Err(_) => {
+            return Some(html(503, diag("caution", "catalog unavailable", "Storage configuration could not be read.")));
+        }
     };
-    get_with_storage(path,query,cookies,base,api_key,&storage)
+    get_with_storage(path, query, cookies, base, api_key, &storage)
 }
 
-pub(crate) fn get_with_storage(path:&str,query:&str,cookies:Option<&str>,base:&str,api_key:&str,storage:&crate::pg::StorageConfig)->Option<ApiResponse> {
-    get_with_storage_and_assets(path,query,cookies,base,api_key,storage,None)
+pub(crate) fn get_with_storage(
+    path: &str,
+    query: &str,
+    cookies: Option<&str>,
+    base: &str,
+    api_key: &str,
+    storage: &crate::pg::StorageConfig,
+) -> Option<ApiResponse> {
+    get_with_storage_and_assets(path, query, cookies, base, api_key, storage, None)
 }
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn get_with_storage_and_assets(path:&str,query:&str,cookies:Option<&str>,base:&str,api_key:&str,storage:&crate::pg::StorageConfig,assets:Option<&crate::pg::fresh_assets::AssetManifest>)->Option<ApiResponse> {
+pub(crate) fn get_with_storage_and_assets(
+    path: &str,
+    query: &str,
+    cookies: Option<&str>,
+    base: &str,
+    api_key: &str,
+    storage: &crate::pg::StorageConfig,
+    assets: Option<&crate::pg::fresh_assets::AssetManifest>,
+) -> Option<ApiResponse> {
     let signed_in = signed_in(cookies, api_key);
     let mut args = parse_query(query);
     let remember = incomplete_choice(&mut args, cookies);
@@ -84,40 +100,16 @@ pub(crate) fn get_with_storage_and_assets(path:&str,query:&str,cookies:Option<&s
         resp.headers.extend(remember.clone());
         resp
     };
-    if signed_in && (matches!(path,"/"|"") || path.starts_with("/ui/")) {
-        if storage.is_postgres() {return fresh::get_with_assets(path,&args,base,api_key,storage,assets).map(remembered);}
+    if signed_in && (matches!(path, "/" | "") || path.starts_with("/ui/")) {
+        return fresh::get_with_assets(path, &args, base, api_key, storage, assets).map(remembered);
     }
     Some(match path {
         "/static/htmx.min.js" => asset("text/javascript; charset=utf-8", HTMX),
         "/static/atlas.css" => asset("text/css; charset=utf-8", CSS),
         "/static/atlas.js" => asset("text/javascript; charset=utf-8", JS),
         "/static/atlas.svg" => asset("image/svg+xml", MARK),
-        "/" | "" if signed_in => remembered(html(200, search_page(&args, base))),
         "/" | "" => html(200, login_page(base, false)),
-        "/ui/results" if signed_in => remembered(results(&args)),
-        "/ui/total" if signed_in => html(200, exact_total(&args)),
         "/ui/results" => ApiResponse { headers: vec![("HX-Redirect".into(), "/".into())], ..html(401, String::new()) },
-        "/ui/release" if signed_in => release_page(&args, api_key),
-        "/ui/duplicates" if signed_in => duplicates_page(&args),
-        "/ui/stats" if signed_in => crate::web_stats::page(),
-        "/ui/stats/live" if signed_in => crate::web_stats::live(),
-        "/ui/stats/stored" if signed_in => crate::web_stats::stored_fragment(),
-        "/ui/details" if signed_in => details_panel(&args),
-        "/ui/pending" if signed_in => crate::web_pending::fragment(&args),
-        "/ui/poster" if signed_in => poster(&args),
-        "/ui/cover" if signed_in => cover(&args),
-        "/ui/still" if signed_in => still(&args),
-        "/ui/image" if signed_in => image(&args),
-        "/ui/samepicture" if signed_in => same_picture_panel(&args),
-        "/ui/picture" if signed_in => picture_state_fragment(&args, api_key),
-        "/ui/samefilm" if signed_in => same_film_panel(&args),
-        "/ui/same" if signed_in => same_key_page(&args),
-        "/ui/meta" if signed_in => crate::web_meta::fragment(&args),
-        "/ui/row" if signed_in => crate::web_meta::row_panel(&args),
-        "/ui/settings" if signed_in => html(200, crate::web_settings::settings_page(None, api_key)),
-        "/ui/settings/groups/search" if signed_in => html(200, crate::web_settings::group_search(&args, api_key)),
-        "/ui/nzb" if signed_in && args.get("fill").is_some_and(|v| v == "1") => filled_nzb(&args),
-        "/ui/nzb" if signed_in => get_nzb(&args),
         "/ui/total" | "/ui/details" | "/ui/pending" | "/ui/poster" | "/ui/cover" | "/ui/still" | "/ui/samefilm"
         | "/ui/image" | "/ui/samepicture" | "/ui/picture" | "/ui/meta" | "/ui/row" | "/ui/stats/live"
         | "/ui/stats/stored" => {
@@ -145,17 +137,32 @@ pub fn post(
     base: &str,
     api_key: &str,
 ) -> Option<ApiResponse> {
-    let storage=match crate::config::checked_storage_config() {
-        Ok(storage)=>storage,Err(_)=>return Some(html(503,diag("caution","catalog unavailable","Storage configuration could not be read."))),
+    let storage = match crate::config::checked_storage_config() {
+        Ok(storage) => storage,
+        Err(_) => {
+            return Some(html(503, diag("caution", "catalog unavailable", "Storage configuration could not be read.")));
+        }
     };
-    post_with_storage(path,body,cookies,htmx,csrf,base,api_key,&storage)
+    post_with_storage(path, body, cookies, htmx, csrf, base, api_key, &storage)
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn post_with_storage(path:&str,body:&str,cookies:Option<&str>,htmx:bool,csrf:Option<&str>,base:&str,api_key:&str,storage:&crate::pg::StorageConfig)->Option<ApiResponse> {
+pub(crate) fn post_with_storage(
+    path: &str,
+    body: &str,
+    cookies: Option<&str>,
+    htmx: bool,
+    csrf: Option<&str>,
+    base: &str,
+    api_key: &str,
+    storage: &crate::pg::StorageConfig,
+) -> Option<ApiResponse> {
     let signed_in = signed_in(cookies, api_key);
-    if signed_in && path.starts_with("/ui/") && storage.is_postgres() {
-        return Some(html(503,diag("caution","native operation unavailable","Native mutation admission is awaiting qualification.")));
+    if signed_in && path.starts_with("/ui/") {
+        return Some(html(
+            503,
+            diag("caution", "native operation unavailable", "Native mutation admission is awaiting qualification."),
+        ));
     }
     match path {
         "/login" => {
@@ -169,9 +176,6 @@ pub(crate) fn post_with_storage(path:&str,body:&str,cookies:Option<&str>,htmx:bo
             })
         }
         "/logout" => Some(redirect(vec![cookie_header("", 0)])),
-        "/ui/ask" if signed_in => Some(ask(body, htmx, cookie_value(cookies, INCOMPLETE_COOKIE) == Some(HIDE))),
-        "/ui/thaw" if signed_in => Some(thaw_release(body)),
-        "/ui/picture" if signed_in => Some(ask_picture(body, csrf, api_key)),
         "/ui/picture" => {
             Some(ApiResponse { headers: vec![("HX-Redirect".into(), "/".into())], ..html(401, String::new()) })
         }
@@ -179,7 +183,6 @@ pub(crate) fn post_with_storage(path:&str,body:&str,cookies:Option<&str>,htmx:bo
             Some(ApiResponse { headers: vec![("HX-Redirect".into(), "/".into())], ..html(401, String::new()) })
         }
         "/ui/ask" | "/ui/thaw" => Some(redirect(Vec::new())),
-        p if crate::web_settings::takes_post(p) && signed_in => crate::web_settings::post(p, body, csrf, api_key),
         p if crate::web_settings::takes_post(p) => Some(redirect(Vec::new())),
         _ => None,
     }
@@ -231,7 +234,16 @@ fn cookie_header(value: &str, max_age: i64) -> (String, String) {
 
 fn redirect(mut headers: Vec<(String, String)>) -> ApiResponse {
     headers.push(("Location".into(), "/".into()));
-    ApiResponse { status: 303, content_type: None, body: String::new(), headers, bytes: None, spool: None, disposition: None, failed: false }
+    ApiResponse {
+        status: 303,
+        content_type: None,
+        body: String::new(),
+        headers,
+        bytes: None,
+        spool: None,
+        disposition: None,
+        failed: false,
+    }
 }
 
 fn asset(content_type: &'static str, body: &str) -> ApiResponse {
@@ -342,14 +354,10 @@ struct Search {
 const SORT_WINDOW: i64 = 2_000;
 /// How far a window grows to fill a page with a rating chip on: in a category where few titles have a score kept, most
 /// rows are left out, and each is looked up first.
-const GROW_WITH_RATING: i64 = 8_000;
 /// How far a window grows to fill a page when it also filters on tags, which are read from each name.
-const GROW_WITH_TAGS: i64 = 64_000;
 /// The deepest a ranked window reads: 2,000 pages of Load more. Each shard reads up to this many before they're merged,
 /// soo a url asking for more can't make the server hold eight times a whole database at once.
-const MAX_WINDOW: i64 = 100_000;
 /// Rows kept across every window: past it, the grown windows of searches not used lately go back to their first pages.
-const ROWS_KEPT: usize = 500_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum SortBy {
@@ -432,7 +440,6 @@ fn row_order(
 }
 
 /// How far back "Hide copies" looks for what a page's copies are copies of.
-const MAX_EARLIER_FOR_COPIES: i64 = 2_000;
 
 /// The quick filters over results. Each but the last two keeps the results whose name's tags say so, among the first
 /// `SORT_WINDOW`: searching the index for each way a tag is written was three or four full searches a click.
@@ -446,13 +453,7 @@ fn is_tag_filter(filter: &str) -> bool {
     filter != HIDE_COPIES && filter != HIDE_SPOTS
 }
 
-/// The ids among these that the results tag SPOT (`spots_of`, which leaves out removed spots).
-fn spot_ids(ids: &[i64]) -> HashSet<i64> {
-    crate::spotnet::store::spots_of(ids).map(|spots| spots.into_keys().collect()).unwrap_or_default()
-}
-
 /// How many names have their tags read at once, before checking whether the page is full.
-const TAG_SLICE: usize = 128;
 
 /// Whether a name's tags say what a filter asks. Tags, not words, soo "DV" leaves DVDRip out.
 pub(crate) fn filter_matches(filter: &str, tags: &release_tags::Tags) -> bool {
@@ -581,126 +582,9 @@ impl Search {
         self.filters.contains(&HIDE_SPOTS)
     }
 
-    /// Whether the page is cut from the first `SORT_WINDOW` results, sorted or filtered, instead of read by offset.
-    fn windowed(&self) -> bool {
-        self.sort.is_some() || (self.filters_by_tags() && self.indexed().is_none())
-    }
-
-    /// Whether a name's tags say what every filter asks.
-    fn has_tags(&self, row: &ReleaseRow) -> bool {
-        // the word index found only what has them
-        if !self.filters_by_tags() || self.indexed().is_some() {
-            return true;
-        }
-        let tags = release_tags::parse(&row.name);
-        self.filters.iter().all(|filter| filter_matches(filter, &tags))
-    }
-
-    /// The rows `has_tags` keeps, in order, until there are `enough`. Reading a name's tags takes about a millisecond,
-    /// soo they are read a slice at a time, on every core.
-    fn keep_tagged(&self, rows: Vec<ReleaseRow>, enough: usize) -> Vec<ReleaseRow> {
-        if !self.filters_by_tags() || self.indexed().is_some() {
-            return rows;
-        }
-        let cores = std::thread::available_parallelism().map_or(4, |n| n.get()).min(16);
-        let mut kept = Vec::new();
-        for slice in rows.chunks(TAG_SLICE) {
-            let per = slice.len().div_ceil(cores).max(1);
-            let keep: Vec<bool> = std::thread::scope(|scope| {
-                let parts: Vec<_> = slice
-                    .chunks(per)
-                    .map(|part| scope.spawn(move || part.iter().map(|r| self.has_tags(r)).collect::<Vec<_>>()))
-                    .collect();
-                parts.into_iter().flat_map(|part| part.join().unwrap_or_default()).collect()
-            });
-            kept.extend(slice.iter().zip(keep).filter(|(_, keep)| *keep).map(|(r, _)| r.clone()));
-            if kept.len() >= enough {
-                break;
-            }
-        }
-        kept
-    }
-
-    /// The column a sort reads in from the database over the whole category, best first: with no words and no fields
-    /// asked, for every column but the rating, which comes from the providers and isn't in the database.
-    fn ranked_by(&self) -> Option<crate::sorted::Column> {
-        use crate::sorted::Column;
-        // tags filtered by the word index: it sorts what it filters
-        if !self.q.is_empty() || self.fields.any() || self.indexed().is_some() {
-            return None;
-        }
-        let column = match self.sort? {
-            SortBy::Size => Column::Size,
-            SortBy::Posted => Column::Posted,
-            SortBy::Name => Column::Name,
-            SortBy::Group => Column::Group,
-            SortBy::Category => Column::Category,
-            SortBy::Rating => return None,
-        };
-        // without its index a whole category is read and sorted on every click: the newest are sorted instead
-        crate::sorted::ready(column).then_some(column)
-    }
-
-    /// The word index and the order it reads words in, once it's built: every match ranked, sorted and filtered by tag,
-    /// not the newest few thousand. None: neither words nor tag filters, fields (which the database looks up), or no
-    /// index yet.
-    fn indexed(&self) -> Option<(std::sync::Arc<word_index::WordIndex>, word_index::By)> {
-        use word_index::By;
-        let words = word_index::searchable(&self.q);
-        // with no words, only tags need it: a category's newest, or its sorts, come from the database
-        if !(words || (self.q.is_empty() && self.filters_by_tags())) || self.fields.any() {
-            return None;
-        }
-        let by = match self.sort {
-            None | Some(SortBy::Rating) if !words => By::Newest,
-            None | Some(SortBy::Rating) => By::Relevance,
-            Some(SortBy::Size) => By::Size,
-            Some(SortBy::Posted) => By::Posted,
-            Some(SortBy::Name) => By::Name,
-            Some(SortBy::Group) => By::Group,
-            Some(SortBy::Category) => By::Category,
-        };
-        Some((word_index::ready()?, by))
-    }
-
-    /// Whether the rows come in the page's order over all of them, soo a page past the window reads further: a sort
-    /// with no words from the database, and words from their index, but for the rating, which isn't in either.
-    fn in_order(&self) -> bool {
-        self.ranked_by().is_some() || (self.indexed().is_some() && self.sort != Some(SortBy::Rating))
-    }
-
     /// The tag filters on, as the word index has them.
     fn tag_filters(&self) -> Vec<&'static str> {
         self.filters.iter().copied().filter(|f| is_tag_filter(f)).collect()
-    }
-
-    /// The search itself: one, whatever the filters.
-    fn search(
-        &self,
-        filter: Option<&crate::category::CatFilter>,
-        from: i64,
-        count: i64,
-    ) -> Result<Vec<ReleaseRow>, String> {
-        if let Some(by) = self.ranked_by() {
-            let mut rows = crate::sorted::top(filter, by, self.descending, from + count).map_err(|e| e.to_string())?;
-            rows.drain(..usize::try_from(from).unwrap_or(0).min(rows.len()));
-            return Ok(rows);
-        }
-        if let Some((index, by)) = self.indexed() {
-            let (from, count) = (usize::try_from(from).unwrap_or(0), usize::try_from(count).unwrap_or(0));
-            let tags = self.tag_filters();
-            return crate::db::with_reader(|conn| {
-                Ok(index.search(conn, &self.q, filter, &tags, by, self.descending, from, count))
-            })
-            .map_err(|e| e.to_string())?
-            .map(|hits| hits.rows)
-            .map_err(|e| e.to_string());
-        }
-        if self.fields.any() {
-            field_search::find(&self.fields, &self.q, filter, from, count).map_err(|e| e.to_string())
-        } else {
-            find_releases(&self.q, filter, from, count).map_err(|e| e.to_string())
-        }
     }
 
     fn filter_links(&self) -> String {
@@ -771,192 +655,11 @@ impl Search {
             .collect()
     }
 
-    /// The table rows, or a full-width diagnostic when the first page has none.
-    fn body(&self) -> String {
-        if self.sorts_from_a_window() {
-            return self.body_from_window();
-        }
-        let filter = parse_filter(&self.cat);
-        let windowed = self.windowed();
-        let count =
-            if self.in_order() { SORT_WINDOW.max(self.offset + PAGE_SIZE + 1).min(MAX_WINDOW) } else { SORT_WINDOW };
-        let (from, mut count) = if windowed { (0, count) } else { (self.offset, PAGE_SIZE) };
-        let tagged = |r: &ReleaseRow| self.has_tags(r);
-        // a sort needs every match in the window, a page only up to one past its end
-        let enough = if self.sort.is_some() { usize::MAX } else { (self.offset + PAGE_SIZE) as usize + 1 };
-        let (mut found, read) = loop {
-            let found = match self.search(filter.as_ref(), from, count) {
-                Ok(found) => found,
-                Err(e) => return self.search_failed(&e),
-            };
-            let read = found.len() as i64;
-            let found = self.keep_tagged(found, enough);
-            // a whole category ranked, with tags leaving too few for the page: read further, as far as a window would
-            let short = (found.len() as i64) <= self.offset + PAGE_SIZE;
-            if windowed
-                && self.ranked_by().is_some()
-                && self.filters_by_tags()
-                && short
-                && read >= count
-                && count < GROW_WITH_TAGS
-            {
-                count = count.saturating_mul(2).min(GROW_WITH_TAGS);
-                continue;
-            }
-            break (found, read);
-        };
-        if found.is_empty() {
-            return if self.offset == 0 {
-                self.nothing_found()
-            } else {
-                format!("<tr><td colspan=\"{COLUMNS}\" class=\"note dim\">That's all of them.</td></tr>")
-            };
-        }
-        let hide_copies = self.filters.contains(&HIDE_COPIES);
-        let mut before = Vec::new();
-        let page_was_full = if windowed {
-            if let Some(sort) = self.sort {
-                let ids: Vec<i64> = found.iter().map(|r| r.id).collect();
-                let categories = crate::category::categories_of(&ids).unwrap_or_default();
-                // only the scores already kept: fetching them for a whole search would use up the providers' limits
-                let scores: HashMap<i64, i64> = if sort == SortBy::Rating { kept_scores(&ids) } else { HashMap::new() };
-                // by the size it shows: all of a post spread over several groups
-                if sort == SortBy::Size
-                    && let Ok(conn) = crate::db::open()
-                {
-                    for r in found.iter_mut() {
-                        if let Ok(Some(post)) = release_info::whole_post_with(&conn, r) {
-                            r.size = Some(post.size);
-                        }
-                    }
-                }
-                sort_rows(&mut found, sort, self.descending, &categories, &scores);
-            }
-            // the whole window is here: filtered before it's cut into pages, soo no page comes out empty
-            // (only rows with a title of their own: one without may be a post's file, judged once folded, below)
-            if self.min_score.is_some() {
-                let titled = titled_scores(&found.iter().map(|r| r.id).collect::<Vec<_>>());
-                found.retain(|r| !titled.get(&r.id).is_some_and(|score| self.scored_out(*score)));
-            }
-            let start = usize::try_from(self.offset).unwrap_or(0).min(found.len());
-            let end = (start + PAGE_SIZE as usize).min(found.len());
-            let more = end < found.len();
-            if hide_copies {
-                let earlier = start.saturating_sub(MAX_EARLIER_FOR_COPIES as usize);
-                before = found[earlier..start].to_vec();
-            }
-            found = found.drain(start..end).collect();
-            more
-        } else {
-            read == PAGE_SIZE
-        };
-        // a post spread over several groups is one row, unless the search is about one of the groups. Before copies are
-        // hidden: its rows can look like copies of each other
-        let mut split = HashMap::new();
-        let conn = crate::db::open().ok();
-        let post_of =
-            |r: &ReleaseRow| conn.as_ref().and_then(|conn| release_info::whole_post_with(conn, r).ok().flatten());
-        let folded = |r: &ReleaseRow, post: &release_info::SplitPost| self.folds(r, post);
-        // a row folded into one that isn't on this page brings that one here in its place: a page of nothing but an
-        // upload's recovery rows would show none of it
-        let on_page: HashSet<i64> = found.iter().map(|r| r.id).collect();
-        let mut brought = HashSet::new();
-        found = std::mem::take(&mut found)
-            .into_iter()
-            .filter_map(|mut r| match self.fold_split_post(conn.as_ref(), &mut r, &mut split) {
-                None => Some(r),
-                Some(listed) if !on_page.contains(&listed) && brought.insert(listed) => {
-                    self.bring(conn.as_ref(), listed, &mut split)
-                }
-                Some(_) => None,
-            })
-            .filter(|r| !self.hides(r))
-            .collect();
-        let mut spots_left_out = false;
-        if self.hides_spots() {
-            let spots = spot_ids(&found.iter().map(|r| r.id).collect::<Vec<_>>());
-            let before = found.len();
-            found.retain(|r| !spots.contains(&r.id));
-            spots_left_out = found.len() < before;
-        }
-        if self.min_score.is_some() {
-            let scores = post_scores(&found, &split);
-            found.retain(|r| !self.rated_out(r.id, &scores));
-        }
-        if found.is_empty() && (self.hide_incomplete || self.min_score.is_some() || self.hides_spots()) {
-            // every row of this page was left out: there may be others further on
-            let what = match (self.hide_incomplete, self.min_score.is_some(), spots_left_out) {
-                (true, true, false) => "complete and rated that high",
-                (true, false, false) => "complete",
-                (false, true, false) => "rated that high",
-                (false, false, true) => "but spots",
-                _ => "left to show",
-            };
-            let note = format!(
-                "<tr><td colspan=\"{COLUMNS}\" class=\"note dim\">Nothing {what} in these {PAGE_SIZE}.</td></tr>"
-            );
-            return if page_was_full { note + &self.load_more() } else { note };
-        }
-        if hide_copies {
-            // a copy of something on an earlier page is a copy too
-            if !windowed && self.offset > 0 {
-                let earlier = self.offset.min(MAX_EARLIER_FOR_COPIES);
-                let start = self.offset - earlier;
-                before = self.search(filter.as_ref(), start, earlier).unwrap_or_default();
-            }
-            before.retain(|r| !post_of(r).is_some_and(|post| folded(r, &post)));
-            // an earlier row left out for being incomplete hides nothing: it isn't there to stand for its copies
-            if self.hide_incomplete {
-                before.retain_mut(|r| {
-                    self.fold_split_post(conn.as_ref(), r, &mut HashMap::new());
-                    !self.hides(r)
-                });
-            }
-            // nor does a spot left out
-            if self.hides_spots() {
-                let spots = spot_ids(&before.iter().map(|r| r.id).collect::<Vec<_>>());
-                before.retain(|r| !spots.contains(&r.id));
-            }
-            // nor does one the rating chips leave out
-            if self.min_score.is_some() {
-                let posts: HashMap<i64, release_info::SplitPost> =
-                    before.iter().filter_map(|r| Some((r.id, post_of(r)?))).collect();
-                let scores = post_scores(&before, &posts);
-                before.retain(|r| !self.rated_out(r.id, &scores));
-            }
-            let ids: Vec<i64> = before.iter().filter(|r| tagged(r)).chain(found.iter()).map(|r| r.id).collect();
-            let hidden = crate::duplicates::later_copies(&ids).unwrap_or_default();
-            found.retain(|r| !hidden.contains(&r.id));
-        }
-        let mut out = rows_html(&found, split).concat();
-        if page_was_full {
-            out.push_str(&self.load_more());
-        }
-        out
-    }
-
-    fn search_failed(&self, error: &str) -> String {
-        eprintln!("web search failed: {error}");
-        let message = "Atlas couldn't read its database. The error is in its log. Search again in a moment.";
-        if self.offset == 0 {
-            diag("caution", "the search failed", message)
-        } else {
-            format!("<tr><td colspan=\"{COLUMNS}\" class=\"note\">{}</td></tr>", escape(message))
-        }
-    }
-
     fn load_more(&self) -> String {
         let next = attr(&self.query(&self.cat, self.offset + PAGE_SIZE));
         format!(
             "<tr><td colspan=\"{COLUMNS}\" class=\"note\"><a class=\"button\" href=\"/?{next}\" hx-get=\"/ui/results?{next}\" hx-target=\"closest tr\" hx-swap=\"outerHTML\">Load more</a></td></tr>"
         )
-    }
-
-    /// Whether a row of a post is left out for the row that stands for the post: a post spread over several groups,
-    /// unless the search is about one of its groups, or an upload linked by its PAR2 set, which is in one group soo it
-    /// stays one row whatever the search.
-    fn folds(&self, r: &ReleaseRow, post: &release_info::SplitPost) -> bool {
-        (self.fields.group.is_empty() || post.lead.is_some() || post.groups.len() == 1) && post.listed_id() != r.id
     }
 
     /// Whether a row is left out for being incomplete: once `fold_split_post` has made it say what all of its post comes
@@ -973,104 +676,6 @@ impl Search {
     /// `rated_out`, for a row whose score is already known.
     fn scored_out(&self, score: Option<i64>) -> bool {
         self.min_score.is_some_and(|min| score.is_none_or(|s| s < min))
-    }
-
-    /// Makes a row of a post say what all of the post comes to. When another row stands for it, that row's id: the
-    /// row is left out for it.
-    fn fold_split_post(
-        &self,
-        conn: Option<&rusqlite::Connection>,
-        r: &mut ReleaseRow,
-        split: &mut HashMap<i64, release_info::SplitPost>,
-    ) -> Option<i64> {
-        let Some(post) = conn.and_then(|conn| release_info::whole_post_with(conn, r).ok().flatten()) else {
-            // whole by its files, or once repaired from its PAR2 volumes (`rows_html` tags that one)
-            if !r.complete
-                && let Some(conn) = conn
-                && (release_info::single_post_complete(conn, r.id).unwrap_or(false)
-                    || release_info::repair_needed(conn, r.id).unwrap_or(false))
-            {
-                r.complete = true;
-            }
-            return None;
-        };
-        if self.folds(r, &post) {
-            return Some(post.listed_id());
-        }
-        if post.lead.is_none() || !crate::parser::is_obfuscated(&r.name) {
-            r.name = release_info::post_stem(&r.name);
-        }
-        r.size = Some(post.size);
-        r.complete = post.complete;
-        split.insert(r.id, post);
-        None
-    }
-
-    /// The row that stands for a post, read to show in place of one folded into it.
-    fn bring(
-        &self,
-        conn: Option<&rusqlite::Connection>,
-        listed: i64,
-        split: &mut HashMap<i64, release_info::SplitPost>,
-    ) -> Option<ReleaseRow> {
-        let mut r = conn.and_then(|conn| crate::search::get_release_with(conn, listed).ok().flatten())?;
-        // it stands for its post, soo it isn't folded itself
-        self.fold_split_post(conn, &mut r, split);
-        Some(r)
-    }
-
-    /// A sort takes its page from the search's window, with no database in the way once the window has been filled.
-    /// "Hide copies" depends on what's before the page, soo it still works the page out each time.
-    /// Hiding incomplete releases goes by the whole post each row stands for, which only rendering a row works out,
-    /// soo those pages come from a window too, in the search's own order when there's no sort.
-    fn sorts_from_a_window(&self) -> bool {
-        (self.sort.is_some() || self.hide_incomplete || self.hides_spots() || self.min_score.is_some())
-            && !self.filters.contains(&HIDE_COPIES)
-    }
-
-    fn body_from_window(&self) -> String {
-        let by = self.sort;
-        let mut at_least = self.offset + PAGE_SIZE + 1;
-        // a rating chip stopped the window growing with more of the search behind it
-        let rated_stop;
-        let (rows, more) = loop {
-            let window = match window_of(self, at_least) {
-                Ok(window) => window,
-                Err(e) => return self.search_failed(&e),
-            };
-            let (rows, more) = window.page(self, by);
-            // short of a page past the end of what was read: folded rows or filters left too few, soo read further
-            if more || !window.can_grow(self) {
-                rated_stop = (self.min_score.is_some() && window.more_in_db && window.asked >= GROW_WITH_RATING)
-                    .then_some(window.asked);
-                break (rows, more);
-            }
-            at_least = window.asked.saturating_mul(2);
-        };
-        if rows.is_empty() {
-            return if self.offset == 0 {
-                self.nothing_found()
-            } else if let Some(asked) = rated_stop {
-                format!(
-                    "<tr><td colspan=\"{COLUMNS}\" class=\"note dim\">A rating chip looks through the first {} results. \
-                     Narrow the search to see further.</td></tr>",
-                    thousands(asked)
-                )
-            } else if self.offset + PAGE_SIZE >= MAX_WINDOW {
-                format!(
-                    "<tr><td colspan=\"{COLUMNS}\" class=\"note dim\">Paging stops {} results in. Narrow the search to \
-                     see further.</td></tr>",
-                    thousands(MAX_WINDOW)
-                )
-            } else {
-                format!("<tr><td colspan=\"{COLUMNS}\" class=\"note dim\">That's all of them.</td></tr>")
-            };
-        }
-        let mut out = rows.concat();
-        if more {
-            out.push_str(&self.load_more());
-        }
-        out
     }
 
     fn nothing_found(&self) -> String {
@@ -1126,155 +731,6 @@ impl Search {
             escape(&title)
         )
     }
-
-    /// Rust-style path of where this is, as on the RustyGet site.
-    fn summary(&self) -> String {
-        let mut path = String::from("atlas::releases");
-        if let Some(name) = category_name(&self.cat) {
-            for part in name.split(" / ") {
-                let _ = write!(path, "::<b>{}</b>", escape(&part.to_lowercase().replace(' ', "_")));
-            }
-        }
-        let sort = match self.sort {
-            Some(by) if self.in_order() => format!(
-                "By {} {}, over all of them",
-                by.word(),
-                if self.descending { "descending" } else { "ascending" }
-            ),
-            Some(by) => format!(
-                "By {} {}, among the first {SORT_WINDOW}",
-                by.word(),
-                if self.descending { "descending" } else { "ascending" }
-            ),
-            None if self.filters_by_tags() && self.indexed().is_none() => format!(
-                "{} first, filtered among the first {SORT_WINDOW}",
-                if self.q.is_empty() { "Newest" } else { "Best or newest matches" }
-            ),
-            None if self.q.is_empty() => "Newest first".to_string(),
-            None => "Best or newest matches first".to_string(),
-        };
-        let sort = if self.hide_incomplete { format!("{sort}, incomplete hidden") } else { sort };
-        let sort = if self.hides_spots() { format!("{sort}, spots hidden") } else { sort };
-        let sort = match self.min_score {
-            Some(min) => format!("{sort}, rated {}+ only", min / 10),
-            None => sort,
-        };
-        let mut scope = String::new();
-        for (name, value) in self.fields.chosen() {
-            let without = Search {
-                q: self.q.clone(),
-                cat: self.cat.clone(),
-                offset: 0,
-                filters: self.filters.clone(),
-                fields: self.fields.without(name),
-                sort: self.sort,
-                descending: self.descending,
-                hide_incomplete: self.hide_incomplete,
-                deep: self.deep,
-                min_score: self.min_score,
-            };
-            let query = attr(&without.query(&self.cat, 0));
-            let _ = write!(
-                scope,
-                "<a class=\"chip\" aria-current=\"true\" href=\"/?{query}\" hx-get=\"/ui/results?{query}\" hx-target=\"#results\" title=\"Remove\">{}: {} ✕</a>",
-                escape(name),
-                escape(&value)
-            );
-        }
-        // the rating chips share their window with the search without them, but not its count
-        let total = if self.sorts_from_a_window()
-            && self.min_score.is_none()
-            && let Ok(window) = window_of(self, 0)
-        {
-            match lock(&window.counted).get(&None).copied() {
-                Some(n) => exact_html(n),
-                None => window.total.get_or_init(|| self.total(true)).clone(),
-            }
-        } else {
-            self.total(true)
-        };
-        format!(
-            "<div class=\"summary\"><span class=\"path\">{path}</span>{total}<span class=\"sort\">{}</span></div>{}",
-            escape(&sort),
-            if scope.is_empty() { String::new() } else { format!("<div class=\"chips\">{scope}</div>") },
-        )
-    }
-
-    /// How many releases the search has, for every page and search: a category's, a filter's, words', fields'. The
-    /// word index counts words, categories and tags, and the database counts fields. What the page leaves out of what
-    /// was counted makes the count a most: copies and incomplete releases, which only the rows themselves tell, and tags
-    /// when the database counted.
-    /// `lazy`: a count small enough for one window says so, and the page asks `/ui/total` for the rows' own count once
-    /// it's shown (`exact_total`), which leaves out what the count can't: folded rows, incomplete and unrated ones. Only
-    /// for a search paged from its window: one paged a page at a time folds differently.
-    fn total(&self, lazy: bool) -> String {
-        let filter = parse_filter(&self.cat);
-        let mut left_out = Vec::new();
-        let counted = match self.counted_by_index() {
-            Some(index) => index
-                .count(&self.q, filter.as_ref(), &self.tag_filters())
-                .map(|n| field_search::Total { count: n as i64, exact: true })
-                .map_err(|e| e.to_string()),
-            None => {
-                if self.filters_by_tags() {
-                    left_out.push("releases without the chosen tags");
-                }
-                field_search::count_any(&self.fields, std::slice::from_ref(&self.q), filter.as_ref())
-                    .map_err(|e| e.to_string())
-            }
-        };
-        if self.filters.contains(&HIDE_COPIES) {
-            left_out.push("copies");
-        }
-        if self.hide_incomplete {
-            left_out.push("incomplete releases");
-        }
-        if self.hides_spots() {
-            left_out.push("spots");
-        }
-        if self.min_score.is_some() {
-            left_out.push("releases rated lower or not rated");
-        }
-        // only a search paged from its window, whose rows the count then matches; an "at least" count may be all
-        // there is too: the window says
-        let small = self.sorts_from_a_window() && matches!(&counted, Ok(t) if t.count > 0 && t.count <= SORT_WINDOW);
-        let html = match counted {
-            Ok(total) if left_out.is_empty() => {
-                format!("<strong class=\"total\" title=\"{ROWS_FOLDED}\">{}</strong>", escape(&total.describe()))
-            }
-            // at least some, of which some are left out: no number to give
-            Ok(total) if !total.exact => String::new(),
-            Ok(total) => format!(
-                "<strong class=\"total\" title=\"{}\">Up to {}</strong>",
-                attr(&format!("Counted before {} are left out. {ROWS_FOLDED}", list_of(&left_out))),
-                escape(&field_search::Total { count: total.count, exact: true }.describe())
-            ),
-            Err(e) => {
-                eprintln!("web count failed: {e}");
-                String::new()
-            }
-        };
-        if lazy && small && !html.is_empty() {
-            let query = attr(&self.query(&self.cat, 0));
-            html.replacen(
-                "<strong class=\"total\"",
-                &format!(
-                    "<strong class=\"total\" hx-get=\"/ui/total?{query}\" hx-trigger=\"load\" hx-swap=\"outerHTML\""
-                ),
-                1,
-            )
-        } else {
-            html
-        }
-    }
-
-    /// The word index, when it can count this search: no fields, and words it keeps or none.
-    fn counted_by_index(&self) -> Option<std::sync::Arc<word_index::WordIndex>> {
-        if self.fields.any() || !(self.q.is_empty() || word_index::searchable(&self.q)) {
-            return None;
-        }
-        word_index::ready()
-    }
 }
 
 /// What a total counts that the rows don't show one by one.
@@ -1291,692 +747,8 @@ fn list_of(items: &[&str]) -> String {
 }
 
 /// How old a window can get before a click on it starts a new one. The click still gets the old one straight away.
-const WINDOW_FRESH: Duration = Duration::from_secs(60);
-/// How long a count waits for its window's background fill; past it the count it had stands.
-const COUNT_WAITS_FOR_FILL: Duration = Duration::from_secs(2);
-/// How often the windows nobody has clicked lately are made again, soo the first click of the day finds one.
-const WINDOW_IDLE_FRESH: Duration = Duration::from_secs(15 * 60);
-/// What counts as lately.
-const WINDOW_IN_USE: Duration = Duration::from_secs(10 * 60);
-/// Searches with a window: a filled one is a few MB.
-const WINDOWS_KEPT: usize = 32;
-/// How long a click sorting by size waits for a new window's split posts, the most that a size can depend on. Past it
-/// the page goes by the sizes known so far, and the next click has them all.
-const SIZES_WAIT: Duration = Duration::from_secs(1);
-/// Threads rendering a window's rows.
-const FILL_THREADS: usize = 4;
-
-/// Places in a window's rows, in the order a column and direction put them.
-type Order = Arc<Vec<usize>>;
-
-/// One row as a results page shows it.
-struct ShownRow {
-    html: String,
-    /// what it sorts by: all of a post spread over several groups
-    size: Option<i64>,
-    /// another row stands for its post
-    folded: bool,
-    /// the row brought in to show here, for a post whose own row wasn't in the window
-    brings: Option<i64>,
-    /// the best kept score of the row it shows (`score_value`), for the rating chips: None until a page with a chip
-    /// looks it up, soo searches without one never read scores
-    score: Option<Option<i64>>,
-    /// the other rows of the post it shows, whose title it takes when its own row has none (`post_scores`)
-    post: Vec<i64>,
-}
-
-/// The first `SORT_WINDOW` results of one search, whatever the sort, kept in memory: choosing a column only puts these
-/// in another order. Rows are rendered in the background, each the first time something needs it.
-struct Window {
-    built: Instant,
-    rows: Vec<ReleaseRow>,
-    /// by release, for the columns that need them, read once
-    categories: OnceLock<HashMap<i64, i64>>,
-    scores: OnceLock<HashMap<i64, i64>>,
-    /// for the rating chips, by window row: the rows with a title (a media row), and the best score kept for it
-    titled: OnceLock<HashMap<i64, Option<i64>>>,
-    total: OnceLock<String>,
-    shown: Mutex<HashMap<i64, ShownRow>>,
-    /// rows brought in for a post whose own row isn't in the window: once each
-    brought: Mutex<HashSet<i64>>,
-    orders: Mutex<HashMap<(SortBy, bool), Order>>,
-    /// every row rendered, soo every size is final: a size order is kept only from then on
-    sized: AtomicBool,
-    /// bumped, under `shown`, each time rows are kept: a size order read from older sizes isn't kept
-    shown_gen: std::sync::atomic::AtomicU64,
-    filled: AtomicBool,
-    /// `shown_count`'s answers, by rating chip (the only thing searches sharing a window differ in that it counts)
-    counted: Mutex<HashMap<Option<i64>, usize>>,
-    /// how many results it was read with
-    asked: i64,
-    /// the search had that many, soo it may have more: a sort over a whole category reads a bigger window when a page
-    /// goes past this one
-    more_in_db: bool,
-}
-
-impl Window {
-    fn read(search: &Search, asked: i64) -> Result<Window, String> {
-        let filter = parse_filter(&search.cat);
-        let rows = search.search(filter.as_ref(), 0, asked)?;
-        Ok(Window {
-            built: Instant::now(),
-            asked,
-            more_in_db: rows.len() as i64 >= asked,
-            rows: search.keep_tagged(rows, usize::MAX),
-            categories: OnceLock::new(),
-            scores: OnceLock::new(),
-            titled: OnceLock::new(),
-            total: OnceLock::new(),
-            shown: Mutex::new(HashMap::new()),
-            brought: Mutex::new(HashSet::new()),
-            orders: Mutex::new(HashMap::new()),
-            sized: AtomicBool::new(false),
-            shown_gen: std::sync::atomic::AtomicU64::new(0),
-            filled: AtomicBool::new(false),
-            counted: Mutex::new(HashMap::new()),
-        })
-    }
-
-    /// Whether a page that ends past it needs a bigger one: a sort over a whole category grows, and so does the search's
-    /// own order, newest or best first, which has no sort to stop at the first ones.
-    fn can_grow(&self, search: &Search) -> bool {
-        self.more_in_db
-            && self.asked < MAX_WINDOW
-            && (search.in_order() || search.sort.is_none())
-            && (!search.filters_by_tags() || search.indexed().is_some() || self.asked < GROW_WITH_TAGS)
-            && (search.min_score.is_none() || self.asked < GROW_WITH_RATING)
-    }
-
-    /// Takes in what a smaller window of the same search showed, soo growing it moves nothing already paged past. A
-    /// post brought in where one of its files was stays there once its own row is read in too: that row is folded.
-    fn carry_from(&self, old: &Window) {
-        let places: HashSet<i64> = self.rows.iter().map(|r| r.id).collect();
-        let old_shown = lock(&old.shown);
-        let mut shown = lock(&self.shown);
-        let mut brought = lock(&self.brought);
-        for (&place, row) in old_shown.iter() {
-            if !places.contains(&place) {
-                continue;
-            }
-            let carried = ShownRow {
-                html: row.html.clone(),
-                size: row.size,
-                folded: row.folded,
-                brings: row.brings,
-                score: row.score,
-                post: row.post.clone(),
-            };
-            shown.insert(place, carried);
-            if let Some(listed) = row.brings.filter(|_| !row.folded) {
-                brought.insert(listed);
-                if places.contains(&listed) {
-                    shown.insert(
-                        listed,
-                        ShownRow {
-                            html: String::new(),
-                            size: row.size,
-                            folded: true,
-                            brings: None,
-                            score: None,
-                            post: Vec::new(),
-                        },
-                    );
-                }
-            }
-        }
-    }
-
-    fn ids(&self) -> Vec<i64> {
-        self.rows.iter().map(|r| r.id).collect()
-    }
-
-    fn categories(&self) -> &HashMap<i64, i64> {
-        self.categories.get_or_init(|| crate::category::categories_of(&self.ids()).unwrap_or_default())
-    }
-
-    /// Only the scores already kept: fetching them for a whole search would use up the providers' limits.
-    /// `titled`, read once per window.
-    fn titled(&self) -> &HashMap<i64, Option<i64>> {
-        self.titled.get_or_init(|| titled_scores(&self.ids()))
-    }
-
-    fn scores(&self) -> &HashMap<i64, i64> {
-        self.scores.get_or_init(|| kept_scores(&self.ids()))
-    }
-
-    fn order(&self, by: SortBy, descending: bool) -> Order {
-        if let Some(order) = lock(&self.orders).get(&(by, descending)) {
-            return order.clone();
-        }
-        let none = HashMap::new();
-        let categories = if by == SortBy::Category { self.categories() } else { &none };
-        let scores = if by == SortBy::Rating { self.scores() } else { &none };
-        let mut sized = None;
-        // read before the sizes: an order from sizes that aren't final yet is answered with but never kept, soo it
-        // can't outlive the fill
-        let keep = by != SortBy::Size || self.sized.load(Ordering::Acquire);
-        let mut gen_read = None;
-        if by == SortBy::Size {
-            let shown = lock(&self.shown);
-            gen_read = Some(self.shown_gen.load(Ordering::Acquire));
-            let mut rows = self.rows.clone();
-            for r in &mut rows {
-                if let Some(row) = shown.get(&r.id) {
-                    r.size = row.size;
-                }
-            }
-            sized = Some(rows);
-        }
-        let rows = sized.as_ref().unwrap_or(&self.rows);
-        let mut order: Vec<usize> = (0..rows.len()).collect();
-        order.sort_by(|&a, &b| row_order(&rows[a], &rows[b], by, descending, categories, scores));
-        let order = Arc::new(order);
-        if keep {
-            let mut orders = lock(&self.orders);
-            // a render that published since may have changed a size: then this order is answered with, not kept
-            if gen_read.is_none_or(|read| read == self.shown_gen.load(Ordering::Acquire)) {
-                orders.insert((by, descending), order.clone());
-            }
-        }
-        order
-    }
-
-    /// Renders rows that aren't yet.
-    fn render(&self, search: &Search, rows: &[ReleaseRow]) {
-        let conn = crate::db::open().ok();
-        // each kept row under the id of the window row it shows in
-        let mut places = Vec::with_capacity(rows.len());
-        let mut kept = Vec::with_capacity(rows.len());
-        let mut split = HashMap::new();
-        let mut done = Vec::with_capacity(rows.len());
-        let left_out = |r: &ReleaseRow| ShownRow {
-            html: String::new(),
-            size: r.size,
-            folded: true,
-            brings: None,
-            score: None,
-            post: Vec::new(),
-        };
-        for r in rows {
-            let place = r.id;
-            let mut r = r.clone();
-            match search.fold_split_post(conn.as_ref(), &mut r, &mut split) {
-                // incomplete as the row shows it, all of its post together: left out like a folded row
-                None if search.hides(&r) => done.push((place, left_out(&r))),
-                None => {
-                    places.push(place);
-                    kept.push(r);
-                }
-                // a row folded into one that isn't in the window brings that one in its place, once
-                Some(listed)
-                    if !self.rows.iter().any(|w| w.id == listed)
-                        && lock(&self.brought).insert(listed)
-                        && let Some(shown) = search.bring(conn.as_ref(), listed, &mut split) =>
-                {
-                    if search.hides(&shown) {
-                        done.push((place, left_out(&shown)));
-                    } else {
-                        places.push(place);
-                        kept.push(shown);
-                    }
-                }
-                Some(_) => done.push((place, left_out(&r))),
-            }
-        }
-        // a row tagged SPOT, by the row it shows: left out like a folded row
-        if search.hides_spots() {
-            let spots = spot_ids(&kept.iter().map(|r| r.id).collect::<Vec<_>>());
-            let (mut keep_places, mut keep_rows) = (Vec::with_capacity(kept.len()), Vec::with_capacity(kept.len()));
-            for (place, r) in places.into_iter().zip(kept) {
-                if spots.contains(&r.id) {
-                    done.push((place, left_out(&r)));
-                } else {
-                    keep_places.push(place);
-                    keep_rows.push(r);
-                }
-            }
-            (places, kept) = (keep_places, keep_rows);
-        }
-        // by the row each place shows, which for a post brought in isn't the window's own row; only for a chip
-        let scores = search.min_score.map(|_| post_scores(&kept, &split));
-        let posts: Vec<Vec<i64>> =
-            kept.iter().map(|r| split.get(&r.id).map_or_else(Vec::new, |p| p.ids.clone())).collect();
-        for (((place, r), html), post) in places.into_iter().zip(&kept).zip(rows_html(&kept, split)).zip(posts) {
-            let brings = (r.id != place).then_some(r.id);
-            let score = scores.as_ref().map(|scores| scores.get(&r.id).copied());
-            done.push((place, ShownRow { html, size: r.size, folded: false, brings, score, post }));
-        }
-        self.publish(done);
-    }
-
-    /// Keeps rendered rows, each under its place.
-    fn publish(&self, done: Vec<(i64, ShownRow)>) {
-        let mut shown = lock(&self.shown);
-        for (place, row) in done {
-            // two renders of one place can race for the row it brings in: the one that lost says folded, and mustn't
-            // hide the row the other one shows there
-            if row.folded && shown.get(&place).is_some_and(|r| !r.folded) {
-                continue;
-            }
-            shown.insert(place, row);
-        }
-        // a render can publish after the fill finished (a page's, that won the race for a brought row): a size order
-        // kept from before it may be wrong now
-        self.shown_gen.fetch_add(1, Ordering::AcqRel);
-        drop(shown);
-        lock(&self.orders).retain(|(by, _), _| *by != SortBy::Size);
-    }
-
-    /// A page's rows, and whether more follow. Renders only what the page reaches and nothing has rendered yet.
-    fn page(&self, search: &Search, by: Option<SortBy>) -> (Vec<String>, bool) {
-        if by == Some(SortBy::Size) {
-            let started = Instant::now();
-            while !self.filled.load(Ordering::Acquire) && started.elapsed() < SIZES_WAIT {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        }
-        let order = match by {
-            Some(by) => self.order(by, search.descending),
-            // as the search read them
-            None => Arc::new((0..self.rows.len()).collect()),
-        };
-        let skip = usize::try_from(search.offset).unwrap_or(0);
-        let wanted = PAGE_SIZE as usize + 1;
-        // hiding incomplete ones, a page can pass many rows it leaves out: they're rendered several pages at a time
-        let batch = if search.hide_incomplete || search.hides_spots() || search.min_score.is_some() {
-            PAGE_SIZE as usize * FILL_THREADS
-        } else {
-            PAGE_SIZE as usize
-        };
-        // a row with a title of its own stands for itself, soo one rated lower is left out before it's rendered; a row
-        // without one may be a post's file that brings the post in, and is rendered to know
-        let titled = search.min_score.map(|_| self.titled());
-        loop {
-            let mut page = Vec::with_capacity(wanted);
-            let mut missing = Vec::new();
-            // rendered for a search without a chip: (place, the row it shows), looked up below, outside the lock
-            let mut unscored = Vec::new();
-            {
-                let shown = lock(&self.shown);
-                let mut passed = 0;
-                for &place in order.iter() {
-                    let r = &self.rows[place];
-                    match shown.get(&r.id) {
-                        Some(row) if row.folded => continue,
-                        Some(row) if search.min_score.is_some() && row.score.is_none() => {
-                            let shows = row.brings.unwrap_or(r.id);
-                            unscored.push((
-                                r.id,
-                                std::iter::once(shows).chain(row.post.iter().copied()).collect::<Vec<_>>(),
-                            ));
-                        }
-                        Some(row) if search.scored_out(row.score.flatten()) => continue,
-                        Some(row) => {
-                            if passed >= skip {
-                                page.push(row.html.clone());
-                            }
-                            passed += 1;
-                        }
-                        None if titled.and_then(|t| t.get(&r.id)).is_some_and(|score| search.scored_out(*score)) => {
-                            continue;
-                        }
-                        None => missing.push(r.clone()),
-                    }
-                    if page.len() == wanted || missing.len() + unscored.len() >= batch {
-                        break;
-                    }
-                }
-            }
-            if !unscored.is_empty() {
-                // as `post_scores`: the row it shows, else another row of its post
-                let scores = kept_scores(&unscored.iter().flat_map(|(_, ids)| ids.iter().copied()).collect::<Vec<_>>());
-                let mut shown = lock(&self.shown);
-                for (place, ids) in unscored {
-                    if let Some(row) = shown.get_mut(&place) {
-                        row.score = Some(ids.iter().find_map(|id| scores.get(id).copied()));
-                    }
-                }
-                continue;
-            }
-            if missing.is_empty() {
-                let more = page.len() == wanted;
-                page.truncate(PAGE_SIZE as usize);
-                return (page, more);
-            }
-            std::thread::scope(|scope| {
-                for slice in missing.chunks(PAGE_SIZE as usize) {
-                    scope.spawn(|| self.render(search, slice));
-                }
-            });
-        }
-    }
-
-    /// How many rows the search shows from this window once its background fill has rendered them all: those not
-    /// folded into another (incomplete ones among them) nor left out by a rating chip. None: the fill hasn't
-    /// finished, and the count it had stands; the next page asks again.
-    fn shown_count(&self, search: &Search) -> Option<usize> {
-        if let Some(n) = lock(&self.counted).get(&search.min_score) {
-            return Some(*n);
-        }
-        // the fill renders the first `SORT_WINDOW` rows: a window grown past them isn't all rendered
-        if self.rows.len() > SORT_WINDOW as usize {
-            return None;
-        }
-        // the background fill renders them all: waited for, soo they aren't rendered twice
-        let started = Instant::now();
-        while !self.filled.load(Ordering::Acquire) && started.elapsed() < COUNT_WAITS_FOR_FILL {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        // waiting its turn behind other windows' fills: not rendered here, on a request's thread
-        if !self.filled.load(Ordering::Acquire) {
-            return None;
-        }
-        if search.min_score.is_some() {
-            // scored as `page` scores them: the row shown, else another row of its post
-            let unscored: Vec<(i64, Vec<i64>)> = lock(&self.shown)
-                .iter()
-                .filter(|(_, row)| !row.folded && row.score.is_none())
-                .map(|(place, row)| {
-                    (*place, std::iter::once(row.brings.unwrap_or(*place)).chain(row.post.iter().copied()).collect())
-                })
-                .collect();
-            let scores = kept_scores(&unscored.iter().flat_map(|(_, ids)| ids.iter().copied()).collect::<Vec<_>>());
-            let mut shown = lock(&self.shown);
-            for (place, ids) in unscored {
-                if let Some(row) = shown.get_mut(&place) {
-                    row.score = Some(ids.iter().find_map(|id| scores.get(id).copied()));
-                }
-            }
-        }
-        // what `page` passes over: folded rows (incomplete ones among them) and rows a chip leaves out
-        let n = {
-            let shown = lock(&self.shown);
-            self.rows
-                .iter()
-                .filter(|r| shown.get(&r.id).is_some_and(|row| !row.folded && !search.scored_out(row.score.flatten())))
-                .count()
-        };
-        lock(&self.counted).insert(search.min_score, n);
-        Some(n)
-    }
-
-    /// Renders every row and works out every order, soo no click has any of it left to do.
-    fn fill(&self, search: &Search) {
-        let shown = lock(&self.shown);
-        // the top of a big window: further down a page renders what it reaches
-        let missing: Vec<ReleaseRow> =
-            self.rows.iter().take(SORT_WINDOW as usize).filter(|r| !shown.contains_key(&r.id)).cloned().collect();
-        drop(shown);
-        let slices: Vec<&[ReleaseRow]> = missing.chunks(PAGE_SIZE as usize).collect();
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        std::thread::scope(|scope| {
-            for _ in 0..FILL_THREADS {
-                scope.spawn(|| {
-                    while let Some(slice) = slices.get(next.fetch_add(1, Ordering::Relaxed)) {
-                        self.render(search, slice);
-                    }
-                });
-            }
-        });
-        // sizes may have changed with the split posts
-        self.sized.store(true, Ordering::Release);
-        lock(&self.orders).clear();
-        for (by, _) in SortBy::ALL {
-            self.order(by, false);
-            self.order(by, true);
-        }
-        self.filled.store(true, Ordering::Release);
-    }
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// A search's window, and what keeps two clicks from each reading one.
-struct WindowSlot {
-    /// the search, with no sort or page
-    search: Search,
-    window: Mutex<Option<Arc<Window>>>,
-    reading: Mutex<()>,
-    replacing: AtomicBool,
-    used: Mutex<Instant>,
-    /// a category's own page, kept warm whether or not anyone has clicked it
-    always: bool,
-}
-
-static WINDOWS: LazyLock<Mutex<HashMap<String, Arc<WindowSlot>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// One background read at a time, on a machine that's indexing.
-static BACKGROUND: Mutex<()> = Mutex::new(());
-
-/// Background fills and replacements waiting for their turn: no more than there are windows kept.
-static WAITING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// A turn at `BACKGROUND` once one comes, or None when as many are waiting as there are windows kept.
-fn background_turn() -> Option<Waiting> {
-    if WAITING.fetch_add(1, Ordering::AcqRel) >= WINDOWS_KEPT {
-        WAITING.fetch_sub(1, Ordering::AcqRel);
-        return None;
-    }
-    Some(Waiting)
-}
-
-/// One of `WAITING`, given back however the work ends.
-struct Waiting;
-
-impl Drop for Waiting {
-    fn drop(&mut self) {
-        WAITING.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-/// Whether a slot is still kept: one dropped from `WINDOWS` while its work waited has no one to show it to.
-fn still_kept(slot: &Arc<WindowSlot>) -> bool {
-    lock(&WINDOWS).values().any(|kept| Arc::ptr_eq(kept, slot))
-}
-
-fn slot_of(search: &Search, always: bool) -> Arc<WindowSlot> {
-    // a sort read from the database in its own order has a window of its own; any other reads the newest
-    // the rating chips only pick among rendered rows, soo they share the window of the search without them
-    let plain = if search.in_order() {
-        Search { offset: 0, min_score: None, ..search.clone() }
-    } else {
-        Search { offset: 0, sort: None, descending: true, min_score: None, ..search.clone() }
-    };
-    // by the categories the filter comes to, not how the url spells them: `8000,x1` and `8000,x2` are one window
-    let key = format!("{}|{:?}", plain.query("", 0), parse_filter(&plain.cat));
-    let mut windows = lock(&WINDOWS);
-    if !windows.contains_key(&key) && windows.len() >= WINDOWS_KEPT {
-        let oldest = windows
-            .iter()
-            .filter(|(_, slot)| !slot.always)
-            .min_by_key(|(_, slot)| *lock(&slot.used))
-            .map(|(k, _)| k.clone());
-        if let Some(oldest) = oldest {
-            windows.remove(&oldest);
-        }
-    }
-    windows
-        .entry(key)
-        .or_insert_with(|| {
-            Arc::new(WindowSlot {
-                search: plain,
-                window: Mutex::new(None),
-                reading: Mutex::new(()),
-                replacing: AtomicBool::new(false),
-                // nobody has clicked it yet
-                used: Mutex::new(Instant::now().checked_sub(WINDOW_IN_USE).unwrap_or_else(Instant::now)),
-                always,
-            })
-        })
-        .clone()
-}
-
-/// The window to answer with now: the one there is, however old, or a new one when there's none or the one there is
-/// was read with fewer than `at_least` results and could have more.
-fn window_of(search: &Search, at_least: i64) -> Result<Arc<Window>, String> {
-    let slot = slot_of(search, false);
-    *lock(&slot.used) = Instant::now();
-    let big_enough = |w: &Window| w.asked >= at_least || !w.can_grow(search);
-    if let Some(window) = lock(&slot.window).clone()
-        && big_enough(&window)
-    {
-        if window.built.elapsed() > WINDOW_FRESH {
-            replace_in_background(&slot);
-        }
-        return Ok(window);
-    }
-    let _reading = lock(&slot.reading);
-    let previous = lock(&slot.window).clone();
-    let asked = match &previous {
-        Some(window) if big_enough(window) => return Ok(window.clone()),
-        // twice as many each time, soo paging on reads the database a few times, not a page at a time
-        Some(window) => at_least.max(window.asked.saturating_mul(2)),
-        None => at_least.max(SORT_WINDOW),
-    }
-    .min(MAX_WINDOW);
-    let window = Window::read(&slot.search, asked)?;
-    if let Some(previous) = &previous {
-        window.carry_from(previous);
-    }
-    let window = Arc::new(window);
-    *lock(&slot.window) = Some(window.clone());
-    if window.rows.len() > SORT_WINDOW as usize {
-        shrink_others(&slot);
-    }
-    // the window answers clicks without it, rendering what a page needs; filled, a click has nothing left to do.
-    // Waiting, it holds neither the window nor its slot, soo a window dropped meanwhile is gone, and isn't filled
-    if let Some(waiting) = background_turn() {
-        let (filling, for_fill) = (Arc::downgrade(&window), Arc::downgrade(&slot));
-        std::thread::spawn(move || {
-            let _waiting = waiting;
-            let _turn = lock(&BACKGROUND);
-            let (Some(window), Some(slot)) = (filling.upgrade(), for_fill.upgrade()) else { return };
-            let current = lock(&slot.window).as_ref().is_some_and(|w| Arc::ptr_eq(w, &window));
-            if current && still_kept(&slot) {
-                window.fill(&slot.search);
-            }
-        });
-    }
-    Ok(window)
-}
-
-/// Past `ROWS_KEPT` rows in all, the grown windows of other searches go, the one used longest ago first. Each is read
-/// again at its first size by the next click or warm-up.
-fn shrink_others(keep: &Arc<WindowSlot>) {
-    let slots: Vec<Arc<WindowSlot>> = lock(&WINDOWS).values().cloned().collect();
-    let rows = |slot: &WindowSlot| lock(&slot.window).as_ref().map_or(0, |w| w.rows.len());
-    let mut total: usize = slots.iter().map(|slot| rows(slot)).sum();
-    let mut grown: Vec<&Arc<WindowSlot>> =
-        slots.iter().filter(|slot| !Arc::ptr_eq(slot, keep) && rows(slot) > SORT_WINDOW as usize).collect();
-    grown.sort_by_key(|slot| *lock(&slot.used));
-    for slot in grown {
-        if total <= ROWS_KEPT {
-            break;
-        }
-        total -= rows(slot);
-        *lock(&slot.window) = None;
-    }
-}
-
-/// Clears `replacing` however the work ends.
-struct Replacing(Arc<WindowSlot>);
-
-impl Drop for Replacing {
-    fn drop(&mut self) {
-        self.0.replacing.store(false, Ordering::Release);
-    }
-}
-
-fn replace_in_background(slot: &Arc<WindowSlot>) {
-    if slot.replacing.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    let replacing = Replacing(slot.clone());
-    let Some(waiting) = background_turn() else { return };
-    std::thread::spawn(move || {
-        let _waiting = waiting;
-        replace(replacing);
-    });
-}
-
-/// A new window takes over only once it's filled, soo a click never finds a worse one than the last.
-fn replace(replacing: Replacing) {
-    let slot = &replacing.0;
-    let _turn = lock(&BACKGROUND);
-    if !still_kept(slot) {
-        return;
-    }
-    let asked = lock(&slot.window).as_ref().map_or(SORT_WINDOW, |w| w.asked);
-    let Ok(window) = Window::read(&slot.search, asked) else { return };
-    window.fill(&slot.search);
-    *lock(&slot.window) = Some(Arc::new(window));
-}
-
-/// Keeps a window ready for each category's page and for what was clicked lately. Doesn't return.
-pub(crate) fn keep_sort_windows_warm(running: impl Fn() -> bool) {
-    let plain = Search::from_args(&HashMap::new());
-    slot_of(&plain, true);
-    for root in TABLE {
-        slot_of(&Search { cat: root.id.to_string(), ..plain.clone() }, true);
-    }
-    loop {
-        if running() {
-            let slots: Vec<Arc<WindowSlot>> = lock(&WINDOWS).values().cloned().collect();
-            for slot in slots {
-                let in_use = lock(&slot.used).elapsed() < WINDOW_IN_USE;
-                let fresh_for = if in_use { WINDOW_FRESH } else { WINDOW_IDLE_FRESH };
-                let current = lock(&slot.window).clone();
-                let stale = current.is_none_or(|window| window.built.elapsed() > fresh_for);
-                if stale && !slot.replacing.swap(true, Ordering::AcqRel) {
-                    replace(Replacing(slot.clone()));
-                }
-            }
-        }
-        std::thread::sleep(Duration::from_secs(5));
-    }
-}
-
-/// Each row's HTML, with what it shows beyond itself read for all of them at once.
-fn rows_html(found: &[ReleaseRow], split: HashMap<i64, release_info::SplitPost>) -> Vec<String> {
-    let ids: Vec<i64> = found.iter().map(|r| r.id).collect();
-    let mut all_ids = ids.clone();
-    for post in split.values() {
-        all_ids.extend_from_slice(&post.ids);
-    }
-    all_ids.sort_unstable();
-    all_ids.dedup();
-    let mut categories = crate::category::categories_of(&all_ids).unwrap_or_default();
-    let passwords = crate::archive::store::passwords(&ids);
-    let mut media = crate::media::query::attrs_of(&all_ids).unwrap_or_default();
-    for (&id, post) in &split {
-        if categories.get(&id).copied().unwrap_or(UNCATEGORIZED) == UNCATEGORIZED
-            && let Some(cat) = post.ids.iter().filter_map(|i| categories.get(i).copied()).find(|c| *c != UNCATEGORIZED)
-        {
-            categories.insert(id, cat);
-        }
-        if !media.contains_key(&id)
-            && let Some(m) = post.ids.iter().find_map(|i| media.get(i).cloned())
-        {
-            media.insert(id, m);
-        }
-    }
-    // a post spread over several groups is all its rows together, whatever one of them holds
-    let single: Vec<i64> = ids.iter().copied().filter(|id| !split.contains_key(id)).collect();
-    let extras = RowExtras {
-        spots: crate::spotnet::store::spots_of(&ids).unwrap_or_default(),
-        recovery: release_info::recovery_only_of(&single),
-        repair: crate::db::open()
-            .map_or_else(|_| HashSet::new(), |conn| release_info::repair_needed_of(&conn, &single)),
-        split,
-        copies: crate::duplicates::counts(&ids).unwrap_or_default(),
-        details: crate::media::details::kept_for(media.iter().map(|(id, m)| (*id, m.kind, &m.ids))),
-    };
-    found.iter().map(|r| row(r, &categories, &passwords, &media, &extras)).collect()
-}
-
 /// What a result shows beyond its own row.
+#[cfg(test)]
 #[derive(Default)]
 struct RowExtras {
     /// all of the post a row lists: spread over several groups, or linked by its PAR2 set
@@ -2226,44 +998,6 @@ fn score_value(d: &crate::media::details::Details) -> Option<i64> {
     d.imdb_score.or(d.tmdb_score).or(d.trakt_score)
 }
 
-/// Of these releases, those with a title (a media row), each with the best score kept for it, if any.
-fn titled_scores(ids: &[i64]) -> HashMap<i64, Option<i64>> {
-    let media = crate::media::query::attrs_of(ids).unwrap_or_default();
-    let scores: HashMap<i64, i64> = crate::media::details::kept_for(media.iter().map(|(id, m)| (*id, m.kind, &m.ids)))
-        .into_iter()
-        .filter_map(|(id, d)| Some((id, score_value(&d)?)))
-        .collect();
-    media.keys().map(|id| (*id, scores.get(id).copied())).collect()
-}
-
-/// `kept_scores` for rows as they show: a post spread over rows whose own row has no title takes one of its other
-/// rows', as `rows_html` takes their title to show.
-fn post_scores(rows: &[ReleaseRow], split: &HashMap<i64, release_info::SplitPost>) -> HashMap<i64, i64> {
-    let mut ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
-    for r in rows {
-        ids.extend(split.get(&r.id).map_or(&[][..], |p| &p.ids[..]));
-    }
-    ids.sort_unstable();
-    ids.dedup();
-    let scores = kept_scores(&ids);
-    rows.iter()
-        .filter_map(|r| {
-            let own = std::iter::once(r.id).chain(split.get(&r.id).map_or(&[][..], |p| &p.ids[..]).iter().copied());
-            own.filter_map(|id| scores.get(&id).copied()).next().map(|s| (r.id, s))
-        })
-        .collect()
-}
-
-/// The best kept score of each of these releases that has one, with nothing fetched: fetching for a whole search
-/// would use up the providers' limits. The details backfill (`media.details_per_minute`) fills them in ahead.
-fn kept_scores(ids: &[i64]) -> HashMap<i64, i64> {
-    let media = crate::media::query::attrs_of(ids).unwrap_or_default();
-    crate::media::details::kept_for(media.iter().map(|(id, m)| (*id, m.kind, &m.ids)))
-        .into_iter()
-        .filter_map(|(id, d)| Some((id, score_value(&d)?)))
-        .collect()
-}
-
 /// The one score a result has room for.
 fn best_score(d: &crate::media::details::Details) -> Option<String> {
     d.imdb_score
@@ -2319,6 +1053,7 @@ fn raw_name_html(raw: Option<&str>) -> String {
     raw.map_or(String::new(), |raw| format!("<div class=\"raw-name\">{}</div>", escape(raw)))
 }
 
+#[cfg(test)]
 fn row(
     r: &ReleaseRow,
     categories: &HashMap<i64, i64>,
@@ -2328,35 +1063,60 @@ fn row(
 ) -> String {
     let details = extras.details.get(&r.id);
     let post = extras.split.get(&r.id);
-    row_from_facts(r, ResultFacts {
-        category: categories.get(&r.id).copied().unwrap_or(UNCATEGORIZED),
-        password: passwords.get(&r.id), media: media.get(&r.id), details: details.map(ResultDetails::from),
-        poster: details.filter(|details| crate::media::details::poster_kept(details)).map(|details| (details.kind, details.tmdb_id)),
-        recovery: extras.recovery.get(&r.id).map(release_info::RecoveryOnly::repairs_bytes), copies: extras.copies.get(&r.id),
-        spot: extras.spots.get(&r.id).map(|spot| SpotBadge { poster: &spot.poster, title: &spot.title }),
-        whole: post.map(|post| WholePostBadge { groups: post.groups.len(), linked_rows: post.lead.map(|_| post.ids.len()) }),
-        repair: extras.repair.contains(&r.id),
-    })
+    row_from_facts(
+        r,
+        ResultFacts {
+            category: categories.get(&r.id).copied().unwrap_or(UNCATEGORIZED),
+            password: passwords.get(&r.id),
+            media: media.get(&r.id),
+            details: details.map(ResultDetails::from),
+            poster: details
+                .filter(|details| crate::media::details::poster_kept(details))
+                .map(|details| (details.kind, details.tmdb_id)),
+            recovery: extras.recovery.get(&r.id).map(release_info::RecoveryOnly::repairs_bytes),
+            copies: extras.copies.get(&r.id),
+            spot: extras.spots.get(&r.id).map(|spot| SpotBadge { poster: &spot.poster, title: &spot.title }),
+            whole: post.map(|post| WholePostBadge {
+                groups: post.groups.len(),
+                linked_rows: post.lead.map(|_| post.ids.len()),
+            }),
+            repair: extras.repair.contains(&r.id),
+        },
+    )
 }
 
 /// Presentation-only whole-post facts. Native callers consume the safe
 /// purpose-qualified derivation; constructing an unsafe legacy SplitPost is
 /// neither necessary nor sufficient to render a badge.
 #[derive(Clone, Copy)]
-pub(crate) struct WholePostBadge { pub groups: usize, pub linked_rows: Option<usize> }
+pub(crate) struct WholePostBadge {
+    pub groups: usize,
+    pub linked_rows: Option<usize>,
+}
 
 #[derive(Clone, Copy)]
-pub(crate) struct SpotBadge<'a> { pub poster: &'a str, pub title: &'a str }
+pub(crate) struct SpotBadge<'a> {
+    pub poster: &'a str,
+    pub title: &'a str,
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct ResultDetails<'a> {
-    pub title: Option<&'a str>, pub released: Option<&'a str>,
-    pub imdb_score: Option<i64>, pub tmdb_score: Option<i64>, pub trakt_score: Option<i64>,
+    pub title: Option<&'a str>,
+    pub released: Option<&'a str>,
+    pub imdb_score: Option<i64>,
+    pub tmdb_score: Option<i64>,
+    pub trakt_score: Option<i64>,
 }
 impl<'a> From<&'a crate::media::details::Details> for ResultDetails<'a> {
     fn from(details: &'a crate::media::details::Details) -> Self {
-        Self { title: details.title.as_deref(), released: details.released.as_deref(),
-            imdb_score: details.imdb_score, tmdb_score: details.tmdb_score, trakt_score: details.trakt_score }
+        Self {
+            title: details.title.as_deref(),
+            released: details.released.as_deref(),
+            imdb_score: details.imdb_score,
+            tmdb_score: details.tmdb_score,
+            trakt_score: details.trakt_score,
+        }
     }
 }
 
@@ -2391,9 +1151,13 @@ pub(crate) fn row_from_facts(r: &ReleaseRow, facts: ResultFacts<'_>) -> String {
     }
     tags.push_str(&name_tags(&release_tags::parse(&r.name)));
     let details = facts.details;
-    let score = details.and_then(|details| details.imdb_score.map(|score| format!("IMDB {score}"))
-        .or_else(|| details.tmdb_score.map(|score| format!("TMDB {score}")))
-        .or_else(|| details.trakt_score.map(|score| format!("TRAKT {score}"))));
+    let score = details.and_then(|details| {
+        details
+            .imdb_score
+            .map(|score| format!("IMDB {score}"))
+            .or_else(|| details.tmdb_score.map(|score| format!("TMDB {score}")))
+            .or_else(|| details.trakt_score.map(|score| format!("TRAKT {score}")))
+    });
     if let Some(score) = score {
         tags.push_str(&tag("tag-ref", &score));
     }
@@ -2492,117 +1256,7 @@ pub(crate) fn diag(level: &str, title: &str, body: &str) -> String {
     )
 }
 
-/// What goes in #results for a first page.
-fn results_html(search: &Search) -> String {
-    let body = search.body();
-    let content = if body.starts_with("<tr") { table(search, &body) } else { body };
-    let frozen = match (search.deep, search.min_score) {
-        // nothing frozen has a score kept: none would pass
-        (true, Some(_)) => "<section class=\"frozen-results\"><h2>Frozen releases</h2><p class=\"note dim\">Not listed with a rating chip on: frozen releases have no scores kept.</p></section>".to_string(),
-        (true, None) => frozen_section(search),
-        (false, _) => String::new(),
-    };
-    format!("{}{}{content}{frozen}", search.filter_links(), search.summary())
-}
-
 /// How many frozen releases a deep search lists, after the live ones.
-const FROZEN_LISTED: usize = 200;
-
-/// A deep search's frozen releases: the newest matching ones, each to its own page (where it can be thawed).
-fn frozen_section(search: &Search) -> String {
-    let f = &search.fields;
-    if !f.crc.is_empty() || !f.agent.is_empty() {
-        return format!(
-            "<section class=\"frozen-results\"><h2>Frozen releases</h2><p class=\"note dim\">{}</p></section>",
-            "Not searched: CRC32 and Posted with come from probe results, which a frozen release keeps packed away."
-        );
-    }
-    let size = match f.size.parse::<i64>() {
-        _ if f.size.is_empty() => None,
-        Ok(n) => Some((n, n)),
-        Err(_) => Some(crate::field_search::size_range(&f.size).unwrap_or((1, 0))),
-    };
-    let narrow = crate::frozen::Narrow {
-        group: f.group.clone(),
-        poster: f.poster.clone(),
-        email: f.email.clone(),
-        size,
-        team: f.team.clone(),
-        complete_only: search.hide_incomplete,
-    };
-    // tags are read from each name: a wider window, soo the newest ones that have them still come to the limit
-    let tags = search.tag_filters();
-    // as do spots, left out once read
-    let window = if tags.is_empty() && !search.hides_spots() { FROZEN_LISTED } else { FROZEN_LISTED * 20 };
-    let filter = parse_filter(&search.cat);
-    let found = crate::frozen::search(&crate::paths::database(), &search.q, filter.as_ref(), &narrow, window);
-    // the read came back full: there may be older ones, whatever the filters left of it
-    let mut full = false;
-    let hits = match found.map(|hits| {
-        full = hits.len() >= window;
-        let mut hits: Vec<_> = hits
-            .into_iter()
-            .filter(|h| {
-                let parsed = release_tags::parse(&h.row.name);
-                tags.iter().all(|t| filter_matches(t, &parsed))
-            })
-            .collect();
-        if search.hides_spots() {
-            let spots = spot_ids(&hits.iter().map(|h| h.row.id).collect::<Vec<_>>());
-            hits.retain(|h| !spots.contains(&h.row.id));
-        }
-        hits.truncate(FROZEN_LISTED);
-        hits
-    }) {
-        Ok(hits) => hits,
-        Err(e) => {
-            eprintln!("web frozen search failed: {e}");
-            return format!(
-                "<section class=\"frozen-results\"><h2>Frozen releases</h2>{}</section>",
-                diag("caution", "frozen releases could not be read", "The error is in Atlas's log.")
-            );
-        }
-    };
-    let mut rows = String::new();
-    for h in &hits {
-        let r = &h.row;
-        let _ = write!(
-            rows,
-            "<tr><td class=\"name\"><a href=\"/ui/release?id={id}\">{name}</a> <span class=\"tag tag-ref\">FROZEN</span></td><td class=\"col-cat\">{cat}</td><td class=\"num col-size\">{size}</td><td class=\"col-posted\">{posted}</td><td class=\"col-group\">{group}</td><td><a class=\"button small\" href=\"/ui/nzb?id={id}\">NZB</a></td></tr>",
-            id = r.id,
-            name = escape(&r.name),
-            cat = escape(&h.category.and_then(label).unwrap_or_else(|| "uncategorized".to_string())),
-            size = escape(&fmt_size(r.size)),
-            posted = escape(&fmt_date(r.posted_date.as_deref())),
-            group = escape(&r.group_name),
-        );
-    }
-    let note = match hits.len() {
-        0 if full => format!("None of the newest {window} match; a narrower search finds older ones."),
-        0 => "None match.".to_string(),
-        n if n >= FROZEN_LISTED || full => format!("The newest {n}; a narrower search finds older ones."),
-        n => format!("{n} set aside, out of the default search."),
-    };
-    let table = if hits.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "<div class=\"table-wrap\"><table><thead><tr><th>Name</th><th class=\"col-cat\">Category</th><th class=\"num col-size\">Size</th><th class=\"col-posted\">Posted</th><th class=\"col-group\">Group</th><th><span class=\"sr-only\">Download</span></th></tr></thead><tbody>{rows}</tbody></table></div>"
-        )
-    };
-    format!(
-        "<section class=\"frozen-results\"><h2>Frozen releases</h2><p class=\"note dim\">{note}</p>{table}</section>"
-    )
-}
-
-/// What htmx swaps in: the whole result area for a new search, more rows for "Load more".
-fn results(args: &HashMap<String, String>) -> ApiResponse {
-    let search = Search::from_args(args);
-    if search.offset > 0 {
-        return html(200, search.body());
-    }
-    first_page(&search, &ask_note("", " hx-swap-oob=\"true\""))
-}
 
 /// A count from the rows themselves.
 fn exact_html(n: usize) -> String {
@@ -2611,47 +1265,6 @@ fn exact_html(n: usize) -> String {
         attr(&format!("Counted from the rows themselves. {ROWS_FOLDED}")),
         escape(&field_search::Total { count: n as i64, exact: true }.describe())
     )
-}
-
-/// The count over a results page, from the rows themselves when the search pages from one window that holds every
-/// match: what a page leaves out (a post's other rows, incomplete and unrated releases) isn't counted, soo it's the
-/// rows paging shows.
-/// A search with more than one window holds keeps the count it had.
-fn exact_total(args: &HashMap<String, String>) -> String {
-    let search = Search { offset: 0, ..Search::from_args(args) };
-    // other searches page a page at a time, folding as they go: no window count matches them
-    if !search.sorts_from_a_window() {
-        return search.total(false);
-    }
-    match window_of(&search, 0) {
-        Ok(window) if !window.more_in_db => match window.shown_count(&search) {
-            Some(n) => exact_html(n),
-            None => search.total(false),
-        },
-        Ok(_) => search.total(false),
-        Err(e) => {
-            eprintln!("web exact count failed: {e}");
-            search.total(false)
-        }
-    }
-}
-
-/// A new search's results, with the sidebar and the form following it. `more` goes in too, for out of band swaps.
-fn first_page(search: &Search, more: &str) -> ApiResponse {
-    let oob = " hx-swap-oob=\"true\"";
-    let body = format!(
-        "{}{}{}{}{more}",
-        results_html(search),
-        category_nav(search, oob),
-        category_input(&search.cat, oob),
-        scope_inputs(search, oob),
-    );
-    let mut resp = html(200, body);
-    // the address bar follows the search, and reloads the full page
-    let query = search.query(&search.cat, 0);
-    let url = if query.is_empty() { "/".to_string() } else { format!("/?{query}") };
-    resp.headers.push(("HX-Push-Url".into(), url));
-    resp
 }
 
 /// "Movies / HD" for a category the table knows, whatever the url asked for.
@@ -2671,10 +1284,10 @@ fn category_input(cat: &str, oob: &str) -> String {
 
 /// More things to search on, with the sort: part of the form, soo typing keeps them.
 fn scope_inputs(search: &Search, oob: &str) -> String {
-    scope_inputs_for(search,oob,true)
+    scope_inputs_for(search, oob, true)
 }
 
-fn scope_inputs_for(search: &Search,oob:&str,include_frozen:bool)->String {
+fn scope_inputs_for(search: &Search, oob: &str, include_frozen: bool) -> String {
     let open = if search.fields.any() || search.deep { " open" } else { "" };
     let field = |name: &str, label: &str, value: &str| {
         format!(
@@ -2683,10 +1296,14 @@ fn scope_inputs_for(search: &Search,oob:&str,include_frozen:bool)->String {
         )
     };
     let hidden = |name: &str, value: &str| format!("<input type=\"hidden\" name=\"{name}\" value=\"{}\">", attr(value));
-    let deep = if include_frozen { format!(
-        "<label class=\"deep-field\"><input class=\"scope-field\" type=\"checkbox\" name=\"{DEEP_ARG}\" value=\"1\"{}> Deep search: frozen releases too</label>",
-        if search.deep { " checked" } else { "" }
-    ) } else {String::new()};
+    let deep = if include_frozen {
+        format!(
+            "<label class=\"deep-field\"><input class=\"scope-field\" type=\"checkbox\" name=\"{DEEP_ARG}\" value=\"1\"{}> Deep search: frozen releases too</label>",
+            if search.deep { " checked" } else { "" }
+        )
+    } else {
+        String::new()
+    };
     format!(
         "<details id=\"scope\" class=\"more-fields\"{open}{oob}><summary>More fields</summary><div class=\"field-grid\">{}{}{}{}{}{}{}</div>{}{}{}{}{}{}</details>",
         field("group", "Usenet group", &search.fields.group),
@@ -2786,12 +1403,7 @@ pub(crate) fn masthead(signed_in: bool) -> String {
     )
 }
 
-fn search_page(args: &HashMap<String, String>, base: &str) -> String {
-    let search = Search::from_args(args);
-    search_page_from_results(&search,base,&results_html(&search),false)
-}
-
-fn search_page_from_results(search:&Search,base:&str,results:&str,native:bool)->String {
+fn search_page_from_results(search: &Search, base: &str, results: &str, native: bool) -> String {
     page(
         "Atlas",
         &format!(
@@ -2819,180 +1431,6 @@ fn search_page_from_results(search:&Search,base:&str,results:&str,native:bool)->
     )
 }
 
-/// One release: what's known about it, and its files where Atlas has looked inside.
-fn release_page(args: &HashMap<String, String>, api_key: &str) -> ApiResponse {
-    let id = args.get("id").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
-    let release = match get_release(id) {
-        Ok(Some(release)) => release,
-        Ok(None) => return frozen_page(id),
-        Err(e) => {
-            eprintln!("web release {id} failed: {e}");
-            return release_problem(500, "caution", "the release could not be read", "The error is in Atlas's log.");
-        }
-    };
-    let ids = [id];
-    let mut category = crate::category::categories_of(&ids).unwrap_or_default().get(&id).copied();
-    let mut inner = crate::archive::store::view(id);
-    let mut media = crate::media::query::attrs_of(&ids).unwrap_or_default().remove(&id);
-    let mut names = release_info::names(id).unwrap_or_default();
-    // the post's contents if it's a split or linked post, else the release's own: each reads every article of its
-    // rows, soo it's read once, for what's shown
-    let mut contents = None;
-    let mut release = release;
-    let mut whole_post = false;
-    let mut split_groups = None;
-    let mut post_ids = vec![id];
-    // a post spread over several groups, or linked by its PAR2 set, is shown whole
-    if let Ok(conn) = crate::db::open()
-        && let Ok(Some(post)) = release_info::whole_post_from_catalog(&conn, &release)
-    {
-        // a split post's contents that can't be read are the release's own, as before
-        let post_contents = release_info::contents_of_split(&conn, &post)
-            .unwrap_or_else(|_| release_info::contents(id).unwrap_or_default());
-        split_groups = release_info::groups_of_ids(&conn, &post.ids).ok();
-        post_ids.extend(post.ids.iter().copied().filter(|other| *other != id));
-        if post.lead.is_none() || !crate::parser::is_obfuscated(&release.name) {
-            release.name = release_info::post_stem(&release.name);
-            if let Some(names) = &mut names {
-                names.posted = release_info::post_stem(&names.posted);
-            }
-        }
-        release.size = Some(post.size);
-        release.complete = post.complete;
-        release.parts = Some(post_contents.articles_seen);
-        contents = Some(post_contents);
-        whole_post = true;
-        if category.unwrap_or(UNCATEGORIZED) == UNCATEGORIZED {
-            let cats = crate::category::categories_of(&post.ids).unwrap_or_default();
-            if let Some(found) = post.ids.iter().filter_map(|i| cats.get(i).copied()).find(|c| *c != UNCATEGORIZED) {
-                category = Some(found);
-            }
-        }
-        if media.is_none() {
-            let mut all_media = crate::media::query::attrs_of(&post.ids).unwrap_or_default();
-            media = post.ids.iter().find_map(|i| all_media.remove(i));
-        }
-        // a linked or split upload's file list may live on its recovery or base row
-        if inner.files.is_empty()
-            && let Some(listed) = post
-                .recovery
-                .iter()
-                .chain(&post.ids)
-                .map(|id| crate::archive::store::view(*id))
-                .find(|v| !v.files.is_empty())
-        {
-            inner.files = listed.files;
-        }
-    } else if !release.complete
-        && let Ok(conn) = crate::db::open()
-        && release_info::single_post_complete(&conn, release.id).unwrap_or(false)
-    {
-        release.complete = true;
-    }
-    let contents = contents.unwrap_or_else(|| release_info::contents(id).unwrap_or_default());
-    let recovery = (!whole_post)
-        .then(|| crate::db::open().ok().and_then(|conn| release_info::recovery_only_with(&conn, id).ok().flatten()))
-        .flatten();
-    html(
-        200,
-        release_html(
-            &release,
-            category,
-            &inner,
-            media.as_ref(),
-            names.as_ref(),
-            &contents,
-            recovery.as_ref(),
-            split_groups.as_deref(),
-            &post_ids,
-            api_key,
-        ),
-    )
-}
-
-/// A release that isn't live: its frozen row if it has one, with its NZB and a way back into the shards.
-fn frozen_page(id: i64) -> ApiResponse {
-    let (hit, frozen_at) = match crate::frozen::get(&crate::paths::database(), id) {
-        Ok(Some(found)) => found,
-        Ok(None) => return release_problem(404, "note", "there is no such release", "It may have been purged."),
-        Err(e) => {
-            eprintln!("web frozen release {id} failed: {e}");
-            return release_problem(500, "caution", "the release could not be read", "The error is in Atlas's log.");
-        }
-    };
-    let r = &hit.row;
-    let why = match hit.reason.as_str() {
-        crate::frozen::rules::SMALL_COMPLETE => "complete and under the small rule's size",
-        crate::frozen::rules::SIDECAR => "only an NFO, mediainfo, other text or a cover image that describes a release",
-        "not_tv_movies" => "outside Movies, TV and Other",
-        _ => "by hand",
-    };
-    let frozen = chrono::DateTime::from_timestamp(frozen_at, 0).map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string());
-    let row = |k: &str, v: &str| format!("<dt>{}</dt><dd>{}</dd>", escape(k), escape(v));
-    let facts = [
-        row("Category", &hit.category.and_then(label).unwrap_or_else(|| "uncategorized".to_string())),
-        row("Size", &fmt_size(r.size)),
-        row("Posted", &fmt_date(r.posted_date.as_deref())),
-        row("Group", &r.group_name),
-        row("Poster", r.poster.as_deref().unwrap_or("?")),
-        row("Articles", &r.parts.map_or_else(|| "?".to_string(), |p| p.to_string())),
-        row("Complete", if r.complete { "yes" } else { "no" }),
-        row("Frozen", &format!("{why}, {}", frozen.as_deref().unwrap_or("?"))),
-    ]
-    .concat();
-    let content = format!(
-        r##"{masthead}<div class="detail"><main>
-<p class="path"><a href="/">atlas::releases</a>::<b>{id}</b></p>
-<h1>{name}</h1><p><span class="tag tag-ref">FROZEN</span></p>
-<div class="actions"><a class="button primary" href="/ui/nzb?id={id}">Download NZB</a><form class="inline-form" method="post" action="/ui/thaw"><input type="hidden" name="id" value="{id}"><button class="button">Thaw</button></form></div>
-{diag}
-<div class="panel"><dl class="facts">{facts}</dl></div>
-</main></div>"##,
-        masthead = masthead(true),
-        name = escape(&r.name),
-        diag = diag(
-            "note",
-            "this release is frozen",
-            "It was set aside out of the shards: the default search, the word index and processing don't see it. Its NZB still downloads. Thawing puts it back as it was, and no rule freezes it again.",
-        ),
-    );
-    html(200, page(&format!("{} · Atlas", r.name), &content))
-}
-
-/// POST /ui/thaw: a frozen release back into its shard, then its page.
-fn thaw_release(body: &str) -> ApiResponse {
-    let args = parse_query(body);
-    let id = args.get("id").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
-    let main = crate::paths::database();
-    let done =
-        crate::compact::hold_off_compaction(&main).and_then(|_writing| Ok(crate::frozen::thaw_by_hand(&main, id)?));
-    match done {
-        Ok(crate::frozen::Thawed::Restored | crate::frozen::Thawed::AlreadyLive) => ApiResponse {
-            status: 303,
-            content_type: None,
-            body: String::new(),
-            headers: vec![("Location".into(), format!("/ui/release?id={id}"))],
-            bytes: None,
-            spool: None,
-            disposition: None,
-            failed: false,
-        },
-        Ok(crate::frozen::Thawed::NameTaken) => release_problem(
-            409,
-            "caution",
-            "a live release has this one's name in its group",
-            "It stays frozen. Its NZB still downloads from its page.",
-        ),
-        Ok(crate::frozen::Thawed::NotFrozen) => {
-            release_problem(404, "note", "there is no such frozen release", "It may have been thawed already.")
-        }
-        Err(e) => {
-            eprintln!("web thaw {id} failed: {e}");
-            release_problem(500, "caution", "the release could not be thawed", &e.to_string())
-        }
-    }
-}
-
 fn release_problem(status: u16, level: &str, title: &str, body: &str) -> ApiResponse {
     let content = format!(
         "{}<div class=\"signin\">{}<p><a href=\"/\">Back to the releases</a></p></div>",
@@ -3005,20 +1443,24 @@ fn release_problem(status: u16, level: &str, title: &str, body: &str) -> ApiResp
 /// Own/qualified display facts only. Loading and trust decisions precede this
 /// renderer; it cannot obtain missing metadata, copies, or provider data.
 struct ReleaseHeaderFacts<'a> {
-    category:i64,
-    details:Option<&'a crate::media::details::Details>,
-    spot:Option<SpotBadge<'a>>,
-    spot_removed:bool,
-    repair:bool,
-    groups:&'a [release_info::GroupPosting],
-    password:&'a str,
+    category: i64,
+    details: Option<&'a crate::media::details::Details>,
+    spot: Option<SpotBadge<'a>>,
+    spot_removed: bool,
+    repair: bool,
+    groups: &'a [release_info::GroupPosting],
+    password: &'a str,
 }
 #[allow(clippy::too_many_arguments)]
 fn release_header_from_facts(
-    r:&ReleaseRow,inner:&crate::archive::store::InnerView,media:Option<&MediaAttrs>,
-    names:Option<&release_info::Names>,contents:&release_info::Contents,
-    recovery:Option<&release_info::RecoveryOnly>,loaded:ReleaseHeaderFacts<'_>,
-)->(String,Option<String>,String,String) {
+    r: &ReleaseRow,
+    inner: &crate::archive::store::InnerView,
+    media: Option<&MediaAttrs>,
+    names: Option<&release_info::Names>,
+    contents: &release_info::Contents,
+    recovery: Option<&release_info::RecoveryOnly>,
+    loaded: ReleaseHeaderFacts<'_>,
+) -> (String, Option<String>, String, String) {
     let category = loaded.category;
     let (shown, raw) = shown_names(r, category, media, loaded.details);
     let mut tags = String::new();
@@ -3148,134 +1590,29 @@ fn release_header_from_facts(
     (shown, raw, tags, facts)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn release_html(
-    r: &ReleaseRow,
-    category: Option<i64>,
-    inner: &crate::archive::store::InnerView,
-    media: Option<&MediaAttrs>,
-    names: Option<&release_info::Names>,
-    contents: &release_info::Contents,
-    recovery: Option<&release_info::RecoveryOnly>,
-    split_groups: Option<&[release_info::GroupPosting]>,
-    post_ids: &[i64],
-    api_key: &str,
-) -> String {
-    let category = category.unwrap_or(UNCATEGORIZED);
-    // only what's kept: the title panel below fetches what isn't
-    let details =
-        media.and_then(|m| crate::media::details::kept_for(std::iter::once((r.id, m.kind, &m.ids))).remove(&r.id));
-    let spot = crate::spotnet::store::detail_of(r.id).unwrap_or_else(|e| {
-        eprintln!("web release {}: its spot: {e}", r.id);
-        None
-    });
-    // missing data its PAR2 volumes can rebuild: listed as whole, as a client repairs it, and said soo
-    let repair = !r.complete
-        && split_groups.is_none()
-        && recovery.is_none()
-        && contents.data_articles_seen < contents.data_articles_expected
-        && contents.repairable();
-    let posted_name = names.map_or(r.name.as_str(), |n| n.posted.as_str());
-    let groups = split_groups
-        .map(<[release_info::GroupPosting]>::to_vec)
-        .unwrap_or_else(|| release_info::groups_of(posted_name).unwrap_or_default());
-    let conn = crate::db::open().ok();
-    // the other postings, read once: the password below and the copies further down both use them
-    let found_copies = conn.as_ref().and_then(|c| crate::duplicates::copies_with(c, r.id).ok()).unwrap_or_default();
-    let own_hint = conn.as_ref().and_then(|c| crate::duplicates::own_password_hint(c, r.id, names));
-    let inherited = match (&own_hint, conn.as_ref()) {
-        (Some(hint), _) => Some(crate::duplicates::Inherited {
-            hint: release_info::PasswordHint { password: hint.password.clone(), source: hint.source },
-            from: r.id,
-            from_name: r.name.clone(),
-        }),
-        (None, Some(c)) => crate::duplicates::carried_password(c, r.id, &found_copies),
-        (None, None) => None,
-    };
-    let password = if let Some(hint) = &own_hint {
-        password_fact(inner, hint)
-    } else if let Some(from) = &inherited {
-        inherited_password_fact(from)
-    } else { String::new() };
-    let (shown, raw, tags, facts) = release_header_from_facts(r, inner, media, names, contents, recovery,
-        ReleaseHeaderFacts {category,details:details.as_ref(),spot:spot.as_ref().map(|detail|SpotBadge {poster:&detail.spot.poster,title:&detail.spot.title}),
-            spot_removed:spot.as_ref().is_some_and(|detail|detail.removed.is_some()),repair,groups:&groups,password:&password});
-
-    // the post's rows, this one first: its pictures and NFO can be in any of them
-    let rows: Vec<i64> = if post_ids.is_empty() { vec![r.id] } else { post_ids.to_vec() };
-    let files = inner_files_html(inner, recovery.is_some());
-
-    // the probe row is decoded once: the panels below read the same one
-    // its own stills, or those of a release with the same video file: shown from there, never made or kept twice
-    let stills = conn
-        .as_ref()
-        .and_then(|conn| {
-            let (shown, kind) = crate::probe::stills::shown_stills(conn, r.id)?;
-            let from = kind.map(|k| (shown, k));
-            Some(stills_html(shown, &crate::probe::stills::stills(conn, shown), from))
-        })
-        .unwrap_or_default();
-    let shown_pictures = conn.as_ref().map(|c| post_images(c, &rows)).unwrap_or_default();
-    let images = images_html(r.id, &shown_pictures);
-    let found = conn.as_ref().and_then(|c| crate::probe::read(c, r.id)).map(|p| seven_z_first_file(p, inner, contents));
-    let nfo = conn
-        .as_ref()
-        .and_then(|c| post_nfo(c, &rows, found.as_ref()))
-        .map_or(String::new(), |(text, imdb)| nfo_html(&text, &imdb));
-    let picture_states = conn.as_ref().map(|c| picture_states(c, &rows, &shown_pictures, contents)).unwrap_or_default();
-    let csrf = crate::web_settings::csrf_token(api_key);
-    let nzb_files = nzb_files_html(r.id, contents, &picture_states, &csrf);
-    let probe = match (conn.as_ref(), found.as_ref()) {
-        (Some(c), Some(found)) => probe_html(
-            found,
-            crate::probe::opensubtitles::read(c, r.id).as_ref(),
-            crate::probe::has_cover(c, r.id).then_some(r.id),
-            crate::web_meta::salt_of(Some(c)),
-        ),
-        _ => String::new(),
-    };
-    let meta = crate::web_meta::meta_html(
-        conn.as_ref(),
-        &crate::web_meta::MetaInputs { release: r, inner, names, contents, probe: found.as_ref() },
-    );
-    let copies = found_copies;
-    let has_twin = crate::duplicates::can_fill(&copies);
-    let fill = if has_twin && contents.articles_seen < contents.articles_expected {
-        format!(
-            "<a class=\"button\" href=\"/ui/nzb?id={}&amp;fill=1\">NZB, gaps filled from a twin (check it with PAR2)</a>",
-            r.id
-        )
-    } else {
-        String::new()
-    };
-    // the other volumes of its set aren't copies of the release, whatever the set's list makes them look like
-    // a password goes only to the copies holding this release's whole payload, not a shared NFO or one volume
-    let carry_to: Vec<i64> = conn
-        .as_ref()
-        .map(|c| crate::duplicates::carriers(c, r.id, &copies).iter().map(|copy| copy.id).collect())
-        .unwrap_or_default();
-    let copies = if recovery.is_some() { String::new() } else { copies_html(&copies, inherited.as_ref(), &carry_to) };
-    let warning = recovery.map_or(String::new(), recovery_warning);
-    let spot = spot.as_ref().map_or(String::new(), |d| {
-        let said = crate::db::with_reader(|c| crate::spotnet::comments::about(c, r.id, &d.message_id))
-            .map(|(comments, reports)| SpotSaid { comments, reports })
-            .unwrap_or_else(|e| {
-                eprintln!("web release {}: its spot's comments: {e}", r.id);
-                SpotSaid::default()
-            });
-        spot_html(d, &said)
-    });
-
-    release_page_from_facts(r, &shown, raw.as_deref(), &tags, &facts, category,
-        ReleaseSections {fill,warning,spot,nfo,images,stills,copies,meta,probe,nzb_files,files})
-}
-
 struct ReleaseSections {
-    fill:String,warning:String,spot:String,nfo:String,images:String,stills:String,
-    copies:String,meta:String,probe:String,nzb_files:String,files:String,
+    fill: String,
+    warning: String,
+    spot: String,
+    nfo: String,
+    images: String,
+    stills: String,
+    copies: String,
+    meta: String,
+    probe: String,
+    nzb_files: String,
+    files: String,
 }
-fn release_page_from_facts(r:&ReleaseRow,shown:&str,raw:Option<&str>,tags:&str,facts:&str,category:i64,sections:ReleaseSections)->String {
-    let ReleaseSections {fill,warning,spot,nfo,images,stills,copies,meta,probe,nzb_files,files}=sections;
+fn release_page_from_facts(
+    r: &ReleaseRow,
+    shown: &str,
+    raw: Option<&str>,
+    tags: &str,
+    facts: &str,
+    category: i64,
+    sections: ReleaseSections,
+) -> String {
+    let ReleaseSections { fill, warning, spot, nfo, images, stills, copies, meta, probe, nzb_files, files } = sections;
     page(
         &format!("{shown} · Atlas"),
         &format!(
@@ -3304,7 +1641,7 @@ fn release_page_from_facts(r:&ReleaseRow,shown:&str,raw:Option<&str>,tags:&str,f
     )
 }
 
-fn inner_files_html(inner:&crate::archive::store::InnerView,repairs:bool)->String {
+fn inner_files_html(inner: &crate::archive::store::InnerView, repairs: bool) -> String {
     let (heading, listed) = inner_files_listed(inner, repairs);
     if listed.is_empty() {
         String::new()
@@ -3366,10 +1703,15 @@ fn nzb_files_html(
     pictures: &HashMap<String, PictureState>,
     csrf: &str,
 ) -> String {
-    nzb_files_html_with(id,contents,pictures,csrf,picture_state_html)
+    nzb_files_html_with(id, contents, pictures, csrf, picture_state_html)
 }
-fn nzb_files_html_with(id:i64,contents:&release_info::Contents,pictures:&HashMap<String,PictureState>,csrf:&str,
-    render_picture:fn(i64,&str,&PictureState,&str)->String)->String {
+fn nzb_files_html_with(
+    id: i64,
+    contents: &release_info::Contents,
+    pictures: &HashMap<String, PictureState>,
+    csrf: &str,
+    render_picture: fn(i64, &str, &PictureState, &str) -> String,
+) -> String {
     if contents.list.is_empty() {
         return String::new();
     }
@@ -3419,32 +1761,6 @@ fn nzb_files_html_with(id:i64,contents:&release_info::Contents,pictures:&HashMap
     format!(
         "<h2>Files in the NZB</h2>{hint}<div class=\"table-wrap\"><table><thead><tr><th>Name</th><th class=\"num col-size\">Posted size</th><th class=\"num\">Articles</th><th class=\"col-state\">State</th>{picture_head}</tr></thead><tbody>{rows}</tbody></table></div>{more}"
     )
-}
-
-/// A release's NZB with what it's missing taken from its twins, or as it is when they don't help.
-fn filled_nzb(args: &HashMap<String, String>) -> ApiResponse {
-    let id = args.get("id").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
-    match crate::duplicates::filled_nzb(id) {
-        Ok(Some(content)) => {
-            let name = get_release(id).ok().flatten().map(|r| r.name).unwrap_or_default();
-            let filename = crate::nzb::nzb_filename(&name, Some(id)).replace(['"', '\\'], "_");
-            ApiResponse {
-                status: 200,
-                content_type: Some("application/x-nzb"),
-                body: content,
-                headers: vec![("Content-Disposition".into(), format!("attachment; filename=\"{filename}\""))],
-                bytes: None,
-                spool: None,
-                disposition: None,
-                failed: false,
-            }
-        }
-        Ok(None) => ApiResponse::not_found(),
-        Err(e) => {
-            eprintln!("web filled nzb {id} failed: {e}");
-            html(500, String::new())
-        }
-    }
 }
 
 pub(crate) fn verdict(ok: Option<bool>, good: &str, bad: &str) -> String {
@@ -3819,111 +2135,7 @@ fn tag_value(name: &str, value: &str) -> String {
 }
 
 /// Copies read in full on one page: each reads its articles.
-const FULL_COPIES: usize = 12;
-const CLUSTERS_PER_PAGE: i64 = 10;
 /// Of one cluster, the most read in full. The rest are links.
-const FULL_MEMBERS: usize = 6;
-
-/// One copy, with everything that helps to choose between copies. Scores and posters are what's already kept, soo a
-/// list never calls out: they come once someone has opened the title.
-fn copy_card(
-    conn: &rusqlite::Connection,
-    badge: &str,
-    r: &ReleaseRow,
-    inherited: Option<&crate::duplicates::Inherited>,
-) -> String {
-    let parsed = release_tags::parse(&r.name);
-    let media = crate::media::query::attrs_with(conn, &[r.id]).unwrap_or_default().remove(&r.id);
-    let details = media
-        .as_ref()
-        .and_then(|m| crate::media::details::kept_for(std::iter::once((r.id, m.kind, &m.ids))).remove(&r.id));
-    let names = release_info::names_with(conn, r.id).unwrap_or_default();
-    // its counts, and its bytes only where the repair verdict needs them: reading every article of each copy was most
-    // of a page's time
-    let contents = release_info::contents_summary_with(conn, r.id).unwrap_or_default();
-    let inner = crate::archive::store::view_with(conn, r.id);
-    let hint = crate::duplicates::own_password_hint(conn, r.id, names.as_ref());
-    // a password found on a posting of the same bytes, never this one's own
-    let inherited = inherited.filter(|from| from.from != r.id);
-
-    let mut tags = badge.to_string();
-    tags.push_str(&name_tags(&parsed));
-    if names.as_ref().is_some_and(|n| n.obfuscated) {
-        tags.push_str(&tag("tag-warn", "OBFUSCATED"));
-    }
-    tags.push_str(&password_tag(inner.password.as_ref()));
-    if !r.complete {
-        tags.push_str(&tag("tag-warn", "INCOMPLETE"));
-    }
-    if let Some(d) = &details {
-        tags.push_str(&scores_html(d));
-    }
-
-    let mut facts = String::new();
-    let mut fact = |name: &str, value: String| {
-        if !value.is_empty() {
-            let _ = write!(facts, "<dt>{name}</dt><dd>{value}</dd>");
-        }
-    };
-    if let Some(size) = r.size {
-        fact("Size", format!("{} · {} bytes", escape(&fmt_size(r.size)), thousands(size)));
-    }
-    fact("Group", search_link_to("group", &r.group_name, &r.group_name));
-    if let Some(raw) = &r.poster {
-        let poster = release_info::parse_poster(raw);
-        fact("Poster", poster.name.as_deref().map_or(String::new(), |name| search_link_to("poster", raw, name)));
-        if let Some(email) = poster.email {
-            let made_up = if release_info::looks_made_up(&email) { tag("tag-warn", "MADE UP") } else { String::new() };
-            fact("Email", format!("{}{made_up}", search_link_to("email", &email, &email)));
-        }
-    }
-    if contents.par2_files > 0 {
-        fact("PAR2 files", format!("{} ({} recovery)", contents.par2_files, contents.recovery_volumes));
-    }
-    fact("Repair", repair_fact(&contents));
-    if let Some(missing) = contents.missing_per_mille() {
-        fact("Articles", health(&contents, missing));
-    }
-    fact("Encryption", encryption_fact(&inner));
-    if let Some(hint) = &hint {
-        fact("Password", password_fact(&inner, hint));
-    } else if let Some(from) = inherited {
-        fact("Password", inherited_password_fact(from));
-    }
-    fact(
-        "Video",
-        escape(
-            &[parsed.codec.as_deref(), parsed.bit_depth.as_deref(), parsed.container.as_deref()]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
-                .join(", "),
-        ),
-    );
-    fact("Audio", escape(&parsed.audio.iter().chain(&parsed.channels).cloned().collect::<Vec<_>>().join(", ")));
-    fact("Languages", escape(&parsed.languages.join(", ")));
-    if let Some(network) = &parsed.network {
-        fact("Ripped from", escape(network));
-    }
-    if let Some(group) = &parsed.group {
-        fact("Release group", search_link_to("team", group, group));
-    }
-    if let Some(m) = &media {
-        fact("Links", id_links(m.kind, &m.ids));
-    }
-    let thumb = details.filter(crate::media::details::poster_kept).map_or(String::new(), |d| {
-        format!(
-            "<img class=\"copy-poster\" src=\"/ui/poster?kind={}&amp;tmdb={}\" alt=\"\" loading=\"lazy\" width=\"72\" height=\"108\">",
-            d.kind, d.tmdb_id
-        )
-    });
-    format!(
-        "<article class=\"panel copy\">{thumb}<div class=\"copy-body\"><div class=\"copy-head\"><div class=\"name\"><a href=\"/ui/release?id={id}\">{name}</a>{tags}{more}</div><a class=\"button small primary\" href=\"/ui/nzb?id={id}\">NZB</a></div><dl class=\"facts facts-wide\">{facts}</dl></div></article>",
-        id = r.id,
-        name = escape(&r.name),
-        more = crate::web_meta::card_trigger(r.id, "closest .copy-body"),
-    )
-}
 
 /// A copy past the first few: its name, badge and size, with the `+` that opens its drawer in place.
 fn copy_link(badge: &str, r: &ReleaseRow) -> String {
@@ -3937,148 +2149,6 @@ fn copy_link(badge: &str, r: &ReleaseRow) -> String {
 }
 
 /// What the kinds of copy on a release's page are.
-const COPIES_ABOUT: &str = "An xpost is this same upload seen in another group: the very same articles. A twin is a separate upload of the same posting, at another time: the same files, PAR2 set, recovery volumes and article counts under other message-ids. An alt holds the same content packed differently.";
-
-/// Other postings of this release's content.
-fn copies_html(
-    copies: &[(crate::duplicates::Copy, ReleaseRow)],
-    inherited: Option<&crate::duplicates::Inherited>,
-    carry_to: &[i64],
-) -> String {
-    use crate::duplicates::Copy;
-    if copies.is_empty() {
-        return String::new();
-    }
-    // xposts and twins holding this release's whole payload take its password; an alt is packed apart
-    let carried = |copy: &ReleaseRow| if carry_to.contains(&copy.id) { inherited } else { None };
-    let badge = |kind: &Copy| match kind {
-        Copy::Xpost => tag("tag-ref", "XPOST"),
-        Copy::Twin => tag("tag-ok", "TWIN"),
-        Copy::Alt => tag("tag-ref", "ALT"),
-    };
-    let Ok(conn) = crate::db::open() else { return String::new() };
-    let cards: String = copies
-        .iter()
-        .take(FULL_COPIES)
-        .map(|(kind, copy)| copy_card(&conn, &badge(kind), copy, carried(copy)))
-        .collect();
-    let rest: String = copies.iter().skip(FULL_COPIES).map(|(kind, copy)| copy_link(&badge(kind), copy)).collect();
-    let rest = if rest.is_empty() { rest } else { format!("<ul class=\"copy-rest\">{rest}</ul>") };
-    format!("<h2>Other copies</h2><div class=\"copies\">{cards}</div>{rest}<p class=\"sort\">{COPIES_ABOUT}</p>")
-}
-
-/// Every cluster of copies, whichever release they're found from.
-fn duplicates_page(args: &HashMap<String, String>) -> ApiResponse {
-    use crate::duplicates::{ClusterKind, cluster_count_with, clusters_with};
-    let kind = if args.get("kind").is_some_and(|k| k == "alts") { ClusterKind::Alts } else { ClusterKind::Twins };
-    let number = args.get("page").and_then(|p| p.parse::<i64>().ok()).unwrap_or(1).max(1);
-    let read = crate::db::open().and_then(|conn| {
-        let twins = cluster_count_with(&conn, ClusterKind::Twins)?;
-        let alts = cluster_count_with(&conn, ClusterKind::Alts)?;
-        let page = clusters_with(&conn, kind, (number - 1) * CLUSTERS_PER_PAGE, CLUSTERS_PER_PAGE)?;
-        Ok((conn, twins, alts, page))
-    });
-    let (conn, twins, alts, page) = match read {
-        Ok(found) => found,
-        Err(e) => {
-            eprintln!("web duplicates failed: {e}");
-            return release_problem(500, "caution", "the copies could not be read", "The error is in Atlas's log.");
-        }
-    };
-    let chip = |word: &str, label: &str, count: i64, on: bool| {
-        let current = if on { " aria-current=\"true\"" } else { "" };
-        format!("<a class=\"chip\" href=\"/ui/duplicates?kind={word}\"{current}>{label} {}</a>", thousands(count))
-    };
-    let (total, word, badge, about) = match kind {
-        ClusterKind::Twins => (
-            twins,
-            "twins",
-            tag("tag-ok", "TWIN"),
-            "Twins are the same posting: the same files, PAR2 set, recovery volumes and article counts, so one can fill the other's gaps. A separate upload is a twin; the same upload seen in another group, the very same articles, is an xpost.",
-        ),
-        ClusterKind::Alts => (
-            alts,
-            "alts",
-            tag("tag-ref", "ALT"),
-            "Alts hold files of the same exact sizes, packed differently, so each is a separate download.",
-        ),
-    };
-    let clusters: String = page
-        .iter()
-        .map(|members| {
-            let title = release_tags::parse(&members[0].name).title;
-            let title = if title.is_empty() { members[0].name.clone() } else { title };
-            // in a twin cluster, a member that is an earlier one crossposted is that upload, not another
-            let xposts = match kind {
-                ClusterKind::Twins => crate::duplicates::xposts_of_earlier(&conn, members),
-                ClusterKind::Alts => vec![false; members.len()],
-            };
-            let xpost = tag("tag-ref", "XPOST");
-            let badge_of = |i: usize| if xposts[i] { &xpost } else { &badge };
-            // every twin in a cluster holds the same bytes: one's password is all of theirs
-            let inherited = match kind {
-                ClusterKind::Twins => crate::duplicates::first_password(&conn, members.iter()),
-                ClusterKind::Alts => None,
-            };
-            let cards: String = members
-                .iter()
-                .enumerate()
-                .take(FULL_MEMBERS)
-                .map(|(i, r)| copy_card(&conn, badge_of(i), r, inherited.as_ref()))
-                .collect();
-            let rest: String =
-                members.iter().enumerate().skip(FULL_MEMBERS).map(|(i, r)| copy_link(badge_of(i), r)).collect();
-            let rest = if rest.is_empty() { rest } else { format!("<ul class=\"copy-rest\">{rest}</ul>") };
-            format!(
-                "<section class=\"cluster\"><h2>{} <span class=\"count\">{} copies</span></h2><div class=\"copies\">{cards}</div>{rest}</section>",
-                escape(&title),
-                members.len()
-            )
-        })
-        .collect();
-    let body = if clusters.is_empty() && number == 1 {
-        diag(
-            "note",
-            &format!("no {word} found yet"),
-            "Copies are found once archives and PAR2 sets have been read, and that needs a body budget.",
-        )
-    } else {
-        clusters
-    };
-    let pages = (total + CLUSTERS_PER_PAGE - 1) / CLUSTERS_PER_PAGE;
-    let pager = if pages > 1 {
-        let link = |to: i64, text: &str| {
-            format!("<a class=\"button\" href=\"/ui/duplicates?kind={word}&amp;page={to}\">{text}</a>")
-        };
-        format!(
-            "<nav class=\"actions\" aria-label=\"Pages\">{}<span class=\"sort\">Page {number} of {pages}</span>{}</nav>",
-            if number > 1 { link(number - 1, "Previous") } else { String::new() },
-            if number < pages { link(number + 1, "Next") } else { String::new() },
-        )
-    } else {
-        String::new()
-    };
-    let content = format!(
-        "{masthead}<div class=\"release\"><main><h1>Duplicates</h1><div class=\"chips\">{twins}{alts}</div><p class=\"sort\">{about}</p>{body}{pager}</main></div>",
-        masthead = masthead(true),
-        twins = chip("twins", "Twins", twins, kind == ClusterKind::Twins),
-        alts = chip("alts", "Alts", alts, kind == ClusterKind::Alts),
-    );
-    html(200, self::page("Duplicates · Atlas", &content))
-}
-
-/// Loaded after the page, soo a slow provider doesn't hold it up. Empty when the title isn't known.
-fn details_panel(args: &HashMap<String, String>) -> ApiResponse {
-    let id = args.get("id").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
-    let media = crate::media::query::attrs_of(&[id]).unwrap_or_default().remove(&id);
-    let details =
-        media.as_ref().and_then(|m| crate::media::details::for_title(&crate::config::media_config(), m.kind, &m.ids));
-    let file_secs = crate::db::open()
-        .ok()
-        .and_then(|conn| crate::probe::read(&conn, id))
-        .and_then(|p| p.media.and_then(|m| m.duration_secs));
-    html(200, details.map(|d| details_html(&d, file_secs)).unwrap_or_default())
-}
 
 /// How this file's length compares with the title's, when they differ by more than credits and logos do.
 fn runtime_note(minutes: i64, file_secs: Option<f64>) -> String {
@@ -4180,42 +2250,6 @@ fn stills_html(id: i64, stills: &[(u8, Option<i64>, u32, u32)], from: Option<(i6
     )
 }
 
-/// The pictures of a post's rows, each picture once (by its bytes): (the row it's kept for, the picture).
-fn post_images(conn: &rusqlite::Connection, rows: &[i64]) -> Vec<(i64, crate::images::step::Image)> {
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for &row in rows.iter().take(LINKED_PICTURE_ROWS) {
-        for image in crate::images::step::images(conn, row) {
-            if seen.insert(image.sha256.clone()) {
-                out.push((row, image));
-            }
-        }
-    }
-    out
-}
-
-/// The NFO of a post: the probe's (with the IMDb ids it read) of this release, else of another of its rows, else one a
-/// step kept for any of them (an NFO posted on its own and found beside the release is kept that way).
-fn post_nfo(
-    conn: &rusqlite::Connection,
-    rows: &[i64],
-    probe: Option<&crate::probe::ProbeInfo>,
-) -> Option<(String, Vec<String>)> {
-    if let Some(p) = probe
-        && let Some(text) = &p.nfo
-    {
-        return Some((text.clone(), p.imdb_ids.clone()));
-    }
-    for &row in rows.iter().skip(1).take(32) {
-        if let Some(p) = crate::probe::read(conn, row)
-            && let Some(text) = p.nfo
-        {
-            return Some((text, p.imdb_ids));
-        }
-    }
-    rows.iter().take(32).find_map(|&row| crate::probe::nfo_store::any_text(conn, row)).map(|text| (text, Vec::new()))
-}
-
 /// The NFO panel: its text as posted, and the IMDb titles it names.
 fn nfo_html(text: &str, imdb_ids: &[String]) -> String {
     let imdb: Vec<String> = imdb_ids
@@ -4265,91 +2299,8 @@ pub(crate) enum PictureState {
     Offer,
 }
 
-/// The state of each picture the post's files list holds.
-fn picture_states(
-    conn: &rusqlite::Connection,
-    rows: &[i64],
-    shown: &[(i64, crate::images::step::Image)],
-    contents: &release_info::Contents,
-) -> HashMap<String, PictureState> {
-    let names: Vec<&str> =
-        contents.list.iter().map(|f| f.name.as_str()).filter(|n| crate::images::is_image_name(n)).collect();
-    if names.is_empty() {
-        return HashMap::new();
-    }
-    let requests = picture_requests_of(conn, rows);
-    names.into_iter().map(|name| (name.to_string(), picture_state(name, shown, &requests))).collect()
-}
-
-/// Requests of a post's rows and of the releases they were found beside or linked into, which read them.
-fn picture_requests_of(conn: &rusqlite::Connection, rows: &[i64]) -> Vec<crate::images::step::Request> {
-    let mut ids: Vec<i64> = rows.iter().take(LINKED_PICTURE_ROWS).copied().collect();
-    for &row in rows.iter().take(LINKED_PICTURE_ROWS) {
-        if let Some(reader) = picture_reader(conn, row)
-            && !ids.contains(&reader)
-        {
-            ids.push(reader);
-        }
-    }
-    crate::images::step::requests(conn, &ids)
-}
-
-fn picture_state(
-    name: &str,
-    shown: &[(i64, crate::images::step::Image)],
-    requests: &[crate::images::step::Request],
-) -> PictureState {
-    if shown.iter().any(|(_, i)| i.file == name) {
-        return PictureState::Shown;
-    }
-    match requests.iter().filter(|q| q.file == name).max_by_key(|q| q.requested_at) {
-        Some(q) if q.done_at.is_none() && q.passed_over => {
-            PictureState::Failed("the pictures step isn't reading this release".to_string())
-        }
-        Some(q) if q.done_at.is_none() => PictureState::Queued(
-            crate::web_pending::step_eta(q.release_id, "images").unwrap_or_else(|| "soon".to_string()),
-        ),
-        Some(q) if q.outcome.as_deref().is_some_and(|o| o != crate::images::step::Answer::Shown.word()) => {
-            PictureState::Failed(q.outcome.clone().unwrap_or_default())
-        }
-        _ => PictureState::Offer,
-    }
-}
-
-/// The release whose pictures step reads row `row`'s files: the release it was found beside, the upload it's linked
-/// into, or the row itself.
-fn picture_reader(conn: &rusqlite::Connection, row: i64) -> Option<i64> {
-    if let Ok(Some(owner)) = crate::archive::link::beside_owner(conn, row) {
-        return Some(owner);
-    }
-    let s = crate::store::shard_of_id(row);
-    let lead: Option<i64> = conn
-        .prepare_cached(&format!("select lead_id from s{s}.upload_link where release_id = ?1"))
-        .and_then(|mut q| rusqlite::OptionalExtension::optional(q.query_row([row], |r| r.get(0))))
-        .ok()
-        .flatten();
-    Some(lead.unwrap_or(row))
-}
-
-/// The release that reads picture `name` of the post release `id` is shown with: the reader of the row holding it.
-fn picture_target(conn: &rusqlite::Connection, id: i64, name: &str) -> Option<i64> {
-    let release = crate::search::get_release_with(conn, id).ok()??;
-    let rows = release_info::whole_post_with(conn, &release).ok().flatten().map_or_else(|| vec![id], |p| p.ids);
-    let holder = rows.into_iter().take(LINKED_PICTURE_ROWS).find(|row| {
-        let s = crate::store::shard_of_id(*row);
-        conn.query_row(
-            &format!("select exists (select 1 from s{s}.files where release_id = ?1 and filename = ?2)"),
-            rusqlite::params![row, name],
-            |r| r.get::<_, bool>(0),
-        )
-        .unwrap_or(false)
-    })?;
-    picture_reader(conn, holder)
-}
-
 /// Rows of a post looked through for its pictures: the one holding a picture asked for, the pictures shown, and
 /// the requests their cells show. One limit for all three, soo a picture that can be asked for shows how it went.
-const LINKED_PICTURE_ROWS: usize = 256;
 
 /// One picture's cell in the files list: shown, queued with when it's read, failed, or a Fetch button. A queued one
 /// asks again every 30 seconds.
@@ -4380,66 +2331,6 @@ fn picture_state_html(id: i64, name: &str, state: &PictureState, csrf: &str) -> 
             button("Try again")
         ),
         PictureState::Offer => format!("<div class=\"picture-state\">{}</div>", button("Fetch")),
-    }
-}
-
-/// `/ui/picture?id=&name=`: a picture's cell, as it stands now. Once it's shown, a link that reloads the page to show it.
-fn picture_state_fragment(args: &HashMap<String, String>, api_key: &str) -> ApiResponse {
-    let id = args.get("id").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
-    let name = args.get("name").map(String::as_str).unwrap_or_default();
-    let Ok(conn) = crate::db::open() else { return html(200, String::new()) };
-    let state = current_picture_state(&conn, id, name);
-    if state == PictureState::Shown {
-        return html(
-            200,
-            format!(
-                "<div class=\"picture-state\">{} <a href=\"/ui/release?id={id}#pictures\">reload to see it</a></div>",
-                tag("tag-ok", "SHOWN")
-            ),
-        );
-    }
-    html(200, picture_state_html(id, name, &state, &crate::web_settings::csrf_token(api_key)))
-}
-
-fn current_picture_state(conn: &rusqlite::Connection, id: i64, name: &str) -> PictureState {
-    let rows = crate::search::get_release_with(conn, id)
-        .ok()
-        .flatten()
-        .and_then(|r| release_info::whole_post_with(conn, &r).ok().flatten())
-        .map_or_else(|| vec![id], |p| p.ids);
-    let shown = post_images(conn, &rows);
-    picture_state(name, &shown, &picture_requests_of(conn, &rows))
-}
-
-/// POST /ui/picture: a picture of release `id` asked for, read at its reader's next turn. Its cell, now queued. A
-/// refusal comes back as a 200 too, soo htmx swaps it in and the cell says why.
-fn ask_picture(body: &str, csrf: Option<&str>, api_key: &str) -> ApiResponse {
-    let args = parse_query(body);
-    if !crate::web_settings::csrf_ok(&args, csrf, api_key) {
-        return html(200, "<div class=\"picture-state\">The page is out of date: reload it.</div>".into());
-    }
-    let id = args.get("id").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
-    let name = args.get("name").map(String::as_str).unwrap_or_default();
-    if !crate::images::is_image_name(name) {
-        return html(200, "<div class=\"picture-state\">Not a picture.</div>".into());
-    }
-    let main = crate::paths::database();
-    let asked = crate::compact::hold_off_compaction(&main).and_then(|_writing| {
-        let conn = crate::db::open()?;
-        let Some(target) = picture_target(&conn, id, name) else { return Ok(None) };
-        crate::images::step::ask(&conn, target, name, chrono::Utc::now().timestamp())?;
-        Ok(Some(conn))
-    });
-    match asked {
-        Ok(Some(conn)) => {
-            let state = current_picture_state(&conn, id, name);
-            html(200, picture_state_html(id, name, &state, &crate::web_settings::csrf_token(api_key)))
-        }
-        Ok(None) => html(200, "<div class=\"picture-state\">No such picture in this release.</div>".into()),
-        Err(e) => {
-            eprintln!("web picture {id} {name:?} failed: {e:#}");
-            html(200, "<div class=\"picture-state\">Couldn't be queued: the error is in Atlas's log.</div>".into())
-        }
     }
 }
 
@@ -4524,17 +2415,6 @@ fn image_facts(i: &crate::images::step::Image) -> String {
     facts.iter().map(|(k, v)| format!("<dt>{k}</dt><dd>{}</dd>", escape(v))).collect()
 }
 
-/// Other releases that carry one of this release's pictures, by the same bytes or the same EXIF or XMP id.
-fn same_picture_panel(args: &HashMap<String, String>) -> ApiResponse {
-    let id = args.get("id").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
-    let Ok(conn) = crate::db::open() else { return html(200, String::new()) };
-    let rows: Vec<(ReleaseRow, crate::images::step::Tie)> = crate::images::step::same_pictures(&conn, id, 50)
-        .into_iter()
-        .filter_map(|(other, _, tie)| Some((crate::search::get_release_with(&conn, other).ok().flatten()?, tie)))
-        .collect();
-    html(200, same_picture_html(&rows))
-}
-
 fn same_picture_html(rows: &[(ReleaseRow, crate::images::step::Tie)]) -> String {
     if rows.is_empty() {
         return String::new();
@@ -4557,41 +2437,6 @@ fn same_picture_html(rows: &[(ReleaseRow, crate::images::step::Tie)]) -> String 
     )
 }
 
-/// One picture posted with a release, as it was posted.
-fn image(args: &HashMap<String, String>) -> ApiResponse {
-    let number = |key: &str| args.get(key).and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
-    let (id, at) = (number("id"), number("at"));
-    let Some((bytes, format)) = crate::db::open().ok().and_then(|conn| crate::images::step::image(&conn, id, at))
-    else {
-        return ApiResponse::not_found();
-    };
-    ApiResponse {
-        status: 200,
-        content_type: Some(crate::images::content_type(&format)),
-        body: String::new(),
-        headers: vec![
-            ("Cache-Control".into(), "private, max-age=86400".into()),
-            ("X-Content-Type-Options".into(), "nosniff".into()),
-            ("Content-Security-Policy".into(), "default-src 'none'; img-src 'self'; sandbox".into()),
-        ],
-        bytes: Some(bytes),
-        spool: None,
-        disposition: None,
-        failed: false,
-    }
-}
-
-/// Other releases whose stills match this one's: the same film, from another source or encode.
-fn same_film_panel(args: &HashMap<String, String>) -> ApiResponse {
-    let id = args.get("id").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
-    let Ok(conn) = crate::db::open() else { return html(200, String::new()) };
-    let rows: Vec<ReleaseRow> = crate::probe::stills::same_film(&conn, id)
-        .into_iter()
-        .filter_map(|other| crate::search::get_release_with(&conn, other).ok().flatten())
-        .collect();
-    html(200, same_film_html(&rows))
-}
-
 fn same_film_html(rows: &[ReleaseRow]) -> String {
     if rows.is_empty() {
         return String::new();
@@ -4612,46 +2457,13 @@ fn same_film_html(rows: &[ReleaseRow]) -> String {
     )
 }
 
-/// `/ui/same?id=&kind=`: the other releases that share one of a release's keys (`keys::Kind`), newest first. The
-/// key is worked out from the release, never taken from the address, and the release is read the way the release
-/// page reads it, soo one in a blocked group, or none, is not served.
-fn same_key_page(args: &HashMap<String, String>) -> ApiResponse {
-    use crate::keys::{self, Kind};
-    let id = args.get("id").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
-    let Some(kind) = args.get("kind").and_then(|k| Kind::parse(k)) else {
-        return release_problem(400, "caution", "no such key", "The link names a key Atlas doesn't keep.");
-    };
-    let read = crate::db::open().and_then(|conn| {
-        let Some(release) = crate::search::get_release_with(&conn, id)? else { return Ok(None) };
-        let main = crate::paths::database();
-        let shard = crate::db::open_shard(&crate::store::shard_path(&main, crate::store::shard_of_id(id)))?;
-        let lookup = keys::read_lookup(&shard, id, release.parts, keys::salt(&conn))?;
-        let rows: Vec<ReleaseRow> = keys::others(&conn, id, &lookup, kind, keys::LIST_CAP)
-            .into_iter()
-            .filter_map(|other| crate::search::get_release_with(&conn, other).ok().flatten())
-            .collect();
-        Ok(Some((release, lookup.has(kind), rows)))
-    });
-    let (release, has, rows) = match read {
-        Ok(Some(found)) => found,
-        Ok(None) => {
-            return release_problem(
-                404,
-                "caution",
-                "no such release",
-                "It may have been deleted, or its group blocked.",
-            );
-        }
-        Err(e) => {
-            eprintln!("web same-key list failed: {e}");
-            return release_problem(500, "caution", "the list could not be read", "The error is in Atlas's log.");
-        }
-    };
-    same_key_page_from_facts(&release,kind,has,&rows)
-}
-
-fn same_key_page_from_facts(release:&ReleaseRow,kind:crate::keys::Kind,has:bool,rows:&[ReleaseRow])->ApiResponse {
-    let id=release.id;
+fn same_key_page_from_facts(
+    release: &ReleaseRow,
+    kind: crate::keys::Kind,
+    has: bool,
+    rows: &[ReleaseRow],
+) -> ApiResponse {
+    let id = release.id;
     let body = if !has {
         diag("note", "this release has no such key", "Its probe, PAR2 set or article timing doesn't give one.")
     } else if rows.is_empty() {
@@ -4695,57 +2507,6 @@ fn clock(ms: i64) -> String {
     let secs = ms.max(0) / 1000;
     let (h, m, s) = (secs / 3600, secs / 60 % 60, secs % 60);
     if h > 0 { format!("{h}:{m:02}:{s:02}") } else { format!("{m}:{s:02}") }
-}
-
-/// One still's JPEG.
-fn still(args: &HashMap<String, String>) -> ApiResponse {
-    let number = |key: &str| args.get(key).and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
-    let (id, at) = (number("id"), number("at"));
-    let found = u8::try_from(at)
-        .ok()
-        .and_then(|at| crate::db::open().ok().and_then(|conn| crate::probe::stills::still(&conn, id, at)));
-    let Some(bytes) = found else {
-        return ApiResponse::not_found();
-    };
-    ApiResponse {
-        status: 200,
-        content_type: Some("image/jpeg"),
-        body: String::new(),
-        headers: vec![
-            ("Cache-Control".into(), "private, max-age=86400".into()),
-            ("X-Content-Type-Options".into(), "nosniff".into()),
-        ],
-        bytes: Some(bytes),
-        spool: None,
-        disposition: None,
-        failed: false,
-    }
-}
-
-fn poster(args: &HashMap<String, String>) -> ApiResponse {
-    let number = |key: &str| args.get(key).and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
-    let cfg = crate::config::media_config();
-    let found = if args.get("art").is_some_and(|art| art == "backdrop") {
-        crate::media::details::backdrop(number("kind"), number("tmdb"), &cfg)
-    } else {
-        crate::media::details::poster(number("kind"), number("tmdb"), &cfg)
-    };
-    let Some(bytes) = found else {
-        return ApiResponse::not_found();
-    };
-    ApiResponse {
-        status: 200,
-        content_type: Some("image/jpeg"),
-        body: String::new(),
-        headers: vec![
-            ("Cache-Control".into(), "private, max-age=2592000".into()),
-            ("X-Content-Type-Options".into(), "nosniff".into()),
-        ],
-        bytes: Some(bytes),
-        spool: None,
-        disposition: None,
-        failed: false,
-    }
 }
 
 /// SDR, HDR10, HLG, PQ, DV, or DV with the layer it falls back to: `DV HDR10`. Empty when nothing says which.
@@ -4835,28 +2596,6 @@ fn transfer_name(code: u64) -> Option<&'static str> {
         16 => Some("PQ"),
         18 => Some("HLG"),
         _ => None,
-    }
-}
-
-/// The cover art attached to a release's video.
-fn cover(args: &HashMap<String, String>) -> ApiResponse {
-    let id = args.get("id").and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(0);
-    let Some((mime, bytes)) = crate::db::open().ok().and_then(|conn| crate::probe::cover(&conn, id)) else {
-        return ApiResponse::not_found();
-    };
-    let content_type = if mime == "image/png" { "image/png" } else { "image/jpeg" };
-    ApiResponse {
-        status: 200,
-        content_type: Some(content_type),
-        body: String::new(),
-        headers: vec![
-            ("Cache-Control".into(), "private, max-age=86400".into()),
-            ("X-Content-Type-Options".into(), "nosniff".into()),
-        ],
-        bytes: Some(bytes),
-        spool: None,
-        disposition: None,
-        failed: false,
     }
 }
 
@@ -5023,57 +2762,6 @@ fn described(search: &Search) -> String {
         parts.push(way);
     }
     parts.join(", ")
-}
-
-/// Plain words to a search: Gemini reads them, the page searches with what it read.
-fn ask(body: &str, htmx: bool, hide_incomplete: bool) -> ApiResponse {
-    let args = parse_query(body);
-    let question: String = args.get("ask").map_or("", |q| q.trim()).chars().take(gemini::MAX_QUESTION).collect();
-    let failed = |title: &str, why: &str| {
-        let mut resp = html(200, diag("caution", title, why));
-        resp.headers.push(("HX-Retarget".into(), "#ask-note".into()));
-        resp.headers.push(("HX-Reswap".into(), "innerHTML".into()));
-        resp
-    };
-    if question.is_empty() {
-        return failed("ask something first", "Type what you want in the Ask AI box, like 4K remuxes of Dune.");
-    }
-    let sorts: Vec<&str> = std::iter::once("relevance").chain(SortBy::ALL.iter().map(|(_, word)| *word)).collect();
-    let choices = gemini::Choices { filters: FILTERS, sorts: &sorts };
-    let settings = gemini::load();
-    let plan = match gemini::plan(&settings, &question, &choices) {
-        Ok(plan) => plan,
-        Err(why) => return failed("Gemini did not answer", &why),
-    };
-    // what's hidden is the reader's choice, not Gemini's
-    let search = Search { hide_incomplete, ..Search::from_args(&plan_args(&plan)) };
-    let query = search.query(&search.cat, 0);
-    if !htmx {
-        let to = if query.is_empty() { "/".to_string() } else { format!("/?{query}") };
-        return ApiResponse {
-            status: 303,
-            content_type: None,
-            body: String::new(),
-            headers: vec![("Location".into(), to)],
-            bytes: None,
-            spool: None,
-            disposition: None,
-            failed: false,
-        };
-    }
-    let said = if plan.note.is_empty() { String::new() } else { format!(" {}", escape(&plan.note)) };
-    let note = format!(
-        "<div class=\"ask-read\" data-q=\"{}\"><p><span class=\"tag tag-ref\">GEMINI</span>{said}</p><p class=\"path\">Searched {}{}</p></div>",
-        attr(&search.q),
-        escape(&described(&search)),
-        if plan.model.is_empty() || plan.model == settings.model() {
-            String::new()
-        } else {
-            format!(". Answered by {}, as {} was busy", escape(&plan.model), escape(settings.model()))
-        },
-    );
-    // the search box takes the words from `data-q` (web.js): swapping the box would drop the form's listener on it
-    first_page(&search, &ask_note(&note, " hx-swap-oob=\"true\""))
 }
 
 fn login_page(base: &str, wrong_key: bool) -> String {
@@ -5288,30 +2976,6 @@ mod tests {
         assert!(super::spot_html(&gone, &super::SpotSaid::default()).contains("could no longer be read"));
     }
 
-    fn window_of_rows(rows: Vec<ReleaseRow>) -> Window {
-        Window {
-            built: Instant::now(),
-            rows,
-            categories: OnceLock::new(),
-            scores: OnceLock::new(),
-            titled: OnceLock::new(),
-            total: OnceLock::new(),
-            shown: Mutex::new(HashMap::new()),
-            brought: Mutex::new(HashSet::new()),
-            orders: Mutex::new(HashMap::new()),
-            sized: AtomicBool::new(false),
-            shown_gen: std::sync::atomic::AtomicU64::new(0),
-            filled: AtomicBool::new(false),
-            counted: Mutex::new(HashMap::new()),
-            asked: SORT_WINDOW,
-            more_in_db: false,
-        }
-    }
-
-    fn shown(html: &str, size: i64, folded: bool) -> ShownRow {
-        ShownRow { html: html.into(), size: Some(size), folded, brings: None, score: None, post: Vec::new() }
-    }
-
     #[test]
     fn a_nested_chain_names_each_file_it_holds() {
         use crate::probe::nest::Layer;
@@ -5425,45 +3089,6 @@ mod tests {
         assert_eq!(a.unpacked, None, "a volume row's size is the whole set's");
     }
 
-    #[test]
-    fn a_render_that_lost_the_race_for_a_brought_row_doesnt_hide_it() {
-        let window = window_of_rows(Vec::new());
-        window.publish(vec![(7, shown("<tr>lead</tr>", 10, false))]);
-        window.publish(vec![(7, shown("", 1, true))]);
-        assert_eq!(lock(&window.shown)[&7].html, "<tr>lead</tr>");
-        // the other way round the row still wins
-        window.publish(vec![(8, shown("", 1, true))]);
-        window.publish(vec![(8, shown("<tr>8</tr>", 2, false))]);
-        assert!(!lock(&window.shown)[&8].folded);
-    }
-
-    #[test]
-    fn a_size_order_from_sizes_not_final_yet_isnt_kept() {
-        let row = |id: i64, size: i64| ReleaseRow { id, size: Some(size), ..Default::default() };
-        let window = window_of_rows(vec![row(1, 1), row(2, 2)]);
-        window.order(SortBy::Size, true);
-        assert!(lock(&window.orders).is_empty(), "the fill hasn't rendered every row yet");
-        window.order(SortBy::Name, true);
-        assert_eq!(lock(&window.orders).len(), 1, "a name order doesn't wait on sizes");
-        window.sized.store(true, Ordering::Release);
-        window.order(SortBy::Size, true);
-        assert!(lock(&window.orders).contains_key(&(SortBy::Size, true)));
-        // a row published after the fill, with another size: the size order kept goes, the name order stays
-        window.publish(vec![(1, shown("<tr>1</tr>", 50, false))]);
-        assert!(!lock(&window.orders).contains_key(&(SortBy::Size, true)));
-        assert!(lock(&window.orders).contains_key(&(SortBy::Name, true)));
-        assert_eq!(*window.order(SortBy::Size, true), vec![0, 1], "the bigger size comes first now");
-    }
-
-    #[test]
-    fn background_work_waits_no_more_than_the_windows_kept() {
-        let turns: Vec<_> = std::iter::from_fn(background_turn).take(WINDOWS_KEPT + 5).collect();
-        assert!(turns.len() <= WINDOWS_KEPT);
-        assert!(background_turn().is_none());
-        drop(turns);
-        assert!(background_turn().is_some(), "a turn given back makes room");
-    }
-
     use super::*;
 
     const KEY: &str = "secret-key";
@@ -5503,8 +3128,6 @@ mod tests {
         for want in ["id=\"servers\"", "id=\"indexing\"", "id=\"api\"", "id=\"gemini\"", "name=\"_csrf\""] {
             assert!(page.body.contains(want), "missing {want:?} in {}", page.body);
         }
-        let search = get("/ui/settings/groups/search", "q=alt.binaries", Some(&cookie()), base, KEY).unwrap();
-        assert_eq!(search.status, 200);
         for path in ["/ui/settings", "/ui/settings/groups/search"] {
             assert_ne!(get(path, "", None, base, KEY).unwrap().status, 200, "{path} needs signing in");
         }
@@ -5712,46 +3335,6 @@ mod tests {
     }
 
     #[test]
-    fn a_copy_carries_the_drawer_trigger_as_a_card() {
-        let release = ReleaseRow {
-            id: 7,
-            name: "Some.Show.S01E01-GRP".into(),
-            group_name: "alt.binaries.g".into(),
-            poster: Some("poster <p@example.com>".into()),
-            posted_date: Some("2026-10-03 17:41:49".into()),
-            size: Some(2048),
-            complete: true,
-            parts: None,
-        };
-        // a link opens its drawer inside its own list item
-        let link = copy_link(&tag("tag-ok", "TWIN"), &release);
-        assert!(
-            link.starts_with("<li><a href=\"/ui/release?id=7\">Some.Show.S01E01-GRP</a>") && link.ends_with("</li>")
-        );
-        assert_eq!(link.matches("drawer-toggle").count(), 1, "{link}");
-        assert!(
-            link.contains("hx-get=\"/ui/row?id=7&amp;as=card\"")
-                && link.contains("hx-target=\"closest li\"")
-                && link.contains("hx-swap=\"beforeend\""),
-            "{link}"
-        );
-        // a card opens it under its facts, inside the card's body
-        let dir = tempfile::tempdir().unwrap();
-        let main = dir.path().join("atlas.db");
-        crate::db::create_db_at(&main).unwrap();
-        let conn = crate::db::open_with_shards(&main).unwrap();
-        let card = copy_card(&conn, &tag("tag-ok", "TWIN"), &release, None);
-        assert_eq!(card.matches("drawer-toggle").count(), 1, "{card}");
-        let toggle = card.find("drawer-toggle").unwrap();
-        assert!(card.find("TWIN").unwrap() < toggle && toggle < card.find("href=\"/ui/nzb?id=7\"").unwrap(), "{card}");
-        assert!(
-            card.contains("hx-get=\"/ui/row?id=7&amp;as=card\"") && card.contains("hx-target=\"closest .copy-body\""),
-            "{card}"
-        );
-        assert!(card.contains("<dt>Poster</dt>") && card.contains("<dt>Email</dt>"), "{card}");
-    }
-
-    #[test]
     fn search_links_keep_the_search_and_stay_on_a_page_start() {
         assert_eq!(search_query("", "", 0), "");
         assert_eq!(search_query("a b&c", "5000", 50), "q=a%20b%26c&cat=5000&offset=50");
@@ -5833,41 +3416,6 @@ mod tests {
         .nothing_found();
         assert!(word.contains("&lt;b&gt;") && !word.contains("<b>"), "{word}");
         assert!(!word.contains("Look in all categories"), "{word}");
-    }
-
-    #[test]
-    fn the_path_names_the_category() {
-        let path = Search {
-            q: String::new(),
-            cat: "2040".into(),
-            offset: 0,
-            filters: Vec::new(),
-            fields: Fields::default(),
-            sort: None,
-            descending: true,
-            hide_incomplete: false,
-            min_score: None,
-            deep: false,
-        }
-        .summary();
-        assert!(path.contains("atlas::releases::<b>movies</b>::<b>hd</b>"), "{path}");
-        assert!(path.contains("Newest first"), "{path}");
-        assert!(
-            Search {
-                q: "x".into(),
-                cat: "9999".into(),
-                offset: 0,
-                filters: Vec::new(),
-                fields: Fields::default(),
-                sort: None,
-                descending: true,
-                hide_incomplete: false,
-                min_score: None,
-                deep: false,
-            }
-            .summary()
-            .contains("Best or newest matches first")
-        );
     }
 
     #[test]
@@ -6165,21 +3713,6 @@ mod tests {
     }
 
     #[test]
-    fn tags_are_read_in_order_until_the_page_is_full() {
-        let names = ["A.2024.2160p.WEB-DL.DV.H265-X", "B.2024.1080p.WEB-DL.H264-X", "C.2024.2160p.BluRay.REMUX-X"];
-        let rows: Vec<ReleaseRow> = (0..300)
-            .map(|i| ReleaseRow { id: i, name: names[i as usize % 3].to_string(), ..Default::default() })
-            .collect();
-        let uhd = Search::from_args(&parse_query("filters=2160p"));
-        let kept = uhd.keep_tagged(rows.clone(), usize::MAX);
-        assert_eq!(kept.len(), 200);
-        assert!(kept.windows(2).all(|w| w[0].id < w[1].id), "in order");
-        assert_eq!(uhd.keep_tagged(rows.clone(), 3).len(), (0..TAG_SLICE).filter(|i| i % 3 != 1).count(), "one slice");
-        let all = Search::from_args(&parse_query("filters=Hide%20copies"));
-        assert_eq!(all.keep_tagged(rows, 1).len(), 300, "no tags to read");
-    }
-
-    #[test]
     fn rated_rows_come_first_either_way() {
         let row = |id| ReleaseRow { id, ..Default::default() };
         let scores = HashMap::from([(1, 50), (2, 90)]);
@@ -6203,175 +3736,13 @@ mod tests {
     }
 
     #[test]
-    fn a_sort_over_a_category_ranks_all_of_it() {
-        crate::sorted::assume_ready(crate::sorted::Column::Group);
-        // by group, once its shards are ready to rank
-        let size = Search::from_args(&parse_query("cat=2000&sort=group&dir=desc"));
-        assert_eq!(size.ranked_by(), Some(crate::sorted::Column::Group));
-        assert!(size.summary().contains("By group descending, over all of them"), "{}", size.summary());
-        // its own window, not the newest releases': a window for each column and way
-        let asc = Search { descending: false, ..size.clone() };
-        let plain = Search { sort: None, ..size.clone() };
-        let keys: HashSet<String> =
-            [&size, &asc, &plain].iter().map(|s| slot_of(s, false).search.query("2000", 0)).collect();
-        assert_eq!(keys.len(), 3, "{keys:?}");
-        // the rating isn't in the database, and words and fields are ranked by the search
-        for query in ["cat=2000&sort=rating", "q=batman&sort=size", "poster=x&sort=size"] {
-            let s = Search::from_args(&parse_query(query));
-            assert_eq!(s.ranked_by(), None, "{query}");
-            if !s.fields.any() {
-                assert!(s.summary().contains("among the first 2000"), "{query}: {}", s.summary());
-            }
-            assert_eq!(slot_of(&s, false).search.sort, None, "{query}");
-        }
-    }
-
-    #[test]
-    fn only_a_ranked_window_with_more_behind_it_grows() {
-        crate::sorted::assume_ready(crate::sorted::Column::Group);
-        let ranked = Search::from_args(&parse_query("cat=2000&sort=group&dir=desc"));
-        let full = Window { more_in_db: true, ..window_of_rows(Vec::new()) };
-        assert!(full.can_grow(&ranked), "a page past 2000 reads further");
-        assert!(!window_of_rows(Vec::new()).can_grow(&ranked), "all of them were read");
-        let words = Search::from_args(&parse_query("q=batman&sort=size"));
-        assert!(!full.can_grow(&words), "a word search sorts what it found");
-        let tags = Search::from_args(&parse_query("cat=2000&sort=group&filters=DV"));
-        assert!(full.can_grow(&tags));
-        let far = Window { asked: GROW_WITH_TAGS, more_in_db: true, ..window_of_rows(Vec::new()) };
-        assert!(!far.can_grow(&tags), "tags are read a name at a time, soo they stop somewhere");
-        assert!(far.can_grow(&ranked));
-        let spelled = |cat: &str| Search::from_args(&parse_query(&format!("cat={cat}&sort=category")));
-        assert!(Arc::ptr_eq(&slot_of(&spelled("8000,x1"), false), &slot_of(&spelled("8000,x2"), false)));
-        assert!(!Arc::ptr_eq(&slot_of(&spelled("8000"), false), &slot_of(&spelled("2000"), false)));
-        let deepest = Window { asked: MAX_WINDOW, more_in_db: true, ..window_of_rows(Vec::new()) };
-        assert!(!deepest.can_grow(&ranked), "a url can't have a whole database read into memory");
-    }
-
-    #[test]
-    fn a_grown_window_keeps_a_brought_post_where_it_was_shown() {
-        let row = |id: i64| ReleaseRow { id, size: Some(id), ..Default::default() };
-        // the first window showed post 9 in the place of its file 2, before 9's own row was read
-        let old = window_of_rows(vec![row(1), row(2)]);
-        old.publish(vec![
-            (1, shown("<tr>1</tr>", 1, false)),
-            (
-                2,
-                ShownRow {
-                    html: "<tr>9</tr>".into(),
-                    size: Some(20),
-                    folded: false,
-                    brings: Some(9),
-                    score: None,
-                    post: Vec::new(),
-                },
-            ),
-        ]);
-        let grown = window_of_rows(vec![row(1), row(2), row(9), row(3)]);
-        grown.carry_from(&old);
-        let shown = lock(&grown.shown);
-        assert_eq!(shown[&2].html, "<tr>9</tr>", "still where the earlier page had it");
-        assert!(shown[&9].folded, "its own row, read in now, doesn't show it a second time");
-        assert!(!shown.contains_key(&3), "new rows are rendered when a page reaches them");
-        assert!(lock(&grown.brought).contains(&9));
-    }
-
-    #[test]
-    fn the_rating_chips_go_by_the_row_a_place_shows_and_share_its_window() {
-        let row = |id: i64| ReleaseRow { id, size: Some(id), ..Default::default() };
-        let w = window_of_rows(vec![row(1), row(2), row(3), row(4)]);
-        // 4 has a title of its own rated lower: left out with nothing rendered
-        let _ = w.titled.set([(4, Some(50))].into_iter().collect());
-        let scored = |html: &str, brings, score| ShownRow {
-            html: html.into(),
-            size: Some(1),
-            folded: false,
-            brings,
-            score,
-            post: Vec::new(),
-        };
-        // place 2 shows post 9, which is rated; place 1's own row isn't
-        w.publish(vec![
-            (1, scored("<tr>1</tr>", None, Some(None))),
-            (2, scored("<tr>9</tr>", Some(9), Some(Some(80)))),
-            (3, scored("<tr>3</tr>", None, Some(Some(65)))),
-        ]);
-        let rated = |q: &str| Search::from_args(&parse_query(q));
-        assert_eq!(w.page(&rated("q=x&rated=70"), None).0, ["<tr>9</tr>"]);
-        assert_eq!(w.page(&rated("q=x&rated=60"), None).0, ["<tr>9</tr>", "<tr>3</tr>"]);
-        assert!(!lock(&w.shown).contains_key(&4), "never rendered");
-        w.publish(vec![(4, scored("<tr>4</tr>", None, None))]);
-        assert_eq!(w.page(&rated("q=x"), None).0.len(), 4, "without a chip nothing is looked up");
-        assert!(
-            Window { more_in_db: true, asked: GROW_WITH_RATING, ..window_of_rows(Vec::new()) }.can_grow(&rated("q=x"))
-        );
-        assert!(
-            !Window { more_in_db: true, asked: GROW_WITH_RATING, ..window_of_rows(Vec::new()) }
-                .can_grow(&rated("q=x&rated=70")),
-            "a chip stops growing sooner"
-        );
-        let sorted = |q: &str| rated(&format!("q=x&sort=size{q}"));
-        assert!(Arc::ptr_eq(&slot_of(&sorted(""), false), &slot_of(&sorted("&rated=70"), false)), "one window");
-        let inputs = scope_inputs(&rated("q=x&rated=80"), "");
-        assert!(inputs.contains("name=\"rated\" value=\"80\""), "a new search keeps the chip: {inputs}");
-    }
-
-    #[test]
-    fn a_window_counts_the_rows_a_search_shows() {
-        let row = |id: i64| ReleaseRow { id, size: Some(id), ..Default::default() };
-        let w = window_of_rows(vec![row(1), row(2), row(3), row(4)]);
-        w.filled.store(true, Ordering::Release);
-        let shows = |brings, folded, score| ShownRow {
-            html: "<tr></tr>".into(),
-            size: Some(1),
-            folded,
-            brings,
-            score: Some(score),
-            post: Vec::new(),
-        };
-        // 2 is folded into another row; 3 shows post 9
-        w.publish(vec![
-            (1, shows(None, false, None)),
-            (2, shows(None, true, None)),
-            (3, shows(Some(9), false, Some(70))),
-            (4, shows(None, false, Some(50))),
-        ]);
-        let search = |q: &str| Search::from_args(&parse_query(q));
-        assert_eq!(w.shown_count(&search("q=x")), Some(3), "a folded row isn't counted");
-        assert_eq!(w.shown_count(&search("q=x&rated=60")), Some(1), "nor one a chip leaves out");
-        w.publish(vec![(1, shows(None, true, None))]);
-        assert_eq!(w.shown_count(&search("q=x")), Some(3), "kept per window and chip");
-        let unfilled = window_of_rows(vec![row(1)]);
-        assert_eq!(unfilled.shown_count(&search("q=x")), None, "not counted before the fill; waits, then gives up");
-    }
-
-    #[test]
-    fn hiding_spots_is_a_chip_that_pages_from_a_window() {
-        let s = Search::from_args(&parse_query("q=x&filters=Hide%20spots"));
-        assert!(s.hides_spots() && s.sorts_from_a_window(), "a page needs its rows rendered to know");
-        assert!(!s.filters_by_tags() && s.tag_filters().is_empty(), "spots aren't read from a name's tags");
-        assert_eq!(s.query("", 0), "q=x&filters=Hide%20spots");
-        assert!(s.filter_links().contains("aria-current=\"true\">Hide spots<"));
-        assert!(s.nothing_found().contains("Spots are hidden. <a href=\"/?q=x\""), "an empty page says why");
-        let off = Search::from_args(&parse_query("q=x"));
-        assert!(!off.hides_spots());
-        assert!(
-            off.filter_links().contains(">Hide spots<")
-                && !off.filter_links().contains("aria-current=\"true\">Hide spots<")
-        );
-        let both = Search::from_args(&parse_query("q=x&filters=1080p,Hide%20spots"));
-        assert_eq!(both.tag_filters(), vec!["1080p"]);
-        let with_copies = Search::from_args(&parse_query("q=x&filters=Hide%20spots,Hide%20copies"));
-        assert!(with_copies.hides_spots() && !with_copies.sorts_from_a_window(), "copies page a page at a time");
-    }
-
-    #[test]
     fn hiding_incomplete_is_kept_in_links_and_a_cookie() {
         let s = Search::from_args(&parse_query("q=x&cat=2040&incomplete=hide"));
-        assert!(s.hide_incomplete && s.sorts_from_a_window(), "a page needs its rows rendered to know");
+        assert!(s.hide_incomplete);
         assert_eq!(s.query("2040", 0), "q=x&cat=2040&incomplete=hide");
         assert_eq!(s.incomplete_toggled(), "q=x&cat=2040&incomplete=show", "turning it off says so");
         let off = Search::from_args(&parse_query("q=x"));
-        assert!(!off.hide_incomplete && !off.sorts_from_a_window());
+        assert!(!off.hide_incomplete);
         assert_eq!(off.incomplete_toggled(), "q=x&incomplete=hide");
         assert!(s.filter_links().contains("aria-current=\"true\">Hide incomplete<"));
         assert!(!off.filter_links().contains("aria-current=\"true\">Hide incomplete<"));
@@ -6379,7 +3750,6 @@ mod tests {
         assert!(!s.hides(&ReleaseRow { complete: true, ..Default::default() }));
         assert!(!off.hides(&ReleaseRow { complete: false, ..Default::default() }));
         // copies hidden still go a page at a time
-        assert!(!Search::from_args(&parse_query("incomplete=hide&filters=Hide%20copies")).sorts_from_a_window());
 
         let saved = Some("atlas_session=abc; atlas_incomplete=hide");
         let mut args = parse_query("q=x");
@@ -6403,7 +3773,6 @@ mod tests {
         let s = Search::from_args(&parse_query("q=film&rated=70"));
         assert_eq!(s.min_score, Some(70));
         assert!(s.query(&s.cat, 0).contains("rated=70"), "it stays in the url");
-        assert!(s.sorts_from_a_window(), "pages come from a window, filtered as they're read");
         assert_eq!(Search::from_args(&parse_query("rated=75")).min_score, None, "only the chips' scores");
         assert_eq!(Search::from_args(&parse_query("rated=x")).min_score, None);
         let scores: HashMap<i64, i64> = [(1, 82), (2, 70), (3, 69)].into_iter().collect();
@@ -6418,30 +3787,12 @@ mod tests {
     }
 
     #[test]
-    fn a_window_with_no_sort_grows_in_the_searchs_own_order() {
-        let newest = Search::from_args(&parse_query("cat=2000&incomplete=hide"));
-        let full = Window { more_in_db: true, ..window_of_rows(Vec::new()) };
-        assert!(full.can_grow(&newest), "the newest over all of them, not the first 2000");
-        let row = |id: i64| ReleaseRow { id, ..Default::default() };
-        let window = window_of_rows(vec![row(3), row(1), row(2)]);
-        window.publish(vec![
-            (3, shown("<tr>3</tr>", 3, false)),
-            (1, shown("", 1, true)),
-            (2, shown("<tr>2</tr>", 2, false)),
-        ]);
-        let (page, more) = window.page(&newest, None);
-        assert_eq!(page, ["<tr>3</tr>", "<tr>2</tr>"], "as read, and left out rows aren't shown");
-        assert!(!more);
-    }
-
-    #[test]
     fn filters_come_from_the_list_and_stay_in_links() {
         let s = Search::from_args(&parse_query("q=x&filters=DV,<b>,Remux"));
         assert_eq!(s.filters, ["DV", "Remux"]);
-        assert!(s.windowed(), "tags are checked over the first results");
         assert_eq!(s.query("2040", 0), "q=x&cat=2040&filters=DV%2CRemux");
         let hide = Search::from_args(&parse_query("filters=Hide%20copies"));
-        assert!(!hide.filters_by_tags() && !hide.windowed(), "pages by offset as before");
+        assert!(!hide.filters_by_tags());
         let links = s.filter_links();
         assert_eq!(links.matches("aria-current").count(), 2, "{links}");
         assert!(!filter_matches("DV", &release_tags::parse("A.1999.DVDRip.XviD-X")), "not a DVD");
