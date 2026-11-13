@@ -362,6 +362,14 @@ pub struct Db {
 pub use crate::pg::ingest::PgWriteLimits;
 
 impl Db {
+    pub(crate) fn bind_native_cache_scope(&self) -> Result<Option<crate::pg::cache_actor::NativeCacheScope>> {
+        match &*self.conn {
+            MainConnection::Sqlite(_) => Ok(None),
+            MainConnection::OwnedPostgres(owner) => crate::pg::cache_actor::NativeCacheScope::bind(owner).map(Some),
+            MainConnection::Postgres(_) => anyhow::bail!("cache commands require the fenced native owner"),
+        }
+    }
+
     pub(crate) fn fail_native(&self, failure: crate::pg::outage::Failure) {
         if let MainConnection::OwnedPostgres(owner) = &*self.conn {
             owner.fail(failure);

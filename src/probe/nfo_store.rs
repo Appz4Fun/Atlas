@@ -7,7 +7,7 @@
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::postprocess::schema::ShardTable;
-use crate::postprocess::step::StepWrite;
+use crate::postprocess::step::{StepMutation, StepWrite};
 use crate::store;
 
 /// An NFO read by a step other than the probe, while the probe has none. The probe moves it into its JSON.
@@ -23,8 +23,6 @@ pub const RELEASE_NFO: ShardTable = ShardTable {
     added: &[],
 };
 
-/// The first NFO read stays: a second reader would have used it.
-const KEEP: &str = "insert or ignore into release_nfo (release_id, file, text) values (?1, ?2, ?3)";
 /// Once the probe's JSON holds the same NFO.
 pub const DROP: &str = "delete from release_nfo where release_id = ?1 and file = ?2";
 
@@ -101,7 +99,7 @@ fn from_table(conn: &Connection, release_id: i64) -> Option<StoredNfo> {
 /// Keeps an NFO a step read, for the probe and the other steps to use in place of fetching it again.
 pub fn keep(release_id: i64, file: &str, text: &str) -> StepWrite {
     let text: String = text.chars().take(MAX_CHARS).collect();
-    StepWrite::new(KEEP, vec![release_id.into(), file.to_string().into(), text.into()])
+    StepWrite::for_mutation(release_id, StepMutation::KeepNfo { file: file.to_string(), text })
 }
 
 #[cfg(test)]

@@ -893,6 +893,29 @@ pub fn storage_config() -> crate::pg::StorageConfig {
         .map_or_else(crate::pg::StorageConfig::default, |v| crate::pg::StorageConfig::from_value(v.get("storage")))
 }
 
+/// Checked cache routing never treats an unreadable or malformed config as SQLite.
+pub(crate) fn checked_storage_config() -> Result<crate::pg::StorageConfig, String> {
+    let path = config_file();
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(crate::pg::StorageConfig::default()),
+        Err(_) => return Err("storage configuration unavailable".into()),
+    };
+    let value = parse_config(&path, &text).map_err(|_| "storage configuration unavailable".to_string())?;
+    if !value.is_object() { return Err("storage configuration unavailable".into()); }
+    if let Some(storage) = value.get("storage") {
+        if !storage.is_object()
+            || ["backend", "url", "schema"].iter().any(|key| storage.get(*key).is_some_and(|value| !value.is_string()))
+            || storage.get("max_connections").is_some_and(|value| value.as_i64().is_none())
+            || storage.get("allow_plaintext").is_some_and(|value| !value.is_boolean()) {
+            return Err("storage configuration unavailable".into());
+        }
+    }
+    let storage = crate::pg::StorageConfig::from_value(value.get("storage"));
+    storage.check().map_err(|_| "storage configuration unavailable".to_string())?;
+    Ok(storage)
+}
+
 /// The file's `shared_catalog` object, for the fill and check commands: no keyring.
 pub fn shared_catalog_config() -> SharedCatalogConfig {
     read_file().map_or_else(SharedCatalogConfig::default, |v| SharedCatalogConfig::from_value(v.get("shared_catalog")))

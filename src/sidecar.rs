@@ -9,7 +9,7 @@
 use crate::config::Config;
 use crate::frozen::rules::{SIDECAR_BYTES, SIDECAR_FILES, SIDECAR_IMAGES};
 use crate::postprocess::schema::ShardTable;
-use crate::postprocess::step::{Needs, Outcome, ReleaseInfo, Reruns, Step, StepCtx, StepError, StepId, StepWrite};
+use crate::postprocess::step::{Needs, Outcome, ReleaseInfo, Reruns, SidecarRecord, Step, StepCtx, StepError, StepId, StepMutation, StepWrite};
 use crate::store::FileInfo;
 
 pub const SIDECAR_STEP: StepId = StepId(11);
@@ -67,7 +67,7 @@ pub const SIDECARS: ShardTable = ShardTable {
 };
 
 /// A rerun that couldn't read anything (`unread`) leaves what an earlier read found.
-const SET: &str = "insert into sidecars
+pub(crate) const SET: &str = "insert into sidecars
     (release_id, name, group_name, file, kind, release_name, segment_uid, text, at)
     values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
     on conflict(release_id) do update set name = excluded.name, group_name = excluded.group_name,
@@ -79,7 +79,7 @@ const SET: &str = "insert into sidecars
 
 /// After `SET` for release ?1: while the shard's texts hold more than ?2 bytes, the oldest texts but ?1's go, just
 /// enough of them; their names and UIDs stay. Soo the newest sidecars always have their text, and the total holds.
-const EVICT: &str = "update sidecars set text = null where release_id in (
+pub(crate) const EVICT: &str = "update sidecars set text = null where release_id in (
     select release_id from (
         select release_id, length(cast(text as blob)) as len,
             sum(length(cast(text as blob))) over (order by at, release_id rows unbounded preceding) as run
@@ -158,7 +158,7 @@ pub fn describing(
 }
 
 /// What the shard's sidecar texts hold now. A failed read counts as nothing: the eviction is then left to the next.
-fn text_bytes(conn: &rusqlite::Connection) -> i64 {
+pub(crate) fn text_bytes(conn: &rusqlite::Connection) -> i64 {
     conn.query_row("select value from meta where key = 'sidecar_text_bytes'", [], |r| r.get(0)).unwrap_or(0)
 }
 
@@ -338,21 +338,15 @@ impl Step for SidecarStep {
         let text = body.as_deref().map(text_of);
         let stored = text.as_ref().map_or(0, String::len);
         let kind = read.as_ref().map_or("unread", |r| r.kind);
-        let params = vec![
-            r.id.into(),
-            r.name.clone().into(),
-            r.group.clone().into(),
-            picked.map(|f| f.filename.clone()).into(),
-            kind.to_string().into(),
-            read.as_ref().and_then(|r| r.release_name.clone()).into(),
-            read.as_ref().and_then(|r| r.segment_uid.clone()).into(),
-            text.into(),
-            chrono::Utc::now().timestamp().into(),
-        ];
-        let mut writes = vec![StepWrite::new(SET, params)];
+        let record = SidecarRecord {
+            name: r.name.clone(),group: r.group.clone(),file: picked.map(|f| f.filename.clone()),kind: kind.to_string(),
+            release_name: read.as_ref().and_then(|r| r.release_name.clone()),
+            segment_uid: read.as_ref().and_then(|r| r.segment_uid.clone()),text,at: chrono::Utc::now().timestamp(),
+        };
+        let mut writes = vec![StepWrite::for_mutation(r.id, StepMutation::KeepSidecar(record))];
         // the oldest texts are looked at only when this one takes the shard past its total: below it, nothing scans
-        if text_bytes(ctx.conn()).saturating_add(stored as i64) > MAX_TOTAL_TEXT {
-            writes.push(StepWrite::new(EVICT, vec![r.id.into(), MAX_TOTAL_TEXT.into()]));
+        if ctx.data().sidecar_text_bytes()?.saturating_add(stored as i64) > MAX_TOTAL_TEXT {
+            writes.push(StepWrite::for_mutation(r.id, StepMutation::EvictSidecarTexts { max_bytes: MAX_TOTAL_TEXT }));
         }
         Ok(Outcome { matched: body.is_some(), writes, ..Outcome::default() })
     }
@@ -389,18 +383,11 @@ impl Step for SidecarImageStep {
             return Ok(Outcome::default());
         }
         let name = image_release_name(&r.name).or_else(|| files.first().and_then(|f| image_release_name(&f.filename)));
-        let params = vec![
-            r.id.into(),
-            r.name.clone().into(),
-            r.group.clone().into(),
-            files.first().map(|f| f.filename.clone()).into(),
-            "image".to_string().into(),
-            name.into(),
-            None::<String>.into(),
-            None::<String>.into(),
-            chrono::Utc::now().timestamp().into(),
-        ];
-        Ok(Outcome { matched: true, writes: vec![StepWrite::new(SET, params)], ..Outcome::default() })
+        let record = SidecarRecord {
+            name: r.name.clone(),group: r.group.clone(),file: files.first().map(|f| f.filename.clone()),kind: "image".into(),
+            release_name: name,segment_uid: None,text: None,at: chrono::Utc::now().timestamp(),
+        };
+        Ok(Outcome { matched: true, writes: vec![StepWrite::for_mutation(r.id, StepMutation::KeepSidecar(record))], ..Outcome::default() })
     }
 }
 

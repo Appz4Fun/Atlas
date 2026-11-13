@@ -10,6 +10,7 @@
 //! caller pauses rather than moving a cursor on past a save that didn't happen. The work it repeats must be safe to
 //! run again even when the first try's commit landed and only its answer was lost (see `with_retry`).
 
+pub(crate) mod cache_actor;
 pub mod ext;
 pub mod header_blocks;
 mod history_gate;

@@ -689,12 +689,12 @@ impl Inner {
         let (mut done, mut failed) = (row.done & !clear, row.failed & !clear);
         let mut a = base;
         if stale_pc {
-            a.writes.push((0, super::step::StepWrite::new(crate::junk::DROP_CATEGORY, vec![row.info.id.into()])));
+            a.writes.push((0, super::step::StepWrite::for_mutation(row.info.id, super::step::StepMutation::DropPcCategory)));
         }
         a.parts_seen = Some(row.info.parts);
         let mut ctx = StepCtx {
             release: row.info.clone(),
-            conn,
+            data: super::data::StepData::LegacySqlite(conn),
             facts: Vec::new(),
             bodies: &self.fetcher,
             used_bodies: 0,
@@ -1076,7 +1076,7 @@ impl Inner {
 
             let mut ctx = StepCtx {
                 release: row.info.clone(),
-                conn,
+                data: super::data::StepData::LegacySqlite(conn),
                 facts: Vec::new(),
                 bodies: &self.fetcher,
                 used_bodies: 0,

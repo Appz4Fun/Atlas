@@ -942,9 +942,20 @@ pub fn is_explicit_rerun(conn: &Connection, release_id: i64, step: crate::postpr
         .unwrap_or(false)
 }
 
-/// Looks up a previously resolved OpenSubtitles `moviehash` in `raw_opensubtitles`.
-/// Returns `Some(Some(Feature))` if matched, `Some(None)` if checked with no match, or `None` if unknown.
-pub fn get_opensubtitles(moviehash: &str) -> Option<Option<Feature>> {
+/// Looks up a previously resolved OpenSubtitles `moviehash` in the selected natural-key cache.
+/// Returns `Ok(Some(Some(Feature)))` if matched, `Ok(Some(None))` for a cached negative, or `Ok(None)` if unknown.
+/// Native owner/configuration/storage failures return `Err` and must not become a provider request.
+/// The legacy SQLite cache keeps its existing best-effort behavior.
+pub fn get_opensubtitles(moviehash: &str) -> anyhow::Result<Option<Option<Feature>>> {
+    use crate::pg::cache_actor::{NativeCacheCommand, NativeCacheReply, execute_if_native};
+    match execute_if_native(NativeCacheCommand::LookupOpenSubtitles { hash: moviehash.to_owned() })? {
+        Some(NativeCacheReply::Lookup(found)) => Ok(found),
+        Some(NativeCacheReply::Stored) => anyhow::bail!("invalid cache lookup reply"),
+        None => Ok(get_opensubtitles_sqlite(moviehash)),
+    }
+}
+
+fn get_opensubtitles_sqlite(moviehash: &str) -> Option<Option<Feature>> {
     with_raw(|conn| {
         let row: Option<Feature> = conn
             .prepare_cached(
@@ -983,9 +994,21 @@ fn prune_opensubtitles(conn: &Connection, max_rows: i64) -> rusqlite::Result<()>
     Ok(())
 }
 
-/// Persists an OpenSubtitles `moviehash` lookup result into `raw_opensubtitles`, bounded by `MAX_OPENSUBTITLES_ROWS`
-/// and storing only the compact structured match fields (`raw_json_zst` omitted).
-pub fn put_opensubtitles(moviehash: &str, feature: Option<&Feature>) {
+/// Persists compact OpenSubtitles match fields in the selected natural-key cache (`raw_json_zst` omitted).
+/// Native writes use the current owned session and propagate failures. Legacy SQLite writes retain their
+/// existing best-effort behavior and `MAX_OPENSUBTITLES_ROWS` bound.
+pub fn put_opensubtitles(moviehash: &str, feature: Option<&Feature>) -> anyhow::Result<()> {
+    use crate::pg::cache_actor::{NativeCacheCommand, NativeCacheReply, execute_if_native};
+    match execute_if_native(NativeCacheCommand::PutOpenSubtitles {
+        hash: moviehash.to_owned(), feature: feature.cloned(), checked_at: chrono::Utc::now().timestamp(),
+    })? {
+        Some(NativeCacheReply::Stored) => Ok(()),
+        Some(NativeCacheReply::Lookup(_)) => anyhow::bail!("invalid cache store reply"),
+        None => { put_opensubtitles_sqlite(moviehash, feature); Ok(()) }
+    }
+}
+
+fn put_opensubtitles_sqlite(moviehash: &str, feature: Option<&Feature>) {
     let f = feature.cloned().unwrap_or_default();
     let now = chrono::Utc::now().timestamp();
     let _ = with_raw_tx(|conn| {
@@ -3301,8 +3324,8 @@ mod tests {
             episode: None,
             release_name: Some("The.Matrix.1999.1080p-GRP".into()),
         };
-        put_opensubtitles("8e245d9679d31e12", Some(&feat));
-        assert_eq!(get_opensubtitles("8e245d9679d31e12"), Some(Some(feat)));
+        put_opensubtitles("8e245d9679d31e12", Some(&feat)).unwrap();
+        assert_eq!(get_opensubtitles("8e245d9679d31e12").unwrap(), Some(Some(feat)));
 
         let stamp = 1 | 2 | 4 | 8;
         let cid_a = b"content-identity-release-A";
@@ -3979,3 +4002,7 @@ mod tests {
         assert_eq!(bd_count, 0, "harvest must replace stale raw_backfill_deepest snapshot");
     }
 }
+
+#[cfg(test)]
+#[path = "raw_store/native_pg_opensubtitles_cache_tests.rs"]
+pub(crate) mod native_pg_opensubtitles_cache_tests;

@@ -37,7 +37,7 @@ use rusqlite::{Connection, OptionalExtension, params_from_iter};
 use sha2::{Digest, Sha256};
 
 use crate::postprocess::schema::ShardTable;
-use crate::postprocess::step::{Needs, Outcome, Reruns, Step, StepCtx, StepError, StepId, StepWrite};
+use crate::postprocess::step::{Needs, Outcome, Reruns, Step, StepCtx, StepError, StepId, StepMutation, StepWrite};
 use crate::probe::ProbeInfo;
 use crate::store;
 
@@ -132,11 +132,10 @@ pub const RELEASE_KEYS: ShardTable = ShardTable {
     ],
 };
 
-const UPSERT: &str = "insert or replace into release_keys
+pub(crate) const UPSERT: &str = "insert or replace into release_keys
     (release_id, account, host, layout, lines, file_crc, body_crc, video, audio, mux, encode, thread, subs, fonts,
      chapters, volumes)
     values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)";
-const DELETE: &str = "delete from release_keys where release_id = ?1";
 
 pub const KEYS_STEP: StepId = StepId(40);
 
@@ -1202,7 +1201,7 @@ pub fn par2_sets(shard: &Connection, release_id: i64) -> rusqlite::Result<Vec<Ve
 }
 
 /// The `release_keys` row a release has. None: no row.
-fn stored(shard: &Connection, release_id: i64) -> rusqlite::Result<Option<Keys>> {
+pub(crate) fn stored(shard: &Connection, release_id: i64) -> rusqlite::Result<Option<Keys>> {
     shard
         .prepare_cached(
             "select account, host, layout, lines, file_crc, body_crc, video, audio, mux, encode, thread, subs, fonts,
@@ -1454,16 +1453,19 @@ pub struct KeysStep {
 
 impl KeysStep {
     /// The salt, read once from shard 0, beside the shard `conn` is on: the one the pages read.
-    fn salt(&self, conn: &Connection) -> Result<i64, StepError> {
-        if let Some(s) = self.salt.get() {
-            return Ok(*s);
-        }
-        let none = || StepError::Retry("the key salt could not be read or made".into());
-        let zero = conn.path().and_then(shard_zero).ok_or_else(none)?;
-        let shard = crate::db::open_shard(&zero).map_err(|e| StepError::Retry(e.to_string()))?;
-        let found = salt_in(&shard, "meta").ok_or_else(none)?;
+    fn salt(&self, data: &crate::postprocess::data::StepData<'_>) -> Result<i64, StepError> {
+        let found = data.key_salt(self.salt.get().copied())?;
         Ok(*self.salt.get_or_init(|| found))
     }
+}
+
+/// The existing legacy shard-zero salt read/create path, available only through checked legacy Step data.
+pub(crate) fn legacy_step_salt(conn: &Connection, cached: Option<i64>) -> Result<i64, StepError> {
+    if let Some(salt) = cached { return Ok(salt); }
+    let none = || StepError::Retry("the key salt could not be read or made".into());
+    let zero = conn.path().and_then(shard_zero).ok_or_else(none)?;
+    let shard = crate::db::open_shard(&zero).map_err(|error| StepError::Retry(error.to_string()))?;
+    salt_in(&shard, "meta").ok_or_else(none)
 }
 
 /// Shard 0's file, from another shard's (`atlas.s3.db` gives `atlas.s0.db`): `store::shard_path`'s names.
@@ -1499,37 +1501,16 @@ impl Step for KeysStep {
         1 | 2 | 4 | 8
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
-        let retry = |e: rusqlite::Error| StepError::Retry(e.to_string());
         let id = ctx.release().id;
         let parts = Some(ctx.release().parts);
-        let salt = self.salt(ctx.conn())?;
-        let keys = read_keys(ctx.conn(), id, parts, Some(salt)).map_err(retry)?;
-        let had = stored(ctx.conn(), id).map_err(retry)?;
+        let salt = self.salt(ctx.data())?;
+        let keys = ctx.data().release_keys(id, parts, salt)?;
+        let had = ctx.data().stored_release_keys(id)?;
         let writes = match (keys.is_empty(), had) {
             (true, None) => Vec::new(),
-            (true, Some(_)) => vec![StepWrite::new(DELETE, vec![id.into()])],
+            (true, Some(_)) => vec![StepWrite::for_mutation(id, StepMutation::ClearReleaseKeys)],
             (false, Some(old)) if old == keys => Vec::new(),
-            (false, _) => vec![StepWrite::new(
-                UPSERT,
-                vec![
-                    id.into(),
-                    keys.account.into(),
-                    keys.host.into(),
-                    keys.layout.into(),
-                    keys.lines.into(),
-                    keys.file_crc.into(),
-                    keys.body_crc.into(),
-                    keys.video.into(),
-                    keys.audio.into(),
-                    keys.mux.into(),
-                    keys.encode.into(),
-                    keys.thread.into(),
-                    keys.subs.into(),
-                    keys.fonts.into(),
-                    keys.chapters.into(),
-                    keys.volumes.into(),
-                ],
-            )],
+            (false, _) => vec![StepWrite::for_mutation(id, StepMutation::KeepReleaseKeys { keys })],
         };
         Ok(Outcome { matched: !keys.is_empty(), writes, ..Outcome::default() })
     }

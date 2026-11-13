@@ -6,13 +6,13 @@ use crate::archive::{self, crc32};
 use crate::config::Config;
 use crate::nntp::yenc_decode;
 use crate::postprocess::step::{
-    BodyRequest, Got, Needs, Outcome, ReleaseInfo, Reruns, Step, StepCtx, StepError, StepId, StepWrite, mask,
+    BodyRequest, Got, Needs, Outcome, ReleaseInfo, Reruns, Step, StepCtx, StepError, StepId, StepMutation, StepWrite, mask,
 };
 use crate::release_info;
 use crate::store::{FileInfo, SegmentPick};
 
 use super::{
-    DROP_COVER, ProbeInfo, SET_COVER, SET_PROBE, agent_of, derive, imdb_ids, keep_headers, media, moviehash, nest,
+    ProbeInfo, agent_of, derive, imdb_ids, keep_headers, media, moviehash, nest,
     nfo_text, parse_sfv, xref_groups, yenc, yenc_quirks,
 };
 
@@ -420,11 +420,11 @@ impl Step for ProbeStep {
         let rel_parts = ctx.release().parts;
         let rel_complete = ctx.release().complete;
         let stamp = self.config_stamp();
-        let content_id = crate::raw_store::release_content_id(ctx.conn(), release_id).unwrap_or_default();
-        let existing_db_pw = archive::store::nfo_password(ctx.conn(), release_id);
+        let content_id = ctx.data().release_content_id(release_id)?.unwrap_or_default();
+        let existing_db_pw = ctx.data().nfo_password(release_id)?;
         let known_pw =
             existing_db_pw.clone().or_else(|| crate::raw_store::get_nfo_password(&rel_name, &rel_group, &content_id));
-        if !crate::raw_store::is_explicit_rerun(ctx.conn(), release_id, PROBE_STEP)
+        if !ctx.data().explicit_rerun(release_id, PROBE_STEP)?
             && let Some(saved) =
                 crate::raw_store::get_probe(&rel_name, &rel_group, &content_id, rel_parts, rel_complete, stamp).filter(
                     |s| {
@@ -439,19 +439,18 @@ impl Step for ProbeStep {
             let backfill = super::body_crc::wants_backfill(&saved.info);
             let mut writes = Vec::new();
             if let Some(pw) = saved.nfo_password {
-                writes.push(StepWrite::new(archive::store::SET_NFO_PASSWORD, vec![release_id.into(), pw.into()]));
+                writes.push(StepWrite::for_mutation(release_id, StepMutation::SetNfoPassword { password: pw }));
             }
             writes.push(match saved.cover {
-                Some((mime, sha256)) => StepWrite::new(SET_COVER, vec![release_id.into(), mime.into(), sha256.into()]),
-                None => StepWrite::new(DROP_COVER, vec![release_id.into()]),
+                Some((mime, sha256)) => StepWrite::for_mutation(release_id, StepMutation::KeepCover { mime, sha256 }),
+                None => StepWrite::for_mutation(release_id, StepMutation::ClearCover),
             });
             let hash = saved.moviehash.clone();
             let decoded: Option<ProbeInfo> = serde_json::from_str(&saved.info).ok();
             writes.extend(title_writes(release_id, decoded.as_ref().and_then(|i| i.media.as_ref())));
-            writes.push(StepWrite::new(
-                SET_PROBE,
-                vec![release_id.into(), saved.crc32.into(), saved.agent.into(), saved.info.into(), hash.clone().into()],
-            ));
+            writes.push(StepWrite::for_mutation(release_id, StepMutation::KeepProbe {
+                crc32: saved.crc32,agent: saved.agent,json: saved.info,moviehash: hash.clone(),
+            }));
             // the account, host and layout keys come from what the probe holds
             let rerun = mask(crate::keys::KEYS_STEP)
                 | if hash.is_some() { mask(super::opensubtitles::OPENSUBTITLES_STEP) } else { 0 }
@@ -460,9 +459,9 @@ impl Step for ProbeStep {
             return Ok(Outcome { matched: true, writes, facts, rerun, ..Outcome::default() });
         }
         let files = ctx.files().map_err(retry)?;
-        let par2_names = archive::select::par2_name_map(ctx.conn(), release_id, &files);
-        let par2_all = archive::select::par2_file_names(ctx.conn(), release_id);
-        let mut check = archive::store::local_password_check(ctx.conn(), release_id);
+        let par2_names = ctx.data().par2_names(release_id, &files)?;
+        let par2_all = ctx.data().par2_file_names(release_id)?;
+        let mut check = ctx.data().local_password_check(release_id)?;
         let mut info = ProbeInfo::default();
         let mut writes = Vec::new();
         let mut found_nfo_password = known_pw.or_else(|| {
@@ -477,7 +476,7 @@ impl Step for ProbeStep {
         });
         if let Some(ref pw) = found_nfo_password {
             crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, pw);
-            writes.push(StepWrite::new(archive::store::SET_NFO_PASSWORD, vec![release_id.into(), pw.clone().into()]));
+            writes.push(StepWrite::for_mutation(release_id, StepMutation::SetNfoPassword { password: pw.clone() }));
         }
 
         // the NFO and SFV come first, being the smallest: a budget that runs out still leaves them
@@ -487,7 +486,7 @@ impl Step for ProbeStep {
                 || f.subject.as_deref().is_some_and(crate::nfo::is_nfo)
         };
         // an NFO read before, by this probe's last run or by a step that came first, isn't fetched again
-        let mut kept = super::nfo_store::stored(ctx.conn(), release_id);
+        let mut kept = ctx.data().stored_nfo(release_id)?;
         for file in files.iter().filter(|f| is_text_or_par2_text(f)).take(3) {
             let par2_name = par2_names.get(&file.filename);
             let eff_name = par2_name.unwrap_or(&file.filename);
@@ -518,10 +517,7 @@ impl Step for ProbeStep {
                 {
                     crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, &password);
                     found_nfo_password = Some(password.clone());
-                    writes.push(StepWrite::new(
-                        archive::store::SET_NFO_PASSWORD,
-                        vec![release_id.into(), password.into()],
-                    ));
+                    writes.push(StepWrite::for_mutation(release_id, StepMutation::SetNfoPassword { password }));
                 }
                 if info.nfo.is_none() {
                     info.imdb_ids = imdb_ids(&text);
@@ -531,10 +527,7 @@ impl Step for ProbeStep {
                     if from_start {
                         info.nfo_file = Some(file.filename.clone());
                         // the probe's JSON holds it now: a copy a step kept goes
-                        writes.push(StepWrite::new(
-                            super::nfo_store::DROP,
-                            vec![release_id.into(), file.filename.clone().into()],
-                        ));
+                        writes.push(StepWrite::for_mutation(release_id, StepMutation::DropNfoCopy { file: file.filename.clone() }));
                     }
                 }
             }
@@ -555,10 +548,7 @@ impl Step for ProbeStep {
                 {
                     crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, &password);
                     found_nfo_password = Some(password.clone());
-                    writes.push(StepWrite::new(
-                        archive::store::SET_NFO_PASSWORD,
-                        vec![release_id.into(), password.into()],
-                    ));
+                    writes.push(StepWrite::for_mutation(release_id, StepMutation::SetNfoPassword { password }));
                     break;
                 }
             }
@@ -610,10 +600,7 @@ impl Step for ProbeStep {
                         {
                             crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, &password);
                             found_nfo_password = Some(password.clone());
-                            writes.push(StepWrite::new(
-                                archive::store::SET_NFO_PASSWORD,
-                                vec![release_id.into(), password.into()],
-                            ));
+                            writes.push(StepWrite::for_mutation(release_id, StepMutation::SetNfoPassword { password }));
                         }
                         inspect(&front, found_nfo_password.as_deref(), &mut info);
                     }
@@ -651,11 +638,11 @@ impl Step for ProbeStep {
             info.moviehash = moviehash_of(ctx, file, &files, &front, &info, known_last.clone())?;
             // the same mux already read whole by another release's probe: its media is taken, and nothing more of
             // this file is read for it (an explicit rerun reads its own)
-            let shared = if front.is_empty() || crate::raw_store::is_explicit_rerun(ctx.conn(), release_id, PROBE_STEP)
+            let shared = if front.is_empty() || ctx.data().explicit_rerun(release_id, PROBE_STEP)?
             {
                 None
             } else {
-                same_mux_of(ctx, release_id, &info, stamp)
+                ctx.data().same_mux_media(release_id, &info, stamp)?
             };
             if let Some(twin) = shared {
                 crate::metrics::names::MEDIA_SHARED.inc(&[("key", crate::keys::Kind::Mux.word())], 1);
@@ -690,9 +677,9 @@ impl Step for ProbeStep {
             cover.and_then(|c| super::keep_cover(&c.bytes).map(|sha256| (c.mime.to_string(), sha256))).or(twin_cover);
         writes.push(match &saved_cover {
             Some((mime, sha256)) => {
-                StepWrite::new(SET_COVER, vec![release_id.into(), mime.clone().into(), sha256.clone().into()])
+                StepWrite::for_mutation(release_id, StepMutation::KeepCover { mime: mime.clone(),sha256: sha256.clone() })
             }
-            None => StepWrite::new(DROP_COVER, vec![release_id.into()]),
+            None => StepWrite::for_mutation(release_id, StepMutation::ClearCover),
         });
         let crc = info.file_crc32.map(i64::from);
         let agent = agent_of(&info.headers).map(str::to_string);
@@ -713,39 +700,12 @@ impl Step for ProbeStep {
             cover: saved_cover.as_ref().map(|(m, s)| (m.as_str(), s.as_str())),
         });
         writes.extend(title_writes(release_id, info.media.as_ref()));
-        writes.push(StepWrite::new(
-            SET_PROBE,
-            vec![release_id.into(), crc.into(), agent.into(), json.into(), hash.clone().into()],
-        ));
+        writes.push(StepWrite::for_mutation(release_id, StepMutation::KeepProbe { crc32: crc,agent,json,moviehash: hash.clone() }));
         // a hash found on a later look is asked about then too
         let needs_list_decrypt = found_nfo_password.is_some()
             && (existing_db_pw != found_nfo_password
                 || info.archive.as_ref().is_some_and(|a| a.name.is_some()))
-            && ctx
-                .conn()
-                .query_row(
-                    "select 1 from archive_release ar
-                     where ar.release_id = ?1
-                       and (
-                           (ar.names_hidden = 1
-                            and not exists (
-                                select 1 from archive_inner_files f
-                                where f.release_id = ar.release_id and f.source in (1, 2, 3)
-                            ))
-                           or (ar.password = 1
-                               and exists (
-                                   select 1 from archive_inner_files f
-                                   where f.release_id = ar.release_id and f.source in (1, 2, 3) and lower(f.name) like '%.nzb'
-                               )
-                               and not exists (
-                                   select 1 from archive_inner_files f
-                                   where f.release_id = ar.release_id and f.source = 5
-                               ))
-                       )",
-                    [release_id],
-                    |_| Ok(true),
-                )
-                .unwrap_or(false);
+            && ctx.data().archive_requires_password_list(release_id)?;
         let rerun = mask(crate::keys::KEYS_STEP)
             | if hash.is_some() { mask(super::opensubtitles::OPENSUBTITLES_STEP) } else { 0 }
             | if needs_list_decrypt { mask(archive::steps::LIST_STEP) } else { 0 };
@@ -776,9 +736,9 @@ pub(crate) struct SameMux {
 }
 
 /// `same_mux_media` for the release being probed, with every shard opened beside its own. None without a mux key.
-fn same_mux_of(ctx: &StepCtx<'_>, release_id: i64, info: &ProbeInfo, stamp: u64) -> Option<SameMux> {
+pub(crate) fn same_mux_of_legacy(conn: &rusqlite::Connection, release_id: i64, info: &ProbeInfo, stamp: u64) -> Option<SameMux> {
     let mux = info.media.as_ref().and_then(crate::keys::mux_text)?;
-    let main = ctx.conn().path().and_then(super::audio_print::main_of)?;
+    let main = conn.path().and_then(super::audio_print::main_of)?;
     let all = crate::db::open_with_shards(&main).ok()?;
     same_mux_media(&all, release_id, info, &mux, stamp)
 }
@@ -942,22 +902,18 @@ const FRONT_ARTICLES: i64 = 6;
 /// an NFO's is (`imdb_from_nfo`), and a TMDB or TVDB id pinned the same way (`tmdb_from_tag`, `tvdb_from_tag`), each
 /// only when the row's kind agrees (a TMDB movie id means nothing for a show). No row yet: nothing, and the next
 /// probe of the release writes them.
-const TAG_IMDB: &str = "update media_release set imdb_id = ?2, imdb_from_nfo = 1 where release_id = ?1 and kind = 2";
-const TAG_TMDB: &str = "update media_release set tmdb_id = ?2, tmdb_from_tag = 1 where release_id = ?1 and kind = ?3";
-const TAG_TVDB: &str = "update media_release set tvdb_id = ?2, tvdb_from_tag = 1 where release_id = ?1 and kind = 1";
-
 pub(crate) fn title_writes(release_id: i64, media: Option<&media::MediaInfo>) -> Vec<StepWrite> {
     let Some(ids) = media.map(media::MediaInfo::title_ids) else { return Vec::new() };
     let mut out = Vec::new();
     if let Some(imdb) = ids.imdb {
-        out.push(StepWrite::new(TAG_IMDB, vec![release_id.into(), imdb.into()]));
+        out.push(StepWrite::for_mutation(release_id, StepMutation::PinTagImdb { imdb_id: imdb }));
     }
     if let Some((movie, tmdb)) = ids.tmdb {
         let kind = if movie { crate::media::title::Kind::Movie } else { crate::media::title::Kind::Tv };
-        out.push(StepWrite::new(TAG_TMDB, vec![release_id.into(), tmdb.into(), (kind as i64).into()]));
+        out.push(StepWrite::for_mutation(release_id, StepMutation::PinTagTmdb { tmdb_id: tmdb,kind }));
     }
     if let Some(tvdb) = ids.tvdb {
-        out.push(StepWrite::new(TAG_TVDB, vec![release_id.into(), tvdb.into()]));
+        out.push(StepWrite::for_mutation(release_id, StepMutation::PinTagTvdb { tvdb_id: tvdb }));
     }
     out
 }

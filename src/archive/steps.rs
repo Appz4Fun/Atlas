@@ -3,7 +3,6 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use rusqlite::params;
 use rusqlite::types::Value;
 
 use crate::duplicates;
@@ -12,7 +11,7 @@ use crate::config::{ArchiveConfig, Config};
 use crate::naming::{self, NameSource};
 use crate::par2;
 use crate::postprocess::step::{
-    BodyRequest, Got, NameChange, Needs, Outcome, ReleaseInfo, Reruns, Step, StepCtx, StepError, StepId, StepWrite,
+    BodyRequest, Got, NameChange, Needs, Outcome, ReleaseInfo, Reruns, Step, StepCtx, StepError, StepId, StepMutation, StepWrite,
 };
 use crate::store::{self, FileInfo, SegmentPick, SegmentRef};
 
@@ -385,7 +384,7 @@ fn with_nzb(
     limits: &ArchiveConfig,
 ) -> Result<Outcome, StepError> {
     let rel = ctx.release();
-    let content_id = crate::raw_store::release_content_id(ctx.conn(), rel.id).unwrap_or_default();
+    let content_id = ctx.data().release_content_id(rel.id)?.unwrap_or_default();
     let Some((inside, nzb_pw)) = inside else {
         if has_inner_nzb && (!wrapper_encrypted || pw_available) {
             crate::raw_store::put_nested_nzb_password(&rel.name, &rel.group, &content_id, "");
@@ -398,20 +397,20 @@ fn with_nzb(
     let mut nested = finish(ctx, SOURCE_NZB, inside, limits)?;
     if let Some(pw) = nzb_pw {
         crate::raw_store::put_nested_nzb_password(&rel.name, &rel.group, &content_id, &pw);
-        add_pointed_password_writes(ctx, &mut nested.writes, &pw, !wrapper_encrypted);
+        add_pointed_password_writes(ctx, &mut nested.writes, &pw, !wrapper_encrypted)?;
     } else {
         crate::raw_store::put_nested_nzb_password(&rel.name, &rel.group, &content_id, "");
     }
     Ok(merge_nzb(outcome, nested))
 }
 
-fn add_pointed_password_writes(ctx: &StepCtx<'_>, writes: &mut Vec<StepWrite>, pw: &str, set_self: bool) {
+fn add_pointed_password_writes(ctx: &StepCtx<'_>, writes: &mut Vec<StepWrite>, pw: &str, set_self: bool) -> Result<(), StepError> {
     let rel = ctx.release();
     let id = rel.id;
     if set_self {
-        let content_id = crate::raw_store::release_content_id(ctx.conn(), id).unwrap_or_default();
+        let content_id = ctx.data().release_content_id(id)?.unwrap_or_default();
         crate::raw_store::put_nfo_password(&rel.name, &rel.group, &content_id, pw);
-        writes.push(StepWrite::new(archive_store::SET_NFO_PASSWORD, vec![id.into(), pw.to_string().into()]));
+        writes.push(StepWrite::for_mutation(id, StepMutation::SetNfoPassword { password: pw.to_string() }));
     }
     let target_names: Vec<String> = writes
         .iter()
@@ -422,14 +421,12 @@ fn add_pointed_password_writes(ctx: &StepCtx<'_>, writes: &mut Vec<StepWrite>, p
         })
         .collect();
     for name in target_names {
-        writes.push(StepWrite::new(archive_store::RERUN_POINTED_LIST.as_str(), vec![name.clone().into(), id.into()]));
-        writes.push(StepWrite::new(archive_store::RERUN_POINTED_PROBE.as_str(), vec![name.clone().into(), id.into()]));
-        writes.push(StepWrite::new(
-            archive_store::MARK_POINTED_PASSWORD,
-            vec![name.clone().into(), id.into(), pw.to_string().into()],
-        ));
-        writes.push(StepWrite::new(archive_store::RANK_POINTED.as_str(), vec![name.into(), id.into()]));
+        writes.push(StepWrite::for_mutation(id, StepMutation::RerunPointedList { name: name.clone() }));
+        writes.push(StepWrite::for_mutation(id, StepMutation::RerunPointedProbe { name: name.clone() }));
+        writes.push(StepWrite::for_mutation(id, StepMutation::SetPointedPassword { name: name.clone(),password: pw.to_string() }));
+        writes.push(StepWrite::for_mutation(id, StepMutation::RankPointed { name }));
     }
+    Ok(())
 }
 
 /// Looks up a password already stored or visible in the release's names/subjects, verified against `check` when given.
@@ -437,11 +434,11 @@ fn known_or_post_password(
     ctx: &StepCtx<'_>,
     files: &[FileInfo],
     check: Option<&super::PasswordTest>,
-) -> Option<String> {
+) -> Result<Option<String>, StepError> {
     let rel = ctx.release();
-    let content_id = crate::raw_store::release_content_id(ctx.conn(), rel.id).unwrap_or_default();
+    let content_id = ctx.data().release_content_id(rel.id)?.unwrap_or_default();
     let mut extra = Vec::new();
-    if let Some(pw) = archive_store::nfo_password(ctx.conn(), rel.id) {
+    if let Some(pw) = ctx.data().nfo_password(rel.id)? {
         extra.push(pw);
     }
     if let Some(pw) = crate::raw_store::get_nfo_password(&rel.name, &rel.group, &content_id)
@@ -453,7 +450,7 @@ fn known_or_post_password(
         .chain(rel.display_name.as_deref())
         .chain(files.iter().map(|f| f.filename.as_str()))
         .chain(files.iter().filter_map(|f| f.subject.as_deref()));
-    crate::release_info::find_verified_password(texts, &extra, check)
+    Ok(crate::release_info::find_verified_password(texts, &extra, check))
 }
 
 /// Harvests a password for an encrypted archive from the post's names/subjects, any posted `.nzb`, or any `.nfo`/`.txt`
@@ -466,12 +463,12 @@ fn harvest_password_from_bodies(
     check: Option<&super::PasswordTest>,
     kept: &mut Vec<StepWrite>,
 ) -> Result<Option<String>, StepError> {
-    if let Some(pw) = known_or_post_password(ctx, files, check) {
+    if let Some(pw) = known_or_post_password(ctx, files, check)? {
         return Ok(Some(pw));
     }
     let rel_id = ctx.release().id;
-    let par2_names = select::par2_name_map(ctx.conn(), rel_id, files);
-    let par2_all = select::par2_file_names(ctx.conn(), rel_id);
+    let par2_names = ctx.data().par2_names(rel_id, files)?;
+    let par2_all = ctx.data().par2_file_names(rel_id)?;
     for par2_name in par2_all.iter().chain(par2_names.values()) {
         if let Some(pw) = crate::release_info::find_verified_password([par2_name.as_str()], &[], check) {
             return Ok(Some(pw));
@@ -495,7 +492,7 @@ fn harvest_password_from_bodies(
         nfo_files.push(unid);
     }
     // an NFO read before, by the probe or another step, is used as it was kept, not fetched again
-    let mut kept_nfo = crate::probe::nfo_store::stored(ctx.conn(), rel_id);
+    let mut kept_nfo = ctx.data().stored_nfo(rel_id)?;
     for nfo_file in nfo_files {
         let par2_name = par2_names.get(&nfo_file.filename).map(String::as_str);
         let reused = match &kept_nfo {
@@ -550,7 +547,7 @@ fn restore_nzb(
     if saved.is_empty() {
         return Ok(None);
     }
-    let pw = known_or_post_password(ctx, files, None)
+    let pw = known_or_post_password(ctx, files, None)?
         .or_else(|| saved.iter().find_map(|f| crate::release_info::find_password(&f.name)));
     if require_checked && pw.is_none() && !crate::raw_store::has_nfo_password_record(&rel.name, &rel.group, content_id)
     {
@@ -560,7 +557,7 @@ fn restore_nzb(
     let listing = Listing { files: inner_files, complete: true, ..Default::default() };
     let mut outcome = finish_with_override(ctx, SOURCE_NZB, listing, None, Some(None), false, limits)?;
     if let Some(pw) = pw {
-        add_pointed_password_writes(ctx, &mut outcome.writes, &pw, true);
+        add_pointed_password_writes(ctx, &mut outcome.writes, &pw, true)?;
     }
     Ok(Some(outcome))
 }
@@ -612,7 +609,7 @@ fn finish_full(
     let is_archive = source != SOURCE_PAR2 && source != SOURCE_NZB;
     // what the headers come to beyond the list: worked out here from a fresh read, the salted ones under this
     // install's salt; a restore's as they were kept
-    let salt = if is_archive && restored.is_none() { crate::keys::step_salt(ctx.conn()) } else { None };
+    let salt = if is_archive && restored.is_none() { ctx.data().legacy_step_key_salt()? } else { None };
     let (keys, facts) = restored.unwrap_or_else(|| {
         let posted = release.posted_date.as_deref().and_then(crate::dates::naive_timestamp);
         (archive_store::ArchiveKeys::of(&listing, salt, posted), archive_store::FACTS)
@@ -624,41 +621,28 @@ fn finish_full(
     let mut writes = Vec::new();
     let rows = collapse_volumes(&listing.files);
     let pw = password_override.unwrap_or_else(|| listing.password());
-    let old: i64 = ctx
-        .conn()
-        .prepare_cached(archive_store::BYTES_OF_SOURCE)
-        .and_then(|mut stmt| stmt.query_row(params![id, source], |r| r.get(0)))
-        .map_err(retry)?;
-    let used = store::get_meta(ctx.conn(), "archive_name_bytes").map_err(retry)?.unwrap_or(0);
+    let old = ctx.data().archive_source_name_bytes(id, source)?;
+    let used = ctx.data().archive_total_name_bytes()?;
     let total_quota_bytes = limits.max_names_mb.saturating_mul(1 << 20);
     let quota = total_quota_bytes / store::SHARDS as i64;
     let mut stored = false;
     // what this release already holds comes back when it's replaced
     if rows.is_empty() || used.saturating_sub(old) < quota {
-        writes.push(StepWrite::new(archive_store::DELETE_SOURCE, vec![id.into(), source.into()]));
+        writes.push(StepWrite::for_mutation(id, StepMutation::ClearArchiveSource { source }));
         let mut bytes = 0i64;
         for (i, row) in rows.iter().enumerate() {
-            let size = row.size.and_then(|s| i64::try_from(s).ok());
-            let params: Vec<Value> = vec![
-                id.into(),
-                (source * 65_536 + i as i64).into(),
-                row.name.clone().into(),
-                size.into(),
-                source.into(),
-                row.crc32.map(i64::from).into(),
-                row.mtime.into(),
-                row.host_os.map(i64::from).into(),
-            ];
-            writes.push(StepWrite::new(archive_store::INSERT_FILE_FACTS, params));
+            writes.push(StepWrite::for_mutation(id, StepMutation::KeepArchiveFile {
+                sequence: source * 65_536 + i as i64,source,file: row.clone(),
+            }));
             bytes += row.name.len() as i64 + 32;
             stored = true;
         }
         if bytes != old {
-            writes.push(StepWrite::new(archive_store::ADD_NAME_BYTES, vec![(bytes - old).into()]));
+            writes.push(StepWrite::for_mutation(id, StepMutation::AdjustArchiveNameBytes { delta: bytes - old }));
         }
     } else {
         // past the total: what's there stays, and this list goes unstored
-        writes.push(StepWrite::new(archive_store::COUNT_OVER_QUOTA, vec![]));
+        writes.push(StepWrite::for_mutation(id, StepMutation::ArchiveNamesOverQuota));
     }
     // part of a list would call two releases the same when only their first files are
     let files = ctx.files().map_err(retry)?;
@@ -677,7 +661,7 @@ fn finish_full(
             .flatten(),
     };
     if persist_raw {
-        let content_id = crate::raw_store::release_content_id(ctx.conn(), id).unwrap_or_default();
+        let content_id = ctx.data().release_content_id(id)?.unwrap_or_default();
         let check_bytes = listing.password_check.map(|c| c.to_bytes());
         crate::raw_store::put_archive(&crate::raw_store::ArchiveRecord {
             name: &release.name,
@@ -705,43 +689,27 @@ fn finish_full(
         || source == SOURCE_PAR2 && duplicates::lists_archives(listing.files.iter().map(|f| f.name.as_str()));
     if !leaves_it {
         writes.push(match content {
-            Some(content) => StepWrite::new(duplicates::SET_CONTENT, vec![id.into(), content.into()]),
-            None => StepWrite::new(duplicates::CLEAR_CONTENT, vec![id.into()]),
+            Some(content) => StepWrite::for_mutation(id, StepMutation::SetContentFingerprint { content }),
+            None => StepWrite::for_mutation(id, StepMutation::ClearContentFingerprint),
         });
     }
     // no archive was read, soo no password to tell
     if source != SOURCE_PAR2 && source != SOURCE_NZB {
-        writes.push(StepWrite::new(archive_store::UPSERT_RELEASE, vec![id.into(), pw.code().into()]));
+        writes.push(StepWrite::for_mutation(id, StepMutation::SetArchivePassword { password: pw }));
         if listing.encryption.is_some() || listing.headers_encrypted || listing.password_check.is_some() {
-            writes.push(StepWrite::new(
-                archive_store::SET_ENCRYPTION,
-                vec![
-                    id.into(),
-                    listing.encryption.map(super::Encryption::code).into(),
-                    i64::from(listing.headers_encrypted).into(),
-                    listing.password_check.map(|check| check.to_bytes()).into(),
-                ],
-            ));
+            writes.push(StepWrite::for_mutation(id, StepMutation::SetArchiveEncryption {
+                encryption: listing.encryption,names_hidden: listing.headers_encrypted,check: listing.password_check,
+            }));
         }
         // every time, soo a read that finds none clears what an older read left
-        writes.push(StepWrite::new(
-            archive_store::SET_KEYS,
-            vec![
-                id.into(),
-                keys.packer.clone().into(),
-                keys.twin_key.into(),
-                keys.owner_key.into(),
-                keys.zone_key.into(),
-                facts.into(),
-            ],
-        ));
+        writes.push(StepWrite::for_mutation(id, StepMutation::SetArchiveKeys { keys: keys.clone(),facts }));
     }
 
     // what an NZB points to, in this shard, is read sooner: the next hop
     if source == SOURCE_NZB {
         for name in nzb::release_names(rows.iter().map(|r| r.name.as_str())) {
-            writes.push(StepWrite::new(archive_store::MARK_POINTED, vec![name.clone().into(), id.into()]));
-            writes.push(StepWrite::new(archive_store::RANK_POINTED.as_str(), vec![name.into(), id.into()]));
+            writes.push(StepWrite::for_mutation(id, StepMutation::MarkPointed { name: name.clone() }));
+            writes.push(StepWrite::for_mutation(id, StepMutation::RankPointed { name }));
         }
     }
     let name_source = if source == SOURCE_PAR2 { NAME_SOURCE_PAR2 } else { NAME_SOURCE_INNER };
@@ -795,7 +763,7 @@ fn restore_archive(
     };
     // salted keys made under another salt (a shard reset makes a new one) no longer line up with this install's
     let mut keys = saved.keys;
-    let salt_now = crate::keys::step_salt(ctx.conn()).map(crate::keys::salt_id);
+    let salt_now = ctx.data().legacy_step_key_salt()?.map(crate::keys::salt_id);
     if saved.key_salt.is_none() || saved.key_salt != salt_now {
         keys.owner_key = None;
         keys.zone_key = None;
@@ -810,7 +778,7 @@ fn restore_archive(
     let mut outcome =
         finish_full(ctx, source, listing, password_override, Some(saved.content_fp), false, restored, limits)?;
     let posted_files = ctx.files().unwrap_or_default();
-    let wrapper_pw = encrypted.then(|| known_or_post_password(ctx, &posted_files, wrapper_check.as_ref())).flatten();
+    let wrapper_pw = if encrypted { known_or_post_password(ctx, &posted_files, wrapper_check.as_ref())? } else { None };
     let rel = ctx.release();
     if require_password_inspected
         && encrypted
@@ -821,7 +789,7 @@ fn restore_archive(
     }
     if let Some(ref pw) = wrapper_pw {
         crate::raw_store::put_nfo_password(&rel.name, &rel.group, content_id, pw);
-        outcome.writes.push(StepWrite::new(archive_store::SET_NFO_PASSWORD, vec![rel.id.into(), pw.clone().into()]));
+        outcome.writes.push(StepWrite::for_mutation(rel.id, StepMutation::SetNfoPassword { password: pw.clone() }));
     }
     let nested = crate::raw_store::get_archive_files(&rel.name, &rel.group, content_id, SOURCE_NZB);
     if nested.is_empty() {
@@ -844,12 +812,12 @@ fn restore_archive(
     let hop_pw = files.iter().find_map(|f| crate::release_info::find_password(&f.name));
     let listing = Listing { files, complete: true, ..Default::default() };
     let mut nested = finish_with_override(ctx, SOURCE_NZB, listing, None, Some(None), false, limits)?;
-    let nzb_pw = crate::raw_store::get_nested_nzb_password(&rel.name, &rel.group, content_id)
+    let mut nzb_pw = crate::raw_store::get_nested_nzb_password(&rel.name, &rel.group, content_id)
         .or(inner_nzb_pw)
-        .or(hop_pw)
-        .or_else(|| if !encrypted { known_or_post_password(ctx, &posted_files, None) } else { None });
+        .or(hop_pw);
+    if nzb_pw.is_none() && !encrypted { nzb_pw = known_or_post_password(ctx, &posted_files, None)?; }
     if let Some(pw) = nzb_pw {
-        add_pointed_password_writes(ctx, &mut nested.writes, &pw, !encrypted);
+        add_pointed_password_writes(ctx, &mut nested.writes, &pw, !encrypted)?;
     }
     Ok(Some(merge_nzb(outcome, nested)))
 }
@@ -875,19 +843,19 @@ fn restore_par2(
     let id = ctx.release().id;
     if !covers_all {
         outcome.writes.retain(|write| write.sql != duplicates::SET_CONTENT);
-        outcome.writes.push(StepWrite::new(duplicates::CLEAR_POSTED, vec![id.into()]));
+        outcome.writes.push(StepWrite::for_mutation(id, StepMutation::ClearPostedFingerprint));
     }
     if let Some(m) = meta {
         if let Some(inv) = &m.inventory {
             outcome.writes.extend(archive_store::par2_file_writes(id, inv));
         }
         if let Some(posted) = m.posted {
-            outcome.writes.push(StepWrite::new(duplicates::SET_POSTED, vec![id.into(), posted.into()]));
+            outcome.writes.push(StepWrite::for_mutation(id, StepMutation::SetPostedFingerprint { posted }));
         }
         if let Some((block, blocks)) = m.sizes {
             outcome
                 .writes
-                .push(StepWrite::new(duplicates::SET_PAR2_SIZES, vec![id.into(), block.into(), blocks.into()]));
+                .push(StepWrite::for_mutation(id, StepMutation::SetPar2Sizes { block,blocks }));
         }
     }
     Ok(outcome)
@@ -1001,7 +969,7 @@ impl Step for Par2Step {
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let files = ctx.files().map_err(retry)?;
-        let explicit = crate::raw_store::is_explicit_rerun(ctx.conn(), ctx.release().id, PAR2_STEP);
+        let explicit = ctx.data().explicit_rerun(ctx.release().id, PAR2_STEP)?;
         let mut outcome = self.read_par2(ctx, &files)?;
         // RAR recovery volumes repair a set as PAR2 does, and are often posted in its place. Read after the set, soo
         // a release's bodies go to its PAR2 list first and the .rev table gets what is left of the budget
@@ -1024,10 +992,10 @@ impl Par2Step {
         let rel_group = ctx.release().group.clone();
         let rel_parts = ctx.release().parts;
         let rel_complete = ctx.release().complete;
-        let content_id = crate::raw_store::release_content_id(ctx.conn(), rel_id).unwrap_or_default();
+        let content_id = ctx.data().release_content_id(rel_id)?.unwrap_or_default();
         let saved_par2 = crate::raw_store::get_archive_files(&rel_name, &rel_group, &content_id, SOURCE_PAR2);
         let par2_meta = crate::raw_store::get_par2(&rel_name, &rel_group, &content_id, rel_parts, rel_complete);
-        if !crate::raw_store::is_explicit_rerun(ctx.conn(), rel_id, PAR2_STEP)
+        if !ctx.data().explicit_rerun(rel_id, PAR2_STEP)?
             && !saved_par2.is_empty()
             && let Some(meta) = par2_meta.as_ref().filter(|m| m.inventory.is_some())
         {
@@ -1100,15 +1068,13 @@ impl Par2Step {
         if !covers_all {
             outcome.writes.retain(|write| write.sql != duplicates::SET_CONTENT);
             let id = ctx.release().id;
-            outcome.writes.push(StepWrite::new(duplicates::CLEAR_POSTED, vec![id.into()]));
+            outcome.writes.push(StepWrite::for_mutation(id, StepMutation::ClearPostedFingerprint));
         }
         if let Some(posted) = posted {
-            let params = vec![ctx.release().id.into(), posted.into()];
-            outcome.writes.push(StepWrite::new(duplicates::SET_POSTED, params));
+            outcome.writes.push(StepWrite::for_mutation(ctx.release().id, StepMutation::SetPostedFingerprint { posted }));
         }
         if let Some((block, blocks)) = sizes {
-            let params = vec![ctx.release().id.into(), block.into(), blocks.into()];
-            outcome.writes.push(StepWrite::new(duplicates::SET_PAR2_SIZES, params));
+            outcome.writes.push(StepWrite::for_mutation(ctx.release().id, StepMutation::SetPar2Sizes { block,blocks }));
         }
         Ok(outcome)
     }
@@ -1342,8 +1308,8 @@ impl Step for ListStep {
         let rel_id = rel.id;
         let rel_name = rel.name.clone();
         let rel_group = rel.group.clone();
-        let content_id = crate::raw_store::release_content_id(ctx.conn(), rel_id).unwrap_or_default();
-        if !crate::raw_store::is_explicit_rerun(ctx.conn(), rel_id, LIST_STEP) {
+        let content_id = ctx.data().release_content_id(rel_id)?.unwrap_or_default();
+        if !ctx.data().explicit_rerun(rel_id, LIST_STEP)? {
             if let Some(saved) =
                 crate::raw_store::get_archive(&rel_name, &rel_group, &content_id, rel.parts, rel.complete)
                 && saved.facts >= archive_store::FACTS
@@ -1481,7 +1447,7 @@ impl Step for ListStep {
                         crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, &pw);
                         outcome
                             .writes
-                            .push(StepWrite::new(archive_store::SET_NFO_PASSWORD, vec![rel_id.into(), pw.into()]));
+                            .push(StepWrite::for_mutation(rel_id, StepMutation::SetNfoPassword { password: pw }));
                     } else if wrapper_encrypted {
                         crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, "");
                     }
@@ -1524,7 +1490,7 @@ impl Step for ListStep {
                         crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, &pw);
                         outcome
                             .writes
-                            .push(StepWrite::new(archive_store::SET_NFO_PASSWORD, vec![rel_id.into(), pw.into()]));
+                            .push(StepWrite::for_mutation(rel_id, StepMutation::SetNfoPassword { password: pw }));
                     } else if wrapper_encrypted {
                         crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, "");
                     }
@@ -1556,7 +1522,7 @@ impl Step for ListStep {
                         crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, &pw);
                         outcome
                             .writes
-                            .push(StepWrite::new(archive_store::SET_NFO_PASSWORD, vec![rel_id.into(), pw.into()]));
+                            .push(StepWrite::for_mutation(rel_id, StepMutation::SetNfoPassword { password: pw }));
                     } else if wrapper_encrypted {
                         crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, "");
                     }
@@ -1584,7 +1550,7 @@ impl Step for ListStep {
                     if data_files != listed {
                         let id = ctx.release().id;
                         for write in outcome.writes.iter_mut().filter(|w| w.sql == duplicates::SET_CONTENT) {
-                            *write = StepWrite::new(duplicates::CLEAR_CONTENT, vec![id.into()]);
+                            *write = StepWrite::for_mutation(id, StepMutation::ClearContentFingerprint);
                         }
                     }
                     return Ok(outcome);
@@ -1596,7 +1562,7 @@ impl Step for ListStep {
             }
         }
         // no archive told what this is: a posted NZB can, by the files of the post it points to
-        let par2_names = select::par2_name_map(ctx.conn(), rel_id, &files);
+        let par2_names = ctx.data().par2_names(rel_id, &files)?;
         for file in select::nzb_sources_with_par2(&files, &par2_names) {
             let Some(body) = whole_file(ctx, file, &mut left)? else { continue };
             if identify(&body) == Format::Nzb {
@@ -1609,8 +1575,9 @@ impl Step for ListStep {
                     Listing { files: followed_files, complete, ..Default::default() },
                     &limits,
                 )?;
-                if let Some(pw) = hop_pw.or_else(|| known_or_post_password(ctx, &files, None)) {
-                    add_pointed_password_writes(ctx, &mut outcome.writes, &pw, true);
+                let pw = match hop_pw { Some(pw) => Some(pw),None => known_or_post_password(ctx, &files, None)? };
+                if let Some(pw) = pw {
+                    add_pointed_password_writes(ctx, &mut outcome.writes, &pw, true)?;
                 } else {
                     crate::raw_store::put_nfo_password(&rel_name, &rel_group, &content_id, "");
                 }

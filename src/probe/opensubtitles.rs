@@ -3,7 +3,6 @@
 
 use std::sync::{Arc, Mutex};
 
-use rusqlite::OptionalExtension;
 use serde_json::Value;
 
 use crate::config::{Config, OpenSubtitlesConfig};
@@ -11,7 +10,7 @@ use crate::media::http::{Client, Reply, encode, now_secs};
 use crate::media::resolve::Trouble;
 use crate::postprocess::schema::ShardTable;
 use crate::postprocess::step::{
-    Needs, Outcome, ReleaseInfo, Reruns, Step, StepCtx, StepError, StepId, StepWrite, mask,
+    Needs, Outcome, ReleaseInfo, Reruns, Step, StepCtx, StepError, StepId, StepMutation, StepWrite, mask,
 };
 use crate::store;
 
@@ -46,14 +45,6 @@ pub const OPENSUBTITLES: ShardTable = ShardTable {
     release_key: Some("release_id"),
     added: &[],
 };
-
-const SET_MATCH: &str = "insert or replace into release_opensubtitles
-    (release_id, moviehash, imdb_id, tmdb_id, kind, title, year, season, episode, release_name, checked_at)
-    values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)";
-
-/// The same pin an NFO's id gets: it came from the release's own bytes, soo a title lookup can't replace it.
-const SET_IMDB: &str =
-    "update media_release set imdb_id = ?2, imdb_from_nfo = 1 where release_id = ?1 and imdb_id is null";
 
 /// What one hash matched.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -138,25 +129,11 @@ impl OpenSubtitlesStep {
         if let Some(hash) = ctx.fact(MOVIEHASH_FACT) {
             return Ok(Some(hash.to_string()));
         }
-        ctx.conn()
-            .query_row("select moviehash from release_probe where release_id = ?1", [ctx.release().id], |r| {
-                r.get::<_, Option<String>>(0)
-            })
-            .optional()
-            .map(Option::flatten)
-            .map_err(|e| StepError::Retry(e.to_string()))
+        ctx.data().probe_moviehash(ctx.release().id)
     }
 
     fn already_asked(ctx: &StepCtx<'_>, hash: &str) -> Result<bool, StepError> {
-        ctx.conn()
-            .query_row(
-                "select 1 from release_opensubtitles where release_id = ?1 and moviehash = ?2",
-                rusqlite::params![ctx.release().id, hash],
-                |_| Ok(()),
-            )
-            .optional()
-            .map(|r| r.is_some())
-            .map_err(|e| StepError::Retry(e.to_string()))
+        ctx.data().opensubtitles_asked(ctx.release().id, hash)
     }
 }
 
@@ -198,7 +175,8 @@ impl Step for OpenSubtitlesStep {
         if Self::already_asked(ctx, &hash)? {
             return Ok(Outcome::default());
         }
-        let reply = if let Some(cached) = crate::raw_store::get_opensubtitles(&hash) {
+        let reply = if let Some(cached) = crate::raw_store::get_opensubtitles(&hash)
+            .map_err(|_| StepError::Retry("OpenSubtitles cache read failed".into()))? {
             cached
         } else {
             let Some((key, base, client)) = self.client() else { return Ok(Outcome::default()) };
@@ -206,11 +184,13 @@ impl Step for OpenSubtitlesStep {
             match client.get(&url, &[("Api-Key", &key), ("Accept", "application/json")]) {
                 Ok(Reply::Json(json)) => {
                     let matched = best_match(&json);
-                    crate::raw_store::put_opensubtitles(&hash, matched.as_ref());
+                    crate::raw_store::put_opensubtitles(&hash, matched.as_ref())
+                        .map_err(|_| StepError::Retry("OpenSubtitles cache write failed".into()))?;
                     matched
                 }
                 Ok(Reply::NotFound) => {
-                    crate::raw_store::put_opensubtitles(&hash, None);
+                    crate::raw_store::put_opensubtitles(&hash, None)
+                        .map_err(|_| StepError::Retry("OpenSubtitles cache write failed".into()))?;
                     None
                 }
                 Err(Trouble::Paused(until) | Trouble::BadKey(until)) => {
@@ -219,28 +199,13 @@ impl Step for OpenSubtitlesStep {
                 Err(Trouble::Bad(why)) => return Err(StepError::Retry(why)),
             }
         };
-        let id = ctx.release().id;
-        let f = reply.clone().unwrap_or_default();
-        let film_imdb = f.imdb_id.filter(|_| f.is_movie());
-        let writes = vec![StepWrite::new(
-            SET_MATCH,
-            vec![
-                id.into(),
-                hash.into(),
-                f.imdb_id.into(),
-                f.tmdb_id.into(),
-                f.kind.into(),
-                f.title.into(),
-                f.year.into(),
-                f.season.into(),
-                f.episode.into(),
-                f.release_name.into(),
-                now_secs().into(),
-            ],
-        )];
+        let film_imdb = reply.as_ref().and_then(|feature| feature.imdb_id.filter(|_| feature.is_movie()));
+        let matched = reply.is_some();
+        let writes = vec![StepWrite::for_mutation(ctx.release().id,
+            StepMutation::OpenSubtitlesMatch { moviehash: hash, feature: reply, checked_at: now_secs() })];
         // a film's id goes to media_release in its own step, after the release has a row there
         let rerun = if film_imdb.is_some() { mask(OPENSUBTITLES_IMDB_STEP) } else { 0 };
-        Ok(Outcome { matched: reply.is_some(), writes, rerun, ..Outcome::default() })
+        Ok(Outcome { matched, writes, rerun, ..Outcome::default() })
     }
 }
 
@@ -270,18 +235,9 @@ impl Step for OpenSubtitlesImdb {
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let id = ctx.release().id;
-        let imdb: Option<i64> = ctx
-            .conn()
-            .query_row(
-                "select imdb_id from release_opensubtitles
-                 where release_id = ?1 and imdb_id is not null and lower(kind) = 'movie'",
-                [id],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(|e| StepError::Retry(e.to_string()))?;
+        let imdb = ctx.data().opensubtitles_movie_imdb(id)?;
         let Some(imdb) = imdb else { return Ok(Outcome::default()) };
-        let writes = vec![StepWrite::new(SET_IMDB, vec![id.into(), imdb.into()])];
+        let writes = vec![StepWrite::for_mutation(id, StepMutation::PinOpenSubtitlesMovieImdb { imdb_id: imdb })];
         Ok(Outcome { matched: true, writes, ..Outcome::default() })
     }
 }
@@ -358,5 +314,92 @@ mod tests {
         assert!(is_hash("8e245d9679d31e12"));
         assert!(!is_hash("8e245d9679d31e1"));
         assert!(!is_hash("8e245d9679d31e1&"));
+    }
+
+    #[test]
+    fn cache_read_failure_keeps_the_actual_step_retryable_without_fetching() {
+        use std::net::TcpListener;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        let home = tempfile::tempdir().unwrap();
+        let unavailable = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = unavailable.local_addr().unwrap().port();
+        drop(unavailable);
+        let http = TcpListener::bind("127.0.0.1:0").unwrap();
+        http.set_nonblocking(true).unwrap();
+        let config = format!(
+            "[storage]\nbackend='postgres'\nurl='host=127.0.0.1 port={port} dbname=example user=example connect_timeout=1'\nschema='cache_fixture'\nmax_connections=1\n\
+             [media.opensubtitles]\napi_key=''\nbase_url='http://127.0.0.1:{}'\n",
+            http.local_addr().unwrap().port()
+        );
+        std::fs::write(home.path().join("config.toml"), config).unwrap();
+        let sentinel = b"no native SQLite cache";
+        std::fs::write(home.path().join("atlas.raw.db"), sentinel).unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "probe::opensubtitles::tests::cache_error_child", "--nocapture"])
+            .env("ATLAS_HOME", home.path())
+            .env("ATLAS_NO_KEYRING", "1")
+            .env("ATLAS_CACHE_STEP_CHILD", "1")
+            .env_remove("ATLAS_PG_TEST_URL")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            if child.try_wait().unwrap().is_some() { break; }
+            if Instant::now() >= until {
+                child.kill().unwrap();
+                let _ = child.wait();
+                panic!("owned step child did not stop");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "actual step child failed: {}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert_eq!(std::fs::read(home.path().join("atlas.raw.db")).unwrap(), sentinel);
+        assert!(matches!(http.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock));
+        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    #[ignore = "only the owned parent fixture runs this configured step child"]
+    fn cache_error_child() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+        assert_eq!(std::env::var("ATLAS_CACHE_STEP_CHILD").unwrap(), "1");
+        assert!(crate::raw_store::native_pg_opensubtitles_cache_tests::open_test_native_owner().is_err(),
+            "unavailable Step destination admitted a canonical owner");
+        crate::raw_store::set_test_raw_path(Some(crate::paths::app_dir().join("atlas.raw.db")));
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(OPENSUBTITLES.create).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let bodies = crate::postprocess::bodies::BodyFetcher::new(
+            Arc::new(crate::nntp::Pool::new(&[])),
+            runtime.handle().clone(),
+            Arc::new(AtomicBool::new(false)),
+            crate::config::PostprocessConfig::default(),
+            Arc::new(crate::postprocess::stats::Stats::default()),
+        );
+        let mut context = StepCtx {
+            release: ReleaseInfo { id: 1, name: "Example.Release".into(), group: "example.group".into(), ..Default::default() },
+            data: crate::postprocess::data::StepData::LegacySqlite(&conn),
+            facts: vec![(MOVIEHASH_FACT, "abcdef0123456789".into())],
+            bodies: &bodies,
+            used_bodies: 0,
+            deadline: Instant::now() + Duration::from_secs(2),
+            lane_can_fetch: false,
+            crcs: Vec::new(),
+            pictures: false,
+        };
+        let step = OpenSubtitlesStep::default();
+        assert!(step.client().is_none(), "provider must stay disabled");
+        let Err(StepError::Retry(message)) = step.run(&mut context) else {
+            panic!("cache failure did not produce a retryable actual Step outcome");
+        };
+        assert!(!message.contains("host="));
+        assert!(!message.contains("port="));
+        assert_eq!(conn.query_row("select count(*) from release_opensubtitles", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        assert!(context.crcs.is_empty());
     }
 }

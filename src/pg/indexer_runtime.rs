@@ -72,6 +72,7 @@ pub(crate) struct Owner {
     accepting: AtomicBool,
     failure: AtomicU8,
     busy_since: Mutex<Option<std::time::Instant>>,
+    cache_destination: Option<CacheDestination>,
 }
 
 impl Owner {
@@ -82,7 +83,19 @@ impl Owner {
             accepting: AtomicBool::new(true),
             failure: AtomicU8::new(0),
             busy_since: Mutex::new(None),
+            cache_destination: None,
         }
+    }
+
+    fn with_cache_destination(client: postgres::Client, storage: super::StorageConfig,
+        identity: DestinationIdentity, version: i32) -> Self {
+        let mut owner = Self::new(client);
+        owner.cache_destination = Some(CacheDestination { storage, identity, version });
+        owner
+    }
+
+    pub(crate) fn cache_destination(&self) -> Option<&CacheDestination> {
+        self.cache_destination.as_ref()
     }
 
     pub(crate) fn with<T>(&self, work: impl FnOnce(&mut postgres::Client) -> Result<T>) -> Result<T> {
@@ -138,6 +151,13 @@ impl Owner {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct CacheDestination {
+    pub(crate) storage: super::StorageConfig,
+    pub(crate) identity: DestinationIdentity,
+    pub(crate) version: i32,
+}
+
 /// Catalog pins supplement the fixed configured destination without requiring
 /// cluster-control privileges. They are not cryptographic cluster identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -148,7 +168,7 @@ pub(crate) struct DestinationIdentity {
     ids: Vec<u32>,
 }
 
-fn destination_identity(client: &mut postgres::Client, schema: &str) -> Result<DestinationIdentity> {
+pub(crate) fn destination_identity(client: &mut postgres::Client, schema: &str) -> Result<DestinationIdentity> {
     let row = client.query_one(
         "select current_database(),current_user,session_user,d.oid,r.oid,s.oid,n.oid,n.nspowner,c.oid
          from pg_database d join pg_roles r on r.rolname=current_user
@@ -227,7 +247,7 @@ impl Runtime {
             })
             .context("initializing native indexer cursors")?;
         }
-        let owner = Arc::new(Owner::new(owner));
+        let owner = Arc::new(Owner::with_cache_destination(owner, storage.clone(), identity.clone(), version));
         let db = crate::indexer::owned_postgres_db(db, owner.clone(), PgWriteLimits::default())?;
         Ok(Self { db, profile: Profile { storage, headers }, owner, identity })
     }

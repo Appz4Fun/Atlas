@@ -2,11 +2,12 @@
 
 use std::sync::RwLock;
 
-use rusqlite::{Connection, OptionalExtension};
+#[cfg(test)]
+use rusqlite::Connection;
 
 use crate::config::Config;
 use crate::postprocess::schema::ShardTable;
-use crate::postprocess::step::{Needs, Outcome, Reruns, Step, StepCtx, StepError, StepId, StepWrite};
+use crate::postprocess::step::{Needs, Outcome, Reruns, Step, StepCtx, StepError, StepId, StepMutation, StepWrite};
 
 use super::rules::{Options, classify_release, stores};
 
@@ -21,31 +22,10 @@ pub const RELEASE_CATEGORY: ShardTable = ShardTable {
     added: &[],
 };
 
-const UPSERT: &str = "insert or replace into release_category (release_id, category) values (?1, ?2)";
-const DELETE: &str = "delete from release_category where release_id = ?1";
-
-fn has_row(conn: &Connection, id: i64) -> rusqlite::Result<bool> {
-    let found: Option<i64> = conn
-        .prepare_cached("select 1 from release_category where release_id = ?1")?
-        .query_row([id], |r| r.get(0))
-        .optional()?;
-    Ok(found.is_some())
-}
-
 /// The kind and subcategories of release `id`'s spot, when it was saved from one (`spotnet::store::SPOTS`).
-fn spot_of(conn: &Connection, id: i64) -> rusqlite::Result<Option<(crate::spotnet::Kind, crate::spotnet::Subcats)>> {
-    let row: Option<(String, String)> = conn
-        .prepare_cached("select kind, coalesce(subcats, '') from spots where release_id = ?1")?
-        .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))
-        .optional()?;
-    Ok(row.and_then(|(kind, subcats)| {
-        let kind = match kind.as_str() {
-            "movie" => crate::spotnet::Kind::Movie,
-            "series" => crate::spotnet::Kind::Series,
-            _ => return None,
-        };
-        Some((kind, crate::spotnet::header::subcats(&subcats)))
-    }))
+#[cfg(test)]
+fn spot_of(conn: &Connection, id: i64) -> Result<Option<(crate::spotnet::Kind, crate::spotnet::Subcats)>, StepError> {
+    crate::postprocess::data::StepData::LegacySqlite(conn).category_spot(id)
 }
 
 /// The category step's id, for a rerun of it alone.
@@ -92,7 +72,7 @@ impl Step for CategoryStep {
         let id = ctx.release().id;
         let mut d = classify_release(ctx.release(), &self.options.read().unwrap());
         // a release saved from a spot: the spotter said movie or series, which wins over a pick elsewhere
-        if let Some((kind, subcats)) = spot_of(ctx.conn(), id).map_err(|e| StepError::Retry(e.to_string()))? {
+        if let Some((kind, subcats)) = ctx.data().category_spot(id)? {
             let release = ctx.release();
             let name = release.display_name.as_deref().unwrap_or(&release.name);
             let picked = if stores(&d) { d.category } else { 0 };
@@ -116,9 +96,9 @@ impl Step for CategoryStep {
             crate::metrics::names::RELEASE_SIZE.observe(&[("root", &root)], ctx.release().size.max(0) as f64);
         }
         let writes = if stores(&d) {
-            vec![StepWrite::new(UPSERT, vec![id.into(), d.category.into()])]
-        } else if has_row(ctx.conn(), id).map_err(|e| StepError::Retry(e.to_string()))? {
-            vec![StepWrite::new(DELETE, vec![id.into()])]
+            vec![StepWrite::for_mutation(id, StepMutation::SetCategory { category: d.category })]
+        } else if ctx.data().category_exists(id)? {
+            vec![StepWrite::for_mutation(id, StepMutation::ClearCategory)]
         } else {
             Vec::new()
         };

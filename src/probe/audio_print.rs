@@ -21,7 +21,7 @@ use crate::audio::{self, decode, mkv};
 use crate::config::Config;
 use crate::keys::{self, Kind};
 use crate::postprocess::schema::ShardTable;
-use crate::postprocess::step::{Needs, Outcome, ReleaseInfo, Reruns, Step, StepCtx, StepError, StepId, StepWrite};
+use crate::postprocess::step::{Needs, Outcome, ReleaseInfo, Reruns, Step, StepCtx, StepError, StepId, StepMutation, StepWrite};
 use crate::store::{self, FileInfo};
 
 use super::ProbeInfo;
@@ -86,12 +86,6 @@ pub const AUDIO_ANCHORS: ShardTable = ShardTable {
     release_key: Some("release_id"),
     added: &[],
 };
-
-const DROP_PRINTS: &str = "delete from release_audio_print where release_id = ?1";
-const DROP_ANCHORS: &str = "delete from release_audio_anchor where release_id = ?1";
-const SET_PRINT: &str =
-    "insert or replace into release_audio_print (release_id, position, at_ms, items) values (?1, ?2, ?3, ?4)";
-const SET_ANCHOR: &str = "insert or ignore into release_audio_anchor (release_id, anchor) values (?1, ?2)";
 
 /// Kinds that say who posted or packed it, not what: one uploader's account, host, archive owner or clock zone ties
 /// together every film they post, soo sharing one doesn't make a print needless.
@@ -434,11 +428,10 @@ impl Step for AudioPrintStep {
         let retry = |e: rusqlite::Error| StepError::Retry(e.to_string());
         let id = ctx.release().id;
         // a release printed before keeps its prints: nothing is fetched again
-        if has_print(ctx.conn(), id) {
+        if ctx.data().has_audio_print(id)? {
             return Ok(Outcome { matched: true, ..Outcome::default() });
         }
-        let info: Option<String> =
-            ctx.conn().query_row("select info from release_probe where release_id = ?1", [id], |r| r.get(0)).ok();
+        let info = ctx.data().probe_info_best_effort(id)?;
         let Some(info) = info.and_then(|i| serde_json::from_str::<ProbeInfo>(&i).ok()) else {
             return Ok(Outcome::default());
         };
@@ -451,8 +444,8 @@ impl Step for AudioPrintStep {
         };
         // nor is one kept in `atlas.raw.db` from before a shard reset, for the same files
         let (name, group) = (ctx.release().name.clone(), ctx.release().group.clone());
-        let content_id = crate::raw_store::release_content_id(ctx.conn(), id).unwrap_or_default();
-        if !crate::raw_store::is_explicit_rerun(ctx.conn(), id, AUDIO_PRINT_STEP) {
+        let content_id = ctx.data().release_content_id(id)?.unwrap_or_default();
+        if !ctx.data().explicit_rerun(id, AUDIO_PRINT_STEP)? {
             let saved: Prints = crate::raw_store::get_audio_prints(&name, &group, &content_id)
                 .into_iter()
                 .map(|p| (p.position, p.at_ms, audio::from_blob(&p.items)))
@@ -463,9 +456,9 @@ impl Step for AudioPrintStep {
             }
         }
         // only for a release no other key ties to another
-        let main = ctx.conn().path().and_then(main_of).ok_or_else(|| StepError::Retry("no main database".into()))?;
+        let main = ctx.data().legacy_main_path()?;
         let all = crate::db::open_with_shards(&main).map_err(retry)?;
-        let lookup = keys::read_lookup(ctx.conn(), id, Some(ctx.release().parts), None).map_err(retry)?;
+        let lookup = ctx.data().release_lookup(id, Some(ctx.release().parts))?;
         if linked_by(&all, id, &lookup).is_some() {
             count("linked");
             return Ok(Outcome::default());
@@ -514,18 +507,15 @@ impl Step for AudioPrintStep {
 
 /// The writes that keep a release's prints, in place of any it had, and their anchors, made from the items.
 fn print_writes(id: i64, prints: &Prints) -> Vec<StepWrite> {
-    let mut writes = vec![StepWrite::new(DROP_PRINTS, vec![id.into()]), StepWrite::new(DROP_ANCHORS, vec![id.into()])];
+    let mut writes = vec![StepWrite::for_mutation(id, StepMutation::ClearAudioPrints), StepWrite::for_mutation(id, StepMutation::ClearAudioAnchors)];
     let mut anchors: Vec<i64> = Vec::new();
     for (position, at, items) in prints {
         anchors.extend(audio::anchors(items));
-        writes.push(StepWrite::new(
-            SET_PRINT,
-            vec![id.into(), i64::from(*position).into(), (*at).into(), audio::to_blob(items).into()],
-        ));
+        writes.push(StepWrite::for_mutation(id, StepMutation::KeepAudioPrint { position: *position,at_ms: *at,items: items.clone() }));
     }
     anchors.sort_unstable();
     anchors.dedup();
-    writes.extend(anchors.into_iter().map(|a| StepWrite::new(SET_ANCHOR, vec![id.into(), a.into()])));
+    writes.extend(anchors.into_iter().map(|anchor| StepWrite::for_mutation(id, StepMutation::KeepAudioAnchor { anchor })));
     writes
 }
 

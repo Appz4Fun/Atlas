@@ -220,37 +220,19 @@ pub fn par2_file_writes(
     release_id: i64,
     inventory: &crate::par2::Inventory,
 ) -> Vec<crate::postprocess::step::StepWrite> {
-    use crate::postprocess::step::StepWrite;
-    let mut writes = vec![StepWrite::new(DELETE_PAR2_FILES, vec![release_id.into()])];
+    use crate::postprocess::step::{StepMutation, StepWrite};
+    let mut writes = vec![StepWrite::for_mutation(release_id, StepMutation::ClearPar2Files)];
     for f in &inventory.files {
         let sealed = inventory.sealed.contains(&(f.set_id, f.file_id)) && f.bound;
-        writes.push(StepWrite::new(
-            INSERT_PAR2_FILE,
-            vec![
-                release_id.into(),
-                f.file_id.to_vec().into(),
-                f.set_id.to_vec().into(),
-                f.md5.to_vec().into(),
-                f.md5_16k.to_vec().into(),
-                i64::try_from(f.size).unwrap_or(i64::MAX).into(),
-                f.name.clone().into(),
-                f.crc32.map(i64::from).into(),
-                i64::from(f.bound).into(),
-                i64::from(sealed).into(),
-                i64::from(inventory.complete).into(),
-            ],
-        ));
+        writes.push(StepWrite::for_mutation(release_id, StepMutation::KeepPar2File { file: f.clone(),sealed,complete: inventory.complete }));
     }
     for (set_id, creator) in &inventory.creators {
-        writes.push(StepWrite::new(
-            SET_PAR2_CREATOR,
-            vec![release_id.into(), set_id.to_vec().into(), creator.clone().into()],
-        ));
+        writes.push(StepWrite::for_mutation(release_id, StepMutation::SetPar2Creator { set_id: *set_id,creator: creator.clone() }));
     }
     // a whole set says which files the upload has: with each of them there and whole, so is the release, whatever
     // its subject counter says (`store::SET_VOUCHED_COMPLETE`)
     if inventory.complete && !inventory.files.is_empty() {
-        writes.push(StepWrite::new(crate::store::SET_VOUCHED_COMPLETE, vec![release_id.into()]));
+        writes.push(StepWrite::for_mutation(release_id, StepMutation::VouchComplete));
     }
     writes
 }
