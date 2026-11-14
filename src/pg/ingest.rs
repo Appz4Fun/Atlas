@@ -53,7 +53,7 @@ impl Source {
                 let mut client = pool.get()?;
                 work(&mut client)
             }
-            Self::Owner(owner) => owner.with(work),
+            Self::Owner(owner) => owner.with_ingest(work),
         }
     }
 }

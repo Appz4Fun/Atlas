@@ -665,6 +665,25 @@ pub(crate) async fn on_db<T: Send + 'static>(
     tokio::task::spawn_blocking(move || conn.with_sql(f)).await.map_err(|e| anyhow!("db task failed: {e}"))?
 }
 
+/// Only committed header progress uses ingestion admission. Claim selection,
+/// frontier scans and all other callbacks keep ordinary FIFO admission.
+pub(crate) async fn on_ingest_progress<T: Send + 'static>(
+    db: &Db,
+    work: impl FnOnce(&dyn Sql) -> Result<T> + Send + 'static,
+) -> Result<T> {
+    let conn = db.conn.clone();
+    tokio::task::spawn_blocking(move || match &*conn {
+        MainConnection::Postgres(_) => conn.with_sql(work),
+        MainConnection::OwnedPostgres(owner) => {
+            let t = std::time::Instant::now();
+            owner.with_ingest(|client| {
+                crate::profile::DB_WAIT.add_since(t);
+                work(&crate::pg::sql::Pg::new(client))
+            })
+        },
+    }).await.map_err(|error| anyhow!("ingestion progress task failed: {error}"))?
+}
+
 /// Everything a pass needs, cheap to clone into tasks.
 #[derive(Clone)]
 pub struct PassContext {
@@ -952,7 +971,7 @@ where
             let (to, began) = to.unwrap_or((last, Some(chrono::Utc::now().timestamp())));
             let began = began.filter(|_| to != s.live_cursor);
             let k = key.clone();
-            on_db(db, move |conn| {
+            on_ingest_progress(db, move |conn| {
                 db::update_live_cursor(conn, &k, to)?;
                 if let Some(b) = began {
                     db::set_start_posted(conn, &k, b)?;
@@ -969,7 +988,7 @@ where
                 && to > s.live_cursor
             {
                 let k = key.clone();
-                on_db(db, move |conn| {
+                on_ingest_progress(db, move |conn| {
                     db::update_live_cursor(conn, &k, to)?;
                     if let Some(b) = began {
                         db::set_start_posted(conn, &k, b)?;
@@ -1494,7 +1513,7 @@ where
     let ranged = pass.process_range(start, cursor, "SWEEP", progress).await;
     // done down from the cursor: the cursor moves past it, failed or not
     if let Some(high) = ranged.high_done {
-        on_db(db, move |conn| Ok(db::update_backfill_cursor(conn, &key, high as i64 - 1)?)).await?;
+        on_ingest_progress(db, move |conn| Ok(db::update_backfill_cursor(conn, &key, high as i64 - 1)?)).await?;
     }
     ranged.into_result()
 }
@@ -1646,7 +1665,7 @@ async fn finish_chunk(
     let (group, day) = (chunk.group.as_str(), chunk.day);
     let c = chunk.clone();
     let now = chrono::Utc::now().timestamp();
-    if !on_db(db, move |conn| Ok(crate::chunks::finish(conn, &c, now)?)).await? {
+    if !on_ingest_progress(db, move |conn| Ok(crate::chunks::finish(conn, &c, now)?)).await? {
         println!("[CHUNK] {group} day {day}: taken over by another worker, leaving it to that one");
         return Ok(());
     }
@@ -1869,7 +1888,7 @@ where
         Ranged { saved, .. } => {
             // stopped part way, not failed: given back as it is
             let c = chunk.clone();
-            on_db(db, move |conn| Ok(crate::chunks::release(conn, &c)?)).await?;
+            on_ingest_progress(db, move |conn| Ok(crate::chunks::release(conn, &c)?)).await?;
             Ok(saved)
         }
     }
@@ -2029,7 +2048,7 @@ impl Pass<'_> {
         // done up from the cursor: the cursor moves past it, failed or not
         if let Some(low) = ranged.low_done {
             let key = self.key.clone();
-            on_db(self.db, move |conn| Ok(db::update_live_cursor(conn, &key, low as i64)?)).await?;
+            on_ingest_progress(self.db, move |conn| Ok(db::update_live_cursor(conn, &key, low as i64)?)).await?;
         }
         ranged.into_result()
     }
@@ -2070,7 +2089,7 @@ impl Pass<'_> {
         // done down from the cursor: the cursor moves past it, failed or not
         if let Some(high) = ranged.high_done {
             let key = self.key.clone();
-            on_db(self.db, move |conn| Ok(db::update_backfill_cursor(conn, &key, high as i64 - 1)?)).await?;
+            on_ingest_progress(self.db, move |conn| Ok(db::update_backfill_cursor(conn, &key, high as i64 - 1)?)).await?;
         }
         let saved = ranged.into_result()?;
         self.ctx.states.with(group, |st| st.backfilling = true);
@@ -2107,7 +2126,7 @@ impl Pass<'_> {
             return;
         }
         let key = self.key.clone();
-        let saved = on_db(self.db, move |conn| {
+        let saved = on_ingest_progress(self.db, move |conn| {
             match side {
                 Side::Up => db::update_live_cursor(conn, &key, to as i64)?,
                 Side::Down => db::update_backfill_cursor(conn, &key, to as i64 - 1)?,
@@ -2249,7 +2268,7 @@ impl Pass<'_> {
 
         if let (Some(low), Some(high)) = (low, high) {
             let key = self.key.clone();
-            if let Err(e) = on_db(self.db, move |conn| Ok(db::save_group_dates(conn, &key, low, high)?)).await {
+            if let Err(e) = on_ingest_progress(self.db, move |conn| Ok(db::save_group_dates(conn, &key, low, high)?)).await {
                 error.get_or_insert(e);
             }
         }
