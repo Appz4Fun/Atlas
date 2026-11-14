@@ -1370,7 +1370,7 @@ mod tests {
         check(&db,&["c-done","d-other"]);
         db.execute("update backfill_chunks set grp='e-moved',state=2 where grp='d-other'",vals![]).unwrap();
         check(&db,&["c-done"]);
-        let rollback:Result<()>=db.tx(|tx| {
+        let rollback:Result<()>=(&db as &dyn Sql).tx(|tx| {
             tx.execute("update backfill_chunks set state=0 where grp='a-done'",vals![])?;
             check(tx,&["a-done","c-done"]);
             Err(crate::pg::sql::Error::Value("intentional fixture rollback".into()))
