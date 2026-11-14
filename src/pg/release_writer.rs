@@ -749,3 +749,7 @@ mod accepted_timing_regressions;
 #[cfg(test)]
 #[path="release_writer_timing_controls.rs"]
 mod timing_controls;
+
+#[cfg(test)]
+#[path="release_writer_plan_tests.rs"]
+mod plan_experiment;
