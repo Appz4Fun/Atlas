@@ -395,14 +395,20 @@ mod tests {
 
     #[test]
     fn forged_headers_dont_grow_seen_blobs() {
-        let mut f = crate::store::FileState::default();
+        let mut seen = Vec::new();
         for i in 0..1000 {
             let subject = format!(r#""a.rar" yEnc (1000000/1) {i}"#);
-            if let Some(p) = parse_subject(&subject) {
-                f.add(&Article { part: Some(p.part), total_parts: Some(p.total_parts), ..Default::default() });
+            let parsed = parse_subject(&subject);
+            assert!(parsed.is_none(), "forged part numbers must be rejected before part tracking");
+            if let Some(p) = parsed {
+                crate::catalog_facts::insert_part(&mut seen, p.part);
             }
         }
-        assert!(f.seen.is_empty());
+        assert!(seen.is_empty());
+        let valid = parse_subject(r#""a.rar" yEnc (1/50)"#).unwrap();
+        crate::catalog_facts::insert_part(&mut seen, valid.part);
+        assert_eq!(seen, [0x02]);
+        assert_eq!(crate::catalog_facts::seen_count(&seen), 1);
     }
 
     #[test]
