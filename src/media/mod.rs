@@ -247,3 +247,6 @@ impl Media {
 
 #[cfg(test)]
 mod native_cache_tests;
+
+#[cfg(test)]
+mod native_provider_tests;
