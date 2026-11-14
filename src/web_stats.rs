@@ -898,6 +898,7 @@ pub(crate) fn native_live_from_facts(facts: &crate::pg::fresh_statistics::Native
     let n = w.now.as_deref();
     let up = n.and_then(|sample| sample.sum("atlas_indexer_up"));
     let state = match up {
+        _ if !facts.live_owner => tag("tag-warn", "LIVE OWNER UNAVAILABLE"),
         Some(up) if up > 0.0 => tag("tag-ok", "RUNNING"),
         Some(0.0) => tag("tag-warn", "ON HOLD"),
         _ => tag("tag-warn", "ACTIVITY NOT REPORTED"),
@@ -947,13 +948,16 @@ pub(crate) fn native_live_from_facts(facts: &crate::pg::fresh_statistics::Native
             "the recorded late matcher's backlog"
         )
     );
+    let offline = if facts.live_owner { "" } else {
+        "<p class=\"sort\">The live indexer owner is unavailable. Retained catalog counts remain available; live activity and rates are unavailable. Previous observations are not shown as current.</p>"
+    };
     let measured = if w.computed.as_ref().is_some_and(|window| !window.rates.series.is_empty()) {
         "Original-series rates use their completed 30–300 second observation windows."
     } else {
         "Rates are unavailable until an original series has a completed observation window of at least 30 seconds."
     };
     format!(
-        "<div id=\"stats-live\" hx-get=\"/ui/stats/live\" hx-trigger=\"every {REFRESH_SECS}s\" hx-swap=\"outerHTML\">{}{}{}{}{}{predb}<p class=\"sort\">Read {}; {measured}</p></div>",
+        "<div id=\"stats-live\" hx-get=\"/ui/stats/live\" hx-trigger=\"every {REFRESH_SECS}s\" hx-swap=\"outerHTML\">{offline}{}{}{}{}{}{predb}<p class=\"sort\">Read {}; {measured}</p></div>",
         headline_from_state(w, state),
         pipelines_with_pace(w, &facts.pace),
         lag(w, now),
