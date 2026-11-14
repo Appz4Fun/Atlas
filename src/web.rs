@@ -21,6 +21,9 @@ use crate::ui::{fmt_date, fmt_size};
 use crate::{release_info, release_tags, word_index};
 
 mod fresh;
+#[cfg(test)]
+#[path = "web/native_server_settings_tests.rs"]
+mod native_server_settings_tests;
 
 const HTMX: &str = include_str!("../assets/htmx-2.0.11.min.js");
 const CSS: &str = include_str!("../assets/web.css");
