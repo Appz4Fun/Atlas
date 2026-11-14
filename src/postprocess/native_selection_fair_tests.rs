@@ -1,4 +1,5 @@
-//! Root runs this control alone in a fresh configured PG/home child; no provider service starts.
+//! The ignored parent owns a migrated PostgreSQL schema and one private configured child.
+//! No provider service starts; callbacks and publication use the original native owner.
 use super::*;
 use std::{
     sync::{atomic::AtomicUsize, mpsc},
@@ -46,9 +47,7 @@ fn hold_selection(owner: &Arc<Owner>) -> (mpsc::Sender<()>, thread::JoinHandle<R
     (release, job)
 }
 
-#[test]
-#[ignore = "requires fresh Root-owned ATLAS_NATIVE_TELEMETRY_OWNED PG/home child, real publication under queued selections"]
-fn real_refresh_and_current_capture_progress_between_selection_turns_without_partial_stop_ack() {
+fn configured_publication_case() {
     assert_eq!(std::env::var("ATLAS_NATIVE_TELEMETRY_OWNED").as_deref(), Ok("1"));
     assert!(std::env::var_os("ATLAS_HOME").is_some());
     let storage = crate::config::checked_storage_config().expect("explicit isolated owned storage");
@@ -158,6 +157,7 @@ fn real_refresh_and_current_capture_progress_between_selection_turns_without_par
         })
     });
     waiters(&owner, [2, 0, 7]);
+    let capture_not_before = chrono::Utc::now().timestamp_millis();
     capture_now.send(()).unwrap();
     waiters(&owner, [2, 1, 7]);
     releases[0].send(()).unwrap();
@@ -180,6 +180,7 @@ fn real_refresh_and_current_capture_progress_between_selection_turns_without_par
         assert_eq!(row.get::<_,Vec<u8>>(1).as_slice(),owner.epoch().unwrap().id().as_slice());
         assert_eq!(row.get::<_,Vec<u8>>(2).as_slice(),owner.epoch().unwrap().catalog().nonce().as_slice());
         assert!(row.get::<_,i64>(3)>0&&row.get::<_,i64>(3)<=chrono::Utc::now().timestamp_millis());assert!(row.get::<_,i64>(4)>0);
+        assert!(row.get::<_,i64>(3)>=capture_not_before,"the head must come from the requested current capture, not an older frame");
         assert_eq!(client.query_one("select count(*) from segments",&[])?.get::<_,i64>(0),1);Ok(row.get::<_,i64>(0))
     }).unwrap();
     finish_cache.send(()).unwrap();
@@ -206,4 +207,217 @@ fn real_refresh_and_current_capture_progress_between_selection_turns_without_par
             .get::<_, i64>(0),
         head
     );
+}
+
+use std::{
+    io::{self, Read, Write},
+    path::Path,
+    process::{Child, Command, ExitStatus, Stdio},
+    thread::JoinHandle,
+};
+
+const PRIVATE_CASE: &str = "ATLAS_NATIVE_NESTED_CASE";
+const PRIVATE_SCHEMA: &str = "ATLAS_NATIVE_NESTED_SCHEMA";
+const CASE: &str = "publication_under_selection";
+const SELECTOR: &str = "postprocess::native::telemetry::selection_fair_tests::real_refresh_and_current_capture_progress_between_selection_turns_without_partial_stop_ack";
+const LOG_BYTES: usize = 64 * 1024;
+const CHILD_DEADLINE: Duration = Duration::from_secs(120);
+const COMPLETED: &str = "native nested publication case completed";
+
+struct Log {
+    kept: Vec<u8>,
+    overflow: bool,
+}
+
+// Retain a bounded prefix but keep draining: an overlong child cannot fill a pipe.
+fn drain_log(mut stream: impl Read) -> io::Result<Log> {
+    let mut kept = Vec::new();
+    let mut overflow = false;
+    let mut chunk = [0u8; 4096];
+    loop {
+        let count = match stream.read(&mut chunk) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if count == 0 {
+            break;
+        }
+        let admitted = count.min(LOG_BYTES - kept.len());
+        kept.extend_from_slice(&chunk[..admitted]);
+        overflow |= admitted != count;
+    }
+    Ok(Log { kept, overflow })
+}
+
+// Declared after the parent schema/home, so cleanup runs before either drops.
+struct OwnedChild {
+    child: Child,
+    reaped: bool,
+    out: Option<JoinHandle<io::Result<Log>>>,
+    err: Option<JoinHandle<io::Result<Log>>>,
+}
+
+impl OwnedChild {
+    fn new(child: Child) -> Self {
+        let mut owned = Self { child, reaped: false, out: None, err: None };
+        let out = owned.child.stdout.take().expect("owned child stdout pipe");
+        let err = owned.child.stderr.take().expect("owned child stderr pipe");
+        owned.out = Some(thread::spawn(move || drain_log(out)));
+        owned.err = Some(thread::spawn(move || drain_log(err)));
+        owned
+    }
+
+    fn terminate_if_unreaped(&mut self) {
+        if !self.reaped {
+            let _ = self.child.kill();
+            if self.child.wait().is_ok() {
+                self.reaped = true;
+            }
+        }
+    }
+
+    fn wait(&mut self) -> io::Result<(ExitStatus, bool)> {
+        let until = Instant::now() + CHILD_DEADLINE;
+        loop {
+            if let Some(status) = self.child.try_wait()? {
+                self.reaped = true;
+                return Ok((status, false));
+            }
+            if Instant::now() >= until {
+                // The child has not been reaped; terminate before waiting.
+                let _ = self.child.kill();
+                let status = self.child.wait()?;
+                self.reaped = true;
+                return Ok((status, true));
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn logs(&mut self) -> (io::Result<Log>, io::Result<Log>) {
+        fn join(reader: JoinHandle<io::Result<Log>>) -> io::Result<Log> {
+            reader.join().map_err(|_| io::Error::other("owned log reader panicked"))?
+        }
+        // Join both even when either reader reports an I/O failure.
+        let out = join(self.out.take().expect("owned stdout reader"));
+        let err = join(self.err.take().expect("owned stderr reader"));
+        (out, err)
+    }
+}
+
+impl Drop for OwnedChild {
+    fn drop(&mut self) {
+        self.terminate_if_unreaped();
+        if let Some(reader) = self.out.take() {
+            let _ = reader.join();
+        }
+        if let Some(reader) = self.err.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+fn private_directory(path: &Path) {
+    std::fs::create_dir(path).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}
+
+fn write_config(home: &Path, schema: &crate::pg::testing::Schema) {
+    let mut config = toml_edit::DocumentMut::new();
+    config["storage"]["backend"] = toml_edit::value("postgres");
+    config["storage"]["url"] = toml_edit::value(schema.url.as_str());
+    config["storage"]["schema"] = toml_edit::value(schema.name.as_str());
+    config["storage"]["max_connections"] = toml_edit::value(1);
+    config["storage"]["allow_plaintext"] = toml_edit::value(true);
+    config["header_store"]["enabled"] = toml_edit::value(true);
+    config["header_store"]["dir"] = toml_edit::value("");
+    config["postprocess"]["enabled"] = toml_edit::value(false);
+    config["predb"]["enabled"] = toml_edit::value(false);
+    config["spots"]["enabled"] = toml_edit::value(false);
+    config["media"]["tvmaze"]["enabled"] = toml_edit::value(false);
+    config["media"]["allocine"]["enabled"] = toml_edit::value(false);
+    config["media"]["details_per_minute"] = toml_edit::value(0);
+    config["inferred_parts"] = toml_edit::value(false);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let pending = home.join("config.toml.new");
+    let mut file = options.open(&pending).unwrap();
+    file.write_all(config.to_string().as_bytes()).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    std::fs::rename(pending, home.join("config.toml")).unwrap();
+}
+
+#[test]
+#[ignore = "requires ATLAS_PG_TEST_URL for an isolated PostgreSQL schema and private configured subprocess"]
+fn real_refresh_and_current_capture_progress_between_selection_turns_without_partial_stop_ack() {
+    if let Some(case) = std::env::var_os(PRIVATE_CASE) {
+        assert_eq!(case.to_str(), Some(CASE), "closed private fixture case");
+        let storage = crate::config::checked_storage_config().expect("private configured storage");
+        assert_eq!(storage.schema, std::env::var(PRIVATE_SCHEMA).expect("parent-owned migrated schema"));
+        assert_eq!(
+            crate::config::header_store_config(),
+            crate::config::HeaderStoreConfig { enabled: true, ..Default::default() }
+        );
+        assert_eq!(crate::config::header_store_config().root(), crate::paths::app_dir().join("header-store"));
+        configured_publication_case();
+        println!("{COMPLETED}");
+        return;
+    }
+    assert!(cfg!(unix), "native fixture requires private Unix file permissions");
+    let schema = crate::pg::testing::Schema::new().expect("ATLAS_PG_TEST_URL must select isolated PostgreSQL");
+    let home = tempfile::tempdir().unwrap();
+    private_directory(&home.path().join("tmp"));
+    private_directory(&home.path().join("header-store"));
+    write_config(home.path(), &schema);
+    // Only this exact ignored selector is executed. The child cannot create a
+    // second schema or inherit unrelated service/configuration environment.
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", SELECTOR, "--nocapture", "--test-threads=1"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", home.path())
+        .env("ATLAS_HOME", home.path())
+        .env("TMPDIR", home.path().join("tmp"))
+        .env("TMP", home.path().join("tmp"))
+        .env("TEMP", home.path().join("tmp"))
+        .env("ATLAS_SAB_DIR", home.path().join("no-sabnzbd"))
+        .env("ATLAS_NO_KEYRING", "1")
+        .env("ATLAS_NATIVE_TELEMETRY_OWNED", "1")
+        .env(PRIVATE_CASE, CASE)
+        .env(PRIVATE_SCHEMA, &schema.name)
+        .current_dir(home.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("private native publication child spawn");
+    // Declared after schema/home: even panic cleanup reaps the child and joins
+    // both pipe drainers before dropping the parent's schema or temporary root.
+    let mut child = OwnedChild::new(child);
+    let waited = child.wait();
+    if waited.is_err() {
+        child.terminate_if_unreaped();
+    }
+    let (out, err) = child.logs();
+    drop(child);
+    let (status, timed_out) = waited.expect("private publication child wait");
+    let out = out.expect("private publication stdout drain");
+    let err = err.expect("private publication stderr drain");
+    assert!(!timed_out, "private publication child exceeded its 120-second deadline");
+    assert!(!out.overflow && !err.overflow, "private publication output exceeded the per-pipe 64-KiB cap");
+    // Keep destination-bearing diagnostics out of ordinary public test output.
+    assert!(status.success(), "private publication child failed: {status}");
+    assert_eq!(String::from_utf8_lossy(&out.kept).matches(COMPLETED).count(), 1, "missing completed publication case");
+    drop(err);
+    drop(home);
+    drop(schema);
 }
