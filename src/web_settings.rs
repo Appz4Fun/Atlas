@@ -754,7 +754,9 @@ pub(crate) fn post(path: &str, body: &str, csrf_header: Option<&str>, api_key: &
 
 /// Load, change, save: the terminal's own sequence, with the save's error said rather than the change kept.
 fn saved(change: impl FnOnce(&mut Config, &Managed) -> Result<String, String>) -> Msg {
-    let mut cfg = current();
+    let Some(mut cfg) = config::load_config() else {
+        return ("caution", "not saved", "Configuration could not be read. Reload before saving.".into());
+    };
     let managed = Managed::detect();
     match change(&mut cfg, &managed) {
         Err(why) => ("caution", "not saved", why),
