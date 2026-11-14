@@ -158,6 +158,30 @@ fn native_thumbnail_associations_keep_poster_counter_and_taken_slot_rules() {
     expected.sort_unstable();
     assert_eq!(posters.len(), 2);
     assert_eq!(rows, expected);
+    // Check the actual writer/reader boundary before the association query:
+    // the counter belongs to the stored subject, not a guessed file ordinal.
+    let thumbnail_files = reads.files(thumb, 2).unwrap();
+    assert_eq!(thumbnail_files.len(), 1);
+    let file = &thumbnail_files[0];
+    assert_eq!(file.filename, "thumbnail.jpg");
+    assert_eq!(file.subject.as_deref(), Some("[8/8] thumbnail"));
+    assert_eq!(file.expected, Some(1));
+    assert_eq!(file.subject.as_deref().and_then(crate::archive::beside::counter), Some((8, 8)));
+    assert!(posters.iter().any(|poster| crate::archive::beside::posters_akin(poster, "ZbivKJ385zX890Qm0z0Yit@picture.test")));
+    runtime.owner.with(|client| {
+        let row = client.query_one(
+            "select r.original_name,r.poster,r.posted_clock-o.posted_clock,
+             exists(select 1 from beside_files where row_id=r.id),
+             exists(select 1 from upload_link where release_id=r.id)
+             from releases r join releases o on o.id=$2 where r.id=$1",
+            &[&thumb, &own],
+        )?;
+        assert_eq!(row.get::<_, Vec<u8>>(0).as_slice(), b"thumbnail.jpg");
+        assert_eq!(row.get::<_, String>(1), "ZbivKJ385zX890Qm0z0Yit@picture.test");
+        assert_eq!(row.get::<_, i64>(2), -1080);
+        assert!(!row.get::<_, bool>(3) && !row.get::<_, bool>(4), "the candidate must actually be unclaimed");
+        Ok(())
+    }).unwrap();
     let slots = [7, 1].into_iter().collect();
     runtime
         .owner
