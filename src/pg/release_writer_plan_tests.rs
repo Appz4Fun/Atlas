@@ -8,7 +8,17 @@ const CHILD:&str="ATLAS_WRITER_STAGE_PLAN_CHILD";
 #[test]
 #[ignore="Root-only isolated PostgreSQL writer plan experiment, bounded to 120 seconds"]
 fn isolated_article_writer_stage_plan_and_semantic_controls() {
-    if std::env::var_os(CHILD).is_some() {run();return;}
+    isolated_child(SELECTOR,false);
+}
+
+#[test]
+#[ignore="Root-only isolated PostgreSQL accepted-winner work regression"]
+fn accepted_article_winner_mapping_has_bounded_join_work() {
+    isolated_child("pg::release_writer::plan_experiment::accepted_article_winner_mapping_has_bounded_join_work",true);
+}
+
+fn isolated_child(selector:&str,regression:bool) {
+    if std::env::var_os(CHILD).is_some() {run(regression);return;}
     let schema=crate::pg::testing::Schema::native_writer().expect("explicit isolated PostgreSQL admission");
     let parent=std::path::PathBuf::from(std::env::var_os("ATLAS_HOME").expect("explicit private test home"));
     let home=tempfile::Builder::new().prefix("writer-stage-plan-").tempdir_in(parent).unwrap();
@@ -16,7 +26,7 @@ fn isolated_article_writer_stage_plan_and_semantic_controls() {
     let mut config=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(home.path().join("config.json")).unwrap();
     config.write_all(b"{}").unwrap();drop(config);
     let log=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(home.path().join("child.private.log")).unwrap();
-    let mut child=Command::new(std::env::current_exe().unwrap()).args(["--ignored","--exact",SELECTOR,"--nocapture"])
+    let mut child=Command::new(std::env::current_exe().unwrap()).args(["--ignored","--exact",selector,"--nocapture"])
         .env_clear().env(CHILD,"1").env("ATLAS_PG_TEST_URL",&schema.url).env("ATLAS_WRITER_STAGE_PLAN_SCHEMA",&schema.name)
         .env("ATLAS_HOME",home.path()).env("HOME",home.path()).env("TMPDIR",home.path().join("tmp"))
         .env("ATLAS_NO_KEYRING","1").env("ATLAS_SAB_DIR",home.path().join("no-sab"))
@@ -33,11 +43,11 @@ fn isolated_article_writer_stage_plan_and_semantic_controls() {
     if !status.success() {let _=home.keep();panic!("closed writer plan child failed; retained private diagnostic under admitted home");}
     let bytes=std::fs::read(report).expect("complete isolated writer plan report");
     let report:serde_json::Value=serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(report["variants"].as_array().unwrap().len(),8);
+    assert_eq!(report["variants"].as_array().unwrap().len(),if regression {2}else{8});
     let semantics:serde_json::Value=serde_json::from_slice(&std::fs::read(home.path().join("semantics.private.json")).unwrap()).unwrap();
     assert_eq!(semantics["ordinary_save_parts"],1700);
     let _=home.keep();
-    eprintln!("closed writer plan report sha256={:x}; eight bounded probes and genuine save/replay parity passed",Sha256::digest(bytes));
+    eprintln!("closed writer plan report sha256={:x}; bounded probes and genuine save/replay parity passed",Sha256::digest(bytes));
 }
 
 fn fixture(seed:bool)->Vec<Release> {
@@ -60,7 +70,7 @@ fn snapshot(client:&mut Client)->serde_json::Value {
     serde_json::json!((0..7).map(|n|row.get::<_,i64>(n)).collect::<Vec<_>>())
 }
 
-fn run() {
+fn run(regression:bool) {
     let pool=crate::pg::Pool::new(&crate::pg::StorageConfig {backend:crate::pg::Backend::Postgres,
         url:std::env::var("ATLAS_PG_TEST_URL").unwrap(),schema:std::env::var("ATLAS_WRITER_STAGE_PLAN_SCHEMA").unwrap(),
         max_connections:1,allow_plaintext:true}).unwrap();
@@ -87,7 +97,8 @@ fn run() {
         posted_clock:crate::dates::naive_timestamp(&r.date),article:Some(a)})).collect();
     assert_eq!(batch.len(),2000);assert!(batch.iter().map(Incoming::approx_bytes).sum::<usize>()<MAX_BATCH_BYTES);
     let mut reports=Vec::new();
-    for (pass,order) in [[0usize,1,2,3],[3usize,2,1,0]].into_iter().enumerate() {
+    let orders=if regression {vec![vec![2usize,0]]}else{vec![vec![0usize,1,2,3],vec![3usize,2,1,0]]};
+    for (pass,order) in orders.into_iter().enumerate() {
         for variant in order {
             let mut tx=client.transaction().unwrap();crate::pg::history_gate::native(&mut tx).unwrap();
             // Recreate, not just TRUNCATE: a previous ANALYZE must not seed the
@@ -108,7 +119,9 @@ fn run() {
                     assert_eq!(tx.query_one("select count(*) from pg_temp.atlas_release_input where ordinal%20 in(0,1,3) and file_id is not null",&[]).unwrap().get::<_,i64>(0),0,"existing MIDs and the later duplicate ordinal must lose");
                     assert_eq!(tx.query_one("select count(*) from files",&[]).unwrap().get::<_,i64>(0),165840,"each plan must add exactly four hundred files");
                     let sparse=tx.query_one("select count(*) from segment_nzb_metadata",&[]).unwrap().get::<_,i64>(0);assert_eq!(sparse,100);
-                    reports.push(serde_json::json!({"pass":pass,"variant":variant,"elapsed_ms":started.elapsed().as_secs_f64()*1000.,"accepted":accepted,"plan":plan}));
+                    let (join_work,scan_work)=actual_work(&plan);
+                    reports.push(serde_json::json!({"pass":pass,"variant":variant,"elapsed_ms":started.elapsed().as_secs_f64()*1000.,"accepted":accepted,
+                        "accepted_join_work":join_work,"stage_scan_work":scan_work,"plan":plan}));
                 },
                 Err(error)=>{
                     let code=error.code().map(|code|code.code());
@@ -135,6 +148,38 @@ fn run() {
         from releases r join pp_queue q on q.release_id=r.id where r.group_name='alt.binaries.test'",&[]).unwrap();
     assert_eq!((row.get::<_,i64>(0),row.get::<_,i64>(1),row.get::<_,i64>(2),row.get::<_,i64>(3)),(100,3300,56100,200));
     write_report("semantics.private.json",&serde_json::json!({"ordinary_save_parts":saved.parts,"ordinary_save_files":saved.files,"replay_unchanged":true,"final_snapshot":after}));
+    if regression {
+        let bound=(batch.len()*8) as f64;
+        let bounded=|variant| {
+            let report=reports.iter().find(|report|report["variant"]==variant).unwrap();
+            report["accepted"]==1700&&report["accepted_join_work"].as_f64().unwrap()<=bound
+                &&report["stage_scan_work"].as_f64().unwrap()<=bound
+        };
+        assert!(bounded(2),"the genuine ordinal-index positive control must bound winner-mapping work");
+        assert!(bounded(0),"accepted article winner mapping exceeded linear join/scan work admission");
+    }
+}
+
+// Count actual tuple work rather than costs, elapsed time, join algorithms or
+// index names. PostgreSQL's per-loop averages are multiplied by real loops.
+// A future safe hash/merge plan may scan the stage once and still pass.
+fn actual_work(plan:&[String])->(f64,f64) {
+    let actual=regex::Regex::new(r"actual rows=([0-9]+(?:\.[0-9]+)?) loops=([0-9]+)").unwrap();
+    let removed=regex::Regex::new(r"Rows Removed by Join Filter: ([0-9]+(?:\.[0-9]+)?)").unwrap();
+    let (mut join_work,mut scan_work,mut loops)=(0.,0.,1.);
+    let (mut accepted,mut saw_accepted,mut saw_scan)=(false,false,false);
+    for line in plan {
+        if line=="  CTE accepted" {accepted=true;saw_accepted=true;continue;}
+        if accepted&&!line.trim().is_empty()&&line.len()-line.trim_start().len()<=2 {accepted=false;}
+        if let Some(capture)=actual.captures(line) {
+            let rows=capture[1].parse::<f64>().unwrap();loops=capture[2].parse::<f64>().unwrap();
+            if line.contains(" on atlas_release_input ") {scan_work+=rows*loops;saw_scan=true;}
+            if accepted&&(line.contains("Nested Loop")||line.contains("Hash Join")||line.contains("Merge Join")) {join_work+=rows*loops;}
+        }
+        if accepted {if let Some(capture)=removed.captures(line) {join_work+=capture[1].parse::<f64>().unwrap()*loops;}}
+    }
+    assert!(saw_accepted&&saw_scan,"real writer plan must expose accepted CTE and stage scan work");
+    (join_work,scan_work)
 }
 
 fn write_report(name:&str,report:&serde_json::Value) {
