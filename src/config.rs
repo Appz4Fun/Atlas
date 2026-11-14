@@ -2081,6 +2081,7 @@ mod tests {
 
     #[test]
     fn predb_defaults_when_absent() {
+        assert!(!Config::default().predb.enabled);
         let c = Config::from_value(&json!({})).predb;
         assert_eq!(c, PredbConfig::default());
         assert!(!c.enabled);
