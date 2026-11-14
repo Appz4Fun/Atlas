@@ -559,3 +559,7 @@ mod tests {
 #[cfg(test)]
 #[path="owner_admission_tests.rs"]
 mod owner_admission_tests;
+
+#[cfg(test)]
+#[path="owner_epoch_protocol_tests.rs"]
+mod owner_epoch_protocol_tests;
