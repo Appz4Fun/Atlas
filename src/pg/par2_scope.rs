@@ -22,7 +22,7 @@ fn object(c:&mut impl GenericClient,name:&str)->Result<(u32,u32)> {
     Ok((r.try_get(0)?,r.try_get::<_,Option<u32>>(1)?.context("cache scope object has no physical identity")?))
 }
 fn exists(c:&mut impl GenericClient,name:&str)->Result<bool> {
-    Ok(c.query_one("select to_regclass(format('%I.%I',current_schema(),$1)) is not null",&[&name])?.try_get(0)?)
+    Ok(c.query_one("select to_regclass(format('%I.%I',current_schema(),$1::text)) is not null",&[&name])?.try_get(0)?)
 }
 fn others(c:&mut impl GenericClient)->Result<Vec<(String,u32)>> {
     Ok(c.query("select relname::text,c.oid from pg_class c join pg_namespace n on n.oid=c.relnamespace where n.nspname=current_schema() and relkind='r' and relname like 'ext\\_%' and relname not in('ext_raw_par2','ext_raw_par2_files','ext_preserved_cache_rows') order by relname",&[])?.into_iter().map(|r|(r.get(0),r.get(1))).collect())
