@@ -124,9 +124,9 @@ fn original_owner_prioritizes_save_and_checkpoint_but_serves_fifo_frontier_and_h
     let (sent, received) = mpsc::channel();
     let mut jobs = Vec::new();
     for (n, name) in ["frontier-1", "heartbeat", "frontier-2"].into_iter().enumerate() {
-        let (owner, sent) = (owner.clone(), sent.clone());
+        let (worker_owner, sent) = (owner.clone(), sent.clone());
         jobs.push(thread::spawn(move || {
-            owner.with(|client| {
+            worker_owner.with(|client| {
                 assert_eq!(client.query_one("select pg_backend_pid()", &[])?.get::<_, i32>(0), pid);
                 if name.starts_with("frontier") {
                     assert_eq!(
