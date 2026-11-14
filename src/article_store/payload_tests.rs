@@ -386,7 +386,14 @@ impl std::ops::DerefMut for OwnedChild {
     }
 }
 impl Drop for OwnedChild {
-    fn drop(&mut self) {}
+    fn drop(&mut self) {
+        // Child caches a reaped exit status, so normal explicit wait/try_wait paths
+        // never signal a reused PID. Every live/unresolved child is killed and reaped.
+        if !matches!(self.0.try_wait(), Ok(Some(_))) {
+            let _ = self.0.kill();
+        }
+        let _ = self.0.wait();
+    }
 }
 fn child(mode: &str, root: &Path, identity: Identity, marker: &Path) -> OwnedChild {
     OwnedChild(
@@ -418,8 +425,16 @@ fn wait_exit(child: &mut Child) -> std::process::ExitStatus {
     }
 }
 fn marker_ready(path: &Path, expected: &[u8]) -> bool {
-    let _ = expected;
-    path.exists()
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return false,
+        Err(error) => panic!("cannot open child boundary marker: {error}"),
+    };
+    // Read only the expected signal plus one byte, so empty/partial/wrong/extra
+    // contents cannot be mistaken for a complete semantic boundary.
+    let mut observed = Vec::with_capacity(expected.len() + 1);
+    file.take(expected.len() as u64 + 1).read_to_end(&mut observed).expect("read bounded child boundary marker");
+    observed == expected
 }
 fn wait_marker(child: &mut Child, path: &Path, expected: &[u8]) {
     let until = deadline();
