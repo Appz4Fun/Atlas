@@ -1366,3 +1366,7 @@ mod native_asset_selection_tests {
 #[cfg(all(test, unix))]
 #[path = "api/native_asset_http_tests.rs"]
 mod native_asset_http_tests;
+
+#[cfg(test)]
+#[path = "api/native_incomplete_tests.rs"]
+mod native_incomplete_tests;

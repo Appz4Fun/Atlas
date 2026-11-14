@@ -295,3 +295,24 @@ The native case is an ordinary unignored test with the existing `Schema::new()` 
 A real Runtime/Owner and accepted release writer create victim, survivor and separate real link leads. Actual Queue claims, StepReads input, typed category writes and settlement create state/category/receipts while retaining a genuinely scheduled queue row. The writer itself creates file_timing. Closed per-table SQL creates only legal ordinary metadata rows for the other29 tables; it never derives generic fillers or writes catalog nonce/epochs, claims, input digests or operation receipts. The retained release and victim each have a nonzero row in EVERY33 former registered release-owned relationship before deletion, then every victim row must be gone and each survivor row must be byte-equivalent JSON. The original special keys remain `beside_files.row_id` and `upload_routes.origin_id`.
 
 The complete33-table inventory is literal in the case, with uniqueness and prepopulation assertions. Real files/segments are checked too. Deletion runs only on the original Owner through the unchanged native transaction gate. Read-only snapshots of every ext_* cache relation and actual identity/epoch/operation records must match across deletion, with populated natural PreDB/media/OpenSubtitles/probe sentinels. Global/outliving pp_walks, sidecars, junk_releases and junk_collections are populated and preserved; the real pending word-index deletion/tombstone entry remains valid bookkeeping. Sidecars explicitly outlive releases and are not misclassified by their release_id column. No trigger-only/FK-only/two-table substitute replaces the full populated oracle.
+
+
+## Follow-up: retained API completeness contract
+
+### tests/incomplete_api.rs
+
+Original full-source SHA-256: `5e2bf4b43e69c4d8a013a0e3f346e1b2c9beb3026925923271ae2ab8cca863a6`.
+
+`incomplete_api::incomplete_releases_are_left_out_of_the_api_unless_asked_for` is PORTED to `api::native_incomplete_tests::incomplete_releases_are_left_out_of_the_api_unless_asked_for`. No Issue #232 behavior is retired. Its exact four post shapes, nine original articles, parser/grouping path, four single-release assertions and all eight public API requests remain. The native writer commits the posts in the original order; the real word keeper and readonly queries establish search readiness before the public `api::handle` assertions.
+
+The test retains default omission of incomplete releases, scanning past newer incomplete rows for limit=1, Film/Gappy name filtering, the exact total=1 response, both deep requests, inclusion of all four posts when requested, exactly three incomplete attributes, and each item's completeness flag. The three incomplete shapes remain missing files, a single partial file, and a missing part despite all files being present. The accepted deep parameter is covered as a native request; no retired frozen-table behavior is claimed.
+
+The ordinary default parent returns before setup without a configured PostgreSQL URL or on unsupported platforms. A malformed nonempty URL remains a strict failure. Its ignored internal child requires the exact case marker and parent-owned migrated schema; it has no optional success path. Genuine Runtime/Owner admission and typed writer commits are used without direct release inserts, synthetic authority or a public writer seam. The existing isolated-child helper checks successful exit and its completion marker, then cleans up its own namespace. Keeper/NXV/Owner drain precedes successful completion; no providers or external APIs are contacted. This direct-writer fixture has no input-header NXV blocks and does not claim header-durability coverage.
+
+Explicit live validation selects only the parent with a nonempty disposable PostgreSQL URL:
+
+```text
+cargo test --frozen --lib -j1 api::native_incomplete_tests::incomplete_releases_are_left_out_of_the_api_unless_asked_for -- --exact --test-threads=1
+```
+
+The same parent without a URL verifies optional default admission only; that result is not a PostgreSQL pass. No other integration target, shared native helper, production dispatch or test-discovery policy changes.
