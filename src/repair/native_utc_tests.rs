@@ -61,12 +61,12 @@ fn mixed_offsets_use_utc_extrema_without_changing_display_or_replay() {
     let windows=f.windows(&[id]).expect("explicit UTC headers must qualify");assert_eq!(windows.len(),1);
     assert_eq!((&*windows[0].group,windows[0].from,windows[0].to),(GROUP,1_767_254_100,1_767_258_300));
     // Neither a duplicate MID nor its changed Date may become new UTC proof.
-    let mut replay=row.clone();for article in &mut replay.articles {article.date="Fri, 01 Jan 2044 00:00:00 +0000".into();}
+    let mut replay=row.clone();for article in &mut replay.articles {article.date="Fri, 01 Jan 2044 00:00:00 +0000".into();article.posted_utc=Some(0);}
     f.save(&replay);assert_eq!(f.timing(id),before);
     // UTC extrema must merge across later accepted batches, not just one COPY.
-    let mut later=row.clone();later.articles.truncate(1);let article=&mut later.articles[0];
+    let mut later=Fixture::release("Mixed",&["Thu, 01 Jan 2026 00:30:00 -0700"]);let article=&mut later.articles[0];
     article.message_id="<Mixed.third@utc.fixture.test>".into();article.part=Some(3);article.number=3;
-    article.subject=article.subject.replace("(1/20)","(3/20)");article.date="Thu, 01 Jan 2026 00:30:00 -0700".into();
+    article.subject=article.subject.replace("(1/20)","(3/20)");
     f.save(&later);assert_eq!(f.timing(id),(1_767_227_400,1_767_261_600,Some(1_767_252_600),Some(1_767_258_000),true,3));
     let windows=f.windows(&[id]).unwrap();assert_eq!((windows[0].from,windows[0].to),(1_767_252_300,1_767_258_300));
 }
@@ -83,17 +83,32 @@ fn unknown_utc_is_sticky_and_does_not_pin_repair_candidate_pagination() {
     assert!(plan.found.posts.iter().any(|p|p.ids.contains(&known)),"unknown UTC must not pin pagination ahead of known headers");
     assert!(plan.found.posts.iter().all(|p|!p.ids.contains(&unknown)));
     f.runtime.owner.with(|client| {assert_eq!(client.query_one("select count(*) from repair_tried where release_id=$1",&[&unknown])?.get::<_,i64>(0),0);Ok(())}).unwrap();
-    let mut later=unknown_row.clone();later.articles.truncate(1);let article=&mut later.articles[0];
-    article.message_id="<Unknown.new@utc.fixture.test>".into();article.date="Thu, 01 Jan 2026 10:01:00 +0200".into();
+    let mut later=Fixture::release("Unknown",&["Thu, 01 Jan 2026 10:01:00 +0200"]);let article=&mut later.articles[0];
+    article.message_id="<Unknown.new@utc.fixture.test>".into();
     // Keep one missing part so this assertion tests UTC qualification rather
     // than complete-post exclusion; same part with a new MID is an observation.
     f.save(&later);assert!(!f.timing(unknown).4);assert!(f.windows(&[unknown]).is_none());
     let partial=f.save(&Fixture::release("PartlyKnown",&["Thu, 01 Jan 2026 10:00:00 +0200","Thu, 01 Jan 2026 10:00:00 -0000"]));
     assert_eq!(f.timing(partial).2,Some(1_767_254_400));assert!(!f.timing(partial).4);assert!(f.windows(&[partial]).is_none());
-    let mut later=known_row.clone();later.articles.truncate(1);later.articles[0].message_id="<Known.unknown@utc.fixture.test>".into();
-    later.articles[0].date="Thu, 01 Jan 2026 10:01:00 -0000".into();
+    let mut later=Fixture::release("Known",&["Thu, 01 Jan 2026 10:01:00 -0000"]);later.articles[0].message_id="<Known.unknown@utc.fixture.test>".into();
     f.save(&later);assert!(!f.timing(known).4,"one new unknown observation invalidates previously complete UTC");
     assert!(f.windows(&[known]).is_none());
+}
+
+#[test]
+#[ignore="explicit isolated PostgreSQL; retained segments without any historical timing producer"]
+fn missing_historical_timing_cannot_be_certified_by_one_later_known_batch() {
+    let f=Fixture::new();let row=Fixture::release("MissingTiming",&["Thu, 01 Jan 2026 10:00:00 +0200"]);
+    let id=f.save(&row);
+    // Genuine accepted segments remain. Remove only their derived timing to
+    // reproduce the earlier native writer, which had no timing producer.
+    f.runtime.owner.with(|client| {assert_eq!(client.execute("delete from file_timing where release_id=$1",&[&id])?,1);Ok(())}).unwrap();
+    assert!(f.windows(&[id]).is_none());
+    let mut later=Fixture::release("MissingTiming",&["Thu, 01 Jan 2026 11:00:00 +0200"]);
+    let article=&mut later.articles[0];article.message_id="<MissingTiming.new@utc.fixture.test>".into();article.part=Some(2);
+    article.subject=article.subject.replace("(1/20)","(2/20)");f.save(&later);
+    assert!(!f.timing(id).4,"new timing cannot prove the old accepted segments' UTC");assert!(f.windows(&[id]).is_none());
+    f.runtime.owner.with(|client| {assert_eq!(client.query_one("select count(*) from segments where release_id=$1",&[&id])?.get::<_,i64>(0),2);Ok(())}).unwrap();
 }
 
 #[test]

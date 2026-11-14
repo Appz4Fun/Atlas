@@ -14,6 +14,9 @@ pub struct Article {
     pub subject: String,
     pub author: String,
     pub date: String,
+    /// Original header's explicit UTC instant, captured before its display
+    /// date loses the zone. None for synthetic/historical unknown wall clocks.
+    pub posted_utc: Option<i64>,
     pub message_id: String,
     pub references: String,
     pub bytes: i64,

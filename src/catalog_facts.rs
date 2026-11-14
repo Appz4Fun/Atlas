@@ -216,7 +216,7 @@ pub(crate) struct ArticleFacts {
 
 impl ArticleFacts {
     pub(crate) fn of(a: &Article) -> ArticleFacts {
-        ArticleFacts { date: crate::dates::naive_timestamp(&a.date), utc: crate::dates::explicit_utc_timestamp(&a.date), id: crate::discovery::id_facts(&a.message_id) }
+        ArticleFacts { date: crate::dates::naive_timestamp(&a.date), utc: a.posted_utc.or_else(||crate::dates::explicit_utc_timestamp(&a.date)), id: crate::discovery::id_facts(&a.message_id) }
     }
 }
 

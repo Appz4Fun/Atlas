@@ -225,6 +225,16 @@ mod tests {
     }
 
     #[test]
+    fn overview_keeps_explicit_utc_before_wallclock_normalization() {
+        for (date, utc) in [("Thu, 01 Jan 2026 10:00:00 +0200",Some(1_767_254_400)),
+            ("Thu, 01 Jan 2026 10:00:00 -0000",None)] {
+            let article=crate::nntp::Overview {date:date.into(),..Default::default()}.into_article();
+            assert_eq!(article.date,"2026-01-01 10:00:00");
+            assert_eq!(crate::catalog_facts::ArticleFacts::of(&article).utc,utc);
+        }
+    }
+
+    #[test]
     fn explicit_utc_timestamp_never_guesses_an_unknown_or_install_zone() {
         for date in ["Thu, 01 Jan 2026 10:00:00 -0000", "Thu, 01 Jan 2026 10:00:00",
             "Thu, 01 Jan 2026 10:00:00 unknown", "Thu, 01 Jan 2026 10:00:00 +9999",
