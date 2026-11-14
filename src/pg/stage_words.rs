@@ -95,7 +95,10 @@ impl Keeper {
             if let Err(error)=&result {
                 let canceled=super::outage::is_attempt_ended(error)
                     && (worker_stop.load(std::sync::atomic::Ordering::Acquire)||owner.stop.load(std::sync::atomic::Ordering::Acquire));
-                if !canceled || owner.failure().is_some() {owner.fail(super::outage::classify(error));}
+                if !canceled || owner.failure().is_some() {
+                    eprintln!("native word keeper failed; prior_failure={:?}; cause={}",owner.failure(),super::linker_runtime::failure_diagnostic(error));
+                    owner.fail(super::outage::classify(error));
+                }
             }
             result
         })?;

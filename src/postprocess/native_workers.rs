@@ -1,6 +1,6 @@
 //! Standard native worker lanes. Every handle drains before the owner closes.
 use super::{Runner,Worker,fail,join_workers};
-use anyhow::{Result,ensure};
+use anyhow::{Context,Result,ensure};
 use std::{sync::{Arc,Mutex,atomic::{AtomicBool,AtomicI64,Ordering}},time::{Duration,Instant}};
 use crate::pg::{indexer_runtime::Owner,stage_queue::{Queue,Claim,Settlement,WalkProgress},stage_telemetry::LaneCounters};
 
@@ -40,7 +40,7 @@ impl Workers {
     fn start(owner:&Arc<Owner>,config:&crate::config::Config,ctx:crate::indexer::PassContext,handle:tokio::runtime::Handle,db:crate::indexer::Db,headers:crate::config::HeaderStoreConfig,drain:Option<Arc<super::telemetry::Drain>>)->Result<Self> {
         check_inferred_platform(config.inferred_parts)?;
         ensure!(config.postprocess.enabled,"native Stage was not configured");
-        Self::start_runner_context(Arc::new(Runner::new(owner,config,ctx.pool.clone(),handle)?),db,headers,Some(ctx),drain)
+        Self::start_runner_context(Arc::new(Runner::new(owner,config,ctx.pool.clone(),handle).context("native startup runner")?),db,headers,Some(ctx),drain)
     }
     #[cfg(test)]
     pub(super) fn start_runner(runner:Arc<Runner>,db:crate::indexer::Db,headers:crate::config::HeaderStoreConfig)->Result<Self> {
@@ -141,7 +141,7 @@ impl Dispatch {
 pub(super) fn details_service(owner:&Arc<Owner>,config:&crate::config::Config,assets:Option<Arc<crate::pg::worker_assets::Grant>>)->Result<Option<crate::media::details::native::Service>> {
     if !crate::media::details::native::Service::enabled(&config.media) {return Ok(None)}
     let assets=match assets {Some(assets)=>Some(assets),None=>crate::pg::worker_assets::Grant::open(owner,config.native_assets.as_ref())?};
-    Ok(Some(crate::media::details::native::Service::new(owner,&config.media,assets)?))
+    Ok(Some(crate::media::details::native::Service::new(owner,&config.media,assets).context("native startup details")?))
 }
 
 pub(super) fn start_details(owner:&Arc<Owner>,mut service:crate::media::details::native::Service,handles:&mut Vec<Worker>)->Result<()> {
@@ -207,7 +207,7 @@ fn start_services(owner:&Arc<Owner>,config:&crate::config::Config,pool:Arc<crate
         let ctx=ctx.ok_or_else(||anyhow::anyhow!("native overview repair requires the original scheduler context"))?;
         ensure!(Arc::ptr_eq(&ctx.pool,&pool),"native overview scheduler pool changed");
         let store=crate::nxv_store::live::handle().ok_or_else(||anyhow::anyhow!("native overview repair requires the existing catalog header store"))?;
-        let mut service=crate::repair::native::Service::new(owner,&db,ctx,handle.clone(),store,&headers,crate::bg_indexer::settings_of(config))?;
+        let mut service=crate::repair::native::Service::new(owner,&db,ctx,handle.clone(),store,&headers,crate::bg_indexer::settings_of(config)).context("native startup overview repair")?;
         let owner_work=owner.clone();handles.push(spawn(owner,"atlas-native-overview-repair".into(),move|| {
             while !owner_work.stop.load(Ordering::Acquire) {
                 let progress=service.tick(now())?;
@@ -217,15 +217,15 @@ fn start_services(owner:&Arc<Owner>,config:&crate::config::Config,pool:Arc<crate
     }
     #[cfg(unix)] if config.inferred_parts {
         let store=crate::nxv_store::live::handle().ok_or_else(||anyhow::anyhow!("native inferred repair requires the existing catalog header store"))?;
-        let service=crate::inferred::native::Service::new(owner,&db,pool.clone(),store,&headers)?;
+        let service=crate::inferred::native::Service::new(owner,&db,pool.clone(),store,&headers).context("native startup inferred repair")?;
         start_inferred(owner,service,handle.clone(),handles)?;
     }
     #[cfg(not(unix))] let _=&headers;
     if config.spots.enabled {
-        let service=Arc::new(crate::spotnet::native::Service::new(owner,db.clone(),config.spots.clone(),pool.clone(),handle.clone())?);
+        let service=Arc::new(crate::spotnet::native::Service::new(owner,db.clone(),config.spots.clone(),pool.clone(),handle.clone()).context("native startup spotnet")?);
         start_spotnet(owner,service,handles)?;
     }
-    let predb=if config.predb.enabled {Some(Arc::new(crate::pg::service_cache::predb::Service::new(owner)?))} else {None};
+    let predb=if config.predb.enabled {Some(Arc::new(crate::pg::service_cache::predb::Service::new(owner).context("native startup predb")?))} else {None};
     if let (Some(drain),Some(predb))=(&drain,&predb) {drain.retain_predb(owner,predb.counters.clone())?;}
     let config=Arc::new(config.clone());
     if let Some(details)=details_service(owner,&config,assets)? {start_details(owner,details,handles)?;}

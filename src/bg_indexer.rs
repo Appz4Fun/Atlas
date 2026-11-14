@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use anyhow::Context;
 use serde::Serialize;
 use serde_json::json;
 
@@ -1230,9 +1231,9 @@ async fn native_media_counts(
         std::thread::scope(|scope| {
             scope
                 .spawn(move || -> anyhow::Result<()> {
-                    let mut service = crate::pg::media_counts::Service::new(&owner, db.clone(), &headers)?;
+                    let mut service = crate::pg::media_counts::Service::new(&owner, db.clone(), &headers).context("native startup media counts")?;
                     while !cancelled.load(Ordering::Acquire) && !sched.stopping() {
-                        match service.tick()? {
+                        match service.tick().context("native media counts tick")? {
                             crate::pg::media_counts::Tick::Stored => {
                                 let groups = crate::indexer::on_native_db_sync(&db, |client| {
                                     Ok(crate::chunks::media_groups(&crate::pg::sql::Pg::new(client))?)
@@ -1255,8 +1256,14 @@ async fn native_media_counts(
             if crate::pg::outage::is_attempt_ended(&error)
                 && observed_owner.stop.load(Ordering::Acquire)
                 && observed_owner.failure().is_none() => {}
-        Ok(Ok(Err(error))) => observed_owner.fail(crate::pg::outage::classify(&error)),
-        Ok(Err(_)) | Err(_) => observed_owner.fail(crate::pg::outage::Failure::Fatal),
+        Ok(Ok(Err(error))) => {
+            eprintln!("native daily media counts failed; prior_failure={:?}; cause={}",observed_owner.failure(),crate::pg::linker_runtime::failure_diagnostic(&error));
+            observed_owner.fail(crate::pg::outage::classify(&error));
+        },
+        Ok(Err(_)) | Err(_) => {
+            eprintln!("native daily media counts join failed; prior_failure={:?}",observed_owner.failure());
+            observed_owner.fail(crate::pg::outage::Failure::Fatal);
+        },
     }
 }
 
@@ -1499,6 +1506,7 @@ async fn run_servers(
                 .await
                 {
                     if !s.ctx.stop.load(Ordering::Acquire) {
+                        eprintln!("native storage health failed; prior_failure={:?}; cause={}",owner.failure(),crate::pg::linker_runtime::failure_diagnostic(&error));
                         owner.fail(crate::pg::outage::classify(&error));
                     }
                     return;
@@ -1819,6 +1827,7 @@ fn run_native(config: Config, storage: crate::pg::StorageConfig, stop: Arc<Atomi
             Ok(keeper) => {
                 let result = index(current.clone(), stop.clone(), native);
                 if let Err(error) = keeper.finish() {
+                    eprintln!("native word keeper lifecycle failed; prior_failure={:?}; cause={}",owner.failure(),crate::pg::linker_runtime::failure_diagnostic(&error));
                     owner.fail(classify(&error));
                 }
                 result
@@ -1832,6 +1841,7 @@ fn run_native(config: Config, storage: crate::pg::StorageConfig, stop: Arc<Atomi
                 0
             }
             Err(error) => {
+                eprintln!("native word keeper lifecycle failed; prior_failure={:?}; cause={}",owner.failure(),crate::pg::linker_runtime::failure_diagnostic(&error));
                 owner.fail(classify(&error));
                 drop(native);
                 1
@@ -1928,6 +1938,7 @@ fn index(config: Config, stop: Arc<AtomicBool>, native: NativeRuntime) -> i32 {
         ) {
             Ok(observer) => Some(observer),
             Err(error) => {
+                eprintln!("native catalog observer lifecycle failed; prior_failure={:?}; cause={}",native.owner.failure(),crate::pg::linker_runtime::failure_diagnostic(&error));
                 native.owner.fail(crate::pg::outage::classify(&error));
                 ui::error("native catalog observer could not start");
                 return 1;
@@ -1940,6 +1951,7 @@ fn index(config: Config, stop: Arc<AtomicBool>, native: NativeRuntime) -> i32 {
     if let Some(observer) = observer
         && let Err(error) = observer.finish()
     {
+        eprintln!("native catalog observer lifecycle failed; prior_failure={:?}; cause={}",native.owner.failure(),crate::pg::linker_runtime::failure_diagnostic(&error));
         native.owner.fail(crate::pg::outage::classify(&error));
         code = 1;
     }
