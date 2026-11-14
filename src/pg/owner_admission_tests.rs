@@ -332,8 +332,8 @@ fn ordinary_observation_heartbeat_commits_between_two_waiting_ingestion_callback
     let checkpoint = thread::spawn(move || {
         second.with_ingest(|client| {
         let head = client.query_one("select o.epoch,o.catalog_nonce from native_runtime_observation_current c join native_runtime_observations o using(observation_id) where c.singleton", &[])?;
-        assert_eq!(head.get::<_,Vec<u8>>(0), second.epoch().unwrap().id());
-        assert_eq!(head.get::<_,Vec<u8>>(1), second.epoch().unwrap().catalog().nonce());
+        assert_eq!(head.get::<_,Vec<u8>>(0).as_slice(), second.epoch().unwrap().id().as_slice());
+        assert_eq!(head.get::<_,Vec<u8>>(1).as_slice(), second.epoch().unwrap().catalog().nonce().as_slice());
         crate::db::update_backfill_cursor(&crate::pg::sql::Pg::new(client), "example.admission", 1999)?;
         Ok(())
     })
