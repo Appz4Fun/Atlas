@@ -3,7 +3,7 @@
 use super::linker_stage::Budget;
 use crate::indexer::{Db, on_native_db, on_native_db_sync};
 use crate::nxv_store::{Store, store::LinkerRetentionPin};
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -41,7 +41,7 @@ pub(crate) async fn step(
     .await?;
     match phase.as_str() {
         "stage" => {
-            if super::linker_source::step(db, store, epoch, budget, cache).await? {
+            if super::linker_source::step(db, store, epoch, budget, cache).await.context("native linker stage")? {
                 on_native_db(db, move |c| super::linker_epoch::scope_step(c, epoch, budget.rows)).await?;
             }
         }
@@ -86,6 +86,53 @@ fn record_failure(db: &Db, error: &anyhow::Error) {
     if !super::outage::is_attempt_ended(error) {
         db.fail_native(super::outage::classify(error));
     }
+}
+
+/// Never render arbitrary causes: driver messages/paths can contain private
+/// values. Keep only typed metadata and closed static invariant labels.
+fn failure_diagnostic(error: &anyhow::Error) -> String {
+    let mut labels = Vec::new();
+    for cause in error.chain().take(9) {
+        if labels.len() == 8 { labels.push("truncated".into()); break; }
+        let label = if let Some(pg) = cause.downcast_ref::<postgres::Error>() {
+            let message = pg.to_string();
+            if let Some(code) = pg.code() { format!("postgres:{}", code.code()) }
+            else if let Some(index) = message.strip_prefix("error serializing parameter ")
+                .and_then(|value| value.parse::<usize>().ok()) { format!("postgres_parameter:{index}") }
+            else if let Some(index) = message.strip_prefix("error deserializing column ")
+                .and_then(|value| value.parse::<usize>().ok()) { format!("postgres_column:{index}") }
+            else if pg.is_closed() { "postgres_closed".into() }
+            else { "postgres".into() }
+        } else if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            format!("io:{:?}", io.kind())
+        } else if cause.is::<super::outage::AttemptEnded>() { "attempt_ended".into() }
+        else if cause.is::<super::outage::SessionUnavailable>() { "session_unavailable".into() }
+        else {
+            match cause.to_string().as_str() {
+                "native linker stage" => "stage",
+                "native source disappeared before durable staging completed" => "source_missing",
+                "native source generation changed before staging completed" => "source_generation_changed",
+                "native source prefix shrank before staging completed" => "source_prefix_shrank",
+                "native source manifest entry missing" => "manifest_entry_missing",
+                "native source manifest sequence changed" => "manifest_sequence_changed",
+                "reading native linker source block" | "reading verified native source block" => "block_decode",
+                "native linker source block checksum failed" => "block_checksum",
+                "opening native linker source cursor at durable offset" => "source_cursor_open",
+                "native linker source row count changed" => "source_row_count_changed",
+                "native linker source exceeds manifest row count" | "native source cursor exceeds manifest rows" => "source_rows_exceeded",
+                "native linker source ended before manifest row count" => "source_ended_early",
+                "native completed source cursor differs from manifest rows" => "source_complete_count",
+                "block outside snapshot" | "block is outside native linker snapshot" => "snapshot_block_outside",
+                "snapshot manifest mismatch" => "snapshot_manifest_mismatch",
+                "snapshot arena identity changed" | "segment was recreated before snapshot capture" => "snapshot_identity_changed",
+                "snapshot block truncated" => "snapshot_block_truncated",
+                "native mutation requires READ COMMITTED isolation" => "mutation_isolation",
+                _ => "redacted",
+            }.into()
+        };
+        labels.push(label);
+    }
+    labels.join(" <- ")
 }
 
 pub(crate) async fn run(db: Db, store: Arc<Store>, stopping: impl Fn() -> bool) {
@@ -164,7 +211,7 @@ pub(crate) async fn run(db: Db, store: Arc<Store>, stopping: impl Fn() -> bool) 
                     Ok(false) => pause(&stopping).await,
                     Err(error) => {
                         record_failure(&db, &error);
-                        eprintln!("native header linker: progress failed; durable phase retained");
+                        eprintln!("native header linker: progress failed; durable phase retained; epoch={completed}; cause={}", failure_diagnostic(&error));
                         return;
                     }
                 }
@@ -172,7 +219,7 @@ pub(crate) async fn run(db: Db, store: Arc<Store>, stopping: impl Fn() -> bool) 
             Ok(false) => tokio::task::yield_now().await,
             Err(error) => {
                 record_failure(&db, &error);
-                eprintln!("native header linker: attempt failed; durable phase retained");
+                eprintln!("native header linker: attempt failed; durable phase retained; epoch={current:?}; cause={}", failure_diagnostic(&error));
                 return;
             }
         }
@@ -183,6 +230,28 @@ pub(crate) async fn run(db: Db, store: Arc<Store>, stopping: impl Fn() -> bool) 
 mod tests {
     use super::*;
     use crate::nxv_store::store::{Clamp, KeepSet, StoreConfig};
+
+    #[test]
+    fn linker_failure_diagnostic_keeps_static_cause_and_redacts_private_values() {
+        let error = anyhow::anyhow!("credential-sentinel group-sentinel /private/path-sentinel")
+            .context("native source generation changed before staging completed");
+        assert_eq!(failure_diagnostic(&error), "source_generation_changed <- redacted");
+        let error = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied, "credential-sentinel /private/path-sentinel",
+        )).context("group-sentinel");
+        assert_eq!(failure_diagnostic(&error), "redacted <- io:PermissionDenied");
+    }
+
+    #[test]
+    fn linker_failure_diagnostic_preserves_cancellation_and_bounds_chain_output() {
+        let ended = anyhow::Error::new(super::super::outage::AttemptEnded).context("private-sentinel");
+        assert_eq!(failure_diagnostic(&ended), "redacted <- attempt_ended");
+        let mut error = anyhow::anyhow!("private-sentinel");
+        for _ in 0..12 { error = error.context("private-sentinel"); }
+        let diagnostic = failure_diagnostic(&error);
+        assert_eq!(diagnostic, vec!["redacted"; 8].join(" <- ") + " <- truncated");
+        assert!(!diagnostic.contains("sentinel"));
+    }
 
     fn fatal_during_drain(inner: bool) {
         use super::super::{
