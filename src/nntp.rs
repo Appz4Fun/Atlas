@@ -5271,7 +5271,9 @@ mod tests {
     }
 
     /// A date search reads a listing's first rows and no more: plain or
-    /// compressed, a listing longer than its rows is left unread.
+    /// compressed, a listing longer than its rows is left unread. Whole-response
+    /// controls must also fit the native overview admission; over-budget responses
+    /// fail closed instead of being reported complete.
     #[test]
     fn a_long_listing_is_read_only_as_far_as_the_row_limit() {
         let dated = |n: usize| {
@@ -5310,9 +5312,9 @@ mod tests {
             )
         };
 
-        for (name, status, wire) in [
-            ("plain", "224 overview follows\r\n", dated(50_000)),
-            ("compressed", "224 overview follows [COMPRESS=GZIP]\r\n", zlib(&dated(50_000))),
+        for (name, status, wire, complete) in [
+            ("plain", "224 overview follows\r\n", dated(50_000), dated(500)),
+            ("compressed", "224 overview follows [COMPRESS=GZIP]\r\n", zlib(&dated(50_000)), zlib(&dated(500))),
         ] {
             let (cut, cut_poisoned) = read(status, wire.clone(), 100);
             let cut = cut.unwrap();
@@ -5320,11 +5322,19 @@ mod tests {
             assert_eq!((cut.whole, cut.rows, cut.read_to), (false, 100, Some(100)), "{name}");
             assert_eq!((cut.first, cut.last), (Some(posted(1)), Some(posted(100))), "{name}");
 
-            let (whole, whole_poisoned) = read(status, wire, 50_000);
+            // A small, dot-terminated listing still exercises the complete path.
+            let (whole, whole_poisoned) = read(status, complete, 500);
             let whole = whole.unwrap();
             assert!(!whole_poisoned, "a complete listing is not a truncated prefix: {name}");
-            assert_eq!((whole.whole, whole.rows), (true, 50_000), "{name}");
-            assert_eq!((whole.first, whole.last), (Some(posted(1)), Some(posted(50_000))), "{name}");
+            assert_eq!((whole.whole, whole.rows), (true, 500), "{name}");
+            assert_eq!((whole.first, whole.last), (Some(posted(1)), Some(posted(500))), "{name}");
+
+            // The 50,000-row response exceeds the existing native byte charge,
+            // even though its row count fits. It must not certify a whole reply.
+            let (oversized, poisoned) = read(status, wire, 50_000);
+            let error = oversized.expect_err("whole response must fit native overview admission");
+            assert!(error.is_overview_budget(), "wrong refusal for {name}: {error}");
+            assert!(poisoned, "over-budget response must never return a reusable connection: {name}");
         }
     }
 
