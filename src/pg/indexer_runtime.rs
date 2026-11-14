@@ -450,3 +450,7 @@ mod tests {
         assert_eq!(connection.get_tcp_user_timeout(), Some(&Duration::from_secs(11)));
     }
 }
+
+#[cfg(test)]
+#[path="owner_admission_tests.rs"]
+mod owner_admission_tests;
