@@ -10,6 +10,7 @@ pub(super) struct Workers {
 struct Dispatch {
     runner:Arc<Runner>,lanes:Arc<LaneCounters>,walk:Mutex<super::super::bodies::TokenBucket>,
     database_turn:AtomicI64,network_turn:AtomicI64,
+    par2_ready:AtomicBool,par2_maintenance_reported:AtomicBool,
 }
 fn now()->i64 {chrono::Utc::now().timestamp()}
 fn stopped(owner:&Owner,error:&anyhow::Error)->bool {
@@ -58,7 +59,7 @@ impl Workers {
         queue.seed(runner.steps.enabled,&stamps,now())?;
         let lanes=Arc::new(LaneCounters::new(runner.steps.enabled as u64)?);
         if let Some(drain)=&drain {drain.retain_stage(&runner,lanes.clone())?;}
-        let dispatch=Arc::new(Dispatch {runner,lanes:lanes.clone(),walk:Mutex::new(super::super::bodies::TokenBucket::new()),database_turn:AtomicI64::new(0),network_turn:AtomicI64::new(0)});
+        let dispatch=Arc::new(Dispatch {runner,lanes:lanes.clone(),walk:Mutex::new(super::super::bodies::TokenBucket::new()),database_turn:AtomicI64::new(0),network_turn:AtomicI64::new(0),par2_ready:AtomicBool::new(false),par2_maintenance_reported:AtomicBool::new(false)});
         let mut handles=Vec::new();
         let started:Result<()>=(|| {
             for id in 0..dispatch.runner.config.postprocess.workers.max(1) {
@@ -95,9 +96,24 @@ impl Drop for Workers {
     fn drop(&mut self) {if let Err(error)=self.drain() {fail(&self.owner,&error);}}
 }
 impl Dispatch {
+    fn cache_ready(&self)->Result<bool> {
+        use crate::pg::natural_cache::par2_quota::{self,Admission};
+        if self.par2_ready.load(Ordering::Acquire) {return Ok(true)}
+        match par2_quota::admission_page(&self.runner.owner)? {
+            Admission::Ready=>{self.par2_ready.store(true,Ordering::Release);Ok(true)},
+            Admission::Progress=>{nap(&self.runner.owner,Duration::from_millis(100));Ok(false)},
+            Admission::MaintenanceRequired(usage)=>{
+                if !self.par2_maintenance_reported.swap(true,Ordering::AcqRel) {
+                    eprintln!("native PP waiting: PAR2 maintenance required; retained_rows={} retained_bytes={}; originals preserved",usage.retained_rows,usage.retained_bytes);
+                }
+                nap(&self.runner.owner,Duration::from_secs(1));Ok(false)
+            },
+        }
+    }
     fn database(&self)->Result<Option<Claim>> {
         let owner=&self.runner.owner;let queue=Queue::for_owner(owner)?;
         while !owner.stop.load(Ordering::Acquire) {
+            if !self.cache_ready()? {continue}
             let claims=queue.claim_turn(now(),1,3600,self.database_turn.fetch_add(1,Ordering::Relaxed))?;
             let mut worked=false;
             for claim in claims {
@@ -121,6 +137,7 @@ impl Dispatch {
     fn network(&self)->Result<Option<Claim>> {
         let owner=&self.runner.owner;let queue=Queue::for_owner(owner)?;
         while !owner.stop.load(Ordering::Acquire) {
+            if !self.cache_ready()? {continue}
             if !self.runner.network_ready(now()) {nap(owner,Duration::from_millis(100));continue}
             let claims=queue.claim_net(now(),1,3600,self.network_turn.fetch_add(1,Ordering::Relaxed))?;
             if claims.is_empty() {nap(owner,Duration::from_millis(100));continue}
