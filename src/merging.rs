@@ -1107,14 +1107,12 @@ mod tests {
             while !body.len().is_multiple_of(4) {
                 body.push(0);
             }
-            let mut pkt = Vec::new();
-            pkt.extend_from_slice(b"PAR2\0PKT");
-            pkt.extend_from_slice(&((64 + body.len()) as u64).to_le_bytes());
-            pkt.extend_from_slice(&[0u8; 16]);
-            pkt.extend_from_slice(&[0x77; 16]);
-            pkt.extend_from_slice(b"PAR 2.0\0FileDesc");
-            pkt.extend_from_slice(&body);
-            pkt
+            // Match the SDK metadata-verification contract, including the packet MD5.
+            par_rs::packet::encode_packet(
+                &par_rs::packet::SetId([0x77; 16]),
+                b"PAR 2.0\0FileDesc",
+                &body,
+            )
         };
 
         // Two RAR5 volumes of equal size (50_000) that share the exact same 16 KiB prefix
@@ -1180,14 +1178,12 @@ mod tests {
             while !body.len().is_multiple_of(4) {
                 body.push(0);
             }
-            let mut pkt = Vec::new();
-            pkt.extend_from_slice(b"PAR2\0PKT");
-            pkt.extend_from_slice(&((64 + body.len()) as u64).to_le_bytes());
-            pkt.extend_from_slice(&[0u8; 16]);
-            pkt.extend_from_slice(&[0x55; 16]);
-            pkt.extend_from_slice(b"PAR 2.0\0FileDesc");
-            pkt.extend_from_slice(&body);
-            pkt
+            // Match the SDK metadata-verification contract, including the packet MD5.
+            par_rs::packet::encode_packet(
+                &par_rs::packet::SetId([0x55; 16]),
+                b"PAR 2.0\0FileDesc",
+                &body,
+            )
         };
 
         let mut par2 = Vec::new();
@@ -1360,14 +1356,12 @@ mod tests {
             while !body.len().is_multiple_of(4) {
                 body.push(0);
             }
-            let mut pkt = Vec::new();
-            pkt.extend_from_slice(b"PAR2\0PKT");
-            pkt.extend_from_slice(&((64 + body.len()) as u64).to_le_bytes());
-            pkt.extend_from_slice(&[0u8; 16]);
-            pkt.extend_from_slice(&[0x99; 16]);
-            pkt.extend_from_slice(b"PAR 2.0\0FileDesc");
-            pkt.extend_from_slice(&body);
-            pkt
+            // Match the SDK metadata-verification contract, including the packet MD5.
+            par_rs::packet::encode_packet(
+                &par_rs::packet::SetId([0x99; 16]),
+                b"PAR 2.0\0FileDesc",
+                &body,
+            )
         };
 
         const EQUAL_SIZE: u64 = 50_000_000;
