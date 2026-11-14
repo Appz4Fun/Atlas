@@ -25,8 +25,10 @@ fn release(mid:&str,part:i64)->crate::parser::Release {crate::parser::Release {n
 fn generated(grant:&Arc<Grant>,id:i64)->(StillFrame,Vec<SavedStill>) {
     let mut frame=grant.still_frame(id).unwrap();let mut stills=Vec::new();
     for (n,position) in crate::probe::stills::POSITIONS.into_iter().enumerate() {
-        let name=frame.keep(&jpeg(50+n as u8),16,16).unwrap();
-        stills.push(SavedStill {position,at_ms:Some(n as i64*1000),sha256:name,width:16,height:16,phash:Some(1)});
+        let value=50+n as u8;let name=frame.keep(&jpeg(value),16,16).unwrap();
+        let luma=crate::video::picture::Plane8 {data:vec![value;16*16],width:16,height:16};
+        let phash=crate::video::phash::phash(&luma).map(|value|value as i64);
+        stills.push(SavedStill {position,at_ms:Some(n as i64*1000),sha256:name,width:16,height:16,phash});
     }
     (frame.finish().unwrap(),stills)
 }
