@@ -209,12 +209,15 @@ impl Grant {
                 ensure!(rows==1,"native asset descriptor conflicts with preserved original");None
             };tx.commit()?;Ok((revision,receipt))
         })?;
-        if captured {
+        let spool=if captured {
             // Compatible captured originals keep their copier/import provenance,
             // as in ImageFrame::keep; only unlisted covers need native evidence.
-            let checked=self.manifest.read_associated(&request,&self.pool,owner.epoch().context("native cover epoch absent")?.catalog(),receipt.as_ref())?;
-            ensure!(checked.is_some(),"captured native cover disappeared");
-        }
+            // Release the first verified read before reserving the retained
+            // receipt-verified result: each cover needs only one pool slot.
+            drop(spool);
+            self.manifest.read_associated(&request,&self.pool,owner.epoch().context("native cover epoch absent")?.catalog(),receipt.as_ref())?
+                .context("captured native cover disappeared")?
+        }else{spool};
         self.check_owner(&owner)?;Ok(CoverHold {grant:self.clone(),release,_revision:revision,mime:cover.mime.into(),name,spool})
     }
     fn poster_request(&self,path:&str)->Result<AssetRequest> {

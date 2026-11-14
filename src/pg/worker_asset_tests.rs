@@ -118,11 +118,12 @@ fn captured_cover_reprobe_preserves_compatible_copier_receipt_and_original_owner
     runtime.owner.with(|client|{client.execute("insert into ext_asset_files(kind,name,byte_length,digest,source_digest) values('covers',$1,$2,$3,$4)",
         &[&sha,&(bytes.len() as i64),&digest,&copier.as_slice()])?;Ok(())}).unwrap();
     let cover=crate::probe::media::Cover {mime:"image/jpeg",bytes:bytes.clone()};
-    for _ in 0..2 {
-        let mut hold=grant.produce_cover(id,&cover).expect("same captured bytes must retain compatible copier provenance");
-        hold.check(&runtime.owner,id).unwrap();assert_eq!(hold.descriptor(),("image/jpeg".into(),sha.clone()));
-        let mut actual=Vec::new();hold.spool.read_to_end(&mut actual).unwrap();assert_eq!(actual,bytes);
-    }
+    let mut held=Vec::new();
+    for _ in 0..31 {held.push(grant.produce_cover(id,&cover).expect("same captured bytes must retain compatible copier provenance"));}
+    let mut last=grant.produce_cover(id,&cover).expect("the32nd captured result must fit one remaining pool slot");
+    last.check(&runtime.owner,id).unwrap();assert_eq!(last.descriptor(),("image/jpeg".into(),sha.clone()));
+    let mut actual=Vec::new();last.spool.read_to_end(&mut actual).unwrap();assert_eq!(actual,bytes);
+    assert!(grant.produce_cover(id,&cover).is_err(),"the existing32-result admission must not be raised");
     assert_eq!(runtime.owner.failure(),None,"compatible captured originals must not end the native attempt");
     runtime.owner.with(|client| {
         let row=client.query_one("select byte_length,digest,source_digest from ext_asset_files where kind='covers' and name=$1",&[&sha])?;
