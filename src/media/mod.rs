@@ -30,6 +30,9 @@ use self::title::Kind;
 
 pub use self::steps::media_target;
 
+// Other native steps may bind their clients without exposing cache internals.
+pub(crate) use cache::native as with_native_cache;
+
 const MAX_CLAIMS: usize = 4_000_000;
 
 /// All of this part's state for one database.

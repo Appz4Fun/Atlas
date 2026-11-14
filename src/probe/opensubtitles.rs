@@ -141,7 +141,7 @@ impl Step for OpenSubtitlesStep {
             // Configuration reloads must retain the original owner's backend,
             // even after the factory's construction context has returned.
             let client = match &self.cache {
-                Some(cache) => crate::media::cache::native(cache.clone(), construct),
+                Some(cache) => crate::media::with_native_cache(cache.clone(), construct),
                 None => construct(),
             };
             *held = Some((wanted.clone(), Arc::new(client)));
