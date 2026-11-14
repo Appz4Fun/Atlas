@@ -68,9 +68,11 @@ fn run() {
     client.batch_execute("set statement_timeout='3s';set lock_timeout='250ms'").unwrap();
     // Fixed background cardinality exercises file-map planning without millions
     // of segment writes. Native migrations, constraints and triggers stay live.
-    client.batch_execute("insert into releases(group_name,is_collection,identity_key,name,poster,posted_date,is_obfuscated)
-        select 'alt.binaries.plan-background',false,sha256(convert_to('background-'||n,'UTF8')),'background-'||n,'fixture','',false
-        from generate_series(1,8192) n").unwrap();
+    for page in 0..16i64 {
+        client.execute("insert into releases(group_name,is_collection,identity_key,name,poster,posted_date,is_obfuscated)
+            select 'alt.binaries.plan-background',false,sha256(convert_to('background-'||n,'UTF8')),'background-'||n,'fixture','',false
+            from generate_series($1::bigint,$2::bigint) n",&[&(page*512+1),&((page+1)*512)]).unwrap();
+    }
     for page in 0..16i64 {
         client.execute("insert into files(release_id,filename_key,filename)
             select r.id,sha256(convert_to('background-file-'||n,'UTF8')),'background-file-'||n
