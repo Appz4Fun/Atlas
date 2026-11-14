@@ -374,15 +374,18 @@ mod tests {
     }
 
     #[test]
-    fn unported_native_read_is_a_typed_attempt_failure_without_a_legacy_path() {
-        let Some(schema)=crate::pg::testing::Schema::new() else {return};
+    #[ignore = "requires explicit isolated ATLAS_PG_TEST_URL and the canonical native owner"]
+    fn ended_native_read_is_a_typed_attempt_failure_without_a_legacy_path() {
+        let schema=crate::pg::testing::Schema::new().expect("explicit isolated PostgreSQL required");
         let runtime=runtime(&schema);let reads=StepReads::for_owner(&runtime.owner).unwrap();
         let data=crate::postprocess::data::StepData::Native(&reads);
-        match data.predb_catalog_path() {
-            Err(crate::postprocess::step::StepError::Native(error))=>assert!(error.is::<crate::postprocess::data::NativeReadUnavailable>()),
-            _=>panic!("an unsupported native read must not become a per-release retry or a SQLite path"),
-        }
+        assert_eq!(data.probe_moviehash(1).unwrap(),None,"an available native reader can report a genuine miss");
         runtime.owner.close();
+        match data.probe_moviehash(1) {
+            Err(crate::postprocess::step::StepError::Native(error))=>assert!(crate::pg::outage::is_attempt_ended(&error)),
+            _=>panic!("an ended native reader must not become a per-release retry or cache miss"),
+        }
+        assert_eq!(runtime.owner.failure(),None,"intentional owner closure is not a new storage failure");
     }
 
     #[test]
