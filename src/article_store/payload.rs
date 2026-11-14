@@ -291,10 +291,11 @@ mod unix {
         if error.raw_os_error() == Some(libc::EEXIST) { Ok(false) } else { Err(Error::Io(error)) }
     }
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Eq, PartialEq)]
     enum SyncPoint {
         Other,
         Selected,
+        Parent,
     }
     pub(crate) struct Writer {
         root: Pinned,
@@ -359,11 +360,13 @@ mod unix {
             if !install(&temp, &writer.root, c"identity")? {
                 return Err(Error::Corrupt);
             }
+            #[cfg(test)]
+            crash_boundary("post-identity-install");
             temp.unlink()?;
             writer.flush(&writer._lock.file, None, SyncPoint::Other)?;
             writer.flush(&writer.chunks.file, None, SyncPoint::Other)?;
             writer.flush(&writer.root.file, None, SyncPoint::Other)?;
-            writer.flush(&parent.file, None, SyncPoint::Other)?;
+            writer.flush(&parent.file, None, SyncPoint::Parent)?;
             Ok(writer)
         }
         pub(crate) fn open(root: &Path, expected: Identity) -> Result<Self> {
@@ -529,14 +532,14 @@ mod unix {
 
     #[cfg(test)]
     thread_local! {
-        static FAIL_SYNC: Cell<Option<bool>> = const { Cell::new(None) };
+        static FAIL_SYNC: Cell<Option<SyncPoint>> = const { Cell::new(None) };
         static SYNC_CALLS: Cell<usize> = const { Cell::new(0) };
     }
     #[cfg(test)]
     fn sync_primitive(file: &File, point: SyncPoint) -> io::Result<()> {
         SYNC_CALLS.with(|calls| calls.set(calls.get() + 1));
         let fail = FAIL_SYNC.with(|failure| match failure.get() {
-            Some(selected_only) if !selected_only || matches!(point, SyncPoint::Selected) => {
+            Some(target) if target == SyncPoint::Other || target == point => {
                 failure.set(None);
                 true
             }
@@ -549,11 +552,19 @@ mod unix {
     }
     #[cfg(test)]
     pub(crate) fn test_fail_next_sync() {
-        FAIL_SYNC.with(|failure| failure.set(Some(false)));
+        FAIL_SYNC.with(|failure| failure.set(Some(SyncPoint::Other)));
     }
     #[cfg(test)]
     pub(crate) fn test_fail_final_sync() {
-        FAIL_SYNC.with(|failure| failure.set(Some(true)));
+        FAIL_SYNC.with(|failure| failure.set(Some(SyncPoint::Selected)));
+    }
+    #[cfg(test)]
+    pub(crate) fn test_fail_parent_sync() {
+        FAIL_SYNC.with(|failure| failure.set(Some(SyncPoint::Parent)));
+    }
+    #[cfg(test)]
+    pub(crate) fn test_clear_sync_failure() {
+        FAIL_SYNC.with(|failure| failure.set(None));
     }
     #[cfg(test)]
     pub(crate) fn test_sync_calls() -> usize {
@@ -574,7 +585,9 @@ mod unix {
 #[cfg(unix)]
 pub(crate) use unix::{Chunk, Reader, Writer};
 #[cfg(all(test, unix))]
-pub(super) use unix::{test_fail_final_sync, test_fail_next_sync, test_sync_calls};
+pub(super) use unix::{
+    test_clear_sync_failure, test_fail_final_sync, test_fail_next_sync, test_fail_parent_sync, test_sync_calls,
+};
 
 #[cfg(not(unix))]
 mod unsupported {

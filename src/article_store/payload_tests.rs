@@ -495,6 +495,52 @@ fn sync_failure_stops_writer() {
     assert!(reader.open_chunk(reference, deadline()).is_ok());
 }
 
+// Catches admitting a writer without durably reconciling an interrupted root mkdir.
+#[test]
+fn interrupted_initialization_reconciles_parent_durability() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let root = base.join("payload");
+    let marker = base.join("initialized");
+    let placeholder = Identity::from_parts(catalog(), StoreId::from_bytes([0; 16]));
+    let mut process = child("post-identity-install", &root, placeholder, &marker);
+    wait_marker(&mut process, &marker);
+    assert_eq!(fs::read(&marker).unwrap(), b"post-identity-install");
+    assert!(!marker.with_extension("returned").exists());
+    process.kill().unwrap();
+    let _ = process.wait().unwrap();
+    let record = fs::read(root.join("identity")).unwrap();
+    assert_eq!(record.len(), 88);
+    assert_eq!(&record[..8], b"ATART001");
+    assert_eq!(&record[24..56], &[0x42; 32]);
+    assert_eq!(&record[56..], Sha256::digest(&record[..56]).as_slice());
+    let mut store = [0; 16];
+    store.copy_from_slice(&record[8..24]);
+    let identity = Identity::from_parts(catalog(), StoreId::from_bytes(store));
+    let before = snapshot(&root);
+    payload::test_fail_parent_sync();
+    let reader_result = Reader::open(&root, identity);
+    let reopen_result = Writer::open(&root, identity);
+    // Clear even when the missing sync leaves the targeted failure unconsumed.
+    payload::test_clear_sync_failure();
+    assert!(reader_result.is_ok(), "read-only reopening cannot perform a durability sync");
+    drop(reader_result);
+    assert_eq!(snapshot(&root), before);
+    assert!(
+        matches!(reopen_result, Err(Error::Io(ref error)) if error.raw_os_error() == Some(libc::EIO)),
+        "writer admission must preserve EIO from the actual root-parent sync"
+    );
+    drop(reopen_result);
+    let mut writer = Writer::open(&root, identity).expect("reconcile interrupted initialization");
+    let reference = abc(&mut writer);
+    drop(writer);
+    let reader = Reader::open(&root, identity).unwrap();
+    let chunk = reader.open_chunk(reference, deadline()).unwrap();
+    let mut out = [0; 3];
+    assert_eq!(chunk.read_range(0, &mut out, deadline()).unwrap(), 3);
+    assert_eq!(&out, b"abc");
+}
+
 #[test]
 fn subprocess_entry() {
     let Ok(mode) = std::env::var("ATLAS_PAYLOAD_TEST_MODE") else {
@@ -508,6 +554,11 @@ fn subprocess_entry() {
         *b = u8::from_str_radix(&encoded[i * 2..i * 2 + 2], 16).unwrap();
     }
     let identity = Identity { catalog: catalog(), store: StoreId(store) };
+    if mode == "post-identity-install" {
+        let _writer = Writer::create(&root, catalog()).unwrap();
+        fs::write(marker.with_extension("returned"), b"returned").unwrap();
+        return;
+    }
     if mode == "busy" {
         assert!(matches!(Writer::open(&root, identity), Err(Error::Busy)));
         fs::write(marker, b"Busy").unwrap();
