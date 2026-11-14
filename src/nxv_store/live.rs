@@ -124,16 +124,9 @@ pub fn keep_now() -> KeepSet {
     }
 }
 
-/// Opens the store when it's on. Call once, from the indexer; it starts the store's linker after.
+/// Opens bounded live capture when enabled. Call once, before the native linker.
+/// Legacy metadata is imported by that worker; startup never authorizes expiry.
 pub fn spawn(cfg: &crate::config::HeaderStoreConfig) -> anyhow::Result<()> {
-    spawn_with_mapping(cfg, false)
-}
-
-pub(crate) fn spawn_bounded(cfg: &crate::config::HeaderStoreConfig) -> anyhow::Result<()> {
-    spawn_with_mapping(cfg, true)
-}
-
-fn spawn_with_mapping(cfg: &crate::config::HeaderStoreConfig, bounded_maps: bool) -> anyhow::Result<()> {
     if !cfg.enabled {
         return Ok(());
     }
@@ -142,7 +135,7 @@ fn spawn_with_mapping(cfg: &crate::config::HeaderStoreConfig, bounded_maps: bool
     let state_dir: PathBuf = root.join("_state");
     load_claimed(&state_dir);
     use anyhow::Context;
-    let (store, opened) = Store::open(StoreConfig { bounded_maps, ..StoreConfig::new(&root) }, keep_now())
+    let (store, opened) = Store::open(StoreConfig { bounded_maps: true, ..StoreConfig::new(&root) }, keep_now())
         .with_context(|| format!("opening header store {}", root.display()))?;
     eprintln!(
         "header store: {} segments, {} blocks; {} logs replayed ({} rows), {} already committed",
@@ -151,12 +144,8 @@ fn spawn_with_mapping(cfg: &crate::config::HeaderStoreConfig, bounded_maps: bool
     anyhow::ensure!(STORE.set(Mutex::new(Some(Arc::clone(&store)))).is_ok(), "header store already started");
     // housekeeping and refused rows ask for the keep set as of then
     store.set_keep_source(Arc::new(keep_now));
-    // the store's linker arms expiry after its first pass; with a linker that can't read its state, nothing would, soo
-    // expiry follows the keep set from the start
-    if !bounded_maps && let Err(e) = super::linker::Linker::open(&store, now()) {
-        eprintln!("header store: its linker couldnt read its state ({e:#}); expiry follows the keep set alone");
-        store.arm_expiry();
-    }
+    // Keep every unprocessed day until the native linker establishes exact
+    // durable coverage. Unreadable legacy state must never grant age expiry.
     let weak = Arc::downgrade(&store);
     let claimed_path = state_dir.join(CLAIMED_FILE);
     let _ = std::thread::Builder::new().name("nxv-keep".into()).spawn(move || {
@@ -179,6 +168,10 @@ fn spawn_with_mapping(cfg: &crate::config::HeaderStoreConfig, bounded_maps: bool
         }
     });
     Ok(())
+}
+
+pub(crate) fn spawn_bounded(cfg: &crate::config::HeaderStoreConfig) -> anyhow::Result<()> {
+    spawn(cfg)
 }
 
 /// One admitted listing, held through NNTP reads and any detached disk work.
@@ -244,51 +237,219 @@ pub fn finish() {
 mod tests {
     use super::*;
 
-    #[test]
-    fn bounded_spawn_never_opens_legacy_linker_metadata() {
-        const CHILD: &str = "ATLAS_TEST_BOUNDED_SPAWN_ROOT";
-        if let Some(root) = std::env::var_os(CHILD) {
-            let cfg = crate::config::HeaderStoreConfig {
-                enabled: true,
-                dir: PathBuf::from(root).to_string_lossy().into_owned(),
-            };
-            spawn_bounded(&cfg).unwrap();
-            handle().unwrap().close().unwrap();
-            return;
+    const CHILD_ROOT: &str = "ATLAS_TEST_LIVE_STARTUP_ROOT";
+    const CHILD_MODE: &str = "ATLAS_TEST_LIVE_STARTUP_MODE";
+    const CHILD_CASE: &str = "ATLAS_TEST_LIVE_STARTUP_CASE";
+    const SPARSE_IDS: u64 = 16 * 1024 * 1024;
+
+    struct Child(std::process::Child);
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
         }
-        // Run the real live startup entrypoint in an isolated process because
-        // production Store ownership is a process singleton. A FIFO makes ANY
-        // eager legacy metadata open observable without allocating a huge map.
+    }
+
+    fn child_fixture() -> Option<(PathBuf, String, String)> {
+        std::env::var_os(CHILD_ROOT)
+            .map(|root| (PathBuf::from(root), std::env::var(CHILD_MODE).unwrap(), std::env::var(CHILD_CASE).unwrap()))
+    }
+
+    fn start(root: &Path, mode: &str, enabled: bool) -> anyhow::Result<()> {
+        let cfg = crate::config::HeaderStoreConfig { enabled, dir: root.to_string_lossy().into_owned() };
+        match mode {
+            "public" => spawn(&cfg),
+            "bounded" => spawn_bounded(&cfg),
+            _ => panic!("unknown isolated live startup fixture"),
+        }
+    }
+
+    fn isolated(selector: &str, mode: &str, case: &str, prepare: impl FnOnce(&Path)) {
         let dir = tempfile::tempdir().unwrap();
-        let state = dir.path().join("_state");
-        std::fs::create_dir(&state).unwrap();
-        let fifo = std::ffi::CString::new(state.join("links.rec").as_os_str().as_encoded_bytes()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
-        let old_ids = std::fs::File::create(state.join("linked-ids.rec")).unwrap();
-        old_ids.set_len(16 * 1024 * 1024).unwrap();
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "nxv_store::live::tests::bounded_spawn_never_opens_legacy_linker_metadata",
-                "--nocapture",
-            ])
-            .env(CHILD, dir.path())
-            .spawn()
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
+        std::fs::create_dir(dir.path().join("_state")).unwrap();
+        std::fs::write(dir.path().join("_state/claimed-days"), b"").unwrap();
+        prepare(dir.path());
+        let mut child = Child(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", selector, "--nocapture"])
+                .env("ATLAS_HOME", dir.path())
+                .env(CHILD_ROOT, dir.path())
+                .env(CHILD_MODE, mode)
+                .env(CHILD_CASE, case)
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(15);
         loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                assert!(status.success());
-                break;
+            if let Some(status) = child.0.try_wait().unwrap() {
+                assert!(status.success(), "isolated {mode}/{case} startup contract failed");
+                return;
             }
-            if Instant::now() >= deadline {
-                child.kill().unwrap();
-                child.wait().unwrap();
-                panic!("bounded startup attempted an eager legacy metadata read");
-            }
+            assert!(Instant::now() < deadline, "isolated {mode}/{case} startup did not finish");
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(old_ids.metadata().unwrap().len(), 16 * 1024 * 1024);
+    }
+
+    fn legacy_fifo(root: &Path, name: &str) {
+        let state = root.join("_state");
+        std::fs::create_dir_all(&state).unwrap();
+        for file in ["links.rec", "linked-ids.rec", "linker.rec"] {
+            if file == name {
+                let path = std::ffi::CString::new(state.join(file).as_os_str().as_encoded_bytes()).unwrap();
+                assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+            } else if file == "linked-ids.rec" {
+                std::fs::File::create(state.join(file)).unwrap().set_len(SPARSE_IDS).unwrap();
+            } else {
+                std::fs::write(state.join(file), b"unchanged legacy startup sentinel\n").unwrap();
+            }
+        }
+    }
+
+    fn metadata_startup(selector: &str, mode: &str) {
+        if let Some((root, mode, fifo)) = child_fixture() {
+            start(&root, &mode, true).unwrap();
+            assert!(handle().is_some(), "actual durable capture must start");
+            finish();
+            assert!(handle().is_none());
+            for file in ["links.rec", "linked-ids.rec", "linker.rec"] {
+                if file == fifo {
+                    continue;
+                }
+                let path = root.join("_state").join(file);
+                if file == "linked-ids.rec" {
+                    assert_eq!(std::fs::metadata(path).unwrap().len(), SPARSE_IDS);
+                } else {
+                    assert_eq!(std::fs::read(path).unwrap(), b"unchanged legacy startup sentinel\n");
+                }
+            }
+            return;
+        }
+        // A separate FIFO for every legacy metadata reader catches any eager
+        // open, without allocating a large map or reading the sparse ID file.
+        for file in ["links.rec", "linked-ids.rec", "linker.rec"] {
+            isolated(selector, mode, file, |root| legacy_fifo(root, file));
+        }
+    }
+
+    #[test]
+    fn bounded_spawn_never_opens_legacy_linker_metadata() {
+        metadata_startup("nxv_store::live::tests::bounded_spawn_never_opens_legacy_linker_metadata", "bounded");
+    }
+
+    #[test]
+    fn public_spawn_never_opens_legacy_linker_metadata() {
+        metadata_startup("nxv_store::live::tests::public_spawn_never_opens_legacy_linker_metadata", "public");
+    }
+
+    fn aged_input(root: &Path) {
+        let (store, _) = Store::open(
+            StoreConfig { bounded_maps: true, sealers: 1, ..StoreConfig::new(root) },
+            KeepSet { live_from: i64::MIN / 2, ..KeepSet::default() },
+        )
+        .unwrap();
+        let row = b"1\tpart\tposter@example.invalid\tFri, 02 Jan 1970 03:30:00 +0000\t<part@example.invalid>\t\t100\t1"
+            .to_vec();
+        store.record("server.example", "group.example", &[row], Clamp::Unknown { now: 100000 }).unwrap();
+        store.close().unwrap();
+        assert_eq!(store.segment_snapshot("group.example", 1).unwrap().unwrap().count, 1);
+    }
+
+    #[test]
+    fn failed_legacy_state_never_authorizes_live_input_expiry() {
+        if let Some((root, mode, case)) = child_fixture() {
+            let state = root.join("_state");
+            if case == "unreadable-links" {
+                let error = super::super::linker::Linker::open_in(&state, now()).err().unwrap();
+                assert!(
+                    error.chain().any(|e| e.downcast_ref::<std::io::Error>().is_some()),
+                    "fixture must exercise a real legacy metadata I/O error"
+                );
+            } else {
+                assert!(super::super::linker::State::load(&state).unwrap_err().to_string().contains("cut short"));
+            }
+            start(&root, &mode, true).unwrap();
+            let store = handle().unwrap();
+            // Remove grace/claims as possible explanations for retention. No
+            // healthy PostgreSQL coverage has been established for this input.
+            store.set_keep_source(Arc::new(|| KeepSet { live_from: i64::MAX / 2, ..KeepSet::default() }));
+            assert_eq!(store.segment_snapshot("group.example", 1).unwrap().unwrap().count, 1);
+            for _ in 0..3 {
+                store.housekeeping();
+            }
+            assert_eq!(
+                store.segment_snapshot("group.example", 1).unwrap().unwrap().count,
+                1,
+                "uncertain linker state cannot authorize deletion after the keep window"
+            );
+            assert!(
+                store.blocks("group.example", i64::MIN, i64::MAX).is_empty(),
+                "live startup must not expose a retained whole-arena mapping"
+            );
+            assert_eq!(std::fs::read(state.join("linker.rec")).unwrap(), b"cut short legacy state\n");
+            finish();
+            drop(store);
+            return;
+        }
+        for mode in ["public", "bounded"] {
+            for case in ["unreadable-links", "cut-short-state"] {
+                isolated(
+                    "nxv_store::live::tests::failed_legacy_state_never_authorizes_live_input_expiry",
+                    mode,
+                    case,
+                    |root| {
+                        aged_input(root);
+                        let state = root.join("_state");
+                        std::fs::create_dir_all(&state).unwrap();
+                        std::fs::write(state.join("linker.rec"), b"cut short legacy state\n").unwrap();
+                        if case == "unreadable-links" {
+                            std::fs::create_dir(state.join("links.rec")).unwrap();
+                        }
+                    },
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn live_startup_propagates_store_errors_without_publishing_a_handle() {
+        if let Some((root, mode, _)) = child_fixture() {
+            let blocked = root.join("not-a-directory");
+            let error = start(&blocked, &mode, true).unwrap_err();
+            assert!(
+                error.chain().any(|e| e.downcast_ref::<std::io::Error>().is_some()),
+                "startup must preserve the actual store I/O cause"
+            );
+            assert!(handle().is_none(), "failed startup cannot publish a ready handle");
+            return;
+        }
+        for mode in ["public", "bounded"] {
+            isolated(
+                "nxv_store::live::tests::live_startup_propagates_store_errors_without_publishing_a_handle",
+                mode,
+                "invalid-root",
+                |root| std::fs::write(root.join("not-a-directory"), b"source fixture").unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_live_startup_does_not_create_or_publish_a_store() {
+        if let Some((root, mode, _)) = child_fixture() {
+            let unopened = root.join("disabled");
+            start(&unopened, &mode, false).unwrap();
+            assert!(!unopened.exists());
+            assert!(handle().is_none());
+            assert!(STARTED.get().is_none());
+            return;
+        }
+        for mode in ["public", "bounded"] {
+            isolated(
+                "nxv_store::live::tests::disabled_live_startup_does_not_create_or_publish_a_store",
+                mode,
+                "disabled",
+                |_| {},
+            );
+        }
     }
 
     #[test]
