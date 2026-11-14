@@ -722,14 +722,6 @@ pub struct KeysStep {
     salt: OnceLock<i64>,
 }
 
-impl KeysStep {
-    /// The original native owner reads and verifies the catalog salt; the Step retains that value.
-    fn salt(&self, data: &crate::postprocess::data::StepData<'_>) -> Result<i64, StepError> {
-        let found = data.key_salt(self.salt.get().copied())?;
-        Ok(*self.salt.get_or_init(|| found))
-    }
-}
-
 impl Step for KeysStep {
     fn id(&self) -> StepId {
         KEYS_STEP
@@ -755,9 +747,12 @@ impl Step for KeysStep {
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let id = ctx.release().id;
         let parts = Some(ctx.release().parts);
-        let salt = self.salt(ctx.data())?;
-        let keys = ctx.data().release_keys(id, parts, salt)?;
-        let had = ctx.data().stored_release_keys(id)?;
+        let snapshot = ctx.data().keys_snapshot(id, parts, self.salt.get().copied(), ctx.deadline())?;
+        let salt = *self.salt.get_or_init(|| snapshot.salt);
+        if salt != snapshot.salt {
+            return Err(StepError::Native(anyhow::anyhow!("native key salt changed within its Step instance")));
+        }
+        let (keys, had) = (snapshot.computed, snapshot.stored);
         let writes = match (keys.is_empty(), had) {
             (true, None) => Vec::new(),
             (true, Some(_)) => vec![StepWrite::for_mutation(id, StepMutation::ClearReleaseKeys)],

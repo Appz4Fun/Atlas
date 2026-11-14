@@ -10,6 +10,7 @@ use super::indexer_runtime::Owner;
 mod links;
 #[path="stage_keys.rs"]
 mod keys;
+pub(crate) use keys::{KeysRead,KeysSnapshot};
 #[path="stage_inventory.rs"]
 mod inventory;
 #[path="stage_xref.rs"]

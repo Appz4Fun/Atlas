@@ -169,6 +169,13 @@ impl StepData<'_> {
         native.key_salt(cached).map_err(StepError::Native)
     }
 
+    pub(crate) fn keys_snapshot(&self,id:i64,parts:Option<i64>,cached:Option<i64>,until:std::time::Instant)->Result<crate::pg::stage_reads::KeysSnapshot,StepError> {
+        match self.native().map_err(StepError::Native)?.keys_snapshot(id,parts,cached,until).map_err(StepError::Native)? {
+            crate::pg::stage_reads::KeysRead::Complete(snapshot)=>Ok(snapshot),
+            crate::pg::stage_reads::KeysRead::Deferred(_cause)=>Err(StepError::OutOfBudget),
+        }
+    }
+
     pub fn release_keys(&self, release_id: i64, parts: Option<i64>, salt: i64) -> Result<crate::keys::Keys, StepError> {
         let native = self.native().map_err(StepError::Native)?;
         native.release_keys(release_id,parts,salt).map_err(StepError::Native)
