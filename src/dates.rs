@@ -185,6 +185,13 @@ pub fn naive_timestamp(value: &str) -> Option<i64> {
     Some(dt.and_utc().timestamp())
 }
 
+/// A header's actual UTC instant, only when its zone was explicit. Historical
+/// wall clocks, absent zones and -0000 cannot authorize a provider date search.
+pub(crate) fn explicit_utc_timestamp(value: &str) -> Option<i64> {
+    let (date, offset) = parse_rfc2822(value)?;
+    FixedOffset::east_opt(offset?)?.from_local_datetime(&date).single().map(|date| date.timestamp())
+}
+
 /// A header or stored date -> unix timestamp, None when it cant be read.
 /// Naive dates are local time, same as python's datetime.timestamp().
 pub fn posted_timestamp(value: &str) -> Option<i64> {
@@ -204,6 +211,27 @@ pub fn posted_timestamp(value: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_utc_timestamp_keeps_the_posters_wall_clock_separate() {
+        for (date, utc, wall) in [
+            ("Thu, 01 Jan 2026 10:00:00 +0200", 1_767_254_400, 1_767_261_600),
+            ("Thu, 01 Jan 2026 01:00:00 -0700", 1_767_254_400, 1_767_229_200),
+            ("Thu, 01 Jan 2026 08:00:00 GMT", 1_767_254_400, 1_767_254_400),
+        ] {
+            assert_eq!(explicit_utc_timestamp(date), Some(utc));
+            assert_eq!(naive_timestamp(date), Some(wall));
+        }
+    }
+
+    #[test]
+    fn explicit_utc_timestamp_never_guesses_an_unknown_or_install_zone() {
+        for date in ["Thu, 01 Jan 2026 10:00:00 -0000", "Thu, 01 Jan 2026 10:00:00",
+            "Thu, 01 Jan 2026 10:00:00 unknown", "Thu, 01 Jan 2026 10:00:00 +9999",
+            "2026-01-01 10:00:00", "not a date"] {
+            assert_eq!(explicit_utc_timestamp(date), None, "unknown UTC must remain unqualified: {date}");
+        }
+    }
 
     #[test]
     fn naive_timestamps_drop_the_zone() {

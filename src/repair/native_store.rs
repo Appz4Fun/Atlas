@@ -104,13 +104,16 @@ impl Read<'_,'_> {
         }
         Ok(facts.repairable())
     }
-    pub fn windows(&mut self,ids:&[i64])->Result<Vec<Window>> {
+    pub fn windows(&mut self,ids:&[i64])->Result<Option<Vec<Window>>> {
         let mut groups=BTreeMap::<String,(i64,i64)>::new();for &id in ids {let Some(h)=self.head(id)? else{return Err(SourceChanged.into())};
-            let rows=self.query("select min(first_date),max(last_date) from file_timing where release_id=$1",&[&id])?;let row=&rows[0];
-            if let (Some(first),Some(last))=(row.try_get::<_,Option<i64>>(0)?,row.try_get::<_,Option<i64>>(1)?) {
-                let e=groups.entry(h.named.group).or_insert((first,last));e.0=e.0.min(first);e.1=e.1.max(last);
-            }}
-        self.budget.charge(groups.len()*256)?;Ok(groups.into_iter().filter(|(g,_)|!g.is_empty()).map(|(group,(from,to))|Window {group,from:from.saturating_sub(MARGIN),to:to.saturating_add(MARGIN)}).collect())
+            let rows=self.query("select min(t.first_utc),max(t.last_utc),bool_and(coalesce(t.utc_complete,false)) from files f left join file_timing t on t.file_id=f.id and t.release_id=f.release_id where f.release_id=$1",&[&id])?;let row=&rows[0];
+            // Unknown/legacy timing is unqualified, not a storage failure or
+            // permission to guess a zone. Missing per-file timing also refuses.
+            if row.try_get::<_,Option<bool>>(2)?!=Some(true) {return Ok(None)}
+            let (Some(first),Some(last))=(row.try_get::<_,Option<i64>>(0)?,row.try_get::<_,Option<i64>>(1)?) else{return Ok(None)};
+            let e=groups.entry(h.named.group).or_insert((first,last));e.0=e.0.min(first);e.1=e.1.max(last);
+        }
+        self.budget.charge(groups.len()*256)?;Ok(Some(groups.into_iter().filter(|(g,_)|!g.is_empty()).map(|(group,(from,to))|Window {group,from:from.saturating_sub(MARGIN),to:to.saturating_add(MARGIN)}).collect()))
     }
     pub fn source_matches(&mut self,s:&Source)->Result<bool> {
         Ok(self.query(SOURCE_MATCH,&[&s.id,&s.revision,&s.group,&s.collection,&&s.identity[..]])?

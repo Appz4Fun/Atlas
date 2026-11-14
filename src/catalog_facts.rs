@@ -210,12 +210,13 @@ pub(crate) const ROUTE_SLACK_SECS: i64 = 90;
 #[derive(Debug, Default)]
 pub(crate) struct ArticleFacts {
     pub(crate) date: Option<i64>,
+    pub(crate) utc: Option<i64>,
     pub(crate) id: crate::discovery::IdFacts,
 }
 
 impl ArticleFacts {
     pub(crate) fn of(a: &Article) -> ArticleFacts {
-        ArticleFacts { date: crate::dates::naive_timestamp(&a.date), id: crate::discovery::id_facts(&a.message_id) }
+        ArticleFacts { date: crate::dates::naive_timestamp(&a.date), utc: crate::dates::explicit_utc_timestamp(&a.date), id: crate::discovery::id_facts(&a.message_id) }
     }
 }
 

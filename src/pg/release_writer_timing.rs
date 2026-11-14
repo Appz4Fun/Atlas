@@ -22,6 +22,7 @@ with ordered as materialized (
     from pg_temp.atlas_release_input where file_id is not null
 ), folded as (
     select file_id,release_id,min(t_date) as first_date,max(t_date) as last_date,
+        min(t_utc) as first_utc,max(t_utc) as last_utc,bool_and(t_utc is not null) as utc_complete,
         min(t_number) as number_first,max(t_number) as number_last,sum(t_lines)::bigint as lines,
         sum(t_references)::bigint as references_seen,max(t_xref) as xref_groups_max,
         (array_agg(t_from order by ordinal))[1] as from_first,
@@ -37,13 +38,15 @@ with ordered as materialized (
 )
 insert into file_timing as old(file_id,release_id,first_date,last_date,number_first,number_last,lines,
     references_seen,xref_groups_max,from_hash,from_variants,encoded_subject,late_articles,articles,
-    tool,clock_first,clock_last,hw_host,hw_key,hw_n_first,hw_n_last)
+    tool,clock_first,clock_last,hw_host,hw_key,hw_n_first,hw_n_last,first_utc,last_utc,utc_complete)
 select file_id,release_id,first_date,last_date,number_first,number_last,lines,references_seen,xref_groups_max,
-    from_last,from_variants,encoded_subject,0,articles,tool,clock_first,clock_last,hw_host,hw_key,hw_n_first,hw_n_last
+    from_last,from_variants,encoded_subject,0,articles,tool,clock_first,clock_last,hw_host,hw_key,hw_n_first,hw_n_last,first_utc,last_utc,utc_complete
 from folded where true
 on conflict(file_id) do update set
     release_id=excluded.release_id,
     first_date=least(old.first_date,excluded.first_date),last_date=greatest(old.last_date,excluded.last_date),
+    first_utc=least(old.first_utc,excluded.first_utc),last_utc=greatest(old.last_utc,excluded.last_utc),
+    utc_complete=old.utc_complete and excluded.utc_complete,
     number_first=least(old.number_first,excluded.number_first),number_last=greatest(old.number_last,excluded.number_last),
     lines=coalesce(old.lines,0)+excluded.lines,references_seen=old.references_seen+excluded.references_seen,
     xref_groups_max=greatest(old.xref_groups_max,excluded.xref_groups_max),
