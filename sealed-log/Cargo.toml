@@ -2,7 +2,7 @@
 name = "sealed-log"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.99"
+rust-version = "1.100"
 description = "Append-only store for Atlas's sealed articles, kept on a big disk"
 license = "GPL-3.0-only"
 
