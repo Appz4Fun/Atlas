@@ -1,14 +1,14 @@
 //! Native fresh-catalog processing on the canonical PostgreSQL owner session.
 
 use anyhow::{Context,Result,ensure};
-use postgres::GenericClient;
+use postgres::{GenericClient,types::Type};
 use sha2::{Digest,Sha256};
 
 #[derive(Clone,PartialEq,Eq)]
 pub(crate) struct CatalogIdentity { nonce:[u8;32],header_root:String }
 impl CatalogIdentity {
     pub(crate) fn read_in(client:&mut impl GenericClient)->Result<Self> {
-        let row=client.query_opt("select c.catalog_nonce,c.header_root,c.codec_version from native_catalog_identity c
+        let row=client.query_typed_opt("select c.catalog_nonce,c.header_root,c.codec_version from native_catalog_identity c
             where c.singleton and c.database_oid=(select oid from pg_database where datname=current_database())
             and c.schema_oid=(select oid from pg_namespace where nspname=current_schema())",&[])?
             .context("native catalog identity is not initialized")?;
@@ -95,8 +95,8 @@ impl OwnerEpoch {
     /// Mutations require the original backend, not just a live row observed
     /// through a different pooled session. A replacement always has a new epoch.
     pub(crate) fn verify(&self,client:&mut impl GenericClient)->Result<()> {
-        client.execute("select pg_stat_clear_snapshot()",&[])?;
-        let valid:bool=client.query_one("select exists(select 1 from native_runtime_current c join native_runtime_epochs e on e.epoch=c.epoch
+        client.batch_execute("select pg_stat_clear_snapshot()")?;
+        let valid:bool=client.query_typed_one("select exists(select 1 from native_runtime_current c join native_runtime_epochs e on e.epoch=c.epoch
             join pg_stat_activity a on a.pid=e.backend_pid and a.backend_start=e.backend_start
             where c.singleton and e.epoch=$1 and e.catalog_nonce=$2 and e.state='active'
             and e.backend_pid=pg_backend_pid() and e.backend_pid=$3 and e.backend_start=$4::text::timestamptz
@@ -110,7 +110,8 @@ impl OwnerEpoch {
             and exists(select 1 from pg_locks l where l.pid=a.pid and l.locktype='advisory' and l.mode='ExclusiveLock' and l.granted
               and l.database=a.datid and l.classid=(hashtext('atlas.indexer')::bigint & 4294967295)::oid
               and l.objid=(hashtext($7)::bigint & 4294967295)::oid and l.objsubid=2))",
-            &[&&self.id[..],&&self.catalog.nonce[..],&self.pid,&self.started,&self.version,&&self.code[..],&self.schema])?.try_get(0)?;
+            &[(&&self.id[..],Type::BYTEA),(&&self.catalog.nonce[..],Type::BYTEA),(&self.pid,Type::INT4),
+                (&self.started,Type::TEXT),(&self.version,Type::INT4),(&&self.code[..],Type::BYTEA),(&self.schema,Type::TEXT)])?.try_get(0)?;
         ensure!(valid,"native owner epoch or original session ended");
         let actual=CatalogIdentity::read_in(client)?;
         ensure!(actual.nonce==self.catalog.nonce && actual.header_root==self.catalog.header_root,"native catalog binding changed");
