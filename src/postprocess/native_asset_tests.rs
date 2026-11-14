@@ -255,6 +255,7 @@ fn run_still_donor_case(complete: bool) {
                 Err(error) if error.kind()==std::io::ErrorKind::WouldBlock=>{std::thread::sleep(Duration::from_millis(5));continue;},
                 Err(error)=>panic!("owned ARTICLE accept failed: {error}"),
             };
+            stream.set_nonblocking(false).unwrap();
             stream.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
             stream.set_write_timeout(Some(Duration::from_millis(500))).unwrap();
             stream.write_all(b"200 owned still fixture\r\n").unwrap();
