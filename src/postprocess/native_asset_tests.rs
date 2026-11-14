@@ -147,3 +147,132 @@ pub(crate) fn run(runtime:&crate::pg::indexer_runtime::Runtime,action:&str) {
     assert!(matches!(listener.accept(),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock),"cache reuse/refusal attempted a provider connection");
     runtime.owner.close();
 }
+
+// The fixture imports only the standalone owned transport, never legacy DB helpers.
+use crate as atlas_api;
+#[path = "../../tests/common/nntp.rs"]
+mod still_donor_nntp;
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires explicit isolated PG; real StillsStep/Prepared visit and private owned NNTP child"]
+fn native_still_donor_does_not_clear_own_rows_or_complete_generation() {
+    const CHILD: &str = "ATLAS_STILL_DONOR_CHILD";
+    const SELECTOR: &str = "postprocess::native::asset_tests::native_still_donor_does_not_clear_own_rows_or_complete_generation";
+    if let Ok(case) = std::env::var(CHILD) {
+        run_still_donor_case(case == "complete");
+        return;
+    }
+    use std::{fs::OpenOptions, io::Write, os::unix::fs::OpenOptionsExt, process::{Command, Stdio}, time::Instant};
+    for case in ["partial", "complete"] {
+        let schema = crate::pg::testing::Schema::new().expect("explicit isolated ATLAS_PG_TEST_URL required");
+        let home = tempfile::tempdir().unwrap();
+        let config = serde_json::json!({"storage":{"backend":"postgres","url":schema.url,"schema":schema.name,"allow_plaintext":true},
+            "header_store":{"enabled":true,"dir":home.path().join("headers")}});
+        let mut selected = OpenOptions::new().create_new(true).write(true).mode(0o600).open(home.path().join("config.json")).unwrap();
+        selected.write_all(serde_json::to_vec(&config).unwrap().as_slice()).unwrap();
+        let log = OpenOptions::new().create_new(true).write(true).mode(0o600).open(home.path().join("child.log")).unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap()).args(["--ignored", "--exact", SELECTOR, "--nocapture"])
+            .env_clear().env(CHILD, case).env("ATLAS_HOME", home.path()).env("ATLAS_NO_KEYRING", "1")
+            .env("ATLAS_SAB_DIR", home.path().join("absent-sab")).stdin(Stdio::null())
+            .stdout(Stdio::from(log.try_clone().unwrap())).stderr(Stdio::from(log)).spawn().unwrap();
+        let until = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() { break status; }
+            if Instant::now() >= until { child.kill().unwrap(); child.wait().unwrap(); panic!("owned still donor child deadline"); }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(status.success(), "owned {case} still donor child failed; private child log retained by qualification harness");
+        assert_eq!(std::fs::read(home.path().join("finished")).unwrap(), b"done");
+        assert!(!home.path().join("atlas.db").exists() && !home.path().join("atlas.raw.db").exists());
+    }
+}
+
+#[cfg(unix)]
+fn run_still_donor_case(complete: bool) {
+    use crate::pg::{fresh_reader::{Budget, ReadView}, stage_reads::StepReads};
+    use crate::probe::{media::VideoTrack, MediaInfo, ProbeInfo};
+    use crate::parser::{Article, Release};
+    use std::time::Instant;
+    let home = crate::paths::app_dir();
+    let storage = crate::config::checked_storage_config().unwrap();
+    assert!(storage.is_postgres());
+    let mut config = crate::config::Config::default();
+    config.postprocess.enabled = false; config.predb.enabled = false; config.spots.enabled = false; config.inferred_parts = false;
+    config.media.tvmaze.enabled = false; config.media.allocine.enabled = false; config.media.details_per_minute = 0;
+    let runtime = crate::pg::indexer_runtime::Runtime::open(&config, storage.clone(), crate::config::header_store_config(), &[], &mut None).unwrap();
+    let media = MediaInfo {container:"matroska".into(),segment_uid:Some("ab12".into()),muxed_at:Some(1_700_000_000),
+        video:vec![VideoTrack {codec:"V_MPEG4/ISO/AVC".into(),..Default::default()}],..Default::default()};
+    let mux = crate::keys::as_key(crate::keys::digest8(crate::keys::mux_text(&media).unwrap().as_bytes()));
+    let info = serde_json::to_string(&ProbeInfo {file:Some("video.mkv".into()),media:Some(media),..Default::default()}).unwrap();
+    std::fs::create_dir(home.join("stills")).unwrap();
+    let mut physical = Vec::new();
+    let ids = runtime.owner.with(|client| {
+        let mut ids = Vec::new();
+        for (name, mid) in [("Own.Stills.Release", "<own-still@example.test>"), ("Donor.Stills.Release", "<donor-still@example.test>")] {
+            let saved = crate::pg::release_writer::save(client, &[Release {name:name.into(),group:"alt.binaries.test".into(),
+                date:"Wed, 01 Jan 2020 00:00:00 +0000".into(),articles:vec![Article {filename:Some("video.mkv".into()),
+                    subject:"video.mkv yEnc (1/1)".into(),message_id:mid.into(),part:Some(1),total_parts:Some(1),bytes:100,..Default::default()}],..Default::default()}],-10_000)?;
+            assert_eq!((saved.releases,saved.files,saved.parts),(1,1,1));
+            let id:i64 = client.query_one("select id from releases where name=$1", &[&name])?.try_get(0)?;
+            client.execute("insert into release_probe(release_id,info) values($1,$2)", &[&id,&info])?;
+            client.execute("insert into release_keys(release_id,mux) values($1,$2)", &[&id,&mux])?;
+            let own = ids.is_empty();
+            for position in crate::probe::stills::POSITIONS {
+                if own && !complete && position != 25 { continue; }
+                let bytes = [b"\xff\xd8\xff\xe0".as_slice(), &[u8::from(own),position], b"\xff\xd9"].concat();
+                let hash = Sha256::digest(&bytes).iter().map(|b|format!("{b:02x}")).collect::<String>();
+                let path = crate::probe::stills::still_file(&hash).unwrap();
+                std::fs::write(&path,&bytes).unwrap(); physical.push((path,bytes));
+                client.execute("insert into release_stills(release_id,position,at_ms,sha256,width,height,phash) values($1,$2,$3,$4,960,540,1)",
+                    &[&id,&i64::from(position),&(i64::from(position)*1000),&hash])?;
+            }
+            ids.push(id);
+        }
+        Ok(ids)
+    }).unwrap();
+    let own = ids[0];
+    let reads = StepReads::for_owner(&runtime.owner).unwrap();
+    let lookup = reads.stills_lookup(own).unwrap();
+    assert_eq!(reads.same_file_stills(own,&lookup).unwrap(),Some(crate::keys::Kind::Mux),"the genuine old donor precondition must hold");
+    let server = still_donor_nntp::Server::new(vec![]);
+    server.body_troubles_left.store(1,Ordering::SeqCst);
+    let port = still_donor_nntp::spawn_server(server.clone());
+    let mut account = crate::config::UsenetServer::new("127.0.0.1","bob","secret",port); account.ssl=Some(false); account.connections=Some(1);
+    let pool = Arc::new(crate::nntp::Pool::new(&[account]).with_timeout(Duration::from_millis(500)).with_body_tries(Duration::from_secs(1),0));
+    let handle = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+    config.postprocess.enabled=true; config.archive.enabled=true; config.postprocess.settle_secs=1; config.postprocess.complete_settle_secs=1;
+    config.postprocess.body_connections=1;
+    let step:Arc<dyn Step> = Arc::new(crate::probe::stills::StillsStep); let bit=mask(step.id());
+    assert!(step.enabled(&config));
+    let mut runner=Runner::new(&runtime.owner,&config,pool.clone(),handle.handle().clone()).unwrap();
+    runner.steps=Steps {ordered:vec![step],enabled:bit,database:0,network:bit,on_growth:bit,stamps:Vec::new()};
+    let queue=Queue::for_owner(&runtime.owner).unwrap();
+    let db=queue.claim(10,2,60).unwrap().into_iter().find(|claim|claim.release_id()==own).unwrap();
+    assert_eq!(runner.database(&db,0,10).unwrap().settle(&queue,&db,11).unwrap(),Settlement::Applied);
+    let net=queue.claim_net(12,1,60,0).unwrap().pop().unwrap(); assert_eq!(net.release_id(),own);
+    assert_eq!(runner.network(&queue,&net,12).unwrap().unwrap().settle(&queue,&net,13).unwrap(),Settlement::Applied);
+    runtime.owner.with(|client| {
+        let row=client.query_one("select done,net_wanted,net_left,net_transient from pp_state where release_id=$1", &[&own])?;
+        let stills:i64=client.query_one("select count(*) from release_stills where release_id=$1", &[&own])?.try_get(0)?;
+        assert_eq!(stills,if complete {3}else{1},"a donor must not delete own still rows");
+        if complete {
+            assert_eq!(row.get::<_,i64>(0)&bit,bit); assert_eq!(row.get::<_,Option<bool>>(1),None);
+        } else {
+            assert_eq!(row.get::<_,i64>(0)&bit,0,"a donor cannot complete own still generation");
+            assert_eq!(row.get::<_,Option<bool>>(1),Some(true)); assert_eq!(row.get::<_,Option<i64>>(2),Some(bit));
+            assert_eq!(row.get::<_,Option<i64>>(3),Some(1),"the actual owned BODY refusal must schedule a normal retry");
+        }
+        assert_eq!(client.query_one("select count(*) from ext_asset_files",&[])?.get::<_,i64>(0),0,"no donor or generated asset grant is minted");
+        Ok(())
+    }).unwrap();
+    assert_eq!(server.body_troubles_left.load(Ordering::SeqCst),usize::from(complete),"partial own stills require an actual own BODY attempt; complete own stills fetch nothing");
+    let mut client=crate::pg::Pool::new(&storage).unwrap().get().unwrap();
+    let view=ReadView::open(&mut client,&storage.schema,Budget::default(),Instant::now()+Duration::from_secs(5)).unwrap();
+    let pictures=view.own_pictures(own).unwrap(); assert_eq!(pictures.stills.len(),if complete {3}else{1});
+    drop(view); drop(client);
+    for (path,bytes) in physical {assert_eq!(std::fs::read(path).unwrap(),bytes);}
+    assert_eq!(runtime.owner.failure(),None);
+    handle.block_on(pool.close()); drop(runner); runtime.owner.close();
+    std::fs::write(home.join("finished"),b"done").unwrap();
+}
