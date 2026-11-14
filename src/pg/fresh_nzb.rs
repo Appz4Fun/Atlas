@@ -244,12 +244,17 @@ mod tests {
         crate::pg::release_writer::save(&mut client,std::slice::from_ref(&release),1).unwrap();
         let id:i64=client.query_one("select id from releases",&[]).unwrap().get(0);
         let row=ReleaseRow {id,name:release.name.clone(),group_name:release.group.clone(),complete:true,..Default::default()};
-        let oracle=release.articles.iter().map(|a|ArticleRow {message_id:a.message_id.clone(),filename:a.filename.clone(),part:a.part,
+        let mut oracle=release.articles.iter().map(|a|ArticleRow {message_id:a.message_id.clone(),filename:a.filename.clone(),part:a.part,
             total_parts:a.total_parts,bytes:Some(a.bytes),subject:Some(a.subject.clone()),poster:Some(release.poster.clone()),posted_date:Some(release.date.clone())}).collect::<Vec<_>>();
+        // The renderer consumes already ordered articles. Nameless envelopes
+        // precede named files; parts and raw message bytes order each file.
+        oracle.sort_by(|a,b|(&a.filename,a.part,a.message_id.as_bytes()).cmp(&(&b.filename,b.part,b.message_id.as_bytes())));
+        assert_eq!(oracle[0].message_id,"<envelope0@example.invalid>");
+        assert_eq!(oracle[1].message_id,"<envelope1@example.invalid>");
         let root=tempfile::tempdir().unwrap();
         #[cfg(unix)] {use std::os::unix::fs::PermissionsExt;std::fs::set_permissions(root.path(),std::fs::Permissions::from_mode(0o700)).unwrap();}
         let pool=Pool::new(root.path().into(),crate::nzb_spool::Limits {requests:6,per_request_bytes:1<<20,total_bytes:6<<20,free_bytes:0}).unwrap();
-        for (pick,selected) in [(Pick::Whole,oracle.clone()),(Pick::Ordinal(1),vec![oracle[257].clone()]),
+        for (pick,selected) in [(Pick::Whole,oracle.clone()),(Pick::Ordinal(1),vec![oracle[0].clone()]),
             (Pick::Ordinal(3),oracle.iter().filter(|a|a.filename.as_deref()==Some("a.bin")).cloned().collect()),
             (Pick::Name("z.bin"),oracle.iter().filter(|a|a.filename.as_deref()==Some("z.bin")).cloned().collect())] {
             let view=ReadView::open(&mut client,&schema.name,Budget::default(),Instant::now()+Duration::from_secs(10)).unwrap();
