@@ -4,6 +4,91 @@ use crate::archive::names::*;
 use crate::archive::select::*;
 use crate::store::FileInfo;
 
+mod password_budget_tests {
+    use super::*;
+    use crate::release_info::{PasswordBudgetExhausted, PasswordCandidateBudget, find_verified_password_with_budget};
+
+    fn aes_check() -> PasswordTest {
+        // Existing independent WinZip PBKDF2 vector in zip::tests::an_aes_zip_tests_its_password.
+        let salt = std::array::from_fn(|i| i as u8);
+        PasswordTest::Zip(zip::PasswordCheck::Aes { strength: 3, salt, verifier: [0xa3, 0x36] })
+    }
+
+    #[test]
+    fn the_twenty_fourth_password_can_succeed_but_rejection_exhausts_the_visit() {
+        let check = aes_check();
+        let wrong: Vec<String> = (0..24).map(|i| format!("wrong-candidate-{i}")).collect();
+        assert!(wrong.iter().all(|candidate| check.accepts(candidate) == Some(false)));
+        let mut candidates = wrong[..23].to_vec();
+        candidates.push("secret".into());
+        let mut budget = PasswordCandidateBudget::default();
+        assert_eq!(find_verified_password_with_budget([], &candidates, Some(&check), &mut budget).unwrap().as_deref(), Some("secret"));
+        assert_eq!(budget.used(), 24);
+
+        let mut budget = PasswordCandidateBudget::default();
+        assert_eq!(find_verified_password_with_budget([], &wrong, Some(&check), &mut budget), Err(PasswordBudgetExhausted));
+        assert_eq!(budget.used(), 24);
+        assert_eq!(find_verified_password_with_budget([], &["secret".into()], Some(&check), &mut budget), Err(PasswordBudgetExhausted));
+        assert_eq!(budget.used(), 24, "a later source gets no fresh allowance");
+        let error: crate::postprocess::step::StepError = PasswordBudgetExhausted.into();
+        assert!(matches!(error, crate::postprocess::step::StepError::Retry(message) if message == "password candidate budget exhausted"));
+    }
+
+    #[test]
+    fn split_filename_searches_share_the_budget_and_repeated_candidates_are_free() {
+        let check = aes_check();
+        let mut budget = PasswordCandidateBudget::default();
+        for _ in 0..100 {
+            assert_eq!(find_verified_password_with_budget(["{{wrong-candidate-0}}"], &[], Some(&check), &mut budget).unwrap(), None);
+        }
+        let after_duplicates = budget.used();
+        assert!(after_duplicates < 24);
+        assert_eq!(find_verified_password_with_budget(["{{secret}}"], &[], Some(&check), &mut budget).unwrap().as_deref(), Some("secret"));
+        assert_eq!(budget.used(), after_duplicates + 1, "a late valid candidate still fits after repeated filenames");
+
+        let mut budget = PasswordCandidateBudget::default();
+        let mut exhausted_at = None;
+        for i in 0..50_000 {
+            let name = format!("{{{{wrong-candidate-{i}}}}}");
+            if find_verified_password_with_budget([name.as_str()], &[], Some(&check), &mut budget).is_err() {
+                exhausted_at = Some(i);
+                break;
+            }
+        }
+        assert!(exhausted_at.is_some_and(|i| i < 24));
+        assert_eq!(budget.used(), 24, "linked names cannot reset the verifier count");
+    }
+
+    #[test]
+    fn a_changed_check_does_not_reuse_a_rejection_or_reset_the_allowance() {
+        let aes = aes_check();
+        let rar = PasswordTest::from_bytes(&[
+            0x0f, 0xcc, 0xf5, 0x00, 0x61, 0xff, 0xba, 0xd4, 0x3d, 0xcf, 0x68, 0x42, 0xb1, 0x49, 0xd5, 0xf5, 0xa2, 0xe7,
+            0x82, 0x9b, 0x3a, 0xab, 0xe0, 0x37, 0xb0,
+        ]).unwrap();
+        let mut budget = PasswordCandidateBudget::default();
+        assert_eq!(find_verified_password_with_budget([], &["F-UnK-NZBNF".into()], Some(&aes), &mut budget).unwrap(), None);
+        let before = budget.used();
+        assert_eq!(find_verified_password_with_budget([], &["F-UnK-NZBNF".into()], Some(&rar), &mut budget).unwrap().as_deref(), Some("F-UnK-NZBNF"));
+        assert_eq!(budget.used(), before + 1);
+    }
+
+    #[test]
+    fn uncheckable_explicit_hints_use_no_crypto_and_the_builtin_is_never_a_guess() {
+        let unsupported = PasswordTest::Rar5(rar::PasswordCheck { kdf: rar::MAX_KDF + 1, salt: [0; 16], check: [0; 8] });
+        let mut budget = PasswordCandidateBudget::default();
+        for check in [None, Some(&unsupported)] {
+            assert_eq!(find_verified_password_with_budget(["password: explicit-secret"], &[], check, &mut budget).unwrap().as_deref(), Some("explicit-secret"));
+            assert_eq!(find_verified_password_with_budget([], &[], check, &mut budget).unwrap(), None);
+        }
+        assert_eq!(budget.used(), 0);
+        let weak = PasswordTest::Zip(zip::PasswordCheck::Crypto { header: [0; 12], check: 0x99 });
+        assert!(!weak.certain());
+        assert_eq!(find_verified_password_with_budget(["password: wrong"], &[], Some(&weak), &mut budget).unwrap(), None);
+        assert!(budget.used() > 0, "a weak ZipCrypto check is supported, not an unsupported-KDF fallback");
+    }
+}
+
 fn names(l: &Listing) -> Vec<String> {
     l.files.iter().map(|f| f.name.clone()).collect()
 }
