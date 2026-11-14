@@ -1,7 +1,7 @@
 //! Fresh native worker construction. Runtime admission remains a separate gate.
 
 use std::sync::Arc;
-use anyhow::{Result,ensure};
+use anyhow::{Context,Result,ensure};
 use super::step::{Step,StepMask,Needs,mask};
 #[path="native_net.rs"]
 mod net;
@@ -89,7 +89,10 @@ pub(crate) struct Prepared {
 fn fail(owner:&crate::pg::indexer_runtime::Owner,error:&anyhow::Error) {
     let stopped=crate::pg::outage::is_attempt_ended(error)
         && owner.stop.load(std::sync::atomic::Ordering::Acquire) && owner.failure().is_none();
-    if !stopped {owner.fail(crate::pg::outage::classify(error));}
+    if !stopped {
+        eprintln!("native Stage failed; prior_failure={:?}; cause={}",owner.failure(),crate::pg::linker_runtime::failure_diagnostic(error));
+        owner.fail(crate::pg::outage::classify(error));
+    }
 }
 
 /// Created only after every retained handle has really joined. Pending claims
@@ -171,7 +174,7 @@ pub(crate) struct Runner {
 }
 impl Runner {
     pub(crate) fn new(owner:&Arc<crate::pg::indexer_runtime::Owner>,config:&crate::config::Config,pool:Arc<crate::nntp::Pool>,handle:tokio::runtime::Handle)->Result<Self> {
-        let assets=crate::pg::worker_assets::Grant::open(owner,config.native_assets.as_ref())?;
+        let assets=crate::pg::worker_assets::Grant::open(owner,config.native_assets.as_ref()).context("native startup assets")?;
         let steps=Steps::for_owner(owner,config)?;
         let stats=Arc::new(super::stats::Stats::default());
         let bodies=super::bodies::BodyFetcher::new(pool,handle,owner.stop.clone(),config.postprocess.clone(),stats.clone());

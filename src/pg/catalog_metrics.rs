@@ -183,7 +183,10 @@ impl Observer {
                 Err(error) if super::outage::is_attempt_ended(&error)
                     && (thread_stop.load(Ordering::Acquire)||thread_owner.stop.load(Ordering::Acquire))
                     && thread_owner.failure().is_none()=>Ok(()),
-                Err(error)=>{thread_owner.fail(super::outage::classify(&error));Err(error)},
+                Err(error)=>{
+                    eprintln!("native catalog observer failed; prior_failure={:?}; cause={}",thread_owner.failure(),super::linker_runtime::failure_diagnostic(&error));
+                    thread_owner.fail(super::outage::classify(&error));Err(error)
+                },
                 Ok(())=>Ok(()),
             }
         }).context("starting native catalog observer")?;

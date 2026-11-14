@@ -115,7 +115,10 @@ impl Owner {
             // A bounded read can observe the operator's stop between pages.
             // It did no new work; preserve any independently recorded failure.
             let canceled=super::outage::is_attempt_ended(error) && self.stop.load(Ordering::Acquire);
-            if !canceled || self.failure().is_some() {self.fail(classify(error));}
+            if !canceled || self.failure().is_some() {
+                eprintln!("native owner callback failed; prior_failure={:?}; cause={}", self.failure(), super::linker_runtime::failure_diagnostic(error));
+                self.fail(classify(error));
+            }
         }
         result
     }
@@ -177,7 +180,10 @@ impl Owner {
             epoch.verify(&mut tx)?;recorded()?;tx.commit()?;Ok(report)
         })();
         *self.busy_since.lock().unwrap_or_else(std::sync::PoisonError::into_inner)=None;
-        if let Err(error)=&result {self.fail(classify(error));}
+        if let Err(error)=&result {
+            eprintln!("native owner stop finalization failed; prior_failure={:?}; cause={}", self.failure(), super::linker_runtime::failure_diagnostic(error));
+            self.fail(classify(error));
+        }
         result
     }
 }
@@ -308,6 +314,23 @@ mod native_profile_tests;
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    #[ignore = "requires an explicit isolated ATLAS_PG_TEST_URL"]
+    fn original_owner_retains_typed_parameter_failure_for_safe_first_cause_diagnostic() {
+        let schema = super::super::testing::Schema::new().expect("explicit isolated ATLAS_PG_TEST_URL required");
+        let owner = Owner::new(postgres::Client::connect(&schema.url, postgres::NoTls).unwrap());
+        let result: Result<()> = owner.with(|client| {
+            client.query_one("select $1::bigint", &[&1_i32])?;
+            Ok(())
+        });
+        let error = result.unwrap_err();
+        assert!(error.downcast_ref::<postgres::Error>().is_some(), "original driver cause must survive");
+        assert!(super::super::linker_runtime::failure_diagnostic(&error).contains("postgres_parameter:0"));
+        assert_eq!(owner.failure(), Some(Failure::Fatal));
+        assert!(owner.stop.load(Ordering::Acquire));
+        owner.close();
+    }
 
     #[test]
     fn cooperative_attempt_end_during_operator_stop_does_not_invent_storage_failure() {

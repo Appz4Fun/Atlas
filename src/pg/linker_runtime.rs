@@ -90,7 +90,7 @@ fn record_failure(db: &Db, error: &anyhow::Error) {
 
 /// Never render arbitrary causes: driver messages/paths can contain private
 /// values. Keep only typed metadata and closed static invariant labels.
-fn failure_diagnostic(error: &anyhow::Error) -> String {
+pub(crate) fn failure_diagnostic(error: &anyhow::Error) -> String {
     let mut labels = Vec::new();
     for cause in error.chain().take(9) {
         if labels.len() == 8 { labels.push("truncated".into()); break; }
@@ -109,6 +109,21 @@ fn failure_diagnostic(error: &anyhow::Error) -> String {
         else if cause.is::<super::outage::SessionUnavailable>() { "session_unavailable".into() }
         else {
             match cause.to_string().as_str() {
+                "native startup assets" => "startup_assets",
+                "native startup runner" => "startup_runner",
+                "native startup overview repair" => "startup_overview",
+                "native startup inferred repair" => "startup_inferred",
+                "native startup spotnet" => "startup_spotnet",
+                "native startup predb" => "startup_predb",
+                "native startup details" => "startup_details",
+                "native startup media counts" => "startup_media_counts",
+                "native media counts tick" => "media_counts_tick",
+                "native catalog header root changed" => "catalog_header_root_changed",
+                "worker assets require a standard thread" | "native workers must start on a standard thread"
+                    | "native media count requires a standard lane" => "standard_lane_required",
+                "retained manifest file digest mismatch" => "asset_manifest_digest",
+                "retained asset root identity changed" => "asset_root_identity",
+                "native worker panicked" | "native Stage coordinator panicked" => "stage_panicked",
                 "native linker stage" => "stage",
                 "native source disappeared before durable staging completed" => "source_missing",
                 "native source generation changed before staging completed" => "source_generation_changed",
@@ -251,6 +266,24 @@ mod tests {
         let diagnostic = failure_diagnostic(&error);
         assert_eq!(diagnostic, vec!["redacted"; 8].join(" <- ") + " <- truncated");
         assert!(!diagnostic.contains("sentinel"));
+    }
+
+    #[test]
+    fn native_failure_diagnostic_identifies_startup_lane_without_private_values() {
+        for (context, label) in [
+            ("native startup assets", "startup_assets"),
+            ("native startup runner", "startup_runner"),
+            ("native startup overview repair", "startup_overview"),
+            ("native startup inferred repair", "startup_inferred"),
+            ("native startup spotnet", "startup_spotnet"),
+            ("native startup predb", "startup_predb"),
+            ("native startup details", "startup_details"),
+            ("native startup media counts", "startup_media_counts"),
+        ] {
+            let error = anyhow::anyhow!("private-password group-name /private/config").context(context);
+            assert_eq!(failure_diagnostic(&error), format!("{label} <- redacted"));
+            assert_eq!(super::super::outage::classify(&error), super::super::outage::Failure::Fatal);
+        }
     }
 
     fn fatal_during_drain(inner: bool) {
