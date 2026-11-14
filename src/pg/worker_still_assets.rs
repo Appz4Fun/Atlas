@@ -38,7 +38,7 @@ impl StillFrame {
     }
     pub(crate) fn keep(&mut self,bytes:&[u8],width:u32,height:u32)->Result<String> {
         if bytes.is_empty()||bytes.len() as u64>super::super::fresh_assets::STILL_BYTES
-            ||width==0||width>960||height==0 {return Err(StillAdmission.into())}
+            ||width==0||width>960||height==0||height>1920 {return Err(StillAdmission.into())}
         ensure!(crate::images::sniff(bytes).is_some_and(|info|info.format=="jpeg"&&info.width==width&&info.height==height),"native still JPEG dimensions/content mismatch");
         let name=super::super::fresh_assets::hex(&sha2::Sha256::digest(bytes));let owner=self.current()?;
         if self.held.contains(&name){return Ok(name)}

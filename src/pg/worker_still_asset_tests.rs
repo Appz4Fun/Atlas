@@ -98,7 +98,7 @@ fn native_still_admission_and_symlink_refusals_leave_prior_stills_untouched() {
     let schema=pg::testing::Schema::new().expect("explicit isolated PG");let (runtime,home,selection,id)=setup(&schema);let grant=Grant::open(&runtime.owner,Some(&selection)).unwrap().unwrap();
     let (prior,stills)=generated(&grant,id);let (queue,claim,prepared)=prepare(&runtime,id,prior,&stills);
     assert_eq!(prepared.settle(&queue,&claim,11).unwrap(),pg::stage_queue::Settlement::Applied);
-    let mut frame=grant.still_frame(id).unwrap();assert!(frame.keep(&jpeg(20),961,16).is_err());for n in 0..3 {frame.keep(&jpeg(40+n),16,16).unwrap();}
+    let mut frame=grant.still_frame(id).unwrap();assert!(frame.keep(&jpeg(20),961,16).is_err());assert!(frame.keep(&jpeg(20),16,1921).is_err());for n in 0..3 {frame.keep(&jpeg(40+n),16,16).unwrap();}
     assert!(frame.keep(&jpeg(99),16,16).is_err(),"a fourth unique image exceeds the producer horizon");drop(frame);
     let held=grant.still_frame(id).unwrap().finish().unwrap();std::fs::rename(home.path().join("assets"),home.path().join("original-assets")).unwrap();
     std::os::unix::fs::symlink(home.path().join("original-assets"),home.path().join("assets")).unwrap();assert!(held.check(&runtime.owner,id).is_err());

@@ -130,7 +130,8 @@ impl Grant {
         let pool=crate::nzb_spool::Pool::new(scratch.path().into(),crate::nzb_spool::Limits {requests:32,per_request_bytes:COVER_BYTES,total_bytes:32*COVER_BYTES,free_bytes:16*1024*1024})?;
         let art_pool=crate::nzb_spool::Pool::new(scratch.path().into(),crate::nzb_spool::Limits {requests:1,per_request_bytes:8<<20,total_bytes:8<<20,free_bytes:16<<20})?;
         // One raw batch spool per live outcome avoids a descriptor per picture.
-        // These are disk limits; per-picture Rust buffers remain <=64MiB.
+        // These are disk limits. ImagesStep buffers remain <=64MiB; still
+        // holds stream bounded JPEGs into the same admitted batch pool.
         let image_pool=crate::nzb_spool::Pool::new(scratch.path().into(),crate::nzb_spool::Limits {requests:128,per_request_bytes:8<<30,total_bytes:16<<30,free_bytes:16<<20})?;
         Ok(Some(Arc::new(Self {owner:Arc::downgrade(owner),epoch:*epoch.id(),catalog:*epoch.catalog().nonce(),manifest,source,pool,art_pool,image_pool,image_writes:std::sync::atomic::AtomicU64::new(0),still_writes:std::sync::atomic::AtomicU64::new(0),_scratch:scratch})))
     }
