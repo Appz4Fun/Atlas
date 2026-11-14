@@ -335,25 +335,54 @@ fn run_still_donor_case(complete: bool) {
     std::fs::write(home.join("finished"),b"done").unwrap();
 }
 
+#[cfg(unix)]
 #[test]
 #[ignore="requires isolated PG; genuine native StillsStep then ImagesStep with default unselected assets"]
 fn native_stills_without_assets_finish_ineligible_releases_before_real_images_step() {
-    for case in ["no-probe","unsupported-codec","no-video"] {run_optional_stills_case(case,false);}
+    optional_stills_children("postprocess::native::asset_tests::native_stills_without_assets_finish_ineligible_releases_before_real_images_step",&["no-probe","unsupported-codec","no-video"]);
 }
+#[cfg(unix)]
 #[test]
 #[ignore="requires isolated PG; eligible still production must retain the unselected-asset retry"]
 fn native_stills_without_assets_defer_eligible_video_before_later_images_step() {
-    run_optional_stills_case("eligible",true);
+    optional_stills_children("postprocess::native::asset_tests::native_stills_without_assets_defer_eligible_video_before_later_images_step",&["eligible"]);
 }
+#[cfg(unix)]
+fn optional_stills_children(selector:&str,cases:&[&str]) {
+    const CHILD:&str="ATLAS_OPTIONAL_STILLS_CHILD";
+    if let Ok(case)=std::env::var(CHILD) {
+        assert!(cases.contains(&case.as_str()),"the selected child must match this closed fixture");
+        run_optional_stills_case(&case,case=="eligible");std::fs::write(crate::paths::app_dir().join("finished"),b"done").unwrap();return;
+    }
+    use std::{fs::OpenOptions,io::Write,os::unix::fs::{OpenOptionsExt,DirBuilderExt},process::{Command,Stdio},time::Instant};
+    for &case in cases {
+        let schema=crate::pg::testing::Schema::new().expect("explicit isolated PostgreSQL");let home=tempfile::tempdir().unwrap();
+        std::fs::DirBuilder::new().mode(0o700).create(home.path().join("tmp")).unwrap();
+        let config=serde_json::json!({"storage":{"backend":"postgres","url":&schema.url,"schema":&schema.name,"max_connections":1,"allow_plaintext":true},"header_store":{"enabled":true,"dir":home.path().join("headers")}});
+        let mut file=OpenOptions::new().create_new(true).write(true).mode(0o600).open(home.path().join("config.json")).unwrap();file.write_all(serde_json::to_vec(&config).unwrap().as_slice()).unwrap();drop(file);
+        let log=OpenOptions::new().create_new(true).write(true).mode(0o600).open(home.path().join("child.log")).unwrap();
+        let mut child=Command::new(std::env::current_exe().unwrap()).args(["--ignored","--exact",selector,"--nocapture"])
+            .env_clear().env(CHILD,case).env("ATLAS_HOME",home.path()).env("HOME",home.path()).env("TMPDIR",home.path().join("tmp"))
+            .env("ATLAS_NO_KEYRING","1").env("ATLAS_SAB_DIR",home.path().join("absent-sab")).stdin(Stdio::null())
+            .stdout(Stdio::from(log.try_clone().unwrap())).stderr(Stdio::from(log)).spawn().unwrap();
+        let until=Instant::now()+Duration::from_secs(30);
+        let status=loop {if let Some(status)=child.try_wait().unwrap(){break status;}if Instant::now()>=until {
+            child.kill().unwrap();child.wait().unwrap();let retained=home.keep();panic!("owned optional-still {case} child deadline; private log {}",retained.join("child.log").display());
+        }std::thread::sleep(Duration::from_millis(20));};
+        if !status.success() {let retained=home.keep();panic!("owned optional-still {case} child failed; private log {}",retained.join("child.log").display());}
+        assert_eq!(std::fs::read(home.path().join("finished")).unwrap(),b"done");assert!(!home.path().join("atlas.db").exists()&&!home.path().join("atlas.raw.db").exists());
+    }
+}
+#[cfg(unix)]
 fn run_optional_stills_case(case:&str,eligible:bool) {
     use crate::{parser::{Article,Release},pg,probe::{ProbeInfo,MediaInfo,media::VideoTrack}};
     use crate::postprocess::rules::{Rules,RowFacts,BodyGate};
-    let schema=pg::testing::Schema::new().expect("explicit isolated PostgreSQL");let home=tempfile::tempdir().unwrap();
+    let storage=crate::config::checked_storage_config().unwrap();let headers=crate::config::header_store_config();
+    assert_eq!(storage.max_connections,1,"Runtime and service cache use the same genuinely selected storage");
     let mut config=crate::config::Config::default();assert!(config.native_assets.is_none(),"exercise the actual default optional asset selection");
     config.postprocess.enabled=false;config.predb.enabled=false;config.spots.enabled=false;config.inferred_parts=false;
     config.media.tvmaze.enabled=false;config.media.allocine.enabled=false;config.media.details_per_minute=0;
-    let headers=crate::config::HeaderStoreConfig {enabled:true,dir:home.path().join("headers").to_str().unwrap().into()};
-    let runtime=pg::indexer_runtime::Runtime::open(&config,pg::StorageConfig {backend:pg::Backend::Postgres,url:schema.url.clone(),schema:schema.name.clone(),max_connections:1,allow_plaintext:true},headers,&[],&mut None).unwrap();
+    let runtime=pg::indexer_runtime::Runtime::open(&config,storage,headers,&[],&mut None).unwrap();
     let id=runtime.owner.with(|client| {
         pg::release_writer::save(client,&[Release {name:format!("Optional.Stills.{case}"),group:"alt.binaries.test".into(),poster:"fixture".into(),date:"Wed, 01 Jan 2020 00:00:00 +0000".into(),
             articles:vec![Article {filename:Some("video.mkv".into()),subject:"video.mkv yEnc (1/1)".into(),message_id:format!("<optional-stills-{case}@fixture.invalid>"),part:Some(1),total_parts:Some(1),bytes:100,..Default::default()}],..Default::default()}],-100000)?;
