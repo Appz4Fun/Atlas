@@ -889,7 +889,7 @@ pub fn complete(db: &dyn Sql, group: &str, servers: &[String]) -> Result<bool> {
 
 /// groups with chunks still to do
 pub fn split_groups(db: &dyn Sql) -> Result<Vec<String>> {
-    db.column("select distinct grp from backfill_chunks where state != 2 order by grp", vals![])
+    db.column("select grp from native_metric_chunk_groups where total > done order by grp", vals![])
 }
 
 #[cfg(test)]
@@ -1345,6 +1345,43 @@ mod tests {
             };
             assert_eq!(row(c), (DONE, Some("b".to_string()), Some(done_at)));
         });
+    }
+
+    #[test]
+    #[ignore="requires explicit isolated PostgreSQL and actual chunk-summary triggers"]
+    fn split_groups_summary_matches_pending_rows_across_all_trigger_changes() {
+        let schema=crate::pg::testing::Schema::new().expect("explicit isolated PostgreSQL");
+        let client=schema.pool.get().unwrap();let db=crate::pg::sql::Pg::new(client);
+        let check=|db:&dyn Sql,want:&[&str]| {
+            let original:Vec<String>=db.column("select distinct grp from backfill_chunks where state != 2 order by grp",vals![]).unwrap();
+            assert_eq!(split_groups(db).unwrap(),original,"summary must match the original row predicate");
+            assert_eq!(original,want.iter().map(|group|group.to_string()).collect::<Vec<_>>());
+        };
+        check(&db,&[]);
+        // Claimed and resting rows still count as unfinished; the old predicate
+        // also includes any non-DONE state, rather than only PENDING/CLAIMED.
+        db.execute("insert into backfill_chunks(grp,day,state,claimed_at,failed_at) values
+            ('a-done',1,2,null,null),('b-pending',1,0,null,100),('b-pending',2,1,100,null),
+            ('c-done',1,2,null,null),('d-other',1,3,null,null)",vals![]).unwrap();
+        check(&db,&["b-pending","d-other"]);
+        db.execute("update backfill_chunks set state=2 where grp='b-pending'",vals![]).unwrap();
+        check(&db,&["d-other"]);
+        db.execute("update backfill_chunks set state=0 where grp='c-done'",vals![]).unwrap();
+        check(&db,&["c-done","d-other"]);
+        db.execute("update backfill_chunks set grp='e-moved',state=2 where grp='d-other'",vals![]).unwrap();
+        check(&db,&["c-done"]);
+        let rollback:Result<()>=db.tx(|tx| {
+            tx.execute("update backfill_chunks set state=0 where grp='a-done'",vals![])?;
+            check(tx,&["a-done","c-done"]);
+            Err(crate::pg::sql::Error::Value("intentional fixture rollback".into()))
+        });
+        assert!(rollback.is_err());check(&db,&["c-done"]);
+        db.execute("delete from backfill_chunks where grp='c-done'",vals![]).unwrap();
+        check(&db,&[]);
+        db.execute("update backfill_chunks set state=0",vals![]).unwrap();
+        check(&db,&["a-done","b-pending","e-moved"]);
+        db.execute("truncate backfill_chunks",vals![]).unwrap();
+        check(&db,&[]);
     }
 
     #[test]
