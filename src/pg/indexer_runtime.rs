@@ -203,7 +203,7 @@ impl Owner {
         self.with_class(0, work)
     }
 
-    /// Only the three indexer scheduler-selection callbacks use this class.
+    /// Indexer claims and closed scheduler read selectors use this class.
     /// It remains ordinary work, alternating with service/control callbacks.
     #[track_caller]
     pub(crate) fn with_selection<T>(&self, work: impl FnOnce(&mut postgres::Client) -> Result<T>) -> Result<T> {
