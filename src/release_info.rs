@@ -636,8 +636,9 @@ mod tests {
 
     #[test]
     fn recovery_volumes_are_told_from_the_index() {
-        assert!(is_par2("A.PAR2") && !is_recovery_volume("a.par2"));
-        assert!(is_recovery_volume("a.vol000+01.par2"));
+        use crate::parity::is_base_par2;
+        assert!(is_par2("A.PAR2") && is_base_par2("a.par2"));
+        assert!(!is_base_par2("a.vol000+01.par2"));
         assert!(!is_par2("a.rar"));
     }
 
