@@ -3,7 +3,7 @@
 use super::outage::{AttemptEnded, Failure, SessionUnavailable, classify};
 use anyhow::{Context, Result, ensure};
 use std::sync::{
-    Arc, Mutex,
+    Arc, Condvar, Mutex,
     atomic::{AtomicBool, AtomicU8, Ordering},
 };
 
@@ -57,12 +57,76 @@ pub(crate) struct Runtime {
 /// A lost session cannot continue writing through a different pooled client.
 pub(crate) struct Owner {
     client: Mutex<Option<postgres::Client>>,
+    admission: Admission,
     pub(crate) stop: Arc<AtomicBool>,
     accepting: AtomicBool,
     failure: AtomicU8,
     busy_since: Mutex<Option<std::time::Instant>>,
     cache_destination: Option<CacheDestination>,
     epoch: Option<super::stage::OwnerEpoch>,
+}
+
+/// Two FIFO classes, alternating whenever both have waiters. A queued save or
+/// progress checkpoint need not wait behind every frontier selection. Ordinary
+/// callbacks (including lease/heartbeat work) retain a turn between ingestion
+/// callbacks. This bounds callback ordering, never the duration of running SQL.
+#[derive(Default)]
+struct Admission {
+    state: Mutex<AdmissionState>,
+    changed: Condvar,
+}
+#[derive(Default)]
+struct AdmissionState {
+    waiting: [std::collections::VecDeque<Arc<()>>; 2],
+    active: bool,
+    next: usize,
+}
+struct OwnerTurn<'a> {
+    admission: &'a Admission,
+    id: Arc<()>,
+    class: usize,
+    active: bool,
+}
+impl Admission {
+    fn enter(&self, class: usize, stop: &AtomicBool, accepting: &AtomicBool) -> Result<OwnerTurn<'_>> {
+        let mut turn = OwnerTurn { admission: self, id: Arc::new(()), class, active: false };
+        let mut state = self.state.lock().map_err(|_| anyhow::anyhow!("native owner admission is poisoned"))?;
+        state.waiting[class].push_back(turn.id.clone());
+        loop {
+            if stop.load(Ordering::Acquire) || !accepting.load(Ordering::Acquire) {
+                // Drop the state lock BEFORE the queued turn removes itself.
+                drop(state);
+                return Err(AttemptEnded.into());
+            }
+            let chosen = if state.waiting[state.next].is_empty() { 1 - state.next } else { state.next };
+            if !state.active && chosen == class
+                && state.waiting[class].front().is_some_and(|id| Arc::ptr_eq(id, &turn.id)) {
+                state.waiting[class].pop_front();
+                state.active = true;
+                state.next = 1 - class;
+                turn.active = true;
+                drop(state);
+                return Ok(turn);
+            }
+            // Existing operator-stop sites write the shared atomic directly.
+            // Timed wake observes them even when the active PG call is stuck;
+            // fail/close also notify immediately. This is not a SQL timeout.
+            state = self.changed.wait_timeout(state, std::time::Duration::from_millis(25))
+                .map_err(|_| anyhow::anyhow!("native owner admission is poisoned"))?.0;
+        }
+    }
+}
+impl Drop for OwnerTurn<'_> {
+    fn drop(&mut self) {
+        let mut state = self.admission.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.active {
+            state.active = false;
+        } else if let Some(at) = state.waiting[self.class].iter().position(|id| Arc::ptr_eq(id, &self.id)) {
+            state.waiting[self.class].remove(at);
+        }
+        drop(state);
+        self.admission.changed.notify_all();
+    }
 }
 
 /// Only public source-relative components may appear in an operational log.
@@ -96,6 +160,7 @@ impl Owner {
     pub(crate) fn new(client: postgres::Client) -> Self {
         Self {
             client: Mutex::new(Some(client)),
+            admission: Admission::default(),
             stop: Arc::new(AtomicBool::new(false)),
             accepting: AtomicBool::new(true),
             failure: AtomicU8::new(0),
@@ -121,6 +186,24 @@ impl Owner {
 
     #[track_caller]
     pub(crate) fn with<T>(&self, work: impl FnOnce(&mut postgres::Client) -> Result<T>) -> Result<T> {
+        self.with_class(1, work)
+    }
+
+    /// Only ingestion commits and their durable progress callbacks use this
+    /// class. Authority/epoch checks remain identical to every other callback.
+    #[track_caller]
+    pub(crate) fn with_ingest<T>(&self, work: impl FnOnce(&mut postgres::Client) -> Result<T>) -> Result<T> {
+        self.with_class(0, work)
+    }
+
+    #[track_caller]
+    fn with_class<T>(&self, class: usize, work: impl FnOnce(&mut postgres::Client) -> Result<T>) -> Result<T> {
+        let _turn = self.admission.enter(class, &self.stop, &self.accepting).map_err(|error| {
+            if !super::outage::is_attempt_ended(&error) { self.fail(Failure::Fatal); }
+            error
+        })?;
+        // Declared after the turn: the original Client guard always drops
+        // first, including unwinding. No next callback can bypass its drain.
         let mut held = self.client.lock().map_err(|_| {
             self.fail(Failure::Fatal);
             anyhow::anyhow!("native owner connection is poisoned")
@@ -154,6 +237,7 @@ impl Owner {
     pub(crate) fn fail(&self, failure: Failure) {
         self.failure.fetch_max(if failure == Failure::Fatal { 2 } else { 1 }, Ordering::AcqRel);
         self.stop.store(true, Ordering::Release);
+        self.admission.changed.notify_all();
     }
 
     pub(crate) fn failure(&self) -> Option<Failure> {
@@ -179,6 +263,7 @@ impl Owner {
     pub(crate) fn close(&self) {
         self.accepting.store(false, Ordering::Release);
         self.stop.store(true, Ordering::Release);
+        self.admission.changed.notify_all();
         let mut held = self.client.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         drop(held.take());
     }
