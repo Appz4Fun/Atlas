@@ -1107,14 +1107,12 @@ mod tests {
             while !body.len().is_multiple_of(4) {
                 body.push(0);
             }
-            let mut pkt = Vec::new();
-            pkt.extend_from_slice(b"PAR2\0PKT");
-            pkt.extend_from_slice(&((64 + body.len()) as u64).to_le_bytes());
-            pkt.extend_from_slice(&[0u8; 16]);
-            pkt.extend_from_slice(&[0x77; 16]);
-            pkt.extend_from_slice(b"PAR 2.0\0FileDesc");
-            pkt.extend_from_slice(&body);
-            pkt
+            // Match the SDK metadata-verification contract, including the packet MD5.
+            par_rs::packet::encode_packet(
+                &par_rs::packet::SetId([0x77; 16]),
+                b"PAR 2.0\0FileDesc",
+                &body,
+            )
         };
 
         // Two RAR5 volumes of equal size (50_000) that share the exact same 16 KiB prefix
@@ -1159,6 +1157,7 @@ mod tests {
             ArticleHead { file_index: 0, payload: shared_head.clone() },
             ArticleHead { file_index: 1, payload: shared_head },
         ];
+        assert_eq!(crate::par2::inventory(&par2_non_rar).files.len(), 2, "valid FileDesc inputs reach prefix matching");
         let res = Par2Bridge::resolve(&par2_non_rar, &mut runs, &heads);
         assert_eq!(res.resolved_count, 0, "ambiguous 16 KiB prefix without disambiguator must stay unresolved");
         assert!(!res.success);
@@ -1179,14 +1178,12 @@ mod tests {
             while !body.len().is_multiple_of(4) {
                 body.push(0);
             }
-            let mut pkt = Vec::new();
-            pkt.extend_from_slice(b"PAR2\0PKT");
-            pkt.extend_from_slice(&((64 + body.len()) as u64).to_le_bytes());
-            pkt.extend_from_slice(&[0u8; 16]);
-            pkt.extend_from_slice(&[0x55; 16]);
-            pkt.extend_from_slice(b"PAR 2.0\0FileDesc");
-            pkt.extend_from_slice(&body);
-            pkt
+            // Match the SDK metadata-verification contract, including the packet MD5.
+            par_rs::packet::encode_packet(
+                &par_rs::packet::SetId([0x55; 16]),
+                b"PAR 2.0\0FileDesc",
+                &body,
+            )
         };
 
         let mut par2 = Vec::new();
@@ -1231,6 +1228,8 @@ mod tests {
             });
         }
 
+        assert_eq!(crate::par2::inventory(&par2).files.len(), 10, "valid FileDesc inputs reach run-index matching");
+        let original_runs = runs.clone();
         // Reverse `heads` so `ArticleHead { file_index: 1 }` precedes `ArticleHead { file_index: 0 }`
         heads.reverse();
 
@@ -1242,6 +1241,17 @@ mod tests {
             assert_eq!(run.full_md5, Some([(idx + 1) as u8; 16]));
             assert!(!run.is_obfuscated);
         }
+
+        // An authenticated packet is required even when the article-head digest matches.
+        let mut damaged = par2.clone();
+        damaged[16] ^= 1;
+        assert_eq!(crate::par2::inventory(&damaged).files.len(), 9);
+        let mut damaged_runs = original_runs;
+        let rejected = Par2Bridge::resolve(&damaged, &mut damaged_runs, &heads);
+        assert_eq!(rejected.resolved_count, 9);
+        assert!(!rejected.success);
+        assert!(damaged_runs[0].full_md5.is_none());
+        assert_eq!(damaged_runs[0].filename, "obf_0001.bin");
     }
 
     #[test]
@@ -1346,14 +1356,12 @@ mod tests {
             while !body.len().is_multiple_of(4) {
                 body.push(0);
             }
-            let mut pkt = Vec::new();
-            pkt.extend_from_slice(b"PAR2\0PKT");
-            pkt.extend_from_slice(&((64 + body.len()) as u64).to_le_bytes());
-            pkt.extend_from_slice(&[0u8; 16]);
-            pkt.extend_from_slice(&[0x99; 16]);
-            pkt.extend_from_slice(b"PAR 2.0\0FileDesc");
-            pkt.extend_from_slice(&body);
-            pkt
+            // Match the SDK metadata-verification contract, including the packet MD5.
+            par_rs::packet::encode_packet(
+                &par_rs::packet::SetId([0x99; 16]),
+                b"PAR 2.0\0FileDesc",
+                &body,
+            )
         };
 
         const EQUAL_SIZE: u64 = 50_000_000;
@@ -1394,6 +1402,7 @@ mod tests {
             payload: foreign_vol1,
         }];
 
+        assert_eq!(crate::par2::inventory(&par2).files.len(), 2, "valid FileDesc inputs reach RAR5 prefix checks");
         let res = Par2Bridge::resolve(&par2, &mut runs, &heads);
         assert_eq!(res.resolved_count, 0, "foreign volume 1 with mismatched 16 KiB prefix must not resolve");
         assert!(runs[0].full_md5.is_none());

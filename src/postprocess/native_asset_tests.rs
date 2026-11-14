@@ -72,13 +72,16 @@ pub(crate) fn run(runtime:&crate::pg::indexer_runtime::Runtime,action:&str) {
     let mut server=crate::config::UsenetServer::new("127.0.0.1","fixture","fixture",listener.local_addr().unwrap().port());server.ssl=Some(false);
     let handle=tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
     let mut config=crate::config::Config::default();config.predb.enabled=false;
+    // The native summary uses zero for a missing/negative last-touch. Use a
+    // genuine settled fixture clock, without relaxing the default rules.
+    let now=config.postprocess.settle_secs.max(config.postprocess.complete_settle_secs)+10;
     if !matches!(action,"worker-asset-unselected"|"worker-asset-wait-unselected") {config.native_assets=Some(selection);}
     let mut runner=Runner::new(&runtime.owner,&config,Arc::new(crate::nntp::Pool::new(&[server]).with_timeout(Duration::from_millis(100))),handle.handle().clone()).unwrap();
     assert!(step.enabled(&config));
     runner.steps=Steps {ordered:vec![step],enabled:bit,database:0,network:bit,on_growth:bit,stamps:vec![(crate::probe::step::PROBE_STEP.0,bit,stamp as i64)]};
-    let queue=Queue::for_owner(&runtime.owner).unwrap();let db=queue.claim(10,1,60).unwrap().pop().unwrap();
-    assert_eq!(runner.database(&db,0,10).unwrap().settle(&queue,&db,11).unwrap(),Settlement::Applied);
-    let claim=queue.claim_net(12,1,60,0).unwrap().pop().unwrap();assert_eq!(claim.release_id(),id);
+    let queue=Queue::for_owner(&runtime.owner).unwrap();let db=queue.claim(now,1,60).unwrap().pop().unwrap();
+    assert_eq!(runner.database(&db,0,now).unwrap().settle(&queue,&db,now+1).unwrap(),Settlement::Applied);
+    let claim=queue.claim_net(now+2,1,60,0).unwrap().pop().unwrap();assert_eq!(claim.release_id(),id);
     let storage=crate::config::checked_storage_config().unwrap();
     let mut observer=postgres::Client::connect(&storage.url,postgres::NoTls).unwrap();observer.batch_execute(&format!("set search_path to \"{}\"",storage.schema)).unwrap();
     if matches!(action,"worker-asset-missing"|"worker-asset-wait-missing") {std::fs::remove_file(&file).unwrap();}
@@ -86,11 +89,11 @@ pub(crate) fn run(runtime:&crate::pg::indexer_runtime::Runtime,action:&str) {
     if action=="worker-asset-drain" {
         let (ready_tx,ready_rx)=mpsc::channel();let (release_tx,release_rx)=mpsc::channel();
         let owner=runtime.owner.clone();let worker:Worker=std::thread::spawn(move|| {
-            let prepared=runner.network(&queue,&claim,12)?.expect("genuine cached NET visit");
+            let prepared=runner.network(&queue,&claim,now+2)?.expect("genuine cached NET visit");
             assert_eq!(prepared.holds.len(),1);assert!(prepared.holds[0].is::<crate::pg::worker_assets::CoverHold>());
             assert_eq!(runner.stats.bodies.load(Ordering::Relaxed),0);
             ready_tx.send(()).unwrap();release_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-            let error=prepared.settle(&queue,&claim,13).unwrap_err();assert!(crate::pg::outage::is_attempt_ended(&error));
+            let error=prepared.settle(&queue,&claim,now+3).unwrap_err();assert!(crate::pg::outage::is_attempt_ended(&error));
             assert_eq!(owner.failure(),None);Ok(Some(claim))
         });
         ready_rx.recv_timeout(Duration::from_secs(3)).unwrap();
@@ -103,7 +106,7 @@ pub(crate) fn run(runtime:&crate::pg::indexer_runtime::Runtime,action:&str) {
         let joined=done_rx.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();assert!(joined.for_owner(&runtime.owner));finish.join().unwrap();
         assert_eq!(runtime.owner.failure(),None);runtime.owner.close();
     } else {
-        let result=runner.network(&queue,&claim,12);
+        let result=runner.network(&queue,&claim,now+2);
         assert_eq!(runner.stats.bodies.load(Ordering::Relaxed),0);
         if action=="worker-asset-corrupt" {
             assert!(result.is_err(),"a corrupt physical asset must preserve its error");
@@ -112,10 +115,10 @@ pub(crate) fn run(runtime:&crate::pg::indexer_runtime::Runtime,action:&str) {
             let prepared=result.unwrap().expect("actual cached-probe visit");
             if matches!(action,"worker-asset-wait-unselected"|"worker-asset-wait-missing") {
                 assert!(prepared.holds.is_empty());
-                assert_eq!(prepared.settle(&queue,&claim,13).unwrap(),Settlement::Applied);
+                assert_eq!(prepared.settle(&queue,&claim,now+3).unwrap(),Settlement::Applied);
                 let row=observer.query_one("select done,net_wanted,net_left,net_attempts,net_transient,net_next_at from pp_state where release_id=$1",&[&id]).unwrap();
                 assert_eq!(row.get::<_,i64>(0)&bit,0);assert_eq!(row.get::<_,Option<bool>>(1),Some(true));assert_eq!(row.get::<_,Option<i64>>(2),Some(bit));
-                assert_eq!(row.get::<_,i64>(3),0);assert_eq!(row.get::<_,i64>(4),1);assert!(row.get::<_,i64>(5)>13);
+                assert_eq!(row.get::<_,i64>(3),0);assert_eq!(row.get::<_,i64>(4),1);assert!(row.get::<_,i64>(5)>now+3);
                 assert_eq!(runtime.owner.failure(),None);
             } else if matches!(action,"worker-asset-unselected"|"worker-asset-missing") {
                 assert!(prepared.holds.is_empty());
@@ -123,12 +126,12 @@ pub(crate) fn run(runtime:&crate::pg::indexer_runtime::Runtime,action:&str) {
             } else {
                 assert_eq!(prepared.holds.len(),1);assert!(prepared.holds[0].is::<crate::pg::worker_assets::CoverHold>());
                 if action=="worker-asset-stale" {
-                    runtime.owner.with(|client|{let mut tx=client.transaction()?;crate::pg::stage_queue::rerun_in(&mut tx,id,bit,13)?;tx.commit()?;Ok(())}).unwrap();
-                    assert_eq!(prepared.settle(&queue,&claim,14).unwrap(),Settlement::Superseded);assert_eq!(runtime.owner.failure(),None);
+                    runtime.owner.with(|client|{let mut tx=client.transaction()?;crate::pg::stage_queue::rerun_in(&mut tx,id,bit,now+3)?;tx.commit()?;Ok(())}).unwrap();
+                    assert_eq!(prepared.settle(&queue,&claim,now+4).unwrap(),Settlement::Superseded);assert_eq!(runtime.owner.failure(),None);
                 } else {
                     assert_eq!(action,"worker-asset-reuse");
                     std::fs::write(&file,vec![0;bytes.len()]).unwrap();
-                    assert_eq!(prepared.settle(&queue,&claim,13).unwrap(),Settlement::Applied);
+                    assert_eq!(prepared.settle(&queue,&claim,now+3).unwrap(),Settlement::Applied);
                     let row=observer.query_one("select done,net_attempts from pp_state where release_id=$1",&[&id]).unwrap();
                     assert_eq!(row.get::<_,i64>(0)&bit,bit);assert_eq!(row.get::<_,i64>(1),0);
                     assert_eq!(observer.query_one("select mime,sha256 from release_cover where release_id=$1",&[&id]).unwrap().get::<_,String>(1),sha);

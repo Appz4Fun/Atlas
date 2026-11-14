@@ -352,10 +352,15 @@ fn configured_cache_supports_the_standard_stage_thread_and_rejects_entered_tokio
 
 #[test]
 fn configured_postgres_pin_rejects_missing_malformed_or_changed_configuration() {
-    let Some(mut schema) = Schema::new() else { return };
-    schema.seed();
     for action in ["config-removed", "config-malformed", "config-sqlite"] {
+        // Each child owns a fresh private home/header root. Reusing a catalog
+        // from another home would correctly fail its root guard before this
+        // test reaches the selected-configuration mutation it is exercising.
+        let Some(mut schema) = Schema::new() else { return };
+        schema.seed();
+        let kept = schema.rows();
         child(&schema.url, &schema.name, action);
+        assert_eq!(schema.rows(), kept, "rejected configuration changed retained cache facts");
     }
 }
 

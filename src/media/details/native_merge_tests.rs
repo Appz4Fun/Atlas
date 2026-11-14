@@ -9,7 +9,7 @@ fn identity()->Ids {Ids {tmdb:Some(42),imdb:Some(1234567),tvdb:Some(7),..Default
 #[test]
 fn a_failed_omdb_refresh_keeps_only_its_valid_old_scores_and_retries_in_an_hour() {
     let kept=old();let now=10_000_000;
-    let mut details=from_tmdb(1,42,&json!({"title":"Fresh title","vote_average":8.2,"vote_count":12}),now);
+    let mut details=from_tmdb(Kind::Tv as i64,42,&json!({"name":"Fresh title","vote_average":8.2,"vote_count":12}),now);
     let omdb=rating_reply(&mut details,Err(Trouble::Paused(now+60)),now,add_omdb).unwrap();
     assert!(omdb);details.trakt_score=Some(86);
     let merged=preserve_failed_scores(Refreshed {details,failed:RatingFailures {omdb,trakt:false}},Some(&kept));
@@ -21,7 +21,7 @@ fn a_failed_omdb_refresh_keeps_only_its_valid_old_scores_and_retries_in_an_hour(
 
 #[test]
 fn a_failed_trakt_refresh_keeps_trakt_without_overwriting_new_omdb_or_metadata() {
-    let kept=old();let now=10_000_000;let mut details=from_tmdb(1,42,&json!({"title":"New"}),now);
+    let kept=old();let now=10_000_000;let mut details=from_tmdb(Kind::Tv as i64,42,&json!({"name":"New"}),now);
     let omdb=rating_reply(&mut details,Ok(Reply::Json(json!({"Ratings":[
         {"Source":"Internet Movie Database","Value":"8.8/10"}, {"Source":"Rotten Tomatoes","Value":"95%"}]}))),now,add_omdb).unwrap();
     let trakt=rating_reply(&mut details,Err(Trouble::Bad("provider response unavailable".into())),now,|d,v|d.trakt_score=trakt_score(v)).unwrap();
