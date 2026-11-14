@@ -114,7 +114,7 @@ fn archive_statement_timeout_restores_original_heaps_and_names() {
 #[test]
 #[ignore="explicit isolated PG; configured child proves actual normal PP worker settlement after archival"]
 fn archived_scope_admits_the_normal_owned_pp_worker_without_provider_or_api_fallback() {
-    std::env::var("ATLAS_PG_TEST_URL").expect("explicit isolated ATLAS_PG_TEST_URL required");
+    assert!(!std::env::var("ATLAS_PG_TEST_URL").expect("explicit isolated ATLAS_PG_TEST_URL required").is_empty(),"explicit isolated ATLAS_PG_TEST_URL must not be empty");
     crate::raw_store::native_pg_opensubtitles_cache_tests::native_worker_parent(
         crate::raw_store::native_pg_opensubtitles_cache_tests::WorkerCase::ArchiveCategory);
 }
