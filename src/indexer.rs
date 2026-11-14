@@ -13,6 +13,8 @@ use crate::nntp::{BlockingPool, Extract, Overview, Pool, Retention, first_names,
 use crate::par2;
 use crate::parser::{Release, is_complete};
 
+mod scheduler_reads;
+
 /// What one finished XOVER slice added, reported as it lands.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Progress {
@@ -690,8 +692,8 @@ async fn on_selection_db<T: Send + 'static>(
     }).await.map_err(|error| anyhow!("selection database task failed: {error}"))?
 }
 
-/// Only committed header progress uses ingestion admission. Claim selection,
-/// frontier scans and all other callbacks keep ordinary FIFO admission.
+/// Only committed header progress uses ingestion admission. Scheduler claims
+/// and fixed scheduler reads use selection; other callbacks keep service FIFO.
 pub(crate) async fn on_ingest_progress<T: Send + 'static>(
     db: &Db,
     work: impl FnOnce(&dyn Sql) -> Result<T> + Send + 'static,
@@ -1053,7 +1055,7 @@ where
     let mut phase = ctx.states.with(group, |st| st.phase);
     let split = settings.mode != "live" && settings.mode != "backfill" && {
         let g = group.to_string();
-        on_db(db, move |conn| Ok(crate::chunks::is_split(conn, &g)?)).await?
+        scheduler_reads::is_split(db, g).await?
     };
     if phase == Phase::Backfill {
         let deferred = ctx.states.with(group, |st| st.backfill_deferred);
@@ -1178,7 +1180,7 @@ fn live_first(mode: &str, phase: Phase, split: bool, behind: i64, slice: u64, _d
 /// (idle workers take those anyway), their retention wont wait for them.
 async fn sweep_due(ctx: &PassContext, db: &Db, group: &str, host: &str) -> Result<bool> {
     let wanted = [(group.to_string(), ctx.states.keeps_from(group, host))];
-    on_db(db, move |conn| Ok(!crate::chunks::waiting(conn, &wanted)?)).await
+    scheduler_reads::sweep_due(db, wanted).await
 }
 
 /// how long a big group that couldnt be split waits before it is probed again
@@ -1198,7 +1200,7 @@ async fn maybe_split(
     cursor: u64,
 ) -> Result<bool> {
     let g = group.to_string();
-    if on_db(db, move |conn| Ok(crate::chunks::is_split(conn, &g)?)).await? {
+    if scheduler_reads::is_split(db, g).await? {
         // a server that goes back further (one added, or keeping more now)
         // is looked for every SPLIT_RECHECK: normal backfill never gets to
         // the days older than the split's
@@ -1247,7 +1249,7 @@ async fn maybe_split(
 /// split was made, and home's retention moves past it.
 async fn reach_back(ctx: &PassContext, db: &Db, group: &str, home: usize, bounds: (u64, u64)) -> Result<()> {
     let g = group.to_string();
-    let Some(newest_day) = on_db(db, move |conn| Ok(crate::chunks::newest_day(conn, &g)?)).await? else {
+    let Some(newest_day) = scheduler_reads::newest_day(db, g).await? else {
         return Ok(());
     };
     let Some(Split { oldest_day, oldest_at, .. }) =
@@ -1795,7 +1797,7 @@ where
         },
         Some(t) if crate::chunks::unix_day(t) == day => {
             let g = group.to_string();
-            let split_oldest = match on_db(db, move |conn| Ok(crate::chunks::oldest_day(conn, &g)?)).await {
+            let split_oldest = match scheduler_reads::oldest_day(db, g).await {
                 Ok(d) => d,
                 Err(e) => return failed(e).await,
             };
@@ -1993,7 +1995,7 @@ async fn goes_back_furthest(
     let servers = ctx.pool.indexing_servers();
     let g = group.to_string();
     let known =
-        on_db(db, move |conn| Ok((crate::chunks::deepest(conn, &g)?, crate::chunks::runner_up(conn, &g)?))).await?;
+        scheduler_reads::deepest_and_runner_up(db, g).await?;
     if let (Some(deepest), runner_up) = known
         && servers.iter().any(|&i| ctx.pool.host(i) == deepest)
     {
@@ -3300,3 +3302,7 @@ mod native_multi_server_contract;
 #[cfg(test)]
 #[path = "../tests/common/native_blocked_contract.rs"]
 mod native_blocked_contract;
+
+#[cfg(test)]
+#[path = "indexer/scheduler_read_selection_tests.rs"]
+mod scheduler_read_selection_tests;
