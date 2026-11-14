@@ -11,6 +11,8 @@ pub(crate) struct Download {pub body:Spool,pub disposition:Option<crate::nzb_htt
 #[derive(Clone,Copy)]
 pub(crate) enum Pick<'a>{Whole,Ordinal(u64),Name(&'a str)}
 
+const INLINE_MESSAGE_BYTES:usize=8192;
+
 pub(super) struct Message<'a,'c> {view:&'a ReadView<'c>,release:i64,key:[u8;32],at:i64,end:i64,buffer:Vec<u8>,used:usize}
 impl<'a,'c> Message<'a,'c> {
     fn chunk(view:&ReadView<'_>,release:i64,key:&[u8;32],at:i64,n:i32)->Result<Vec<u8>> {
@@ -50,7 +52,18 @@ fn number(input:&mut impl Read)->Result<i64>{let mut bytes=[0;8];input.read_exac
 fn put(output:&mut impl Write,n:i64)->Result<()>{output.write_all(&n.to_le_bytes())?;Ok(())}
 fn segment(input:&mut impl Read)->Result<([u8;32],Option<i64>,i64,i64)>{
     let mut key=[0;32];input.read_exact(&mut key)?;let tag=number(input)?;let part=number(input)?;
-    ensure!(tag==0||tag==1,"invalid native segment optional tag");Ok((key,(tag==1).then_some(part),number(input)?,number(input)?))
+    ensure!(tag==0||tag==1,"invalid native segment optional tag");let bytes=number(input)?;let length=number(input)?;
+    ensure!(length>=0,"negative native article extent");Ok((key,(tag==1).then_some(part),bytes,length))
+}
+fn inline_message<'a>(input:&mut impl Read,length:i64,buffer:&'a mut [u8;INLINE_MESSAGE_BYTES])->Result<Option<&'a [u8]>> {
+    ensure!(length>=0,"negative native article extent");
+    if length>INLINE_MESSAGE_BYTES as i64 {return Ok(None);}
+    let bytes=&mut buffer[..length as usize];input.read_exact(bytes)?;Ok(Some(bytes))
+}
+fn trimmed_message(bytes:&[u8])->&[u8] {
+    let start=bytes.iter().position(|b|*b!=b'<'&&*b!=b'>').unwrap_or(bytes.len());
+    let end=bytes.iter().rposition(|b|*b!=b'<'&&*b!=b'>').map_or(start,|at|at+1);
+    &bytes[start..end]
 }
 #[derive(Clone,Copy)]
 struct SparseHeader {key:[u8;32],subject_bytes:i64,poster_bytes:i64,timestamp:i64}
@@ -161,23 +174,36 @@ impl ReadView<'_> {
             self.before_query()?;let mut tx=self.tx.borrow_mut();
             let params:[&(dyn postgres::types::ToSql+Sync);3]=[&id,&file,&singleton];
             let mut rows=tx.query_raw("select substring(message_key from 1 for 33),octet_length(message_key)::bigint,
-                part,bytes,octet_length(message_id)::bigint from segments where release_id=$1 and file_id=$2
+                part,bytes,octet_length(message_id)::bigint,
+                case when octet_length(message_id)<=8192 then message_id else null::bytea end
+                from segments where release_id=$1 and file_id=$2
                 and($3::bytea is null or message_key=$3) order by part nulls first,message_id",params)?;
             let mut seen=0i64;
             while let Some(row)=rows.next()? {
                 self.check_deadline()?;let key:Vec<u8>=row.try_get(0)?;
                 ensure!(row.try_get::<_,i64>(1)?==32&&key.len()==32,"invalid native message key extent");
-                plan.write_all(&key)?;let part:Option<i64>=row.try_get(2)?;
-                for value in [i64::from(part.is_some()),part.unwrap_or(0),row.try_get(3)?,row.try_get(4)?]{put(&mut plan,value)?;}
+                plan.write_all(&key)?;let part:Option<i64>=row.try_get(2)?;let length:i64=row.try_get(4)?;
+                ensure!(length>=0,"negative native article extent");
+                let inline:Option<&[u8]>=row.try_get(5)?;
+                ensure!(inline.is_some()==(length<=INLINE_MESSAGE_BYTES as i64)
+                    && inline.is_none_or(|bytes|bytes.len() as i64==length),"native inline article extent changed");
+                for value in [i64::from(part.is_some()),part.unwrap_or(0),row.try_get(3)?,length]{put(&mut plan,value)?;}
+                // Only a bounded row payload is copied to disk. Large IDs keep
+                // their range-reader identity; no file's IDs accumulate in RAM.
+                if let Some(inline)=inline {plan.write_all(inline)?;}
                 seen=seen.checked_add(1).context("native article count overflow")?;
             }
             ensure!(seen==count,"native article inventory changed within snapshot");
         }
         drop(files);let mut plan=plan.finish()?;
         let mut xml=XmlWriter::new(pool.open()?,group.as_bytes())?;let mut gaps=0u64;let mut details=collect_gaps.then(Vec::new);
+        let mut message_buffer=[0;INLINE_MESSAGE_BYTES];
         for _ in 0..selected {
             let descriptor=FileDescriptor::read(&mut plan)?;let file=descriptor.file;let count=descriptor.count;
-            let mut check=GapCheck::new(descriptor.expected);for _ in 0..count{let (_,part,_,_)=segment(&mut plan)?;check.push(part)?;}
+            let mut check=GapCheck::new(descriptor.expected);for _ in 0..count{
+                self.check_deadline()?;let (_,part,_,length)=segment(&mut plan)?;
+                inline_message(&mut plan,length,&mut message_buffer)?;check.push(part)?;
+            }
             if let Some(gap)=check.finish(){
                 gaps=gaps.checked_add(1).context("native gap count overflow")?;
                 if let Some(details)=&mut details {
@@ -208,7 +234,13 @@ impl ReadView<'_> {
                 xml.file(Text::new(self,TextField::ReleasePoster(id)),crate::dates::article_timestamp(&posted),Text::new(self,TextField::FileSubject(descriptor.file)))?;
             }
             xml.group(group.as_bytes())?;xml.segments()?;
-            for _ in 0..count{let(key,part,bytes,length)=segment(&mut plan)?;xml.segment(bytes,part,Message::new(self,id,key,length)?)?;}
+            for _ in 0..count{
+                self.check_deadline()?;let(key,part,bytes,length)=segment(&mut plan)?;
+                match inline_message(&mut plan,length,&mut message_buffer)? {
+                    Some(message)=>xml.segment(bytes,part,trimmed_message(message))?,
+                    None=>xml.segment(bytes,part,Message::new(self,id,key,length)?)?,
+                }
+            }
             xml.end_file()?;
         }
         ensure!(plan.read(&mut[0u8;1])?==0,"native NZB inventory has trailing rows");drop(plan);
@@ -223,6 +255,67 @@ mod tests {
     use super::*;
     use crate::{parser::{Article,Release},pg::fresh_reader::Budget};
     use std::time::{Instant,Duration};
+    #[test]
+    fn inline_message_plan_preserves_bounds_and_angle_trimming() {
+        let mut buffer=[0;INLINE_MESSAGE_BYTES];
+        assert_eq!(trimmed_message(b"<<a<b>&>>"),b"a<b>&");
+        assert!(trimmed_message(b"<><>").is_empty());
+        assert!(trimmed_message(b"").is_empty());
+        let mut input=b"raw".as_slice();
+        assert_eq!(inline_message(&mut input,3,&mut buffer).unwrap().unwrap(),b"raw");
+        assert!(input.is_empty());
+        assert!(inline_message(&mut b"raw".as_slice(),4,&mut buffer).is_err());
+        assert!(inline_message(&mut b"".as_slice(),-1,&mut buffer).is_err());
+        let mut input=b"untouched".as_slice();
+        assert!(inline_message(&mut input,8193,&mut buffer).unwrap().is_none());
+        assert_eq!(input,b"untouched");
+    }
+
+    #[test]
+    #[ignore="requires explicit isolated PostgreSQL and bounded NZB spool admission"]
+    fn inline_and_large_message_ids_preserve_raw_xml_and_invalid_utf8_refusal() {
+        use crate::search::{ArticleRow,ReleaseRow};
+        let schema=crate::pg::testing::Schema::native_writer().expect("explicit isolated PG fixture");
+        let mut client=schema.pool.get().unwrap();
+        let ids=["<字幕&\"@example.invalid>".to_string(),"<".repeat(8192),">".repeat(8193),
+            format!("<{}é&>","a".repeat(8187)),format!("<{}é&>","a".repeat(8188)),format!("<{}>","漢".repeat(4096))];
+        assert_eq!(ids[3].len(),8192);assert_eq!(ids[4].len(),8193);
+        let articles=ids.iter().enumerate().map(|(n,id)|Article {filename:Some(format!("case{n}.bin")),subject:format!("case{n}.bin yEnc (1/1)"),
+            message_id:id.clone(),part:Some(1),total_parts:Some(1),bytes:17,..Default::default()}).collect::<Vec<_>>();
+        let release=Release {name:"Message.Id.Boundaries".into(),group:"alt.binaries.test".into(),poster:"poster&test".into(),
+            date:"Wed, 01 Jan 2020 00:00:00 +0000".into(),articles,..Default::default()};
+        crate::pg::release_writer::save(&mut client,std::slice::from_ref(&release),1).unwrap();
+        let id:i64=client.query_one("select id from releases",&[]).unwrap().get(0);
+        let row=ReleaseRow {id,name:release.name.clone(),group_name:release.group.clone(),complete:true,..Default::default()};
+        let oracle=release.articles.iter().map(|a|ArticleRow {message_id:a.message_id.clone(),filename:a.filename.clone(),part:a.part,
+            total_parts:a.total_parts,bytes:Some(a.bytes),subject:Some(a.subject.clone()),poster:Some(release.poster.clone()),posted_date:Some(release.date.clone())}).collect::<Vec<_>>();
+        let root=tempfile::tempdir().unwrap();
+        #[cfg(unix)] {use std::os::unix::fs::PermissionsExt;std::fs::set_permissions(root.path(),std::fs::Permissions::from_mode(0o700)).unwrap();}
+        let pool=Pool::new(root.path().into(),crate::nzb_spool::Limits {requests:6,per_request_bytes:1<<20,total_bytes:6<<20,free_bytes:0}).unwrap();
+        for pick in [Pick::Whole,Pick::Ordinal(4),Pick::Name("case4.bin")] {
+            let selected=match pick {Pick::Whole=>oracle.clone(),Pick::Ordinal(_)=>vec![oracle[3].clone()],Pick::Name(_)=>vec![oracle[4].clone()]};
+            let view=ReadView::open(&mut client,&schema.name,Budget::default(),Instant::now()+Duration::from_secs(10)).unwrap();
+            let mut download=view.nzb_own(id,pick,&pool).unwrap().unwrap();let mut actual=String::new();download.body.read_to_string(&mut actual).unwrap();
+            let expected=crate::nzb::render_checked(&row,&selected,std::slice::from_ref(&row.group_name),matches!(pick,Pick::Whole));
+            assert_eq!(actual,expected.xml);assert_eq!(download.gaps,0);
+        }
+        // Corrupt raw bytea is rejected by the same strict XML text reader on
+        // both sides of the inline boundary; it is never decoded lossily.
+        for (original,length) in [(&ids[3],8192),(&ids[4],8193)] {
+            let mut invalid=vec![b'a';length];invalid[length-1]=0xff;
+            assert_eq!(client.execute("update segments set message_id=$2 where release_id=$1 and message_id=$3",
+                &[&id,&invalid,&original.as_bytes()]).unwrap(),1);
+            {
+                let view=ReadView::open(&mut client,&schema.name,Budget::default(),Instant::now()+Duration::from_secs(10)).unwrap();
+                let file=if length==8192 {"case3.bin"}else{"case4.bin"};
+                let error=view.nzb_own(id,Pick::Name(file),&pool).err().expect("invalid UTF-8 cannot become an NZB");
+                assert!(error.chain().any(|cause|cause.to_string().contains("invalid UTF-8 in NZB text")));
+            }
+            assert_eq!(client.execute("update segments set message_id=$2 where release_id=$1 and message_id=$3",
+                &[&id,&original.as_bytes(),&invalid]).unwrap(),1);
+        }
+    }
+
     #[test]
     #[ignore="requires explicit isolated PostgreSQL and bounded NZB spool admission"]
     fn short_message_ids_do_not_require_per_segment_database_reads() {
