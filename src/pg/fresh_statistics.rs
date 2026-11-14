@@ -275,7 +275,7 @@ mod pg_observation_tests {
         let releases=[Release {name:"Retained.Stats.Example".into(),group:"alt.binaries.test".into(),poster:"p".into(),
             date:"Wed, 01 Jan 2020 00:00:00 +0000".into(),articles:vec![Article {filename:Some("f.bin".into()),
                 subject:"f.bin yEnc (1/1)".into(),message_id:"retained-stats@example.invalid".into(),part:Some(1),total_parts:Some(1),bytes:123,..Default::default()}],..Default::default()}];
-        assert_eq!(pg::release_writer::save(&mut client,&releases,1).unwrap().releases,1);
+        assert_eq!(runtime.owner.with(|owner|pg::release_writer::save(owner,&releases,1)).unwrap().releases,1);
         pg::stage_telemetry::capture(&runtime.owner,None).unwrap();
         let pid=runtime.owner.with(|owner|Ok(owner.query_one("select pg_backend_pid()",&[])?.get::<_,i32>(0))).unwrap();
         runtime.owner.close();
