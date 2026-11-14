@@ -234,8 +234,13 @@ pub fn finish() {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// Publish an owned fixture only inside a separately spawned test process.
+    pub(crate) fn publish_owned_store(store: Arc<Store>) {
+        assert!(STORE.set(Mutex::new(Some(store))).is_ok());
+    }
 
     const CHILD_ROOT: &str = "ATLAS_TEST_LIVE_STARTUP_ROOT";
     const CHILD_MODE: &str = "ATLAS_TEST_LIVE_STARTUP_MODE";

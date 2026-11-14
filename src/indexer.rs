@@ -2717,6 +2717,70 @@ mod tests {
     use super::*;
     use crate::parser::Article;
 
+    #[test]
+    fn an_already_durable_slice_saves_without_another_header_store_tick() {
+        const CHILD: &str = "ATLAS_TEST_DURABLE_SLICE_SAVE";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "indexer::tests::an_already_durable_slice_saves_without_another_header_store_tick", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "isolated slice save failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+
+        use crate::nxv_store::{live, store::{KeepSet, Store, StoreConfig}};
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StoreConfig::new(dir.path());
+        config.sync_every = Duration::from_secs(3600);
+        config.sealers = 1;
+        let (store, _) = Store::open(config, KeepSet { live_from: i64::MIN / 2, ..Default::default() }).unwrap();
+        live::tests::publish_owned_store(store.clone());
+
+        // This real native save has no release rows, so it never opens a PG connection.
+        // The unparseable overview still needs durable raw capture before it counts as saved.
+        let pg = Arc::new(crate::pg::Pool::new(&crate::pg::StorageConfig {
+            url: "host=/atlas-unused-durability-fixture dbname=atlas".into(),
+            ..Default::default()
+        }).unwrap());
+        let db = Db {
+            conn: Arc::new(MainConnection::Postgres(pg.clone())),
+            native: Some(crate::pg::ingest::Native::new(pg, PgWriteLimits::default()).unwrap()),
+        };
+        let pool = Arc::new(Pool::new(&[]).with_max_unsaved(1));
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let saved_without_tick = rt.block_on(async {
+            let fetch = live::Fetch::begin().await.unwrap();
+            let lines = fetch.record("fixture", "example.durable", vec![
+                b"1\thello world\tposter\tThu, 12 Nov 2026 00:00:00 +0000\t<durable@fixture.test>\t\t10\t1".to_vec()
+            ]).await.unwrap();
+            let mut finish = Box::pin(fetch.finish());
+            assert!(tokio::time::timeout(Duration::from_millis(30), &mut finish).await.is_err(),
+                "capture must wait until its actual log bytes are durable");
+            store.tick().unwrap();
+            finish.await.unwrap();
+
+            // The production consumer receives the slice only after Fetch::finish.
+            let headers = lines.iter().map(|line| crate::nntp::overview_of(line).unwrap()).collect();
+            let unsaved = pool.reserve_unsaved_shard(0, 1).await;
+            let mut saving = Box::pin(save_slice(&pool, &db, "example.durable", headers, unsaved));
+            let result = tokio::time::timeout(Duration::from_secs(2), &mut saving).await;
+            let saved_without_tick = result.is_ok();
+            let saved = match result {
+                Ok(saved) => saved,
+                // Release the old implementation's blocking wait before reporting the regression.
+                Err(_) => { store.tick().unwrap(); saving.await }
+            }.unwrap();
+            assert_eq!(saved, Progress { articles: 1, ..Default::default() });
+            assert_eq!(pool.unsaved_headers(), 0, "saved slices return their admission capacity");
+            saved_without_tick
+        });
+        store.close().unwrap();
+        assert!(saved_without_tick, "an already durable slice waited for an unrelated future storage tick");
+    }
+
     fn native_fixture() -> (crate::pg::testing::Schema, Db) {
         let schema = crate::pg::testing::Schema::native_writer().expect("explicit isolated ATLAS_PG_TEST_URL required");
         let database: String = schema.pool.get().unwrap().query_one("select current_database()", &[]).unwrap().get(0);
