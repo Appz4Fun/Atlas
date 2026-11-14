@@ -54,7 +54,7 @@ impl Steps {
             Arc::new(crate::archive::link::LinkStep::default()),
             Arc::new(crate::probe::ProbeStep::default()),
             Arc::new(crate::probe::body_crc::BodyCrcStep),
-            Arc::new(crate::probe::opensubtitles::OpenSubtitlesStep::default()),
+            Arc::new(crate::probe::opensubtitles::OpenSubtitlesStep::for_owner(owner)?),
             Arc::new(crate::probe::stills::StillsStep),
             Arc::new(crate::naming::steps::Naming),Arc::new(crate::naming::steps::NfoName),
             Arc::new(crate::sidecar::SidecarStep),Arc::new(crate::sidecar::SidecarImageStep),
@@ -415,7 +415,8 @@ pub(crate) fn run_factory_fixture(runtime:&crate::pg::indexer_runtime::Runtime) 
     runtime.owner.with(|client| {
         client.execute("delete from ext_opensubtitles where moviehash=any($1)",&[&hashes.as_slice()])?;Ok(())
     }).unwrap();
-    runtime.owner.close();
+    let url=format!("{}/subtitles?moviehash={}",cfg.media.opensubtitles.base_url.as_deref().unwrap(),hashes[1]);
+    crate::probe::opensubtitles::tests::assert_http_client_owner_fence(&runtime.owner,&cfg,&url);
     let Err(super::step::StepError::Native(error))=run(hashes[0]) else {panic!("ended original owner must remain a typed storage failure")};
     assert!(crate::pg::outage::is_attempt_ended(&error));
     assert_eq!(crate::pg::outage::classify(&error),crate::pg::outage::Failure::Unavailable);

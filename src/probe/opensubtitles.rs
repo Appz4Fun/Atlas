@@ -88,9 +88,14 @@ fn is_hash(text: &str) -> bool {
 #[derive(Default)]
 pub struct OpenSubtitlesStep {
     client: Mutex<Option<(OpenSubtitlesConfig, Arc<Client>)>>,
+    cache: Option<Arc<crate::pg::service_cache::Cache>>,
 }
 
 impl OpenSubtitlesStep {
+    pub(crate) fn for_owner(owner: &Arc<crate::pg::indexer_runtime::Owner>) -> anyhow::Result<Self> {
+        Ok(Self { cache: Some(Arc::new(crate::pg::service_cache::Cache::new(owner)?)), ..Self::default() })
+    }
+
     fn client(&self) -> Option<(String, String, Arc<Client>)> {
         let held = self.client.lock().unwrap_or_else(|e| e.into_inner());
         held.as_ref().map(|(cfg, client)| {
@@ -132,7 +137,13 @@ impl Step for OpenSubtitlesStep {
             *held = None;
         } else if held.as_ref().is_none_or(|(had, _)| had != wanted) {
             let base = wanted.base_url.clone().unwrap_or_else(|| BASE_URL.to_string());
-            let client = Client::new("opensubtitles", &base, wanted.requests_per_minute);
+            let construct = || Client::new("opensubtitles", &base, wanted.requests_per_minute);
+            // Configuration reloads must retain the original owner's backend,
+            // even after the factory's construction context has returned.
+            let client = match &self.cache {
+                Some(cache) => crate::media::cache::native(cache.clone(), construct),
+                None => construct(),
+            };
             *held = Some((wanted.clone(), Arc::new(client)));
         }
         on
@@ -224,9 +235,32 @@ pub struct Stored {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
+
+    pub(crate) fn assert_http_client_owner_fence(owner: &Arc<crate::pg::indexer_runtime::Owner>, cfg: &Config, url: &str) {
+        let step = OpenSubtitlesStep::for_owner(owner).unwrap();
+        assert!(step.enabled(cfg));
+        let (_, _, retained) = step.client().unwrap();
+        assert!(matches!(retained.get(url, &[]), Ok(Reply::Json(_))), "owner-bound HTTP cache must work outside construction");
+        owner.close();
+        let assert_ended = |client: &Client| {
+            let Err(Trouble::Cache(error)) = client.get(url, &[]) else {
+                panic!("an ended original HTTP-cache owner must remain a typed cache failure")
+            };
+            let error = error.into_error();
+            assert!(crate::pg::outage::is_attempt_ended(&error));
+            assert_eq!(crate::pg::outage::classify(&error), crate::pg::outage::Failure::Unavailable);
+        };
+        assert_ended(&retained);
+        let mut reloaded = cfg.clone();
+        reloaded.media.opensubtitles.api_key.push_str("-reload");
+        assert!(step.enabled(&reloaded));
+        let (_, _, rebuilt) = step.client().unwrap();
+        assert!(!Arc::ptr_eq(&retained, &rebuilt));
+        assert_ended(&rebuilt);
+    }
 
     #[test]
     fn only_hash_matches_vote() {
