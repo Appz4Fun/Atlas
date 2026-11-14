@@ -305,10 +305,12 @@ fn copy_input(tx: &mut Transaction<'_>, batch: &[Incoming<'_>], timing_key: Opti
 
 // The connection-local table is reused when a pool connection is reused. A
 // commit or rollback leaves no rows for the next save.
+// COPY ordinals are unique within each truncated batch. Their key lets the
+// accepted-winner update look up a row without repeatedly scanning the batch.
 const CREATE_STAGE: &str = "
     set local synchronous_commit = on;
     create temporary table if not exists pg_temp.atlas_release_input (
-        ordinal bigint not null,
+        ordinal bigint primary key,
         identity_key bytea not null,
         is_collection boolean not null,
         name text not null,
