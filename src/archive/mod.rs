@@ -233,6 +233,14 @@ impl PasswordTest {
         }
     }
 
+    /// The existing verifier's admission check, without running a trial KDF for an empty password.
+    pub(crate) fn can_verify(&self) -> bool {
+        match self {
+            Self::Rar5(check) => check.kdf <= rar::MAX_KDF,
+            Self::Zip(_) => true,
+        }
+    }
+
     /// Whether a yes settles it. ZipCrypto's check is one byte, soo one wrong password in 256 passes.
     pub fn certain(&self) -> bool {
         !matches!(self, PasswordTest::Zip(zip::PasswordCheck::Crypto { .. }))

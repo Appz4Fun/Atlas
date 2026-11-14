@@ -457,6 +457,7 @@ fn known_or_post_password(
     ctx: &StepCtx<'_>,
     files: &[FileInfo],
     check: Option<&super::PasswordTest>,
+    passwords: &mut crate::release_info::PasswordCandidateBudget,
 ) -> Result<Option<String>, StepError> {
     let rel = ctx.release();
     let content_id = ctx.data().release_content_id(rel.id)?.unwrap_or_default();
@@ -473,7 +474,12 @@ fn known_or_post_password(
         .chain(rel.display_name.as_deref())
         .chain(files.iter().map(|f| f.filename.as_str()))
         .chain(files.iter().filter_map(|f| f.subject.as_deref()));
-    Ok(crate::release_info::find_verified_password(texts, &extra, check))
+    Ok(crate::release_info::find_verified_password_with_budget(texts, &extra, check, passwords)?)
+}
+
+/// A stored explicit hint without a verifier performs no candidate crypto.
+fn known_or_post_hint(ctx: &StepCtx<'_>, files: &[FileInfo]) -> Result<Option<String>, StepError> {
+    known_or_post_password(ctx, files, None, &mut crate::release_info::PasswordCandidateBudget::default())
 }
 
 /// Harvests a password for an encrypted archive from the post's names/subjects, any posted `.nzb`, or any `.nfo`/`.txt`
@@ -485,15 +491,16 @@ fn harvest_password_from_bodies(
     left: &mut usize,
     check: Option<&super::PasswordTest>,
     kept: &mut Vec<StepWrite>,
+    passwords: &mut crate::release_info::PasswordCandidateBudget,
 ) -> Result<Option<String>, StepError> {
-    if let Some(pw) = known_or_post_password(ctx, files, check)? {
+    if let Some(pw) = known_or_post_password(ctx, files, check, passwords)? {
         return Ok(Some(pw));
     }
     let rel_id = ctx.release().id;
     let par2_names = ctx.data().par2_names(rel_id, files)?;
     let par2_all = ctx.data().par2_file_names(rel_id)?;
     for par2_name in par2_all.iter().chain(par2_names.values()) {
-        if let Some(pw) = crate::release_info::find_verified_password([par2_name.as_str()], &[], check) {
+        if let Some(pw) = crate::release_info::find_verified_password_with_budget([par2_name.as_str()], &[], check, passwords)? {
             return Ok(Some(pw));
         }
     }
@@ -501,7 +508,7 @@ fn harvest_password_from_bodies(
         let Some(body) = whole_file(ctx, nzb_file, left)? else { continue };
         if identify(&body) == Format::Nzb
             && let Some(meta_pw) = nzb::meta_password(&body)
-            && let Some(pw) = crate::release_info::find_verified_password(std::iter::empty(), &[meta_pw], check)
+            && let Some(pw) = crate::release_info::find_verified_password_with_budget(std::iter::empty(), &[meta_pw], check, passwords)?
         {
             return Ok(Some(pw));
         }
@@ -535,7 +542,7 @@ fn harvest_password_from_bodies(
                 text
             }
         };
-        if let Some(pw) = crate::release_info::find_verified_password([text.as_str()], &[], check) {
+        if let Some(pw) = crate::release_info::find_verified_password_with_budget([text.as_str()], &[], check, passwords)? {
             return Ok(Some(pw));
         }
     }
@@ -570,7 +577,7 @@ fn restore_nzb(
     if saved.is_empty() {
         return Ok(None);
     }
-    let pw = known_or_post_password(ctx, files, None)?
+    let pw = known_or_post_hint(ctx, files)?
         .or_else(|| saved.iter().find_map(|f| crate::release_info::find_password(&f.name)));
     if require_checked && pw.is_none() && !crate::raw_store::has_nfo_password_record_checked(&rel.name, &rel.group, content_id).map_err(StepError::from_cache)?
     {
@@ -762,6 +769,7 @@ fn restore_archive(
     content_id: &[u8],
     require_password_inspected: bool,
     limits: &ArchiveConfig,
+    passwords: &mut crate::release_info::PasswordCandidateBudget,
 ) -> Result<Option<Outcome>, StepError> {
     let source = saved.files.first().map(|f| f.source).unwrap_or_else(|| {
         match saved.encryption.and_then(super::Encryption::from_code) {
@@ -801,7 +809,7 @@ fn restore_archive(
     let mut outcome =
         finish_full(ctx, source, listing, password_override, Some(saved.content_fp), false, restored, limits)?;
     let posted_files = ctx.files().map_err(StepError::from_inventory)?;
-    let wrapper_pw = if encrypted { known_or_post_password(ctx, &posted_files, wrapper_check.as_ref())? } else { None };
+    let wrapper_pw = if encrypted { known_or_post_password(ctx, &posted_files, wrapper_check.as_ref(), passwords)? } else { None };
     let rel = ctx.release();
     if require_password_inspected
         && encrypted
@@ -838,7 +846,7 @@ fn restore_archive(
     let mut nzb_pw = crate::raw_store::get_nested_nzb_password_checked(&rel.name, &rel.group, content_id).map_err(StepError::from_cache)?
         .or(inner_nzb_pw)
         .or(hop_pw);
-    if nzb_pw.is_none() && !encrypted { nzb_pw = known_or_post_password(ctx, &posted_files, None)?; }
+    if nzb_pw.is_none() && !encrypted { nzb_pw = known_or_post_hint(ctx, &posted_files)?; }
     if let Some(pw) = nzb_pw {
         add_pointed_password_writes(ctx, &mut nested.writes, &pw, !encrypted)?;
     }
@@ -1301,6 +1309,7 @@ impl Step for ListStep {
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let limits = self.limits.lock().unwrap().clone();
+        let mut passwords = crate::release_info::PasswordCandidateBudget::default();
         let files = ctx.files().map_err(StepError::from_inventory)?;
         let rel = ctx.release();
         let rel_id = rel.id;
@@ -1312,7 +1321,7 @@ impl Step for ListStep {
                 crate::raw_store::get_archive_checked(&rel_name, &rel_group, &content_id, rel.parts, rel.complete).map_err(StepError::from_cache)?
                 && saved.facts >= archive_store::FACTS
                 && !(saved.names_hidden && saved.files.is_empty())
-                && let Some(outcome) = restore_archive(ctx, saved, &content_id, true, &limits)?
+                && let Some(outcome) = restore_archive(ctx, saved, &content_id, true, &limits, &mut passwords)?
             {
                 return Ok(outcome);
             }
@@ -1418,7 +1427,7 @@ impl Step for ListStep {
                     let mut pw_found = None;
                     if listing.encrypted {
                         let check = listing.password_check.as_ref();
-                        pw_found = harvest_password_from_bodies(ctx, &files, &mut left, check, &mut nfo_writes)?;
+                        pw_found = harvest_password_from_bodies(ctx, &files, &mut left, check, &mut nfo_writes, &mut passwords)?;
                         if let Some(ref pw) = pw_found
                             && listing.headers_encrypted
                         {
@@ -1461,7 +1470,7 @@ impl Step for ListStep {
                     let has_inner_nzb = listing.files.iter().any(|f| select::classify(&f.name) == Kind::Nzb);
                     let pw_found = if listing.encrypted {
                         let check = listing.password_check.as_ref();
-                        harvest_password_from_bodies(ctx, &files, &mut left, check, &mut nfo_writes)?
+                        harvest_password_from_bodies(ctx, &files, &mut left, check, &mut nfo_writes, &mut passwords)?
                     } else {
                         None
                     };
@@ -1502,7 +1511,7 @@ impl Step for ListStep {
                     let has_inner_nzb = listing.files.iter().any(|f| select::classify(&f.name) == Kind::Nzb);
                     let pw_found = if listing.encrypted {
                         let check = listing.password_check.as_ref();
-                        harvest_password_from_bodies(ctx, &files, &mut left, check, &mut nfo_writes)?
+                        harvest_password_from_bodies(ctx, &files, &mut left, check, &mut nfo_writes, &mut passwords)?
                     } else {
                         None
                     };
@@ -1575,7 +1584,7 @@ impl Step for ListStep {
                     Listing { files: followed_files, complete, ..Default::default() },
                     &limits,
                 )?;
-                let pw = match hop_pw { Some(pw) => Some(pw),None => known_or_post_password(ctx, &files, None)? };
+                let pw = match hop_pw { Some(pw) => Some(pw),None => known_or_post_hint(ctx, &files)? };
                 if let Some(pw) = pw {
                     add_pointed_password_writes(ctx, &mut outcome.writes, &pw, true)?;
                 } else {
@@ -1586,7 +1595,7 @@ impl Step for ListStep {
         }
         let rel = ctx.release();
         if let Some(saved) = crate::raw_store::get_archive_checked(&rel.name, &rel.group, &content_id, 0, false).map_err(StepError::from_cache)?
-            && let Some(outcome) = restore_archive(ctx, saved, &content_id, false, &limits)?
+            && let Some(outcome) = restore_archive(ctx, saved, &content_id, false, &limits, &mut passwords)?
         {
             return Ok(outcome);
         }

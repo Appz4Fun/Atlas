@@ -87,6 +87,20 @@ mod password_budget_tests {
         assert_eq!(find_verified_password_with_budget(["password: wrong"], &[], Some(&weak), &mut budget).unwrap(), None);
         assert!(budget.used() > 0, "a weak ZipCrypto check is supported, not an unsupported-KDF fallback");
     }
+
+    #[test]
+    fn a_verified_password_still_decrypts_and_discovers_the_archives_nzb_names() {
+        let (file, plain) = super::super::testkit::authenticated_aes_nzb();
+        let check = zip::list_head(&file).password_check.unwrap();
+        let mut budget = PasswordCandidateBudget::default();
+        assert_eq!(find_verified_password_with_budget(["{{wrong}}"], &[], Some(&check), &mut budget).unwrap(), None);
+        let password = find_verified_password_with_budget([], &["secret".into()], Some(&check), &mut budget).unwrap().unwrap();
+        let unwrapped = crate::probe::nest::unwrap_nzb_with_password(&file, Some(&password));
+        assert_eq!(unwrapped.inner.as_ref(), plain);
+        assert_eq!(nzb::meta_password(&unwrapped.inner).as_deref(), Some("inner-secret"));
+        assert_eq!(names(&nzb::list(&unwrapped.inner)), ["movie.mkv"]);
+        assert!(budget.used() < 24);
+    }
 }
 
 fn names(l: &Listing) -> Vec<String> {

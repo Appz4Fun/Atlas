@@ -449,9 +449,10 @@ impl Step for ProbeStep {
         let par2_names = ctx.data().par2_names(release_id, &files)?;
         let par2_all = ctx.data().par2_file_names(release_id)?;
         let mut check = ctx.data().local_password_check(release_id)?;
+        let mut passwords = release_info::PasswordCandidateBudget::default();
         let mut info = ProbeInfo::default();
         let mut writes = Vec::new();
-        let mut found_nfo_password = known_pw.or_else(|| {
+        let mut found_nfo_password = if known_pw.is_some() { known_pw } else {
             let rel = ctx.release();
             let texts = std::iter::once(rel.name.as_str())
                 .chain(rel.display_name.as_deref())
@@ -459,8 +460,8 @@ impl Step for ProbeStep {
                 .chain(files.iter().filter_map(|f| f.subject.as_deref()))
                 .chain(par2_all.iter().map(String::as_str))
                 .chain(par2_names.values().map(String::as_str));
-            release_info::find_verified_password(texts, &[], check.as_ref())
-        });
+            release_info::find_verified_password_with_budget(texts, &[], check.as_ref(), &mut passwords)?
+        };
         if let Some(ref pw) = found_nfo_password {
             crate::raw_store::put_nfo_password_checked(&rel_name, &rel_group, &content_id, pw)
                 .map_err(StepError::from_cache)?;
@@ -505,7 +506,7 @@ impl Step for ProbeStep {
                 info.sfv = parse_sfv(&text);
             } else {
                 if found_nfo_password.is_none()
-                    && let Some(password) = release_info::find_verified_password([text.as_str()], &[], check.as_ref())
+                    && let Some(password) = release_info::find_verified_password_with_budget([text.as_str()], &[], check.as_ref(), &mut passwords)?
                 {
                     crate::raw_store::put_nfo_password_checked(&rel_name, &rel_group, &content_id, &password)
                         .map_err(StepError::from_cache)?;
@@ -544,7 +545,7 @@ impl Step for ProbeStep {
                 if archive::identify(&body) == archive::Format::Nzb
                     && let Some(meta_pw) = archive::nzb::meta_password(&body)
                     && let Some(password) =
-                        release_info::find_verified_password(std::iter::empty(), &[meta_pw], check.as_ref())
+                        release_info::find_verified_password_with_budget(std::iter::empty(), &[meta_pw], check.as_ref(), &mut passwords)?
                 {
                     crate::raw_store::put_nfo_password_checked(&rel_name, &rel_group, &content_id, &password)
                         .map_err(StepError::from_cache)?;
@@ -597,7 +598,7 @@ impl Step for ProbeStep {
                             && check.is_some()
                             && let Some(ref nfo_s) = info.nfo
                             && let Some(password) =
-                                release_info::find_verified_password([nfo_s.as_str()], &[], check.as_ref())
+                                release_info::find_verified_password_with_budget([nfo_s.as_str()], &[], check.as_ref(), &mut passwords)?
                         {
                             crate::raw_store::put_nfo_password_checked(&rel_name, &rel_group, &content_id, &password)
                                 .map_err(StepError::from_cache)?;

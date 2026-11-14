@@ -387,64 +387,92 @@ pub fn find_password(text: &str) -> Option<String> {
     find_all_passwords(text).into_iter().next()
 }
 
-/// Finds a password in `texts` and `extra_candidates`, verifying candidates against `check` when available.
-/// When `check` is present and `check.certain()` is true, an unverified regex match that `check.accepts`
-/// rejects is discarded, and broader tokens/lines/URLs from `texts` are tested against `check`.
+/// A single archive/probe visit shares this allowance across all password sources and check changes.
+/// The memo retains at most 24 checked, 128-byte candidates; it never grants a new allowance per filename.
+#[derive(Default)]
+pub(crate) struct PasswordCandidateBudget {
+    checked: Vec<(crate::archive::PasswordTest, String, Option<bool>)>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PasswordBudgetExhausted;
+
+impl From<PasswordBudgetExhausted> for crate::postprocess::step::StepError {
+    fn from(_: PasswordBudgetExhausted) -> Self {
+        Self::Retry("password candidate budget exhausted".into())
+    }
+}
+
+impl PasswordCandidateBudget {
+    const LIMIT: usize = 24;
+
+    fn verify(&mut self, check: &crate::archive::PasswordTest, candidate: &str) -> Result<Option<bool>, PasswordBudgetExhausted> {
+        if let Some((_, _, result)) = self.checked.iter().find(|(old, text, _)| old == check && text == candidate) {
+            return Ok(*result);
+        }
+        self.available()?;
+        let result = check.accepts(candidate);
+        self.checked.push((*check, candidate.to_owned(), result));
+        Ok(result)
+    }
+
+    fn available(&self) -> Result<(), PasswordBudgetExhausted> {
+        if self.checked.len() >= Self::LIMIT { Err(PasswordBudgetExhausted) } else { Ok(()) }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn used(&self) -> usize { self.checked.len() }
+}
+
+/// Finds a password, keeping the public single-search interface for callers without a shared visit.
 pub fn find_verified_password<'a>(
     texts: impl IntoIterator<Item = &'a str>,
     extra_candidates: &[String],
     check: Option<&crate::archive::PasswordTest>,
 ) -> Option<String> {
+    find_verified_password_with_budget(texts, extra_candidates, check, &mut PasswordCandidateBudget::default()).ok().flatten()
+}
+
+/// Explicit/cached candidates precede broader tokens. Only the existing supported verifier may accept a guess.
+/// Exhaustion is distinct from a completed search with no password, so workers cannot persist a false negative.
+pub(crate) fn find_verified_password_with_budget<'a>(
+    texts: impl IntoIterator<Item = &'a str>,
+    extra_candidates: &[String],
+    check: Option<&crate::archive::PasswordTest>,
+    budget: &mut PasswordCandidateBudget,
+) -> Result<Option<String>, PasswordBudgetExhausted> {
     let texts: Vec<&str> = texts.into_iter().collect();
     let empty_meta = std::collections::HashMap::new();
-    let mut priority = Vec::new();
-    let push_uniq = |vec: &mut Vec<String>, s: &str| {
-        let t = s.trim();
-        if !t.is_empty() && t.len() <= 128 && !is_false_positive_password(t) && !vec.iter().any(|x| x == t) {
-            vec.push(t.to_string());
-        }
-    };
-    for c in extra_candidates {
-        push_uniq(&mut priority, c);
-    }
-    for &t in &texts {
-        for c in find_all_passwords(t) {
-            push_uniq(&mut priority, &c);
-        }
-        for c in crate::archive::PasswordHarvester::extract_candidates(t, Some(t), &empty_meta) {
-            push_uniq(&mut priority, &c);
-        }
-    }
-    let Some(chk) = check else {
-        return priority.into_iter().next();
-    };
-    let mut tested = 0usize;
-    const MAX_CHECK_CANDIDATES: usize = 24;
-    let mut fallback: Option<String> = None;
-    for cand in &priority {
-        if tested >= MAX_CHECK_CANDIDATES {
-            break;
-        }
-        tested += 1;
-        match chk.accepts(cand) {
-            Some(true) => return Some(cand.clone()),
-            None => {
-                if fallback.is_none() {
-                    fallback = Some(cand.clone());
+    // Unsupported KDFs retain explicit hints without spending crypto or turning the builtin into a guess.
+    let check = check.filter(|check| check.can_verify());
+    macro_rules! try_candidate {
+        ($candidate:expr) => {{
+            let candidate = $candidate.trim();
+            if !candidate.is_empty() && candidate.len() <= 128 && !is_false_positive_password(candidate) {
+                match check {
+                    None => return Ok(Some(candidate.to_owned())),
+                    Some(check) if budget.verify(check, candidate)? == Some(true) => return Ok(Some(candidate.to_owned())),
+                    Some(_) => {},
                 }
             }
-            Some(false) => {}
+        }};
+    }
+    for candidate in extra_candidates {
+        try_candidate!(candidate);
+    }
+    for &text in &texts {
+        for candidate in find_all_passwords(text) {
+            try_candidate!(candidate);
+        }
+        for candidate in crate::archive::PasswordHarvester::extract_candidates(text, Some(text), &empty_meta) {
+            try_candidate!(candidate);
         }
     }
-    if chk.accepts("").is_none() {
-        return fallback.or_else(|| priority.into_iter().next());
-    }
-    // Broader NFO/subject token scan when explicit regexes didn't yield the password:
-    // test short single-token lines, quoted tokens, values after `:`, and URLs/domains.
-    let mut broad = Vec::new();
+    if check.is_none() { return Ok(None); }
+    // These guesses are verified only, after all explicit candidates. The memo deduplicates them across calls.
     const COMMON_ARCHIVE_PASSWORDS: &[&str] = &["74744567bnbnvbnb"];
     for &password in COMMON_ARCHIVE_PASSWORDS {
-        push_uniq(&mut broad, password);
+        try_candidate!(password);
     }
     static RE_URL: LazyLock<Regex> = LazyLock::new(|| {
         #[allow(clippy::unwrap_used)]
@@ -453,14 +481,14 @@ pub fn find_verified_password<'a>(
     for &t in &texts {
         for m in RE_URL.find_iter(t) {
             let u = m.as_str().trim_end_matches(['.', ',', ')', ']']);
-            push_uniq(&mut broad, u);
+            try_candidate!(u);
             if let Some(stripped) = u.strip_prefix("https://").or_else(|| u.strip_prefix("http://")) {
-                push_uniq(&mut broad, stripped.trim_end_matches('/'));
+                try_candidate!(stripped.trim_end_matches('/'));
                 if let Some(no_www) = stripped.strip_prefix("www.") {
-                    push_uniq(&mut broad, no_www.trim_end_matches('/'));
+                    try_candidate!(no_www.trim_end_matches('/'));
                 }
             } else if let Some(no_www) = u.strip_prefix("www.") {
-                push_uniq(&mut broad, no_www.trim_end_matches('/'));
+                try_candidate!(no_www.trim_end_matches('/'));
             }
         }
         for raw_line in t.lines() {
@@ -475,35 +503,25 @@ pub fn find_verified_password<'a>(
                 continue;
             }
             if line.len() <= 80 && !line.contains(char::is_whitespace) && (3..=64).contains(&line.len()) {
-                push_uniq(&mut broad, line);
+                try_candidate!(line);
             }
             for (idx, _) in line.match_indices([':', '=']) {
                 let rhs = line[idx + 1..].trim();
                 let val = rhs.trim_matches(['"', '\'', '.', ',']);
                 if !val.contains(char::is_whitespace) && (3..=64).contains(&val.len()) {
-                    push_uniq(&mut broad, val);
+                    try_candidate!(val);
                 } else if let Some(first) = val.split_whitespace().next() {
                     let tok = first.trim_matches(['"', '\'', '.', ',', ';', ')', ']']);
                     if (3..=64).contains(&tok.len()) {
-                        push_uniq(&mut broad, tok);
+                        try_candidate!(tok);
                     }
                 }
             }
         }
     }
-    for cand in broad {
-        if priority.iter().any(|p| p == &cand) {
-            continue;
-        }
-        if tested >= MAX_CHECK_CANDIDATES {
-            break;
-        }
-        tested += 1;
-        if chk.accepts(&cand) == Some(true) {
-            return Some(cand);
-        }
-    }
-    fallback
+    // Even an exactly spent search remains unresolved: later sources must not fetch or record an empty password.
+    budget.available()?;
+    Ok(None)
 }
 
 /// What the page can say without reading any article.
