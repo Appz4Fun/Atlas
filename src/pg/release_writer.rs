@@ -414,15 +414,24 @@ const WRITE_ARTICLES: &str = "
         from candidates c join file_map f using (release_id, filename_key)
         on conflict (release_id, message_key) do nothing
         returning release_id, file_id, message_key
+    ), winners as materialized (
+        select release_id, message_key, max(ordinal) as ordinal, max(file_id) as file_id
+        from (
+            select release_id, message_key, ordinal, null::bigint as file_id from candidates
+            union all
+            select release_id, message_key, null::bigint as ordinal, file_id from added
+        ) mapping_input
+        group by release_id, message_key
+        having max(file_id) is not null
     ), sparse_nzb as (
         insert into segment_nzb_metadata (release_id,message_key,subject,poster,posted_date,nzb_timestamp,expected,subject_file_index,subject_file_total)
-        select a.release_id,a.message_key,c.nzb_subject,c.nzb_poster,c.nzb_posted_date,c.nzb_timestamp,c.expected,c.nzb_file_index,c.file_total
-        from added a join candidates c using(release_id,message_key) where c.nzb_subject is not null
+        select w.release_id,w.message_key,s.nzb_subject,s.nzb_poster,s.nzb_posted_date,s.nzb_timestamp,s.expected,s.nzb_file_index,s.file_total
+        from winners w join pg_temp.atlas_release_input s on s.ordinal=w.ordinal where s.nzb_subject is not null
         on conflict(release_id,message_key) do nothing
         returning 1
     ), accepted as (
-        update pg_temp.atlas_release_input s set release_id = a.release_id, file_id = a.file_id
-        from added a join candidates c using (release_id, message_key) where s.ordinal = c.ordinal
+        update pg_temp.atlas_release_input s set release_id = w.release_id, file_id = w.file_id
+        from winners w where s.ordinal = w.ordinal
         returning 1
     )
     select (select count(*) from added_files), (select count(*) from accepted)";
