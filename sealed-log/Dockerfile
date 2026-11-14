@@ -1,5 +1,5 @@
 # built by compose.yml, from this folder
-FROM rust:1.99.0-slim-trixie AS build
+FROM rust:1.100.0-slim-trixie AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
