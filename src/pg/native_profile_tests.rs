@@ -7,7 +7,7 @@ fn headers() -> HeaderStoreConfig {
 }
 
 fn enabled() -> Config {
-    Config::from_value(&serde_json::json!({
+    crate::config::from_value_for_test(&serde_json::json!({
         "inferred_parts":true,
         "postprocess":{"enabled":true,"workers":2,"body_connections":2,"body_max_bytes":134217728},
         "predb":{"enabled":true},"spots":{"enabled":true,"comments":true},
@@ -109,7 +109,7 @@ fn direct_unclamped_spot_settings_refuse_but_file_parser_clamps_them() {
     config.inferred_parts = false;
     config.spots.concurrency = 65;
     assert!(Profile::check(&config, &headers()).unwrap_err().to_string().contains("Spotnet"));
-    let parsed = Config::from_value(&serde_json::json!({"inferred_parts":false,
+    let parsed = crate::config::from_value_for_test(&serde_json::json!({"inferred_parts":false,
         "spots":{"enabled":true,"concurrency":65,"per_pass":10001,"poll_minutes":0}}));
     assert_eq!(parsed.spots.concurrency, 64);
     assert_eq!(parsed.spots.per_pass, 10000);

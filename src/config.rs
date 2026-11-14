@@ -1442,6 +1442,11 @@ impl Config {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn from_value_for_test(value: &Value) -> Config {
+    Config::from_value(value)
+}
+
 fn as_port(v: &Value) -> Option<u16> {
     as_int(v).and_then(|n| u16::try_from(n).ok())
 }
