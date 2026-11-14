@@ -26,7 +26,7 @@ fn catalog() -> CatalogId {
 }
 fn setup() -> (tempfile::TempDir, PathBuf, Writer) {
     let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("payload");
+    let root = temp.path().canonicalize().unwrap().join("payload");
     let writer = Writer::create(&root, catalog()).expect("create a physical payload store");
     (temp, root, writer)
 }
@@ -66,7 +66,9 @@ fn snapshot(path: &Path) -> Vec<(PathBuf, u32, Vec<u8>)> {
 fn identity_binding_survives_reopen_and_refuses_mismatch() {
     let (_temp, root, mut writer) = setup();
     let identity = writer.identity();
+    assert_eq!(Identity::from_bytes(identity.to_bytes()), identity);
     let reference = abc(&mut writer);
+    assert_eq!(PayloadRef::from_parts(identity, ABC, 3).unwrap(), reference);
     let bytes = fs::read(root.join("identity")).unwrap();
     assert_eq!(bytes.len(), 88);
     assert_eq!(&bytes[..8], b"ATART001");
@@ -195,6 +197,7 @@ fn range_and_length_limits_fail_closed() {
     assert_eq!(chunk.read_range(3, &mut out, deadline()).unwrap(), 0);
     assert_eq!(chunk.read_range(0, &mut [], deadline()).unwrap(), 0);
     for offset in [4, u64::MAX] {
+        assert!(matches!(chunk.read_range(offset, &mut [], deadline()), Err(Error::Limit)));
         assert!(matches!(chunk.read_range(offset, &mut out, deadline()), Err(Error::Limit)));
     }
     assert!(matches!(chunk.read_range(0, &mut vec![0; MAX_RANGE_BYTES + 1], deadline()), Err(Error::Limit)));
@@ -311,6 +314,10 @@ fn retained_chunks_are_counted_in_handle_fd_limit() {
     assert!(!chunks.is_empty());
     chunks.pop();
     assert!(reader.open_chunk(reference, deadline()).is_ok());
+    drop(reader);
+    let mut out = [0; 3];
+    assert_eq!(chunks[0].read_range(0, &mut out, deadline()).unwrap(), 3);
+    assert_eq!(&out, b"abc");
 }
 
 fn fifo(path: &Path) {
@@ -447,13 +454,13 @@ fn publish_crash_boundaries() {
         } else {
             assert_eq!(fs::read(&path).unwrap(), b"abc");
         }
-        let writer = Writer::open(&root, identity).unwrap();
+        let mut writer = Writer::open(&root, identity).unwrap();
+        let replay = abc(&mut writer);
+        assert_eq!(replay.identity, identity);
         drop(writer);
         let reader = Reader::open(&root, identity).unwrap();
         let result = reader.open_chunk(PayloadRef { identity, digest: ABC, bytes: 3 }, deadline());
-        if boundary == "pre-install" {
-            assert!(matches!(result, Err(Error::Missing)));
-        } else {
+        {
             let chunk = result.unwrap();
             let mut out = [0; 3];
             assert_eq!(chunk.read_range(0, &mut out, deadline()).unwrap(), 3);
@@ -475,6 +482,17 @@ fn sync_failure_stops_writer() {
     let calls = payload::test_sync_calls();
     assert!(matches!(writer.publish(3, &mut &b"abc"[..], deadline()), Err(Error::Busy)));
     assert_eq!(payload::test_sync_calls(), calls);
+    drop(writer);
+    let (_other_temp, other_root, mut writer) = setup();
+    let reference = abc(&mut writer);
+    payload::test_fail_final_sync();
+    assert!(
+        matches!(writer.publish(3, &mut &b"abc"[..], deadline()), Err(Error::Io(e)) if e.raw_os_error() == Some(libc::EIO))
+    );
+    assert_eq!(fs::read(object(&other_root, ABC)).unwrap(), b"abc");
+    assert!(matches!(writer.publish(3, &mut &b"abc"[..], deadline()), Err(Error::Busy)));
+    let reader = Reader::open(&other_root, reference.identity).unwrap();
+    assert!(reader.open_chunk(reference, deadline()).is_ok());
 }
 
 #[test]
