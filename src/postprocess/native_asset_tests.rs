@@ -148,11 +148,6 @@ pub(crate) fn run(runtime:&crate::pg::indexer_runtime::Runtime,action:&str) {
     runtime.owner.close();
 }
 
-// The fixture imports only the standalone owned transport, never legacy DB helpers.
-use crate as atlas_api;
-#[path = "../../tests/common/nntp.rs"]
-mod still_donor_nntp;
-
 #[cfg(unix)]
 #[test]
 #[ignore = "requires explicit isolated PG; real StillsStep/Prepared visit and private owned NNTP child"]
@@ -242,9 +237,49 @@ fn run_still_donor_case(complete: bool) {
     let reads = StepReads::for_owner(&runtime.owner).unwrap();
     let lookup = reads.stills_lookup(own).unwrap();
     assert_eq!(reads.same_file_stills(own,&lookup).unwrap(),Some(crate::keys::Kind::Mux),"the genuine old donor precondition must hold");
-    let server = still_donor_nntp::Server::new(vec![]);
-    server.body_troubles_left.store(1,Ordering::SeqCst);
-    let port = still_donor_nntp::spawn_server(server.clone());
+    // StillsStep uses fetch_article (Raw), not BODY. Audit the actual own
+    // ARTICLE command and return a transient response on that exact path.
+    let listener=TcpListener::bind("127.0.0.1:0").unwrap();listener.set_nonblocking(true).unwrap();
+    let port=listener.local_addr().unwrap().port();
+    let article_hits=Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hits=article_hits.clone();
+    let transport_stop=Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopped=transport_stop.clone();
+    let transport=std::thread::spawn(move|| {
+        use std::io::{BufRead,Read,Write};
+        let until=Instant::now()+Duration::from_secs(10);
+        while !stopped.load(Ordering::Acquire) {
+            assert!(Instant::now()<until,"owned ARTICLE fixture deadline");
+            let (mut stream,_)=match listener.accept() {
+                Ok(connection)=>connection,
+                Err(error) if error.kind()==std::io::ErrorKind::WouldBlock=>{std::thread::sleep(Duration::from_millis(5));continue;},
+                Err(error)=>panic!("owned ARTICLE accept failed: {error}"),
+            };
+            stream.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+            stream.set_write_timeout(Some(Duration::from_millis(500))).unwrap();
+            stream.write_all(b"200 owned still fixture\r\n").unwrap();
+            let mut reader=std::io::BufReader::new(stream.try_clone().unwrap());
+            for _ in 0..8 {
+                let mut line=String::new();
+                let size=(&mut reader).take(1024).read_line(&mut line).unwrap();
+                if size==0 {break;}
+                assert!(line.ends_with('\n'),"owned ARTICLE command exceeded bound");
+                let reply:&[u8]=match line.trim_end() {
+                    "AUTHINFO USER bob"=>b"381 password required\r\n",
+                    "AUTHINFO PASS secret"=>b"281 authenticated\r\n",
+                    "XFEATURE COMPRESS GZIP"=>b"500 unsupported\r\n",
+                    "ARTICLE <own-still@example.test>"=>{
+                        stream.write_all(b"502 try later\r\n").unwrap();
+                        hits.fetch_add(1,Ordering::SeqCst);
+                        return;
+                    },
+                    "QUIT"=>{stream.write_all(b"205 closing\r\n").unwrap();return;},
+                    other=>panic!("unexpected owned still command: {other}"),
+                };
+                stream.write_all(reply).unwrap();
+            }
+        }
+    });
     let mut account = crate::config::UsenetServer::new("127.0.0.1","bob","secret",port); account.ssl=Some(false); account.connections=Some(1);
     let pool = Arc::new(crate::nntp::Pool::new(&[account]).with_timeout(Duration::from_millis(500)).with_body_tries(Duration::from_secs(1),0));
     let handle = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
@@ -259,6 +294,7 @@ fn run_still_donor_case(complete: bool) {
     assert_eq!(runner.database(&db,0,10).unwrap().settle(&queue,&db,11).unwrap(),Settlement::Applied);
     let net=queue.claim_net(12,1,60,0).unwrap().pop().unwrap(); assert_eq!(net.release_id(),own);
     assert_eq!(runner.network(&queue,&net,12).unwrap().unwrap().settle(&queue,&net,13).unwrap(),Settlement::Applied);
+    assert_eq!(article_hits.load(Ordering::SeqCst),usize::from(!complete),"partial own stills must reach the real own ARTICLE502 response; complete own stills fetch nothing");
     runtime.owner.with(|client| {
         let row=client.query_one("select done,net_wanted,net_left,net_transient from pp_state where release_id=$1", &[&own])?;
         let stills:i64=client.query_one("select count(*) from release_stills where release_id=$1", &[&own])?.try_get(0)?;
@@ -268,12 +304,12 @@ fn run_still_donor_case(complete: bool) {
         } else {
             assert_eq!(row.get::<_,i64>(0)&bit,0,"a donor cannot complete own still generation");
             assert_eq!(row.get::<_,Option<bool>>(1),Some(true)); assert_eq!(row.get::<_,Option<i64>>(2),Some(bit));
-            assert_eq!(row.get::<_,Option<i64>>(3),Some(1),"the actual owned BODY refusal must schedule a normal retry");
+            assert_eq!(row.get::<_,Option<i64>>(3),Some(1),"the actual owned ARTICLE refusal must schedule a normal retry");
         }
         assert_eq!(client.query_one("select count(*) from ext_asset_files",&[])?.get::<_,i64>(0),0,"no donor or generated asset grant is minted");
         Ok(())
     }).unwrap();
-    assert_eq!(server.body_troubles_left.load(Ordering::SeqCst),usize::from(complete),"partial own stills require an actual own BODY attempt; complete own stills fetch nothing");
+
     let read_pool=crate::pg::Pool::new(&storage).unwrap();
     let mut client=read_pool.get().unwrap();
     let view=ReadView::open(&mut client,&storage.schema,Budget::default(),Instant::now()+Duration::from_secs(5)).unwrap();
@@ -281,6 +317,7 @@ fn run_still_donor_case(complete: bool) {
     drop(view); drop(client);
     for (path,bytes) in physical {assert_eq!(std::fs::read(path).unwrap(),bytes);}
     assert_eq!(runtime.owner.failure(),None);
-    handle.block_on(pool.close()); drop(runner); runtime.owner.close();
+    handle.block_on(pool.close());transport_stop.store(true,Ordering::Release);transport.join().unwrap();
+    drop(runner); runtime.owner.close();
     std::fs::write(home.join("finished"),b"done").unwrap();
 }
