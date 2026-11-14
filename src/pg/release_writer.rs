@@ -300,17 +300,19 @@ fn copy_input(tx: &mut Transaction<'_>, batch: &[Incoming<'_>], timing_key: Opti
         ])?;
     }
     writer.finish()?;
+    // Build against this filled batch: an index made on the empty stage left
+    // winner-join cardinality underestimated even when ordinal probes used it.
+    tx.batch_execute("drop index if exists pg_temp.atlas_release_input_ordinal_idx;
+        create unique index atlas_release_input_ordinal_idx on pg_temp.atlas_release_input(ordinal)")?;
     Ok(())
 }
 
 // The connection-local table is reused when a pool connection is reused. A
 // commit or rollback leaves no rows for the next save.
-// COPY ordinals are unique within each truncated batch. Their key lets the
-// accepted-winner update look up a row without repeatedly scanning the batch.
 const CREATE_STAGE: &str = "
     set local synchronous_commit = on;
     create temporary table if not exists pg_temp.atlas_release_input (
-        ordinal bigint primary key,
+        ordinal bigint not null,
         identity_key bytea not null,
         is_collection boolean not null,
         name text not null,
