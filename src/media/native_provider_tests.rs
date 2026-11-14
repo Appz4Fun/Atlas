@@ -1,6 +1,322 @@
+//! The 36 provider contracts on their real original-owner cache backend.
+//! Each ignored LIB parent owns a fresh schema and a single isolated child.
+
+use std::{
+    io::{self, Read, Write},
+    path::{Path, PathBuf},
+    process::{Child, Command, ExitStatus, Stdio},
+    sync::Arc,
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
+};
+
+#[path = "../../tests/common/http.rs"]
+mod fixture_http;
+
+const CHILD_CASE: &str = "ATLAS_NATIVE_PROVIDER_CASE";
+const CHILD_SCHEMA: &str = "ATLAS_NATIVE_PROVIDER_SCHEMA";
+const SELECTOR_PREFIX: &str = "media::native_provider_tests::";
+const LOG_BYTES: usize = 64 * 1024;
+const CHILD_DEADLINE: Duration = Duration::from_secs(120);
+
+// This is the only case registry: it supplies registration and child dispatch.
+macro_rules! provider_cases {
+    ($register:ident) => {
+        $register! {
+            a_hit_takes_one_call,
+            an_aka_matches,
+            a_country_mismatch_falls_to_search,
+            a_year_mismatch_falls_to_search,
+            a_404_falls_to_search_then_misses_in_two_calls,
+            a_wrong_show_is_rejected,
+            a_429_pauses_for_retry_after,
+            a_500_pauses_and_doubles,
+            a_connection_refused_pauses,
+            bad_json_is_bad_not_a_miss,
+            the_bucket_paces_requests,
+            a_two_request_lookup_finishes_at_the_lowest_rate,
+            an_oversized_name_is_no_candidate,
+            a_redirect_isnt_followed,
+            no_token_within_two_seconds_gives_paused,
+            a_huge_body_is_refused,
+            tmdb_tv_takes_two_calls_and_finds_external_ids,
+            tmdb_movie_passes_the_year_and_finds_imdb,
+            tmdb_miss_takes_one_call,
+            tmdb_picks_the_best_of_many,
+            tmdb_null_ids_are_none,
+            tmdb_401_is_bad_key_and_records_nothing,
+            tmdb_key_never_reaches_the_log,
+            trakt_sends_its_headers,
+            trakt_movie_finds_all_its_ids,
+            trakt_miss_is_an_empty_list,
+            a_client_is_a_public_type,
+            tvdb_logs_in_once_and_finds_its_ids,
+            tvdb_matches_an_alias_a_country_and_a_year,
+            tvdb_asks_only_for_tv,
+            a_refused_tvdb_key_pauses_and_says_nothing_of_it,
+            a_token_it_stops_taking_logs_in_again,
+            a_login_with_no_token_is_bad_not_a_miss,
+            an_empty_tvdb_search_is_a_miss,
+            a_translated_name_matches,
+            a_pin_goes_with_the_key_when_there_is_one,
+        }
+    };
+}
+
+macro_rules! register_cases {
+    ($($case:ident),+ $(,)?) => {
+        fn case_body(name: &str) -> Option<fn()> {
+            match name {
+                $(stringify!($case) => Some(cases::$case),)+
+                _ => None,
+            }
+        }
+        $(
+            #[test]
+            #[ignore = "requires explicit isolated PostgreSQL and the owned native provider child"]
+            fn $case() {
+                run_case(stringify!($case));
+            }
+        )+
+    };
+}
+provider_cases!(register_cases);
+
+struct Log {
+    kept: Vec<u8>,
+    overflow: bool,
+}
+
+// Retain a bounded prefix but keep draining: an overlong child cannot fill a pipe.
+fn drain_log(mut stream: impl Read) -> io::Result<Log> {
+    let mut kept = Vec::new();
+    let mut overflow = false;
+    let mut chunk = [0u8; 4096];
+    loop {
+        let count = match stream.read(&mut chunk) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if count == 0 {
+            break;
+        }
+        let admitted = count.min(LOG_BYTES - kept.len());
+        kept.extend_from_slice(&chunk[..admitted]);
+        overflow |= admitted != count;
+    }
+    Ok(Log { kept, overflow })
+}
+
+// Declared after Schema/home in run_case, so cleanup runs before either drops.
+struct OwnedChild {
+    child: Child,
+    reaped: bool,
+    out: Option<JoinHandle<io::Result<Log>>>,
+    err: Option<JoinHandle<io::Result<Log>>>,
+}
+
+impl OwnedChild {
+    fn new(child: Child) -> Self {
+        let mut owned = Self {
+            child,
+            reaped: false,
+            out: None,
+            err: None,
+        };
+        let out = owned.child.stdout.take().expect("owned child stdout pipe");
+        let err = owned.child.stderr.take().expect("owned child stderr pipe");
+        owned.out = Some(thread::spawn(move || drain_log(out)));
+        owned.err = Some(thread::spawn(move || drain_log(err)));
+        owned
+    }
+
+    fn terminate_if_unreaped(&mut self) {
+        if !self.reaped {
+            let _ = self.child.kill();
+            if self.child.wait().is_ok() {
+                self.reaped = true;
+            }
+        }
+    }
+
+    fn wait(&mut self) -> io::Result<(ExitStatus, bool)> {
+        let until = Instant::now() + CHILD_DEADLINE;
+        loop {
+            if let Some(status) = self.child.try_wait()? {
+                self.reaped = true;
+                return Ok((status, false));
+            }
+            if Instant::now() >= until {
+                // The child has not been reaped; terminate before waiting.
+                let _ = self.child.kill();
+                let status = self.child.wait()?;
+                self.reaped = true;
+                return Ok((status, true));
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn logs(&mut self) -> (io::Result<Log>, io::Result<Log>) {
+        fn join(reader: JoinHandle<io::Result<Log>>) -> io::Result<Log> {
+            reader.join().map_err(|_| io::Error::other("owned log reader panicked"))?
+        }
+        // Join both even when either reader reports an I/O failure.
+        let out = join(self.out.take().expect("owned stdout reader"));
+        let err = join(self.err.take().expect("owned stderr reader"));
+        (out, err)
+    }
+}
+
+impl Drop for OwnedChild {
+    fn drop(&mut self) {
+        self.terminate_if_unreaped();
+        if let Some(reader) = self.out.take() {
+            let _ = reader.join();
+        }
+        if let Some(reader) = self.err.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+fn private_directory(path: &Path) {
+    std::fs::create_dir(path).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}
+
+fn write_config(home: &Path, schema: &crate::pg::testing::Schema) {
+    let mut config = toml_edit::DocumentMut::new();
+    config["storage"]["backend"] = toml_edit::value("postgres");
+    config["storage"]["url"] = toml_edit::value(schema.url.as_str());
+    config["storage"]["schema"] = toml_edit::value(schema.name.as_str());
+    config["storage"]["max_connections"] = toml_edit::value(1);
+    config["storage"]["allow_plaintext"] = toml_edit::value(true);
+    config["header_store"]["enabled"] = toml_edit::value(true);
+    config["header_store"]["dir"] = toml_edit::value(home.join("headers").to_str().unwrap());
+    config["postprocess"]["enabled"] = toml_edit::value(false);
+    config["predb"]["enabled"] = toml_edit::value(false);
+    config["spots"]["enabled"] = toml_edit::value(false);
+    config["media"]["tvmaze"]["enabled"] = toml_edit::value(false);
+    config["media"]["allocine"]["enabled"] = toml_edit::value(false);
+    config["media"]["details_per_minute"] = toml_edit::value(0);
+    config["inferred_parts"] = toml_edit::value(false);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let pending = home.join("config.toml.new");
+    let mut file = options.open(&pending).unwrap();
+    file.write_all(config.to_string().as_bytes()).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    std::fs::rename(pending, home.join("config.toml")).unwrap();
+}
+
+struct OwnedRuntime(crate::pg::indexer_runtime::Runtime);
+impl Drop for OwnedRuntime {
+    fn drop(&mut self) {
+        self.0.owner.close();
+    }
+}
+
+fn completion(case: &str) -> String {
+    format!("owned native provider case completed: {case}")
+}
+
+fn configured_case(case: &str, body: fn()) {
+    let home = PathBuf::from(std::env::var_os("ATLAS_HOME").expect("private child home"));
+    let config = crate::config::load_config().expect("selected private fixture configuration");
+    let storage = crate::config::checked_storage_config().expect("checked private PostgreSQL destination");
+    assert_eq!(storage.schema, std::env::var(CHILD_SCHEMA).expect("parent-owned schema"));
+    let headers = crate::config::header_store_config();
+    assert!(headers.enabled);
+    assert_eq!(headers.root(), home.join("headers"));
+    let runtime = OwnedRuntime(
+        crate::pg::indexer_runtime::Runtime::open(&config, storage, headers.clone(), &[], &mut None)
+            .expect("real original native owner admission"),
+    );
+    assert_eq!(runtime.0.configured_headers(), headers);
+    assert!(runtime.0.header_config().unwrap().root().starts_with(home.join("headers")));
+    let cache = Arc::new(crate::pg::service_cache::Cache::new(&runtime.0.owner).unwrap());
+    cache.check().expect("actual owner/config/epoch/cache preflight");
+    let retained = cache.clone();
+    // A constructor context, NOT an Owner::with callback or transaction over HTTP.
+    super::cache::native(cache, body);
+    retained.check().expect("same original owner remains valid after the case");
+    assert_eq!(runtime.0.owner.failure(), None, "provider case must not fail its native owner");
+    drop(retained);
+    drop(runtime);
+    // Every provider/server fixture has returned and the owner has closed.
+    println!("{}", completion(case));
+}
+
+fn run_case(case: &str) {
+    let body = case_body(case).expect("closed provider case registry");
+    if let Some(selected) = std::env::var_os(CHILD_CASE) {
+        assert_eq!(selected.to_str(), Some(case), "mismatched owned child case");
+        configured_case(case, body);
+        return;
+    }
+    assert!(cfg!(unix), "native provider fixture requires private Unix file permissions");
+    let schema = crate::pg::testing::Schema::new().expect("ATLAS_PG_TEST_URL must select isolated PostgreSQL");
+    let home = tempfile::tempdir().unwrap();
+    private_directory(&home.path().join("tmp"));
+    private_directory(&home.path().join("headers"));
+    write_config(home.path(), &schema);
+    let selector = format!("{SELECTOR_PREFIX}{case}");
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", selector.as_str(), "--nocapture", "--test-threads=1"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", home.path())
+        .env("ATLAS_HOME", home.path())
+        .env("TMPDIR", home.path().join("tmp"))
+        .env("TMP", home.path().join("tmp"))
+        .env("ATLAS_SAB_DIR", home.path().join("no-sabnzbd"))
+        .env("ATLAS_NO_KEYRING", "1")
+        .env(CHILD_CASE, case)
+        .env(CHILD_SCHEMA, &schema.name)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("owned provider child spawn");
+    let mut child = OwnedChild::new(child);
+    let waited = child.wait();
+    if waited.is_err() {
+        child.terminate_if_unreaped();
+    }
+    let (out, err) = child.logs();
+    // Drop reaps on a wait error and joins any remaining readers before Schema.
+    drop(child);
+    let (status, timed_out) = waited.expect("owned provider child wait");
+    let out = out.expect("owned provider stdout drain");
+    let err = err.expect("owned provider stderr drain");
+    assert!(!timed_out, "owned provider case {case} exceeded its 120-second deadline");
+    assert!(!out.overflow && !err.overflow, "owned provider case {case} exceeded its per-pipe 64-KiB log cap");
+    // Do not copy raw child output into parent failures: it can contain a driver
+    // diagnostic about the private selected destination. Status/case identifies
+    // the exact isolated assertion for Root's separately owned diagnostics.
+    assert!(status.success(), "owned native provider case {case} failed: {status}; child output kept private");
+    let marker = completion(case);
+    assert_eq!(String::from_utf8_lossy(&out.kept).matches(&marker).count(), 1, "missing owned case completion");
+    // stderr is drained and admitted even when successful libtest writes none.
+    drop(err);
+    drop(home);
+    drop(schema);
+}
+
+mod cases {
 //! The providers, each against a loopback server answering from fixtures.
 
-mod common;
+use crate as atlas;
 
 use std::time::{Duration, Instant};
 
@@ -12,7 +328,7 @@ use atlas::media::tmdb::Tmdb;
 use atlas::media::trakt::Trakt;
 use atlas::media::tvdb::Tvdb;
 use atlas::media::tvmaze::Tvmaze;
-use common::http::*;
+use super::fixture_http::*;
 
 const FAST: i64 = 600_000;
 
@@ -64,8 +380,7 @@ fn search() -> Route {
     route("/search/shows", fixture("tvmaze_search.json"))
 }
 
-#[test]
-fn a_hit_takes_one_call() {
+pub(super) fn a_hit_takes_one_call() {
     let s = FixtureServer::start(vec![single()]);
     let ids = found(maze(&s, FAST).find(&tv("Some Show")));
     assert_eq!(ids.tvmaze, Some(101));
@@ -77,22 +392,19 @@ fn a_hit_takes_one_call() {
     assert_eq!(requests[0], "/singlesearch/shows?q=Some%20Show&embed=akas");
 }
 
-#[test]
-fn an_aka_matches() {
+pub(super) fn an_aka_matches() {
     let s = FixtureServer::start(vec![single()]);
     assert_eq!(found(maze(&s, FAST).find(&tv("Some Alias"))).tvmaze, Some(101));
 }
 
-#[test]
-fn a_country_mismatch_falls_to_search() {
+pub(super) fn a_country_mismatch_falls_to_search() {
     let s = FixtureServer::start(vec![single(), search()]);
     let q = TitleQuery { country: Some("UK"), ..tv("Some Show") };
     assert_eq!(found(maze(&s, FAST).find(&q)).tvmaze, Some(103));
     assert_eq!(s.requests().len(), 2);
 }
 
-#[test]
-fn a_year_mismatch_falls_to_search() {
+pub(super) fn a_year_mismatch_falls_to_search() {
     let s = FixtureServer::start(vec![single()]);
     let q = TitleQuery { year: Some(1990), ..tv("Some Show") };
     assert_eq!(maze(&s, FAST).find(&q), Ok(Answer::NotFound));
@@ -100,22 +412,19 @@ fn a_year_mismatch_falls_to_search() {
     assert!(s.requests()[1].starts_with("/search/shows"));
 }
 
-#[test]
-fn a_404_falls_to_search_then_misses_in_two_calls() {
+pub(super) fn a_404_falls_to_search_then_misses_in_two_calls() {
     let s = FixtureServer::start(vec![]);
     assert_eq!(maze(&s, FAST).find(&tv("Some Show")), Ok(Answer::NotFound));
     assert_eq!(s.requests().len(), 2);
 }
 
-#[test]
-fn a_wrong_show_is_rejected() {
+pub(super) fn a_wrong_show_is_rejected() {
     let s = FixtureServer::start(vec![single(), search()]);
     assert_eq!(maze(&s, FAST).find(&tv("Another Thing")), Ok(Answer::NotFound));
     assert_eq!(s.requests().len(), 2);
 }
 
-#[test]
-fn a_429_pauses_for_retry_after() {
+pub(super) fn a_429_pauses_for_retry_after() {
     let limited = Route { headers: vec![("Retry-After", "120".into())], ..status("/singlesearch/shows", 429) };
     let s = FixtureServer::start(vec![limited]);
     let p = maze(&s, FAST);
@@ -125,8 +434,7 @@ fn a_429_pauses_for_retry_after() {
     assert_eq!(s.requests().len(), 1, "no request while paused");
 }
 
-#[test]
-fn a_500_pauses_and_doubles() {
+pub(super) fn a_500_pauses_and_doubles() {
     let s = FixtureServer::start(vec![status("/singlesearch/shows", 500)]);
     let p = maze(&s, FAST);
     let Err(Trouble::Paused(t)) = p.find(&tv("Some Show")) else { panic!("not paused") };
@@ -142,8 +450,7 @@ fn a_500_pauses_and_doubles() {
     near(t, 60);
 }
 
-#[test]
-fn a_connection_refused_pauses() {
+pub(super) fn a_connection_refused_pauses() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
@@ -152,14 +459,12 @@ fn a_connection_refused_pauses() {
     assert!(matches!(Tvmaze::new(&cfg).find(&tv("Some Show")), Err(Trouble::Paused(_))));
 }
 
-#[test]
-fn bad_json_is_bad_not_a_miss() {
+pub(super) fn bad_json_is_bad_not_a_miss() {
     let s = FixtureServer::start(vec![route("/singlesearch/shows", "<html>".into())]);
     assert!(matches!(maze(&s, FAST).find(&tv("Some Show")), Err(Trouble::Bad(_))));
 }
 
-#[test]
-fn the_bucket_paces_requests() {
+pub(super) fn the_bucket_paces_requests() {
     let s = FixtureServer::start(vec![single()]);
     let p = maze(&s, 120);
     let start = Instant::now();
@@ -169,8 +474,7 @@ fn the_bucket_paces_requests() {
     assert!(start.elapsed() >= Duration::from_millis(1_900), "{:?}", start.elapsed());
 }
 
-#[test]
-fn a_two_request_lookup_finishes_at_the_lowest_rate() {
+pub(super) fn a_two_request_lookup_finishes_at_the_lowest_rate() {
     let s = FixtureServer::start(vec![
         route("/search/tv", fixture("tmdb_search_tv.json")),
         route("/tv/401/external_ids", fixture("tmdb_tv_ids.json")),
@@ -193,8 +497,7 @@ fn a_two_request_lookup_finishes_at_the_lowest_rate() {
     assert!(requests[1].starts_with("/search/shows"));
 }
 
-#[test]
-fn an_oversized_name_is_no_candidate() {
+pub(super) fn an_oversized_name_is_no_candidate() {
     let name = "Some Show ".repeat(100_000);
     let show = serde_json::json!({"id": 101, "name": name, "premiered": "2015-03-02", "_embedded": {"akas": [{"name": "Some Alias"}]}});
     let s = FixtureServer::start(vec![route("/singlesearch/shows", show.to_string())]);
@@ -203,8 +506,7 @@ fn an_oversized_name_is_no_candidate() {
     assert!(title.len() <= 255, "{}", title.len());
 }
 
-#[test]
-fn a_redirect_isnt_followed() {
+pub(super) fn a_redirect_isnt_followed() {
     let elsewhere = FixtureServer::start(vec![single()]);
     let redirect = Route {
         headers: vec![("Location", format!("{}/singlesearch/shows", elsewhere.base))],
@@ -215,8 +517,7 @@ fn a_redirect_isnt_followed() {
     assert!(elsewhere.requests().is_empty());
 }
 
-#[test]
-fn no_token_within_two_seconds_gives_paused() {
+pub(super) fn no_token_within_two_seconds_gives_paused() {
     let s = FixtureServer::start(vec![single()]);
     let p = maze(&s, 1);
     found(p.find(&tv("Some Show")));
@@ -226,15 +527,13 @@ fn no_token_within_two_seconds_gives_paused() {
     assert_eq!(s.requests().len(), 1);
 }
 
-#[test]
-fn a_huge_body_is_refused() {
+pub(super) fn a_huge_body_is_refused() {
     let huge = format!("[{}]", " ".repeat(3 << 20));
     let s = FixtureServer::start(vec![route("/singlesearch/shows", huge)]);
     assert!(matches!(maze(&s, FAST).find(&tv("Some Show")), Err(Trouble::Bad(_))));
 }
 
-#[test]
-fn tmdb_tv_takes_two_calls_and_finds_external_ids() {
+pub(super) fn tmdb_tv_takes_two_calls_and_finds_external_ids() {
     let s = FixtureServer::start(vec![
         route("/search/tv", fixture("tmdb_search_tv.json")),
         route("/tv/401/external_ids", fixture("tmdb_tv_ids.json")),
@@ -244,8 +543,7 @@ fn tmdb_tv_takes_two_calls_and_finds_external_ids() {
     assert_eq!(s.requests().len(), 2);
 }
 
-#[test]
-fn tmdb_movie_passes_the_year_and_finds_imdb() {
+pub(super) fn tmdb_movie_passes_the_year_and_finds_imdb() {
     let s = FixtureServer::start(vec![
         route("/search/movie", fixture("tmdb_search_movie.json")),
         route("/movie/501/external_ids", fixture("tmdb_movie_ids.json")),
@@ -258,15 +556,13 @@ fn tmdb_movie_passes_the_year_and_finds_imdb() {
     }
 }
 
-#[test]
-fn tmdb_miss_takes_one_call() {
+pub(super) fn tmdb_miss_takes_one_call() {
     let s = FixtureServer::start(vec![route("/search/tv", fixture("tmdb_empty.json"))]);
     assert_eq!(tmdb(&s, FAST).find(&tv("Some Show")), Ok(Answer::NotFound));
     assert_eq!(s.requests().len(), 1);
 }
 
-#[test]
-fn tmdb_picks_the_best_of_many() {
+pub(super) fn tmdb_picks_the_best_of_many() {
     let results = serde_json::json!({"results": [
         {"id": 1, "name": "Some Show Again", "first_air_date": "2015-01-01"},
         {"id": 2, "name": "Some Shows", "first_air_date": "2015-01-01"},
@@ -279,8 +575,7 @@ fn tmdb_picks_the_best_of_many() {
     assert_eq!(found(tmdb(&s, FAST).find(&tv("Some Show"))).tmdb, Some(3));
 }
 
-#[test]
-fn tmdb_null_ids_are_none() {
+pub(super) fn tmdb_null_ids_are_none() {
     let s = FixtureServer::start(vec![
         route("/search/tv", fixture("tmdb_search_tv.json")),
         route("/tv/401/external_ids", r#"{"imdb_id":null,"tvdb_id":null}"#.into()),
@@ -289,15 +584,13 @@ fn tmdb_null_ids_are_none() {
     assert_eq!((ids.tmdb, ids.imdb, ids.tvdb), (Some(401), None, None));
 }
 
-#[test]
-fn tmdb_401_is_bad_key_and_records_nothing() {
+pub(super) fn tmdb_401_is_bad_key_and_records_nothing() {
     let s = FixtureServer::start(vec![status("/search/tv", 401)]);
     let Err(Trouble::BadKey(t)) = tmdb(&s, FAST).find(&tv("Some Show")) else { panic!("not a bad key") };
     near(t, 3_600);
 }
 
-#[test]
-fn tmdb_key_never_reaches_the_log() {
+pub(super) fn tmdb_key_never_reaches_the_log() {
     let mut answers = Vec::new();
     for route in [
         status("/search/tv", 401),
@@ -314,8 +607,7 @@ fn tmdb_key_never_reaches_the_log() {
     }
 }
 
-#[test]
-fn trakt_sends_its_headers() {
+pub(super) fn trakt_sends_its_headers() {
     let s = FixtureServer::start(vec![route("/search/show", fixture("trakt_show.json"))]);
     let ids = found(trakt(&s).find(&tv("Some Show")));
     assert_eq!(
@@ -328,21 +620,18 @@ fn trakt_sends_its_headers() {
     assert_eq!(of("trakt-api-key"), Some("ID"));
 }
 
-#[test]
-fn trakt_movie_finds_all_its_ids() {
+pub(super) fn trakt_movie_finds_all_its_ids() {
     let s = FixtureServer::start(vec![route("/search/movie", fixture("trakt_movie.json"))]);
     let ids = found(trakt(&s).find(&movie("Some Movie", Some(2019))));
     assert_eq!((ids.trakt, ids.imdb, ids.tmdb), (Some(602), Some(200002), Some(501)));
 }
 
-#[test]
-fn trakt_miss_is_an_empty_list() {
+pub(super) fn trakt_miss_is_an_empty_list() {
     let s = FixtureServer::start(vec![route("/search/show", "[]".into())]);
     assert_eq!(trakt(&s).find(&tv("Some Show")), Ok(Answer::NotFound));
 }
 
-#[test]
-fn a_client_is_a_public_type() {
+pub(super) fn a_client_is_a_public_type() {
     // the two hooks a test needs are reachable, and nothing else about a client is
     let _ = Client::new("x", "http://127.0.0.1:1", 1);
 }
@@ -360,8 +649,7 @@ fn tvdb_routes() -> Vec<Route> {
     vec![route("/login", fixture("tvdb_login.json")), route("/search", fixture("tvdb_search.json"))]
 }
 
-#[test]
-fn tvdb_logs_in_once_and_finds_its_ids() {
+pub(super) fn tvdb_logs_in_once_and_finds_its_ids() {
     let s = FixtureServer::start(tvdb_routes());
     let p = tvdb(&s);
     let ids = found(p.find(&tv("Some Show")));
@@ -375,8 +663,7 @@ fn tvdb_logs_in_once_and_finds_its_ids() {
     assert_eq!(auth, Some("Bearer T0KEN"));
 }
 
-#[test]
-fn tvdb_matches_an_alias_a_country_and_a_year() {
+pub(super) fn tvdb_matches_an_alias_a_country_and_a_year() {
     let s = FixtureServer::start(tvdb_routes());
     let p = tvdb(&s);
     assert_eq!(found(p.find(&tv("Some Alias"))).tvdb, Some(3001));
@@ -387,14 +674,12 @@ fn tvdb_matches_an_alias_a_country_and_a_year() {
     assert_eq!(p.find(&tv("Another Thing")), Ok(Answer::NotFound));
 }
 
-#[test]
-fn tvdb_asks_only_for_tv() {
+pub(super) fn tvdb_asks_only_for_tv() {
     let s = FixtureServer::start(tvdb_routes());
     assert!(tvdb(&s).asks(Kind::Tv) && !tvdb(&s).asks(Kind::Movie));
 }
 
-#[test]
-fn a_refused_tvdb_key_pauses_and_says_nothing_of_it() {
+pub(super) fn a_refused_tvdb_key_pauses_and_says_nothing_of_it() {
     let s = FixtureServer::start(vec![status("/login", 401)]);
     let answer = tvdb(&s).find(&tv("Some Show"));
     let Err(Trouble::BadKey(t)) = &answer else { panic!("{answer:?}") };
@@ -402,8 +687,7 @@ fn a_refused_tvdb_key_pauses_and_says_nothing_of_it() {
     assert!(!format!("{answer:?}").contains("SECRETK"));
 }
 
-#[test]
-fn a_token_it_stops_taking_logs_in_again() {
+pub(super) fn a_token_it_stops_taking_logs_in_again() {
     let s = FixtureServer::start(tvdb_routes());
     let p = tvdb(&s);
     found(p.find(&tv("Some Show")));
@@ -415,14 +699,12 @@ fn a_token_it_stops_taking_logs_in_again() {
     assert_eq!(s.requests().iter().filter(|r| r.starts_with("/login")).count(), 2);
 }
 
-#[test]
-fn a_login_with_no_token_is_bad_not_a_miss() {
+pub(super) fn a_login_with_no_token_is_bad_not_a_miss() {
     let s = FixtureServer::start(vec![route("/login", r#"{"status":"failure"}"#.into())]);
     assert!(matches!(tvdb(&s).find(&tv("Some Show")), Err(Trouble::Bad(_))));
 }
 
-#[test]
-fn an_empty_tvdb_search_is_a_miss() {
+pub(super) fn an_empty_tvdb_search_is_a_miss() {
     let s = FixtureServer::start(vec![
         route("/login", fixture("tvdb_login.json")),
         route("/search", r#"{"data":[]}"#.into()),
@@ -430,8 +712,7 @@ fn an_empty_tvdb_search_is_a_miss() {
     assert_eq!(tvdb(&s).find(&tv("Some Show")), Ok(Answer::NotFound));
 }
 
-#[test]
-fn a_translated_name_matches() {
+pub(super) fn a_translated_name_matches() {
     let item = serde_json::json!({"data": [{"name": "Originaltitel", "tvdb_id": "3001", "translations": {"eng": "Some Show", "fra": "Une Serie"}, "name_translated": "Another Name"}]});
     let s = FixtureServer::start(vec![route("/login", fixture("tvdb_login.json")), route("/search", item.to_string())]);
     let p = tvdb(&s);
@@ -440,8 +721,7 @@ fn a_translated_name_matches() {
     assert_eq!(found(p.find(&tv("Another Name"))).tvdb, Some(3001));
 }
 
-#[test]
-fn a_pin_goes_with_the_key_when_there_is_one() {
+pub(super) fn a_pin_goes_with_the_key_when_there_is_one() {
     let s = FixtureServer::start(tvdb_routes());
     found(tvdb(&s).find(&tv("Some Show")));
     assert_eq!(
@@ -461,4 +741,6 @@ fn a_pin_goes_with_the_key_when_there_is_one() {
         serde_json::from_str::<serde_json::Value>(&s.body_of(0)).unwrap(),
         serde_json::json!({"apikey": "SECRETK", "pin": "1234"})
     );
+}
+
 }
