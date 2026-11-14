@@ -334,3 +334,7 @@ pub(crate) async fn run_with_drain(owner:Arc<Owner>,db:crate::indexer::Db,header
 #[cfg(test)]
 #[path = "../../tests/common/native_mixed_contract.rs"]
 mod mixed_contract;
+
+#[cfg(test)]
+#[path="native_publication_tests.rs"]
+mod publication_tests;
