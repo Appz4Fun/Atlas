@@ -1,10 +1,12 @@
 //! Small durable summaries and nullable group marks, never a release/NXV scan.
-use super::{Inventory,Metric,MAX_ROWS,MAX_BYTES};
+use super::{Inventory,Metric,capacity};
 use anyhow::{Result,ensure,Context};
 use std::{collections::BTreeMap,sync::atomic::{AtomicBool,Ordering}};
 use crate::metrics::{names::*,ObservedValue};
 
 const PRESENCE:&str="atlas_native_group_present";
+const MAX_GROUP_ROWS:usize=10000;
+const MAX_WORKSPACE:usize=8*1024*1024;
 pub(super) fn owns(family:&str)->bool {
     [CATALOG_RELEASES.name,CATALOG_BYTES.name,GROUP_ARTICLE.name,GROUP_BACKFILL.name,GROUP_POSTED.name,GROUP_CHUNKS.name,GROUP_CHUNK_DAYS.name,PRESENCE].contains(&family)
 }
@@ -14,7 +16,7 @@ fn gauge(out:&mut Inventory,family:&'static str,keys:&[(&str,&str)],value:i128)-
 }
 fn workspace(bytes:&mut usize,name:&str,overhead:usize)->Result<()> {
     *bytes=bytes.checked_add(name.len()*2+overhead).context("native group workspace overflow")?;
-    ensure!(*bytes<=MAX_BYTES,"native group workspace exceeds observation admission");Ok(())
+    capacity(*bytes<=MAX_WORKSPACE)
 }
 fn stop(stop:&AtomicBool)->Result<()> {
     if stop.load(Ordering::Acquire) {return Err(crate::pg::outage::AttemptEnded.into())}Ok(())
@@ -40,7 +42,7 @@ pub(super) fn append(tx:&mut postgres::Transaction<'_>,out:&mut Inventory,stoppi
         let rows=tx.query("select case when octet_length(group_name)<=4096 then group_name end,total,complete,nzb_ready,named,still_obfuscated,predb_matched,bytes from native_metric_catalog_groups where ($1::text is null or group_name>$1) order by group_name limit 128",&[&after])?;
         let count=rows.len();
         for row in rows {
-            seen+=1;ensure!(seen<=MAX_ROWS,"native catalog group inventory exceeds observation admission");
+            seen+=1;capacity(seen<=MAX_GROUP_ROWS)?;
             let group:String=row.try_get(0)?;after=Some(group.clone());
             if crate::filters::group_blocked(&group) {continue}
             for (i,total) in totals.iter_mut().enumerate() {*total=total.checked_add(i128::from(row.try_get::<_,i64>(i+1)?)).context("native catalog summary overflow")?;}
@@ -55,7 +57,7 @@ pub(super) fn append(tx:&mut postgres::Transaction<'_>,out:&mut Inventory,stoppi
         let rows=tx.query("select case when octet_length(name)<=4096 then name end,first_article,last_article,backfill_cursor,live_cursor,low_posted,high_posted from groups where ($1::text is null or name>$1) order by name limit 128",&[&after])?;
         let count=rows.len();
         for row in rows {
-            seen+=1;ensure!(seen<=MAX_ROWS,"native cursor inventory exceeds observation admission");
+            seen+=1;capacity(seen<=MAX_GROUP_ROWS)?;
             let key:String=row.try_get(0)?;after=Some(key.clone());let name=key.split('@').next().unwrap_or(&key).to_owned();
             let candidate=Group {marks:[row.try_get(1)?,row.try_get(2)?,row.try_get(3)?,row.try_get(4)?],posted:[row.try_get(5)?,row.try_get(6)?]};
             // Select one actual provider row. Never combine another account's
@@ -73,7 +75,7 @@ pub(super) fn append(tx:&mut postgres::Transaction<'_>,out:&mut Inventory,stoppi
         let rows=tx.query("select case when octet_length(grp)<=4096 then grp end,total,done,oldest_day,newest_day,oldest_done_day from native_metric_chunk_groups where ($1::text is null or grp>$1) order by grp limit 128",&[&after])?;
         let count=rows.len();
         for row in rows {
-            seen+=1;ensure!(seen<=MAX_ROWS,"native chunk group inventory exceeds observation admission");
+            seen+=1;capacity(seen<=MAX_GROUP_ROWS)?;
             let name:String=row.try_get(0)?;after=Some(name.clone());
             if !groups.contains_key(&name) {workspace(&mut owned,&name,512)?;}
             workspace(&mut owned,&name,256)?;groups.entry(name.clone()).or_default();

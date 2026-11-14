@@ -220,7 +220,7 @@ pub(super) fn start_inferred(owner:&Arc<Owner>,mut service:crate::inferred::nati
 fn start_publication(owner:&Arc<Owner>,telemetry:Option<super::telemetry::Producer>,lanes:Option<Arc<LaneCounters>>,handles:&mut Vec<Worker>)->Result<()> {
     let owner_work=owner.clone();
     handles.push(spawn(owner,"atlas-native-observation".into(),move|| {
-        let mut observed=None;
+        let mut next_observation=Instant::now();
         let mut next_stats=Instant::now();
         while !owner_work.stop.load(Ordering::Acquire) {
             if let Some(telemetry)=&telemetry && Instant::now()>=next_stats {
@@ -230,8 +230,12 @@ fn start_publication(owner:&Arc<Owner>,telemetry:Option<super::telemetry::Produc
                 };
                 next_stats=Instant::now()+rest;
             }
-            if observed.is_none_or(|at:Instant|at.elapsed()>=Duration::from_secs(30)) {
-                crate::pg::stage_telemetry::capture(&owner_work,lanes.as_deref())?;observed=Some(Instant::now());
+            if Instant::now()>=next_observation {
+                let rest=match crate::pg::stage_telemetry::capture(&owner_work,lanes.as_deref())? {
+                    crate::pg::stage_telemetry::Capture::Complete=>Duration::from_secs(30),
+                    crate::pg::stage_telemetry::Capture::Deferred(_)=>Duration::from_secs(5),
+                };
+                next_observation=Instant::now()+rest;
             }
             nap(&owner_work,Duration::from_secs(1));
         }Ok(None)
