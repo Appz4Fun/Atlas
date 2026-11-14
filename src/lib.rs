@@ -4,6 +4,7 @@ pub mod ai;
 pub mod api;
 pub mod app;
 pub mod archive;
+pub(crate) mod article_store;
 pub mod atomic;
 pub mod audio;
 pub mod bg_indexer;
