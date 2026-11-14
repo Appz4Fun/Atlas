@@ -334,3 +334,69 @@ fn run_still_donor_case(complete: bool) {
     drop(runner); runtime.owner.close();
     std::fs::write(home.join("finished"),b"done").unwrap();
 }
+
+#[test]
+#[ignore="requires isolated PG; genuine native StillsStep then ImagesStep with default unselected assets"]
+fn native_stills_without_assets_finish_ineligible_releases_before_real_images_step() {
+    for case in ["no-probe","unsupported-codec","no-video"] {run_optional_stills_case(case,false);}
+}
+#[test]
+#[ignore="requires isolated PG; eligible still production must retain the unselected-asset retry"]
+fn native_stills_without_assets_defer_eligible_video_before_later_images_step() {
+    run_optional_stills_case("eligible",true);
+}
+fn run_optional_stills_case(case:&str,eligible:bool) {
+    use crate::{parser::{Article,Release},pg,probe::{ProbeInfo,MediaInfo,media::VideoTrack}};
+    use crate::postprocess::rules::{Rules,RowFacts,BodyGate};
+    let schema=pg::testing::Schema::new().expect("explicit isolated PostgreSQL");let home=tempfile::tempdir().unwrap();
+    let mut config=crate::config::Config::default();assert!(config.native_assets.is_none(),"exercise the actual default optional asset selection");
+    config.postprocess.enabled=false;config.predb.enabled=false;config.spots.enabled=false;config.inferred_parts=false;
+    config.media.tvmaze.enabled=false;config.media.allocine.enabled=false;config.media.details_per_minute=0;
+    let headers=crate::config::HeaderStoreConfig {enabled:true,dir:home.path().join("headers").to_str().unwrap().into()};
+    let runtime=pg::indexer_runtime::Runtime::open(&config,pg::StorageConfig {backend:pg::Backend::Postgres,url:schema.url.clone(),schema:schema.name.clone(),max_connections:1,allow_plaintext:true},headers,&[],&mut None).unwrap();
+    let id=runtime.owner.with(|client| {
+        pg::release_writer::save(client,&[Release {name:format!("Optional.Stills.{case}"),group:"alt.binaries.test".into(),poster:"fixture".into(),date:"Wed, 01 Jan 2020 00:00:00 +0000".into(),
+            articles:vec![Article {filename:Some("video.mkv".into()),subject:"video.mkv yEnc (1/1)".into(),message_id:format!("<optional-stills-{case}@fixture.invalid>"),part:Some(1),total_parts:Some(1),bytes:100,..Default::default()}],..Default::default()}],-100000)?;
+        let id:i64=client.query_one("select id from releases",&[])?.get(0);
+        if case!="no-probe" {
+            let video=if case=="no-video" {Vec::new()} else {vec![VideoTrack {codec:if case=="unsupported-codec" {"V_VP9".into()} else {"V_MPEG4/ISO/AVC".into()},..Default::default()}]};
+            let info=serde_json::to_string(&ProbeInfo {file:Some("video.mkv".into()),media:Some(MediaInfo {container:"matroska".into(),video,..Default::default()}),..Default::default()})?;
+            client.execute("insert into release_probe(release_id,info) values($1,$2)",&[&id,&info])?;
+        }
+        Ok(id)
+    }).unwrap();
+    let listener=TcpListener::bind("127.0.0.1:0").unwrap();listener.set_nonblocking(true).unwrap();
+    let mut account=crate::config::UsenetServer::new("127.0.0.1","fixture","fixture",listener.local_addr().unwrap().port());account.ssl=Some(false);account.connections=Some(1);
+    let pool=Arc::new(crate::nntp::Pool::new(&[account]).with_timeout(Duration::from_secs(1)));
+    let handle=tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+    config.postprocess.enabled=true;config.archive.enabled=true;config.postprocess.body_min_size_bytes=0;config.postprocess.min_completion_percent=0;
+    config.postprocess.settle_secs=1;config.postprocess.complete_settle_secs=1;
+    let stills:Arc<dyn Step>=Arc::new(crate::probe::stills::StillsStep);let images:Arc<dyn Step>=Arc::new(crate::images::step::ImagesStep::default());
+    assert!(stills.enabled(&config)&&images.enabled(&config));assert!(stills.rank()<images.rank());let still_bit=mask(stills.id());let image_bit=mask(images.id());let both=still_bit|image_bit;
+    let reads=pg::stage_reads::StepReads::for_owner(&runtime.owner).unwrap();let row=reads.snapshot(id).unwrap().unwrap();
+    let facts=RowFacts {group:&row.info.group,name:&row.info.name,size:row.info.size,parts:row.info.parts,complete:row.info.complete,file_total:row.info.file_total};
+    assert!(matches!(crate::postprocess::rules::body_gate(&Rules::new(&config.postprocess),&facts,&row.summary),BodyGate::Open),"the real steps must run, not merely be marked outside the body gate");
+    let mut runner=Runner::new(&runtime.owner,&config,pool.clone(),handle.handle().clone()).unwrap();
+    runner.steps=Steps {ordered:vec![stills,images],enabled:both,database:0,network:both,on_growth:both,stamps:Vec::new()};
+    let queue=Queue::for_owner(&runtime.owner).unwrap();let db=queue.claim(10,1,60).unwrap().pop().unwrap();
+    assert_eq!(runner.database(&db,0,10).unwrap().settle(&queue,&db,11).unwrap(),Settlement::Applied);
+    let first=queue.claim_net(12,1,60,0).unwrap().pop().unwrap();assert_eq!(first.release_id(),id);
+    assert_eq!(runner.network(&queue,&first,12).unwrap().unwrap().settle(&queue,&first,13).unwrap(),Settlement::Applied);
+    runtime.owner.with(|client| {
+        let row=client.query_one("select done,net_wanted,net_left,net_transient,last_error from pp_state where release_id=$1",&[&id])?;
+        if eligible {
+            assert_eq!(row.get::<_,i64>(0)&both,0);assert_eq!(row.get::<_,Option<bool>>(1),Some(true));assert_eq!(row.get::<_,Option<i64>>(2),Some(both));assert_eq!(row.get::<_,Option<i64>>(3),Some(1));
+            assert!(row.get::<_,Option<String>>(4).unwrap().contains("native still namespace has not been selected"));
+        } else {assert_eq!(row.get::<_,i64>(0)&still_bit,still_bit);assert_eq!(row.get::<_,i64>(0)&image_bit,0);assert_eq!(row.get::<_,Option<i64>>(2),Some(image_bit));}
+        Ok(())
+    }).unwrap();
+    if !eligible {
+        let second=queue.claim_net(14,1,60,0).unwrap().pop().expect("the actual later ImagesStep remains immediately runnable");
+        assert_eq!(runner.network(&queue,&second,14).unwrap().unwrap().settle(&queue,&second,15).unwrap(),Settlement::Applied);
+        runtime.owner.with(|client| {assert_eq!(client.query_one("select done from pp_state where release_id=$1",&[&id])?.get::<_,i64>(0)&both,both);Ok(())}).unwrap();
+        assert_eq!(runner.stats.steps_done.load(Ordering::Relaxed),2,"both real NET step implementations completed");
+    } else {assert!(queue.claim_net(14,1,60,0).unwrap().is_empty());assert_eq!(runner.stats.steps_done.load(Ordering::Relaxed),0);}
+    runtime.owner.with(|client| {assert_eq!(client.query_one("select count(*) from release_stills",&[])?.get::<_,i64>(0),0);assert_eq!(client.query_one("select count(*) from ext_asset_files",&[])?.get::<_,i64>(0),0);Ok(())}).unwrap();
+    assert!(matches!(listener.accept(),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock),"optional still eligibility/refusal must not contact a provider");
+    assert_eq!(runtime.owner.failure(),None);handle.block_on(pool.close());drop(runner);runtime.owner.close();
+}

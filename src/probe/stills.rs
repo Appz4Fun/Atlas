@@ -665,6 +665,29 @@ impl Step for StillsStep {
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let release_id = ctx.release().id;
+        // Optional asset selection is needed only after the native probe and
+        // actual file inventory establish a still-capable release. Unmatched
+        // cases finish normally so later NET steps retain their own turn.
+        let info = ctx.data().probe_info_best_effort(release_id)?;
+        let Some(info) = info.and_then(|i| serde_json::from_str::<ProbeInfo>(&i).ok()) else {
+            return Ok(Outcome::default());
+        };
+        // only video we can decode: HEVC or H.264, in Matroska or MP4
+        let media = info.media.as_ref();
+        let codec = media.and_then(|m| m.video.first()).map(|v| v.codec.as_str());
+        let container = media.map(|m| m.container.as_str());
+        let matroska = matches!(container, Some("matroska" | "webm"))
+            && matches!(codec, Some("V_MPEGH/ISO/HEVC" | "V_MPEG4/ISO/AVC"));
+        let is_mp4 = container == Some("mp4") && codec.is_some_and(|c| MP4_CODECS.contains(&c));
+        if !(matroska || is_mp4)
+            || info.archive.as_ref().is_some_and(|a| a.encrypted || a.method.as_deref() != Some("m0"))
+        {
+            return Ok(Outcome::default());
+        }
+        // Native pages show only this release's stills. A donor key does not
+        // authorize deleting own rows or skipping their generation.
+        let files = ctx.files().map_err(StepError::from_inventory)?;
+        let Some(first) = main_file(&files) else { return Ok(Outcome::default()) };
         // a release whose stills are all still on disk, and hashed, keeps them: the walk for a new stamp bit fetches
         // nothing. One trimmed from the folder, or from before hashes, is made again.
         let kept = ctx.data().kept_stills(release_id)?;
@@ -691,26 +714,6 @@ impl Step for StillsStep {
             }
             publication=grant.still_frame(release_id).map_err(still_error)?;
         }
-        let info = ctx.data().probe_info_best_effort(release_id)?;
-        let Some(info) = info.and_then(|i| serde_json::from_str::<ProbeInfo>(&i).ok()) else {
-            return Ok(Outcome::default());
-        };
-        // only video we can decode: HEVC or H.264, in Matroska or MP4
-        let media = info.media.as_ref();
-        let codec = media.and_then(|m| m.video.first()).map(|v| v.codec.as_str());
-        let container = media.map(|m| m.container.as_str());
-        let matroska = matches!(container, Some("matroska" | "webm"))
-            && matches!(codec, Some("V_MPEGH/ISO/HEVC" | "V_MPEG4/ISO/AVC"));
-        let is_mp4 = container == Some("mp4") && codec.is_some_and(|c| MP4_CODECS.contains(&c));
-        if !(matroska || is_mp4)
-            || info.archive.as_ref().is_some_and(|a| a.encrypted || a.method.as_deref() != Some("m0"))
-        {
-            return Ok(Outcome::default());
-        }
-        // Native pages show only this release's stills. A donor key does not
-        // authorize deleting own rows or skipping their generation.
-        let files = ctx.files().map_err(StepError::from_inventory)?;
-        let Some(first) = main_file(&files) else { return Ok(Outcome::default()) };
         let found = if matroska {
             mkv_frames(ctx, &files, first)?
         } else {
