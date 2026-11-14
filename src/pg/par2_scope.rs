@@ -51,7 +51,9 @@ pub(crate) fn archive(owner:&Owner,baseline:[u8;32])->Result<Receipt> {
     let baseline=super::fresh_assets::hex(&baseline);
     owner.with(|client| {
         let mut tx=client.transaction()?;super::history_gate::native(&mut tx)?;epoch.verify(&mut tx)?;
-        tx.batch_execute("set local synchronous_commit=on;set local lock_timeout='5s'")?;
+        // The defensive no-claims proof can scan PP tables; bound server
+        // execution as well as lock acquisition. Any timeout rolls back DDL.
+        tx.batch_execute("set local synchronous_commit=on;set local lock_timeout='5s';set local statement_timeout='5s'")?;
         let claimed:bool=tx.query_one("select exists(select 1 from pp_queue where lease_epoch=$1) or exists(select 1 from pp_state where native_net_epoch=$1)",&[&epoch.id().as_slice()])?.try_get(0)?;
         ensure!(!claimed,"cache archival requires pre-claim or fully drained ownership");
         if exists(&mut tx,SCOPE)? {

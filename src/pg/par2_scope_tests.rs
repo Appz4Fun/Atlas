@@ -79,6 +79,37 @@ fn archive_cli_requires_explicit_apply_and_closed_unmixed_arguments() {
     assert!(parse(&args(&["--archive-par2-cache","--apply","--source-baseline-sha256","not-a-digest"])).is_err());
 }
 
+#[test]
+#[ignore="explicit isolated PG; server timeout after renames must roll back the entire scope"]
+fn archive_statement_timeout_restores_original_heaps_and_names() {
+    let (schema,runtime)=fixture();
+    let before=runtime.owner.with(|c|FACTS.iter().map(|(hot,_)|Ok((object(c,hot)?,digest(c,hot)))).collect::<Result<Vec<_>>>()).unwrap();
+    // The actual production initializer is reached only after the heap-name
+    // swap. Delay that server call, without replacing any archival code.
+    runtime.owner.with(|c| {c.batch_execute("alter function atlas_par2_cache_init_page(integer,bigint) rename to fixture_par2_init_page;
+        create function atlas_par2_cache_init_page(page_rows integer default 256,page_bytes bigint default 8388608) returns void language plpgsql as $$
+        begin
+          if current_setting('statement_timeout')<>'5s' or current_setting('lock_timeout')<>'5s' then
+            raise exception 'fixture requires exact maintenance SQL deadlines';
+          end if;
+          perform pg_sleep(6);
+          perform fixture_par2_init_page(page_rows,page_bytes);
+        end $$")?;Ok(())}).unwrap();
+    let error=archive(&runtime.owner,[7;32]).unwrap_err();
+    let code=error.chain().find_map(|cause|cause.downcast_ref::<postgres::Error>().and_then(postgres::Error::code));
+    assert_eq!(code,Some(&postgres::error::SqlState::QUERY_CANCELED),"must reach the actual server deadline after asserting its exact settings");
+    runtime.owner.close();
+    let mut c=schema.pool.get().unwrap();
+    assert!(!exists(&mut *c,SCOPE).unwrap());
+    for (i,(hot,cold)) in FACTS.iter().enumerate() {
+        assert_eq!((object(&mut *c,hot).unwrap(),digest(&mut *c,hot)),before[i]);
+        assert!(!exists(&mut *c,cold).unwrap());
+    }
+    for (hot,cold) in LEDGER.iter().chain(std::iter::once(&TOUCH)) {
+        assert!(exists(&mut *c,hot).unwrap());assert!(!exists(&mut *c,cold).unwrap());
+    }
+}
+
 #[cfg(unix)]
 #[test]
 #[ignore="explicit isolated PG; configured child proves actual normal PP worker settlement after archival"]

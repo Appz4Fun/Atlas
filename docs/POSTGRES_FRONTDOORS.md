@@ -102,6 +102,11 @@ The digest references an already reviewed OLD-scope preservation checkpoint; it
 is recorded as an operator reference, not manufactured COPY parity. The command
 acquires the genuine native Runtime/Owner fence, starts no workers/providers,
 and refuses mixed commands or missing `--apply`.
+Its defensive preclaim checks may scan PP tables; every maintenance statement
+has a five-second server deadline as well as a five-second lock deadline.
+Timeouts refuse the operation and roll back the entire transaction, without an
+automatic retry. Metadata-only archival describes the retained payload heaps,
+not a claim that every ownership-admission check uses constant work.
 
 One durable transaction renames exactly the inherited `ext_raw_par2`,
 `ext_raw_par2_files`, `ext_preserved_cache_rows`, and their partial accounting
