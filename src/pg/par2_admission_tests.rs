@@ -51,17 +51,19 @@ fn native_par2_preadmission_resumes_actual_accounting_and_preserves_all_cache_fa
     assert!(runtime.owner.failure().is_none());runtime.owner.close();
 }
 #[test]
-#[ignore="explicit isolated PG; 33 bounded TOAST rows exceed the real fixed byte ceiling"]
+#[ignore="explicit isolated PG; 34 bounded TOAST rows exceed the real fixed byte ceiling"]
 fn native_par2_preadmission_over_cap_preserves_originals_and_keeps_header_owner_healthy() {
     // Each actual row remains below the existing 8MiB accounting-page bound.
     // PostgreSQL compresses these repeated synthetic filenames; only lengths
-    // and counters cross into Rust, never the 276MB logical string payload.
-    let (_schema,runtime)=legacy_cache(33,8_380_000);
+    // and counters cross into Rust, never the logical string payload.
+    let (_schema,runtime)=legacy_cache(34,8_380_000);
     let before=facts(&runtime);assert!(before.1>MAX_BYTES);
     let Admission::MaintenanceRequired(blocked)=finish_pages(&runtime) else {panic!("over-cap originals must wait, never be trimmed by startup")};
-    assert_eq!(blocked.phase,Phase::Trimming);assert!(blocked.retained_bytes>MAX_BYTES as u64);
+    assert_eq!(blocked.phase,Phase::Building);assert!(blocked.retained_bytes>MAX_BYTES as u64);
+    assert!(blocked.retained_rows<before.0 as u64,"stop before accounting remaining source rows");
     assert_eq!((blocked.evicted_rows,blocked.pending_eviction_rows),(0,0));
     for _ in 0..3 {assert!(matches!(admission_page(&runtime.owner).unwrap(),Admission::MaintenanceRequired(_)));}
+    assert_eq!(runtime.owner.with(|c|usage(c)).unwrap(),blocked,"parked accounting must stop growing its ledger");
     assert_eq!(facts(&runtime),before);
     crate::pg::stage_queue_tests::push(&runtime);
     runtime.owner.with(|c| {assert!(c.query_one("select exists(select 1 from releases)",&[])?.get::<_,bool>(0));Ok(())}).unwrap();
