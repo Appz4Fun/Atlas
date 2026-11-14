@@ -757,3 +757,7 @@ mod timing_controls;
 #[cfg(test)]
 #[path="release_writer_plan_tests.rs"]
 mod plan_experiment;
+
+#[cfg(test)]
+#[path="release_writer_multipart_plan_tests.rs"]
+mod multipart_plan_experiment;

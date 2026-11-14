@@ -163,7 +163,7 @@ fn run(regression:bool) {
 // Count actual tuple work rather than costs, elapsed time, join algorithms or
 // index names. PostgreSQL's per-loop averages are multiplied by real loops.
 // A future safe hash/merge plan may scan the stage once and still pass.
-fn actual_work(plan:&[String])->(f64,f64) {
+pub(super) fn actual_work(plan:&[String])->(f64,f64) {
     let actual=regex::Regex::new(r"actual rows=([0-9]+(?:\.[0-9]+)?) loops=([0-9]+)").unwrap();
     let removed=regex::Regex::new(r"Rows Removed by Join Filter: ([0-9]+(?:\.[0-9]+)?)").unwrap();
     let (mut join_work,mut scan_work,mut loops)=(0.,0.,1.);
