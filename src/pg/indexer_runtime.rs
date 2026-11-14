@@ -65,6 +65,33 @@ pub(crate) struct Owner {
     epoch: Option<super::stage::OwnerEpoch>,
 }
 
+/// Only public source-relative components may appear in an operational log.
+fn source_callsite(file: &str, line: u32) -> String {
+    let normalized = file.replace('\\', "/");
+    let source = if normalized.starts_with("src/") { Some(&normalized[4..]) }
+        else { normalized.rsplit_once("/src/").map(|(_, source)| source) };
+    let mut parts = vec!["src"];
+    if let Some(source) = source {
+        for part in source.split('/') {
+            match part {
+                "" | "." => {},
+                ".." if parts.len() > 1 => { parts.pop(); },
+                ".." => return format!("unknown:{line}"),
+                _ if part.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')) => parts.push(part),
+                _ => return format!("unknown:{line}"),
+            }
+        }
+        if parts.len() > 1 { return format!("{}:{line}", parts.join("/")); }
+    }
+    format!("unknown:{line}")
+}
+
+#[track_caller]
+fn caller_diagnostic() -> String {
+    let caller = std::panic::Location::caller();
+    source_callsite(caller.file(), caller.line())
+}
+
 impl Owner {
     pub(crate) fn new(client: postgres::Client) -> Self {
         Self {
@@ -92,6 +119,7 @@ impl Owner {
 
     pub(crate) fn epoch(&self)->Option<&super::stage::OwnerEpoch> {self.epoch.as_ref()}
 
+    #[track_caller]
     pub(crate) fn with<T>(&self, work: impl FnOnce(&mut postgres::Client) -> Result<T>) -> Result<T> {
         let mut held = self.client.lock().map_err(|_| {
             self.fail(Failure::Fatal);
@@ -116,7 +144,7 @@ impl Owner {
             // It did no new work; preserve any independently recorded failure.
             let canceled=super::outage::is_attempt_ended(error) && self.stop.load(Ordering::Acquire);
             if !canceled || self.failure().is_some() {
-                eprintln!("native owner callback failed; prior_failure={:?}; cause={}", self.failure(), super::linker_runtime::failure_diagnostic(error));
+                eprintln!("native owner callback failed; caller={}; prior_failure={:?}; cause={}", caller_diagnostic(), self.failure(), super::linker_runtime::failure_diagnostic(error));
                 self.fail(classify(error));
             }
         }
@@ -330,6 +358,18 @@ mod tests {
         assert_eq!(owner.failure(), Some(Failure::Fatal));
         assert!(owner.stop.load(Ordering::Acquire));
         owner.close();
+    }
+
+    #[test]
+    fn native_failure_callsite_strips_private_prefixes_and_rejects_escape() {
+        assert_eq!(source_callsite("/Users/private-sentinel/project/src/pg/stage_reads.rs", 53), "src/pg/stage_reads.rs:53");
+        assert_eq!(source_callsite(r"C:\private-sentinel\project\src\pg\stage_queue.rs", 108), "src/pg/stage_queue.rs:108");
+        assert_eq!(source_callsite("src/pg/../spotnet/native_step_reads.rs", 7), "src/spotnet/native_step_reads.rs:7");
+        for path in ["/private-sentinel/no-source.rs", "src/../../private-sentinel", "src/private-sentinel:password.rs"] {
+            assert_eq!(source_callsite(path, 1), "unknown:1");
+        }
+        let expected_line = line!() + 1;
+        assert_eq!(caller_diagnostic(), format!("src/pg/indexer_runtime.rs:{expected_line}"));
     }
 
     #[test]
