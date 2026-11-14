@@ -200,9 +200,9 @@ fn native_thumbnail_associations_keep_poster_counter_and_taken_slot_rules() {
                 })
                 .unwrap();
         }
-        assert_eq!(reads.find_thumbnail(own, 8, &slots, &posters, posted).unwrap(), Some(thumb));
-        assert_eq!(reads.find_thumbnail(own, 8, &[7, 1, 8].into_iter().collect(), &posters, posted).unwrap(), None);
-        assert_eq!(reads.find_thumbnail(own, 9, &slots, &posters, posted).unwrap(), None);
+        assert_eq!(reads.find_thumbnail(own, 8, &slots, &posters, posted).unwrap(), Some(thumb), "indexed={indexed}");
+        assert_eq!(reads.find_thumbnail(own, 8, &[7, 1, 8].into_iter().collect(), &posters, posted).unwrap(), None, "indexed={indexed}");
+        assert_eq!(reads.find_thumbnail(own, 9, &slots, &posters, posted).unwrap(), None, "indexed={indexed}");
     }
     runtime.owner.close();
 }
