@@ -89,7 +89,7 @@ fn record_failure(db: &Db, error: &anyhow::Error) {
 }
 
 /// Never render arbitrary causes: driver messages/paths can contain private
-/// values. Keep only typed metadata and closed static invariant labels.
+/// values. Keep typed metadata, closed labels, or an opaque SHA-256 fingerprint.
 pub(crate) fn failure_diagnostic(error: &anyhow::Error) -> String {
     let mut labels = Vec::new();
     for cause in error.chain().take(9) {
@@ -108,7 +108,8 @@ pub(crate) fn failure_diagnostic(error: &anyhow::Error) -> String {
         } else if cause.is::<super::outage::AttemptEnded>() { "attempt_ended".into() }
         else if cause.is::<super::outage::SessionUnavailable>() { "session_unavailable".into() }
         else {
-            match cause.to_string().as_str() {
+            let message = cause.to_string();
+            let known = match message.as_str() {
                 "native startup assets" => "startup_assets",
                 "native startup runner" => "startup_runner",
                 "native startup overview repair" => "startup_overview",
@@ -142,8 +143,12 @@ pub(crate) fn failure_diagnostic(error: &anyhow::Error) -> String {
                 "snapshot arena identity changed" | "segment was recreated before snapshot capture" => "snapshot_identity_changed",
                 "snapshot block truncated" => "snapshot_block_truncated",
                 "native mutation requires READ COMMITTED isolation" => "mutation_isolation",
-                _ => "redacted",
-            }.into()
+                _ => "",
+            };
+            if known.is_empty() {
+                use sha2::Digest;
+                format!("unknown_sha256:{:x}", sha2::Sha256::digest(message.as_bytes()))
+            } else { known.into() }
         };
         labels.push(label);
     }
@@ -250,21 +255,21 @@ mod tests {
     fn linker_failure_diagnostic_keeps_static_cause_and_redacts_private_values() {
         let error = anyhow::anyhow!("credential-sentinel group-sentinel /private/path-sentinel")
             .context("native source generation changed before staging completed");
-        assert_eq!(failure_diagnostic(&error), "source_generation_changed <- redacted");
+        assert_eq!(failure_diagnostic(&error), "source_generation_changed <- unknown_sha256:ddc0ad173f84906bfa6b8e381de7e29e79615366b5b9e4dace3001900510e41f");
         let error = anyhow::Error::new(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied, "credential-sentinel /private/path-sentinel",
         )).context("group-sentinel");
-        assert_eq!(failure_diagnostic(&error), "redacted <- io:PermissionDenied");
+        assert_eq!(failure_diagnostic(&error), "unknown_sha256:3e90a8d09c7202c6e63548c1f995d8b4762f63d2b6c165d6124ffb4ef7ed3ce9 <- io:PermissionDenied");
     }
 
     #[test]
     fn linker_failure_diagnostic_preserves_cancellation_and_bounds_chain_output() {
         let ended = anyhow::Error::new(super::super::outage::AttemptEnded).context("private-sentinel");
-        assert_eq!(failure_diagnostic(&ended), "redacted <- attempt_ended");
+        assert_eq!(failure_diagnostic(&ended), "unknown_sha256:a664c072846cedc98fc69acbfd231a00ea73810545e81f5c571e336b751ab440 <- attempt_ended");
         let mut error = anyhow::anyhow!("private-sentinel");
         for _ in 0..12 { error = error.context("private-sentinel"); }
         let diagnostic = failure_diagnostic(&error);
-        assert_eq!(diagnostic, vec!["redacted"; 8].join(" <- ") + " <- truncated");
+        assert_eq!(diagnostic, vec!["unknown_sha256:a664c072846cedc98fc69acbfd231a00ea73810545e81f5c571e336b751ab440"; 8].join(" <- ") + " <- truncated");
         assert!(!diagnostic.contains("sentinel"));
     }
 
@@ -281,9 +286,17 @@ mod tests {
             ("native startup media counts", "startup_media_counts"),
         ] {
             let error = anyhow::anyhow!("private-password group-name /private/config").context(context);
-            assert_eq!(failure_diagnostic(&error), format!("{label} <- redacted"));
+            assert_eq!(failure_diagnostic(&error), format!("{label} <- unknown_sha256:7f38e817d592af1c877ebd73a446f7d33034939021dc07ab781742f2bd8251ac"));
             assert_eq!(super::super::outage::classify(&error), super::super::outage::Failure::Fatal);
         }
+    }
+
+    #[test]
+    fn unknown_native_failure_has_exact_stable_fingerprint_without_raw_text() {
+        let error = anyhow::anyhow!("native file lacks admitted original name");
+        assert_eq!(failure_diagnostic(&error), "unknown_sha256:59c81009a0090ad0d83bc09807079d23ec8ed4e9c8f0e46ef73c5833011d7606");
+        assert!(!failure_diagnostic(&error).contains("original name"));
+        assert_eq!(super::super::outage::classify(&error), super::super::outage::Failure::Fatal);
     }
 
     fn fatal_during_drain(inner: bool) {
