@@ -1159,6 +1159,7 @@ mod tests {
             ArticleHead { file_index: 0, payload: shared_head.clone() },
             ArticleHead { file_index: 1, payload: shared_head },
         ];
+        assert_eq!(crate::par2::inventory(&par2_non_rar).files.len(), 2, "valid FileDesc inputs reach prefix matching");
         let res = Par2Bridge::resolve(&par2_non_rar, &mut runs, &heads);
         assert_eq!(res.resolved_count, 0, "ambiguous 16 KiB prefix without disambiguator must stay unresolved");
         assert!(!res.success);
@@ -1231,6 +1232,8 @@ mod tests {
             });
         }
 
+        assert_eq!(crate::par2::inventory(&par2).files.len(), 10, "valid FileDesc inputs reach run-index matching");
+        let original_runs = runs.clone();
         // Reverse `heads` so `ArticleHead { file_index: 1 }` precedes `ArticleHead { file_index: 0 }`
         heads.reverse();
 
@@ -1242,6 +1245,17 @@ mod tests {
             assert_eq!(run.full_md5, Some([(idx + 1) as u8; 16]));
             assert!(!run.is_obfuscated);
         }
+
+        // An authenticated packet is required even when the article-head digest matches.
+        let mut damaged = par2.clone();
+        damaged[16] ^= 1;
+        assert_eq!(crate::par2::inventory(&damaged).files.len(), 9);
+        let mut damaged_runs = original_runs;
+        let rejected = Par2Bridge::resolve(&damaged, &mut damaged_runs, &heads);
+        assert_eq!(rejected.resolved_count, 9);
+        assert!(!rejected.success);
+        assert!(damaged_runs[0].full_md5.is_none());
+        assert_eq!(damaged_runs[0].filename, "obf_0001.bin");
     }
 
     #[test]
@@ -1394,6 +1408,7 @@ mod tests {
             payload: foreign_vol1,
         }];
 
+        assert_eq!(crate::par2::inventory(&par2).files.len(), 2, "valid FileDesc inputs reach RAR5 prefix checks");
         let res = Par2Bridge::resolve(&par2, &mut runs, &heads);
         assert_eq!(res.resolved_count, 0, "foreign volume 1 with mismatched 16 KiB prefix must not resolve");
         assert!(runs[0].full_md5.is_none());
