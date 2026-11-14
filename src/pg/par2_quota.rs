@@ -1,6 +1,6 @@
 //! Bounded live PAR2 retention on the caller's existing transaction. Original
 //! offline preservation is separate; no other cache family is evicted here.
-use anyhow::{Result,ensure};
+use anyhow::{Context,Result,ensure};
 use postgres::{GenericClient,Transaction};
 use serde::{Serialize,Deserialize};
 
@@ -50,6 +50,47 @@ pub(crate) fn lock(tx:&mut Transaction<'_>)->Result<()> {
 pub(crate) fn require_ready(client:&mut impl GenericClient)->Result<()> {
     let phase:String=client.query_one("select phase from atlas_par2_cache_usage where singleton",&[])?.try_get(0)?;
     ensure!(Phase::read(&phase)?==Phase::Ready,"PAR2 quota initialization is incomplete");Ok(())
+}
+
+/// A pre-claim result, not a cache miss or an authorization to evict facts.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub(crate) enum Admission {Ready,Progress,MaintenanceRequired(Usage)}
+
+/// Resume only derived accounting on the original owner, one existing bounded
+/// page per turn. Startup never selects or advances an eviction victim.
+pub(crate) fn admission_page(owner:&crate::pg::indexer_runtime::Owner)->Result<Admission> {
+    ensure!(tokio::runtime::Handle::try_current().is_err(),"PAR2 admission requires a standard native lane");
+    owner.epoch().context("PAR2 admission requires the canonical owner")?;
+    owner.with(|client| {
+        let mut tx=client.transaction()?;crate::pg::history_gate::native(&mut tx)?;
+        let state=tx.query_one("select phase,scan_relation,evict_key is not null from atlas_par2_cache_usage where singleton for update",&[])?;
+        let phase=Phase::read(state.try_get::<_,String>(0)?.as_str())?;
+        let relation:i32=state.try_get(1)?;let evicting:bool=state.try_get(2)?;
+        let before=usage(&mut tx)?;
+        if phase==Phase::Ready {
+            ensure!(relation==4&&!evicting,"PAR2 ready accounting lacks its actual EOFs");
+            if before.retained_rows>MAX_ROWS as u64||before.retained_bytes>MAX_BYTES as u64 {
+                tx.rollback()?;return Ok(Admission::MaintenanceRequired(before))
+            }
+            tx.commit()?;return Ok(Admission::Ready)
+        }
+        if phase==Phase::Trimming {
+            ensure!(relation==4,"PAR2 accounting has not reached every source EOF");
+            if evicting||before.retained_rows>MAX_ROWS as u64||before.retained_bytes>MAX_BYTES as u64 {
+                tx.rollback()?;return Ok(Admission::MaintenanceRequired(before))
+            }
+            // Under this same row lock the trim loop immediately exits: no
+            // active victim, both fixed caps satisfied. It only certifies Ready.
+        } else {ensure!(!evicting,"PAR2 building accounting has an eviction victim");}
+        if owner.stop.load(std::sync::atomic::Ordering::Acquire) {tx.rollback()?;return Err(crate::pg::outage::AttemptEnded.into())}
+        let after=initialize_page(&mut tx)?;
+        ensure!((after.evicted_inventories,after.evicted_rows,after.evicted_bytes,after.pending_eviction_rows,after.pending_eviction_bytes)
+            ==(before.evicted_inventories,before.evicted_rows,before.evicted_bytes,before.pending_eviction_rows,before.pending_eviction_bytes),
+            "PAR2 preadmission attempted cache eviction");
+        if owner.stop.load(std::sync::atomic::Ordering::Acquire) {tx.rollback()?;return Err(crate::pg::outage::AttemptEnded.into())}
+        tx.commit()?;
+        Ok(if after.phase==Phase::Ready {Admission::Ready}else{Admission::Progress})
+    })
 }
 
 pub(crate) fn usage(client:&mut impl GenericClient)->Result<Usage> {
@@ -303,3 +344,7 @@ mod tests {
         let mut tx=client.transaction().unwrap();let error=finish(&mut tx).unwrap_err();assert!(error.downcast_ref::<postgres::Error>().is_some());tx.rollback().unwrap();
     }
 }
+
+#[cfg(test)]
+#[path="par2_admission_tests.rs"]
+mod admission_tests;
