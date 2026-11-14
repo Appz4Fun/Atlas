@@ -224,6 +224,45 @@ mod tests {
     use crate::{parser::{Article,Release},pg::fresh_reader::Budget};
     use std::time::{Instant,Duration};
     #[test]
+    #[ignore="requires explicit isolated PostgreSQL and bounded NZB spool admission"]
+    fn short_message_ids_do_not_require_per_segment_database_reads() {
+        use crate::search::{ArticleRow,ReleaseRow};
+        let schema=crate::pg::testing::Schema::native_writer().expect("explicit isolated PG fixture");
+        let mut client=schema.pool.get().unwrap();
+        let mut articles=(0..256).map(|n| {
+            let filename=if n<128 {"a.bin"} else {"z.bin"};
+            Article {filename:Some(filename.into()),subject:format!("{filename} yEnc ({}/128)",n%128+1),
+                message_id:format!("<<part{n}.字幕&@example.invalid>>"),part:Some(n%128+1),total_parts:Some(128),bytes:17,..Default::default()}
+        }).collect::<Vec<_>>();
+        let mut duplicate=articles[63].clone();duplicate.message_id="<duplicate-part64@example.invalid>".into();articles.push(duplicate);
+        for n in 0..2 {
+            articles.push(Article {filename:None,subject:format!("original nameless envelope {n} & subtitle"),
+                message_id:format!("<envelope{n}@example.invalid>"),part:Some(1),total_parts:Some(1),bytes:23,..Default::default()});
+        }
+        let release=Release {name:"Bounded.Message.Id.Release".into(),group:"alt.binaries.test".into(),poster:"poster&test".into(),
+            date:"Wed, 01 Jan 2020 00:00:00 +0000".into(),articles,..Default::default()};
+        crate::pg::release_writer::save(&mut client,std::slice::from_ref(&release),1).unwrap();
+        let id:i64=client.query_one("select id from releases",&[]).unwrap().get(0);
+        let row=ReleaseRow {id,name:release.name.clone(),group_name:release.group.clone(),complete:true,..Default::default()};
+        let oracle=release.articles.iter().map(|a|ArticleRow {message_id:a.message_id.clone(),filename:a.filename.clone(),part:a.part,
+            total_parts:a.total_parts,bytes:Some(a.bytes),subject:Some(a.subject.clone()),poster:Some(release.poster.clone()),posted_date:Some(release.date.clone())}).collect::<Vec<_>>();
+        let root=tempfile::tempdir().unwrap();
+        #[cfg(unix)] {use std::os::unix::fs::PermissionsExt;std::fs::set_permissions(root.path(),std::fs::Permissions::from_mode(0o700)).unwrap();}
+        let pool=Pool::new(root.path().into(),crate::nzb_spool::Limits {requests:6,per_request_bytes:1<<20,total_bytes:6<<20,free_bytes:0}).unwrap();
+        for (pick,selected) in [(Pick::Whole,oracle.clone()),(Pick::Ordinal(1),vec![oracle[257].clone()]),
+            (Pick::Ordinal(3),oracle.iter().filter(|a|a.filename.as_deref()==Some("a.bin")).cloned().collect()),
+            (Pick::Name("z.bin"),oracle.iter().filter(|a|a.filename.as_deref()==Some("z.bin")).cloned().collect())] {
+            let view=ReadView::open(&mut client,&schema.name,Budget::default(),Instant::now()+Duration::from_secs(10)).unwrap();
+            let before=view.guard_query_count();
+            let mut download=view.nzb_own(id,pick,&pool).unwrap().unwrap();let mut actual=String::new();download.body.read_to_string(&mut actual).unwrap();
+            let expected=crate::nzb::render_checked(&row,&selected,std::slice::from_ref(&row.group_name),matches!(pick,Pick::Whole));
+            assert_eq!(actual,expected.xml);assert_eq!(download.gaps,0);assert_eq!(actual.matches("<segment ").count(),selected.len());
+            let guards=view.guard_query_count()-before;
+            assert!(guards<128,"short message IDs must share streamed inventory reads; executed {guards} timeout-guard SQL queries");
+        }
+    }
+
+    #[test]
     #[ignore="requires explicit isolated fresh PostgreSQL and spool admission"]
     fn real_native_writer_nzb_matches_own_payload_oracle_and_file_selection() {
         let schema=crate::pg::testing::Schema::native_writer().expect("explicit isolated PG fixture");
