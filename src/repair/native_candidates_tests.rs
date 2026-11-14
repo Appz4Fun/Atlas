@@ -30,7 +30,7 @@ impl Fixture {
         service.next=Instant::now();service
     }
     fn row(&self,tag:&str,name:&str,group:&str,posted:i64,parts:std::ops::RangeInclusive<i64>,bytes:i64)->i64 {
-        let date=chrono::DateTime::from_timestamp(posted,0).unwrap().format("%Y-%m-%d %H:%M:%S").to_string();
+        let date=chrono::DateTime::from_timestamp(posted,0).unwrap().to_rfc2822();
         let release=crate::parser::Release {name:name.into(),group:group.into(),poster:"owned poster".into(),date:date.clone(),
             articles:parts.map(|part|crate::parser::Article {filename:Some(format!("{name}.rar")),subject:format!("\"{name}.rar\" yEnc ({part}/20)"),
                 author:"owned poster".into(),date:date.clone(),message_id:format!("<{tag}.{part}@candidate.fixture.test>"),part:Some(part),total_parts:Some(20),

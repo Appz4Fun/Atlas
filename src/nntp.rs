@@ -180,6 +180,7 @@ impl Overview {
             subject: self.subject,
             author: self.from,
             date: to_iso_date(&self.date),
+            posted_utc: crate::dates::explicit_utc_timestamp(&self.date),
             message_id: self.message_id,
             references: self.references,
             bytes: if self.bytes > 0 { self.bytes } else { bytes_from_lines(self.lines) },

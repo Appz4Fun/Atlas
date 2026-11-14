@@ -53,7 +53,7 @@ impl Incoming<'_> {
             .map_or(0, |a| a.subject.len() + r.poster.len() + r.date.len() + 32);
         // Include the extra scalar timing fields and the possible ID-derived
         // host/key text, whose combined length cannot exceed the original MID.
-        400 + self.article.map_or(0, |a| a.message_id.len())
+        416 + self.article.map_or(0, |a| a.message_id.len())
             + 2*r.name.len() + r.poster.len() + r.date.len() + r.display_name.as_deref().map_or(0, str::len) + article + rare
             + self.article.and_then(|a|a.filename.as_deref()).map_or(0,str::len)
     }
@@ -184,7 +184,7 @@ fn copy_input(tx: &mut Transaction<'_>, batch: &[Incoming<'_>], timing_key: Opti
             junk, filename_key, filename, message_key, message_id, subject, part, expected, file_total,
             zero_file_index, bytes, original_name, original_filename, file_index, original_name_key, posted_at, posted_clock,
             nzb_subject, nzb_poster, nzb_posted_date, nzb_timestamp, nzb_file_index,
-            t_date, t_number, t_lines, t_references, t_xref, t_from, t_encoded, t_tool, t_clock,
+            t_date, t_utc, t_number, t_lines, t_references, t_xref, t_from, t_encoded, t_tool, t_clock,
             t_hw_host, t_hw_key, t_hw_n
          ) from stdin binary",
     )?;
@@ -222,7 +222,7 @@ fn copy_input(tx: &mut Transaction<'_>, batch: &[Incoming<'_>], timing_key: Opti
             T::BYTEA,
             T::INT8,
             T::INT8,
-            T::INT8, T::INT8, T::INT8, T::INT8, T::INT8, T::INT8, T::INT8, T::INT8, T::INT8,
+            T::INT8, T::INT8, T::INT8, T::INT8, T::INT8, T::INT8, T::INT8, T::INT8, T::INT8, T::INT8,
             T::TEXT, T::TEXT, T::INT8,
         ],
     );
@@ -285,6 +285,7 @@ fn copy_input(tx: &mut Transaction<'_>, batch: &[Incoming<'_>], timing_key: Opti
             &nameless.map(|_|crate::dates::article_timestamp(&r.date)),
             &nameless.and_then(|article|article.file_index),
             &facts.as_ref().and_then(|facts| facts.date),
+            &facts.as_ref().and_then(|facts| facts.utc),
             &number,
             &a.map(|article| article.lines.max(0)),
             &a.map(|article| i64::from(!article.references.trim().is_empty())),
@@ -338,6 +339,7 @@ const CREATE_STAGE: &str = "
         nzb_timestamp bigint,
         nzb_file_index bigint,
         t_date bigint,
+        t_utc bigint,
         t_number bigint,
         t_lines bigint,
         t_references bigint,

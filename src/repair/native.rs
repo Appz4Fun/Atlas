@@ -212,7 +212,10 @@ fn observe_in(r:&mut Read<'_,'_>,id:i64,recent:bool)->Result<Option<(Looked,Vec<
     // Only the actual assembled identity/size qualifies a candidate. A small
     // observed post is revisitable; it never enters permanent repair_tried.
     if post.size<MIN_BYTES {return Ok(None)}
-    let permille=r.union(&post.ids)?.permille();let all_windows=r.windows(&post.ids)?;
+    let permille=r.union(&post.ids)?.permille();
+    // Advance past unknown historical timing without marking repair_tried or
+    // holding the bounded candidate cursor at an unprovable UTC anchor.
+    let Some(all_windows)=r.windows(&post.ids)? else{return Ok(None)};
     let worth=(MIN_PERMILLE..1000).contains(&permille);
     let days=if recent&&permille<MIN_PERMILLE {super::days_of(&all_windows)}else{Vec::new()};
     let name=r.head(id)?.ok_or(SourceChanged)?.name;let sources=r.sources(&post.ids)?;
@@ -252,3 +255,7 @@ mod tests;
 #[cfg(all(test,unix))]
 #[path="native_candidates_tests.rs"]
 mod candidate_tests;
+
+#[cfg(test)]
+#[path="native_utc_tests.rs"]
+mod utc_tests;
