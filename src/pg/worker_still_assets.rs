@@ -70,6 +70,14 @@ impl StillFrame {
         }
         self.current()?;self.grant.check_owner(&owner)?;Ok(name)
     }
+    /// Compare with currently verified old bytes after BODY/decoding. If the
+    /// old set wins, keep its physical files and spool through settlement too.
+    pub(crate) fn prefer_previous(&self,kept:&[(String,bool)],made:usize)->Result<Option<Self>> {
+        if made>=kept.len(){return Ok(None)}
+        self.current()?;let mut previous=self.grant.still_frame(self.release)?;let mut available=0;
+        for (name,_) in kept {if previous.reuse(name)? {available+=1;}}
+        Ok((made<available).then_some(previous))
+    }
     pub(crate) fn finish(mut self)->Result<Self> {
         self.body=Some(self.body.take().context("native still hold was already finished")?.finish()?);Ok(self)
     }

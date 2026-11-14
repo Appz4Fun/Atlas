@@ -33,8 +33,11 @@ fn generated(grant:&Arc<Grant>,id:i64)->(StillFrame,Vec<SavedStill>) {
     (frame.finish().unwrap(),stills)
 }
 fn prepare(runtime:&pg::indexer_runtime::Runtime,id:i64,frame:StillFrame,stills:&[SavedStill])->(pg::stage_queue::Queue,pg::stage_queue::Claim,Prepared) {
+    prepare_at(runtime,id,frame,stills,10)
+}
+fn prepare_at(runtime:&pg::indexer_runtime::Runtime,id:i64,frame:StillFrame,stills:&[SavedStill],now:i64)->(pg::stage_queue::Queue,pg::stage_queue::Claim,Prepared) {
     use crate::postprocess::{apply::Applied,step::{StepWrite,StepMutation}};
-    let queue=pg::stage_queue::Queue::for_owner(&runtime.owner).unwrap();let claim=queue.claim(10,1,60).unwrap().pop().expect("real writer-generated queue claim");assert_eq!(claim.release_id(),id);
+    let queue=pg::stage_queue::Queue::for_owner(&runtime.owner).unwrap();let claim=queue.claim(now,1,60).unwrap().pop().expect("real writer-generated queue claim");assert_eq!(claim.release_id(),id);
     let bit=mask(crate::probe::stills::STILLS_STEP);let mut writes=vec![(bit,StepWrite::for_mutation(id,StepMutation::ClearStills))];
     writes.extend(stills.iter().cloned().map(|still|(bit,StepWrite::for_mutation(id,StepMutation::KeepStill(still)))));
     let visit=pg::stage_queue::Visit::prepare(&claim,Applied {release_id:id,set_done:bit,writes,..Default::default()},Sha256::digest(b"native-generated-stills").into()).unwrap();
@@ -83,14 +86,20 @@ fn native_stills_preserve_captured_originals_and_refuse_foreign_receipts() {
 #[ignore="Root-only isolated PG; actual supersession and stopped owner hold checks"]
 fn native_still_prepared_supersession_and_owner_loss_never_clear_the_prior_association() {
     let schema=pg::testing::Schema::new().expect("explicit isolated PG");let (runtime,_home,selection,id)=setup(&schema);let grant=Grant::open(&runtime.owner,Some(&selection)).unwrap().unwrap();
-    let (frame,stills)=generated(&grant,id);let (queue,claim,prepared)=prepare(&runtime,id,frame,&stills);
-    runtime.owner.with(|client|{pg::release_writer::save(client,&[release("<native-still-2@fixture.invalid>",2)],1)?;Ok(())}).unwrap();
-    assert_eq!(prepared.settle(&queue,&claim,11).unwrap(),pg::stage_queue::Settlement::Superseded);assert_eq!(runtime.owner.failure(),None);
-    let mut stopped=grant.still_frame(id).unwrap();let _=stopped.keep(&jpeg(30),16,16).unwrap();let stopped=stopped.finish().unwrap();runtime.owner.close();
-    assert!(stopped.check(&runtime.owner,id).is_err());assert!(grant.still_frame(id).is_err());
+    let (prior,stills)=generated(&grant,id);let (queue,claim,prepared)=prepare(&runtime,id,prior,&stills);
+    assert_eq!(prepared.settle(&queue,&claim,11).unwrap(),pg::stage_queue::Settlement::Applied);
+    let want=stills.iter().map(|still|still.sha256.clone()).collect::<Vec<_>>();
+    queue.request_walk(mask(crate::probe::stills::STILLS_STEP),None,20).unwrap();queue.walk_tick(20).unwrap();
+    let (frame,next)=generated(&grant,id);let (queue,claim,prepared)=prepare_at(&runtime,id,frame,&next,20);
+    runtime.owner.with(|client|{pg::release_writer::save(client,&[release("<native-still-2@fixture.invalid>",2)],21)?;Ok(())}).unwrap();
+    assert_eq!(prepared.settle(&queue,&claim,22).unwrap(),pg::stage_queue::Settlement::Superseded);assert_eq!(runtime.owner.failure(),None);
+    let (stopped,next)=generated(&grant,id);let (queue,claim,prepared)=prepare_at(&runtime,id,stopped,&next,100000);
+    let held=grant.still_frame(id).unwrap().finish().unwrap();runtime.owner.close();
+    assert!(prepared.settle(&queue,&claim,100001).is_err());assert!(held.check(&runtime.owner,id).is_err());assert!(grant.still_frame(id).is_err());
     let other_schema=pg::testing::Schema::new().expect("explicit second isolated PG schema");let (other,_other_home,_selection,other_id)=setup(&other_schema);
-    assert!(stopped.check(&other.owner,other_id).is_err(),"a retained frame cannot move to another actual epoch/owner");other.owner.close();
-    let mut observer=schema.pool.get().unwrap();assert_eq!(observer.query_one("select count(*) from release_stills",&[]).unwrap().get::<_,i64>(0),0);
+    assert!(held.check(&other.owner,other_id).is_err(),"a retained frame cannot move to another actual epoch/owner");other.owner.close();
+    let mut observer=schema.pool.get().unwrap();let actual=observer.query("select sha256 from release_stills where release_id=$1 order by position",&[&id]).unwrap().into_iter().map(|row|row.get::<_,String>(0)).collect::<Vec<_>>();
+    assert_eq!(actual,want,"supersession and closed-owner settlement preserve the prior genuine association");
 }
 #[test]
 #[ignore="Root-only isolated PG; width, output horizon, physical namespace and refusal preservation"]
@@ -98,6 +107,10 @@ fn native_still_admission_and_symlink_refusals_leave_prior_stills_untouched() {
     let schema=pg::testing::Schema::new().expect("explicit isolated PG");let (runtime,home,selection,id)=setup(&schema);let grant=Grant::open(&runtime.owner,Some(&selection)).unwrap().unwrap();
     let (prior,stills)=generated(&grant,id);let (queue,claim,prepared)=prepare(&runtime,id,prior,&stills);
     assert_eq!(prepared.settle(&queue,&claim,11).unwrap(),pg::stage_queue::Settlement::Applied);
+    let busy=(0..128).map(|_|grant.still_frame(id).unwrap()).collect::<Vec<_>>();
+    let refusal=grant.still_frame(id).err().expect("actual existing 128-request spool admission");
+    assert!(refusal.downcast_ref::<std::io::Error>().and_then(std::io::Error::get_ref).is_some_and(|cause|cause.is::<crate::nzb_spool::AdmissionError>()));
+    assert_eq!(runtime.owner.failure(),None,"local spool admission cannot poison the owner");drop(busy);
     let mut frame=grant.still_frame(id).unwrap();assert!(frame.keep(&jpeg(20),961,16).is_err());assert!(frame.keep(&jpeg(20),16,1921).is_err());for n in 0..3 {frame.keep(&jpeg(40+n),16,16).unwrap();}
     assert!(frame.keep(&jpeg(99),16,16).is_err(),"a fourth unique image exceeds the producer horizon");drop(frame);
     let held=grant.still_frame(id).unwrap().finish().unwrap();std::fs::rename(home.path().join("assets"),home.path().join("original-assets")).unwrap();
@@ -107,4 +120,25 @@ fn native_still_admission_and_symlink_refusals_leave_prior_stills_untouched() {
         let kept=client.query("select sha256 from release_stills where release_id=$1 order by position",&[&id])?.into_iter().map(|row|row.get::<_,String>(0)).collect::<Vec<_>>();
         assert_eq!(kept,stills.iter().map(|still|still.sha256.clone()).collect::<Vec<_>>(),"admission/root refusal cannot clear prior genuine stills");Ok(())
     }).unwrap();runtime.owner.close();
+}
+
+#[test]
+#[ignore="Root-only isolated PG; actual sibling trim after a prior still snapshot"]
+fn native_still_final_choice_recounts_after_trim_instead_of_discarding_valid_new_output() {
+    let schema=pg::testing::Schema::new().expect("explicit isolated PG");let (runtime,home,selection,id)=setup(&schema);let grant=Grant::open(&runtime.owner,Some(&selection)).unwrap().unwrap();
+    let (prior,stills)=generated(&grant,id);let (queue,claim,prepared)=prepare(&runtime,id,prior,&stills);
+    assert_eq!(prepared.settle(&queue,&claim,11).unwrap(),pg::stage_queue::Settlement::Applied);
+    let kept=stills.iter().map(|still|(still.sha256.clone(),still.phash.is_some())).collect::<Vec<_>>();
+    let mut candidate=grant.still_frame(id).unwrap();let sha=candidate.keep(&jpeg(220),16,16).unwrap();
+    let sparse=home.path().join("assets/stills").join("22".repeat(32));std::fs::File::create(&sparse).unwrap().set_len(2<<30).unwrap();
+    for value in 100..160 {let mut other=grant.still_frame(id).unwrap();other.keep(&jpeg(value),16,16).unwrap();drop(other.finish().unwrap());}
+    let mut other=grant.still_frame(id).unwrap();other.keep(&jpeg(200),16,16).unwrap();drop(other.finish().unwrap());
+    for (hash,_) in &kept {assert!(!grant.still_available(hash).unwrap(),"the real sibling trim removed the unheld old set");}
+    assert!(candidate.prefer_previous(&kept,1).unwrap().is_none(),"a stale pre-BODY count must not discard the new held JPEG");
+    queue.request_walk(mask(crate::probe::stills::STILLS_STEP),None,20).unwrap();queue.walk_tick(20).unwrap();
+    let luma=crate::video::picture::Plane8 {data:vec![220;16*16],width:16,height:16};
+    let next=[SavedStill {position:25,at_ms:Some(0),sha256:sha.clone(),width:16,height:16,phash:crate::video::phash::phash(&luma).map(|value|value as i64)}];
+    let (queue,claim,prepared)=prepare_at(&runtime,id,candidate.finish().unwrap(),&next,20);
+    assert_eq!(prepared.settle(&queue,&claim,21).unwrap(),pg::stage_queue::Settlement::Applied);
+    runtime.owner.with(|client| {let rows=client.query("select sha256 from release_stills where release_id=$1",&[&id])?;assert_eq!(rows.len(),1);assert_eq!(rows[0].get::<_,String>(0),sha);Ok(())}).unwrap();runtime.owner.close();
 }

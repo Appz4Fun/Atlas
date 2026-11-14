@@ -623,7 +623,7 @@ fn still_of(track: &VideoTrack, frame: &[u8]) -> Option<(Vec<u8>, u32, u32, Opti
 
 fn still_error(error:anyhow::Error)->StepError {
     if error.is::<crate::pg::worker_assets::StillChanged>()||error.is::<crate::pg::worker_assets::StillAdmission>()
-        ||error.downcast_ref::<std::io::Error>().is_some_and(|io|io.kind()==std::io::ErrorKind::WouldBlock) {StepError::Transient(error.to_string())}
+        ||error.downcast_ref::<std::io::Error>().and_then(std::io::Error::get_ref).is_some_and(|cause|cause.is::<crate::nzb_spool::AdmissionError>()) {StepError::Transient(error.to_string())}
     else {StepError::from_cache(error)}
 }
 fn still_hold(frame:crate::pg::worker_assets::StillFrame)->Result<Option<Box<dyn std::any::Any+Send>>,StepError> {
@@ -746,8 +746,8 @@ impl Step for StillsStep {
             writes.push(StepWrite::for_mutation(release_id, StepMutation::KeepStill(still)));
         }
         // fewer than it has already (a run asked for again whose reads came to less): what it has stays
-        if made < kept_available {
-            return Ok(Outcome { matched: true, ..Outcome::default() });
+        if let Some(previous)=publication.prefer_previous(&kept,made).map_err(still_error)? {
+            return Ok(Outcome {matched:true,hold:still_hold(previous)?,..Outcome::default()});
         }
         if !raw_saved.is_empty() {
             crate::raw_store::put_stills_checked(&rel_name, &rel_group, &content_id, &raw_saved).map_err(StepError::from_cache)?;
@@ -760,6 +760,17 @@ impl Step for StillsStep {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_still_error_defers_only_typed_admission_and_retains_os_causes() {
+        let root=tempfile::tempdir().unwrap();let pool=crate::nzb_spool::Pool::new(root.path().into(),crate::nzb_spool::Limits {requests:1,per_request_bytes:4,total_bytes:4,free_bytes:0}).unwrap();
+        let held=pool.open().unwrap();assert!(matches!(still_error(pool.open().unwrap_err().into()),StepError::Transient(_)));drop(held);
+        for code in [libc::EIO,libc::EACCES] {
+            let StepError::Native(error)=still_error(std::io::Error::from_raw_os_error(code).into()) else {panic!("physical I/O must remain a native storage error")};
+            assert_eq!(error.downcast_ref::<std::io::Error>().unwrap().raw_os_error(),Some(code));
+        }
+        assert!(matches!(still_error(std::io::Error::new(std::io::ErrorKind::WouldBlock,"OS contention").into()),StepError::Native(_)));
+    }
 
     fn file(name: &str, parts: i64) -> FileInfo {
         FileInfo {

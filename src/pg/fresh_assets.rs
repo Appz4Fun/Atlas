@@ -68,6 +68,7 @@ fn trim_cache(directory:&File,limit:u64,stop:&std::sync::atomic::AtomicBool,unti
         let mut found=std::ptr::null_mut();let error=unsafe{libc::readdir_r(entries.0,&mut entry,&mut found)};
         if error!=0{return Err(std::io::Error::from_raw_os_error(error).into())}if found.is_null(){break;}
         let name=unsafe{CStr::from_ptr(entry.d_name.as_ptr())}.to_str()?;if matches!(name,"."|".."){continue;}cache_assets::filename(name)?;
+        if originals.is_some()&&items.len()>=IMAGE_CACHE_BYTES as usize/(16<<10)+64{return Ok(false)}
         ensure!(items.len()<IMAGE_CACHE_BYTES as usize/(16<<10)+64,"native image cache file-count admission");
         let file=physical_child(directory,std::ffi::OsStr::new(name),false)?;let identity=file.metadata()?;ensure!(identity.is_file(),"native image cache contains a non-file");
         let charge=image_charge(identity.len());total=total.checked_add(charge).context("native image cache charge overflow")?;
@@ -276,7 +277,14 @@ impl AssetManifest {
                 let error=std::io::Error::last_os_error();if error.kind()==std::io::ErrorKind::WouldBlock{return Ok(None)}return Err(error.into())
             }
         }
-        let held=StillFile {before:file.metadata()?,file};self.check_still_hold(name,&held)?;Ok(Some(held))
+        let held=StillFile {before:file.metadata()?,file};
+        // The trimmer may have unlinked this inode between open and SH flock.
+        // At establishment that is ordinary unavailability, not corruption of
+        // a previously admitted Prepared hold. Recheck the root independently.
+        self.check_root()?;
+        let current=match physical_child(&directory,std::ffi::OsStr::new(name),false) {Ok(file)=>file,Err(error) if error.kind()==std::io::ErrorKind::NotFound=>return Ok(None),Err(error)=>return Err(error.into())};
+        if !same_inode(&held.before,&current.metadata()?){return Ok(None)}
+        self.check_still_hold(name,&held)?;Ok(Some(held))
     }
     pub(super) fn check_still_hold(&self,name:&str,held:&StillFile)->Result<()> {
         self.check_root()?;let directory=physical_child(&self.root,std::ffi::OsStr::new("stills"),true)?;

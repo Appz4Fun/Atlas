@@ -9,6 +9,17 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// A configured request/byte/headroom limit, distinct from physical I/O or
+/// arithmetic/invariant failure. Only the pool's actual admission branches
+/// construct this marker; error kinds, messages and public APIs are unchanged.
+#[derive(Debug)]
+pub(crate) struct AdmissionError(&'static str);
+impl std::fmt::Display for AdmissionError {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str(self.0)}
+}
+impl std::error::Error for AdmissionError {}
+fn admission(kind:io::ErrorKind,message:&'static str)->io::Error {io::Error::new(kind,AdmissionError(message))}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     pub requests: usize,
@@ -55,7 +66,7 @@ impl Pool {
     pub fn open(self: &Arc<Self>) -> io::Result<Spool> {
         let mut usage = self.usage.lock().unwrap_or_else(|error| error.into_inner());
         if usage.requests >= self.limits.requests {
-            return Err(io::Error::new(io::ErrorKind::WouldBlock, "NZB spool requests are busy"));
+            return Err(admission(io::ErrorKind::WouldBlock, "NZB spool requests are busy"));
         }
         self.check_disk(usage.disk_credit)?;
         let file = tempfile::tempfile_in(&self.root)?;
@@ -78,7 +89,7 @@ impl Pool {
     fn check_disk(&self, bytes: u64) -> io::Result<()> {
         let required = self.limits.free_bytes.checked_add(bytes).ok_or_else(|| io::Error::other("NZB disk admission overflow"))?;
         if available_bytes(&self.root)? < required {
-            return Err(io::Error::other("insufficient free space for NZB spool"));
+            return Err(admission(io::ErrorKind::Other, "insufficient free space for NZB spool"));
         }
         Ok(())
     }
@@ -213,12 +224,12 @@ impl OutputReservation {
         let mut usage = pool.usage.lock().unwrap_or_else(|error| error.into_inner());
         let total = usage.bytes.checked_add(bytes).ok_or_else(|| io::Error::other("NZB output quota overflow"))?;
         if total > pool.limits.total_bytes {
-            return Err(io::Error::other("NZB atomic output exceeds aggregate spool admission"));
+            return Err(admission(io::ErrorKind::Other, "NZB atomic output exceeds aggregate spool admission"));
         }
         let credit = usage.disk_credit.checked_add(bytes).ok_or_else(|| io::Error::other("NZB output disk reservation overflow"))?;
         let floor = pool.limits.free_bytes.checked_add(credit).ok_or_else(|| io::Error::other("NZB output disk floor overflow"))?;
         if available_bytes(parent)? < floor {
-            return Err(io::Error::other("insufficient destination free space for atomic NZB output"));
+            return Err(admission(io::ErrorKind::Other, "insufficient destination free space for atomic NZB output"));
         }
         usage.bytes = total;
         usage.disk_credit = credit;
@@ -259,12 +270,12 @@ impl Write for Spool {
         let amount = u64::try_from(buffer.len()).map_err(|_| io::Error::other("NZB spool write length"))?;
         let next = self.bytes.checked_add(amount).ok_or_else(|| io::Error::other("NZB spool size overflow"))?;
         if next > self.pool.limits.per_request_bytes {
-            return Err(io::Error::other("NZB request exceeds spool admission"));
+            return Err(admission(io::ErrorKind::Other, "NZB request exceeds spool admission"));
         }
         let mut usage = self.pool.usage.lock().unwrap_or_else(|error| error.into_inner());
         let total = usage.bytes.checked_add(amount).ok_or_else(|| io::Error::other("NZB spool total overflow"))?;
         if total > self.pool.limits.total_bytes {
-            return Err(io::Error::other("NZB requests exceed total spool admission"));
+            return Err(admission(io::ErrorKind::Other, "NZB requests exceed total spool admission"));
         }
         if amount > self.disk_credit {
             let remaining = self.pool.limits.per_request_bytes - self.bytes;
@@ -359,6 +370,29 @@ mod tests {
 
     fn pool(root: &Path, requests: usize, bytes: u64) -> Arc<Pool> {
         Pool::new(root.to_owned(), Limits { requests, per_request_bytes: bytes, total_bytes: bytes, free_bytes: 0 }).unwrap()
+    }
+
+    fn marked(error:&io::Error)->bool {error.get_ref().is_some_and(|cause|cause.is::<AdmissionError>())}
+
+    #[test]
+    fn admission_marker_preserves_the_existing_io_kind_and_message() {
+        for (kind,text) in [(io::ErrorKind::WouldBlock,"NZB spool requests are busy"),(io::ErrorKind::Other,"NZB requests exceed total spool admission")] {
+            let error=admission(kind,text);assert!(marked(&error));assert_eq!(error.kind(),kind);assert_eq!(error.to_string(),text);
+        }
+        assert!(!marked(&io::Error::other("NZB requests exceed total spool admission")),"matching text is not an admission marker");
+    }
+
+    #[test]
+    fn configured_spool_limits_have_a_typed_marker_without_reclassifying_io() {
+        let root=tempfile::tempdir().unwrap();let one=pool(root.path(),1,4);let mut body=one.open().unwrap();
+        let busy=one.open().unwrap_err();assert!(marked(&busy));assert_eq!(busy.kind(),io::ErrorKind::WouldBlock);assert_eq!(busy.to_string(),"NZB spool requests are busy");
+        let size=body.write_all(b"12345").unwrap_err();assert!(marked(&size));assert_eq!(size.kind(),io::ErrorKind::Other);assert_eq!(size.to_string(),"NZB request exceeds spool admission");drop(body);
+        let two=Pool::new(root.path().into(),Limits {requests:2,per_request_bytes:4,total_bytes:4,free_bytes:0}).unwrap();
+        let mut first=two.open().unwrap();first.write_all(b"1234").unwrap();let mut second=two.open().unwrap();
+        assert!(marked(&second.write_all(b"1").unwrap_err()));drop((first,second));
+        let full=Pool::new(root.path().into(),Limits {requests:1,per_request_bytes:4,total_bytes:4,free_bytes:u64::MAX}).unwrap();assert!(marked(&full.open().unwrap_err()));
+        for error in [io::Error::from_raw_os_error(libc::EIO),io::Error::from_raw_os_error(libc::EACCES),io::Error::other("NZB spool total overflow"),io::Error::new(io::ErrorKind::WouldBlock,"OS contention")] {assert!(!marked(&error));}
+        let missing=root.path().join("missing");assert!(!marked(&Pool::new(missing,Limits {requests:1,per_request_bytes:4,total_bytes:4,free_bytes:0}).unwrap_err()));
     }
 
     // Removing the lifetime permit must fail while a completed body is retained.
