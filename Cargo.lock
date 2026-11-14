@@ -1040,7 +1040,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2334,13 +2334,11 @@ dependencies = [
 [[package]]
 name = "par-rs"
 version = "0.2.0"
-source = "git+https://github.com/xbmc4lyfe/par-rs?rev=fb13bd33ca741d4b73ae37d28442d9e2401da4b4#fb13bd33ca741d4b73ae37d28442d9e2401da4b4"
+source = "git+https://github.com/xbmc4lyfe/par-rs?rev=4e91c872882a2e39bb95a96b7dcfc14a6c8959fc#4e91c872882a2e39bb95a96b7dcfc14a6c8959fc"
 dependencies = [
  "crc32fast",
  "md-5 0.10.6",
  "memchr",
- "regex",
- "sha1",
  "thiserror 2.0.21",
 ]
 
@@ -2994,7 +2992,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3370,7 +3368,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3750,10 +3748,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3766,7 +3764,7 @@ dependencies = [
  "parking_lot",
  "rustix",
  "signal-hook 0.3.18",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4136,7 +4134,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset",
  "tempfile",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4526,7 +4524,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5029,12 +5027,12 @@ dependencies = [
 [[package]]
 name = "zip-container"
 version = "0.1.0"
-source = "git+https://github.com/xbmc4lyfe/zipfast?rev=7c681b66a603d36b9ed603ed49f0630a37f9617b#7c681b66a603d36b9ed603ed49f0630a37f9617b"
+source = "git+https://github.com/xbmc4lyfe/zipfast?rev=c3cc683cdf7a93b9d22ce226c1fa75075dad2013#c3cc683cdf7a93b9d22ce226c1fa75075dad2013"
 
 [[package]]
 name = "zipfast"
 version = "0.1.0"
-source = "git+https://github.com/xbmc4lyfe/zipfast?rev=7c681b66a603d36b9ed603ed49f0630a37f9617b#7c681b66a603d36b9ed603ed49f0630a37f9617b"
+source = "git+https://github.com/xbmc4lyfe/zipfast?rev=c3cc683cdf7a93b9d22ce226c1fa75075dad2013#c3cc683cdf7a93b9d22ce226c1fa75075dad2013"
 dependencies = [
  "bzip2",
  "crc32fast",
@@ -5051,7 +5049,7 @@ dependencies = [
 [[package]]
 name = "zipview"
 version = "0.1.0"
-source = "git+https://github.com/xbmc4lyfe/zipfast?rev=7c681b66a603d36b9ed603ed49f0630a37f9617b#7c681b66a603d36b9ed603ed49f0630a37f9617b"
+source = "git+https://github.com/xbmc4lyfe/zipfast?rev=c3cc683cdf7a93b9d22ce226c1fa75075dad2013#c3cc683cdf7a93b9d22ce226c1fa75075dad2013"
 dependencies = [
  "flate2",
  "subtle",
