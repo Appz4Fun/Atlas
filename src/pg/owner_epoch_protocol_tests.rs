@@ -1,7 +1,7 @@
 //! Count real protocol completions, without retaining query or authentication payloads.
 use std::{
     io::{self, Read, Write},
-    net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs},
+    net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream},
     sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -53,43 +53,38 @@ impl Frames {
 
 enum Wire {
     Tcp(TcpStream),
-    #[cfg(unix)]
-    Unix(std::os::unix::net::UnixStream),
 }
 impl Wire {
     fn connect(config:&postgres::Config)->io::Result<Self> {
         let port=config.get_ports().first().copied().unwrap_or(5432);
         match config.get_hosts().first() {
             Some(postgres::config::Host::Tcp(host))=>{
-                let address=(host.as_str(),port).to_socket_addrs()?.next()
-                    .ok_or_else(||io::Error::new(io::ErrorKind::InvalidInput,"fixture upstream address"))?;
+                // Setup and Drop must not wait on DNS or an unbounded local
+                // socket connect. This fixture admits only literal TCP IPs.
+                let ip:IpAddr=host.parse().map_err(|_|io::Error::new(io::ErrorKind::InvalidInput,"fixture requires a literal TCP address"))?;
+                let address=SocketAddr::new(ip,port);
                 let stream=TcpStream::connect_timeout(&address,Duration::from_secs(2))?;
                 stream.set_nodelay(true)?;Ok(Self::Tcp(stream))
             },
-            #[cfg(unix)]
-            Some(postgres::config::Host::Unix(path))=>Ok(Self::Unix(std::os::unix::net::UnixStream::connect(path.join(format!(".s.PGSQL.{port}")))?)),
             _=>Err(io::Error::new(io::ErrorKind::InvalidInput,"fixture upstream transport")),
         }
     }
     fn copy(&self)->io::Result<Self> {match self {
         Self::Tcp(s)=>Ok(Self::Tcp(s.try_clone()?)),
-        #[cfg(unix)] Self::Unix(s)=>Ok(Self::Unix(s.try_clone()?)),
     }}
     fn timeouts(&self)->io::Result<()> {match self {
         Self::Tcp(s)=>{s.set_read_timeout(Some(Duration::from_millis(100)))?;s.set_write_timeout(Some(Duration::from_secs(2)))},
-        #[cfg(unix)] Self::Unix(s)=>{s.set_read_timeout(Some(Duration::from_millis(100)))?;s.set_write_timeout(Some(Duration::from_secs(2)))},
     }}
     fn shutdown(&self) {let _=match self {
         Self::Tcp(s)=>s.shutdown(Shutdown::Both),
-        #[cfg(unix)] Self::Unix(s)=>s.shutdown(Shutdown::Both),
     };}
 }
 impl Read for Wire {fn read(&mut self,out:&mut [u8])->io::Result<usize> {match self {
-    Self::Tcp(s)=>s.read(out),#[cfg(unix)] Self::Unix(s)=>s.read(out),
+    Self::Tcp(s)=>s.read(out),
 }}}
 impl Write for Wire {
     fn write(&mut self,input:&[u8])->io::Result<usize> {match self {
-        Self::Tcp(s)=>s.write(input),#[cfg(unix)] Self::Unix(s)=>s.write(input),
+        Self::Tcp(s)=>s.write(input),
     }}
     fn flush(&mut self)->io::Result<()> {Ok(())}
 }
