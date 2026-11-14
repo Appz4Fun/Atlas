@@ -2690,7 +2690,7 @@ mod tests {
         let groups=["a","m0","b","m1","c"].into_iter().map(str::to_owned).collect();
         let mut sched=scheduler(pool,groups);sched.plan=vec![(0,workers)];
         *sched.media.write().unwrap()=vec!["m0".into(),"m1".into()];
-        for group in ["a","m0","b","m1","c"] {sched.ctx.states.with(group,|state|state.backfilling=true);}
+        for group in ["a","m0","b","m1","c"] {assert!(!sched.ctx.states.is_idle(group),"fixture groups remain due");}
         sched
     }
 
