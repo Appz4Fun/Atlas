@@ -628,6 +628,8 @@ const CORE_TABLES: &[(&str, &str)] = &[
 
 ### Task 4: Queue on save, and keep a step's name
 
+**Historical benchmark retired:** The SQLite-only `pp_enqueue_cost::enqueue_cost` comparator and `store::SKIP_ENQUEUE_FOR_BENCH` toggle below are no longer supported after the PostgreSQL cutover. Its printed ratios describe the former SQLite path, not native performance. Do not recreate the queue bypass or run the removed target; see the [retirement record](../RETIRED_MAINTENANCE_TESTS.md#testspp_enqueue_costrs). The queue-on-save and naming behavior checklist remains historical design context.
+
 **Files:** `src/store.rs`; test in its `mod tests`, and `tests/pp_enqueue_cost.rs`.
 
 - [ ] **Tests first:**

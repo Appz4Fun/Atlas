@@ -316,3 +316,14 @@ cargo test --frozen --lib -j1 api::native_incomplete_tests::incomplete_releases_
 ```
 
 The same parent without a URL verifies optional default admission only; that result is not a PostgreSQL pass. No other integration target, shared native helper, production dispatch or test-discovery policy changes.
+
+
+## Follow-up: obsolete SQLite enqueue timing comparator
+
+### tests/pp_enqueue_cost.rs
+
+Original full-source SHA-256: `6a0ed0c9a9efe36903e12ea91a5e078244c80673dfab951aab5050fb38634405`.
+
+`pp_enqueue_cost::enqueue_cost` is a RETIRED informational benchmark for the removed SQLite save/database engine and `store::SKIP_ENQUEUE_FOR_BENCH` queue-bypass toggle. The ignored case made five alternating pairs of 100,000 one-article saves in batches of 10,000, then printed ratios and a median. It contained no assertions. Its old database constructor, save entry point and bypass toggle no longer exist; compiling an ignored target still requires those removed APIs.
+
+No correctness assertion, native benchmark, native queue bypass, throughput result or performance parity is claimed by this retirement. Queue-on-save, due-time, replay and late-part behavior remain independently covered by the native release-writer tests. The old postprocess plan's measurement and instructions are explicitly historical, with this retirement linked. Only this obsolete benchmark target and its documentation change; production sources, shared fixtures and Cargo discovery stay unchanged. Other legacy integration blockers remain open.
