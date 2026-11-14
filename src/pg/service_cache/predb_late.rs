@@ -51,11 +51,39 @@ impl Service {
         let mut report=LateReport::default();
         for _ in 0..name_rows {
             if !self.cache.with(index_one)? {break} report.indexed+=1;
+            #[cfg(test)] self.pause_index_for_test()?;
         }
         let page=self.cache.with(|tx|late_page(tx,now))?;
         self.counters.page(&page);
         report.titles=page.titles;report.reruns=page.reruns;report.overflow=page.overflow;report.pending=page.pending;report.budget_exhausted=page.budget_exhausted;
         Ok(report)
+    }
+}
+// One-shot fixture barrier AFTER a committed name-index transaction. It never
+// holds the original Owner, and cannot exist in a production build.
+#[cfg(test)]
+pub(super) struct IndexPause {
+    entered:std::sync::mpsc::Sender<()>,resume:std::sync::mpsc::Receiver<()>,
+}
+#[cfg(test)]
+impl Service {
+    pub(crate) fn pause_after_index_for_test(&self)->(std::sync::mpsc::Receiver<()>,std::sync::mpsc::Sender<()>) {
+        let(entered,ready)=std::sync::mpsc::channel();let(resume,wait)=std::sync::mpsc::channel();
+        let mut slot=self.index_pause.lock().unwrap();assert!(slot.is_none());*slot=Some(IndexPause {entered,resume:wait});(ready,resume)
+    }
+    fn pause_index_for_test(&self)->Result<()> {
+        let pause=self.index_pause.lock().map_err(|_|anyhow::anyhow!("name-index fixture pause poisoned"))?.take();
+        let Some(pause)=pause else {return Ok(())};
+        pause.entered.send(())?;
+        let owner=self.cache.owner.upgrade().ok_or(crate::pg::outage::AttemptEnded)?;
+        let until=std::time::Instant::now()+std::time::Duration::from_secs(75);
+        loop {
+            if owner.stop.load(std::sync::atomic::Ordering::Acquire) {return Err(crate::pg::outage::AttemptEnded.into())}
+            let left=until.checked_duration_since(std::time::Instant::now()).ok_or_else(||anyhow::anyhow!("name-index fixture pause timed out"))?;
+            match pause.resume.recv_timeout(left.min(std::time::Duration::from_millis(25))) {
+                Ok(())=>return Ok(()),Err(std::sync::mpsc::RecvTimeoutError::Timeout)=>{},Err(error)=>return Err(error.into()),
+            }
+        }
     }
 }
 fn checked_names(tx:&mut Transaction<'_>,id:i64,lock:bool)->Result<Option<(String,Option<String>,Option<i64>,i64)>> {

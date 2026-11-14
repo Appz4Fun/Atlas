@@ -215,6 +215,30 @@ pub(super) fn start_inferred(owner:&Arc<Owner>,mut service:crate::inferred::nati
     })?);Ok(())
 }
 
+/// Publication owns the original optional Producer exactly once. Maintenance
+/// never runs on this lane; the original Owner still serializes every PG turn.
+fn start_publication(owner:&Arc<Owner>,telemetry:Option<super::telemetry::Producer>,lanes:Option<Arc<LaneCounters>>,handles:&mut Vec<Worker>)->Result<()> {
+    let owner_work=owner.clone();
+    handles.push(spawn(owner,"atlas-native-observation".into(),move|| {
+        let mut observed=None;
+        let mut next_stats=Instant::now();
+        while !owner_work.stop.load(Ordering::Acquire) {
+            if let Some(telemetry)=&telemetry && Instant::now()>=next_stats {
+                let rest=match telemetry.refresh()? {
+                    super::telemetry::Refresh::Published=>Duration::from_secs(1),
+                    super::telemetry::Refresh::Deferred(cause)=>{drop(cause);Duration::from_secs(5)},
+                };
+                next_stats=Instant::now()+rest;
+            }
+            if observed.is_none_or(|at:Instant|at.elapsed()>=Duration::from_secs(30)) {
+                crate::pg::stage_telemetry::capture(&owner_work,lanes.as_deref())?;observed=Some(Instant::now());
+            }
+            nap(&owner_work,Duration::from_secs(1));
+        }Ok(None)
+    })?);
+    Ok(())
+}
+
 // Every service receives the same actual runtime Db and canonical Owner.
 #[allow(clippy::too_many_arguments)]
 fn start_services(owner:&Arc<Owner>,config:&crate::config::Config,pool:Arc<crate::nntp::Pool>,handle:tokio::runtime::Handle,lanes:Option<Arc<LaneCounters>>,telemetry:Option<super::telemetry::Producer>,assets:Option<Arc<crate::pg::worker_assets::Grant>>,db:crate::indexer::Db,headers:crate::config::HeaderStoreConfig,ctx:Option<crate::indexer::PassContext>,drain:Option<Arc<super::telemetry::Drain>>,handles:&mut Vec<Worker>)->Result<()> {
@@ -256,22 +280,13 @@ fn start_services(owner:&Arc<Owner>,config:&crate::config::Config,pool:Arc<crate
             }Ok(None)
         })?);
     }
+    // Publication is independently retained before later maintenance setup.
+    // A later constructor failure still returns through the existing join path.
+    start_publication(owner,telemetry,lanes,handles)?;
     let owner_work=owner.clone();
     let mut refresh=crate::pg::stage_group_refresh::Refresh::new(owner,pool,handle)?;
     handles.push(spawn(owner,"atlas-native-cache".into(),move|| {
-        let mut observed=None;
-        let mut next_stats=Instant::now();
         while !owner_work.stop.load(Ordering::Acquire) {
-            if let Some(telemetry)=&telemetry && Instant::now()>=next_stats {
-                let rest=match telemetry.refresh()? {
-                    super::telemetry::Refresh::Published=>Duration::from_secs(1),
-                    super::telemetry::Refresh::Deferred(cause)=>{drop(cause);Duration::from_secs(5)},
-                };
-                next_stats=Instant::now()+rest;
-            }
-            if observed.is_none_or(|at:Instant|at.elapsed()>=Duration::from_secs(30)) {
-                crate::pg::stage_telemetry::capture(&owner_work,lanes.as_deref())?;observed=Some(Instant::now());
-            }
             match refresh.tick()? {
                 crate::pg::stage_group_refresh::Tick::Idle=>{},
                 crate::pg::stage_group_refresh::Tick::Stored(_capture)=>{},
