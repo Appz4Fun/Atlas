@@ -3300,3 +3300,7 @@ mod native_multi_server_contract;
 #[cfg(test)]
 #[path = "../tests/common/native_blocked_contract.rs"]
 mod native_blocked_contract;
+
+#[cfg(test)]
+#[path = "indexer/scheduler_read_selection_tests.rs"]
+mod scheduler_read_selection_tests;
