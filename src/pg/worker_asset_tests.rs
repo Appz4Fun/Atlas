@@ -36,6 +36,38 @@ fn verify(grant:&Arc<Grant>,id:i64,key:crate::pg::natural_cache::Key<'_>,parts:i
     grant.verify_probe(id,key,parts,complete,stamp,saved,&checked)
 }
 #[test]
+#[ignore="requires isolated PostgreSQL; actual Grant startup in an isolated normal-umask subprocess"]
+fn worker_cover_grant_private_scratch_survives_normal_umask() {
+    use std::os::unix::{fs::PermissionsExt,process::CommandExt};
+    const CHILD:&str="ATLAS_WORKER_GRANT_UMASK_CHILD";
+    if std::env::var_os(CHILD).as_deref()!=Some(std::ffi::OsStr::new("1")) {
+        let url=std::env::var("ATLAS_PG_TEST_URL").expect("explicit isolated PG required");
+        let home=tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().unwrap();
+        let mut child=std::process::Command::new(std::env::current_exe().unwrap());
+        child.args(["--exact","pg::worker_assets::tests::worker_cover_grant_private_scratch_survives_normal_umask","--ignored","--nocapture","--test-threads=1"])
+            .env_clear().env(CHILD,"1").env("ATLAS_PG_TEST_URL",url).env("HOME",home.path()).env("TMPDIR",home.path());
+        // Only the forked child changes its mask. The parallel test process
+        // and unrelated fixture creation retain their original permissions.
+        unsafe {child.pre_exec(|| {libc::umask(0o022);Ok(())});}
+        let result=child.output().unwrap();
+        assert!(result.status.success(),"normal-umask Grant child failed: {}",String::from_utf8_lossy(&result.stderr));
+        return;
+    }
+    let ordinary=tempfile::tempdir().unwrap();
+    assert_eq!(ordinary.path().metadata().unwrap().permissions().mode()&0o777,0o755,"child must actually use the normal 022 mask");
+    let error=crate::nzb_spool::Pool::new(ordinary.path().into(),crate::nzb_spool::Limits {requests:1,per_request_bytes:8,total_bytes:8,free_bytes:0}).unwrap_err();
+    assert_eq!(error.kind(),std::io::ErrorKind::PermissionDenied,"shared spool roots must remain refused");
+    let schema=crate::pg::testing::Schema::new().expect("explicit isolated PG required");
+    let runtime=crate::pg::stage_queue_tests::runtime(&schema);
+    let (_root,_evidence,selection,_)=selected(&jpeg());
+    let grant=Grant::open(&runtime.owner,Some(&selection)).expect("real Grant must start under umask 022").unwrap();
+    assert_eq!(grant._scratch.path().metadata().unwrap().permissions().mode()&0o777,0o700);
+    for pool in [&grant.pool,&grant.art_pool,&grant.image_pool] {drop(pool.open().expect("real granted spool must open"));}
+    assert!(runtime.owner.failure().is_none());
+    drop(grant);runtime.owner.close();
+}
+
+#[test]
 #[ignore="requires isolated PostgreSQL and genuine Unix asset identity"]
 fn worker_cover_grant_uses_real_pg_association_and_pins_verified_spool_until_settlement() {
     let schema=crate::pg::testing::Schema::new().expect("explicit isolated PG required");let runtime=crate::pg::stage_queue_tests::runtime(&schema);

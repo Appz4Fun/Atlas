@@ -117,7 +117,13 @@ impl Grant {
         let epoch=owner.epoch().context("worker assets require the canonical owner")?;
         let manifest=Arc::new(AssetManifest::from_selection(selection)?);
         let source=manifest.native_source(AssetKind::Covers,epoch.catalog())?;
-        let scratch=tempfile::Builder::new().prefix("atlas-worker-assets-").tempdir()?;
+        let mut scratch=tempfile::Builder::new();
+        scratch.prefix("atlas-worker-assets-");
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            scratch.permissions(std::fs::Permissions::from_mode(0o700));
+        }
+        let scratch=scratch.tempdir()?;
         let pool=crate::nzb_spool::Pool::new(scratch.path().into(),crate::nzb_spool::Limits {requests:32,per_request_bytes:COVER_BYTES,total_bytes:32*COVER_BYTES,free_bytes:16*1024*1024})?;
         let art_pool=crate::nzb_spool::Pool::new(scratch.path().into(),crate::nzb_spool::Limits {requests:1,per_request_bytes:8<<20,total_bytes:8<<20,free_bytes:16<<20})?;
         // One raw batch spool per live outcome avoids a descriptor per picture.
