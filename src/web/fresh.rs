@@ -190,7 +190,7 @@ fn native_picture_etas<'name>(view:&ReadView<'_>,pictures:&pg::fresh_pictures::P
         }
     }Ok(etas)
 }
-fn native_picture_state(name:&str,pictures:&pg::fresh_pictures::Pictures,etas:&HashMap<i64,String>)->PictureState {
+pub(super) fn native_picture_state(name:&str,pictures:&pg::fresh_pictures::Pictures,etas:&HashMap<i64,String>)->PictureState {
     if pictures.images.iter().any(|(_,image)|image.file==name){return PictureState::Shown;}
     match pictures.requests.iter().filter(|request|request.file==name).max_by_key(|request|request.requested_at) {
         Some(request) if request.done_at.is_none()&&request.passed_over=>PictureState::Failed("the pictures step isn't reading this release".into()),
@@ -1071,6 +1071,7 @@ mod native_own_enrichment_tests {
 #[cfg(test)]
 mod native_spot_callers_tests {
     use super::*;
+    use std::time::{Duration,Instant};
     fn view<'a>(client:&'a mut postgres::Client,schema:&str,bytes:u64)->ReadView<'a> {
         ReadView::open(client,schema,pg::fresh_reader::Budget {rows:100,bytes},Instant::now()+Duration::from_secs(10)).unwrap()
     }
