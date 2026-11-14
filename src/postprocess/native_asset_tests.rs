@@ -294,6 +294,7 @@ fn run_still_donor_case(complete: bool) {
     assert_eq!(runner.database(&db,0,10).unwrap().settle(&queue,&db,11).unwrap(),Settlement::Applied);
     let net=queue.claim_net(12,1,60,0).unwrap().pop().unwrap(); assert_eq!(net.release_id(),own);
     assert_eq!(runner.network(&queue,&net,12).unwrap().unwrap().settle(&queue,&net,13).unwrap(),Settlement::Applied);
+    transport_stop.store(true,Ordering::Release);transport.join().unwrap();
     assert_eq!(article_hits.load(Ordering::SeqCst),usize::from(!complete),"partial own stills must reach the real own ARTICLE502 response; complete own stills fetch nothing");
     runtime.owner.with(|client| {
         let row=client.query_one("select done,net_wanted,net_left,net_transient from pp_state where release_id=$1", &[&own])?;
@@ -317,7 +318,7 @@ fn run_still_donor_case(complete: bool) {
     drop(view); drop(client);
     for (path,bytes) in physical {assert_eq!(std::fs::read(path).unwrap(),bytes);}
     assert_eq!(runtime.owner.failure(),None);
-    handle.block_on(pool.close());transport_stop.store(true,Ordering::Release);transport.join().unwrap();
+    handle.block_on(pool.close());
     drop(runner); runtime.owner.close();
     std::fs::write(home.join("finished"),b"done").unwrap();
 }
