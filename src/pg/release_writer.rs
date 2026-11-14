@@ -300,6 +300,10 @@ fn copy_input(tx: &mut Transaction<'_>, batch: &[Incoming<'_>], timing_key: Opti
         ])?;
     }
     writer.finish()?;
+    // Build against this filled batch: an index made on the empty stage left
+    // winner-join cardinality underestimated even when ordinal probes used it.
+    tx.batch_execute("drop index if exists pg_temp.atlas_release_input_ordinal_idx;
+        create unique index atlas_release_input_ordinal_idx on pg_temp.atlas_release_input(ordinal)")?;
     Ok(())
 }
 
@@ -749,3 +753,7 @@ mod accepted_timing_regressions;
 #[cfg(test)]
 #[path="release_writer_timing_controls.rs"]
 mod timing_controls;
+
+#[cfg(test)]
+#[path="release_writer_plan_tests.rs"]
+mod plan_experiment;
