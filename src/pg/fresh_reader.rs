@@ -15,6 +15,8 @@ pub(crate) struct ReadView<'client> {
     pub(super) budget: Budget,
     until: Instant,
     owned: Cell<u64>,
+    #[cfg(test)]
+    guard_queries: Cell<u64>,
 }
 
 impl<'client> ReadView<'client> {
@@ -24,7 +26,8 @@ impl<'client> ReadView<'client> {
         ensure!(super::valid_schema(schema) && budget.rows > 0 && budget.bytes >= 131_072,
             "invalid native reader admission");
         let tx = client.build_transaction().isolation_level(IsolationLevel::RepeatableRead).read_only(true).start()?;
-        let view = Self { tx: RefCell::new(tx), budget, until, owned:Cell::new(0) };
+        let view = Self { tx: RefCell::new(tx), budget, until, owned:Cell::new(0),
+            #[cfg(test)] guard_queries:Cell::new(0) };
         view.before_query()?;
         let row = view.tx.borrow_mut().query_one("select current_schema()=$1 and current_setting('transaction_read_only')='on'
             and current_setting('transaction_isolation')='repeatable read'", &[&schema])?;
@@ -72,8 +75,12 @@ impl<'client> ReadView<'client> {
             .context("native reader deadline expired")?;
         let timeout = remaining.as_millis().clamp(1, i32::MAX as u128).to_string();
         self.tx.borrow_mut().query_one("select set_config('statement_timeout',$1,true)", &[&timeout])?;
+        #[cfg(test)] self.guard_queries.set(self.guard_queries.get()+1);
         Ok(())
     }
+
+    #[cfg(test)]
+    pub(crate) fn guard_query_count(&self)->u64 {self.guard_queries.get()}
 
     pub(crate) fn count(&self) -> Result<i64> {
         self.before_query()?;
