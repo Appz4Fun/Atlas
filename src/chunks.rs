@@ -388,14 +388,12 @@ fn frontier_by(db: &dyn Sql, groups: &[(String, i64)], now: i64, newest: bool) -
                           order by c.day {order} limit 1), 0
                   from wanted w
                   union all
-                  select (select c.day from backfill_chunks c
-                          where c.grp = w.g and c.state = {CLAIMED} and c.day >= w.oldest and {live}
-                          order by c.day {order} limit 1), 0
+                  select (select {most}(c.day) filter (where {live}) from backfill_chunks c
+                          where c.grp = w.g and c.state = {CLAIMED} and c.day >= w.oldest), 0
                   from wanted w
                   union all
-                  select (select c.day from backfill_chunks c
-                          where c.grp = w.g and c.state = {CLAIMED} and c.day >= w.oldest and not {live}
-                          order by c.day {order} limit 1), 1
+                  select (select {most}(c.day) filter (where not {live}) from backfill_chunks c
+                          where c.grp = w.g and c.state = {CLAIMED} and c.day >= w.oldest), 1
                   from wanted w
               )
          select coalesce({most}(case when stale = 0 then day end), {most}(day)) from days",
@@ -502,7 +500,7 @@ fn claim_ordered(
     now: i64,
     oldest_first: bool,
 ) -> Result<Option<Claim>> {
-    let (order, pick, best) = if oldest_first { ("asc", "<=", "asc") } else { ("desc", ">=", "desc") };
+    let (order, pick, best, most) = if oldest_first { ("asc", "<=", "asc", "min") } else { ("desc", ">=", "desc", "max") };
     let n = ranges.len() * 4;
     let rows = values_rows(ranges.len(), &["text", "bigint", "bigint", "bigint"], 0);
     let sql = format!(
@@ -513,10 +511,8 @@ fn claim_ordered(
                           where c.grp = w.g and c.state = {PENDING} and c.day >= w.oldest and c.day <= w.newest
                             and {resting}
                           order by c.day {order} limit 1),
-                         (select c.day from backfill_chunks c
-                          where c.grp = w.g and c.state = {CLAIMED} and c.day >= w.oldest and c.day <= w.newest
-                            and c.claimed_at < ${stale}
-                          order by c.day {order} limit 1)
+                         (select {most}(c.day) filter (where c.claimed_at < ${stale}) from backfill_chunks c
+                          where c.grp = w.g and c.state = {CLAIMED} and c.day >= w.oldest and c.day <= w.newest)
                   from wanted w
               ),
               best (grp, media, day) as (
@@ -1506,6 +1502,68 @@ mod tests {
             let k = claim_with(c, &all, "h2", late, Some(20_000)).unwrap().unwrap();
             assert_eq!((k.group.as_str(), k.day), ("big", 20_000));
             assert!(!finish(c, &big, late).unwrap(), "the dead run's claim is no longer its own");
+        });
+    }
+
+    #[test]
+    fn claimed_frontiers_preserve_expiry_nulls_bounds_and_stale_fallback() {
+        both(|c| {
+            c.execute("insert into backfill_chunks(grp,day,state,claimed_at,failed_at,failures) values
+                ('mixed',5,0,null,10000,1),('mixed',10,1,8199,null,null),
+                ('mixed',20,1,8200,null,null),('mixed',25,0,null,null,null),
+                ('mixed',30,1,8201,null,null),('mixed',40,1,8199,null,null),
+                ('mixed',50,1,null,null,null),('mixed',60,0,null,10000,1),
+                ('mixed',70,2,null,null,null),
+                ('boundary',10,1,8199,null,null),('boundary',20,1,8200,null,null),
+                ('stale',10,1,8199,null,null),('stale',20,1,8198,null,null),
+                ('unknown',10,1,null,null,null)", vals![]).unwrap();
+            for (groups, now, oldest, newest) in [
+                (vec![("mixed", 0)], 10000, Some(20), Some(30)),
+                (vec![("mixed", 26)], 10000, Some(30), Some(30)),
+                (vec![("mixed", 31)], 10000, Some(40), Some(40)),
+                (vec![("mixed", 41)], 10000, None, None),
+                (vec![("mixed", 26), ("mixed", 0)], 10000, Some(20), Some(30)),
+                (vec![("mixed", 0)], 10300, Some(5), Some(60)),
+                (vec![("boundary", 0)], 10000, Some(20), Some(20)),
+                (vec![("boundary", 0)], 10001, Some(10), Some(20)),
+                (vec![("stale", 0), ("stale", 15)], 10000, Some(10), Some(20)),
+                (vec![("unknown", 0)], 10000, None, None),
+                (vec![("unlisted", 0)], 10000, None, None),
+                (vec![], 10000, None, None),
+            ] {
+                let groups: Vec<_> = groups.into_iter().map(|(group, floor)| (group.to_string(), floor)).collect();
+                assert_eq!(frontier_oldest(c, &groups, now).unwrap(), oldest, "oldest: {groups:?} at {now}");
+                assert_eq!(frontier(c, &groups, now).unwrap(), newest, "newest: {groups:?} at {now}");
+            }
+        });
+    }
+
+    #[test]
+    fn ordered_claims_preserve_stale_bounds_live_cutoff_and_pending_rest() {
+        both(|c| {
+            for oldest_first in [true, false] {
+                wipe(c);
+                c.execute("insert into backfill_chunks(grp,day,state,claimed_at,failed_at,failures) values
+                    ('g',9,1,8199,null,null),('g',10,1,8199,null,null),
+                    ('g',11,1,8200,null,null),('g',12,1,null,null,null),
+                    ('g',13,0,null,10000,1),('g',14,0,null,null,null),
+                    ('g',15,1,8199,null,null),('g',16,1,8199,null,null)", vals![]).unwrap();
+                let ranges = [("g".to_string(), 10, 15)];
+                let expected = if oldest_first { [10, 14, 15] } else { [15, 14, 10] };
+                for expected_day in expected {
+                    let claimed = claim_ordered(c, &ranges, &[], "worker", 10000, oldest_first).unwrap().unwrap();
+                    assert_eq!(claimed.day, expected_day);
+                    assert!(finish(c, &claimed, 10000).unwrap());
+                }
+                assert!(claim_ordered(c, &ranges, &[], "worker", 10000, oldest_first).unwrap().is_none(),
+                    "live, NULL-timed, resting and out-of-range rows cannot be claimed");
+                let expired = claim_ordered(c, &ranges, &[], "worker", 10001, oldest_first).unwrap().unwrap();
+                assert_eq!(expired.day, 11, "a claim exactly at the cutoff becomes stale one second later");
+                assert!(finish(c, &expired, 10001).unwrap());
+                assert!(claim_ordered(c, &ranges, &[], "worker", 10001, oldest_first).unwrap().is_none());
+                let rested = claim_ordered(c, &ranges, &[], "worker", 10300, oldest_first).unwrap().unwrap();
+                assert_eq!(rested.day, 13, "pending failure rest expires at its exact boundary");
+            }
         });
     }
 
