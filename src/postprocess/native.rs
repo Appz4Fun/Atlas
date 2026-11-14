@@ -311,13 +311,16 @@ pub(crate) fn run_category_fixture(runtime:&crate::pg::indexer_runtime::Runtime)
     // The fixture selects one REAL Step to qualify the runner/commit boundary;
     // the separate factory test inventories all20, not their runtime admission.
     let config=crate::config::Config::default();assert!(config.freeze.enabled);
+    // Preserve the default settling rules; zero-touch fixture rows need a
+    // clock beyond both default settle horizons before the Step may run.
+    let now=config.postprocess.settle_secs.max(config.postprocess.complete_settle_secs)+10;
     let handle=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     let mut runner=Runner::new(&runtime.owner,&config,Arc::new(crate::nntp::Pool::new(&[])),handle.handle().clone()).unwrap();
     let category:Arc<dyn Step>=Arc::new(crate::category::CategoryStep::new());assert!(category.enabled(&config));let bit=mask(category.id());
     runner.steps=Steps {ordered:vec![category],enabled:bit,database:bit,network:0,on_growth:0,stamps:Vec::new()};
     crate::pg::stage_queue_tests::push(runtime);
-    let queue=crate::pg::stage_queue::Queue::for_owner(&runtime.owner).unwrap();let claims=queue.claim(10,1,60).unwrap();assert_eq!(claims.len(),1);
-    assert_eq!(runner.database(&claims[0],0,10).unwrap().settle(&queue,&claims[0],11).unwrap(),crate::pg::stage_queue::Settlement::Applied);
+    let queue=crate::pg::stage_queue::Queue::for_owner(&runtime.owner).unwrap();let claims=queue.claim(now,1,60).unwrap();assert_eq!(claims.len(),1);
+    assert_eq!(runner.database(&claims[0],0,now).unwrap().settle(&queue,&claims[0],now+1).unwrap(),crate::pg::stage_queue::Settlement::Applied);
     runtime.owner.with(|client| {
         assert_eq!(client.query_one("select done from pp_state",&[])?.get::<_,i64>(0),bit);
         assert_eq!(client.query_one("select count(*) from releases",&[])?.get::<_,i64>(0),1);
@@ -329,6 +332,9 @@ pub(crate) fn run_category_fixture(runtime:&crate::pg::indexer_runtime::Runtime)
 #[cfg(test)]
 pub(crate) fn run_network_fixture(runtime:&crate::pg::indexer_runtime::Runtime) {
     let config=crate::config::Config::default();assert!(config.freeze.enabled);
+    // Preserve the default settling rules; zero-touch fixture rows need a
+    // clock beyond both default settle horizons before the Step may run.
+    let now=config.postprocess.settle_secs.max(config.postprocess.complete_settle_secs)+10;
     let handle=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     let mut runner=Runner::new(&runtime.owner,&config,Arc::new(crate::nntp::Pool::new(&[])),handle.handle().clone()).unwrap();
     let category:Arc<dyn Step>=Arc::new(crate::category::CategoryStep::new());assert!(category.enabled(&config));let db=mask(category.id());
@@ -336,14 +342,14 @@ pub(crate) fn run_network_fixture(runtime:&crate::pg::indexer_runtime::Runtime) 
     let mut ordered=vec![category,body_crc];ordered.sort_by_key(|step|step.rank());
     runner.steps=Steps {ordered,enabled:db|net,database:db,network:net,on_growth:0,stamps:Vec::new()};
     crate::pg::stage_queue_tests::push(runtime);
-    let queue=crate::pg::stage_queue::Queue::for_owner(&runtime.owner).unwrap();let claims=queue.claim(10,1,60).unwrap();
-    runner.database(&claims[0],0,10).unwrap().settle(&queue,&claims[0],11).unwrap();
-    let claims=queue.claim_net(12,1,60,0).unwrap();assert_eq!(claims.len(),1);
-    let prepared=runner.network(&queue,&claims[0],12).unwrap().expect("real BodyCrc visit");
+    let queue=crate::pg::stage_queue::Queue::for_owner(&runtime.owner).unwrap();let claims=queue.claim(now,1,60).unwrap();
+    runner.database(&claims[0],0,now).unwrap().settle(&queue,&claims[0],now+1).unwrap();
+    let claims=queue.claim_net(now+2,1,60,0).unwrap();assert_eq!(claims.len(),1);
+    let prepared=runner.network(&queue,&claims[0],now+2).unwrap().expect("real BodyCrc visit");
     runtime.owner.with(|client| {
         assert_eq!(client.query_one("select net_attempts from pp_state",&[])?.get::<_,i64>(0),1,"NET begin must persist before the completed Step is settled");Ok(())
     }).unwrap();
-    assert_eq!(prepared.settle(&queue,&claims[0],13).unwrap(),crate::pg::stage_queue::Settlement::Applied);
+    assert_eq!(prepared.settle(&queue,&claims[0],now+3).unwrap(),crate::pg::stage_queue::Settlement::Applied);
     runtime.owner.with(|client| {
         let row=client.query_one("select done,net_attempts,net_wanted,native_net_token,native_net_before from pp_state",&[])?;
         assert_eq!(row.get::<_,i64>(0),db|net);assert_eq!(row.get::<_,i64>(1),0);assert_eq!(row.get::<_,Option<bool>>(2),None);assert_eq!(row.get::<_,Option<i64>>(3),None);
