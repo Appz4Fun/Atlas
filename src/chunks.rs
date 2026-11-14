@@ -1657,3 +1657,6 @@ mod tests {
         assert_eq!(sorted, (1..=40).collect::<Vec<_>>(), "every day once: {days:?}");
     }
 }
+
+#[cfg(test)]
+mod day_batches_tests;
