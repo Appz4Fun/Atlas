@@ -2,7 +2,7 @@
 //! SQLite connection, caller SQL or best-effort error-to-miss policy lives here.
 use anyhow::{Result,ensure};
 use postgres::{Transaction,types::ToSql};
-use std::collections::{HashMap,HashSet};
+use std::collections::{BTreeMap,HashMap,HashSet};
 use super::StepReads;
 use crate::catalog_facts::FileInfo;
 use crate::archive::{beside,link,select};
@@ -45,16 +45,33 @@ fn named(tx:&mut Transaction<'_>,me:i64,name:&str,window:(&str,&str,&str),budget
       &[&normalized,&high,&name.as_bytes(),&raw_high,&me,&from,&to,&center,&beside::NAME_ROWS],&["original_name","poster"],budget)?.into_iter().map(|r|Ok((r.try_get(0)?,String::from_utf8(r.try_get(1)?)?,r.try_get(2)?))).collect()
 }
 fn start(tx:&mut Transaction<'_>)->Result<()> {tx.query_one("select set_config('statement_timeout','10000',true)",&[])?;Ok(())}
+
+// Stream admitted rows without retaining duplicate String payloads. Tree
+// lookup bounds comparisons even for adversarial names; first-seen positions
+// restore the original local-then-linked order without cloning retained keys.
+struct Par2Names<T> {unique:BTreeMap<T,usize>}
+impl<T:Ord> Par2Names<T> {
+    fn new()->Self {Self {unique:BTreeMap::new()}}
+    fn insert(&mut self,name:T) {
+        let position=self.unique.len();self.unique.entry(name).or_insert(position);
+    }
+    fn finish(self)->Vec<T> {
+        let mut names=self.unique.into_iter().map(|(name,position)|(position,name)).collect::<Vec<_>>();
+        names.sort_unstable_by_key(|(position,_)|*position);
+        names.into_iter().map(|(_,name)|name).collect()
+    }
+}
+
 impl StepReads {
     pub(crate) fn archive_requires_password_list(&self,id:i64)->Result<bool> {self.read(|tx|password_list(tx,id))}
     pub(crate) fn nfo_password_rerun_flags(&self,id:i64)->Result<(bool,bool)> {self.read(|tx|Ok((password_list(tx,id)?,tx.query_one("select exists(select 1 from release_probe where release_id=$1 and info like '%\"encrypted\":true%')",&[&id])?.try_get(0)?)))}
     pub(crate) fn par2_file_names(&self,id:i64)->Result<Vec<String>> {self.read(|tx| {
-        start(tx)?;let mut budget=Budget::default();let mut names=Vec::new();
+        start(tx)?;let mut budget=Budget::default();let mut names=Par2Names::new();
         for sql in ["select release_id,name from par2_files where release_id=$1 order by file_id","select pf.release_id,pf.name from upload_link ul join upload_link rec on rec.lead_id=ul.lead_id join par2_files pf on pf.release_id=rec.release_id where ul.release_id=$1 order by rec.release_id,pf.file_id"] {
             let selected=rows(tx,sql,&[&id],&["name"],&mut budget)?;
             self.observe_in(tx,&selected.iter().map(|r|r.try_get(0)).collect::<std::result::Result<Vec<i64>,_>>()?)?;
-            for r in selected {let name:String=r.try_get(1)?;if !names.contains(&name){names.push(name)}}
-        }Ok(names)
+            for r in selected {names.insert(r.try_get::<_,String>(1)?);}
+        }Ok(names.finish())
     })}
     pub(crate) fn par2_names(&self,id:i64,input:&[FileInfo])->Result<HashMap<String,String>> {self.read(|tx| {
         start(tx)?;let mut budget=Budget::default();budget.charge(input.len() as i64,input.iter().map(|f|f.filename.len() as i64).sum())?;
@@ -197,6 +214,56 @@ fn candidate_file(r:&postgres::Row,at:usize)->Result<FileInfo> {Ok(FileInfo {id:
 mod tests {
     use super::*;
     use crate::postprocess::{data::StepData,step::StepError};
+
+    #[test]
+    fn linked_par2_names_preserve_first_occurrence_and_exact_equality() {
+        let mut names=Par2Names::new();
+        for batch in [vec!["z.mkv","A.mkv","","a\0b.mkv"],vec!["A.mkv","a.mkv","a\0b.mkv","é.mkv","e\u{301}.mkv","","z.mkv"]] {
+            for name in batch {names.insert(name.to_owned());}
+        }
+        assert_eq!(names.finish(),["z.mkv","A.mkv","","a\0b.mkv","a.mkv","é.mkv","e\u{301}.mkv"]);
+        assert!(Par2Names::<String>::new().finish().is_empty());
+    }
+
+    #[test]
+    fn linked_par2_name_deduplication_has_a_comparison_bound() {
+        use std::{cell::Cell,cmp::Ordering,rc::Rc};
+        struct CountedName {name:String,comparisons:Rc<Cell<usize>>,live:Rc<Cell<usize>>}
+        impl Drop for CountedName {
+            fn drop(&mut self) {self.live.set(self.live.get()-1);}
+        }
+        impl Ord for CountedName {
+            fn cmp(&self,other:&Self)->Ordering {
+                self.comparisons.set(self.comparisons.get()+1);
+                self.name.cmp(&other.name)
+            }
+        }
+        impl PartialOrd for CountedName {
+            fn partial_cmp(&self,other:&Self)->Option<Ordering> {Some(self.cmp(other))}
+        }
+        impl PartialEq for CountedName {
+            fn eq(&self,other:&Self)->bool {self.cmp(other)==Ordering::Equal}
+        }
+        impl Eq for CountedName {}
+
+        // The reported linked-inventory shape, plus a fully distinct admitted
+        // inventory. Count actual key comparisons rather than elapsed time.
+        for (members,files) in [(64usize,512usize),(1,50_000)] {
+            let comparisons=Rc::new(Cell::new(0));let live=Rc::new(Cell::new(0));let mut names=Par2Names::new();
+            for _ in 0..members {
+                for file in (0..files).rev() {
+                    live.set(live.get()+1);
+                    names.insert(CountedName {name:format!("inventory-file-{file:05}.mkv"),comparisons:comparisons.clone(),live:live.clone()});
+                    assert!(live.get()<=files,"duplicates must not retain extra owned payloads");
+                }
+            }
+            let actual=names.finish().into_iter().map(|mut name|std::mem::take(&mut name.name)).collect::<Vec<_>>();
+            assert_eq!(actual,(0..files).rev().map(|file|format!("inventory-file-{file:05}.mkv")).collect::<Vec<_>>());
+            assert_eq!(live.get(),0);
+            assert!(comparisons.get()>=members*files-files,"the counted insertion path must actually run");
+            assert!(comparisons.get()<=members*files*64,"linked inventories must not require a linear scan for every name");
+        }
+    }
 
     #[test]
     fn native_posted_dates_match_the_sqlite_age_oracle() {
