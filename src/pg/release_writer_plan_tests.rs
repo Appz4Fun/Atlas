@@ -34,7 +34,8 @@ fn isolated_article_writer_stage_plan_and_semantic_controls() {
     let bytes=std::fs::read(report).expect("complete isolated writer plan report");
     let report:serde_json::Value=serde_json::from_slice(&bytes).unwrap();
     assert_eq!(report["variants"].as_array().unwrap().len(),8);
-    assert_eq!(report["ordinary_save_parts"],1700);
+    let semantics:serde_json::Value=serde_json::from_slice(&std::fs::read(home.path().join("semantics.private.json")).unwrap()).unwrap();
+    assert_eq!(semantics["ordinary_save_parts"],1700);
     let _=home.keep();
     eprintln!("closed writer plan report sha256={:x}; eight bounded probes and genuine save/replay parity passed",Sha256::digest(bytes));
 }
@@ -117,6 +118,11 @@ fn run() {
             tx.rollback().unwrap();assert_eq!(snapshot(&mut client),frozen,"probe writes must all roll back");
         }
     }
+    // Preserve all plans even if the subsequent unchanged writer exceeds its
+    // statement budget. TEXT avoids enabling an extra JSON driver feature;
+    // PostgreSQL still supplies every node, loop, buffer, JIT and trigger line.
+    write_report("plans.private.json",&serde_json::json!({"input_rows":2000,"background_releases":8192,
+        "background_files":163840,"format":"postgresql explain analyze buffers text timing off","variants":reports}));
     assert!(reports.iter().any(|report|report["accepted"]==1700),"at least one exact writer probe must finish within admission");
     // Exercise the complete real path too: timings, completeness and queue
     // generation are deliberately not substituted by the diagnostic SQL path.
@@ -126,8 +132,12 @@ fn run() {
     let row=client.query_one("select count(*),sum(r.parts)::bigint,sum(r.size)::bigint,sum(q.generation)::bigint
         from releases r join pp_queue q on q.release_id=r.id where r.group_name='alt.binaries.test'",&[]).unwrap();
     assert_eq!((row.get::<_,i64>(0),row.get::<_,i64>(1),row.get::<_,i64>(2),row.get::<_,i64>(3)),(100,3300,56100,200));
-    let report=serde_json::json!({"input_rows":2000,"background_releases":8192,"background_files":163840,"ordinary_save_parts":saved.parts,"variants":reports});
+    write_report("semantics.private.json",&serde_json::json!({"ordinary_save_parts":saved.parts,"ordinary_save_files":saved.files,"replay_unchanged":true,"final_snapshot":after}));
+}
+
+fn write_report(name:&str,report:&serde_json::Value) {
     let mut file=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
-        .open(crate::paths::app_dir().join("plans.private.json")).unwrap();
+        .open(crate::paths::app_dir().join(name)).unwrap();
     file.write_all(&serde_json::to_vec_pretty(&report).unwrap()).unwrap();file.sync_all().unwrap();
+    std::fs::File::open(crate::paths::app_dir()).unwrap().sync_all().unwrap();
 }
