@@ -265,12 +265,26 @@ mod pg_observation_tests {
     #[ignore="requires explicit isolated PostgreSQL and native release-writer admission"]
     fn stopped_owner_keeps_retained_catalog_without_live_samples() {
         use crate::parser::{Article,Release};
-        let schema=pg::testing::Schema::native_writer().expect("explicit isolated PostgreSQL");
+        let schema=pg::testing::Schema::new().expect("explicit isolated PostgreSQL");let root=tempfile::tempdir().unwrap();
+        let mut config=Config::default();config.postprocess.enabled=false;config.predb.enabled=false;config.spots.enabled=false;config.inferred_parts=false;
+        config.media.tvmaze.enabled=false;config.media.allocine.enabled=false;config.media.details_per_minute=0;
+        let storage=pg::StorageConfig {backend:pg::Backend::Postgres,url:schema.url.clone(),schema:schema.name.clone(),max_connections:1,allow_plaintext:true};
+        let headers=HeaderStoreConfig {enabled:true,dir:root.path().join("headers").to_str().unwrap().into()};
+        let runtime=pg::indexer_runtime::Runtime::open(&config,storage,headers,&[],&mut None).unwrap();
         let mut client=schema.pool.get().unwrap();
         let releases=[Release {name:"Retained.Stats.Example".into(),group:"alt.binaries.test".into(),poster:"p".into(),
             date:"Wed, 01 Jan 2020 00:00:00 +0000".into(),articles:vec![Article {filename:Some("f.bin".into()),
                 subject:"f.bin yEnc (1/1)".into(),message_id:"retained-stats@example.invalid".into(),part:Some(1),total_parts:Some(1),bytes:123,..Default::default()}],..Default::default()}];
         assert_eq!(pg::release_writer::save(&mut client,&releases,1).unwrap().releases,1);
+        pg::stage_telemetry::capture(&runtime.owner,None).unwrap();
+        let pid=runtime.owner.with(|owner|Ok(owner.query_one("select pg_backend_pid()",&[])?.get::<_,i32>(0))).unwrap();
+        runtime.owner.close();
+        let stopped=Instant::now()+Duration::from_secs(2);
+        loop {
+            client.query_one("select pg_stat_clear_snapshot()",&[]).unwrap();
+            if !client.query_one("select exists(select 1 from pg_stat_activity where pid=$1)",&[&pid]).unwrap().get::<_,bool>(0){break;}
+            assert!(Instant::now()<stopped,"original owner backend must finish closing");std::thread::sleep(Duration::from_millis(5));
+        }
         {
             let view=ReadView::open(&mut client,&schema.name,Budget {rows:100,bytes:64*1024*1024},Instant::now()+Duration::from_secs(10)).unwrap();
             let facts=view.live_statistics().unwrap();
