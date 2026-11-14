@@ -192,14 +192,18 @@ mod scenarios {
         }).unwrap();
     }
     pub(super) fn metric_capture_batches_real_statements_and_preserves_complete_frame_and_pruning(f:&Fixture) {
+        println!("metric capture controls: phase=seed");
         seed_metric_payloads();count_metric_insert_statements(f);
         let expected=expected_registry();
+        println!("metric capture controls: phase=capture");
         pg::stage_telemetry::capture(&f.runtime.owner,None).unwrap();
         let first=head(f).unwrap();let mut check=f.observer();
+        println!("metric capture controls: phase=parity");
         assert_eq!(metric_frame(&mut check,first.id),expected,"batching must preserve every bit, NULL and original identity");
         let stats=check.query_one("select count(*),sum(rows)::bigint,max(rows),max(bytes) from fixture_metric_insert_calls",&[]).unwrap();
         let (calls,rows,max_rows,max_bytes):(i64,i64,i64,i64)=(stats.get(0),stats.get(1),stats.get(2),stats.get(3));
         assert_eq!(rows,expected.len() as i64);
+        println!("metric capture controls: phase=pruning");
         // Populate the retained-frame boundary through real FK-bound observations.
         f.runtime.owner.with(|client| {
             client.execute("insert into native_runtime_observations(epoch,catalog_nonce,process_nonce,observed_at_ms,monotonic_ns,stage_running)
@@ -673,6 +677,21 @@ fn run_case(case: &str) {
     let (status, timed_out) = waited.expect("private publication child wait");
     let out = out.expect("private stdout drain");
     let err = err.expect("private stderr drain");
+    if !status.success() {
+        use sha2::{Digest,Sha256};
+        let evidence=tempfile::Builder::new().prefix("atlas-publication-failure-").tempdir().unwrap();
+        #[cfg(unix)] {use std::os::unix::fs::PermissionsExt;std::fs::set_permissions(evidence.path(),std::fs::Permissions::from_mode(0o700)).unwrap();}
+        for (name,bytes) in [("child.stdout.private.log",&out.kept),("child.stderr.private.log",&err.kept)] {
+            let mut options=std::fs::OpenOptions::new();options.write(true).create_new(true);
+            #[cfg(unix)] {use std::os::unix::fs::OpenOptionsExt;options.mode(0o600);}
+            let mut file=options.open(evidence.path().join(name)).unwrap();file.write_all(bytes).unwrap();file.sync_all().unwrap();
+            let digest=Sha256::digest(bytes);let sha=digest.iter().map(|b|format!("{b:02x}")).collect::<String>();
+            println!("private publication failure log: {name} sha256={sha}");
+        }
+        // Retain bounded logs only. The destination-bearing private config is
+        // still removed with the original home, and no path enters stdout.
+        let _retained=evidence.keep();
+    }
     assert!(!timed_out, "publication case exceeded120-second child deadline");
     assert!(!out.overflow && !err.overflow, "publication case exceeded64-KiB pipe cap");
     // Forward only closed fixture diagnostics, never arbitrary destination-
