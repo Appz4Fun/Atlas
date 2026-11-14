@@ -148,6 +148,12 @@ impl Prepared {
                 fail(&self.owner,&error);return Err(error)
             }
         }
+        for hold in &self.holds {
+            if let Some(stills)=hold.downcast_ref::<crate::pg::worker_assets::StillFrame>()
+                && let Err(error)=stills.check(&self.owner,claim.release_id()) {
+                fail(&self.owner,&error);return Err(error)
+            }
+        }
         let visit=self.visit.take().expect("prepared native visit");
         let result=queue.settle(claim,visit,now);
         if let Err(error)=&result {fail(&self.owner,error);}
@@ -374,3 +380,7 @@ pub(crate) mod image_asset_tests;
 #[cfg(test)]
 #[path = "../media/native_settlement_tests.rs"]
 mod media_settlement_tests;
+
+#[cfg(all(test,unix))]
+#[path="../pg/worker_still_asset_tests.rs"]
+mod still_asset_tests;

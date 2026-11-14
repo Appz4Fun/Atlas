@@ -5,10 +5,13 @@ use sha2::Digest;
 use std::{io::Read,cell::RefCell,sync::{Arc,Weak},marker::PhantomData,rc::Rc};
 use super::{indexer_runtime::Owner,fresh_assets::{AssetManifest,AssetRequest,AssetKind},natural_cache::{self,Key,Budget}};
 const COVER_BYTES:u64=crate::probe::media::MAX_COVER as u64;
+#[path="worker_still_assets.rs"]
+mod stills;
+pub(crate) use stills::{StillFrame,StillChanged,StillAdmission};
 
 pub(crate) struct Grant {
     owner:Weak<Owner>,epoch:[u8;32],catalog:[u8;32],manifest:Arc<AssetManifest>,source:[u8;32],
-    pool:Arc<crate::nzb_spool::Pool>,art_pool:Arc<crate::nzb_spool::Pool>,image_pool:Arc<crate::nzb_spool::Pool>,image_writes:std::sync::atomic::AtomicU64,_scratch:tempfile::TempDir,
+    pool:Arc<crate::nzb_spool::Pool>,art_pool:Arc<crate::nzb_spool::Pool>,image_pool:Arc<crate::nzb_spool::Pool>,image_writes:std::sync::atomic::AtomicU64,still_writes:std::sync::atomic::AtomicU64,_scratch:tempfile::TempDir,
 }
 #[derive(Debug,PartialEq,Eq)]
 pub(crate) enum ArtworkStatus {Kept,Missing,Unavailable,Changed}
@@ -129,7 +132,7 @@ impl Grant {
         // One raw batch spool per live outcome avoids a descriptor per picture.
         // These are disk limits; per-picture Rust buffers remain <=64MiB.
         let image_pool=crate::nzb_spool::Pool::new(scratch.path().into(),crate::nzb_spool::Limits {requests:128,per_request_bytes:8<<30,total_bytes:16<<30,free_bytes:16<<20})?;
-        Ok(Some(Arc::new(Self {owner:Arc::downgrade(owner),epoch:*epoch.id(),catalog:*epoch.catalog().nonce(),manifest,source,pool,art_pool,image_pool,image_writes:std::sync::atomic::AtomicU64::new(0),_scratch:scratch})))
+        Ok(Some(Arc::new(Self {owner:Arc::downgrade(owner),epoch:*epoch.id(),catalog:*epoch.catalog().nonce(),manifest,source,pool,art_pool,image_pool,image_writes:std::sync::atomic::AtomicU64::new(0),still_writes:std::sync::atomic::AtomicU64::new(0),_scratch:scratch})))
     }
     pub(crate) fn image_frame(self:&Arc<Self>,release:i64,limit:u64)->Result<ImageFrame> {
         ensure!(limit>0&&limit<=super::fresh_assets::IMAGE_BYTES,"native image frame byte admission");let owner=self.owner()?;
