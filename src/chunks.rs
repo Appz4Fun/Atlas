@@ -49,19 +49,39 @@ pub fn unix_day(t: i64) -> i64 {
 
 /// Pending chunks for `newest_day` down to `oldest_day`, keeping any that exist.
 pub fn add(db: &dyn Sql, group: &str, newest_day: i64, oldest_day: i64) -> Result<usize> {
-    db.tx(|tx| add_days(tx, group, oldest_day, newest_day + 1))
+    db.tx(|tx| add_inclusive_days(tx, group, oldest_day, newest_day))
 }
 
-/// SQL: a pending chunk `$1`, `$2`, kept as it is when there is one
-const ADD: &str = "insert into backfill_chunks (grp, day, state) values ($1, $2, $3) on conflict (grp, day) do nothing";
+// Bound the generated rows and statement-trigger boundary refreshes per statement.
+const DAY_BATCH: i64 = 2_048;
+const ADD: &str = "insert into backfill_chunks (grp, day, state)
+    select $1::text, day, $4::bigint
+    from generate_series($2::bigint, $3::bigint, -1::bigint) as days(day)
+    order by day desc on conflict (grp, day) do nothing";
 
 /// Pending chunks for the days before `before` back to `from`, newest first, keeping any that exist. The count added.
 fn add_days(tx: &dyn Sql, group: &str, from: i64, before: i64) -> Result<usize> {
-    let mut added = 0;
-    for day in (from..before).rev() {
-        added += tx.execute(ADD, vals![group, day, PENDING])?;
+    if from >= before {
+        return Ok(0);
     }
-    Ok(added)
+    add_inclusive_days(tx, group, from, before - 1)
+}
+
+/// Inclusive bounds avoid overflowing the public API's newest day. Every batch stays in its caller's transaction.
+fn add_inclusive_days(tx: &dyn Sql, group: &str, from: i64, newest: i64) -> Result<usize> {
+    if from > newest {
+        return Ok(0);
+    }
+    let mut added = 0;
+    let mut high = newest;
+    loop {
+        let low = from.max(high.saturating_sub(DAY_BATCH - 1));
+        added += tx.execute(ADD, vals![group, high, low, PENDING])?;
+        if low == from {
+            return Ok(added);
+        }
+        high = low - 1;
+    }
 }
 
 /// When a server goes back further than any did on split `group`, to
@@ -1657,3 +1677,6 @@ mod tests {
         assert_eq!(sorted, (1..=40).collect::<Vec<_>>(), "every day once: {days:?}");
     }
 }
+
+#[cfg(test)]
+mod day_batches_tests;
