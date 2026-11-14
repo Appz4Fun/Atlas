@@ -274,6 +274,12 @@ pub(super) fn run_runtime_case(selector: &'static str, body: impl FnOnce(&crate:
         | "media::steps::tests::each_step_has_its_lane"
         | "postprocess::native::media_settlement_tests::a_files_own_tags_pin_its_ids_against_a_lookup_by_name"
     ), "closed native runtime fixture selector");
+    if std::env::var_os(CHILD_CASE).is_none()
+        && (!cfg!(unix) || std::env::var("ATLAS_PG_TEST_URL").ok().filter(|url| !url.is_empty()).is_none())
+    {
+        eprintln!("skipping default native media fixture: Unix and ATLAS_PG_TEST_URL are required");
+        return;
+    }
     run_owned_case(selector, selector, false, body);
 }
 
