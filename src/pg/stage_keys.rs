@@ -72,6 +72,8 @@ impl StepReads {
 
 fn probe_in(tx:&mut Transaction<'_>,id:i64)->Result<(Option<crate::probe::ProbeInfo>,Option<String>)> {
     tx.query_one("select set_config('statement_timeout','10000',true)",&[])?;
+    #[cfg(test)]
+    tests::apply_query_timeout(tx)?;
     let Some(row)=tx.query_opt("select case when octet_length(info)<=67108864 then info end,octet_length(info),case when octet_length(moviehash)<=65536 then moviehash end,octet_length(moviehash) from release_probe where release_id=$1",&[&id])? else {return Ok((None,None))};
     ensure!(row.try_get::<_,Option<i32>>(1)?.is_none_or(|n|n<=64*1024*1024) && row.try_get::<_,Option<i32>>(3)?.is_none_or(|n|n<=65536),"native key probe exceeds read admission");
     let info:Option<String>=row.try_get(0)?;
@@ -119,6 +121,79 @@ fn folded_in(tx:&mut Transaction<'_>,id:i64,stop:&std::sync::atomic::AtomicBool)
 #[cfg(test)]
 mod tests {
     use super::super::StepReads;
+
+    thread_local! {
+        static QUERY_TIMEOUT_MS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    }
+    pub(super) fn apply_query_timeout(tx:&mut postgres::Transaction<'_>)->anyhow::Result<()> {
+        if let Some(millis)=QUERY_TIMEOUT_MS.with(|timeout|timeout.get()) {
+            assert!(millis>0);
+            tx.query_one("select set_config('statement_timeout',$1,true)",&[&millis.to_string()])?;
+        }
+        Ok(())
+    }
+    struct QueryTimeout(Option<u64>);
+    impl Drop for QueryTimeout {
+        fn drop(&mut self) {QUERY_TIMEOUT_MS.with(|timeout|timeout.set(self.0));}
+    }
+
+    #[test]
+    #[ignore="requires explicit isolated PostgreSQL and an actual blocked Keys SELECT"]
+    fn keys_step_local_query_timeout_defers_without_poisoning_owner() {
+        use crate::postprocess::{data::StepData,step::{ReleaseInfo,Step,StepCtx,StepError}};
+        use std::{sync::{Arc,atomic::Ordering},time::{Duration,Instant}};
+
+        let schema=crate::pg::testing::Schema::new().expect("explicit isolated PostgreSQL required");
+        let runtime=crate::pg::stage_queue_tests::runtime(&schema);
+        crate::pg::stage_queue_tests::push(&runtime);
+        let id=runtime.owner.with(|client| {
+            let id:i64=client.query_one("select id from releases",&[])?.get(0);
+            client.execute("insert into release_keys(release_id,video) values($1,99)",&[&id])?;
+            Ok(id)
+        }).unwrap();
+        let reads=StepReads::for_owner(&runtime.owner).unwrap();
+        let executor=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let bodies=crate::postprocess::bodies::BodyFetcher::new(
+            Arc::new(crate::nntp::Pool::new(&[])),executor.handle().clone(),runtime.owner.stop.clone(),
+            crate::config::PostprocessConfig::default(),Arc::new(crate::postprocess::stats::Stats::default()));
+        let mut blocker=schema.pool.get().unwrap();
+        let mut held=blocker.transaction().unwrap();
+        held.batch_execute("lock table release_probe in access exclusive mode").unwrap();
+        let _timeout=QueryTimeout(QUERY_TIMEOUT_MS.with(|timeout|timeout.replace(Some(100))));
+        let mut context=StepCtx {
+            release:ReleaseInfo {id,parts:1,..Default::default()},data:StepData::Native(&reads),facts:Vec::new(),
+            bodies:&bodies,used_bodies:0,deadline:Instant::now()+Duration::from_millis(200),
+            lane_can_fetch:false,crcs:Vec::new(),pictures:false,
+        };
+        let result=crate::keys::KeysStep::default().run(&mut context);
+        // Drain the real blocker before any regression assertion can unwind.
+        held.rollback().unwrap();
+        drop(blocker);
+        assert_eq!(context.used_bodies,0);
+        assert!(context.crcs.is_empty());
+        if let Err(StepError::Native(error))=&result {
+            let pg=error.chain().find_map(|cause|cause.downcast_ref::<postgres::Error>())
+                .expect("the unfixed path must retain its actual SELECT timeout cause");
+            assert_eq!(pg.code(),Some(&postgres::error::SqlState::QUERY_CANCELED));
+            assert_eq!(pg.as_db_error().unwrap().message(),"canceling statement due to statement timeout");
+        }
+        let failure=runtime.owner.failure();
+        let healthy=failure.is_none()&&!runtime.owner.stop.load(Ordering::Acquire);
+        if healthy {
+            runtime.owner.with(|client| {
+                assert_eq!(client.query_one("select 1",&[])?.get::<_,i32>(0),1);
+                Ok(())
+            }).expect("a deferred read must leave the original owner usable after rollback");
+        }
+        let mut observer=schema.pool.get().unwrap();
+        assert_eq!(observer.query_one("select video from release_keys where release_id=$1",&[&id]).unwrap().get::<_,i64>(0),99);
+        assert_eq!(observer.query_one("select count(*) from native_operations",&[]).unwrap().get::<_,i64>(0),0);
+        drop(observer);
+        runtime.owner.close();
+        let error=result.err().expect("the blocked Keys read must defer rather than complete");
+        assert!(matches!(&error,StepError::OutOfBudget)&&healthy,
+            "a local Keys SELECT deadline must defer without ending the owner: error={error:?}, owner_failure={failure:?}");
+    }
 
     #[test]
     fn native_key_inputs_preserve_original_salt_nulls_crc_and_still_hash_policy() {
