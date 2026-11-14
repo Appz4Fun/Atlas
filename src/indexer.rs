@@ -665,6 +665,31 @@ pub(crate) async fn on_db<T: Send + 'static>(
     tokio::task::spawn_blocking(move || conn.with_sql(f)).await.map_err(|e| anyhow!("db task failed: {e}"))?
 }
 
+/// Closed scheduler selection: claim_chunk, claim_turn and sweep_to_take only.
+/// The two former Sql callers retain their original DB_WAIT accounting; the
+/// typed sweep selector previously used on_native_db without that counter.
+async fn on_selection_db<T: Send + 'static>(
+    db: &Db,
+    record_wait: bool,
+    work: impl FnOnce(&mut postgres::Client) -> Result<T> + Send + 'static,
+) -> Result<T> {
+    let db = db.clone();
+    tokio::task::spawn_blocking(move || {
+        let t = std::time::Instant::now();
+        match &*db.conn {
+            MainConnection::Postgres(pool) => {
+                let mut client = pool.get()?;
+                if record_wait { crate::profile::DB_WAIT.add_since(t); }
+                work(&mut client)
+            },
+            MainConnection::OwnedPostgres(owner) => owner.with_selection(|client| {
+                if record_wait { crate::profile::DB_WAIT.add_since(t); }
+                work(client)
+            }),
+        }
+    }).await.map_err(|error| anyhow!("selection database task failed: {error}"))?
+}
+
 /// Only committed header progress uses ingestion admission. Claim selection,
 /// frontier scans and all other callbacks keep ordinary FIFO admission.
 pub(crate) async fn on_ingest_progress<T: Send + 'static>(
@@ -1058,7 +1083,8 @@ where
         let (kept, running) = (ctx.states.kept_days(&host), ctx.states.groups());
         // the split's generation as of the claim: a sweep noted after the split reached back isnt
         let g = group.to_string();
-        let (claimed, generation) = on_db(db, move |conn| {
+        let (claimed, generation) = on_selection_db(db, true, move |client| {
+            let conn = &crate::pg::sql::Pg::new(client);
             let generation = crate::chunks::sweep_generation(conn, &g)?;
             let split: Vec<(String, i64)> = crate::chunks::split_groups(conn)?
                 .into_iter()
@@ -1408,7 +1434,8 @@ pub async fn claim_chunk(
     groups: std::collections::HashSet<String>,
     oldest: HashMap<String, i64>,
 ) -> Result<Option<crate::chunks::Claim>> {
-    on_db(db, move |conn| {
+    on_selection_db(db, true, move |client| {
+        let conn = &crate::pg::sql::Pg::new(client);
         let split: Vec<(String, i64)> = crate::chunks::split_groups(conn)?
             .into_iter()
             .filter(|g| groups.contains(g))
@@ -1428,7 +1455,7 @@ pub async fn sweep_to_take(db: &Db, host: String, groups: Vec<String>) -> Result
     // Keep selection in one reply: per-group EXISTS round trips held the
     // canonical owner for an entire tracked-group scan, even on an empty catalog.
     // Ordinality preserves the caller's provider-filtered order, including duplicates.
-    on_native_db(db, move |conn| {
+    on_selection_db(db, false, move |conn| {
         let row = conn.query_opt(
             "select wanted.grp
              from unnest($1::text[]) with ordinality as wanted(grp, ord)

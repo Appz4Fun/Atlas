@@ -347,3 +347,63 @@ fn ordinary_observation_heartbeat_commits_between_two_waiting_ingestion_callback
     assert_eq!(owner.failure(), None);
     owner.close();
 }
+
+fn queued_three(admission: &Admission, wanted: [usize; 3]) {
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        let sizes = {let state=admission.state.lock().unwrap();std::array::from_fn(|n|state.waiting[n].len())};
+        if sizes==wanted {return}
+        assert!(Instant::now()<until,"three admission queues {sizes:?}, expected {wanted:?}");
+        thread::yield_now();
+    }
+}
+
+#[test]
+fn nested_turns_preserve_ingestion_share_and_service_selection_fifos() {
+    let gate=Arc::new(Admission::default());let stop=Arc::new(AtomicBool::new(false));let accepting=Arc::new(AtomicBool::new(true));
+    let held=gate.enter(2,&stop,&accepting).unwrap();let (sent,received)=mpsc::channel();let mut jobs=Vec::new();let mut sizes=[0;3];
+    for (class,name) in [(2,"C0"),(2,"C1"),(2,"C2"),(1,"B0"),(1,"B1"),(1,"B2"),(0,"A0"),(0,"A1"),(0,"A2"),(0,"A3"),(0,"A4"),(0,"A5")] {
+        let (g,s,a,sent)=(gate.clone(),stop.clone(),accepting.clone(),sent.clone());
+        jobs.push(thread::spawn(move|| {let _turn=g.enter(class,&s,&a).unwrap();sent.send(name).unwrap();}));
+        sizes[class]+=1;queued_three(&gate,sizes);
+    }
+    drop(held);
+    let actual:Vec<_>=(0..12).map(|_|received.recv_timeout(Duration::from_secs(5)).unwrap()).collect();
+    assert_eq!(actual,["A0","B0","A1","C0","A2","B1","A3","C1","A4","B2","A5","C2"]);
+    for job in jobs {job.join().unwrap()}
+    queued_three(&gate,[0;3]);assert!(!gate.state.lock().unwrap().active);
+    // With no ingestion/service demand, selection is work-conserving, not artificially throttled.
+    let only=gate.enter(2,&stop,&accepting).unwrap();drop(only);
+    let only=gate.enter(1,&stop,&accepting).unwrap();drop(only);
+}
+
+#[test]
+fn three_queued_classes_stop_without_releasing_active_selection_and_panic_does_not_strand_it() {
+    let gate=Arc::new(Admission::default());let stop=Arc::new(AtomicBool::new(false));let accepting=Arc::new(AtomicBool::new(true));
+    let held=gate.enter(2,&stop,&accepting).unwrap();let mut jobs=Vec::new();let mut sizes=[0;3];
+    for class in 0..3 {
+        let (g,s,a)=(gate.clone(),stop.clone(),accepting.clone());
+        jobs.push(thread::spawn(move||g.enter(class,&s,&a).err().is_some_and(|e|outage::is_attempt_ended(&e))));
+        sizes[class]+=1;queued_three(&gate,sizes);
+    }
+    stop.store(true,Ordering::Release);gate.changed.notify_all();
+    for job in jobs {assert!(job.join().unwrap());}
+    queued_three(&gate,[0;3]);assert!(gate.state.lock().unwrap().active);drop(held);
+    stop.store(false,Ordering::Release);
+    assert!(std::panic::catch_unwind(|| {let _turn=gate.enter(2,&stop,&accepting).unwrap();panic!("selection fixture panic");}).is_err());
+    let next=gate.enter(0,&stop,&accepting).unwrap();drop(next);assert!(!gate.state.lock().unwrap().active);
+}
+
+#[test]
+#[ignore="requires explicit isolated PostgreSQL; real indexer selection adapter, no provider work"]
+fn indexer_claim_callback_uses_selection_queue_and_stop_never_runs_its_sql() {
+    let schema=crate::pg::testing::Schema::new().expect("explicit isolated PostgreSQL required");let runtime=crate::pg::stage_queue_tests::runtime(&schema);
+    let (release,held)=held_owner(&runtime.owner);let db=runtime.db.clone();
+    let worker=thread::spawn(move||tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(
+        crate::indexer::claim_chunk(&db,"fixture".into(),std::collections::HashSet::from(["example.admission".into()]),Default::default())
+    ));
+    queued_three(&runtime.owner.admission,[0,0,1]);runtime.owner.stop.store(true,Ordering::Release);
+    let result=worker.join().unwrap();assert!(outage::is_attempt_ended(&result.unwrap_err()));queued_three(&runtime.owner.admission,[0;3]);
+    assert!(runtime.owner.admission.state.lock().unwrap().active);release.send(()).unwrap();held.join().unwrap().unwrap();
+    assert_eq!(runtime.owner.failure(),None);runtime.owner.close();
+}

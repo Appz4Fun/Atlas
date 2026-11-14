@@ -165,3 +165,7 @@ mod tests;
 #[cfg(test)]
 #[path="native_counter_drain_tests.rs"]
 mod drain_tests;
+
+#[cfg(test)]
+#[path="native_selection_fair_tests.rs"]
+mod selection_fair_tests;
