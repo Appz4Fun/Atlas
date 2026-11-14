@@ -7,6 +7,7 @@ use sha2::Digest;
 
 use crate::catalog_facts::{FileInfo, SegmentPick};
 use crate::config::Config;
+#[cfg(test)]
 use crate::keys;
 use crate::postprocess::step::{
     Got, Needs, Outcome, Reruns, Step, StepCtx, StepError, StepId, StepMutation, StepWrite,
@@ -58,11 +59,6 @@ fn keep(bytes: &[u8]) -> Option<String> {
     }
     Some(sha256)
 }
-
-/// The keys that name the video file itself, whichever release carries it: the Matroska SegmentUID with the mux's
-/// DateUTC, and the OpenSubtitles hash (the size with the first and last 64 KiB). Both come from the probed main
-/// file, never a sample or an extra, soo a release that shares one has the same pictures at the same places.
-const SAME_FILE: [keys::Kind; 2] = [keys::Kind::Mux, keys::Kind::MovieHash];
 
 /// How far apart in the film two stills may be and still be compared: each encode puts its keyframes in its own
 /// places, soo the one nearest a quarter of the way in is seconds off from another's.
@@ -680,9 +676,10 @@ impl Step for StillsStep {
     /// Bit 1: every Matroska video gets stills, not only those of 100 MiB or more, soo smaller ones already
     /// processed are looked at again. Bit 2: each still has a perceptual hash. Bit 4: a Matroska file's keyframes
     /// are found by its Cues, soo the many done with none found by the scan are looked at again (one with its
-    /// stills all kept fetches nothing).
+    /// stills all kept fetches nothing). Bit 8: revisit prior donor-only completions;
+    /// native pages require their own stills, and complete own sets still fetch nothing.
     fn config_stamp(&self) -> u64 {
-        1 | 2 | 4
+        1 | 2 | 4 | 8
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let release_id = ctx.release().id;
@@ -724,21 +721,8 @@ impl Step for StillsStep {
         {
             return Ok(Outcome::default());
         }
-        // the same video file in another release that already has its stills: they are shown from there, soo nothing
-        // is read from the server or kept a second time
-        if !ctx.data().explicit_rerun(release_id, STILLS_STEP)? {
-            let lookup = ctx.data().stills_lookup(release_id)?;
-            if SAME_FILE.iter().any(|k| lookup.has(*k)) {
-                if let Some(kind) = ctx.data().same_file_stills(release_id, &lookup)? {
-                    crate::metrics::names::STILLS_SHARED.inc(&[("key", kind.word())], 1);
-                    return Ok(Outcome {
-                        matched: true,
-                        writes: vec![StepWrite::for_mutation(release_id, StepMutation::ClearStills)],
-                        ..Outcome::default()
-                    });
-                }
-            }
-        }
+        // Native pages show only this release's stills. A donor key does not
+        // authorize deleting own rows or skipping their generation.
         let files = ctx.files().map_err(StepError::from_inventory)?;
         let Some(first) = main_file(&files) else { return Ok(Outcome::default()) };
         let found = if matroska {
