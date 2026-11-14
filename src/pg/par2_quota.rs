@@ -81,7 +81,14 @@ pub(crate) fn admission_page(owner:&crate::pg::indexer_runtime::Owner)->Result<A
             }
             // Under this same row lock the trim loop immediately exits: no
             // active victim, both fixed caps satisfied. It only certifies Ready.
-        } else {ensure!(!evicting,"PAR2 building accounting has an eviction victim");}
+        } else {
+            ensure!(!evicting,"PAR2 building accounting has an eviction victim");
+            // Partial totals are monotone during Building. Once either fixed
+            // cap is exceeded, further accounting cannot make this scope Ready.
+            if before.retained_rows>MAX_ROWS as u64||before.retained_bytes>MAX_BYTES as u64 {
+                tx.rollback()?;return Ok(Admission::MaintenanceRequired(before))
+            }
+        }
         if owner.stop.load(std::sync::atomic::Ordering::Acquire) {tx.rollback()?;return Err(crate::pg::outage::AttemptEnded.into())}
         let after=initialize_page(&mut tx)?;
         ensure!((after.evicted_inventories,after.evicted_rows,after.evicted_bytes,after.pending_eviction_rows,after.pending_eviction_bytes)
