@@ -98,17 +98,21 @@ impl Reducer {
 
 pub(crate) struct NativeStatistics {
     pub window:Window,pub pace:crate::web_pending::NativePace,pub catalog:crate::web_stats::NativeCatalog,
-    pub predb:crate::web_stats::NativePredb,pub now:f64,
+    pub predb:crate::web_stats::NativePredb,pub now:f64,pub live_owner:bool,
 }
 struct Observation {id:i64,process:[u8;32],at:i64,mono:i64}
 impl super::fresh_reader::ReadView<'_> {
     pub(crate) fn live_statistics(&self)->Result<NativeStatistics> {
         use crate::web_stats::{NativeCatalog,NativeFeed,NativePredb};
         self.before_query()?;
-        let owner=super::fresh_live::RuntimeObservation::read_in(&mut *self.tx.borrow_mut())?.context("native statistics owner is unavailable")?;
+        let owner=super::fresh_live::RuntimeObservation::read_in(&mut *self.tx.borrow_mut())?;
+        let now=self.statistics_clock()?;
+        // Persisted observations cannot establish current activity after the
+        // owning session ends. Retained catalog/cache facts are still readable.
+        let (window,pace)=if let Some(owner)=owner.as_ref() {
         self.before_query()?;
         let catalog=super::stage::CatalogIdentity::read_in(&mut *self.tx.borrow_mut())?;
-        let now=self.statistics_clock()?;let now_ms=now.checked_mul(1000).context("native statistics clock overflow")?;
+        let now_ms=now.checked_mul(1000).context("native statistics clock overflow")?;
         self.before_query()?;
         let head:i64=self.tx.borrow_mut().query_opt("select o.observation_id from native_runtime_observation_current h
             join native_runtime_observations o on o.observation_id=h.observation_id
@@ -150,7 +154,9 @@ impl super::fresh_reader::ReadView<'_> {
             reducer.older(self.metric_frame(observation.id,*counts.get(&observation.id).unwrap_or(&(0,0)))?,observation.mono)?;
         }
         let window=reducer.finish()?;self.admit_owned(available.checked_sub(left).context("native label ownership accounting overflow")?)?;
-        let pace=self.processing_pace(Some(&owner),now)?;
+        let pace=self.processing_pace(Some(owner),now)?;
+        (window,pace)
+        }else{(Window::default(),crate::web_pending::NativePace::Stopped {enabled:None})};
         self.before_query()?;
         let row=self.tx.borrow_mut().query_one("select count(*),count(*) filter(where r.complete),count(*) filter(where r.display_name is not null),
             count(*) filter(where p.release_id is not null),count(*) filter(where r.is_obfuscated and r.display_name is null),coalesce(sum(r.size),0)::bigint
@@ -170,8 +176,8 @@ impl super::fresh_reader::ReadView<'_> {
         let rows=self.tx.borrow_mut().query("select key,failures,last_ok_at,last_error from ext_predb_feeds where failures>0 order by source",&[])?;
         ensure!(rows.len() as i64==count,"native feed inventory changed");
         let feeds=rows.into_iter().map(|row|Ok(NativeFeed {key:row.try_get(0)?,failures:row.try_get(1)?,last_ok:row.try_get(2)?,error:row.try_get(3)?})).collect::<Result<Vec<_>>>()?;
-        self.before_query()?;owner.verify_after(&mut *self.tx.borrow_mut())?;
-        Ok(NativeStatistics {window,pace,catalog,predb:NativePredb {titles,behind,feeds},now:now as f64})
+        self.verify_runtime(owner.as_ref())?;
+        Ok(NativeStatistics {window,pace,catalog,predb:NativePredb {titles,behind,feeds},now:now as f64,live_owner:owner.is_some()})
     }
     fn metric_frame(&self,id:i64,extent:(i64,i64))->Result<Vec<Raw>> {
         use postgres::fallible_iterator::FallibleIterator;
@@ -256,6 +262,34 @@ mod pg_observation_tests {
     use std::time::{Duration,Instant};
 
     #[test]
+    #[ignore="requires explicit isolated PostgreSQL and native release-writer admission"]
+    fn stopped_owner_keeps_retained_catalog_without_live_samples() {
+        use crate::parser::{Article,Release};
+        let schema=pg::testing::Schema::native_writer().expect("explicit isolated PostgreSQL");
+        let mut client=schema.pool.get().unwrap();
+        let releases=[Release {name:"Retained.Stats.Example".into(),group:"alt.binaries.test".into(),poster:"p".into(),
+            date:"Wed, 01 Jan 2020 00:00:00 +0000".into(),articles:vec![Article {filename:Some("f.bin".into()),
+                subject:"f.bin yEnc (1/1)".into(),message_id:"retained-stats@example.invalid".into(),part:Some(1),total_parts:Some(1),bytes:123,..Default::default()}],..Default::default()}];
+        assert_eq!(pg::release_writer::save(&mut client,&releases,1).unwrap().releases,1);
+        {
+            let view=ReadView::open(&mut client,&schema.name,Budget {rows:100,bytes:64*1024*1024},Instant::now()+Duration::from_secs(10)).unwrap();
+            let facts=view.live_statistics().unwrap();
+            assert!(!facts.live_owner);assert_eq!(facts.catalog.total,1);assert_eq!(facts.catalog.bytes,123);
+            assert!(facts.window.now.is_none()&&facts.window.computed.is_none());
+            assert!(facts.pace.measured().is_none());assert_eq!(facts.predb.behind,None);
+            let fragment=crate::web_stats::native_live_from_facts(&facts);
+            assert!(fragment.contains("LIVE OWNER UNAVAILABLE")&&fragment.contains("Retained catalog counts remain available"));
+            assert!(!fragment.contains("RUNNING")&&!fragment.contains("0 articles a second"));
+            let page=crate::web_stats::native_page_from_facts(&facts);
+            assert!(page.contains("<footer class=\"site-footer\" role=\"contentinfo\">")&&page.contains("https://www.patreon.com/cw/xbmc4lyfe"));
+        }
+        // Offline is an observation state, not permission to hide broken SQL.
+        client.batch_execute("alter table ext_predb_titles rename to unavailable_predb_titles").unwrap();
+        let view=ReadView::open(&mut client,&schema.name,Budget {rows:100,bytes:64*1024*1024},Instant::now()+Duration::from_secs(10)).unwrap();
+        assert!(view.live_statistics().is_err(),"a genuine missing relation must remain unavailable");
+    }
+
+    #[test]
     #[ignore="requires isolated PG, original canonical owner and a separately admitted 31-second actual observation window"]
     fn live_reader_uses_real_registry_capture_and_preserves_large_counter_delta() {
         let schema=pg::testing::Schema::new().expect("explicit isolated PostgreSQL");let root=tempfile::tempdir().unwrap();
@@ -314,6 +348,9 @@ mod pg_observation_tests {
             assert!(Instant::now()<stopped,"original owner backend must finish closing");std::thread::sleep(Duration::from_millis(5));
         }
         let view=ReadView::open(&mut client,&schema.name,Budget {rows:100,bytes:64*1024*1024},Instant::now()+Duration::from_secs(10)).unwrap();
-        assert!(view.live_statistics().is_err(),"persisted epoch/head cannot replace actual current owner liveness");
+        let facts=view.live_statistics().unwrap();
+        assert!(!facts.live_owner&&facts.window.now.is_none()&&facts.window.computed.is_none(),
+            "persisted epoch/head cannot replace actual current owner liveness or supply current rates");
+        assert!(facts.pace.measured().is_none());
     }
 }
