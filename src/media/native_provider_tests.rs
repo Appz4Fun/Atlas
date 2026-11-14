@@ -244,7 +244,8 @@ fn configured_case(case: &str, body: fn()) {
             .expect("real original native owner admission"),
     );
     assert_eq!(runtime.0.configured_headers(), headers);
-    assert!(runtime.0.header_config().unwrap().root().starts_with(home.join("headers")));
+    let owned_headers = home.join("headers").canonicalize().expect("canonical owned header directory");
+    assert!(runtime.0.header_config().unwrap().root().starts_with(owned_headers));
     let cache = Arc::new(crate::pg::service_cache::Cache::new(&runtime.0.owner).unwrap());
     cache.check().expect("actual owner/config/epoch/cache preflight");
     let retained = cache.clone();
