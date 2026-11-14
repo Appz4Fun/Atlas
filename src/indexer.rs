@@ -674,9 +674,13 @@ pub(crate) async fn on_ingest_progress<T: Send + 'static>(
     let conn = db.conn.clone();
     tokio::task::spawn_blocking(move || match &*conn {
         MainConnection::Postgres(_) => conn.with_sql(work),
-        MainConnection::OwnedPostgres(owner) => owner.with_ingest(|client| {
-            work(&crate::pg::sql::Pg::new(client))
-        }),
+        MainConnection::OwnedPostgres(owner) => {
+            let t = std::time::Instant::now();
+            owner.with_ingest(|client| {
+                crate::profile::DB_WAIT.add_since(t);
+                work(&crate::pg::sql::Pg::new(client))
+            })
+        },
     }).await.map_err(|error| anyhow!("ingestion progress task failed: {error}"))?
 }
 
