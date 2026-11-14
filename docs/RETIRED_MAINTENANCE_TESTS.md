@@ -273,3 +273,25 @@ After the remaining mixed fixtures are ported, ROOT owns meaningful exact-head c
 The six preserved mixed cases are OPEN port requirements, not admitted old SQLite tests, ignored successes, or claimed native passes. Root must keep actual SQL test admission mandatory and explicit when implementing those ports. Current native test source references above do not waive original oracles or qualify unrun tests.
 
 Ledger totals at the pinned baseline: **93 original selectors = 86 retired strict command/engine selectors + 6 retained mixed selectors + 1 retained pure selector**. Two new pure vector selectors are additional, not counted as original CLI coverage.
+
+## Follow-up: strict shard schema cases and retained native cascade
+
+This separate finite family is pinned to `28da8d4219b2282240a6cb22e771888b6c230c54`. The original fourteen-target ledger above is preserved. Only `tests/pp_schema.rs`, the existing private `src/pg/stage_schema_tests.rs`, and this ledger change. No SQLite dependency/adapter, production API, wipe/menu, shared stage helper, Cargo discovery policy, or unrelated integration target is added or altered.
+
+### tests/pp_schema.rs
+
+Original full-source SHA-256: `1caea63007997e90012219e86afa5190650620b89ff9186a76ac24153b662a96`. Four strict engine cases retire; the all-populated-table deletion oracle moves before this integration target is removed.
+
+| Original selector | Original function SHA-256 | Disposition |
+| --- | --- | --- |
+| `pp_schema::an_old_shard_gets_the_new_tables_without_a_rewrite` | `b6bf595fac5e905b9ccfea6f11d16413c7a95c7ef513fc2c8431e818b50a7cb4` | RETIRED SQLite shard-open upgrade, sqlite_master/GC trigger and PRAGMA page growth policy. Native added-column types/null/defaults and migration idempotence remain in pg::stage_schema_tests and pg::migrate tests. |
+| `pp_schema::deleting_a_release_clears_it_from_every_registered_table` | `16740b72a3f7ad859014b1488cf187d6d383df33c2af68040ff5add7223b413f` | PORTED to pg::stage_schema_tests::deleting_a_release_clears_it_from_every_registered_table, preserving the populated all-table oracle and adding unrelated survivor/outliving-cache checks. |
+| `pp_schema::the_menu_purge_clears_stage_rows` | `37d1b0fbdb9bedca6142479f57bc2cc2cb05cac1caace7ab5c894830cc644056` | RETIRED purge-incomplete menu/SQLite entry point. Generic release deletion cleanup is retained below; no native purge command is created. |
+| `pp_schema::no_index_is_built_on_an_existing_table` | `c394a50ac2ed27895d9189ec7664fb016a8a3e4896ed29177af0346e29897f71` | RETIRED old SQLite registry/index-placement policy; current PostgreSQL index migrations are supported. |
+| `pp_schema::a_wipe_leaves_new_empty_tables` | `b8951f496674ba88443d5a6a8eaef1e95a23ec7b2dadbc943f58f5aa86fd677f` | RETIRED db::wipe/eight-shard recreation. Existing native fresh-empty/orphan checks remain; no reset operation is introduced. |
+
+The native case is an ordinary unignored test with the existing `Schema::new()` optional admission: no URL returns before setup, while malformed nonempty URLs still fail. Root must supply its restricted disposable QA URL and verify actual execution to qualify PostgreSQL coverage; absent-URL compatibility is not a native pass. There is no internal selected child to silently skip. All native controls are UNRUN at this source checkpoint.
+
+A real Runtime/Owner and accepted release writer create victim, survivor and separate real link leads. Actual Queue claims, StepReads input, typed category writes and settlement create state/category/receipts while retaining a genuinely scheduled queue row. The writer itself creates file_timing. Closed per-table SQL creates only legal ordinary metadata rows for the other29 tables; it never derives generic fillers or writes catalog nonce/epochs, claims, input digests or operation receipts. The retained release and victim each have a nonzero row in EVERY33 former registered release-owned relationship before deletion, then every victim row must be gone and each survivor row must be byte-equivalent JSON. The original special keys remain `beside_files.row_id` and `upload_routes.origin_id`.
+
+The complete33-table inventory is literal in the case, with uniqueness and prepopulation assertions. Real files/segments are checked too. Deletion runs only on the original Owner through the unchanged native transaction gate. Read-only snapshots of every ext_* cache relation and actual identity/epoch/operation records must match across deletion, with populated natural PreDB/media/OpenSubtitles/probe sentinels. Global/outliving pp_walks, sidecars, junk_releases and junk_collections are populated and preserved; the real pending word-index deletion/tombstone entry remains valid bookkeeping. Sidecars explicitly outlive releases and are not misclassified by their release_id column. No trigger-only/FK-only/two-table substitute replaces the full populated oracle.
