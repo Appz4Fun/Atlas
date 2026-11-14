@@ -107,6 +107,62 @@ fn worker_native_produced_cover_reuses_durable_receipt_without_manifest_rewrite(
     runtime.owner.with(|client| {client.execute("update ext_asset_files set source_digest=decode(repeat('00',32),'hex') where kind='covers' and name=$1",&[&sha])?;Ok(())}).unwrap();
     assert!(verify(&grant,id,key,parts,complete,127,&saved).is_err(),"unmatched namespace provenance cannot grant a dynamic file");
 }
+
+#[test]
+#[ignore="requires explicit isolated PostgreSQL and genuine captured asset bytes"]
+fn captured_cover_reprobe_preserves_compatible_copier_receipt_and_original_owner() {
+    let schema=crate::pg::testing::Schema::new().expect("explicit isolated PG required");let runtime=crate::pg::stage_queue_tests::runtime(&schema);
+    let (id,_,_,_,_,_)=source(&runtime);let bytes=jpeg();let (_root,_evidence,selection,sha)=selected(&bytes);
+    let grant=Grant::open(&runtime.owner,Some(&selection)).unwrap().unwrap();
+    let digest=Sha256::digest(&bytes).to_vec();let mut copier=grant.source;copier[0]^=1;
+    runtime.owner.with(|client|{client.execute("insert into ext_asset_files(kind,name,byte_length,digest,source_digest) values('covers',$1,$2,$3,$4)",
+        &[&sha,&(bytes.len() as i64),&digest,&copier.as_slice()])?;Ok(())}).unwrap();
+    let cover=crate::probe::media::Cover {mime:"image/jpeg",bytes:bytes.clone()};
+    for _ in 0..2 {
+        let mut hold=grant.produce_cover(id,&cover).expect("same captured bytes must retain compatible copier provenance");
+        hold.check(&runtime.owner,id).unwrap();assert_eq!(hold.descriptor(),("image/jpeg".into(),sha.clone()));
+        let mut actual=Vec::new();hold.spool.read_to_end(&mut actual).unwrap();assert_eq!(actual,bytes);
+    }
+    assert_eq!(runtime.owner.failure(),None,"compatible captured originals must not end the native attempt");
+    runtime.owner.with(|client| {
+        let row=client.query_one("select byte_length,digest,source_digest from ext_asset_files where kind='covers' and name=$1",&[&sha])?;
+        assert_eq!(row.try_get::<_,i64>(0)?,bytes.len() as i64);assert_eq!(row.try_get::<_,Vec<u8>>(1)?,digest);
+        assert_eq!(row.try_get::<_,Vec<u8>>(2)?,copier,"copier provenance must not be rewritten as native");
+        assert_eq!(client.query_one("select count(*) from ext_asset_files where kind='covers'",&[])?.try_get::<_,i64>(0)?,1);Ok(())
+    }).unwrap();runtime.owner.close();
+}
+
+#[test]
+#[ignore="requires explicit isolated PostgreSQL and genuine captured asset bytes"]
+fn captured_cover_reprobe_refuses_a_conflicting_content_descriptor() {
+    let schema=crate::pg::testing::Schema::new().expect("explicit isolated PG required");let runtime=crate::pg::stage_queue_tests::runtime(&schema);
+    let (id,_,_,_,_,_)=source(&runtime);let bytes=jpeg();let (_root,_evidence,selection,sha)=selected(&bytes);
+    let grant=Grant::open(&runtime.owner,Some(&selection)).unwrap().unwrap();
+    let mut digest=Sha256::digest(&bytes).to_vec();digest[0]^=1;let mut copier=grant.source;copier[0]^=1;
+    runtime.owner.with(|client|{client.execute("insert into ext_asset_files(kind,name,byte_length,digest,source_digest) values('covers',$1,$2,$3,$4)",
+        &[&sha,&(bytes.len() as i64),&digest,&copier.as_slice()])?;Ok(())}).unwrap();
+    assert!(grant.produce_cover(id,&crate::probe::media::Cover {mime:"image/jpeg",bytes}).is_err());
+    let mut observer=schema.pool.get().unwrap();
+    let row=observer.query_one("select digest,source_digest from ext_asset_files where kind='covers' and name=$1",&[&sha]).unwrap();
+    assert_eq!(row.get::<_,Vec<u8>>(0),digest);assert_eq!(row.get::<_,Vec<u8>>(1),copier);
+    drop(observer);runtime.owner.close();
+}
+
+#[test]
+#[ignore="requires explicit isolated PostgreSQL and genuine native asset namespace"]
+fn uncaptured_cover_reprobe_still_refuses_a_foreign_writer_namespace() {
+    let schema=crate::pg::testing::Schema::new().expect("explicit isolated PG required");let runtime=crate::pg::stage_queue_tests::runtime(&schema);
+    let (id,_,_,_,_,_)=source(&runtime);let (_root,_evidence,selection,_)=selected(&jpeg());
+    let grant=Grant::open(&runtime.owner,Some(&selection)).unwrap().unwrap();let mut bytes=jpeg();bytes[10]^=1;
+    let digest=Sha256::digest(&bytes).to_vec();let sha=crate::pg::fresh_assets::hex(&digest);let mut foreign=grant.source;foreign[0]^=1;
+    runtime.owner.with(|client|{client.execute("insert into ext_asset_files(kind,name,byte_length,digest,source_digest) values('covers',$1,$2,$3,$4)",
+        &[&sha,&(bytes.len() as i64),&digest,&foreign.as_slice()])?;Ok(())}).unwrap();
+    assert!(grant.produce_cover(id,&crate::probe::media::Cover {mime:"image/jpeg",bytes}).is_err());
+    let mut observer=schema.pool.get().unwrap();
+    let row=observer.query_one("select digest,source_digest from ext_asset_files where kind='covers' and name=$1",&[&sha]).unwrap();
+    assert_eq!(row.get::<_,Vec<u8>>(0),digest);assert_eq!(row.get::<_,Vec<u8>>(1),foreign);
+    drop(observer);runtime.owner.close();
+}
 #[test]
 fn worker_asset_selection_redacts_paths_and_requires_exact_physical_manifest() {
     let (_root,_evidence,mut config,_)=selected(&jpeg());
