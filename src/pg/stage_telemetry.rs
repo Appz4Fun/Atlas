@@ -9,8 +9,26 @@ use super::indexer_runtime::Owner;
 #[path="stage_catalog_observation.rs"]
 mod catalog;
 
-const MAX_ROWS:usize=10000;
-const MAX_BYTES:usize=8*1024*1024;
+pub(crate) const MAX_ROWS:usize=65536;
+pub(crate) const MAX_BYTES:usize=16*1024*1024;
+const BATCH_ROWS:usize=128;
+const BATCH_BYTES:usize=64*1024;
+
+#[derive(Debug)]
+pub(crate) struct LocalCapacity;
+impl std::fmt::Display for LocalCapacity {fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str("native metric frame exceeds local capacity")}}
+impl std::error::Error for LocalCapacity {}
+#[derive(Debug)]
+pub(crate) enum Capture {Complete,Deferred(LocalCapacity)}
+#[derive(Debug)]
+struct CaptureRollback {work:anyhow::Error,rollback:postgres::Error}
+impl std::fmt::Display for CaptureRollback {fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str("native metric capture and rollback failed")}}
+impl std::error::Error for CaptureRollback {
+    fn source(&self)->Option<&(dyn std::error::Error+'static)> {
+        if !self.work.is::<LocalCapacity>()&&super::outage::classify(&self.work)==super::outage::Failure::Fatal {Some(self.work.as_ref())}else{Some(&self.rollback)}
+    }
+}
+fn capacity(allowed:bool)->Result<()> {if allowed {Ok(())}else{Err(LocalCapacity.into())}}
 
 /// One actual native Stage counter instance; never an invented shard lane.
 /// The runner increments these at the corresponding completed transitions.
@@ -41,7 +59,7 @@ impl Inventory {
     fn push(&mut self,family:&'static str,labels:&str,value:crate::metrics::ObservedValue)->Result<()> {
         ensure!(family.len()<=256 && labels.len()<=16384,"native metric identity exceeds observation admission");
         let bytes=self.bytes.checked_add(family.len()+labels.len()+128).context("native observation byte overflow")?;
-        ensure!(bytes<=MAX_BYTES && self.rows.len()<MAX_ROWS,"native metric inventory exceeds observation admission");
+        capacity(bytes<=MAX_BYTES && self.rows.len()<MAX_ROWS)?;
         let (kind,counter,gauge,count,sum)=match value {
             crate::metrics::ObservedValue::Counter(n)=>(1,Some(n as i64),None,None,None),
             crate::metrics::ObservedValue::GaugeBits(n)=>(2,None,Some(n as i64),None,None),
@@ -66,18 +84,23 @@ fn process()->Result<&'static Process> {
 /// Only a full actual registry visit can reach the transaction. Overflow does
 /// not move the published head. No provider, HTTP/file reader, sampler thread,
 /// runtime activation, or caller-supplied metric totals are involved.
-pub(crate) fn capture(owner:&Arc<Owner>,lanes:Option<&LaneCounters>)->Result<()> {
+pub(crate) fn capture(owner:&Arc<Owner>,lanes:Option<&LaneCounters>)->Result<Capture> {
     ensure!(tokio::runtime::Handle::try_current().is_err(),"native observations require a standard owner lane");
+    if owner.stop.load(Ordering::Acquire) {return Err(super::outage::AttemptEnded.into());}
     let process=process()?;let mut inventory=Inventory::new();
-    crate::metrics::visit(|family,labels,value|if catalog::owns(family) {Ok(())} else {inventory.push(family,labels,value)})?;
+    if let Err(error)=crate::metrics::visit(|family,labels,value|if catalog::owns(family) {Ok(())} else {inventory.push(family,labels,value)}) {
+        if owner.stop.load(Ordering::Acquire) {return Err(super::outage::AttemptEnded.into());}
+        return if error.is::<LocalCapacity>() {Ok(Capture::Deferred(LocalCapacity))}else{Err(error)}
+    }
     let lane=lanes.map(LaneCounters::snapshot);
     let monotonic=i64::try_from(process.started.elapsed().as_nanos()).context("native observation clock overflow")?;
     let observed=chrono::Utc::now().timestamp_millis();
     let epoch=owner.epoch().context("native observation requires canonical owner")?;
-    owner.with(|client| {
+    let captured=owner.with(|client| {
         let mut tx=client.transaction()?;super::history_gate::native(&mut tx)?;
         epoch.verify(&mut tx)?;
         tx.batch_execute("set local statement_timeout='10s';set local lock_timeout='5s'")?;
+        let result=(||->Result<()> {
         catalog::append(&mut tx,&mut inventory,&owner.stop)?;
         let row=tx.query_one("insert into native_runtime_observations(epoch,catalog_nonce,process_nonce,stage_instance_nonce,observed_at_ms,monotonic_ns,stage_running,enabled_mask,net_visits_bits,net_finished_bits,queue_taken_bits,walk_rows_bits)
             values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) returning observation_id",
@@ -85,18 +108,43 @@ pub(crate) fn capture(owner:&Arc<Owner>,lanes:Option<&LaneCounters>)->Result<()>
                 &lane.as_ref().is_some_and(|s|s.running),&lane.as_ref().map(|s|s.enabled),&lane.as_ref().map(|s|s.net_visits),
                 &lane.as_ref().map(|s|s.net_finished),&lane.as_ref().map(|s|s.queue_taken),&lane.as_ref().map(|s|s.walk_rows)])?;
         let id:i64=row.try_get(0)?;
-        let statement=tx.prepare("insert into native_metric_samples(observation_id,series_key,family,labels,kind,counter_bits,gauge_bits,histogram_count_bits,histogram_sum_bits) values($1,$2,$3,$4,$5,$6,$7,$8,$9)")?;
-        for sample in &inventory.rows {
+        // In addition to the admitted inventory, at most 128 rows/64 KiB
+        // of payload and 1152 parameter references/short placeholders live
+        // here. Every batch stays in this original transaction and session.
+        let mut first=0;
+        while first<inventory.rows.len() {
             if owner.stop.load(Ordering::Acquire) {return Err(super::outage::AttemptEnded.into());}
-            tx.execute(&statement,&[&id,&&sample.key[..],&sample.family,&sample.labels,&sample.kind,&sample.counter,&sample.gauge,&sample.count,&sample.sum])?;
+            let mut end=first;let mut bytes=0;
+            while end<inventory.rows.len()&&end-first<BATCH_ROWS {
+                let sample=&inventory.rows[end];let size=sample.family.len()+sample.labels.len()+128;
+                if bytes+size>BATCH_BYTES {break}bytes+=size;end+=1;
+            }
+            ensure!(end>first,"native metric identity exceeds SQL batch admission");
+            let rows=(0..end-first).map(|i|format!("({})",(1..=9).map(|j|format!("${}",i*9+j)).collect::<Vec<_>>().join(","))).collect::<Vec<_>>().join(",");
+            let sql=format!("insert into native_metric_samples(observation_id,series_key,family,labels,kind,counter_bits,gauge_bits,histogram_count_bits,histogram_sum_bits) values {rows}");
+            let mut args:Vec<&(dyn postgres::types::ToSql+Sync)>=Vec::with_capacity((end-first)*9);
+            let keys=inventory.rows[first..end].iter().map(|sample|sample.key.as_slice()).collect::<Vec<_>>();
+            for (sample,key) in inventory.rows[first..end].iter().zip(&keys) {
+                args.extend([&id as &(dyn postgres::types::ToSql+Sync),key,&sample.family,&sample.labels,&sample.kind,&sample.counter,&sample.gauge,&sample.count,&sample.sum]);
+            }
+            tx.execute(&sql,&args)?;first=end;
         }
         tx.execute("insert into native_runtime_observation_current(singleton,observation_id) values(true,$1) on conflict(singleton) do update set observation_id=excluded.observation_id",&[&id])?;
         tx.execute("delete from native_runtime_observations where observation_id not in(select observation_id from native_runtime_observations order by observation_id desc limit 32)",&[])?;
-        epoch.verify(&mut tx)?;tx.commit()?;Ok(())
+        epoch.verify(&mut tx)?;Ok(())
+        })();
+        match result {
+            Ok(())=>{tx.commit()?;Ok(Capture::Complete)},
+            Err(work)=>match tx.rollback() {
+                Ok(()) if work.is::<LocalCapacity>()=>Ok(Capture::Deferred(LocalCapacity)),
+                Ok(())=>Err(work),
+                Err(rollback)=>Err(CaptureRollback {work,rollback}.into()),
+            },
+        }
     })?;
     // Publish registry gauges only after the corresponding complete PG frame
     // committed. Failed capture leaves both prior readings intact.
-    catalog::publish(&inventory.rows);Ok(())
+    if matches!(captured,Capture::Complete) {catalog::publish(&inventory.rows);}Ok(captured)
 }
 
 #[cfg(test)]

@@ -259,7 +259,11 @@ mod scenarios {
         let result=pg::stage_telemetry::capture(&f.runtime.owner,None);
         println!("metric capture controls: complete group frame capture_ok={}, owner_healthy={}",result.is_ok(),f.runtime.owner.failure().is_none());
         assert!(result.is_ok()&&f.runtime.owner.failure().is_none(),"a complete bounded group inventory must not exhaust the emitted-series cap or end the native owner");
-        let id=head(f).unwrap().id;let mut check=f.observer();let rows=metric_frame(&mut check,id);
+        let first=head(f).unwrap().id;
+        assert!(matches!(pg::stage_telemetry::capture(&f.runtime.owner,None).unwrap(),pg::stage_telemetry::Capture::Complete));
+        let id=head(f).unwrap().id;assert!(id>first);
+        let mut check=f.observer();let rows=metric_frame(&mut check,id);
+        assert_eq!(metric_frame(&mut check,first),rows,"two real complete frames must have identical original inputs");
         for (family,labels) in [
             ("atlas_native_group_present",String::new()),
             ("atlas_group_article_number",",mark=\"last\"".into()),
@@ -283,10 +287,11 @@ mod scenarios {
     }
     fn safe_refusal(f:&Fixture,previous:i64) {
         let owner=f.runtime.owner.clone();let work=owner.clone();
+        let published=crate::metrics::names::NATIVE_GROUP_PRESENT.rows();
         // Exercise the real worker error classifier too: pre-Owner registry
         // overflow must not escape as a fatal publication worker error.
         let job=spawn(&owner,"fixture-metric-capacity".into(),move|| {
-            pg::stage_telemetry::capture(&work,None)?;Ok(None)
+            assert!(matches!(pg::stage_telemetry::capture(&work,None)?,pg::stage_telemetry::Capture::Deferred(_)),"an over-capacity complete frame must return the typed local deferral");Ok(None)
         }).unwrap();
         let result=job.join().unwrap();
         let mut check=f.observer();
@@ -294,6 +299,7 @@ mod scenarios {
         assert_eq!(current,previous,"a refused frame must not replace the previous complete head");
         assert_eq!(check.query_one("select count(*) from native_runtime_observations",&[]).unwrap().get::<_,i64>(0),1,"a refused frame cannot retain partial metadata");
         assert_eq!(check.query_one("select count(*) from native_metric_samples where observation_id<>$1",&[&previous]).unwrap().get::<_,i64>(0),0);
+        assert_eq!(crate::metrics::names::NATIVE_GROUP_PRESENT.rows(),published,"a partial catalog inventory must never publish registry gauges");
         let healthy=f.runtime.owner.failure().is_none()&&!f.runtime.owner.stop.load(Ordering::Acquire);
         println!("metric capture controls: refused frame kept old head; worker_ok={}, owner_healthy={healthy}",result.is_ok());
         assert!(result.is_ok()&&healthy,"optional complete-frame admission refusal must defer without poisoning the native worker or original owner");
@@ -323,6 +329,13 @@ mod scenarios {
             charged+=fixed+size;index+=1;
         }
         assert_eq!(charged,target);assert!(expected_registry().len()<65536,"this fixture isolates the byte guard, not row admission");
+        safe_refusal(f,previous);
+    }
+    pub(super) fn metric_group_workspace_refusal_rolls_back_before_deferring(f:&Fixture) {
+        pg::stage_telemetry::capture(&f.runtime.owner,None).unwrap();let previous=head(f).unwrap().id;
+        f.runtime.owner.with(|client| {
+            client.execute("insert into groups(name) select 'alt.binaries.capacity.'||g from generate_series(1,10001) g",&[])?;Ok(())
+        }).unwrap();
         safe_refusal(f,previous);
     }
     pub(super) fn recurring_publication_while_real_maintenance_is_paused(f: &Fixture) {
@@ -712,6 +725,7 @@ cases! {
     complete_group_metric_frame_reaches_the_actual_bounded_stats_reader,
     metric_frame_row_ceiling_plus_one_defers_without_partial_publish_or_owner_failure,
     metric_frame_byte_ceiling_plus_one_defers_without_partial_publish_or_owner_failure,
+    metric_group_workspace_refusal_rolls_back_before_deferring,
     recurring_publication_while_real_maintenance_is_paused,
     no_producer_still_publishes_header_only,
     actual_publication_sql_error_is_fatal_and_rolls_back,

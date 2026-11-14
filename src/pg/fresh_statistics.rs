@@ -18,37 +18,92 @@ fn series_key(family:&str,labels:&str,kind:u8)->[u8;32] {
     hash.update((labels.len() as u64).to_le_bytes());hash.update(labels.as_bytes());hash.update([kind]);hash.finalize().into()
 }
 fn charge(left:&mut u64,bytes:u64)->Result<()> {*left=left.checked_sub(bytes).context("native statistics ownership exceeds admission")?;Ok(())}
+/// The existing label parser grows its pair Vec geometrically (minimum four)
+/// and each decoded value String geometrically (minimum eight). Count the
+/// actual quoted grammar before invoking it; '=' inside a value is data.
+fn label_memory(text:&str)->Result<u64> {
+    let mut rest=text.trim();let mut pairs=0usize;let mut strings=0usize;
+    while !rest.is_empty() {
+        let eq=rest.find('=').context("invalid captured metric labels")?;
+        let key=rest[..eq].trim().trim_start_matches(',').trim();
+        rest=rest[eq+1..].trim_start().strip_prefix('"').context("invalid captured metric labels")?;
+        let mut chars=rest.char_indices();let mut decoded=0usize;
+        let end=loop {
+            let (at,c)=chars.next().context("invalid captured metric labels")?;
+            match c {
+                '\\'=>{let c=chars.next().context("invalid captured metric labels")?.1;decoded+=if c=='n' {1}else{c.len_utf8()};},
+                '"'=>break at,
+                c=>decoded+=c.len_utf8(),
+            }
+        };
+        strings=strings.checked_add(key.len()+if decoded==0 {0}else{decoded.saturating_mul(2).max(8)}).context("native label ownership overflow")?;
+        pairs+=1;rest=rest[end+1..].trim_start().trim_start_matches(',').trim_start();
+    }
+    let capacity=if pairs==0 {0}else{pairs.max(4).checked_next_power_of_two().context("native label pair extent overflow")?};
+    u64::try_from(strings.checked_add(capacity.checked_mul(std::mem::size_of::<(String,String)>()).context("native label vector extent overflow")?).context("native label ownership overflow")?).map_err(Into::into)
+}
+fn frame_workspace(rows:u64,bytes:u64,current:u64)->Result<u64> {
+    // One Raw frame is consumed/dropped before the next is read. Series,
+    // sorted indices and old values remain bounded by CURRENT cardinality.
+    // Four MiB covers one driver row, per-label duplicate validation, bounded
+    // metadata/pace/feed setup, and the renderer's fixed/top-15 scratch.
+    // tokio-postgres responses use channel(1), with one pending message;
+    // schema-bounded identities keep each row below 17 KiB. There is no
+    // second full-frame transport queue to charge alongside the Raw Vec.
+    let retained=std::mem::size_of::<Series>()+std::mem::size_of::<([u8;32],usize)>()
+        +std::mem::size_of::<Option<Value>>()+3*std::mem::size_of::<&str>();
+    rows.checked_mul(std::mem::size_of::<Raw>() as u64).and_then(|n|n.checked_add(bytes))
+        .and_then(|n|n.checked_add(current.checked_mul(retained as u64)?))
+        .and_then(|n|n.checked_add(4*1024*1024)).context("native statistics workspace overflow")
+}
 fn validate(row:&Raw)->Result<()> {
     ensure!(!row.family.is_empty()&&row.family.len()<=256&&row.labels.len()<=16384,"native metric identity exceeds admission");
     ensure!(series_key(&row.family,&row.labels,row.value.kind())==row.key,"native original-series identity changed");
     match row.value {Value::Gauge(value)=>ensure!(value.is_finite(),"nonfinite native gauge"),Value::Histogram {sum,..}=>ensure!(sum.is_finite()&&sum>=0.0,"invalid native histogram sum"),_=>{}}Ok(())
 }
 struct Series {family:String,labels:Labels,current:Value,previous:Option<Value>,active:bool,elapsed:i64,count:u128,sum:f64,gauge:f64}
-struct Reducer {series:Vec<Series>,indices:HashMap<[u8;32],usize>,now:i64,previous:i64,at:f64,frames:usize}
+struct Reducer {series:Vec<Series>,indices:Vec<([u8;32],usize)>,now:i64,previous:i64,at:f64,frames:usize}
 impl Reducer {
     fn new(rows:Vec<Raw>,mono:i64,at:f64,left:&mut u64)->Result<Self> {
-        ensure!(rows.len()<=10000&&mono>=0&&at.is_finite(),"invalid native observation extent");
-        let mut series=Vec::with_capacity(rows.len());let mut indices=HashMap::with_capacity(rows.len());
+        ensure!(rows.len()<=super::stage_telemetry::MAX_ROWS&&mono>=0&&at.is_finite(),"invalid native observation extent");
+        // Distinct families bound output HashMap tables, family strings,
+        // changes and unknown-gauge sets. Their size does not grow per series.
+        let temporary=(rows.len()*std::mem::size_of::<&str>()) as u64;charge(left,temporary)?;
+        let mut families=rows.iter().map(|row|row.family.as_str()).collect::<Vec<_>>();families.sort_unstable();families.dedup();
+        let family_bytes=families.iter().try_fold(0u64,|sum,family|sum.checked_add(2048+family.len() as u64*8).context("native output families overflow"))?;
+        drop(families);*left=left.checked_add(temporary).context("native temporary ownership overflow")?;charge(left,family_bytes)?;
+        // At most fifteen lag rows render owned group text. Bound URL/HTML
+        // escaping plus simultaneously formatted fragment/page copies; the
+        // group value cannot exceed its original quoted label extent.
+        let lag_text=rows.iter().filter(|row|matches!(row.family.as_str(),"atlas_group_article_number"|"atlas_group_posted_timestamp_seconds"))
+            .map(|row|row.labels.len() as u64).max().unwrap_or(0);
+        charge(left,lag_text.checked_mul(15*64).context("native lag text extent overflow")?)?;
+        let mut series=Vec::with_capacity(rows.len());let mut indices=Vec::with_capacity(rows.len());
         for row in rows {
             validate(&row)?;
-            // Admit pair/vector growth and both current/rate presentation
-            // copies before the existing label parser allocates decoded text.
-            let pairs=row.labels.bytes().filter(|byte|*byte==b'=').count() as u64;
-            charge(left,(row.labels.len() as u64*8).checked_add(pairs*384).and_then(|n|n.checked_add(row.family.len() as u64*8+1024)).context("native label extent overflow")?)?;
+            // Gauges move their labels once; counters may add one rate copy;
+            // histogram count/sum can each have current AND rate output.
+            let copies=match row.value {Value::Gauge(_)=>1,Value::Counter(_)=>2,Value::Histogram {..}=>4};
+            let parsed=label_memory(&row.labels)?;
+            let render=if matches!(row.family.as_str(),"atlas_group_article_number"|"atlas_group_posted_timestamp_seconds") {256}else{0};
+            charge(left,parsed.checked_mul(copies).and_then(|n|n.checked_add(64*copies+row.family.len() as u64+render)).context("native label extent overflow")?)?;
             let labels=crate::web_stats::parse_labels(&row.labels).context("invalid captured metric labels")?;
-            let mut keys=HashSet::new();ensure!(labels.iter().all(|(key,_)|!key.is_empty()&&keys.insert(key)),"duplicate or empty native metric label");drop(keys);
-            ensure!(indices.insert(row.key,series.len()).is_none(),"duplicate native original series");
+            let mut keys=labels.iter().map(|(key,_)|key.as_str()).collect::<Vec<_>>();keys.sort_unstable();
+            ensure!(keys.iter().all(|key|!key.is_empty())&&!keys.windows(2).any(|pair|pair[0]==pair[1]),"duplicate or empty native metric label");drop(keys);
+            indices.push((row.key,series.len()));
             series.push(Series {family:row.family,labels,current:row.value,previous:Some(row.value),active:true,elapsed:0,count:0,sum:0.0,gauge:0.0});
         }
+        indices.sort_unstable_by_key(|entry|entry.0);ensure!(!indices.windows(2).any(|pair|pair[0].0==pair[1].0),"duplicate native original series");
         Ok(Self {series,indices,now:mono,previous:mono,at,frames:1})
     }
-    fn older(&mut self,rows:Vec<Raw>,mono:i64)->Result<()> {
+    fn older(&mut self,mut rows:Vec<Raw>,mono:i64)->Result<()> {
         ensure!(self.frames<32&&mono>=0&&mono<self.previous&&self.now-mono<=MAX_NS,"invalid native observation order");
         let elapsed=self.previous-mono;self.frames+=1;self.previous=mono;
-        let mut old=vec![None;self.series.len()];let mut seen=HashSet::with_capacity(rows.len());
+        rows.sort_unstable_by_key(|row|row.key);ensure!(!rows.windows(2).any(|pair|pair[0].key==pair[1].key),"duplicate native prior series");
+        let mut old=vec![None;self.series.len()];
         for row in rows {
-            validate(&row)?;ensure!(seen.insert(row.key),"duplicate native prior series");
-            if let Some(index)=self.indices.get(&row.key){old[*index]=Some(row.value);}
+            validate(&row)?;
+            if let Ok(index)=self.indices.binary_search_by_key(&row.key,|entry|entry.0){old[self.indices[index].1]=Some(row.value);}
         }
         for (series,older)in self.series.iter_mut().zip(old) {
             if !series.active{continue;}
@@ -67,15 +122,15 @@ impl Reducer {
         }Ok(())
     }
     fn finish(self)->Result<Window> {
-        let mut current=Scrape {at:self.at,..Default::default()};let mut rates=Scrape {at:self.at,..Default::default()};
-        let mut changes=HashMap::new();let mut unknown_gauges=HashSet::new();let mut slots=HashSet::new();
+        let Self {series,indices,now,previous,at,frames}=self;drop(indices);
+        let mut current=Scrape {at,..Default::default()};let mut rates=Scrape {at,..Default::default()};
+        let mut changes=HashMap::new();let mut unknown_gauges=HashSet::new();
         let mut insert=|family:String,labels:Labels,value:f64,rate:Option<f64>|->Result<()> {
             ensure!(value.is_finite()&&rate.is_none_or(f64::is_finite),"native metric reduction is nonfinite");
-            ensure!(slots.insert((family.clone(),labels.clone())),"ambiguous native metric output identity");
             if let Some(rate)=rate{rates.series.entry(family.clone()).or_default().push((labels.clone(),rate));}
             current.series.entry(family).or_default().push((labels,value));Ok(())
         };
-        for series in self.series {
+        for series in series {
             let seconds=(series.elapsed>=MIN_NS).then_some(series.elapsed as f64/1_000_000_000.0);
             match series.current {
                 Value::Counter(value)=>insert(series.family,series.labels,value as f64,seconds.map(|seconds|series.count as f64/seconds))?,
@@ -90,7 +145,11 @@ impl Reducer {
             }
         }
         for family in unknown_gauges{changes.remove(&family);}
-        let window=ComputedWindow {from:(self.frames>1).then_some(self.previous as f64/1_000_000_000.0),to:self.now as f64/1_000_000_000.0,
+        for rows in current.series.values() {
+            let mut labels=rows.iter().map(|(labels,_)|labels).collect::<Vec<_>>();labels.sort_unstable();
+            ensure!(!labels.windows(2).any(|pair|pair[0]==pair[1]),"ambiguous native metric output identity");
+        }
+        let window=ComputedWindow {from:(frames>1).then_some(previous as f64/1_000_000_000.0),to:now as f64/1_000_000_000.0,
             rates:Arc::new(rates),changes,lag:None};
         Ok(Window {now:Some(Arc::new(current)),computed:Some(window),..Default::default()})
     }
@@ -140,13 +199,14 @@ impl super::fresh_reader::ReadView<'_> {
         let mut counts=HashMap::new();let mut max_rows=0u64;let mut max_bytes=0u64;
         for row in extents {
             let id:i64=row.try_get(0)?;let count:i64=row.try_get(1)?;let bytes:i64=row.try_get(2)?;
-            ensure!(ids.contains(&id)&&(0..=10000).contains(&count)&&(0..=8*1024*1024).contains(&bytes),"native metric frame exceeds producer admission");
+            ensure!(ids.contains(&id)&&(0..=super::stage_telemetry::MAX_ROWS as i64).contains(&count)&&bytes>=0
+                &&count.checked_mul(128).and_then(|n|n.checked_add(bytes)).is_some_and(|n|n<=super::stage_telemetry::MAX_BYTES as i64),"native metric frame exceeds producer admission");
             max_rows=max_rows.max(count as u64);max_bytes=max_bytes.max(bytes as u64);
             ensure!(counts.insert(id,(count,bytes)).is_none(),"duplicate native metric frame extent");
         }
         // Reserve maximum transport/old-frame workspace once. Intermediate
         // frames are consumed and dropped, never retained as32 full snapshots.
-        self.admit_owned(131072u64.checked_add(max_bytes*4).and_then(|n|n.checked_add(max_rows*1024)).context("native statistics workspace overflow")?)?;
+        self.admit_owned(frame_workspace(max_rows,max_bytes,counts.get(&current.id).map_or(0,|extent|extent.0 as u64))?)?;
         let available=self.remaining_owned();let mut left=available;
         let rows=self.metric_frame(current.id,*counts.get(&current.id).unwrap_or(&(0,0)))?;
         let mut reducer=Reducer::new(rows,current.mono,current.at as f64/1000.0,&mut left)?;
@@ -215,6 +275,40 @@ mod tests {
     fn rate(window:&Window,family:&str,group:&str)->Option<f64> {
         window.computed.as_ref()?.rates.series.get(family)?.iter()
             .find(|(labels,_)|labels.iter().any(|(key,value)|key=="group"&&value==group)).map(|(_,value)|*value)
+    }
+
+    #[test]
+    fn quoted_label_memory_admits_actual_parser_capacities_and_rejects_bad_grammar() {
+        let many=(0..129).map(|n|format!("key{n}=\"value=\\\"雪\\n{n}\"" )).collect::<Vec<_>>().join(",");
+        for text in [String::new(),"empty=\"\",key=\"=inside\\\"quoted\\n雪\"".into(),many] {
+            let admitted=label_memory(&text).unwrap();let labels=crate::web_stats::parse_labels(&text).unwrap();
+            let actual=labels.capacity()*std::mem::size_of::<(String,String)>()+labels.iter().map(|(k,v)|k.capacity()+v.capacity()).sum::<usize>();
+            assert!(admitted>=actual as u64,"preparse admission must cover real String and Vec capacities");
+        }
+        assert!(label_memory("key=\"unterminated").is_err());
+        assert!(label_memory("key=unquoted").is_err());
+    }
+
+    #[test]
+    fn counter_and_histogram_label_copies_are_admitted_before_output_allocation() {
+        let large="x".repeat(2048);
+        assert!(Reducer::new(vec![sample(&large,Value::Gauge(1.))],0,1.,&mut 8192).is_ok());
+        assert!(Reducer::new(vec![sample(&large,Value::Counter(1))],0,1.,&mut 8192).is_err());
+        assert!(Reducer::new(vec![sample(&large,Value::Histogram {count:1,sum:1.})],0,1.,&mut 16384).is_err());
+        let mut reducer=Reducer::new(vec![sample(&large,Value::Histogram {count:3,sum:1.5})],60_000_000_000,60.,&mut 32768).unwrap();
+        reducer.older(vec![sample(&large,Value::Histogram {count:1,sum:0.5})],30_000_000_000).unwrap();
+        let window=reducer.finish().unwrap();
+        assert_eq!(window.now.as_ref().unwrap().series.values().map(Vec::len).sum::<usize>(),2);
+        assert_eq!(window.computed.as_ref().unwrap().rates.series.values().map(Vec::len).sum::<usize>(),2);
+    }
+
+    #[test]
+    fn derived_histogram_output_identity_cannot_alias_an_original_counter() {
+        let histogram=sample("same",Value::Histogram {count:1,sum:1.});
+        let mut counter=sample("same",Value::Counter(1));counter.family="duration_seconds_count".into();
+        counter.key=series_key(&counter.family,&counter.labels,counter.value.kind());
+        let reducer=Reducer::new(vec![histogram,counter],0,1.,&mut (1024*1024)).unwrap();
+        assert!(reducer.finish().is_err(),"exact family/ordered-label ambiguity must remain a refusal without cloned identity sets");
     }
 
     #[test]
