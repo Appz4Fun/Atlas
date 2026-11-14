@@ -54,7 +54,7 @@ impl Steps {
             Arc::new(crate::archive::link::LinkStep::default()),
             Arc::new(crate::probe::ProbeStep::default()),
             Arc::new(crate::probe::body_crc::BodyCrcStep),
-            Arc::new(crate::probe::opensubtitles::OpenSubtitlesStep::default()),
+            Arc::new(crate::probe::opensubtitles::OpenSubtitlesStep::for_owner(owner)?),
             Arc::new(crate::probe::stills::StillsStep),
             Arc::new(crate::naming::steps::Naming),Arc::new(crate::naming::steps::NfoName),
             Arc::new(crate::sidecar::SidecarStep),Arc::new(crate::sidecar::SidecarImageStep),
@@ -361,14 +361,66 @@ pub(crate) fn run_network_fixture(runtime:&crate::pg::indexer_runtime::Runtime) 
 
 #[cfg(test)]
 pub(crate) fn run_factory_fixture(runtime:&crate::pg::indexer_runtime::Runtime) {
-    let cfg=crate::config::Config::default();
+    let mut cfg=crate::config::Config::default();
+    cfg.archive.enabled=true;
+    cfg.media.opensubtitles.api_key="factory-fixture-key".into();
+    cfg.media.opensubtitles.base_url=Some("https://opensubtitles-cache-fixture.invalid/api/v1".into());
     let steps=Steps::for_owner(&runtime.owner,&cfg).unwrap();
     assert_eq!(steps.ordered.len(),20);
     let mut ids=std::collections::HashSet::new();let mut ranks=std::collections::HashSet::new();
     for step in &steps.ordered {assert!(ids.insert(step.id().0));assert!(ranks.insert(step.rank()));}
     assert_eq!(steps.ordered.iter().filter(|step|step.needs()==Needs::Database).fold(0,|mask,step|mask|super::step::mask(step.id())),steps.database);
     assert_eq!(steps.ordered.iter().filter(|step|step.needs()!=Needs::Database).fold(0,|mask,step|mask|super::step::mask(step.id())),steps.network);
-    runtime.owner.close();assert!(Steps::for_owner(&runtime.owner,&cfg).is_err());
+    let step=steps.ordered.iter().find(|step|step.id()==crate::probe::opensubtitles::OPENSUBTITLES_STEP).unwrap();
+    assert_ne!(steps.enabled & mask(step.id()),0);
+    let cache=crate::pg::service_cache::Cache::new(&runtime.owner).unwrap();
+    let reads=crate::pg::stage_reads::StepReads::for_owner(&runtime.owner).unwrap();
+    let executor=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let bodies=super::bodies::BodyFetcher::new(Arc::new(crate::nntp::Pool::new(&[])),executor.handle().clone(),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),cfg.postprocess.clone(),Arc::new(super::stats::Stats::default()));
+    let run=|hash:&str| {
+        let mut context=super::step::StepCtx {
+            release:super::step::ReleaseInfo {id:1,..Default::default()},
+            data:super::data::StepData::Native(&reads),facts:vec![(crate::probe::step::MOVIEHASH_FACT,hash.into())],
+            bodies:&bodies,used_bodies:0,deadline:std::time::Instant::now()+std::time::Duration::from_secs(5),
+            lane_can_fetch:false,crcs:Vec::new(),pictures:false,
+        };
+        let result=step.run(&mut context);
+        assert_eq!(context.used_bodies,0);assert!(context.crcs.is_empty());result
+    };
+    // The real factory's lazily constructed HTTP client must retain the owner
+    // after construction returns. No natural-key hit or loopback cache bypass
+    // can satisfy these two distinct HTTP-cache replies.
+    let hashes=["0000000000000011","0000000000000012"];
+    let response=r#"{"data":[{"attributes":{"moviehash_match":true,"feature_details":{"imdb_id":133093,"feature_type":"Movie","title":"Factory Film"}}}]}"#;
+    for (index,hash) in hashes.iter().enumerate() {
+        if index==1 {
+            cfg.media.opensubtitles.api_key="reloaded-factory-fixture-key".into();
+            cfg.media.opensubtitles.base_url=Some("https://reloaded-opensubtitles-cache-fixture.invalid/api/v1".into());
+            assert!(step.enabled(&cfg));
+        }
+        assert!(crate::raw_store::get_opensubtitles(hash).unwrap().is_none());
+        let url=format!("{}/subtitles?moviehash={hash}",cfg.media.opensubtitles.base_url.as_deref().unwrap());
+        cache.put_http("opensubtitles",&url,200,response).unwrap();
+        let outcome=run(hash).expect("factory OpenSubtitles client must read its original owner's HTTP cache");
+        assert!(outcome.matched);assert_eq!(outcome.rerun,mask(crate::probe::opensubtitles::OPENSUBTITLES_IMDB_STEP));
+        assert_eq!(outcome.writes.len(),1);
+        assert!(matches!(outcome.writes[0].native_mutation_for(1).unwrap(),super::step::StepMutation::OpenSubtitlesMatch {
+            moviehash,feature:Some(feature),..
+        } if moviehash.as_str()==*hash && feature.imdb_id==Some(133093) && feature.title.as_deref()==Some("Factory Film")));
+        assert_eq!(crate::raw_store::get_opensubtitles(hash).unwrap().unwrap().unwrap().imdb_id,Some(133093));
+    }
+    // Keep the parent's retained natural-cache comparison independent of the
+    // fixture's new hashes; the Step results above are intentionally unsettled.
+    runtime.owner.with(|client| {
+        client.execute("delete from ext_opensubtitles where moviehash=any($1)",&[&hashes.as_slice()])?;Ok(())
+    }).unwrap();
+    let url=format!("{}/subtitles?moviehash={}",cfg.media.opensubtitles.base_url.as_deref().unwrap(),hashes[1]);
+    crate::probe::opensubtitles::tests::assert_http_client_owner_fence(&runtime.owner,&cfg,&url);
+    let Err(super::step::StepError::Native(error))=run(hashes[0]) else {panic!("ended original owner must remain a typed storage failure")};
+    assert!(crate::pg::outage::is_attempt_ended(&error));
+    assert_eq!(crate::pg::outage::classify(&error),crate::pg::outage::Failure::Unavailable);
+    assert!(Steps::for_owner(&runtime.owner,&cfg).is_err());
 }
 #[cfg(test)]
 mod tests {
