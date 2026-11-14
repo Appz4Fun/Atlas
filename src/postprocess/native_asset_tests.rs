@@ -179,10 +179,17 @@ fn native_still_donor_does_not_clear_own_rows_or_complete_generation() {
         let until = Instant::now() + Duration::from_secs(30);
         let status = loop {
             if let Some(status) = child.try_wait().unwrap() { break status; }
-            if Instant::now() >= until { child.kill().unwrap(); child.wait().unwrap(); panic!("owned still donor child deadline"); }
+            if Instant::now() >= until {
+                child.kill().unwrap(); child.wait().unwrap();
+                let retained = home.keep();
+                panic!("owned still donor child deadline; private log {}", retained.join("child.log").display());
+            }
             std::thread::sleep(Duration::from_millis(20));
         };
-        assert!(status.success(), "owned {case} still donor child failed; private child log retained by qualification harness");
+        if !status.success() {
+            let retained = home.keep();
+            panic!("owned {case} still donor child failed; private log {}", retained.join("child.log").display());
+        }
         assert_eq!(std::fs::read(home.path().join("finished")).unwrap(), b"done");
         assert!(!home.path().join("atlas.db").exists() && !home.path().join("atlas.raw.db").exists());
     }
