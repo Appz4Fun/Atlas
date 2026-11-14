@@ -623,7 +623,7 @@ fn still_of(track: &VideoTrack, frame: &[u8]) -> Option<(Vec<u8>, u32, u32, Opti
 
 fn still_error(error:anyhow::Error)->StepError {
     if error.is::<crate::pg::worker_assets::StillChanged>()||error.is::<crate::pg::worker_assets::StillAdmission>()
-        ||error.downcast_ref::<std::io::Error>().is_some() {StepError::Transient(error.to_string())}
+        ||error.downcast_ref::<std::io::Error>().is_some_and(|io|io.kind()==std::io::ErrorKind::WouldBlock) {StepError::Transient(error.to_string())}
     else {StepError::from_cache(error)}
 }
 fn still_hold(frame:crate::pg::worker_assets::StillFrame)->Result<Option<Box<dyn std::any::Any+Send>>,StepError> {
