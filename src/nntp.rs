@@ -5287,13 +5287,18 @@ mod tests {
             run(async move {
                 let (client, mut server) = tokio::io::duplex(1 << 16);
                 let mut conn = Conn::over(Box::new(client), Duration::from_secs(5));
-                tokio::spawn(async move {
+                let peer = tokio::spawn(async move {
                     let mut cmd = [0u8; 64];
                     let _ = tokio::io::AsyncReadExt::read(&mut server, &mut cmd).await;
                     let _ = server.write_all(status.as_bytes()).await;
                     let _ = server.write_all(&wire).await;
                 });
-                conn.xover_ends(1, 50_000, rows).await.unwrap()
+                let result = conn.xover_ends(1, 50_000, rows).await;
+                let poisoned = conn.poisoned;
+                drop(conn);
+                peer.abort();
+                let _ = peer.await;
+                (result, poisoned)
             })
         };
         let posted = |n: u64| {
@@ -5309,11 +5314,15 @@ mod tests {
             ("plain", "224 overview follows\r\n", dated(50_000)),
             ("compressed", "224 overview follows [COMPRESS=GZIP]\r\n", zlib(&dated(50_000))),
         ] {
-            let cut = read(status, wire.clone(), 100);
+            let (cut, cut_poisoned) = read(status, wire.clone(), 100);
+            let cut = cut.unwrap();
+            assert!(cut_poisoned, "a partial date listing must never return a reusable connection: {name}");
             assert_eq!((cut.whole, cut.rows, cut.read_to), (false, 100, Some(100)), "{name}");
             assert_eq!((cut.first, cut.last), (Some(posted(1)), Some(posted(100))), "{name}");
 
-            let whole = read(status, wire, 50_000);
+            let (whole, whole_poisoned) = read(status, wire, 50_000);
+            let whole = whole.unwrap();
+            assert!(!whole_poisoned, "a complete listing is not a truncated prefix: {name}");
             assert_eq!((whole.whole, whole.rows), (true, 50_000), "{name}");
             assert_eq!((whole.first, whole.last), (Some(posted(1)), Some(posted(50_000))), "{name}");
         }
