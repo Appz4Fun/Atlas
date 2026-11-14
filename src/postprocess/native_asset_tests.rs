@@ -222,13 +222,14 @@ fn run_still_donor_case(complete: bool) {
             let own = ids.is_empty();
             for position in crate::probe::stills::POSITIONS {
                 if own && !complete && position != 25 { continue; }
-                let value=position+u8::from(own);let luma=crate::video::picture::Plane8 {data:vec![value;16*16],width:16,height:16};
-                let bytes=crate::video::jpeg::encode(&luma.data,&[128;8*8],&[128;8*8],16,16,85);
-                let phash=crate::video::phash::phash(&luma).map(|hash|hash as i64);
+                let value=position+u8::from(own);
+                let luma=crate::video::picture::Plane8 {data:(0..32*32).map(|at|32+((at%32*3+at/32*5+usize::from(value))%192) as u8).collect(),width:32,height:32};
+                let bytes=crate::video::jpeg::encode(&luma.data,&[128;16*16],&[128;16*16],32,32,85);
+                let phash=Some(crate::video::phash::phash(&luma).expect("textured 32x32 native luma must produce a real perceptual hash") as i64);
                 let hash = Sha256::digest(&bytes).iter().map(|b|format!("{b:02x}")).collect::<String>();
                 let path = home.join("stills").join(&hash);
                 std::fs::write(&path,&bytes).unwrap(); physical.push((path,bytes));
-                client.execute("insert into release_stills(release_id,position,at_ms,sha256,width,height,phash) values($1,$2,$3,$4,16,16,$5)",
+                client.execute("insert into release_stills(release_id,position,at_ms,sha256,width,height,phash) values($1,$2,$3,$4,32,32,$5)",
                     &[&id,&i64::from(position),&(i64::from(position)*1000),&hash,&phash])?;
             }
             ids.push(id);

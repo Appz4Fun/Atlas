@@ -8,14 +8,17 @@ use sha2::{Sha256,Digest};
 fn hex(bytes:&[u8])->String {bytes.iter().map(|byte|format!("{byte:02x}")).collect()}
 fn jpeg(value:u8)->Vec<u8> {crate::video::jpeg::encode(&vec![value;16*16],&vec![128;8*8],&vec![128;8*8],16,16,85)}
 fn setup(schema:&pg::testing::Schema)->(pg::indexer_runtime::Runtime,tempfile::TempDir,crate::config::NativeAssetsConfig,i64) {
+    setup_selected(pg::StorageConfig {backend:pg::Backend::Postgres,url:schema.url.clone(),schema:schema.name.clone(),max_connections:1,allow_plaintext:true},None)
+}
+fn setup_selected(storage:pg::StorageConfig,configured_headers:Option<crate::config::HeaderStoreConfig>)->(pg::indexer_runtime::Runtime,tempfile::TempDir,crate::config::NativeAssetsConfig,i64) {
     let home=tempfile::tempdir().unwrap();let root=home.path().join("assets");std::fs::create_dir(&root).unwrap();std::fs::create_dir(root.join("stills")).unwrap();
     let original=jpeg(10);let name=hex(&Sha256::digest(&original));std::fs::write(root.join("stills").join(&name),original).unwrap();
     let manifest=home.path().join("assets.jsonl");pg::testing::capture_asset_manifest(&root,&manifest,pg::testing::AssetCaptureLimits {min_files:1,max_files:8,max_file_bytes:1<<20,max_total_bytes:8<<20,read_bytes_per_second:32<<20}).unwrap();
     let selection=crate::config::NativeAssetsConfig {root:root.canonicalize().unwrap().to_str().unwrap().into(),manifest:manifest.canonicalize().unwrap().to_str().unwrap().into(),whole_sha256:hex(&Sha256::digest(std::fs::read(&manifest).unwrap()))};
     let mut config=crate::config::Config::default();config.postprocess.enabled=false;config.predb.enabled=false;config.spots.enabled=false;config.inferred_parts=false;
     config.media.tvmaze.enabled=false;config.media.allocine.enabled=false;config.media.details_per_minute=0;
-    let headers=crate::config::HeaderStoreConfig {enabled:true,dir:home.path().join("headers").to_str().unwrap().into()};
-    let runtime=pg::indexer_runtime::Runtime::open(&config,pg::StorageConfig {backend:pg::Backend::Postgres,url:schema.url.clone(),schema:schema.name.clone(),max_connections:1,allow_plaintext:true},headers,&[],&mut None).unwrap();
+    let headers=configured_headers.unwrap_or_else(||crate::config::HeaderStoreConfig {enabled:true,dir:home.path().join("headers").to_str().unwrap().into()});
+    let runtime=pg::indexer_runtime::Runtime::open(&config,storage,headers,&[],&mut None).unwrap();
     let id=runtime.owner.with(|client| {
         pg::release_writer::save(client,&[release("<native-still-1@fixture.invalid>",1)],-100000)?;
         Ok(client.query_one("select id from releases",&[])?.get::<_,i64>(0))
@@ -52,7 +55,34 @@ fn http(runtime:&pg::indexer_runtime::Runtime,selection:&crate::config::NativeAs
 #[test]
 #[ignore="Root-only isolated PG, private ATLAS_HOME and real HTTP spool disk admission"]
 fn native_generated_stills_prepared_settlement_serves_exact_jpeg_without_manifest_rewrite() {
-    let schema=pg::testing::Schema::new().expect("explicit isolated PG");let (runtime,home,selection,id)=setup(&schema);
+    const CHILD:&str="ATLAS_STILL_HTTP_CHILD";
+    const SELECTOR:&str="postprocess::native::still_asset_tests::native_generated_stills_prepared_settlement_serves_exact_jpeg_without_manifest_rewrite";
+    if std::env::var_os(CHILD).is_some() {
+        let storage=crate::config::checked_storage_config().unwrap();let headers=crate::config::header_store_config();
+        run_configured_http_stills(storage,headers);std::fs::write(crate::paths::app_dir().join("finished"),b"done").unwrap();return;
+    }
+    // Config is process-global. Select a real private home/header root before
+    // the child initializes Runtime and enters the unchanged signed-in handler.
+    use std::{fs::OpenOptions,io::Write,os::unix::fs::{OpenOptionsExt,DirBuilderExt},process::{Command,Stdio},time::{Duration,Instant}};
+    let schema=pg::testing::Schema::new().expect("explicit isolated PG");let home=tempfile::tempdir().unwrap();
+    std::fs::DirBuilder::new().mode(0o700).create(home.path().join("tmp")).unwrap();
+    let config=serde_json::json!({"storage":{"backend":"postgres","url":&schema.url,"schema":&schema.name,"allow_plaintext":true},"header_store":{"enabled":true,"dir":home.path().join("headers")}});
+    let mut file=OpenOptions::new().create_new(true).write(true).mode(0o600).open(home.path().join("config.json")).unwrap();file.write_all(serde_json::to_vec(&config).unwrap().as_slice()).unwrap();drop(file);
+    let log=OpenOptions::new().create_new(true).write(true).mode(0o600).open(home.path().join("child.log")).unwrap();
+    let mut child=Command::new(std::env::current_exe().unwrap()).args(["--ignored","--exact",SELECTOR,"--nocapture"])
+        .env_clear().env(CHILD,"1").env("ATLAS_HOME",home.path()).env("HOME",home.path()).env("TMPDIR",home.path().join("tmp"))
+        .env("ATLAS_NO_KEYRING","1").env("ATLAS_SAB_DIR",home.path().join("absent-sab")).stdin(Stdio::null())
+        .stdout(Stdio::from(log.try_clone().unwrap())).stderr(Stdio::from(log)).spawn().unwrap();
+    let until=Instant::now()+Duration::from_secs(30);
+    let status=loop {if let Some(status)=child.try_wait().unwrap(){break status;}if Instant::now()>=until {
+        child.kill().unwrap();child.wait().unwrap();let retained=home.keep();panic!("owned still HTTP child deadline; private log {}",retained.join("child.log").display());
+    }std::thread::sleep(Duration::from_millis(20));};
+    if !status.success() {let retained=home.keep();panic!("owned still HTTP child failed; private log {}",retained.join("child.log").display());}
+    assert_eq!(std::fs::read(home.path().join("finished")).unwrap(),b"done");
+    assert!(!home.path().join("atlas.db").exists()&&!home.path().join("atlas.raw.db").exists()&&!home.path().join("stills").exists());
+}
+fn run_configured_http_stills(storage:pg::StorageConfig,headers:crate::config::HeaderStoreConfig) {
+    let (runtime,home,selection,id)=setup_selected(storage,Some(headers));
     let original=std::fs::read(&selection.manifest).unwrap();assert_ne!(std::path::Path::new(&selection.root),crate::paths::app_dir());
     let grant=Grant::open(&runtime.owner,Some(&selection)).unwrap().unwrap();let (frame,stills)=generated(&grant,id);
     assert_eq!(http(&runtime,&selection,id).status,404,"a file/receipt alone is not a public still association");
