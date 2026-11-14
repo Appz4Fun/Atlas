@@ -161,6 +161,15 @@ pub(crate) fn post_with_storage(
     storage: &crate::pg::StorageConfig,
 ) -> Option<ApiResponse> {
     let signed_in = signed_in(cookies, api_key);
+    // Server settings edit the selected configuration file, not catalog state.
+    // Keep the existing form validation and CSRF boundary without admitting
+    // unrelated native actor mutations or contacting a provider/database.
+    if signed_in && path == "/ui/settings/servers" {
+        if !storage.is_postgres() || crate::config::checked_storage_config().as_ref().ok() != Some(storage) {
+            return Some(html(503, diag("caution", "configuration unavailable", "Storage configuration changed or could not be read. Reload before saving.")));
+        }
+        return crate::web_settings::post(path, body, csrf, api_key);
+    }
     if signed_in && path.starts_with("/ui/") {
         return Some(html(
             503,
