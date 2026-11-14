@@ -81,14 +81,17 @@ fn configured_native_media_child() {
 
 #[test]
 fn native_title_claims_keep_capacity_and_release_on_guard_drop() {
-    let Some(schema)=crate::pg::testing::Schema::new() else {eprintln!("skipping PostgreSQL test: ATLAS_PG_TEST_URL is required");return};
-    let runtime=crate::pg::stage_queue_tests::runtime(&schema);
-    let media=native_service(&runtime.owner,&Config::default()).unwrap();media.with_max_claims(1);
-    let first=media.claim_native(11,1,10).expect("first title claim");
-    assert!(media.claim_native(11,1,10).is_none());
-    assert!(media.claim_native(12,2,10).is_none());
-    drop(first);
-    let second=media.claim_native(12,2,11).expect("guard drop releases capacity");
-    assert!(media.claim_native(11,1,11).is_none());drop(second);
-    assert!(media.claim_native(11,1,12).is_some());
+    crate::media::with_native_test_runtime(
+        "media::native_cache_tests::native_title_claims_keep_capacity_and_release_on_guard_drop",
+        |runtime| {
+            let media=native_service(&runtime.owner,&Config::default()).unwrap();media.with_max_claims(1);
+            let first=media.claim_native(11,1,10).expect("first title claim");
+            assert!(media.claim_native(11,1,10).is_none());
+            assert!(media.claim_native(12,2,10).is_none());
+            drop(first);
+            let second=media.claim_native(12,2,11).expect("guard drop releases capacity");
+            assert!(media.claim_native(11,1,11).is_none());drop(second);
+            assert!(media.claim_native(11,1,12).is_some());
+        },
+    );
 }

@@ -231,7 +231,7 @@ fn completion(case: &str) -> String {
     format!("owned native provider case completed: {case}")
 }
 
-fn configured_case(case: &str, body: fn()) {
+fn configured_case(case: &str, body: impl FnOnce(&crate::pg::indexer_runtime::Runtime)) {
     let home = PathBuf::from(std::env::var_os("ATLAS_HOME").expect("private child home"));
     let config = crate::config::load_config().expect("selected private fixture configuration");
     let storage = crate::config::checked_storage_config().expect("checked private PostgreSQL destination");
@@ -250,7 +250,7 @@ fn configured_case(case: &str, body: fn()) {
     cache.check().expect("actual owner/config/epoch/cache preflight");
     let retained = cache.clone();
     // A constructor context, NOT an Owner::with callback or transaction over HTTP.
-    super::cache::native(cache, body);
+    super::cache::native(cache, || body(&runtime.0));
     retained.check().expect("same original owner remains valid after the case");
     assert_eq!(runtime.0.owner.failure(), None, "provider case must not fail its native owner");
     drop(retained);
@@ -261,6 +261,28 @@ fn configured_case(case: &str, body: fn()) {
 
 fn run_case(case: &str) {
     let body = case_body(case).expect("closed provider case registry");
+    let selector = format!("{SELECTOR_PREFIX}{case}");
+    run_owned_case(&selector, case, true, |_| body());
+}
+
+// These existing default selectors share the reviewed provider fixture's exact
+// selected-config/original-owner admission. They remain unignored parent tests.
+pub(super) fn run_runtime_case(selector: &'static str, body: impl FnOnce(&crate::pg::indexer_runtime::Runtime)) {
+    assert!(matches!(selector,
+        "media::native_cache_tests::native_title_claims_keep_capacity_and_release_on_guard_drop"
+        | "media::steps::tests::a_spots_kind_gives_its_title_to_look_up"
+        | "media::steps::tests::each_step_has_its_lane"
+        | "postprocess::native::media_settlement_tests::a_files_own_tags_pin_its_ids_against_a_lookup_by_name"
+    ), "closed native runtime fixture selector");
+    run_owned_case(selector, selector, false, body);
+}
+
+fn run_owned_case(
+    selector: &str,
+    case: &str,
+    ignored: bool,
+    body: impl FnOnce(&crate::pg::indexer_runtime::Runtime),
+) {
     if let Some(selected) = std::env::var_os(CHILD_CASE) {
         assert_eq!(selected.to_str(), Some(case), "mismatched owned child case");
         configured_case(case, body);
@@ -272,9 +294,12 @@ fn run_case(case: &str) {
     private_directory(&home.path().join("tmp"));
     private_directory(&home.path().join("headers"));
     write_config(home.path(), &schema);
-    let selector = format!("{SELECTOR_PREFIX}{case}");
-    let child = Command::new(std::env::current_exe().unwrap())
-        .args(["--ignored", "--exact", selector.as_str(), "--nocapture", "--test-threads=1"])
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command.args(["--exact", selector, "--nocapture", "--test-threads=1"]);
+    if ignored {
+        command.arg("--ignored");
+    }
+    let child = command
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", home.path())

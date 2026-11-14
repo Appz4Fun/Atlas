@@ -97,29 +97,29 @@ fn ids(runtime: &crate::pg::indexer_runtime::Runtime, id: i64) -> (Option<i64>, 
 }
 #[test]
 fn a_files_own_tags_pin_its_ids_against_a_lookup_by_name() {
-    let Some(schema) = crate::pg::testing::Schema::new() else {
-        eprintln!("skipping PostgreSQL test: ATLAS_PG_TEST_URL is required");
-        return;
-    };
-    let runtime = crate::pg::stage_queue_tests::runtime(&schema);
-    crate::pg::stage_queue_tests::push(&runtime);
-    let id = runtime
-        .owner
-        .with(|client| {
-            let id = client.query_one("select id from releases", &[])?.try_get::<_, i64>(0)?;
-            client.execute("insert into media_release(release_id,kind,title_key,quality) values($1,2,77,0)", &[&id])?;
-            Ok(id)
-        })
-        .unwrap();
-    turn(&runtime, Action::Tags, 10);
-    assert_eq!(ids(&runtime, id), (Some(133_093), Some(603), None));
-    rerun(&runtime, id, 20);
-    turn(&runtime, Action::Found, 20);
-    assert_eq!(ids(&runtime, id), (Some(133_093), Some(603), Some(5)));
-    // Fixture baseline for a TV row: result writes still go through the queue.
-    runtime.owner.with(|client|Ok(client.execute("update media_release set kind=1,imdb_id=null,tmdb_id=null,tvdb_id=null,imdb_from_nfo=0,tmdb_from_tag=0,tvdb_from_tag=0 where release_id=$1",&[&id])?)).unwrap();
-    rerun(&runtime, id, 30);
-    turn(&runtime, Action::Tags, 30);
-    assert_eq!(ids(&runtime, id), (None, None, Some(81_189)));
-    assert_eq!(runtime.owner.failure(), None);
+    crate::media::with_native_test_runtime(
+        "postprocess::native::media_settlement_tests::a_files_own_tags_pin_its_ids_against_a_lookup_by_name",
+        |runtime| {
+            crate::pg::stage_queue_tests::push(&runtime);
+            let id = runtime
+                .owner
+                .with(|client| {
+                    let id = client.query_one("select id from releases", &[])?.try_get::<_, i64>(0)?;
+                    client.execute("insert into media_release(release_id,kind,title_key,quality) values($1,2,77,0)", &[&id])?;
+                    Ok(id)
+                })
+                .unwrap();
+            turn(&runtime, Action::Tags, 10);
+            assert_eq!(ids(&runtime, id), (Some(133_093), Some(603), None));
+            rerun(&runtime, id, 20);
+            turn(&runtime, Action::Found, 20);
+            assert_eq!(ids(&runtime, id), (Some(133_093), Some(603), Some(5)));
+            // Fixture baseline for a TV row: result writes still go through the queue.
+            runtime.owner.with(|client|Ok(client.execute("update media_release set kind=1,imdb_id=null,tmdb_id=null,tvdb_id=null,imdb_from_nfo=0,tmdb_from_tag=0,tvdb_from_tag=0 where release_id=$1",&[&id])?)).unwrap();
+            rerun(&runtime, id, 30);
+            turn(&runtime, Action::Tags, 30);
+            assert_eq!(ids(&runtime, id), (None, None, Some(81_189)));
+            assert_eq!(runtime.owner.failure(), None);
+        },
+    );
 }

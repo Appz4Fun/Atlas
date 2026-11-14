@@ -294,31 +294,39 @@ mod tests {
 
     #[test]
     fn a_spots_kind_gives_its_title_to_look_up() {
-        // a name the category rules don't read as a movie: the spot says it is one
-        let Some(schema) = crate::pg::testing::Schema::new() else { return };
-        let runtime = crate::pg::stage_queue_tests::runtime(&schema);
-        let media = super::super::native_service(&runtime.owner, &Config::default()).unwrap();
-        let r = ReleaseInfo {
-            name: "01. The Matrix (1999) 4k UHD Rife 60fps AI-Enhanced Dolby True-HD Atmos".into(),
-            group: "alt.binaries.boneless".into(),
-            poster: Some("yEncBin@Poster.com (FrameMaster)".into()),
-            ..Default::default()
-        };
-        assert!(target_of(&media, &r).is_none(), "no movie by its name alone");
-        let spot = ReleaseInfo { spot_kind: Some(crate::spotnet::Kind::Movie), ..r };
-        let (kind, p) = target_of(&media, &spot).unwrap();
-        assert_eq!((kind, p.title.as_str(), p.year), (Kind::Movie, "The Matrix", Some(1999)));
-        assert_eq!(MediaLookup(media.clone()).skip_reason(&spot), None);
+        crate::media::with_native_test_runtime(
+            "media::steps::tests::a_spots_kind_gives_its_title_to_look_up",
+            |runtime| {
+                // a name the category rules don't read as a movie: the spot says it is one
+                let media = super::super::native_service(&runtime.owner, &Config::default()).unwrap();
+                let r = ReleaseInfo {
+                    name: "01. The Matrix (1999) 4k UHD Rife 60fps AI-Enhanced Dolby True-HD Atmos".into(),
+                    group: "alt.binaries.boneless".into(),
+                    poster: Some("yEncBin@Poster.com (FrameMaster)".into()),
+                    ..Default::default()
+                };
+                assert!(target_of(&media, &r).is_none(), "no movie by its name alone");
+                let spot = ReleaseInfo { spot_kind: Some(crate::spotnet::Kind::Movie), ..r };
+                let (kind, p) = target_of(&media, &spot).unwrap();
+                assert_eq!((kind, p.title.as_str(), p.year), (Kind::Movie, "The Matrix", Some(1999)));
+                assert_eq!(MediaLookup(media.clone()).skip_reason(&spot), None);
+
+            },
+        );
     }
 
     #[test]
     fn each_step_has_its_lane() {
-        let Some(schema) = crate::pg::testing::Schema::new() else { return };
-        let runtime = crate::pg::stage_queue_tests::runtime(&schema);
-        let media = super::super::native_service(&runtime.owner, &Config::default()).unwrap();
-        assert_eq!(MediaParse(media.clone()).needs(), Needs::Database);
-        assert_eq!(MediaLookup(media.clone()).needs(), Needs::External);
-        assert_eq!(MediaNfo(media).needs(), Needs::Bodies);
+        crate::media::with_native_test_runtime(
+            "media::steps::tests::each_step_has_its_lane",
+            |runtime| {
+                let media = super::super::native_service(&runtime.owner, &Config::default()).unwrap();
+                assert_eq!(MediaParse(media.clone()).needs(), Needs::Database);
+                assert_eq!(MediaLookup(media.clone()).needs(), Needs::External);
+                assert_eq!(MediaNfo(media).needs(), Needs::Bodies);
+
+            },
+        );
     }
 
     #[test]

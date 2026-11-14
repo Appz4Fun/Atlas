@@ -250,3 +250,13 @@ mod native_cache_tests;
 
 #[cfg(test)]
 mod native_provider_tests;
+
+// Reuse the same portable, selected-config original Runtime for the four
+// cache-dependent default contracts; no process-global environment is changed.
+#[cfg(test)]
+pub(crate) fn with_native_test_runtime(
+    selector: &'static str,
+    body: impl FnOnce(&crate::pg::indexer_runtime::Runtime),
+) {
+    native_provider_tests::run_runtime_case(selector, body);
+}
