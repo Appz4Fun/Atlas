@@ -102,14 +102,14 @@ mod unix {
         if !exclusive && error.raw_os_error() == Some(libc::EEXIST) { Ok(()) } else { Err(path_error(error)) }
     }
     /// Walk every component without following symbolic links. For create, only the
-    /// final component is initialized and its pinned parent is returned for syncing.
+    /// final component is initialized. Retain the final pinned parent for writer
+    /// admission to reconcile an initialization interrupted before its parent sync.
     fn root_directory(root: &Path, create: bool, budget: &Arc<Budget>) -> Result<(Pinned, Option<Pinned>)> {
         let mut current = directory(libc::AT_FDCWD, if root.is_absolute() { c"/" } else { c"." }, budget)?;
         let mut components = root
             .components()
             .filter(|component| !matches!(component, Component::RootDir | Component::CurDir))
             .peekable();
-        let mut walked = false;
         while let Some(component) = components.next() {
             let Component::Normal(component) = component else {
                 return Err(Error::Corrupt);
@@ -120,16 +120,12 @@ mod unix {
                 mkdir_at(current.as_raw_fd(), &component, true)?;
             }
             let next = directory(current.as_raw_fd(), &component, budget)?;
-            if create && last {
+            if last {
                 return Ok((next, Some(current)));
             }
             current = next;
-            walked = true;
         }
-        if !walked {
-            return Err(Error::Corrupt);
-        }
-        Ok((current, None))
+        Err(Error::Corrupt)
     }
     fn random<const N: usize>() -> Result<[u8; N]> {
         let mut bytes = [0; N];
@@ -216,7 +212,7 @@ mod unix {
         check(deadline)?;
         Ok(before)
     }
-    fn identity_at(root: &Pinned, budget: &Arc<Budget>) -> Result<Identity> {
+    fn identity_at(root: &Pinned, budget: &Arc<Budget>) -> Result<(Identity, Pinned)> {
         let identity = open_at(root.as_raw_fd(), c"identity", libc::O_RDONLY, budget)?;
         let before = stable(&identity.file)?;
         if before.bytes != 88 {
@@ -235,7 +231,7 @@ mod unix {
         }
         let mut label = [0; 48];
         label.copy_from_slice(&bytes[8..56]);
-        Ok(Identity::from_bytes(label))
+        Ok((Identity::from_bytes(label), identity))
     }
     fn lock_at(root: &Pinned, create: bool, budget: &Arc<Budget>) -> Result<Pinned> {
         let flags = libc::O_RDWR | if create { libc::O_CREAT | libc::O_EXCL } else { 0 };
@@ -371,14 +367,24 @@ mod unix {
         }
         pub(crate) fn open(root: &Path, expected: Identity) -> Result<Self> {
             let budget = Arc::new(Budget::default());
-            let (root, _) = root_directory(root, false, &budget)?;
-            let identity = identity_at(&root, &budget)?;
+            let (root, parent) = root_directory(root, false, &budget)?;
+            let parent = parent.expect("opened root has a pinned parent");
+            let chunks = directory(root.as_raw_fd(), c"chunks", &budget)?;
+            let lock = lock_at(&root, false, &budget)?;
+            let (identity, identity_file) = identity_at(&root, &budget)?;
             if identity != expected {
                 return Err(Error::IdentityMismatch);
             }
-            let chunks = directory(root.as_raw_fd(), c"chunks", &budget)?;
-            let lock = lock_at(&root, false, &budget)?;
-            Ok(Self { root, chunks, _lock: lock, identity, budget, poisoned: Cell::new(false) })
+            let writer = Self { root, chunks, _lock: lock, identity, budget, poisoned: Cell::new(false) };
+            // Visible valid identity bytes can precede completion of initialization.
+            // Admit a writer only after the actual pinned inode and complete required
+            // directory chain are durable under the acquired single-writer lock.
+            writer.flush(&identity_file.file, None, SyncPoint::Other)?;
+            writer.flush(&writer._lock.file, None, SyncPoint::Other)?;
+            writer.flush(&writer.chunks.file, None, SyncPoint::Other)?;
+            writer.flush(&writer.root.file, None, SyncPoint::Other)?;
+            writer.flush(&parent.file, None, SyncPoint::Parent)?;
+            Ok(writer)
         }
         pub(crate) fn identity(&self) -> Identity {
             self.identity
@@ -477,7 +483,7 @@ mod unix {
         pub(crate) fn open(root: &Path, expected: Identity) -> Result<Self> {
             let budget = Arc::new(Budget::default());
             let (root, _) = root_directory(root, false, &budget)?;
-            let identity = identity_at(&root, &budget)?;
+            let (identity, _identity_file) = identity_at(&root, &budget)?;
             if identity != expected {
                 return Err(Error::IdentityMismatch);
             }

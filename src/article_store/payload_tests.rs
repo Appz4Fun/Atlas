@@ -519,10 +519,13 @@ fn interrupted_initialization_reconciles_parent_durability() {
     let identity = Identity::from_parts(catalog(), StoreId::from_bytes(store));
     let before = snapshot(&root);
     payload::test_fail_parent_sync();
+    let before_reader_syncs = payload::test_sync_calls();
     let reader_result = Reader::open(&root, identity);
+    let after_reader_syncs = payload::test_sync_calls();
     let reopen_result = Writer::open(&root, identity);
     // Clear even when the missing sync leaves the targeted failure unconsumed.
     payload::test_clear_sync_failure();
+    assert_eq!(after_reader_syncs, before_reader_syncs, "read-only reopening cannot invoke a sync primitive");
     assert!(reader_result.is_ok(), "read-only reopening cannot perform a durability sync");
     drop(reader_result);
     assert_eq!(snapshot(&root), before);
