@@ -66,10 +66,10 @@ pub(crate) struct Owner {
     epoch: Option<super::stage::OwnerEpoch>,
 }
 
-/// Two FIFO classes, alternating whenever both have waiters. A queued save or
-/// progress checkpoint need not wait behind every frontier selection. Ordinary
-/// callbacks (including lease/heartbeat work) retain a turn between ingestion
-/// callbacks. This bounds callback ordering, never the duration of running SQL.
+/// Ingestion alternates with ordinary work. Within each ordinary turn,
+/// service/control and scheduler selection alternate, FIFO within each queue.
+/// Neither publication nor ingestion waits behind every queued frontier probe;
+/// each class still progresses. This bounds ordering, never running SQL time.
 #[derive(Default)]
 struct Admission {
     state: Mutex<AdmissionState>,
@@ -77,9 +77,10 @@ struct Admission {
 }
 #[derive(Default)]
 struct AdmissionState {
-    waiting: [std::collections::VecDeque<Arc<()>>; 2],
+    waiting: [std::collections::VecDeque<Arc<()>>; 3],
     active: bool,
     next: usize,
+    selection_next: bool,
 }
 struct OwnerTurn<'a> {
     admission: &'a Admission,
@@ -98,12 +99,18 @@ impl Admission {
                 drop(state);
                 return Err(AttemptEnded.into());
             }
-            let chosen = if state.waiting[state.next].is_empty() { 1 - state.next } else { state.next };
+            // Top-level ingestion/ordinary alternation is unchanged. Only an
+            // actual ordinary admission advances the service/selection subturn.
+            let ordinary = if state.waiting[1].is_empty() { 2 }
+                else if state.waiting[2].is_empty() || !state.selection_next { 1 } else { 2 };
+            let chosen = if state.waiting[0].is_empty() { ordinary }
+                else if state.waiting[ordinary].is_empty() || state.next == 0 { 0 } else { ordinary };
             if !state.active && chosen == class
                 && state.waiting[class].front().is_some_and(|id| Arc::ptr_eq(id, &turn.id)) {
                 state.waiting[class].pop_front();
                 state.active = true;
-                state.next = 1 - class;
+                state.next = usize::from(class == 0);
+                if class != 0 { state.selection_next = class == 1; }
                 turn.active = true;
                 drop(state);
                 return Ok(turn);
@@ -194,6 +201,19 @@ impl Owner {
     #[track_caller]
     pub(crate) fn with_ingest<T>(&self, work: impl FnOnce(&mut postgres::Client) -> Result<T>) -> Result<T> {
         self.with_class(0, work)
+    }
+
+    /// Only the three indexer scheduler-selection callbacks use this class.
+    /// It remains ordinary work, alternating with service/control callbacks.
+    #[track_caller]
+    pub(crate) fn with_selection<T>(&self, work: impl FnOnce(&mut postgres::Client) -> Result<T>) -> Result<T> {
+        self.with_class(2, work)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admission_waiters_for_test(&self) -> [usize; 3] {
+        let state = self.admission.state.lock().unwrap();
+        std::array::from_fn(|n| state.waiting[n].len())
     }
 
     #[track_caller]

@@ -121,6 +121,7 @@ fn real_refresh_and_current_capture_progress_between_selection_turns_without_par
     let (refreshed, refresh_done) = mpsc::channel();
     let (capture_now, may_capture) = mpsc::channel();
     let (captured, capture_done) = mpsc::channel();
+    let (finish_cache, cache_may_finish) = mpsc::channel();
     let cache_owner = owner.clone();
     let cache = thread::spawn(move || -> Result<()> {
         assert!(matches!(producer.refresh()?, Refresh::Published));
@@ -129,6 +130,7 @@ fn real_refresh_and_current_capture_progress_between_selection_turns_without_par
         crate::pg::stage_telemetry::capture(&cache_owner, Some(&lanes))?;
         captured.send(())?;
         // Keep the actual producer installed through the parent's commit assertions.
+        cache_may_finish.recv_timeout(Duration::from_secs(10))?;
         Ok(())
     });
     waiters(&owner, [2, 1, 8]);
@@ -164,7 +166,6 @@ fn real_refresh_and_current_capture_progress_between_selection_turns_without_par
     assert_eq!(done.load(Ordering::Acquire), 1, "real capture committed before all selected callbacks finished");
     replay.join().unwrap().unwrap();
     checkpoint.join().unwrap().unwrap();
-    cache.join().unwrap().unwrap();
     releases[1].send(()).unwrap();
     for n in 2..8 {
         assert_eq!(enter.recv_timeout(Duration::from_secs(5)).unwrap(), n);
@@ -181,6 +182,8 @@ fn real_refresh_and_current_capture_progress_between_selection_turns_without_par
         assert!(row.get::<_,i64>(3)>0&&row.get::<_,i64>(3)<=chrono::Utc::now().timestamp_millis());assert!(row.get::<_,i64>(4)>0);
         assert_eq!(client.query_one("select count(*) from segments",&[])?.get::<_,i64>(0),1);Ok(row.get::<_,i64>(0))
     }).unwrap();
+    finish_cache.send(()).unwrap();
+    cache.join().unwrap().unwrap();
     let (release, held) = hold_selection(&owner);
     let stopped_owner = owner.clone();
     let stopped = thread::spawn(move || crate::pg::stage_telemetry::capture(&stopped_owner, None));
