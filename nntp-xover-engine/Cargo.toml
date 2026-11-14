@@ -2,7 +2,7 @@
 name = "nntp-xover-engine"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.99"
+rust-version = "1.100"
 description = "Columnar, mmap-able compressed storage for NNTP overview (XOVER/OVER) lines"
 license = "GPL-3.0-only"
 publish = false

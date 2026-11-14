@@ -4,7 +4,7 @@
 
 A high-performance, self-hosted Usenet indexer, Web UI, and Newznab server written in Rust
 
-[![Rust 1.99.0](https://img.shields.io/badge/Rust-1.99.0-orange?logo=rust&logoColor=white)](https://www.rust-lang.org)
+[![Rust 1.100.0](https://img.shields.io/badge/Rust-1.100.0-orange?logo=rust&logoColor=white)](https://www.rust-lang.org)
 ![Edition 2024](https://img.shields.io/badge/edition-2024-orange?logo=rust&logoColor=white)
 [![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](https://www.gnu.org/licenses/gpl-3.0.txt)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-informational)
@@ -13,7 +13,7 @@ A high-performance, self-hosted Usenet indexer, Web UI, and Newznab server writt
 [![Support xbmc4lyfe on Patreon](https://img.shields.io/badge/Patreon-Donate%20to%20xbmc4lyfe-F96854?style=for-the-badge&logo=patreon&logoColor=white)](https://www.patreon.com/cw/xbmc4lyfe)
 
 **Authored by:** [Eraxty](https://github.com/Eraxty) & **Forked and ported to Rust by:** [xbmc4lyfe](https://github.com/xbmc4lyfe)  
-**Version:** `v0.0.0.1` • **Last git commit:** [`7bdc024`](https://github.com/Appz4Fun/Atlas/commit/7bdc024d067171e8594288b113fc5d71fd0b582d) • **© 2026** • **License:** [GNU GPL v3.0](https://www.gnu.org/licenses/gpl-3.0.txt) • **Rust Version:** `1.99.0`
+**Version:** `v0.0.0.1` • **Last git commit:** [`7bdc024`](https://github.com/Appz4Fun/Atlas/commit/7bdc024d067171e8594288b113fc5d71fd0b582d) • **© 2026** • **License:** [GNU GPL v3.0](https://www.gnu.org/licenses/gpl-3.0.txt) • **Rust Version:** `1.100.0`
 
 [Support on Patreon](#support-development) • [Features](#features) • [Latest Features](#latest-features) • [Deviations from Python](#deviations-from-the-original-python-implementation) • [Built with Rust](#built-with-rust) • [Install](#installation) • [config.toml](#configure-atlas-configtoml) • [Usage](#usage) • [Stats dashboard](#stats-dashboard) • [Web UI](#web-ui) • [Newznab API](#newznab-api) • [Development](#development)
 
@@ -41,13 +41,13 @@ Use Atlas from the terminal, browse its built-in Web UI, or point Prowlarr, NZBH
 ## Built with Rust
 
 > [!IMPORTANT]
-> Atlas is a single native binary written in **[Rust](https://www.rust-lang.org) 1.99.0**, edition 2024.
+> Atlas is a single native binary written in **[Rust](https://www.rust-lang.org) 1.100.0**, edition 2024.
 
 The Rust version replaces the original Python version. This PostgreSQL cutover branch requires a checked PostgreSQL destination for product startup. SQLite conversion commands and the old terminal menu are retired. The source cutover still requires guarded production builds, retained integration-test ports, and actual native qualification. See [current commands and graph qualification](docs/POSTGRES_FRONTDOORS.md). Service activation and deployment require their separate native qualification.
 
 | Component | Crate |
 |---|---|
-| Toolchain | Rust **1.99.0**, pinned in `rust-toolchain.toml` and set as `rust-version = "1.99"` in `Cargo.toml` |
+| Toolchain | Rust **1.100.0**, pinned in `rust-toolchain.toml` and set as `rust-version = "1.100"` in `Cargo.toml` |
 | Async network I/O | [`tokio`](https://tokio.rs) with [`rustls`](https://github.com/rustls/rustls) for Transport Layer Security (TLS) |
 | Terminal UI | [`ratatui`](https://ratatui.rs) |
 | Database | Native PostgreSQL catalog and cache ports; legacy SQLite code remains pending build-graph cleanup |
@@ -103,7 +103,7 @@ Atlas was originally created in Python by [Eraxty](https://github.com/Eraxty) (`
 
 | Area | Original Python Implementation (`v5.2.1`) | Rust Edition (`Appz4Fun/Atlas`) |
 |---|---|---|
-| **Runtime & Binary** | Python 3.10+ interpreter, virtualenv, and `pip` dependencies | Single native Rust **1.99.0** (edition 2024) binary with PostgreSQL catalog storage |
+| **Runtime & Binary** | Python 3.10+ interpreter, virtualenv, and `pip` dependencies | Single native Rust **1.100.0** (edition 2024) binary with PostgreSQL catalog storage |
 | **Configuration & Paths** | `config.json` in the working directory; single Usenet server only | `config.toml` (auto-migrates `config.json` with comment preservation); defaults to `~/.atlas`; supports unlimited parallel `[[usenet_servers]]` with priorities and `index = false` fill servers |
 | **NNTP Engine & Backfill** | Sequential single-server header fetching | Async `tokio` + `rustls` connection pools across all servers simultaneously, `XFEATURE COMPRESS GZIP`, UTC day-chunk backfill splitting across providers, automatic connection-limit step-down, and `max_unsaved_headers` memory backpressure |
 | **Database Architecture** | Single `atlas.db` SQLite file storing raw article rows | Native PostgreSQL catalog/cache ports and NXV header storage; old shard conversion, compaction and mirroring commands are retired in the cutover branch |
@@ -120,7 +120,7 @@ Atlas was originally created in Python by [Eraxty](https://github.com/Eraxty) (`
 You need:
 
 - A Usenet provider account with Network News Transfer Protocol (NNTP) access over SSL.
-- [Rust](https://rustup.rs). rustup installs the pinned 1.99.0 toolchain automatically.
+- [Rust](https://rustup.rs). rustup installs the pinned 1.100.0 toolchain automatically.
 - Optional: [just](https://github.com/casey/just) for the shortcuts in this guide.
 
 ```bash
@@ -1135,7 +1135,7 @@ CI (`.github/workflows/ci.yml`) checks formatting, runs clippy, and runs the tes
 <div align="center">
 
 **Atlas - Rust Edition.** Authored by: [Eraxty](https://github.com/Eraxty) & Forked and ported to Rust by: [xbmc4lyfe](https://github.com/xbmc4lyfe)  
-Version: `v0.0.0.1` · last git commit: [`7bdc024`](https://github.com/Appz4Fun/Atlas/commit/7bdc024d067171e8594288b113fc5d71fd0b582d) · © 2026 · License: [GPL v3 (GNU General Public License v3.0)](https://www.gnu.org/licenses/gpl-3.0.txt) · Rust Version: `1.99.0`  
+Version: `v0.0.0.1` · last git commit: [`7bdc024`](https://github.com/Appz4Fun/Atlas/commit/7bdc024d067171e8594288b113fc5d71fd0b582d) · © 2026 · License: [GPL v3 (GNU General Public License v3.0)](https://www.gnu.org/licenses/gpl-3.0.txt) · Rust Version: `1.100.0`\
 Donate to my Patreon to help with AI token cost and get prioritized features and personal support:  
 [![Patreon - xbmc4lyfe](https://img.shields.io/badge/Patreon-xbmc4lyfe-F96854?style=for-the-badge&logo=patreon&logoColor=white)](https://www.patreon.com/cw/xbmc4lyfe)  
 **[https://www.patreon.com/cw/xbmc4lyfe](https://www.patreon.com/cw/xbmc4lyfe)**

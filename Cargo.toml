@@ -2,7 +2,7 @@
 name = "atlas"
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.99"
+rust-version = "1.100"
 description = "A self hosted Usenet indexer that lives in your terminal"
 license = "GPL-3.0-only"
 repository = "https://github.com/Eraxty/Atlas"
