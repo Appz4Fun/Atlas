@@ -274,7 +274,8 @@ fn run_still_donor_case(complete: bool) {
         Ok(())
     }).unwrap();
     assert_eq!(server.body_troubles_left.load(Ordering::SeqCst),usize::from(complete),"partial own stills require an actual own BODY attempt; complete own stills fetch nothing");
-    let mut client=crate::pg::Pool::new(&storage).unwrap().get().unwrap();
+    let read_pool=crate::pg::Pool::new(&storage).unwrap();
+    let mut client=read_pool.get().unwrap();
     let view=ReadView::open(&mut client,&storage.schema,Budget::default(),Instant::now()+Duration::from_secs(5)).unwrap();
     let pictures=view.own_pictures(own).unwrap(); assert_eq!(pictures.stills.len(),if complete {3}else{1});
     drop(view); drop(client);
