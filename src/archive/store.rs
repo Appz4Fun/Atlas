@@ -88,3 +88,7 @@ pub struct InnerView {
     /// how the first file was packed (`archive_release.packer`)
     pub packer: Option<String>,
 }
+
+#[cfg(test)]
+#[path = "native_schema_tests.rs"]
+mod native_schema_tests;
