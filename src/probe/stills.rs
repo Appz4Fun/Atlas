@@ -3,8 +3,6 @@
 //! In Matroska a keyframe is found by its marks in the bytes read; in MP4 the `moov`'s sample tables say where each
 //! one is, soo those are read first.
 
-use sha2::Digest;
-
 use crate::catalog_facts::{FileInfo, SegmentPick};
 use crate::config::Config;
 #[cfg(test)]
@@ -32,33 +30,6 @@ const FRONT_ARTICLES: i64 = 3;
 const STILL_WIDTH: usize = 960;
 const QUALITY: u8 = 85;
 
-/// Past this, the oldest stills go. One is 50 to 150 KB.
-const MAX_STILL_CACHE: u64 = 2 << 30;
-const TRIM_EVERY: u64 = 64;
-
-fn still_dir() -> std::path::PathBuf {
-    crate::paths::app_dir().join("stills")
-}
-
-pub(crate) fn still_file(sha256: &str) -> Option<std::path::PathBuf> {
-    (sha256.len() == 64 && sha256.bytes().all(|b| b.is_ascii_hexdigit())).then(|| still_dir().join(sha256))
-}
-
-/// Keeps a still, named by its hash.
-fn keep(bytes: &[u8]) -> Option<String> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    let sha256: String = sha2::Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect();
-    let file = still_file(&sha256)?;
-    if !file.exists() {
-        static WRITTEN: AtomicU64 = AtomicU64::new(0);
-        std::fs::create_dir_all(still_dir()).ok()?;
-        crate::atomic::write_atomic(&file, bytes).ok()?;
-        if WRITTEN.fetch_add(1, Ordering::Relaxed).is_multiple_of(TRIM_EVERY) {
-            crate::media::details::trim_posters(&still_dir(), MAX_STILL_CACHE);
-        }
-    }
-    Some(sha256)
-}
 
 /// How far apart in the film two stills may be and still be compared: each encode puts its keyframes in its own
 /// places, soo the one nearest a quarter of the way in is seconds off from another's.
@@ -650,6 +621,15 @@ fn still_of(track: &VideoTrack, frame: &[u8]) -> Option<(Vec<u8>, u32, u32, Opti
     Some((jpeg, y.width as u32, y.height as u32, crate::video::phash::phash(&y)))
 }
 
+fn still_error(error:anyhow::Error)->StepError {
+    if error.is::<crate::pg::worker_assets::StillChanged>()||error.is::<crate::pg::worker_assets::StillAdmission>()
+        ||error.downcast_ref::<std::io::Error>().and_then(std::io::Error::get_ref).is_some_and(|cause|cause.is::<crate::nzb_spool::AdmissionError>()) {StepError::Transient(error.to_string())}
+    else {StepError::from_cache(error)}
+}
+fn still_hold(frame:crate::pg::worker_assets::StillFrame)->Result<Option<Box<dyn std::any::Any+Send>>,StepError> {
+    Ok(Some(Box::new(frame.finish().map_err(still_error)?)))
+}
+
 #[derive(Default)]
 pub struct StillsStep;
 
@@ -678,32 +658,38 @@ impl Step for StillsStep {
     /// are found by its Cues, soo the many done with none found by the scan are looked at again (one with its
     /// stills all kept fetches nothing). Bit 8: revisit prior donor-only completions;
     /// native pages require their own stills, and complete own sets still fetch nothing.
+    /// Bit 16: publish native stills in the selected asset namespace with
+    /// original-owner receipts and held bytes.
     fn config_stamp(&self) -> u64 {
-        1 | 2 | 4 | 8
+        1 | 2 | 4 | 8 | 16
     }
     fn run(&self, ctx: &mut StepCtx<'_>) -> Result<Outcome, StepError> {
         let release_id = ctx.release().id;
         // a release whose stills are all still on disk, and hashed, keeps them: the walk for a new stamp bit fetches
         // nothing. One trimmed from the folder, or from before hashes, is made again.
         let kept = ctx.data().kept_stills(release_id)?;
-        if kept.len() == POSITIONS.len()
-            && kept.iter().all(|(h, hashed)| *hashed && still_file(h).is_some_and(|f| f.exists()))
-        {
-            return Ok(Outcome { matched: true, ..Outcome::default() });
+        let grant=crate::pg::worker_assets::current().map_err(still_error)?.ok_or_else(||StepError::Transient("native still namespace has not been selected".into()))?;
+        let mut publication=grant.still_frame(release_id).map_err(still_error)?;
+        let mut kept_available=0;
+        for (hash,_) in &kept {if grant.still_available(hash).map_err(still_error)? {kept_available+=1;}}
+        if kept.len()==POSITIONS.len()&&kept.iter().all(|(_,hashed)|*hashed)&&kept_available==POSITIONS.len() {
+            let mut complete=true;for (hash,_) in &kept {complete&=publication.reuse(hash).map_err(still_error)?;}
+            if complete {return Ok(Outcome {matched:true,hold:still_hold(publication)?,..Outcome::default()});}
+            publication=grant.still_frame(release_id).map_err(still_error)?;
         }
         let rel_name = ctx.release().name.clone();
         let rel_group = ctx.release().group.clone();
         let content_id = ctx.data().release_content_id(release_id)?.unwrap_or_default();
         let saved_stills = crate::raw_store::get_stills_checked(&rel_name, &rel_group, &content_id).map_err(StepError::from_cache)?;
         if !ctx.data().explicit_rerun(release_id, STILLS_STEP)?
-            && saved_stills.len() == POSITIONS.len()
-            && saved_stills.iter().all(|s| s.phash.is_some() && still_file(&s.sha256).is_some_and(|f| f.exists()))
-        {
-            let mut writes = vec![StepWrite::for_mutation(release_id, StepMutation::ClearStills)];
-            for s in saved_stills {
-                writes.push(StepWrite::for_mutation(release_id, StepMutation::KeepStill(s)));
+            && saved_stills.len()==POSITIONS.len()&&saved_stills.iter().all(|s|s.phash.is_some()) {
+            let mut complete=true;for still in &saved_stills {complete&=publication.reuse(&still.sha256).map_err(still_error)?;}
+            if complete {
+                let mut writes=vec![StepWrite::for_mutation(release_id,StepMutation::ClearStills)];
+                writes.extend(saved_stills.into_iter().map(|still|StepWrite::for_mutation(release_id,StepMutation::KeepStill(still))));
+                return Ok(Outcome {matched:true,writes,hold:still_hold(publication)?,..Outcome::default()});
             }
-            return Ok(Outcome { matched: true, writes, ..Outcome::default() });
+            publication=grant.still_frame(release_id).map_err(still_error)?;
         }
         let info = ctx.data().probe_info_best_effort(release_id)?;
         let Some(info) = info.and_then(|i| serde_json::from_str::<ProbeInfo>(&i).ok()) else {
@@ -745,7 +731,7 @@ impl Step for StillsStep {
         let mut raw_saved = Vec::new();
         for (percent, frame, at_ms) in frames {
             let Some((jpeg, w, h, phash)) = still_of(&track, &frame) else { continue };
-            let Some(sha256) = keep(&jpeg) else { continue };
+            let sha256=publication.keep(&jpeg,w,h).map_err(still_error)?;
             let phash_i64 = phash.map(|p| p as i64);
             made += 1;
             let still = crate::raw_store::SavedStill {
@@ -760,19 +746,31 @@ impl Step for StillsStep {
             writes.push(StepWrite::for_mutation(release_id, StepMutation::KeepStill(still)));
         }
         // fewer than it has already (a run asked for again whose reads came to less): what it has stays
-        if made < kept.iter().filter(|(h, _)| still_file(h).is_some_and(|f| f.exists())).count() {
-            return Ok(Outcome { matched: true, ..Outcome::default() });
+        if let Some(previous)=publication.prefer_previous(&kept,made).map_err(still_error)? {
+            return Ok(Outcome {matched:true,hold:still_hold(previous)?,..Outcome::default()});
         }
         if !raw_saved.is_empty() {
             crate::raw_store::put_stills_checked(&rel_name, &rel_group, &content_id, &raw_saved).map_err(StepError::from_cache)?;
         }
-        Ok(Outcome { matched: made > 0, writes, ..Outcome::default() })
+        if made==0 {return Ok(Outcome::default());}
+        Ok(Outcome {matched:true,writes,hold:still_hold(publication)?,..Outcome::default()})
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_still_error_defers_only_typed_admission_and_retains_os_causes() {
+        let root=tempfile::tempdir().unwrap();let pool=crate::nzb_spool::Pool::new(root.path().into(),crate::nzb_spool::Limits {requests:1,per_request_bytes:4,total_bytes:4,free_bytes:0}).unwrap();
+        let held=pool.open().unwrap();assert!(matches!(still_error(pool.open().unwrap_err().into()),StepError::Transient(_)));drop(held);
+        for code in [libc::EIO,libc::EACCES] {
+            let StepError::Native(error)=still_error(std::io::Error::from_raw_os_error(code).into()) else {panic!("physical I/O must remain a native storage error")};
+            assert_eq!(error.downcast_ref::<std::io::Error>().unwrap().raw_os_error(),Some(code));
+        }
+        assert!(matches!(still_error(std::io::Error::new(std::io::ErrorKind::WouldBlock,"OS contention").into()),StepError::Native(_)));
+    }
 
     fn file(name: &str, parts: i64) -> FileInfo {
         FileInfo {

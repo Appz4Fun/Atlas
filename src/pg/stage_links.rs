@@ -1,6 +1,6 @@
 //! Checked native link predicates used before costly new audio/still probes.
 //! These are read-only suppression hints, never article-lending authority.
-use anyhow::{Result,Context,ensure};
+use anyhow::{Result,ensure};
 use crate::keys::{Kind,Lookup};
 use std::{sync::atomic::Ordering,time::{Duration,Instant}};
 use super::StepReads;
@@ -41,12 +41,10 @@ impl StepReads {
             if self.owner.stop.load(Ordering::Acquire) {return Err(super::super::outage::AttemptEnded.into());}
             let mut complete=true;
             for hash in hashes {
-                let path=crate::probe::stills::still_file(&hash).context("native still hash is invalid")?;
-                match std::fs::metadata(path) {
-                    Ok(metadata)=>complete&=metadata.is_file(),
-                    Err(error) if error.kind()==std::io::ErrorKind::NotFound=>complete=false,
-                    Err(error)=>return Err(error.into()),
-                }
+                super::super::fresh_assets::digest(&hash)?;
+                let Some(grant)=super::super::worker_assets::current()? else {return Ok(None)};
+                grant.require_owner(&self.owner)?;
+                complete&=grant.still_available(&hash)?;
             }
             if complete {return Ok(Some(kind));}
         }

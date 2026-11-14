@@ -41,10 +41,15 @@ fn physical_directory(path:&Path)->Result<File> {
     }}ensure!(current.metadata()?.is_dir(),"retained asset root is not a directory");Ok(current)
 }
 pub(super) const IMAGE_BYTES:u64=64<<20;
+pub(super) const STILL_BYTES:u64=256<<20;
 const IMAGE_CACHE_BYTES:u64=2<<30;
 fn image_charge(length:u64)->u64 {length.div_ceil(4096).saturating_mul(4096).max(16<<10)}
 #[cfg(unix)]
 fn trim_images(directory:&File,limit:u64,stop:&std::sync::atomic::AtomicBool,until:std::time::Instant)->Result<bool> {
+    trim_cache(directory,limit,stop,until,None)
+}
+#[cfg(unix)]
+fn trim_cache(directory:&File,limit:u64,stop:&std::sync::atomic::AtomicBool,until:std::time::Instant,originals:Option<&AssetManifest>)->Result<bool> {
     use std::{ffi::{CStr,CString},os::fd::AsRawFd,sync::atomic::Ordering,time::SystemTime};
     struct Entries(*mut libc::DIR);
     impl Drop for Entries {fn drop(&mut self){unsafe{libc::closedir(self.0);}}}
@@ -57,10 +62,13 @@ fn trim_images(directory:&File,limit:u64,stop:&std::sync::atomic::AtomicBool,unt
     struct Item {at:SystemTime,name:String,charge:u64,identity:std::fs::Metadata}
     let mut items=Vec::new();let mut total=0u64;
     loop {
-        if stop.load(Ordering::Acquire){return Err(super::outage::AttemptEnded.into())}ensure!(std::time::Instant::now()<until,"native image cache scan deadline expired");
+        if stop.load(Ordering::Acquire){return Err(super::outage::AttemptEnded.into())}
+        if originals.is_some()&&std::time::Instant::now()>=until{return Ok(false)}
+        ensure!(std::time::Instant::now()<until,"native image cache scan deadline expired");
         let mut found=std::ptr::null_mut();let error=unsafe{libc::readdir_r(entries.0,&mut entry,&mut found)};
         if error!=0{return Err(std::io::Error::from_raw_os_error(error).into())}if found.is_null(){break;}
         let name=unsafe{CStr::from_ptr(entry.d_name.as_ptr())}.to_str()?;if matches!(name,"."|".."){continue;}cache_assets::filename(name)?;
+        if originals.is_some()&&items.len()>=IMAGE_CACHE_BYTES as usize/(16<<10)+64{return Ok(false)}
         ensure!(items.len()<IMAGE_CACHE_BYTES as usize/(16<<10)+64,"native image cache file-count admission");
         let file=physical_child(directory,std::ffi::OsStr::new(name),false)?;let identity=file.metadata()?;ensure!(identity.is_file(),"native image cache contains a non-file");
         let charge=image_charge(identity.len());total=total.checked_add(charge).context("native image cache charge overflow")?;
@@ -68,13 +76,24 @@ fn trim_images(directory:&File,limit:u64,stop:&std::sync::atomic::AtomicBool,unt
     }
     items.sort_by(|a,b|a.at.cmp(&b.at).then_with(||a.name.cmp(&b.name)));
     for item in items {
-        if total<=limit{break;}if stop.load(Ordering::Acquire){return Err(super::outage::AttemptEnded.into())}ensure!(std::time::Instant::now()<until,"native image cache trim deadline expired");
+        if total<=limit{break;}
+        if originals.is_some_and(|manifest|manifest.entries.contains_key(&(AssetKind::Stills,item.name.clone()))) {continue;}
+        if stop.load(Ordering::Acquire){return Err(super::outage::AttemptEnded.into())}
+        if originals.is_some()&&std::time::Instant::now()>=until{return Ok(false)}
+        ensure!(std::time::Instant::now()<until,"native image cache trim deadline expired");
         let file=match physical_child(directory,std::ffi::OsStr::new(&item.name),false){Ok(file)=>file,Err(error) if error.kind()==std::io::ErrorKind::NotFound=>{total-=item.charge;continue},Err(error)=>return Err(error.into())};
+        if originals.is_some() {
+            use std::os::fd::AsRawFd;
+            if unsafe{libc::flock(file.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}<0 {
+                let error=std::io::Error::last_os_error();if error.kind()==std::io::ErrorKind::WouldBlock{continue;}return Err(error.into())
+            }
+        }
         let current=file.metadata()?;ensure!(same_inode(&item.identity,&current)&&item.identity.len()==current.len()&&item.identity.modified()?==current.modified()?,"native image cache entry changed during trim");
         let name=CString::new(item.name)?;if unsafe{libc::unlinkat(directory.as_raw_fd(),name.as_ptr(),0)}==0{total-=item.charge;}
     }
     Ok(total<=limit)
 }
+pub(super) struct StillFile {file:File,before:std::fs::Metadata}
 pub(super) struct Receipt {bytes:i64,digest:Vec<u8>,source:Vec<u8>}
 pub(super) fn receipt_in(client:&mut impl postgres::GenericClient,request:&AssetRequest)->Result<Option<Receipt>> {
     cache_assets::filename(&request.name)?;
@@ -95,7 +114,7 @@ impl AssetManifest {
         #[cfg(not(unix))] {bail!("asset namespaces require Unix")}
     }
     pub(super) fn native_source(&self,kind:AssetKind,catalog:&super::stage::CatalogIdentity)->Result<[u8;32]> {
-        let domain=match kind {AssetKind::Covers=>b"atlas.native-cover-writer.v1\0".as_slice(),AssetKind::Posters=>b"atlas.native-poster-writer.v1\0".as_slice(),AssetKind::Images=>b"atlas.native-image-writer.v1\0".as_slice(),_=>bail!("dynamic writer evidence unavailable for this asset family")};
+        let domain=match kind {AssetKind::Covers=>b"atlas.native-cover-writer.v1\0".as_slice(),AssetKind::Posters=>b"atlas.native-poster-writer.v1\0".as_slice(),AssetKind::Images=>b"atlas.native-image-writer.v1\0".as_slice(),AssetKind::Stills=>b"atlas.native-still-writer.v1\0".as_slice()};
         let mut digest=Sha256::new();digest.update(domain);digest.update(self.namespace()?);digest.update(catalog.nonce());Ok(digest.finalize().into())
     }
     pub(super) fn read_associated(&self,request:&AssetRequest,pool:&Arc<crate::nzb_spool::Pool>,catalog:&super::stage::CatalogIdentity,receipt:Option<&Receipt>)->Result<Option<crate::nzb_spool::Spool>> {
@@ -246,6 +265,61 @@ impl AssetManifest {
         }else{true};
         drop(pending);directory.sync_all()?;self.root.sync_all()?;self.check_root()?;Ok((value,created))
     }
+    /// Pin a named still against our cache trimmer before verifying its bytes.
+    /// The returned physical handle remains with Prepared until settlement.
+    pub(super) fn hold_still(&self,name:&str)->Result<Option<StillFile>> {
+        digest(name)?;self.check_root()?;
+        let directory=match physical_child(&self.root,std::ffi::OsStr::new("stills"),true) {Ok(file)=>file,Err(error) if error.kind()==std::io::ErrorKind::NotFound=>return Ok(None),Err(error)=>return Err(error.into())};
+        let file=match physical_child(&directory,std::ffi::OsStr::new(name),false) {Ok(file)=>file,Err(error) if error.kind()==std::io::ErrorKind::NotFound=>return Ok(None),Err(error)=>return Err(error.into())};
+        #[cfg(unix)] {
+            use std::os::fd::AsRawFd;
+            if unsafe{libc::flock(file.as_raw_fd(),libc::LOCK_SH|libc::LOCK_NB)}<0 {
+                let error=std::io::Error::last_os_error();if error.kind()==std::io::ErrorKind::WouldBlock{return Ok(None)}return Err(error.into())
+            }
+        }
+        let held=StillFile {before:file.metadata()?,file};
+        // The trimmer may have unlinked this inode between open and SH flock.
+        // At establishment that is ordinary unavailability, not corruption of
+        // a previously admitted Prepared hold. Recheck the root independently.
+        self.check_root()?;
+        let current=match physical_child(&directory,std::ffi::OsStr::new(name),false) {Ok(file)=>file,Err(error) if error.kind()==std::io::ErrorKind::NotFound=>return Ok(None),Err(error)=>return Err(error.into())};
+        if !same_inode(&held.before,&current.metadata()?){return Ok(None)}
+        self.check_still_hold(name,&held)?;Ok(Some(held))
+    }
+    pub(super) fn check_still_hold(&self,name:&str,held:&StillFile)->Result<()> {
+        self.check_root()?;let directory=physical_child(&self.root,std::ffi::OsStr::new("stills"),true)?;
+        let current=physical_child(&directory,std::ffi::OsStr::new(name),false)?;
+        let before=&held.before;let file=held.file.metadata()?;let after=current.metadata()?;
+        ensure!(before.is_file()&&before.len()>0&&before.len()<=STILL_BYTES&&same_inode(before,&after)&&same_inode(before,&file)
+            &&before.len()==after.len()&&before.len()==file.len()&&before.modified()?==after.modified()?&&before.modified()?==file.modified()?,"native still hold changed before settlement");Ok(())
+    }
+
+    /// The old still cache's 2GiB target and first/every64 write cadence,
+    /// confined to the selected namespace. Captured originals are never evicted.
+    pub(super) fn store_still(&self,bytes:&[u8],writes:&std::sync::atomic::AtomicU64,stop:&std::sync::atomic::AtomicBool)->Result<Option<(String,[u8;32])>> {
+        ensure!(!bytes.is_empty()&&bytes.len() as u64<=STILL_BYTES,"native still exceeds byte admission");self.check_root()?;
+        #[cfg(unix)] {
+            use std::{os::fd::AsRawFd,sync::atomic::Ordering,time::{Duration,Instant}};
+            let directory=self.writable_directory(AssetKind::Stills)?;let until=Instant::now()+Duration::from_secs(10);
+            loop {
+                if stop.load(Ordering::Acquire){return Err(super::outage::AttemptEnded.into())}
+                if Instant::now()>=until{return Ok(None)}
+                if unsafe{libc::flock(directory.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}==0{break;}
+                let error=std::io::Error::last_os_error();if error.kind()!=std::io::ErrorKind::WouldBlock{return Err(error.into())}std::thread::sleep(Duration::from_millis(10));
+            }
+            let name=hex(&Sha256::digest(bytes));
+            let absent=match physical_child(&directory,std::ffi::OsStr::new(&name),false) {Ok(_)=>false,Err(error) if error.kind()==std::io::ErrorKind::NotFound=>true,Err(error)=>return Err(error.into())};
+            if absent&&writes.load(Ordering::Relaxed).is_multiple_of(64)
+                && !trim_cache(&directory,IMAGE_CACHE_BYTES-image_charge(bytes.len() as u64),stop,until,Some(self))? {return Ok(None)}
+            let (digest,created)=self.store_in_directory(&directory,&name,bytes)?;if created{writes.fetch_add(1,Ordering::Relaxed);}
+            if stop.load(Ordering::Acquire){return Err(super::outage::AttemptEnded.into())}
+            let current=physical_child(&self.root,std::ffi::OsStr::new("stills"),true)?;
+            ensure!(same_inode(&directory.metadata()?,&current.metadata()?),"native still directory changed during write");
+            directory.sync_all()?;self.check_root()?;Ok(Some((name,digest)))
+        }
+        #[cfg(not(unix))] {let _=(writes,stop);bail!("native still confinement requires Unix")}
+    }
+
     /// The old image cache target/cadence/charge, with every operation confined
     /// to the opened directory. No selected manifest is rewritten by eviction.
     pub(super) fn store_image(&self,bytes:&[u8],writes:&std::sync::atomic::AtomicU64,stop:&std::sync::atomic::AtomicBool)->Result<Option<(String,[u8;32])>> {

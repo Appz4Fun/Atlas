@@ -222,12 +222,15 @@ fn run_still_donor_case(complete: bool) {
             let own = ids.is_empty();
             for position in crate::probe::stills::POSITIONS {
                 if own && !complete && position != 25 { continue; }
-                let bytes = [b"\xff\xd8\xff\xe0".as_slice(), &[u8::from(own),position], b"\xff\xd9"].concat();
+                let value=position+u8::from(own);
+                let luma=crate::video::picture::Plane8 {data:(0..32*32).map(|at|32+((at%32*3+at/32*5+usize::from(value))%192) as u8).collect(),width:32,height:32};
+                let bytes=crate::video::jpeg::encode(&luma.data,&[128;16*16],&[128;16*16],32,32,85);
+                let phash=Some(crate::video::phash::phash(&luma).expect("textured 32x32 native luma must produce a real perceptual hash") as i64);
                 let hash = Sha256::digest(&bytes).iter().map(|b|format!("{b:02x}")).collect::<String>();
-                let path = crate::probe::stills::still_file(&hash).unwrap();
+                let path = home.join("stills").join(&hash);
                 std::fs::write(&path,&bytes).unwrap(); physical.push((path,bytes));
-                client.execute("insert into release_stills(release_id,position,at_ms,sha256,width,height,phash) values($1,$2,$3,$4,960,540,1)",
-                    &[&id,&i64::from(position),&(i64::from(position)*1000),&hash])?;
+                client.execute("insert into release_stills(release_id,position,at_ms,sha256,width,height,phash) values($1,$2,$3,$4,32,32,$5)",
+                    &[&id,&i64::from(position),&(i64::from(position)*1000),&hash,&phash])?;
             }
             ids.push(id);
         }
@@ -236,7 +239,15 @@ fn run_still_donor_case(complete: bool) {
     let own = ids[0];
     let reads = StepReads::for_owner(&runtime.owner).unwrap();
     let lookup = reads.stills_lookup(own).unwrap();
-    assert_eq!(reads.same_file_stills(own,&lookup).unwrap(),Some(crate::keys::Kind::Mux),"the genuine old donor precondition must hold");
+    let manifest=home.join("still-assets.jsonl");
+    crate::pg::testing::capture_asset_manifest(&home,&manifest,crate::pg::testing::AssetCaptureLimits {min_files:1,max_files:16,max_file_bytes:1<<20,max_total_bytes:16<<20,read_bytes_per_second:32<<20}).unwrap();
+    let selection=crate::config::NativeAssetsConfig {root:home.canonicalize().unwrap().to_str().unwrap().into(),manifest:manifest.canonicalize().unwrap().to_str().unwrap().into(),whole_sha256:Sha256::digest(std::fs::read(&manifest).unwrap()).iter().map(|byte|format!("{byte:02x}")).collect()};
+    let grant=crate::pg::worker_assets::Grant::open(&runtime.owner,Some(&selection)).unwrap().unwrap();
+    {
+        let _scope=crate::pg::worker_assets::Scope::bind(&runtime.owner,Some(&grant)).unwrap();
+        assert_eq!(reads.same_file_stills(own,&lookup).unwrap(),Some(crate::keys::Kind::Mux),"the genuinely captured and verified donor precondition must hold");
+    }
+    config.native_assets=Some(selection);
     // StillsStep uses fetch_article (Raw), not BODY. Audit the actual own
     // ARTICLE command and return a transient response on that exact path.
     let listener=TcpListener::bind("127.0.0.1:0").unwrap();listener.set_nonblocking(true).unwrap();
