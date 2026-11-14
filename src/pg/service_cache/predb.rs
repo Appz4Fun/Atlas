@@ -10,7 +10,9 @@ const MAX_BODY:usize=8<<20;
 const MAX_BACKOFF:i64=21_600;
 const RATE_LIMIT_DEFAULT:i64=60;
 
-pub(crate) struct Service { pub(super) cache:Cache, poll_busy:std::sync::Mutex<()>, pub(super) late_at:std::sync::Mutex<Option<Instant>>,pub(crate) counters:Arc<Counters> }
+pub(crate) struct Service { pub(super) cache:Cache, poll_busy:std::sync::Mutex<()>, pub(super) late_at:std::sync::Mutex<Option<Instant>>,pub(crate) counters:Arc<Counters>,
+    #[cfg(test)] pub(super) index_pause:std::sync::Mutex<Option<super::predb_late::IndexPause>>,
+}
 struct FeedCounters {id:i64,key:&'static str,inserted:AtomicU64,updated:AtomicU64,skipped:AtomicU64}
 /// The finite canonical feed set bounds registration independently of config.
 /// These are this service's events, never persisted feed/catalog gauges.
@@ -46,7 +48,7 @@ struct Pending;
 impl std::fmt::Display for Pending {fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str("PreDB derived index pending")}}
 impl std::error::Error for Pending {}
 impl Service {
-    pub(crate) fn new(owner:&Arc<crate::pg::indexer_runtime::Owner>)->Result<Self> {Ok(Self {cache:Cache::new(owner)?,poll_busy:std::sync::Mutex::new(()),late_at:std::sync::Mutex::new(None),counters:Arc::new(Counters::new())})}
+    pub(crate) fn new(owner:&Arc<crate::pg::indexer_runtime::Owner>)->Result<Self> {Ok(Self {cache:Cache::new(owner)?,poll_busy:std::sync::Mutex::new(()),late_at:std::sync::Mutex::new(None),counters:Arc::new(Counters::new()),#[cfg(test)] index_pause:std::sync::Mutex::new(None)})}
     pub(crate) fn tick(&self,cfg:&PredbConfig,fetch:&dyn Fetch,now:i64,pause:&dyn Fn(Duration)->bool)->Result<Tick> {
         let result=self.tick_inner(cfg,fetch,now,pause);
         if result.as_ref().is_err_and(|error|!error.is::<Pending>()&&!crate::pg::outage::is_attempt_ended(error))
