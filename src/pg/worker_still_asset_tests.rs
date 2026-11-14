@@ -5,12 +5,13 @@ use crate::{pg,pg::worker_assets::{Grant,StillFrame},raw_store::SavedStill};
 use std::io::Read;
 use sha2::{Sha256,Digest};
 
+fn hex(bytes:&[u8])->String {bytes.iter().map(|byte|format!("{byte:02x}")).collect()}
 fn jpeg(value:u8)->Vec<u8> {crate::video::jpeg::encode(&vec![value;16*16],&vec![128;8*8],&vec![128;8*8],16,16,85)}
 fn setup(schema:&pg::testing::Schema)->(pg::indexer_runtime::Runtime,tempfile::TempDir,crate::config::NativeAssetsConfig,i64) {
     let home=tempfile::tempdir().unwrap();let root=home.path().join("assets");std::fs::create_dir(&root).unwrap();std::fs::create_dir(root.join("stills")).unwrap();
-    let original=jpeg(10);let name=pg::fresh_assets::hex(&Sha256::digest(&original));std::fs::write(root.join("stills").join(&name),original).unwrap();
+    let original=jpeg(10);let name=hex(&Sha256::digest(&original));std::fs::write(root.join("stills").join(&name),original).unwrap();
     let manifest=home.path().join("assets.jsonl");pg::testing::capture_asset_manifest(&root,&manifest,pg::testing::AssetCaptureLimits {min_files:1,max_files:8,max_file_bytes:1<<20,max_total_bytes:8<<20,read_bytes_per_second:32<<20}).unwrap();
-    let selection=crate::config::NativeAssetsConfig {root:root.canonicalize().unwrap().to_str().unwrap().into(),manifest:manifest.canonicalize().unwrap().to_str().unwrap().into(),whole_sha256:pg::fresh_assets::hex(&Sha256::digest(std::fs::read(&manifest).unwrap()))};
+    let selection=crate::config::NativeAssetsConfig {root:root.canonicalize().unwrap().to_str().unwrap().into(),manifest:manifest.canonicalize().unwrap().to_str().unwrap().into(),whole_sha256:hex(&Sha256::digest(std::fs::read(&manifest).unwrap()))};
     let mut config=crate::config::Config::default();config.postprocess.enabled=false;config.predb.enabled=false;config.spots.enabled=false;config.inferred_parts=false;
     config.media.tvmaze.enabled=false;config.media.allocine.enabled=false;config.media.details_per_minute=0;
     let headers=crate::config::HeaderStoreConfig {enabled:true,dir:home.path().join("headers").to_str().unwrap().into()};
@@ -66,7 +67,7 @@ fn native_generated_stills_prepared_settlement_serves_exact_jpeg_without_manifes
 #[ignore="Root-only isolated PG; captured authority, cache cadence and source mismatch"]
 fn native_stills_preserve_captured_originals_and_refuse_foreign_receipts() {
     let schema=pg::testing::Schema::new().expect("explicit isolated PG");let (runtime,home,selection,id)=setup(&schema);let grant=Grant::open(&runtime.owner,Some(&selection)).unwrap().unwrap();
-    let captured=jpeg(10);let sha=pg::fresh_assets::hex(&Sha256::digest(&captured));let manifest=std::fs::read(&selection.manifest).unwrap();
+    let captured=jpeg(10);let sha=hex(&Sha256::digest(&captured));let manifest=std::fs::read(&selection.manifest).unwrap();
     let mut frame=grant.still_frame(id).unwrap();assert_eq!(frame.keep(&captured,16,16).unwrap(),sha);drop(frame.finish().unwrap());
     runtime.owner.with(|client|{assert_eq!(client.query_one("select count(*) from ext_asset_files where kind='stills'",&[])?.get::<_,i64>(0),0,"captured manifest authority is not restamped as native");Ok(())}).unwrap();
     // Sparse, unlisted content exercises the real 2GiB trim boundary without a large payload read.
