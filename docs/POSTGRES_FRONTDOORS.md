@@ -17,6 +17,7 @@ production migration, a working-preview claim, or deployment evidence.
 | No arguments | Checked PostgreSQL selection, then native Web startup |
 | `--bg-indexer` | Existing native indexer ownership, queue and outage admission |
 | `--selftest` | Provider login checks after checked PostgreSQL product selection |
+| `--archive-par2-cache --source-baseline-sha256 SHA256 --apply` | Explicit original-Owner maintenance: retain inherited PAR2/preservation heaps cold and create an empty bounded live scope |
 | `--dump-ext`, `--restore-ext DIR` | Existing native external-cache dump/restore, checksums and destination checks |
 | `--save-replay` | Requires both `--pg-database` and `--pg-schema`; its own parser checks the isolated staging destination and scratch paths |
 | `--header-store`, `--overview` | Independent NXV/overview tools; no product catalog configuration is required |
@@ -92,3 +93,36 @@ migration tests now use retained `--selftest` admission without provider credent
 SQLite API/NZB/provider-cache fixtures that depended on an absent configuration
 must likewise move to explicit native destinations and owned cache scopes; an
 unselected legacy fixture cannot authorize a product fallback.
+
+## Explicit inherited PAR2 archival
+
+Stop and drain the indexer before running `atlas --archive-par2-cache
+--source-baseline-sha256 SHA256 --apply` against the intended checked configuration.
+The digest references an already reviewed OLD-scope preservation checkpoint; it
+is recorded as an operator reference, not manufactured COPY parity. The command
+acquires the genuine native Runtime/Owner fence, starts no workers/providers,
+and refuses mixed commands or missing `--apply`.
+
+One durable transaction renames exactly the inherited `ext_raw_par2`,
+`ext_raw_par2_files`, `ext_preserved_cache_rows`, and their partial accounting
+relations/sequence to closed `atlas_par2_cold_*` names. It copies or deletes no
+payload rows. Cold tables reject writes. All other active cache relations,
+including PreDB, HTTP/API, current probes and covers, remain untouched. Preserved
+variants were already inert originals, not active fallback hits; they remain
+physically retained cold, as do the separately preserved source and old backup.
+
+The empty canonical hot relations keep the original schemas, indexes, guards,
+and bounded retention. Their actual empty EOFs establish readiness for a NEW
+scope. New posts use normal configured PAR2 processing and a genuine bounded live
+cache. The immutable receipt records old/new OIDs and physical nodes, catalog and
+owner identity, and the old checkpoint reference. Retry with the same reference
+validates that receipt without rotating or discarding new hot facts. Any DDL
+failure rolls back the whole transaction; ambiguous completion must be retried
+only after the old original session has drained.
+
+Backups record the source PAR2 scope. A different scope requires a reviewed,
+explicit `--dump-ext --allow-shrink` baseline; the old parity checkpoint remains
+about the old scope. The command never creates that baseline automatically and
+never activates postprocessing or changes configured rates. This maintenance
+entrypoint is not called by startup. Source changes and fixtures alone are not
+operational admission or proof of production completion.

@@ -116,6 +116,9 @@ pub struct Manifest {
     /// Same-snapshot accounting of live optional PAR2 retention, not readiness.
     #[serde(default)]
     pub par2_usage:Option<Par2Usage>,
+    /// Backup SOURCE scope provenance, never authority to adopt that scope on restore.
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    pub source_par2_scope:Option<String>,
     /// Restore returns the verified source manifest and explicit final policy
     /// result; source COPY row counts/checksums are never relabelled retained.
     #[serde(skip)]
@@ -198,6 +201,7 @@ pub fn dump(c: &mut Client, dir: &Path, keep: usize, allow_shrink: bool) -> Resu
         let version: i32 = tx.query_one("select coalesce(max(version), 0) from schema_migrations", &[])?.get(0);
         let par2_usage=if par2_quota::installed(&mut tx)? {Some(par2_quota::usage(&mut tx)?)} else {None};
         ensure!(par2_usage.is_none_or(|u|u.phase==par2_quota::Phase::Ready),"PAR2 retention is incomplete: finish maintenance before a qualified backup");
+        let source_par2_scope=super::par2_scope::source_scope(&mut tx)?;
         let names: Vec<String> = tables_of(&mut tx)?;
         if names.is_empty() {
             bail!("schema {schema} has no ext_* tables: nothing to dump (wrong schema, or not migrated)");
@@ -235,7 +239,7 @@ pub fn dump(c: &mut Client, dir: &Path, keep: usize, allow_shrink: bool) -> Resu
         }
         tx.commit()?;
         let m = Manifest { taken_at: stamp.clone(), schema_version: version, tables, baseline: allow_shrink,
-            par2_usage,restore_retention:None };
+            par2_usage,source_par2_scope,restore_retention:None };
         if let Some(why) = shrank(&kept_manifests(dir), &m).filter(|_| !allow_shrink) {
             return Err(Shrank(why).into());
         }
@@ -338,6 +342,9 @@ fn quota_shrink(kept:&[Manifest],now:&Manifest)->bool {
 }
 
 fn shrank(kept: &[Manifest], now: &Manifest) -> Option<String> {
+    if kept.iter().any(|old|old.source_par2_scope!=now.source_par2_scope) {
+        return Some("PAR2 live cache scope changed: review archival receipt and select an explicit new dump baseline".into());
+    }
     let mut most: std::collections::BTreeMap<&str, i64> = std::collections::BTreeMap::new();
     let mut most_pinned: std::collections::BTreeMap<&str, i64> = std::collections::BTreeMap::new();
     for m in kept {
@@ -647,7 +654,7 @@ mod tests {
             sha256: None,
             pinned: None,
         };
-        let m = |tables| Manifest { taken_at: String::new(), schema_version: 2, tables, baseline: false,par2_usage:None,restore_retention:None };
+        let m = |tables| Manifest { taken_at: String::new(), schema_version: 2, tables, baseline: false,par2_usage:None,source_par2_scope:None,restore_retention:None };
         let kept = [
             m(vec![t("ext_a", 5000), t("ext_b", 3), t("ext_http_cache", 900)]),
             m(vec![t("ext_a", 4600), t("ext_b", 3), t("ext_http_cache", 10)]),
@@ -683,12 +690,20 @@ mod tests {
     }
 
     #[test]
+    fn backup_scope_change_requires_explicit_baseline_and_never_relabels_old_parity() {
+        let make=|scope|Manifest {taken_at:String::new(),schema_version:12,tables:vec![],baseline:false,par2_usage:None,source_par2_scope:scope,restore_retention:None};
+        let old=make(None);let new=make(Some("01".repeat(32)));
+        assert!(shrank(&[old],&new).unwrap().contains("scope changed"));
+        let old=make(Some("01".repeat(32)));assert!(shrank(&[old],&new).is_none());
+    }
+
+    #[test]
     fn backup_shrink_accepts_only_accounted_par2_eviction_and_pins_other_preserved_families() {
         let table=|name:&str,rows,pinned|Dumped {table:name.into(),columns:vec![],rows,file:format!("{name}.copy.zst"),bytes:0,sha256:None,pinned};
         let manifest=|files,preserved,pinned,evicted|Manifest {taken_at:String::new(),schema_version:11,
           tables:vec![table("ext_raw_par2",0,None),table("ext_raw_par2_files",files,None),table("ext_preserved_cache_rows",preserved,Some(pinned)),table("ext_predb_titles",3,None)],
           baseline:false,par2_usage:Some(par2_quota::Usage {phase:par2_quota::Phase::Ready,retained_rows:(files+preserved-pinned) as u64,
-            evicted_rows:evicted,..Default::default()}),restore_retention:None};
+            evicted_rows:evicted,..Default::default()}),source_par2_scope:None,restore_retention:None};
         let old=manifest(10,10,5,0);let kept=[old];
         assert!(shrank(&kept,&manifest(2,7,5,11)).is_none(),"11 actual optional rows evicted, all essential variants remain");
         assert!(shrank(&kept,&manifest(2,7,5,10)).is_some(),"counter does not explain the drop");

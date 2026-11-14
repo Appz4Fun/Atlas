@@ -232,13 +232,13 @@ fn child(url: &str, schema: &str, action: &str) -> tempfile::TempDir {
 
 // These are closed worker fixtures in the same configured child lane. The
 // parent retains the URL and schema; workers receive only the real Runtime.
-pub(crate) enum WorkerCase { Category, Held, PredbOnly, FeedHeld, Factory, FanoutFence, AssetReuse, AssetStale, AssetDrain, AssetMissing, AssetUnselected, AssetCorrupt, AssetWaitMissing, AssetWaitUnselected, HeaderOnly }
+pub(crate) enum WorkerCase { ArchiveCategory, Category, Held, PredbOnly, FeedHeld, Factory, FanoutFence, AssetReuse, AssetStale, AssetDrain, AssetMissing, AssetUnselected, AssetCorrupt, AssetWaitMissing, AssetWaitUnselected, HeaderOnly }
 
 pub(crate) fn native_worker_parent(case:WorkerCase) {
     let Some(mut schema)=Schema::new() else { return };
     schema.seed();
     let kept=schema.rows();
-    let action=match case {WorkerCase::Category=>"worker-loop",WorkerCase::Held=>"worker-held",WorkerCase::PredbOnly=>"worker-predb",WorkerCase::FeedHeld=>"worker-feed",WorkerCase::Factory=>"worker-factory",WorkerCase::FanoutFence=>"worker-fanout-fence",WorkerCase::AssetReuse=>"worker-asset-reuse",WorkerCase::AssetStale=>"worker-asset-stale",WorkerCase::AssetDrain=>"worker-asset-drain",WorkerCase::AssetMissing=>"worker-asset-missing",WorkerCase::AssetUnselected=>"worker-asset-unselected",WorkerCase::AssetCorrupt=>"worker-asset-corrupt",WorkerCase::AssetWaitMissing=>"worker-asset-wait-missing",WorkerCase::AssetWaitUnselected=>"worker-asset-wait-unselected",WorkerCase::HeaderOnly=>"worker-header-only"};
+    let action=match case {WorkerCase::ArchiveCategory=>"worker-archive-category",WorkerCase::Category=>"worker-loop",WorkerCase::Held=>"worker-held",WorkerCase::PredbOnly=>"worker-predb",WorkerCase::FeedHeld=>"worker-feed",WorkerCase::Factory=>"worker-factory",WorkerCase::FanoutFence=>"worker-fanout-fence",WorkerCase::AssetReuse=>"worker-asset-reuse",WorkerCase::AssetStale=>"worker-asset-stale",WorkerCase::AssetDrain=>"worker-asset-drain",WorkerCase::AssetMissing=>"worker-asset-missing",WorkerCase::AssetUnselected=>"worker-asset-unselected",WorkerCase::AssetCorrupt=>"worker-asset-corrupt",WorkerCase::AssetWaitMissing=>"worker-asset-wait-missing",WorkerCase::AssetWaitUnselected=>"worker-asset-wait-unselected",WorkerCase::HeaderOnly=>"worker-header-only"};
     child(&schema.url,&schema.name,action);
     assert_eq!(schema.rows(),kept,"native completion changed retained cache facts");
     assert_eq!(schema.client.query_one("select count(*) from releases",&[]).unwrap().get::<_,i64>(0),if matches!(case,WorkerCase::PredbOnly|WorkerCase::Factory|WorkerCase::HeaderOnly) {0}else{1});
@@ -552,6 +552,10 @@ fn configured_cache_child() {
         action @ ("worker-asset-reuse"|"worker-asset-stale"|"worker-asset-drain"|"worker-asset-missing"|"worker-asset-unselected"|"worker-asset-corrupt"|"worker-asset-wait-missing"|"worker-asset-wait-unselected")=>crate::postprocess::native::asset_tests::run(native.as_ref().unwrap(),action),
         "worker-details-held"=>crate::postprocess::native::worker_tests::run_details_held(native.as_ref().unwrap()),
         "worker-header-only"=>crate::postprocess::native::worker_tests::run_header_only(native.as_ref().unwrap()),
+        "worker-archive-category"=>{
+            crate::pg::par2_scope::archive(&native.as_ref().unwrap().owner,[7;32]).unwrap();
+            crate::postprocess::native::worker_tests::run_category_loop(native.as_ref().unwrap());
+        },
         "worker-loop"=>crate::postprocess::native::worker_tests::run_category_loop(native.as_ref().unwrap()),
         "worker-fanout-fence"=>crate::postprocess::native::worker_tests::run_fanout_fence(native.as_ref().unwrap()),
         "worker-factory"=>crate::postprocess::native::run_factory_fixture(native.as_ref().unwrap()),

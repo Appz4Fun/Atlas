@@ -13,6 +13,7 @@
 pub(crate) mod cache_actor;
 pub(crate) mod worker_assets;
 pub mod ext;
+pub mod par2_scope;
 pub(crate) mod service_cache;
 pub(crate) mod predb_cache;
 pub(crate) mod natural_cache;
