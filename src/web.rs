@@ -752,6 +752,8 @@ struct RowExtras {
     split: HashMap<i64, release_info::SplitPost>,
     copies: HashMap<i64, crate::duplicates::CopyCount>,
     details: HashMap<i64, crate::media::details::Details>,
+    /// Kept-artwork facts are supplied separately from provider metadata.
+    posters: HashMap<i64, (i64, i64)>,
     /// rows with nothing but PAR2 data in them
     recovery: HashMap<i64, release_info::RecoveryOnly>,
     /// rows saved from a Spotnet spot
@@ -1067,9 +1069,7 @@ fn row(
             password: passwords.get(&r.id),
             media: media.get(&r.id),
             details: details.map(ResultDetails::from),
-            poster: details
-                .filter(|details| crate::media::details::poster_kept(details))
-                .map(|details| (details.kind, details.tmdb_id)),
+            poster: extras.posters.get(&r.id).copied(),
             recovery: extras.recovery.get(&r.id).map(release_info::RecoveryOnly::repairs_bytes),
             copies: extras.copies.get(&r.id),
             spot: extras.spots.get(&r.id).map(|spot| SpotBadge { poster: &spot.poster, title: &spot.title }),
@@ -3341,15 +3341,20 @@ mod tests {
             kind: Kind::Movie as i64,
             tmdb_id: 1,
             title: Some("Matchbox the Movie".into()),
+            poster: Some("/metadata-poster.jpg".into()),
             ..Default::default()
         };
-        let extras = RowExtras { details: HashMap::from([(7, details)]), ..RowExtras::default() };
+        let mut extras = RowExtras { details: HashMap::from([(7, details)]), ..RowExtras::default() };
         let html = row(&release, &HashMap::from([(7, 2045)]), &HashMap::new(), &media, &extras);
         assert!(
             html.contains(">Matchbox the Movie (2026) [WEB-DL-2160p][DV HDR10][EAC3 Atmos 5.1][MULTi][H265]-FRQC</a>"),
             "{html}"
         );
         assert!(html.contains(&format!("<div class=\"raw-name\">{name}</div>")), "{html}");
+        assert!(!html.contains("class=\"thumb\""), "provider metadata alone is no admitted artwork fact");
+        extras.posters.insert(7, (Kind::Movie as i64, 1));
+        let kept = row(&release, &HashMap::from([(7, 2045)]), &HashMap::new(), &media, &extras);
+        assert!(kept.contains("class=\"thumb\"") && kept.contains("/ui/poster?kind=2&amp;tmdb=1"), "{kept}");
         // anything but a movie or an episode keeps its own name, once
         let html = row(&release, &HashMap::from([(7, 3040)]), &HashMap::new(), &media, &extras);
         assert!(html.contains(&format!(">{name}</a>")) && !html.contains("raw-name"), "{html}");
@@ -3651,19 +3656,24 @@ mod tests {
             outcome: outcome.map(str::to_string),
             passed_over: false,
         };
-        assert_eq!(picture_state("a.jpg", &[], &[]), PictureState::Offer);
+        let state = |requests: Vec<crate::images::step::Request>| {
+            fresh::native_picture_state("a.jpg", &crate::pg::fresh_pictures::Pictures {
+                images: Vec::new(), stills: Vec::new(), requests,
+            }, &HashMap::new())
+        };
+        assert_eq!(state(vec![]), PictureState::Offer);
         assert_eq!(
-            picture_state("a.jpg", &[], &[req(Some(2), Some("unreadable"))]),
+            state(vec![req(Some(2), Some("unreadable"))]),
             PictureState::Failed("unreadable".into())
         );
         assert_eq!(
-            picture_state("a.jpg", &[], &[req(Some(2), Some("shown"))]),
+            state(vec![req(Some(2), Some("shown"))]),
             PictureState::Offer,
             "its file went from the folder"
         );
-        assert!(matches!(picture_state("a.jpg", &[], &[req(None, None)]), PictureState::Queued(_)));
+        assert!(matches!(state(vec![req(None, None)]), PictureState::Queued(_)));
         let passed = crate::images::step::Request { passed_over: true, ..req(None, None) };
-        assert!(matches!(picture_state("a.jpg", &[], &[passed]), PictureState::Failed(_)), "no run will answer it");
+        assert!(matches!(state(vec![passed]), PictureState::Failed(_)), "no run will answer it");
     }
 
     #[test]
