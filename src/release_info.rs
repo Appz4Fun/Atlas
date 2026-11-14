@@ -442,6 +442,10 @@ pub fn find_verified_password<'a>(
     // Broader NFO/subject token scan when explicit regexes didn't yield the password:
     // test short single-token lines, quoted tokens, values after `:`, and URLs/domains.
     let mut broad = Vec::new();
+    const COMMON_ARCHIVE_PASSWORDS: &[&str] = &["74744567bnbnvbnb"];
+    for &password in COMMON_ARCHIVE_PASSWORDS {
+        push_uniq(&mut broad, password);
+    }
     static RE_URL: LazyLock<Regex> = LazyLock::new(|| {
         #[allow(clippy::unwrap_used)]
         Regex::new(r"(?i)\b(?:https?://|www\.)[^\s\x22'<>]{3,96}|\b[a-z0-9][-a-z0-9]{1,48}\.(?:com|net|org|to|cc|info|biz|ws|de|nl|ru|me|tv|io|xyz)\b").unwrap()
