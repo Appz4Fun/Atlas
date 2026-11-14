@@ -373,18 +373,35 @@ fn unsafe_paths_are_refused() {
     assert_eq!(fs::read(outside).unwrap(), b"abc");
 }
 
-fn child(mode: &str, root: &Path, identity: Identity, marker: &Path) -> Child {
-    Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "article_store::payload_tests::subprocess_entry", "--nocapture"])
-        .env("ATLAS_PAYLOAD_TEST_MODE", mode)
-        .env("ATLAS_PAYLOAD_TEST_ROOT", root)
-        .env("ATLAS_PAYLOAD_TEST_MARKER", marker)
-        .env("ATLAS_PAYLOAD_TEST_STORE", identity.store.0.iter().map(|b| format!("{b:02x}")).collect::<String>())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap()
+struct OwnedChild(Child);
+impl std::ops::Deref for OwnedChild {
+    type Target = Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for OwnedChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+impl Drop for OwnedChild {
+    fn drop(&mut self) {}
+}
+fn child(mode: &str, root: &Path, identity: Identity, marker: &Path) -> OwnedChild {
+    OwnedChild(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "article_store::payload_tests::subprocess_entry", "--nocapture"])
+            .env("ATLAS_PAYLOAD_TEST_MODE", mode)
+            .env("ATLAS_PAYLOAD_TEST_ROOT", root)
+            .env("ATLAS_PAYLOAD_TEST_MARKER", marker)
+            .env("ATLAS_PAYLOAD_TEST_STORE", identity.store.0.iter().map(|b| format!("{b:02x}")).collect::<String>())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    )
 }
 fn wait_exit(child: &mut Child) -> std::process::ExitStatus {
     let until = deadline();
@@ -400,10 +417,14 @@ fn wait_exit(child: &mut Child) -> std::process::ExitStatus {
         thread::sleep(Duration::from_millis(10));
     }
 }
-fn wait_marker(child: &mut Child, path: &Path) {
+fn marker_ready(path: &Path, expected: &[u8]) -> bool {
+    let _ = expected;
+    path.exists()
+}
+fn wait_marker(child: &mut Child, path: &Path, expected: &[u8]) {
     let until = deadline();
     loop {
-        if path.exists() {
+        if marker_ready(path, expected) {
             return;
         }
         if let Some(status) = child.try_wait().unwrap() {
@@ -443,7 +464,7 @@ fn publish_crash_boundaries() {
         drop(writer);
         let marker = temp.path().join("boundary");
         let mut process = child(boundary, &root, identity, &marker);
-        wait_marker(&mut process, &marker);
+        wait_marker(&mut process, &marker, boundary.as_bytes());
         assert_eq!(fs::read(&marker).unwrap(), boundary.as_bytes());
         assert!(!marker.with_extension("returned").exists());
         process.kill().unwrap();
@@ -504,7 +525,7 @@ fn interrupted_initialization_reconciles_parent_durability() {
     let marker = base.join("initialized");
     let placeholder = Identity::from_parts(catalog(), StoreId::from_bytes([0; 16]));
     let mut process = child("post-identity-install", &root, placeholder, &marker);
-    wait_marker(&mut process, &marker);
+    wait_marker(&mut process, &marker, b"post-identity-install");
     assert_eq!(fs::read(&marker).unwrap(), b"post-identity-install");
     assert!(!marker.with_extension("returned").exists());
     process.kill().unwrap();
@@ -544,6 +565,69 @@ fn interrupted_initialization_reconciles_parent_durability() {
     assert_eq!(&out, b"abc");
 }
 
+// Catches accepting the pathname before its complete semantic signal is visible.
+#[test]
+fn marker_readiness_requires_complete_expected_bytes() {
+    let temp = tempfile::tempdir().unwrap();
+    let marker = temp.path().join("boundary");
+    let mut observed = vec![marker_ready(&marker, b"post-install")];
+    for bytes in [&b""[..], &b"post-"[..], &b"pre-install"[..], &b"post-install"[..]] {
+        fs::write(&marker, bytes).unwrap();
+        observed.push(marker_ready(&marker, b"post-install"));
+    }
+    assert_eq!(
+        observed,
+        [false, false, false, false, true],
+        "marker readiness requires complete expected bytes, including empty/partial rejection"
+    );
+}
+
+// Catches std::process::Child Drop leaving a parked lock-owning subprocess alive.
+#[test]
+fn parent_unwind_kills_and_reaps_owned_child() {
+    let (temp, root, writer) = setup();
+    let identity = writer.identity();
+    drop(writer);
+    let marker = temp.path().join("holding");
+    let pid = std::cell::Cell::new(None);
+    let reached_panic = std::cell::Cell::new(false);
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut process = child("park-holding-lock", &root, identity, &marker);
+        pid.set(Some(process.id() as libc::pid_t));
+        wait_marker(&mut process, &marker, b"Holding");
+        assert_eq!(fs::read(&marker).unwrap(), b"Holding");
+        assert!(matches!(Writer::open(&root, identity), Err(Error::Busy)));
+        reached_panic.set(true);
+        panic!("deliberate parent unwind after actual child lock admission");
+    }));
+    let pid = pid.get().expect("child was spawned before the deliberate unwind");
+    // ESRCH proves both death and reaping; a zombie still responds to kill(pid, 0).
+    let absent = unsafe { libc::kill(pid, 0) } == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+    let lock_released = Writer::open(&root, identity).is_ok();
+    // Emergency cleanup keeps this regression bounded even before OwnedChild Drop
+    // is implemented. It occurs only after recording the failed cleanup oracle.
+    if !absent {
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        let until = deadline();
+        loop {
+            let mut status = 0;
+            let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if waited == pid || (waited == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)) {
+                break;
+            }
+            assert!(Instant::now() < until, "bounded emergency child reap timed out");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    assert!(reached_panic.get(), "control must reach the exact lock-holding semantic boundary");
+    assert!(unwound.is_err(), "control must exercise a real parent panic");
+    assert!(absent && lock_released, "parent unwind must kill and reap its owned child before returning");
+    let writer = Writer::open(&root, identity).expect("no child may retain the writer lock");
+    drop(writer);
+}
+
 #[test]
 fn subprocess_entry() {
     let Ok(mode) = std::env::var("ATLAS_PAYLOAD_TEST_MODE") else {
@@ -568,6 +652,12 @@ fn subprocess_entry() {
         return;
     }
     let mut writer = Writer::open(&root, identity).unwrap();
+    if mode == "park-holding-lock" {
+        fs::write(marker, b"Holding").unwrap();
+        loop {
+            thread::park();
+        }
+    }
     if mode == "acquire" {
         fs::write(marker, b"Acquired").unwrap();
         return;

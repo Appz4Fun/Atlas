@@ -6,7 +6,9 @@
 use std::{fmt, io};
 
 mod payload;
-pub(crate) use payload::{Chunk, Reader, Writer};
+#[allow(unused_imports)] // The inactive primitive still exposes its planned return type.
+pub(crate) use payload::Chunk;
+pub(crate) use payload::{Reader, Writer};
 
 pub(crate) const MAX_CHUNK_BYTES: u32 = 1024 * 1024;
 pub(crate) const MAX_RANGE_BYTES: usize = 64 * 1024;

@@ -35,7 +35,7 @@ mod unix {
     impl Budget {
         fn acquire(self: &Arc<Self>) -> Result<Permit> {
             self.0
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| (count < MAX_OWNED_FDS).then_some(count + 1))
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |count| (count < MAX_OWNED_FDS).then_some(count + 1))
                 .map_err(|_| Error::Limit)?;
             Ok(Permit(self.clone()))
         }
