@@ -1406,13 +1406,20 @@ pub async fn claim_chunk(
 /// A split group whose day chunks are all done that `host`, not its home,
 /// still has to sweep, among `groups`.
 pub async fn sweep_to_take(db: &Db, host: String, groups: Vec<String>) -> Result<Option<String>> {
-    on_db(db, move |conn| {
-        for g in groups {
-            if crate::chunks::chunks_done(conn, &g)? && !crate::chunks::swept(conn, &g, &host)? {
-                return Ok(Some(g));
-            }
-        }
-        Ok(None)
+    // Keep selection in one reply: per-group EXISTS round trips held the
+    // canonical owner for an entire tracked-group scan, even on an empty catalog.
+    // Ordinality preserves the caller's provider-filtered order, including duplicates.
+    on_native_db(db, move |conn| {
+        let row = conn.query_opt(
+            "select wanted.grp
+             from unnest($1::text[]) with ordinality as wanted(grp, ord)
+             where exists (select 1 from backfill_chunks c where c.grp=wanted.grp)
+               and not exists (select 1 from backfill_chunks c where c.grp=wanted.grp and c.state!=2)
+               and not exists (select 1 from backfill_sweeps s where s.grp=wanted.grp and s.server=$2)
+             order by wanted.ord limit 1",
+            &[&groups, &host],
+        )?;
+        Ok(row.map(|row| row.try_get(0)).transpose()?)
     })
     .await
 }
@@ -2680,6 +2687,60 @@ mod tests {
         )
         .unwrap();
         (schema, db)
+    }
+
+    /// The fixture view records actual PostgreSQL statement boundaries, not elapsed
+    /// time: a healthy scan must not become thousands of owner-held round trips.
+    #[test]
+    #[ignore = "requires an explicit isolated ATLAS_PG_TEST_URL"]
+    fn native_sweep_empty_catalog_uses_one_statement_for_all_tracked_groups() {
+        let (schema, db) = native_fixture();
+        let mut client = postgres::Client::connect(&schema.url, postgres::NoTls).unwrap();
+        client.batch_execute(&format!("set search_path to {}", schema.name)).unwrap();
+        let owner = Arc::new(crate::pg::indexer_runtime::Owner::new(client));
+        let db = owned_postgres_db(db, owner.clone(), PgWriteLimits::default()).unwrap();
+        schema.pool.get().unwrap().batch_execute("
+            alter table backfill_chunks rename to sweep_fixture_chunks;
+            create table sweep_fixture_statements (started timestamptz primary key);
+            create function sweep_fixture_read() returns setof sweep_fixture_chunks
+            language plpgsql volatile as $$ begin
+                insert into sweep_fixture_statements values(statement_timestamp()) on conflict do nothing;
+                return query select * from sweep_fixture_chunks;
+            end $$;
+            create view backfill_chunks as select * from sweep_fixture_read();
+        ").unwrap();
+        let groups = (0..3087).map(|i| format!("example.empty.{i}")).collect();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        assert_eq!(rt.block_on(sweep_to_take(&db, "provider.test".into(), groups)).unwrap(), None);
+        let statements: i64 = schema.pool.get().unwrap()
+            .query_one("select count(*) from sweep_fixture_statements", &[]).unwrap().get(0);
+        assert_eq!(statements, 1, "sweep candidates must share one PostgreSQL statement");
+        assert_eq!(owner.failure(), None, "a healthy empty scan is not a storage outage");
+        owner.close();
+    }
+
+    #[test]
+    #[ignore = "requires an explicit isolated ATLAS_PG_TEST_URL"]
+    fn native_sweep_selection_preserves_input_order_and_chunk_and_host_exclusions() {
+        let (schema, db) = native_fixture();
+        let conn = crate::pg::sql::Pg::new(schema.pool.get().unwrap());
+        for group in ["pending", "claimed", "swept", "z-first", "a-second", "excluded"] {
+            crate::chunks::add(&conn, group, 20_000, 19_999).unwrap();
+        }
+        conn.execute("update backfill_chunks set state=2 where grp not in ('pending','claimed')", &[]).unwrap();
+        conn.execute("update backfill_chunks set state=2 where grp='pending' and day=19999", &[]).unwrap();
+        conn.execute("update backfill_chunks set state=1 where grp='claimed' and day=20000", &[]).unwrap();
+        conn.execute("insert into backfill_sweeps(grp,server) values ('swept','provider.test'),('z-first','other.test')", &[]).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let groups = || ["absent", "pending", "claimed", "swept", "z-first", "a-second", "z-first"]
+            .into_iter().map(str::to_owned).collect();
+        assert_eq!(rt.block_on(sweep_to_take(&db, "provider.test".into(), groups())).unwrap().as_deref(), Some("z-first"));
+        conn.execute("insert into backfill_sweeps(grp,server) values ('z-first','provider.test')", &[]).unwrap();
+        assert_eq!(rt.block_on(sweep_to_take(&db, "provider.test".into(), groups())).unwrap().as_deref(), Some("a-second"));
+        conn.execute("insert into backfill_sweeps(grp,server) values ('a-second','provider.test')", &[]).unwrap();
+        assert_eq!(rt.block_on(sweep_to_take(&db, "provider.test".into(), groups())).unwrap(), None,
+            "unselected completed groups and incomplete chunks must not leak into the result");
+        assert_eq!(rt.block_on(sweep_to_take(&db, "provider.test".into(), Vec::new())).unwrap(), None);
     }
 
     #[test]
