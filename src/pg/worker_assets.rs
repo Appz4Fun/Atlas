@@ -198,13 +198,26 @@ impl Grant {
         ensure!(crate::probe::media::cover_mime(&cover.bytes)==Some(cover.mime),"native cover producer bytes/MIME mismatch");
         let (name,digest)=self.manifest.store_cover(&cover.bytes)?;
         let request=AssetRequest {bytes:Some(cover.bytes.len() as u64),..Self::request(cover.mime,&name)?};
-        let spool=self.manifest.read_recorded(&request,&self.pool)?.context("native produced cover disappeared")?;
-        let revision=owner.with(|client| {
+        let captured=self.manifest.contains_cover(&name)?;
+        let spool=if captured {self.manifest.read_cover(&request,&self.pool)?}else{self.manifest.read_recorded(&request,&self.pool)?}
+            .context("native produced cover disappeared")?;
+        let (revision,receipt)=owner.with(|client| {
             let mut tx=client.transaction()?;super::history_gate::native(&mut tx)?;
             let revision:i64=tx.query_one("select native_work_revision from releases where id=$1",&[&release])?.try_get(0)?;
-            let rows=tx.execute("insert into ext_asset_files as old(kind,name,byte_length,digest,source_digest) values('covers',$1,$2,$3,$4) on conflict(kind,name) do update set name=excluded.name where old.byte_length=excluded.byte_length and old.digest=excluded.digest and old.source_digest=excluded.source_digest",&[&name,&(cover.bytes.len() as i64),&digest.as_slice(),&self.source.as_slice()])?;
-            ensure!(rows==1,"native asset descriptor conflicts with preserved original");tx.commit()?;Ok(revision)
+            let receipt=if captured {super::fresh_assets::receipt_in(&mut tx,&request)?}else {
+                let rows=tx.execute("insert into ext_asset_files as old(kind,name,byte_length,digest,source_digest) values('covers',$1,$2,$3,$4) on conflict(kind,name) do update set name=excluded.name where old.byte_length=excluded.byte_length and old.digest=excluded.digest and old.source_digest=excluded.source_digest",&[&name,&(cover.bytes.len() as i64),&digest.as_slice(),&self.source.as_slice()])?;
+                ensure!(rows==1,"native asset descriptor conflicts with preserved original");None
+            };tx.commit()?;Ok((revision,receipt))
         })?;
+        let spool=if captured {
+            // Compatible captured originals keep their copier/import provenance,
+            // as in ImageFrame::keep; only unlisted covers need native evidence.
+            // Release the first verified read before reserving the retained
+            // receipt-verified result: each cover needs only one pool slot.
+            drop(spool);
+            self.manifest.read_associated(&request,&self.pool,owner.epoch().context("native cover epoch absent")?.catalog(),receipt.as_ref())?
+                .context("captured native cover disappeared")?
+        }else{spool};
         self.check_owner(&owner)?;Ok(CoverHold {grant:self.clone(),release,_revision:revision,mime:cover.mime.into(),name,spool})
     }
     fn poster_request(&self,path:&str)->Result<AssetRequest> {
