@@ -158,6 +158,30 @@ fn native_thumbnail_associations_keep_poster_counter_and_taken_slot_rules() {
     expected.sort_unstable();
     assert_eq!(posters.len(), 2);
     assert_eq!(rows, expected);
+    // Check the actual writer/reader boundary before the association query:
+    // the counter belongs to the stored subject, not a guessed file ordinal.
+    let thumbnail_files = reads.files(thumb, 2).unwrap();
+    assert_eq!(thumbnail_files.len(), 1);
+    let file = &thumbnail_files[0];
+    assert_eq!(file.filename, "thumbnail.jpg");
+    assert_eq!(file.subject.as_deref(), Some("[8/8] thumbnail"));
+    assert_eq!(file.expected, Some(1));
+    assert_eq!(file.subject.as_deref().and_then(crate::archive::beside::counter), Some((8, 8)));
+    assert!(posters.iter().any(|poster| crate::archive::beside::posters_akin(poster, "ZbivKJ385zX890Qm0z0Yit@picture.test")));
+    runtime.owner.with(|client| {
+        let row = client.query_one(
+            "select r.original_name,r.poster,r.posted_clock-o.posted_clock,
+             exists(select 1 from beside_files where row_id=r.id),
+             exists(select 1 from upload_link where release_id=r.id)
+             from releases r join releases o on o.id=$2 where r.id=$1",
+            &[&thumb, &own],
+        )?;
+        assert_eq!(row.get::<_, Vec<u8>>(0).as_slice(), b"thumbnail.jpg");
+        assert_eq!(row.get::<_, String>(1), "ZbivKJ385zX890Qm0z0Yit@picture.test");
+        assert_eq!(row.get::<_, i64>(2), -1080);
+        assert!(!row.get::<_, bool>(3) && !row.get::<_, bool>(4), "the candidate must actually be unclaimed");
+        Ok(())
+    }).unwrap();
     let slots = [7, 1].into_iter().collect();
     runtime
         .owner
@@ -176,10 +200,33 @@ fn native_thumbnail_associations_keep_poster_counter_and_taken_slot_rules() {
                 })
                 .unwrap();
         }
-        assert_eq!(reads.find_thumbnail(own, 8, &slots, &posters, posted).unwrap(), Some(thumb));
-        assert_eq!(reads.find_thumbnail(own, 8, &[7, 1, 8].into_iter().collect(), &posters, posted).unwrap(), None);
-        assert_eq!(reads.find_thumbnail(own, 9, &slots, &posters, posted).unwrap(), None);
+        assert_eq!(reads.find_thumbnail(own, 8, &slots, &posters, posted).unwrap(), Some(thumb), "indexed={indexed}");
+        assert_eq!(reads.find_thumbnail(own, 8, &[7, 1, 8].into_iter().collect(), &posters, posted).unwrap(), None, "indexed={indexed}");
+        assert_eq!(reads.find_thumbnail(own, 9, &slots, &posters, posted).unwrap(), None, "indexed={indexed}");
     }
+    // A bytewise poster index supports the prefix range even when the
+    // database's default collation does not. Keep both access paths covered.
+    runtime.owner.with(|client| {
+        client.batch_execute("drop index idx_release_poster; create index idx_release_poster on releases(poster collate \"C\")")?;
+        Ok(())
+    }).unwrap();
+    assert_eq!(reads.find_thumbnail(own, 8, &slots, &posters, posted).unwrap(), Some(thumb), "bytewise poster index");
+    assert_eq!(reads.find_thumbnail(own, 8, &[7, 1, 8].into_iter().collect(), &posters, posted).unwrap(), None);
+    assert_eq!(reads.find_thumbnail(own, 9, &slots, &posters, posted).unwrap(), None);
+    let other_owner = add(&runtime, "Other.Film", "example.owner", "other@example.test", posted, &["other.mkv"]);
+    runtime.owner.with(|client| {
+        client.execute("insert into beside_files(row_id,release_id) values($1,$2)", &[&thumb, &other_owner])?;
+        Ok(())
+    }).unwrap();
+    assert_eq!(reads.find_thumbnail(own, 8, &slots, &posters, posted).unwrap(), None, "a different post owns the beside row");
+    runtime.owner.with(|client| {
+        assert_eq!(client.execute("delete from beside_files where row_id=$1 and release_id=$2", &[&thumb, &other_owner])?, 1);
+        client.execute("insert into upload_link(release_id,lead_id) values($1,$2)", &[&thumb, &other_owner])?;
+        assert_eq!(client.query_one("select count(*) from ext_asset_files", &[])?.get::<_, i64>(0), 0,
+            "thumbnail metadata lookup does not grant asset access");
+        Ok(())
+    }).unwrap();
+    assert_eq!(reads.find_thumbnail(own, 8, &slots, &posters, posted).unwrap(), None, "a different post owns the upload row");
     runtime.owner.close();
 }
 

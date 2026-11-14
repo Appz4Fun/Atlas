@@ -142,13 +142,27 @@ impl StepReads {
     pub(crate) fn find_thumbnail(&self,id:i64,total:i64,slots:&HashSet<i64>,posters:&[String],posted:&str)->Result<Option<i64>> {self.read(|tx| {
         start(tx)?;let Some((from,to))=link::beside_window(posted,link::BESIDE_SECS) else{return Ok(None)};let mut budget=Budget::default();budget.charge(posters.len() as i64,posters.iter().map(|p|p.len() as i64).sum())?;
         let low=id.saturating_sub(link::ID_WINDOW);let high=id.saturating_add(link::ID_WINDOW);let mut ids=Vec::new();let mut have=HashSet::new();
-        let indexed:bool=tx.query_one("select exists(select 1 from pg_indexes where schemaname=current_schema() and indexname='idx_release_poster')",&[])?.try_get(0)?;
+        // The prefix..prefix+DEL range is bytewise, as in the original SQLite
+        // lookup. A default-locale poster index cannot prove that access path.
+        // Without a complete compatible index, keep the bounded ID fallback.
+        let indexed:bool=tx.query_one(r#"select exists(
+            select 1 from pg_index i join pg_class c on c.oid=i.indexrelid
+            join pg_am m on m.oid=c.relam
+            join pg_attribute a on a.attrelid=i.indrelid and a.attnum=i.indkey[0]
+            join pg_opclass o on o.oid=i.indclass[0]
+            where i.indexrelid=to_regclass(format('%I.idx_release_poster',current_schema()))
+              and i.indrelid=to_regclass(format('%I.releases',current_schema()))
+              and a.attname='poster' and m.amname='btree'
+              and o.opcname='text_ops' and o.opcnamespace='pg_catalog'::regnamespace
+              and i.indcollation[0]='pg_catalog."C"'::regcollation
+              and i.indisvalid and i.indisready and i.indislive and i.indpred is null
+        )"#,&[])?.try_get(0)?;
         if indexed {
             for poster in posters {
-                for row in rows(tx,"select id from releases where poster=$1 and id between $2 and $3 order by id limit $4",&[&poster,&low,&high,&(beside::SCANNED as i64)],&[],&mut budget)? {let other:i64=row.try_get(0)?;if other!=id&&have.insert(other){ids.push(other)}}
+                for row in rows(tx,"select id from releases where poster collate \"C\"=$1 and id between $2 and $3 order by id limit $4",&[&poster,&low,&high,&(beside::SCANNED as i64)],&[],&mut budget)? {let other:i64=row.try_get(0)?;if other!=id&&have.insert(other){ids.push(other)}}
                 if let Some((local,_))=poster.split_once('@') && local.is_ascii() && local.len()>=beside::POSTER_PREFIX+2 && !local.contains(['<',' ','"']) {
                     let prefix=&local[..beside::POSTER_PREFIX];let end=format!("{prefix}\u{7f}");
-                    for row in rows(tx,"select id from releases where poster>=$1 and poster<$2 order by poster,id limit $3",&[&prefix,&end,&(beside::SCANNED as i64)],&[],&mut budget)? {let other:i64=row.try_get(0)?;if (low..=high).contains(&other)&&other!=id&&have.insert(other){ids.push(other)}}
+                    for row in rows(tx,"select id from releases where poster collate \"C\">=$1 and poster collate \"C\"<$2 order by poster collate \"C\",id limit $3",&[&prefix,&end,&(beside::SCANNED as i64)],&[],&mut budget)? {let other:i64=row.try_get(0)?;if (low..=high).contains(&other)&&other!=id&&have.insert(other){ids.push(other)}}
                 }
             }
         }
