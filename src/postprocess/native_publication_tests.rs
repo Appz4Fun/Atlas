@@ -7,7 +7,7 @@ use std::{
     path::Path,
     process::{Child, Command, ExitStatus, Stdio},
     sync::{Weak, mpsc},
-    thread::JoinHandle,
+    thread::{self, JoinHandle},
 };
 
 const PRIVATE_CASE: &str = "ATLAS_NATIVE_PUBLICATION_CASE";
