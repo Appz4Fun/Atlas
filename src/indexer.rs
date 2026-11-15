@@ -2217,6 +2217,9 @@ impl Pass<'_> {
         let mut refused: Vec<(u64, u64)> = Vec::new();
         let range = (start.max(0) as u64, end.max(0) as u64);
         let mut round = 0;
+        // every retry round in all, progressing or not: what bounds a pass whose rounds keep finishing a little
+        let mut rounds = 0;
+        let mut done_at_round = 0;
         let mut saved = Progress::default();
         let mut done = 0;
         let mut finished = Finished::default();
@@ -2242,8 +2245,20 @@ impl Pass<'_> {
                 let stopped = self.ctx.stop.load(std::sync::atomic::Ordering::Acquire);
                 // a slice failing stops the stream starting the rest: those are as unread as the failed ones
                 let unread = unread(range, &finished, &refused, &again, size);
-                if (!again.is_empty() || !unread.is_empty()) && round < SLICE_ROUNDS && !stopped && !save_failed {
+                // a round that finished slices doesnt count against `SLICE_ROUNDS`: only rounds in a row that
+                // finished none do, with `SLICE_ROUNDS_MOST` rounds in all
+                if done > done_at_round {
+                    round = 0;
+                }
+                done_at_round = done;
+                if (!again.is_empty() || !unread.is_empty())
+                    && round < SLICE_ROUNDS
+                    && rounds < SLICE_ROUNDS_MOST
+                    && !stopped
+                    && !save_failed
+                {
                     round += 1;
+                    rounds += 1;
                     let mut retry = halved(std::mem::take(&mut again), false);
                     retry.extend(unread);
                     retry.sort_unstable();
@@ -2251,7 +2266,7 @@ impl Pass<'_> {
                         retry.reverse();
                     }
                     if self.ctx.verbose {
-                        println!("[{kind}] {group}: asking {} slices again (round {round})", retry.len());
+                        println!("[{kind}] {group}: asking {} slices again (round {rounds})", retry.len());
                     }
                     again_error = None;
                     rx = pool.stream_headers(group, self.server, retry, width, kind != "LIVE", self.ctx.stop.clone());
@@ -2335,6 +2350,7 @@ impl Pass<'_> {
         }
         // read in part with nothing failing on the last try and no stop: not a success either
         if error.is_none()
+            && range.0 <= range.1
             && !self.ctx.stop.load(std::sync::atomic::Ordering::Acquire)
             && finished.ends(range.0, range.1).0 != Some(range.1)
         {
@@ -2637,8 +2653,10 @@ fn name_sources(release: &Release) -> Vec<(String, Extract)> {
         .collect()
 }
 
-/// How many times what a pass left unread is asked again (see `process_range`).
+/// How many rounds in a row that finish nothing a pass asks again for what it left unread (see `process_range`).
 const SLICE_ROUNDS: usize = 3;
+/// The most rounds a pass asks again in all, progressing or not.
+const SLICE_ROUNDS_MOST: usize = 64;
 
 /// The parts of `range` not finished, refused for now or failed (`again`), cut into `size` long slices: the ones a
 /// stream never started after a slice failed.
