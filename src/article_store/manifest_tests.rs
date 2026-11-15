@@ -385,16 +385,22 @@ fn manifest_rejects_binding_extent_and_budget_errors() {
         BatchManifestBuilder::new(&mut writer, binding(), vec![data; 257], deadline()),
         Err(Error::Limit)
     ));
-    for extent in [
-        Extent { chunk_index: 1, offset: 0, bytes: 1 },
-        Extent { chunk_index: 0, offset: 3, bytes: 1 },
-        Extent { chunk_index: 0, offset: u32::MAX, bytes: 2 },
-    ] {
+    for extent in [Extent { chunk_index: 1, offset: 0, bytes: 1 }, Extent { chunk_index: 0, offset: 3, bytes: 1 }] {
         let mut row = AcceptedRowV1::default();
         row.fields[0] = Some(FieldRef::new(extent.bytes as u64, vec![extent]).unwrap());
         let mut builder = BatchManifestBuilder::new(&mut writer, binding(), vec![data], deadline()).unwrap();
         assert!(matches!(builder.push(row), Err(Error::Corrupt | Error::Limit)));
     }
+    let overflow = Extent { chunk_index: 0, offset: u32::MAX, bytes: 2 };
+    assert!(matches!(FieldRef::new(2, vec![overflow]), Err(Error::Limit)));
+    // Mutate a valid public input to exercise the independent builder guard too.
+    let mut changed = field(0, 0, 2);
+    changed.extents[0] = overflow;
+    let mut row = AcceptedRowV1::default();
+    row.fields[0] = Some(changed);
+    let mut builder = BatchManifestBuilder::new(&mut writer, binding(), vec![data], deadline()).unwrap();
+    assert!(matches!(builder.push(row), Err(Error::Limit)));
+    drop(builder);
     assert!(matches!(FieldRef::new(64 * 1024 * 1024 + 1, vec![]), Err(Error::Limit)));
     assert!(matches!(FieldRef::new(u64::MAX, vec![]), Err(Error::Limit)));
     assert!(matches!(
@@ -575,6 +581,118 @@ fn lazy_data_reads_refuse_missing_corrupt_and_replaced_children() {
             assert!(matches!(result, Err(Error::Missing)));
         }
     }
+}
+
+// A real lazy storage failure terminates this snapshot even after the original
+// object is restored; healthy EOF or retry success must never hide that failure.
+fn assert_lazy_failure_is_terminal(mode: u8) {
+    use std::os::unix::fs::PermissionsExt;
+    let (_temp, root, mut writer) = setup();
+    let data = publish(&mut writer, b"abc");
+    let mut row = AcceptedRowV1::default();
+    row.fields[0] = Some(field(0, 0, 3));
+    let reference = batch(&mut writer, vec![data], vec![row]);
+    let reader = Reader::open(&root, reference.identity).unwrap();
+    let mut snapshot = open(&reader, &reference);
+    let token = snapshot.next_row().unwrap().unwrap().fields[0].take().unwrap();
+    let path = object(&root, data.digest);
+    match mode {
+        0 => fs::remove_file(&path).unwrap(),
+        1 => fs::write(&path, b"xyz").unwrap(),
+        2 => fs::set_permissions(&path, fs::Permissions::from_mode(0)).unwrap(),
+        _ => unreachable!(),
+    }
+    let result = snapshot.read_field_range(&token, 0, &mut [0; 3], deadline());
+    // Restore physical bytes/permissions before testing terminal session state.
+    if mode == 2 {
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    fs::write(&path, b"abc").unwrap();
+    match mode {
+        0 => assert!(matches!(result, Err(Error::Missing))),
+        1 => assert!(matches!(result, Err(Error::Corrupt))),
+        2 => assert!(matches!(result, Err(Error::Io(e)) if e.raw_os_error() == Some(libc::EACCES))),
+        _ => unreachable!(),
+    }
+    let terminal_row = matches!(snapshot.next_row(), Err(Error::Busy));
+    let terminal_field = matches!(snapshot.read_field_range(&token, 0, &mut [0; 3], deadline()), Err(Error::Busy));
+    assert!(
+        terminal_row && terminal_field,
+        "storage failure {mode} must remain terminal: row={terminal_row}, field={terminal_field}"
+    );
+}
+#[test]
+fn missing_lazy_child_failure_is_terminal() {
+    assert_lazy_failure_is_terminal(0);
+}
+#[test]
+fn corrupt_lazy_child_failure_is_terminal() {
+    assert_lazy_failure_is_terminal(1);
+}
+#[test]
+fn io_lazy_child_failure_is_terminal() {
+    assert_lazy_failure_is_terminal(2);
+}
+
+// Tiny valid contents cannot smuggle an oversized retained group allocation into
+// a builder that otherwise respects all length and wire limits.
+#[test]
+fn oversized_group_capacity_is_refused_before_admission() {
+    let (_temp, _root, mut writer) = setup();
+    let mut binding = binding();
+    let mut group = String::with_capacity(1024 * 1024);
+    group.push_str("alt.x");
+    assert!(group.capacity() >= 1024 * 1024);
+    binding.group = group;
+    assert!(matches!(BatchManifestBuilder::new(&mut writer, binding, vec![], deadline()), Err(Error::Limit)));
+}
+
+// Factory-created empty and short descriptors must not retain arbitrary spare
+// storage. Both results are observed even against the unfixed implementation.
+#[test]
+fn oversized_field_capacity_is_refused_by_factory() {
+    let mut refused = vec![];
+    for present_bytes in [0, 1] {
+        let mut extents = Vec::with_capacity(128 * 1024);
+        if present_bytes == 1 {
+            extents.push(Extent { chunk_index: 0, offset: 0, bytes: 1 });
+        }
+        assert!(extents.capacity() >= 128 * 1024);
+        refused.push(matches!(FieldRef::new(present_bytes, extents), Err(Error::Limit)));
+    }
+    assert_eq!(refused, [true, true]);
+}
+
+// Public inputs can acquire spare capacity after factory validation. Aggregate
+// retained capacities must be checked before a nested publisher buffer exists.
+#[test]
+fn aggregate_row_capacity_is_refused_before_page_flush() {
+    let (_temp, _root, mut writer) = setup();
+    let data = publish(&mut writer, b"abc");
+    let mut big = AcceptedRowV1::default();
+    big.fields[0] = Some(FieldRef::new(1024, vec![Extent { chunk_index: 0, offset: 0, bytes: 1 }; 1024]).unwrap());
+    let mut builder = BatchManifestBuilder::new(&mut writer, binding(), vec![data], deadline()).unwrap();
+    for _ in 0..3 {
+        builder.push(big.clone()).unwrap();
+    }
+    for _ in 0..15 {
+        builder.push(AcceptedRowV1::default()).unwrap();
+    }
+    // Independent sizes: page holds 13 + 3*(10356+4) + 15*(106+4)
+    // = 32743 bytes. Another present-empty row would force page publication.
+    let mut row = AcceptedRowV1::default();
+    for slot in &mut row.fields {
+        let mut empty = FieldRef::new(0, vec![]).unwrap();
+        empty.extents = Vec::with_capacity(1024);
+        *slot = Some(empty);
+    }
+    let before = payload::test_sync_calls();
+    let refused = matches!(builder.push(row), Err(Error::Limit));
+    let flushed = payload::test_sync_calls() != before;
+    assert!(
+        refused && !flushed,
+        "aggregate row capacity must fail before page flush: refused={refused}, flushed={flushed}"
+    );
 }
 
 // A page/data descriptor must be dropped before replacement to keep the eight-FD budget usable indefinitely.
