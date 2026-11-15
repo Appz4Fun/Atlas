@@ -2037,10 +2037,9 @@ async fn goes_back_furthest(
     if unasked {
         // A server left out may go back further: never call this one alone on that (it would drop older days as
         // only its own), only that it may read the day. Its own first post stands in as the runner up.
-        let runner_up = runner_up.or(Some(oldest.0)).map(|r| r.min(oldest.0));
-        if deepest != host {
-            println!("[CHUNK] {group}: a carrier didnt answer how far back it keeps it, asking again next time");
-        }
+        // Only where this server came out deepest: elsewhere the runner up decides whether it keeps the day at all.
+        let runner_up = if deepest == host { Some(runner_up.map_or(oldest.0, |r| r.min(oldest.0))) } else { runner_up };
+        println!("[CHUNK] {group}: a carrier didnt answer how far back it keeps it, asking again next time");
         return Ok((deepest == host, runner_up));
     }
     let (g, d) = (group.to_string(), deepest.clone());
