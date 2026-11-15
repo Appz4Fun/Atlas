@@ -3279,9 +3279,9 @@ mod tests {
     }
 
     #[test]
-    fn a_day_chunk_streams_wider_than_other_passes() {
+    fn a_day_chunk_streams_at_least_as_wide_as_other_passes() {
         assert_eq!(stream_width("CHUNK"), crate::nntp::CHUNK_STREAM_SLICES);
-        assert!(crate::nntp::CHUNK_STREAM_SLICES >= 4 * crate::nntp::STREAM_SLICES);
+        assert!(crate::nntp::CHUNK_STREAM_SLICES >= crate::nntp::STREAM_SLICES);
         for kind in ["LIVE", "BACKFILL", "SWEEP"] {
             assert_eq!(stream_width(kind), crate::nntp::STREAM_SLICES);
         }

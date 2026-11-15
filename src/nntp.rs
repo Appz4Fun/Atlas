@@ -750,10 +750,13 @@ const SLICES_BUFFERED: usize = 4;
 /// unsaved budget in one burst and every other pass waits while it saves
 /// them one by one
 pub const STREAM_SLICES: usize = 2 * SLICES_BUFFERED;
-/// `STREAM_SLICES` of a day chunk's pass: forward backfill holds every group to the slowest one's day
-/// (`chunks::LOCKSTEP_DAYS`), and one day of the biggest groups is tens of millions of article numbers, soo a chunk
-/// takes many connections at once while the rest wait on it. The unsaved budget still bounds them all
-pub const CHUNK_STREAM_SLICES: usize = 32;
+/// Slices a day chunk's pass streams at once. It was 32, for one big group's day holding every other group's forward
+/// backfill to it; with the lockstep window wider than a day (`chunks::lockstep_days`) that no longer happens, and a
+/// pass parses and saves its slices one at a time (~260 ms each on prod against ~830 ms for a 5000-row XOVER), so 32
+/// only held room in the unsaved budget: about 15 passes held all of the bulk share while 130 other claimed day
+/// chunks waited for room with their servers' connections idle. Eight keep one pass's saving busy and let four
+/// times as many passes share the budget.
+pub const CHUNK_STREAM_SLICES: usize = 8;
 
 /// `fut`'s output, or None as soon as `stop` is set: stopping doesnt wait on
 /// a provider that went quiet mid reply. Dropping a request part way is safe,
