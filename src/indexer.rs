@@ -1767,7 +1767,7 @@ where
         Ok(Retention::Since(t)) => (Some(t), true),
         Ok(Retention::Unsure(t)) => (Some(t), false),
         Ok(Retention::Empty) => (None, true),
-        Err(e) => return failed(e.into()).await,
+        Err(e) => return failed(anyhow::Error::new(e).context("finding how far back the server keeps it")).await,
     };
     // from when the server is taken to keep days whole
     let mut keeps_from = oldest;
@@ -1855,7 +1855,7 @@ where
     .await
     {
         Ok(range) => range,
-        Err(e) => return failed(e.into()).await,
+        Err(e) => return failed(anyhow::Error::new(e).context("finding where the day starts and ends")).await,
     };
     // days only this server has are bounded all together, see `chunks::Speculative`
     let floor = match runner_up_day {
@@ -1909,7 +1909,7 @@ where
     let window = alone.then_some((day * 86_400, (day + 1) * 86_400));
     let ranged = pass.process_range_dated(start as i64, end as i64, "CHUNK", window, progress).await;
     match ranged {
-        Ranged { error: Some(e), .. } => failed(e).await,
+        Ranged { error: Some(e), .. } => failed(e.context(format!("reading the headers {start}-{end}"))).await,
         Ranged { saved, complete: true, in_window, .. } => {
             finish_chunk(db, chunk, (alone, floor, oldest), in_window).await?;
             Ok(saved)
@@ -2131,8 +2131,11 @@ impl Pass<'_> {
     /// the newest slices first.
     ///
     /// A slice failing stops new ones from starting, but the ones that made it
-    /// are still saved, and `Ranged` says how far the range is done from
-    /// either end, soo a cursor can move past them and they arent fetched again.
+    /// are still saved. Once the stream ends, what is left unread (the slices
+    /// that failed, halved, and those never started) is asked again, up to
+    /// `SLICE_ROUNDS` times. `Ranged` says how far the range is done from
+    /// either end, soo a cursor can move past them and they arent fetched again;
+    /// a range left unread with no stop is an error.
     async fn process_range<P>(&self, start: i64, end: i64, kind: &str, progress: &mut P) -> Ranged
     where
         P: FnMut(&Progress) + ?Sized,
@@ -2204,6 +2207,20 @@ impl Pass<'_> {
         let width = stream_width(kind);
         // everything but live takes from the bulk share of the unsaved budget: new posts never wait behind old days
         let mut rx = pool.stream_headers(group, self.server, slices, width, kind != "LIVE", self.ctx.stop.clone());
+        // Slices that failed on the way (a timeout, a dropped connection): asked again, halved, once the rest are
+        // in. A day chunk is thousands of slices, and one failure among them used to fail the whole day, which was
+        // then read again from its start: on prod the biggest groups' days failed every time and held every other
+        // group's backfill behind them.
+        let mut again: Vec<(u64, u64)> = Vec::new();
+        let mut again_error: Option<crate::nntp::NntpError> = None;
+        // slices refused with a 5xx and not passed over yet: tried again on a later pass, not in this one
+        let mut refused: Vec<(u64, u64)> = Vec::new();
+        let range = (start.max(0) as u64, end.max(0) as u64);
+        let mut round = 0;
+        // every retry round in all, progressing or not: what bounds a pass whose rounds keep finishing a little
+        let mut rounds = 0;
+        let mut done_at_round = 0;
+        let began = Instant::now();
         let mut saved = Progress::default();
         let mut done = 0;
         let mut finished = Finished::default();
@@ -2225,7 +2242,40 @@ impl Pass<'_> {
             if let Some(side) = side {
                 self.advance(side, &finished, (start, end), &mut moved).await;
             }
-            let Some(slice) = rx.recv().await else { break };
+            let Some(slice) = rx.recv().await else {
+                let stopped = self.ctx.stop.load(std::sync::atomic::Ordering::Acquire);
+                // a slice failing stops the stream starting the rest: those are as unread as the failed ones
+                let unread = unread(range, &finished, &refused, &again, size);
+                // a round that finished slices doesnt count against `SLICE_ROUNDS`: only rounds in a row that
+                // finished none do, with `SLICE_ROUNDS_MOST` rounds in all
+                if done > done_at_round {
+                    round = 0;
+                }
+                done_at_round = done;
+                if (!again.is_empty() || !unread.is_empty())
+                    && round < SLICE_ROUNDS
+                    && rounds < SLICE_ROUNDS_MOST
+                    && began.elapsed() < SLICE_RETRY_FOR
+                    && !stopped
+                    && !save_failed
+                {
+                    round += 1;
+                    rounds += 1;
+                    let mut retry = halved(std::mem::take(&mut again), false);
+                    retry.extend(unread);
+                    retry.sort_unstable();
+                    if kind == "BACKFILL" {
+                        retry.reverse();
+                    }
+                    if self.ctx.verbose {
+                        println!("[{kind}] {group}: asking {} slices again (round {rounds})", retry.len());
+                    }
+                    again_error = None;
+                    rx = pool.stream_headers(group, self.server, retry, width, kind != "LIVE", self.ctx.stop.clone());
+                    continue;
+                }
+                break;
+            };
             // the slice's room in the unsaved budget goes back once it's parsed
             // (or skipped)
             let unsaved = slice.unsaved;
@@ -2256,12 +2306,14 @@ impl Pass<'_> {
                         finished.add(slice.start, slice.end);
                     } else {
                         println!("[{kind}] {group} {}-{} refused ({e}), trying it again later", slice.start, slice.end);
+                        refused.push((slice.start, slice.end));
                         error.get_or_insert_with(|| anyhow::Error::new(e));
                     }
                     continue;
                 }
                 Err(e) => {
-                    error.get_or_insert_with(|| anyhow::Error::new(e));
+                    again.push((slice.start, slice.end));
+                    again_error.get_or_insert(e);
                     continue;
                 }
             };
@@ -2295,6 +2347,17 @@ impl Pass<'_> {
             }
         }
 
+        if let Some(e) = again_error {
+            error.get_or_insert_with(|| anyhow::Error::new(e));
+        }
+        // read in part with nothing failing on the last try and no stop: not a success either
+        if error.is_none()
+            && range.0 <= range.1
+            && !self.ctx.stop.load(std::sync::atomic::Ordering::Acquire)
+            && finished.ends(range.0, range.1).0 != Some(range.1)
+        {
+            error = Some(anyhow!("{group} {}-{}: part of the range was left unread", range.0, range.1));
+        }
         if let (Some(low), Some(high)) = (low, high) {
             let key = self.key.clone();
             if let Err(e) = on_ingest_progress(self.db, move |conn| Ok(db::save_group_dates(conn, &key, low, high)?)).await {
@@ -2592,6 +2655,56 @@ fn name_sources(release: &Release) -> Vec<(String, Extract)> {
         .collect()
 }
 
+/// How many rounds in a row that finish nothing a pass asks again for what it left unread (see `process_range`).
+const SLICE_ROUNDS: usize = 3;
+/// The most rounds a pass asks again in all, progressing or not.
+const SLICE_ROUNDS_MOST: usize = 64;
+/// No retry round starts once a pass has run this long: half a day chunk's claim (`chunks::CLAIM_TIMEOUT`), soo no
+/// other worker takes the day over while it is still being read.
+const SLICE_RETRY_FOR: Duration = Duration::from_secs(crate::chunks::CLAIM_TIMEOUT as u64 / 2);
+
+/// The parts of `range` not finished, refused for now or failed (`again`), cut into `size` long slices: the ones a
+/// stream never started after a slice failed.
+fn unread(range: (u64, u64), finished: &Finished, refused: &[(u64, u64)], again: &[(u64, u64)], size: u64) -> Vec<(u64, u64)> {
+    let mut taken: Vec<(u64, u64)> = finished.0.iter().chain(refused).chain(again).copied().collect();
+    taken.sort_unstable();
+    let mut out = Vec::new();
+    let mut next = Some(range.0);
+    for (a, b) in taken {
+        let Some(n) = next else { break };
+        if b < n {
+            continue;
+        }
+        if a > n {
+            out.extend(make_slices(n, (a - 1).min(range.1), size, false));
+        }
+        next = b.checked_add(1);
+    }
+    if let Some(n) = next.filter(|n| *n <= range.1) {
+        out.extend(make_slices(n, range.1, size, false));
+    }
+    out.retain(|(a, _)| *a <= range.1);
+    out
+}
+
+/// `slices` cut in two where they can be, in the order a pass reads them.
+fn halved(slices: Vec<(u64, u64)>, descending: bool) -> Vec<(u64, u64)> {
+    let mut out: Vec<(u64, u64)> = Vec::with_capacity(slices.len() * 2);
+    for (a, b) in slices {
+        if a < b {
+            let mid = a + (b - a) / 2;
+            out.extend([(a, mid), (mid + 1, b)]);
+        } else {
+            out.push((a, b));
+        }
+    }
+    out.sort_unstable();
+    if descending {
+        out.reverse();
+    }
+    out
+}
+
 /// `start..=end` cut into `size` long slices, newest first when `descending`.
 pub fn make_slices(start: u64, end: u64, size: u64, descending: bool) -> Vec<(u64, u64)> {
     let size = size.max(1);
@@ -2611,6 +2724,28 @@ pub fn make_slices(start: u64, end: u64, size: u64, descending: bool) -> Vec<(u6
         slices.reverse();
     }
     slices
+}
+
+#[cfg(test)]
+mod slice_retry_tests {
+    #[test]
+    fn failed_slices_are_asked_again_in_halves_in_reading_order() {
+        assert_eq!(super::halved(vec![(10, 19), (0, 3), (7, 7)], false), vec![(0, 1), (2, 3), (7, 7), (10, 14), (15, 19)]);
+        assert_eq!(super::halved(vec![(0, 3), (10, 11)], true), vec![(11, 11), (10, 10), (2, 3), (0, 1)]);
+        assert!(super::halved(Vec::new(), false).is_empty());
+    }
+
+    #[test]
+    fn slices_a_stream_never_started_are_unread_and_refused_ones_are_not() {
+        let mut finished = super::Finished::default();
+        finished.add(0, 9);
+        finished.add(30, 39);
+        // 10-19 failed, 20-29 never started, 40-49 refused for now, 50-64 never started
+        let unread = super::unread((0, 64), &finished, &[(40, 49)], &[(10, 19)], 10);
+        assert_eq!(unread, vec![(20, 29), (50, 59), (60, 64)]);
+        assert!(super::unread((0, 9), &finished, &[], &[], 10).is_empty());
+        assert_eq!(super::unread((5, 12), &super::Finished::default(), &[], &[], 4), vec![(5, 8), (9, 12)]);
+    }
 }
 
 /// One group at a time from sync code, on the pool's active server.
