@@ -33,6 +33,10 @@ pub(crate) mod stop_tests;
 #[path="native_asset_tests.rs"]
 pub(crate) mod asset_tests;
 
+#[cfg(test)]
+#[path="native_predb_revision_tests.rs"]
+mod predb_revision_tests;
+
 pub(crate) struct Steps {
     pub(crate) ordered:Vec<Arc<dyn Step>>,
     pub(crate) enabled:StepMask,

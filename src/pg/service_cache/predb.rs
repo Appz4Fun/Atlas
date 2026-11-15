@@ -86,6 +86,11 @@ impl Service {
         Ok(counts)
     }
 
+    #[cfg(test)]
+    pub(crate) fn import_page_for_test(&self,source:i64,entries:&[Entry],now:i64,cursor:Option<(i64,i64)>)->Result<Counts> {
+        self.import(source,entries,now,cursor)
+    }
+
     fn cached(&self,spec:&FeedSpec,url:&str,page:u32)->Result<Option<String>> {
         if !crate::raw_store::is_immutable_predb_page(spec.key,page) {return Ok(None)}
         let key=format!("GET:{}:{}",spec.key,crate::raw_store::canonical_cache_url(url));
