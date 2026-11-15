@@ -335,6 +335,10 @@ struct Scheduler {
     chunk_errors: Mutex<HashMap<(String, usize), u32>>,
     /// servers one of whose workers sweeps a split group (see `take_sweep`)
     sweeping: Mutex<HashSet<usize>>,
+    /// per server, until when a look for a split group to sweep that found none is not repeated (`SWEEP_RECHECK`)
+    no_sweep_until: Mutex<HashMap<usize, Instant>>,
+    /// per server, until when a look for a day chunk that found none is not repeated (`CHUNK_RECHECK`)
+    no_chunk_until: Mutex<HashMap<usize, Instant>>,
     /// per server, how many of its workers run a day chunk now (see `next_work`)
     chunking: Mutex<HashMap<usize, usize>>,
     /// groups resting after going idle or after an error
@@ -559,12 +563,16 @@ impl Scheduler {
 
     /// `take_chunk` in a day chunk worker's place on `server` (`start_chunk`), given back when there is none.
     async fn take_chunk_within(&self, server: usize, db: &Db, most: usize) -> Option<crate::chunks::Claim> {
+        if self.no_chunk_until.lock().unwrap().get(&server).is_some_and(|t| Instant::now() < *t) {
+            return None;
+        }
         if !self.start_chunk(server, most) {
             return None;
         }
         let chunk = take_chunk(self, server, db).await;
         if chunk.is_none() {
             self.chunk_done(server);
+            self.no_chunk_until.lock().unwrap().insert(server, Instant::now() + CHUNK_RECHECK);
         }
         chunk
     }
@@ -1006,6 +1014,9 @@ async fn take_chunk(sched: &Scheduler, server: usize, db: &Db) -> Option<crate::
 /// and hasnt swept, none while another of its workers sweeps.
 async fn take_sweep(sched: &Scheduler, server: usize, db: &Db) -> Option<String> {
     let tier = sched.ctx.pool.indexing_tier();
+    if sched.no_sweep_until.lock().unwrap().get(&server).is_some_and(|t| Instant::now() < *t) {
+        return None;
+    }
     if !tier.contains(&server) || !sched.sweeping.lock().unwrap().insert(server) {
         return None;
     }
@@ -1051,9 +1062,27 @@ async fn take_sweep(sched: &Scheduler, server: usize, db: &Db) -> Option<String>
     };
     if found.is_none() {
         sched.sweeping.lock().unwrap().remove(&server);
+        sched.no_sweep_until.lock().unwrap().insert(server, Instant::now() + SWEEP_RECHECK);
     }
     found
 }
+
+/// How long a server's look for a split group to sweep that found none holds before the next. Every idle worker
+/// looked, each time, on the indexer's one owner session: on prod it was that session's biggest single user, ahead of
+/// the saves. A sweep is due only once every day chunk of a split group is done, which these seconds barely delay.
+#[cfg(not(test))]
+const SWEEP_RECHECK: Duration = Duration::from_secs(30);
+/// Tests look again at once.
+#[cfg(test)]
+const SWEEP_RECHECK: Duration = Duration::ZERO;
+
+/// How long a server's look for a day chunk that found none holds before its workers look again: each idle worker
+/// looked straight away, with a claim over every group on the owner session. A chunk that becomes claimable in the
+/// meantime waits at most this long.
+#[cfg(not(test))]
+const CHUNK_RECHECK: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const CHUNK_RECHECK: Duration = Duration::ZERO;
 
 /// What a worker does next.
 enum Work {
@@ -1422,6 +1451,8 @@ async fn run_servers(
         skip: Mutex::new(HashMap::new()),
         chunk_errors: Mutex::new(HashMap::new()),
         sweeping: Mutex::new(HashSet::new()),
+        no_sweep_until: Mutex::new(HashMap::new()),
+        no_chunk_until: Mutex::new(HashMap::new()),
         chunking: Mutex::new(HashMap::new()),
         wait_until: Mutex::new(HashMap::new()),
         wait_pruned: Mutex::new(None),
@@ -2448,6 +2479,8 @@ mod tests {
             skip: Default::default(),
             chunk_errors: Default::default(),
             sweeping: Default::default(),
+            no_sweep_until: Default::default(),
+            no_chunk_until: Default::default(),
             chunking: Default::default(),
             wait_until: Default::default(),
             wait_pruned: Default::default(),
