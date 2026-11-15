@@ -123,7 +123,7 @@ pub(crate) fn execute_if_native(command: NativeCacheCommand<'_>) -> Result<Optio
                      episode=coalesce(excluded.episode,existing.episode),
                      release_name=coalesce(excluded.release_name,existing.release_name),
                      raw_json_zst=NULL, checked_at=excluded.checked_at"
-                ), &[&hash,&f.imdb_id,&f.tmdb_id,&f.kind,&f.title,&f.year,&f.season,&f.episode,&f.release_name,&checked_at])?;
+                ), &[&super::nul_free(&hash),&f.imdb_id,&f.tmdb_id,&super::nul_free_opt(&f.kind),&super::nul_free_opt(&f.title),&f.year,&f.season,&f.episode,&super::nul_free_opt(&f.release_name),&checked_at])?;
                 NativeCacheReply::Stored
             }
         };
