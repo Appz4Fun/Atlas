@@ -45,9 +45,12 @@ const LIVE_MEMORY_BUDGET: usize = 512 << 20;
 pub(crate) const FETCH_HEADROOM: usize = 16 << 20;
 /// The header store's memory budget admits one listing request per `FETCH_SLOT` of it. It used to be one per
 /// `FETCH_HEADROOM`: 32 at once on prod's 512 MiB, across every server, with 180 connections open, and ingest
-/// stayed at about 25 XOVERs in flight. Memory is still bounded by the budget: every record reserves its charge first
-/// (`reserve_memory`), and admission still waits until `FETCH_HEADROOM` of it is free.
-pub(crate) const FETCH_SLOT: usize = 2 << 20;
+/// stayed at about 25 XOVERs in flight. What the store copies stays within the budget (every record reserves its
+/// charge first, `reserve_memory`), but a request's read is not charged to it: each may hold up to `FETCH_HEADROOM`
+/// while it reads (`nntp::OVERVIEW_CHARGE`, `OVERVIEW_TEXT`), so reads can hold up to
+/// `min(connections, budget / FETCH_SLOT) * FETCH_HEADROOM` on top of the budget: 128 * 16 MiB = 2 GiB on prod,
+/// under the indexer's 8 GiB guard. Typical reads (5000 overview rows) are a few MiB.
+pub(crate) const FETCH_SLOT: usize = 4 << 20;
 /// How long a day claimed here stays kept after its last claim, on top of the keep set's source.
 pub const RECENT_CLAIM: Duration = Duration::from_secs(6 * 3600);
 

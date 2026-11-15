@@ -33,6 +33,8 @@ mod overview_budget_tests;
 // The same per-fetch headroom used by NXV admission. Half is conservatively
 // charged to raw/capture/parsed rows; the other half covers bounded compressed
 // input/output, a partial line, connection buffers and temporary decode copies.
+// Not charged to the store's budget: admitted reads together hold at most
+// `FETCH_SLOT`-many of these (see `nxv_store::store::FETCH_SLOT`).
 const OVERVIEW_CHARGE: usize = crate::nxv_store::store::FETCH_HEADROOM / 2;
 const OVERVIEW_TEXT: usize = crate::nxv_store::store::FETCH_HEADROOM / 8;
 const OVERVIEW_LINE: usize = crate::nxv_store::slab::MAX_LINE;
