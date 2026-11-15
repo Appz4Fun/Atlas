@@ -14,6 +14,7 @@ use anyhow::{Context, Result};
 use memmap2::{Mmap, MmapOptions};
 use nntp_xover_engine::container::NxvBlockView;
 
+use super::recovery_read::{self, ReadKind, RecoveryReadPacer};
 use super::sync::{fsync_only, full_flush};
 
 pub const ENTRY_LEN: usize = 64;
@@ -79,10 +80,35 @@ impl Entry {
     /// The entry for a block found at `offset` of a mapped arena, if a whole, intact block is there. Its time range is
     /// the block's clamped into `day`: a stray date stays in the row (lossless), and readers clamp a row's time into its
     /// entry's range.
-    fn of_block(map: &[u8], offset: u64, seq: u32, day: i64) -> Option<Entry> {
+    fn of_block(
+        map: &[u8],
+        offset: u64,
+        seq: u32,
+        day: i64,
+        mut pacer: Option<&mut RecoveryReadPacer>,
+    ) -> Option<Entry> {
         let at = usize::try_from(offset).ok()?;
-        let view = NxvBlockView::from_mmap_slice(map.get(at..)?).ok()?;
-        if !view.verify_body() {
+        let data = map.get(at..)?;
+        if let Some(pacer) = pacer.as_deref_mut() {
+            recovery_read::admit(Some(pacer), ReadKind::Metadata, recovery_read::metadata_allowance(data.len()));
+        } else {
+            #[cfg(test)]
+            super::store::recovery_pacing_tests::observe_metadata(data.len());
+        }
+        let view = NxvBlockView::from_mmap_slice(data).ok()?;
+        let intact = if let Some(pacer) = pacer {
+            view.verify_body_with_admission(|bytes| recovery_read::admit(Some(&mut *pacer), ReadKind::Body, bytes))
+        } else {
+            #[cfg(test)]
+            if !view.is_cold() {
+                super::store::recovery_pacing_tests::observe(
+                    super::store::recovery_pacing_tests::ReadKind::Body,
+                    view.header.total_block_bytes as usize - nntp_xover_engine::container::DATA_START,
+                );
+            }
+            view.verify_body()
+        };
+        if !intact {
             return None;
         }
         Some(Self::from_view(view, offset, seq, day))
@@ -252,6 +278,14 @@ impl Segment {
         Self::open_with_mapping(dir, day, false)
     }
     pub(crate) fn open_with_mapping(dir: &Path, day: i64, bounded_maps: bool) -> Result<(Arc<Segment>, Healed)> {
+        Self::open_with_recovery_read(dir, day, bounded_maps, None)
+    }
+    pub(super) fn open_with_recovery_read(
+        dir: &Path,
+        day: i64,
+        bounded_maps: bool,
+        pacer: Option<&mut RecoveryReadPacer>,
+    ) -> Result<(Arc<Segment>, Healed)> {
         std::fs::create_dir_all(dir).with_context(|| format!("making {}", dir.display()))?;
         let name = day_name(day);
         let arena_path = dir.join(format!("{name}.nxv"));
@@ -260,7 +294,7 @@ impl Segment {
         let arena = rw(&arena_path).with_context(|| format!("opening {}", arena_path.display()))?;
         let index = rw(&index_path).with_context(|| format!("opening {}", index_path.display()))?;
         let identity = file_identity(&arena)?;
-        let (entries, arena_len, healed) = heal(&arena, &index, day)?;
+        let (entries, arena_len, healed) = heal(&arena, &index, day, pacer)?;
         let map = if bounded_maps { None } else { map_arena(&arena, arena_len)? };
         let committed = entries.iter().map(|e| (e.server, e.slab_gen)).collect();
         let seg = Segment {
@@ -405,12 +439,19 @@ fn map_arena(arena: &File, len: u64) -> Result<Option<Arc<Mmap>>> {
     Ok(Some(Arc::new(map)))
 }
 
-fn recovery_entry(arena: &File, arena_len: u64, offset: u64, seq: u32, day: i64) -> Result<Option<Entry>> {
+fn recovery_entry(
+    arena: &File,
+    arena_len: u64,
+    offset: u64,
+    seq: u32,
+    day: i64,
+    mut pacer: Option<&mut RecoveryReadPacer>,
+) -> Result<Option<Entry>> {
     if arena_len.saturating_sub(offset) < 64 {
         return Ok(None);
     }
     let mut header = [0; 64];
-    arena.read_exact_at(&mut header, offset)?;
+    recovery_read::read_exact_at(arena, &mut header, offset, pacer.as_deref_mut(), ReadKind::Header)?;
     let len = u32::from_le_bytes(header[48..52].try_into().expect("fixed header field")) as usize;
     if len < nntp_xover_engine::container::DATA_START
         || !len.is_multiple_of(64)
@@ -421,14 +462,19 @@ fn recovery_entry(arena: &File, arena_len: u64, offset: u64, seq: u32, day: i64)
     // SAFETY: recovery is exclusive, and no truncation happens until this
     // single-block mapping has been dropped by returning from this helper.
     let map = unsafe { MmapOptions::new().offset(offset).len(len).map(arena)? };
-    Ok(Entry::of_block(&map, 0, seq, day).map(|mut entry| {
+    Ok(Entry::of_block(&map, 0, seq, day, pacer).map(|mut entry| {
         entry.offset = offset;
         entry
     }))
 }
 
 /// Recovery at open: the entries to keep, the arena's good length, and what was done.
-fn heal(arena: &File, index: &File, day: i64) -> Result<(Vec<Entry>, u64, Healed)> {
+fn heal(
+    arena: &File,
+    index: &File,
+    day: i64,
+    mut pacer: Option<&mut RecoveryReadPacer>,
+) -> Result<(Vec<Entry>, u64, Healed)> {
     let arena_len = arena.metadata()?.len();
     let index_len = index.metadata()?.len();
     let mut healed = Healed::default();
@@ -436,7 +482,13 @@ fn heal(arena: &File, index: &File, day: i64) -> Result<(Vec<Entry>, u64, Healed
     let count = (index_len / ENTRY_LEN as u64) as usize;
     let mut raw = vec![0u8; count * ENTRY_LEN];
     if count > 0 {
-        index.read_exact_at(&mut raw, 0)?;
+        if let Some(pacer) = pacer.as_deref_mut() {
+            recovery_read::read_exact_at(index, &mut raw, 0, Some(pacer), ReadKind::Index)?;
+        } else {
+            #[cfg(test)]
+            super::store::recovery_pacing_tests::observe(super::store::recovery_pacing_tests::ReadKind::Index, raw.len());
+            index.read_exact_at(&mut raw, 0)?;
+        }
     }
     let mut entries: Vec<Entry> = Vec::with_capacity(count);
     let mut end = 0u64;
@@ -460,7 +512,7 @@ fn heal(arena: &File, index: &File, day: i64) -> Result<(Vec<Entry>, u64, Healed
     // Recovery faults in at most one block, then unmaps it before inspecting
     // the next tail block. A large roll-forward cannot retain arena-wide RSS.
     if let Some(last) = entries.last().copied()
-        && recovery_entry(arena, arena_len, last.offset, last.seq, day)?.is_none()
+        && recovery_entry(arena, arena_len, last.offset, last.seq, day, pacer.as_deref_mut())?.is_none()
     {
         entries.pop();
         healed.dropped_entries += 1;
@@ -468,7 +520,7 @@ fn heal(arena: &File, index: &File, day: i64) -> Result<(Vec<Entry>, u64, Healed
         end = last.offset;
     }
     while end < arena_len {
-        match recovery_entry(arena, arena_len, end, entries.len() as u32, day)? {
+        match recovery_entry(arena, arena_len, end, entries.len() as u32, day, pacer.as_deref_mut())? {
             Some(entry) => {
                 end += u64::from(entry.len);
                 entries.push(entry);

@@ -1683,6 +1683,20 @@ impl<'a> NxvBlockView<'a> {
         xxhash_rust::xxh3::xxh3_64(&self.data[DATA_START..]) == self.body_hash()
     }
 
+    /// Verify the hot body after admitting each bounded chunk before it is read.
+    /// Cold blocks retain the ordinary verifier's lazy policy.
+    pub fn verify_body_with_admission(&self, mut before_chunk: impl FnMut(usize)) -> bool {
+        if self.is_cold() {
+            return true;
+        }
+        let mut hash = xxhash_rust::xxh3::Xxh3::new();
+        for chunk in self.data[DATA_START..].chunks(1024 * 1024) {
+            before_chunk(chunk.len());
+            hash.update(chunk);
+        }
+        hash.digest() == self.body_hash()
+    }
+
     /// Verify a cold block's body without allocating a full hot block.
     pub fn verify_cold_body(&self) -> Result<()> {
         ensure!(self.is_cold(), "block is not cold");

@@ -7,6 +7,7 @@
 
 pub mod linker;
 pub mod live;
+mod recovery_read;
 pub mod segment;
 pub mod slab;
 pub mod store;
