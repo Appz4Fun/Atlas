@@ -6,7 +6,13 @@
 //! The indexer is the single writer and the web process reads the same file.
 //! A save writes here first and names the PostgreSQL transaction it belongs to;
 //! `settle` later asks PostgreSQL how that transaction ended and takes the rows
-//! back out when it rolled back, so the two never disagree after a crash.
+//! back out when it rolled back, so the two never disagree after the process
+//! crashes. Commits here are not synced to disk one by one (`synchronous =
+//! normal` in WAL mode): an operating system crash or power loss can lose the
+//! last ones while PostgreSQL kept the transactions that counted them, which
+//! leaves those releases short of articles. That is the loss the store is
+//! allowed (the user accepts up to a rolling day of it); every save syncing
+//! here held the indexer's one PostgreSQL owner session for its fsyncs.
 //!
 //! The file holds only what Usenet said, but PostgreSQL's counts are of the
 //! articles in it: the catalogue names the one store it counts, and a
@@ -128,8 +134,8 @@ impl Store {
         conn.busy_timeout(std::time::Duration::from_secs(30))?;
         conn.execute_batch(
             "pragma journal_mode = wal;
-             pragma synchronous = full;
-             pragma cache_size = -131072;
+             pragma synchronous = normal;
+             pragma cache_size = -1048576;
              pragma wal_autocheckpoint = 8192;
              pragma temp_store = memory;",
         )?;
