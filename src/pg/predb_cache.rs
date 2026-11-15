@@ -200,3 +200,6 @@ fn rows_for_key(client: &mut impl GenericClient, key: i64) -> Result<Vec<TitleRo
 #[cfg(test)]
 #[path="predb_cache_tests.rs"]
 mod tests;
+#[cfg(test)]
+#[path="predb_cache_fastpath_tests.rs"]
+mod fastpath_tests;
