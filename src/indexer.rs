@@ -2131,8 +2131,11 @@ impl Pass<'_> {
     /// the newest slices first.
     ///
     /// A slice failing stops new ones from starting, but the ones that made it
-    /// are still saved, and `Ranged` says how far the range is done from
-    /// either end, soo a cursor can move past them and they arent fetched again.
+    /// are still saved. Once the stream ends, what is left unread (the slices
+    /// that failed, halved, and those never started) is asked again, up to
+    /// `SLICE_ROUNDS` times. `Ranged` says how far the range is done from
+    /// either end, soo a cursor can move past them and they arent fetched again;
+    /// a range left unread with no stop is an error.
     async fn process_range<P>(&self, start: i64, end: i64, kind: &str, progress: &mut P) -> Ranged
     where
         P: FnMut(&Progress) + ?Sized,
@@ -2210,6 +2213,9 @@ impl Pass<'_> {
         // group's backfill behind them.
         let mut again: Vec<(u64, u64)> = Vec::new();
         let mut again_error: Option<crate::nntp::NntpError> = None;
+        // slices refused with a 5xx and not passed over yet: tried again on a later pass, not in this one
+        let mut refused: Vec<(u64, u64)> = Vec::new();
+        let range = (start.max(0) as u64, end.max(0) as u64);
         let mut round = 0;
         let mut saved = Progress::default();
         let mut done = 0;
@@ -2233,9 +2239,17 @@ impl Pass<'_> {
                 self.advance(side, &finished, (start, end), &mut moved).await;
             }
             let Some(slice) = rx.recv().await else {
-                if !again.is_empty() && round < SLICE_ROUNDS && !self.ctx.stop.load(std::sync::atomic::Ordering::Acquire) {
+                let stopped = self.ctx.stop.load(std::sync::atomic::Ordering::Acquire);
+                // a slice failing stops the stream starting the rest: those are as unread as the failed ones
+                let unread = unread(range, &finished, &refused, &again, size);
+                if (!again.is_empty() || !unread.is_empty()) && round < SLICE_ROUNDS && !stopped && !save_failed {
                     round += 1;
-                    let retry = halved(std::mem::take(&mut again), kind == "BACKFILL");
+                    let mut retry = halved(std::mem::take(&mut again), false);
+                    retry.extend(unread);
+                    retry.sort_unstable();
+                    if kind == "BACKFILL" {
+                        retry.reverse();
+                    }
                     if self.ctx.verbose {
                         println!("[{kind}] {group}: asking {} slices again (round {round})", retry.len());
                     }
@@ -2275,6 +2289,7 @@ impl Pass<'_> {
                         finished.add(slice.start, slice.end);
                     } else {
                         println!("[{kind}] {group} {}-{} refused ({e}), trying it again later", slice.start, slice.end);
+                        refused.push((slice.start, slice.end));
                         error.get_or_insert_with(|| anyhow::Error::new(e));
                     }
                     continue;
@@ -2317,6 +2332,13 @@ impl Pass<'_> {
 
         if let Some(e) = again_error {
             error.get_or_insert_with(|| anyhow::Error::new(e));
+        }
+        // read in part with nothing failing on the last try and no stop: not a success either
+        if error.is_none()
+            && !self.ctx.stop.load(std::sync::atomic::Ordering::Acquire)
+            && finished.ends(range.0, range.1).0 != Some(range.1)
+        {
+            error = Some(anyhow!("{group} {}-{}: part of the range was left unread", range.0, range.1));
         }
         if let (Some(low), Some(high)) = (low, high) {
             let key = self.key.clone();
@@ -2615,9 +2637,32 @@ fn name_sources(release: &Release) -> Vec<(String, Extract)> {
         .collect()
 }
 
-/// `start..=end` cut into `size` long slices, newest first when `descending`.
-/// How many times the slices of a pass that failed are asked again, halved each time (see `process_range_dated`).
+/// How many times what a pass left unread is asked again (see `process_range`).
 const SLICE_ROUNDS: usize = 3;
+
+/// The parts of `range` not finished, refused for now or failed (`again`), cut into `size` long slices: the ones a
+/// stream never started after a slice failed.
+fn unread(range: (u64, u64), finished: &Finished, refused: &[(u64, u64)], again: &[(u64, u64)], size: u64) -> Vec<(u64, u64)> {
+    let mut taken: Vec<(u64, u64)> = finished.0.iter().chain(refused).chain(again).copied().collect();
+    taken.sort_unstable();
+    let mut out = Vec::new();
+    let mut next = Some(range.0);
+    for (a, b) in taken {
+        let Some(n) = next else { break };
+        if b < n {
+            continue;
+        }
+        if a > n {
+            out.extend(make_slices(n, (a - 1).min(range.1), size, false));
+        }
+        next = b.checked_add(1);
+    }
+    if let Some(n) = next.filter(|n| *n <= range.1) {
+        out.extend(make_slices(n, range.1, size, false));
+    }
+    out.retain(|(a, _)| *a <= range.1);
+    out
+}
 
 /// `slices` cut in two where they can be, in the order a pass reads them.
 fn halved(slices: Vec<(u64, u64)>, descending: bool) -> Vec<(u64, u64)> {
@@ -2637,6 +2682,7 @@ fn halved(slices: Vec<(u64, u64)>, descending: bool) -> Vec<(u64, u64)> {
     out
 }
 
+/// `start..=end` cut into `size` long slices, newest first when `descending`.
 pub fn make_slices(start: u64, end: u64, size: u64, descending: bool) -> Vec<(u64, u64)> {
     let size = size.max(1);
     let mut slices = Vec::new();
@@ -2664,6 +2710,18 @@ mod slice_retry_tests {
         assert_eq!(super::halved(vec![(10, 19), (0, 3), (7, 7)], false), vec![(0, 1), (2, 3), (7, 7), (10, 14), (15, 19)]);
         assert_eq!(super::halved(vec![(0, 3), (10, 11)], true), vec![(11, 11), (10, 10), (2, 3), (0, 1)]);
         assert!(super::halved(Vec::new(), false).is_empty());
+    }
+
+    #[test]
+    fn slices_a_stream_never_started_are_unread_and_refused_ones_are_not() {
+        let mut finished = super::Finished::default();
+        finished.add(0, 9);
+        finished.add(30, 39);
+        // 10-19 failed, 20-29 never started, 40-49 refused for now, 50-64 never started
+        let unread = super::unread((0, 64), &finished, &[(40, 49)], &[(10, 19)], 10);
+        assert_eq!(unread, vec![(20, 29), (50, 59), (60, 64)]);
+        assert!(super::unread((0, 9), &finished, &[], &[], 10).is_empty());
+        assert_eq!(super::unread((5, 12), &super::Finished::default(), &[], &[], 4), vec![(5, 8), (9, 12)]);
     }
 }
 
