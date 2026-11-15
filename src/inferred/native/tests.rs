@@ -70,7 +70,7 @@ fn native_inferred_real_head_is_durable_before_atomic_missing_part_acceptance() 
     let pool=Arc::new(crate::nntp::Pool::new(&[server.config.clone()]).with_body_tries(Duration::from_secs(1),0));
     let mut service=Service::new(&runtime.owner,&runtime.db,pool,store.clone(),&headers).unwrap();service.next=Instant::now();
     let progress=service.tick(net.handle(),now).unwrap();assert_eq!(progress.requested,1);assert_eq!(progress.found,1);assert!(service.journal.pending().unwrap().is_none());
-    runtime.owner.with(|client| {assert_eq!(client.query_one("select count(*) from segments",&[])?.get::<_,i64>(0),4);assert_eq!(client.query_one("select tries from inferred_ids where message_id='part3of4.own@example.invalid'",&[])?.get::<_,i64>(0),1);Ok(())}).unwrap();
+    runtime.owner.with(|client| {assert_eq!(crate::article_local::Store::articles_for_test(&mut *client).len() as i64,4);assert_eq!(client.query_one("select tries from inferred_ids where message_id='part3of4.own@example.invalid'",&[])?.get::<_,i64>(0),1);Ok(())}).unwrap();
     service.next=Instant::now();assert_eq!(service.tick(net.handle(),now+301).unwrap().requested,0);assert_eq!(server.hits.load(Ordering::Acquire),1);
     drop(service);runtime.owner.close();store.close().unwrap();
 }
@@ -80,7 +80,7 @@ fn native_inferred_wrong_actual_mid_cannot_fill_the_expected_part() {
     let (_schema,runtime,_root,store,headers)=fixture();let now=1800000000;seed(&runtime,now,&[1,2,4]);let server=peer(now,true,None);let net=net();
     let mut service=Service::new(&runtime.owner,&runtime.db,Arc::new(crate::nntp::Pool::new(&[server.config.clone()]).with_body_tries(Duration::from_secs(1),0)),store.clone(),&headers).unwrap();service.next=Instant::now();
     let progress=service.tick(net.handle(),now).unwrap();assert_eq!(progress.found,0);assert_eq!(progress.unusable,1);assert!(service.journal.pending().unwrap().is_none());
-    runtime.owner.with(|client| {assert_eq!(client.query_one("select count(*) from segments",&[])?.get::<_,i64>(0),3);assert_eq!(client.query_one("select count(*) from segments where part=3",&[])?.get::<_,i64>(0),0);Ok(())}).unwrap();
+    runtime.owner.with(|client| {assert_eq!(crate::article_local::Store::articles_for_test(&mut *client).len() as i64,3);assert_eq!(crate::article_local::Store::articles_for_test(&mut *client).iter().filter(|a|a.part==Some(3)).count() as i64,0);Ok(())}).unwrap();
     assert_eq!(server.hits.load(Ordering::Acquire),1);drop(service);runtime.owner.close();store.close().unwrap();
 }
 #[test]
@@ -92,7 +92,7 @@ fn native_inferred_actual_writer_growth_during_head_supersedes_without_a_late_re
     let worker=std::thread::spawn(move||{let progress=service.tick(&handle,now).unwrap();(service,progress)});
     ready.recv_timeout(Duration::from_secs(10)).unwrap();seed(&runtime,now,&[3]);release.send(()).unwrap();let (mut service,progress)=worker.join().unwrap();
     assert_eq!(progress.found,0);assert_eq!(progress.superseded,1);assert!(service.journal.pending().unwrap().is_none());
-    runtime.owner.with(|client| {assert_eq!(client.query_one("select count(*) from inferred_ids",&[])?.get::<_,i64>(0),0);assert_eq!(client.query_one("select count(*) from segments",&[])?.get::<_,i64>(0),4);Ok(())}).unwrap();
+    runtime.owner.with(|client| {assert_eq!(client.query_one("select count(*) from inferred_ids",&[])?.get::<_,i64>(0),0);assert_eq!(crate::article_local::Store::articles_for_test(&mut *client).len() as i64,4);Ok(())}).unwrap();
     drop(service);runtime.owner.close();store.close().unwrap();
 }
 #[test]
@@ -108,7 +108,7 @@ fn native_inferred_pending_raw_head_replays_after_owner_replacement_without_refe
     let actual=replacement.owner.epoch().unwrap().catalog().header_config(&headers).unwrap();let (store,_)=crate::nxv_store::store::Store::open(crate::nxv_store::store::StoreConfig::new(actual.root()),crate::nxv_store::store::KeepSet::default()).unwrap();
     let mut service=Service::new(&replacement.owner,&replacement.db,pool,store.clone(),&headers).unwrap();service.next=Instant::now();let progress=service.tick(net.handle(),now+1).unwrap();
     assert_eq!(progress.found,1);assert_eq!(progress.requested,0,"retained real HEAD needs no new provider response");assert_eq!(server.hits.load(Ordering::Acquire),1);assert!(service.journal.pending().unwrap().is_none());
-    replacement.owner.with(|client| {assert_eq!(client.query_one("select count(*) from segments",&[])?.get::<_,i64>(0),4);assert_eq!(client.query_one("select tries from inferred_ids",&[])?.get::<_,i64>(0),1);Ok(())}).unwrap();
+    replacement.owner.with(|client| {assert_eq!(crate::article_local::Store::articles_for_test(&mut *client).len() as i64,4);assert_eq!(client.query_one("select tries from inferred_ids",&[])?.get::<_,i64>(0),1);Ok(())}).unwrap();
     drop(service);replacement.owner.close();store.close().unwrap();
 }
 
@@ -123,7 +123,7 @@ fn native_inferred_stop_drains_the_actual_head_read_before_any_part_or_result() 
     let (mut service,result)=worker.join().unwrap();assert!(crate::pg::outage::is_attempt_ended(&result.unwrap_err()));assert!(service.journal.pending().unwrap().is_none());assert_eq!(runtime.owner.failure(),None);
     release.send(()).unwrap();
     let mut observer=schema.pool.get().unwrap();let mut tx=observer.build_transaction().read_only(true).start().unwrap();
-    assert_eq!(tx.query_one("select count(*) from inferred_ids",&[]).unwrap().get::<_,i64>(0),0);assert_eq!(tx.query_one("select count(*) from segments",&[]).unwrap().get::<_,i64>(0),3);tx.commit().unwrap();drop(observer);
+    assert_eq!(tx.query_one("select count(*) from inferred_ids",&[]).unwrap().get::<_,i64>(0),0);assert_eq!(crate::article_local::Store::articles_for_test(&mut tx).len() as i64,3);tx.commit().unwrap();drop(observer);
     assert_eq!(server.hits.load(Ordering::Acquire),1);drop(service);runtime.owner.close();store.close().unwrap();
 }
 
@@ -149,7 +149,7 @@ fn native_inferred_oversized_header_filename_is_deferred_without_poisoning_owner
     runtime.owner.with(|client|crate::pg::release_writer::save(client,&[release],now).map(|_|())).unwrap();
     let mut service=Service::new(&runtime.owner,&runtime.db,Arc::new(crate::nntp::Pool::new(&[])),store.clone(),&headers).unwrap();let plan=service.plan(now).unwrap();assert!(plan.requests.is_empty());assert_eq!(plan.deferred,1);
     service.next=Instant::now();let net=net();let progress=service.tick(net.handle(),now).unwrap();assert_eq!(progress.deferred,1);assert_eq!(progress.requested,0);assert_eq!(runtime.owner.failure(),None);
-    runtime.owner.with(|client| {assert_eq!(client.query_one("select octet_length(original_filename) from files",&[])?.get::<_,i32>(0) as usize,filename.len());assert_eq!(client.query_one("select count(*) from segments",&[])?.get::<_,i64>(0),3);assert_eq!(client.query_one("select count(*) from inferred_ids",&[])?.get::<_,i64>(0),0);Ok(())}).unwrap();
+    runtime.owner.with(|client| {assert_eq!(client.query_one("select octet_length(original_filename) from files",&[])?.get::<_,i32>(0) as usize,filename.len());assert_eq!(crate::article_local::Store::articles_for_test(&mut *client).len() as i64,3);assert_eq!(client.query_one("select count(*) from inferred_ids",&[])?.get::<_,i64>(0),0);Ok(())}).unwrap();
     drop(service);runtime.owner.close();store.close().unwrap();
 }
 
@@ -166,15 +166,15 @@ fn native_inferred_bracketed_catalog_and_bare_retry_key_reconcile_one_real_commi
     assert!(matches!(service.accept(&request,request.source.revision,Outcome::Found,Some(&releases),now).unwrap(),Acceptance::Applied(_,Outcome::Found)),"a genuinely stored part must be Found");
     drop(releases);drop(permit);drop(durable);
     runtime.owner.with(|client| {
-        let row=client.query_one("select s.message_id,s.part,f.original_filename from segments s join files f on(f.release_id,f.id)=(s.release_id,s.file_id) where s.part=3",&[])?;
-        assert_eq!(row.try_get::<_,Vec<u8>>(0)?,b"<part3of4.own@example.invalid>");assert_eq!(row.try_get::<_,Option<i64>>(1)?,Some(3));assert_eq!(row.try_get::<_,Vec<u8>>(2)?,b"own.bin");
+        let third=crate::article_local::Store::articles_for_test(&mut *client).into_iter().filter(|a|a.part==Some(3)).collect::<Vec<_>>();assert_eq!(third.len(),1);let row=&third[0];
+        assert_eq!(row.message_id,b"<part3of4.own@example.invalid>");assert_eq!(row.part,Some(3));assert_eq!(row.filename,b"own.bin");
         assert_eq!(client.query_one("select message_id,tries from inferred_ids",&[])?.try_get::<_,String>(0)?,"part3of4.own@example.invalid");Ok(())
     }).unwrap();
     // Exact production sequence: the header/result COMMIT succeeded, while
     // the durable raw HEAD has not yet received its journal-consumed marker.
     let mut progress=Progress::default();service.recover(net.handle(),&mut progress,now+1).unwrap();
     assert_eq!(progress.found,0);assert_eq!(progress.replayed,1);assert!(service.journal.pending().unwrap().is_none());assert_eq!(server.hits.load(Ordering::Acquire),1,"covered recovery never re-fetches");
-    runtime.owner.with(|client| {assert_eq!(client.query_one("select count(*) from segments",&[])?.try_get::<_,i64>(0)?,4);assert_eq!(client.query_one("select tries from inferred_ids",&[])?.try_get::<_,i64>(0)?,1);assert_eq!(client.query_one("select count(*) from inferred_ids where message_id='<part3of4.own@example.invalid>'",&[])?.try_get::<_,i64>(0)?,0);Ok(())}).unwrap();
+    runtime.owner.with(|client| {assert_eq!(crate::article_local::Store::articles_for_test(&mut *client).len() as i64,4);assert_eq!(client.query_one("select tries from inferred_ids",&[])?.try_get::<_,i64>(0)?,1);assert_eq!(client.query_one("select count(*) from inferred_ids where message_id='<part3of4.own@example.invalid>'",&[])?.try_get::<_,i64>(0)?,0);Ok(())}).unwrap();
     drop(service);runtime.owner.close();store.close().unwrap();
 }
 
@@ -198,7 +198,7 @@ fn native_inferred_same_bracketed_mid_owned_by_another_file_is_not_carried_into_
     let mut service=Service::new(&runtime.owner,&runtime.db,Arc::new(crate::nntp::Pool::new(&[server.config.clone()]).with_body_tries(Duration::from_secs(1),0)),store.clone(),&headers).unwrap();
     conflicting_advertisement(&service,&net,true,now);service.next=Instant::now();let progress=service.tick(net.handle(),now).unwrap();
     assert_eq!(progress.found,0);assert_eq!(progress.unusable,1);assert_eq!(server.hits.load(Ordering::Acquire),2);
-    runtime.owner.with(|client| {let row=client.query_one("select f.original_filename,s.part from segments s join files f on(f.release_id,f.id)=(s.release_id,s.file_id) where s.message_id=$1",&[&b"<part3of4.own@example.invalid>".as_slice()])?;assert_eq!(row.try_get::<_,Vec<u8>>(0)?,b"other.bin");assert_eq!(row.try_get::<_,Option<i64>>(1)?,Some(3));assert_eq!(client.query_one("select count(*) from segments s join files f on(f.release_id,f.id)=(s.release_id,s.file_id) where f.original_filename=$1 and s.part=3",&[&b"own.bin".as_slice()])?.try_get::<_,i64>(0)?,0);Ok(())}).unwrap();
+    runtime.owner.with(|client| {let all=crate::article_local::Store::articles_for_test(&mut *client);let own=all.iter().filter(|a|a.message_id==b"<part3of4.own@example.invalid>").collect::<Vec<_>>();assert_eq!(own.len(),1);let row=own[0];assert_eq!(row.filename,b"other.bin");assert_eq!(row.part,Some(3));assert_eq!(all.iter().filter(|a|a.filename==b"own.bin"&&a.part==Some(3)).count(),0);Ok(())}).unwrap();
     drop(service);runtime.owner.close();store.close().unwrap();
 }
 #[test]
@@ -207,6 +207,6 @@ fn native_inferred_same_bracketed_mid_with_the_wrong_stored_part_cannot_authoriz
     let (_schema,runtime,_root,store,headers)=fixture();let now=1800000000;seed(&runtime,now,&[1,2,4]);let server=peer(now,false,None);let net=net();
     let mut service=Service::new(&runtime.owner,&runtime.db,Arc::new(crate::nntp::Pool::new(&[server.config.clone()]).with_body_tries(Duration::from_secs(1),0)),store.clone(),&headers).unwrap();
     conflicting_advertisement(&service,&net,false,now);assert!(service.plan(now).unwrap().requests.is_empty(),"every own MID/part must prove the template");service.next=Instant::now();let progress=service.tick(net.handle(),now).unwrap();assert_eq!(progress.found,0);assert_eq!(progress.requested,0);assert_eq!(server.hits.load(Ordering::Acquire),1);
-    runtime.owner.with(|client| {let row=client.query_one("select f.original_filename,s.part from segments s join files f on(f.release_id,f.id)=(s.release_id,s.file_id) where s.message_id=$1",&[&b"<part3of4.own@example.invalid>".as_slice()])?;assert_eq!(row.try_get::<_,Vec<u8>>(0)?,b"own.bin");assert_eq!(row.try_get::<_,Option<i64>>(1)?,Some(2));assert_eq!(client.query_one("select count(*) from segments where part=3",&[])?.try_get::<_,i64>(0)?,0);assert_eq!(client.query_one("select count(*) from inferred_ids",&[])?.try_get::<_,i64>(0)?,0);Ok(())}).unwrap();
+    runtime.owner.with(|client| {let all=crate::article_local::Store::articles_for_test(&mut *client);let own=all.iter().filter(|a|a.message_id==b"<part3of4.own@example.invalid>").collect::<Vec<_>>();assert_eq!(own.len(),1);let row=own[0];assert_eq!(row.filename,b"own.bin");assert_eq!(row.part,Some(2));assert_eq!(crate::article_local::Store::articles_for_test(&mut *client).iter().filter(|a|a.part==Some(3)).count() as i64,0);assert_eq!(client.query_one("select count(*) from inferred_ids",&[])?.try_get::<_,i64>(0)?,0);Ok(())}).unwrap();
     drop(service);runtime.owner.close();store.close().unwrap();
 }

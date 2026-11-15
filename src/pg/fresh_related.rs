@@ -58,7 +58,37 @@ impl ReadView<'_> {
         for file in files {
             let Some(n)=file.try_get::<_,Option<i64>>(1)?.filter(|n|(1..=4096).contains(n)) else{continue};
             if file.try_get::<_,i64>(2)?<n{continue;}
-            self.before_query()?;let file_id:i64=file.try_get(0)?;
+            let file_id:i64=file.try_get(0)?;
+            if let Some(store)=&self.local {
+                // The join below, a page at a time: a part's first article in
+                // message-ID order that has a CRC, and no further than a gap.
+                let (mut next,mut size,mut crc)=(1i64,0i64,0u32);let mut after:Option<(i64,Option<Vec<u8>>)>=None;
+                'file: while next<=n {
+                    self.check_deadline()?;
+                    let page=store.file_part_ids(id,file_id,next,n,after.as_ref().map(|(part,id)|(*part,id.as_deref())),1024)?;
+                    let Some((last,_))=page.last() else{break};let (last,full)=(*last,page.len()==1024);
+                    self.before_query()?;
+                    let ids=page.iter().map(|(_,id)|id.as_slice()).collect::<Vec<_>>();
+                    let found=self.tx.borrow_mut().query("select message_id,decoded,crc32 from segment_crc where release_id=$1 and message_id=any($2)",&[&id,&ids])?;
+                    let mut known=std::collections::HashMap::with_capacity(found.len());
+                    for row in &found {known.insert(row.try_get::<_,&[u8]>(0)?,row);}
+                    for (part,message) in &page {
+                        if *part<next{continue;}
+                        if *part>next{break 'file;}
+                        let Some(row)=known.get(message.as_slice()) else{continue};
+                        self.check_deadline()?;
+                        let decoded:i64=row.try_get(1)?;let length=usize::try_from(decoded).context("negative native decoded length")?;
+                        let value=u32::try_from(row.try_get::<_,i64>(2)?).context("native segment CRC is out of range")?;
+                        crc=if next==1{value}else{crate::gf2::crc32_combine(crc,value,length)};
+                        size=size.checked_add(decoded).context("native folded file size overflow")?;next+=1;
+                    }
+                    if !full{break;}
+                    after=Some(if next>last{(last,None)}else{page.into_iter().next_back().map(|(part,id)|(part,Some(id))).context("native part page is empty")?});
+                }
+                if next==n+1 {if let Some(file)=FileCrc::new(size,crc){if !out.contains(&file){out.push(file);}}}
+                continue;
+            }
+            self.before_query()?;
             let mut tx=self.tx.borrow_mut();
             let mut rows=tx.query_raw("select distinct on(s.part) s.part,c.decoded,c.crc32 from segments s join segment_crc c on c.release_id=s.release_id and c.message_id=s.message_id
                 where s.release_id=$1 and s.file_id=$2 and s.part between 1 and $3 order by s.part,s.message_id",[&id,&file_id,&n])?;
@@ -133,5 +163,67 @@ impl ReadView<'_> {
         }};
         let mut rows=Vec::new();for page in ids.chunks(self.budget.rows){rows.extend(self.rows(page)?);}
         Ok(Some(SameKey {release,has,rows}))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{parser::{Article,Release},pg::{self,fresh_reader::Budget},nzb_spool::{Pool,Limits}};
+    use sha2::{Digest,Sha256};
+    use std::time::{Duration,Instant};
+    fn article(file:&str,mid:String,part:Option<i64>,total:i64,bytes:i64)->Article {
+        Article {filename:Some(file.into()),subject:format!("{file} yEnc ({}/{total})",part.unwrap_or(0)),message_id:mid,part,total_parts:Some(total),bytes,..Default::default()}
+    }
+    // Runs with the articles in PostgreSQL and, under ATLAS_TEST_LOCAL_ARTICLES,
+    // in the local store: both must give exactly these facts.
+    #[test]
+    #[ignore="requires explicit isolated fresh schema9 read-only web admission"]
+    fn article_facts_keep_copy_order_gaps_and_unnumbered_parts() {
+        let schema=pg::testing::Schema::native_writer().expect("explicit fresh schema9");let mut client=schema.pool.get().unwrap();
+        // data.bin: part 1 twice, part 2 in 1100 copies, part 3 once, and one unnumbered article.
+        let mut articles=vec![article("data.bin","<p1-a@example.test>".into(),Some(1),3,20),article("data.bin","<p1-b@example.test>".into(),Some(1),3,10),
+            article("data.bin","<p3@example.test>".into(),Some(3),3,40),article("data.bin","<unnumbered@example.test>".into(),None,3,5)];
+        articles.extend((0..1100).map(|n|article("data.bin",format!("<p2-{n:04}@example.test>"),Some(2),3,30)));
+        // long.bin: 1500 parts, each once. sparse.bin: parts 1, 2 and 65 of 128.
+        articles.extend((1..=1500).map(|n|article("long.bin",format!("<long-{n:04}@example.test>"),Some(n),1500,50)));
+        articles.extend([1,2,65].map(|n|article("sparse.bin",format!("<sparse-{n}@example.test>"),Some(n),128,60)));
+        let mut ids=articles.iter().map(|article|article.message_id.clone().into_bytes()).collect::<Vec<_>>();ids.sort();
+        pg::release_writer::save(&mut client,&[Release {name:"Article.Facts.Example".into(),poster:"poster".into(),group:"alt.binaries.test".into(),date:"2020-01-01".into(),articles,..Default::default()}],1).unwrap();
+        let id:i64=client.query_one("select id from releases",&[]).unwrap().get(0);
+        let mut crc=|mid:&str,decoded:i64,crc:i64|{client.execute("insert into segment_crc(release_id,message_id,decoded,crc32) values($1,$2,$3,$4)",&[&id,&mid.as_bytes(),&decoded,&crc]).unwrap();};
+        // Part 1's first copy has no CRC, so its second copy counts; part 2's only CRC is on its last copy.
+        crc("<p1-b@example.test>",600_000,11);crc("<p2-1099@example.test>",600_000,22);crc("<p3@example.test>",100_000,33);
+        crc("<unnumbered@example.test>",900_000,44);
+        for n in 1..=1500 {crc(&format!("<long-{n:04}@example.test>"),1000,n);}
+        crc("<sparse-1@example.test>",2_000_000,55);crc("<sparse-2@example.test>",2_000_000,66);
+        let root=tempfile::tempdir().unwrap();
+        #[cfg(unix)]{use std::os::unix::fs::PermissionsExt;std::fs::set_permissions(root.path(),std::fs::Permissions::from_mode(0o700)).unwrap();}
+        let pool=Pool::new(root.path().into(),Limits {requests:3,per_request_bytes:1<<20,total_bytes:3<<20,free_bytes:0}).unwrap();
+        fn open<'c>(client:&'c mut postgres::Client,schema:&str)->ReadView<'c> {ReadView::open(client,schema,Budget::default(),Instant::now()+Duration::from_secs(30)).unwrap()}
+        let view=open(&mut client,&schema.name);
+        let data=FileCrc::new(1_300_000,crate::gf2::crc32_combine(crate::gf2::crc32_combine(11,22,600_000),33,100_000)).unwrap();
+        let long=FileCrc::new(1_500_000,(2..=1500u32).fold(1,|crc,n|crate::gf2::crc32_combine(crc,n,1000))).unwrap();
+        // sparse.bin has fewer parts than it expects, so it is not folded at all.
+        assert_eq!(view.folded_key_files(id).unwrap(),[long,data]);
+        let parts=view.metadata_parts(id).unwrap().unwrap();assert!(parts.complete);assert_eq!(parts.files,3);
+        let rows=parts.rows.iter().map(|row|(row.subject.as_str(),row.expected,row.seen,row.map,row.first.as_deref(),row.last.as_deref(),row.smallest,row.largest,row.reposted)).collect::<Vec<_>>();
+        let row=rows.iter().find(|row|row.0.starts_with("data.bin")).unwrap();
+        // An unnumbered article sorts as part 0: first of the file, and not a second copy of anything.
+        assert_eq!((row.1,row.2,row.3,row.4,row.5,row.6,row.7,row.8),(3,3,u64::MAX,Some("<unnumbered@example.test>"),Some("<p3@example.test>"),Some(5),Some(40),2),"{row:?}");
+        let row=rows.iter().find(|row|row.0.starts_with("long.bin")).unwrap();
+        assert_eq!((row.1,row.2,row.3,row.4,row.5,row.6,row.7,row.8),(1500,1500,u64::MAX,Some("<long-0001@example.test>"),Some("<long-1500@example.test>"),Some(50),Some(50),0),"{row:?}");
+        let row=rows.iter().find(|row|row.0.starts_with("sparse.bin")).unwrap();
+        // 128 parts in 64 cells: only the cell of parts 1 and 2 is whole; part 65 alone leaves its cell open.
+        assert_eq!((row.1,row.2,row.3,row.4,row.5,row.8),(128,3,1,Some("<sparse-1@example.test>"),Some("<sparse-65@example.test>"),0),"{row:?}");
+        let contents=view.own_contents(id).unwrap();
+        assert_eq!(contents.list.iter().map(|file|(file.name.as_str(),file.bytes)).collect::<Vec<_>>(),[("data.bin",20+10+40+5+1100*30),("long.bin",1500*50),("sparse.bin",180)]);
+        let (hashes,_)=view.metadata_hashes(id,&pool).unwrap().unwrap();assert!(hashes.complete);assert_eq!(hashes.articles,ids.len());
+        let mut hash=Sha256::new();for id in &ids{hash.update(id);hash.update(b"\n");}
+        assert_eq!(hashes.digest.unwrap(),<[u8;32]>::from(hash.finalize()));
+        drop(view);
+        // Without part 2's CRC the file stops at the gap, whatever part 3 has.
+        client.execute("delete from segment_crc where message_id=$1",&[&b"<p2-1099@example.test>".as_slice()]).unwrap();
+        assert_eq!(open(&mut client,&schema.name).folded_key_files(id).unwrap(),[long]);
     }
 }

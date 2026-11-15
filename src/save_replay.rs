@@ -249,14 +249,20 @@ fn parse(group: &str, lines: &[Vec<u8>]) -> Vec<Release> {
 }
 
 fn postgres_counts(pool: &Pool) -> Result<(i64, i64, i64, i64)> {
-    let row = pool.get()?.query_one(
+    let mut client = pool.get()?;
+    let local = crate::article_local::of(&mut *client)?;
+    let row = client.query_one(
         "select (select count(*) from releases), (select count(*) from files),
                 (select count(*) from segments), (select coalesce(sum(parts), 0)::bigint from releases),
                 (select coalesce(sum(pg_total_relation_size(oid)), 0)::bigint from pg_class
                  where relnamespace = current_schema()::regnamespace and relkind = 'r')",
         &[],
     )?;
-    let parts: i64 = row.get(2);
+    // With a local article store the articles are counted there; the PostgreSQL table stays empty.
+    let parts: i64 = match &local {
+        Some(store) => store.segment_count()?,
+        None => row.get(2),
+    };
     ensure!(parts == row.get::<_, i64>(3), "release part totals differ from the stored segments");
     Ok((row.get(0), row.get(1), parts, row.get(4)))
 }

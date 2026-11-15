@@ -9,7 +9,17 @@ impl ReadView<'_> {
         let id=inputs.release.id;let files=self.metadata_files(id)?;
         let main=crate::probe::step::main_file(&files).cloned();
         let first_id=main.as_ref().map(|file|self.metadata_first_id(id,file)).transpose()?.flatten();
-        let last=if let Some(main)=&main {
+        let last=if let (Some(main),Some(store))=(&main,&self.local) {
+            self.check_deadline()?;
+            if let Some(length)=store.file_edge_len(id,main.id,true)? {
+                ensure!(length>=0,"negative native last ID extent");
+                self.admit_owned((length as u64).checked_mul(4).and_then(|n|n.checked_add(256)).context("native last ID extent overflow")?)?;
+                self.check_deadline()?;
+                let last=store.file_edge(id,main.id,true)?.context("native last ID disappeared")?;
+                ensure!(last.message_id.len() as i64==length,"native last ID extent changed");
+                Some(SegmentRef {message_id:String::from_utf8(last.message_id).context("native last ID is not UTF-8")?,part:last.part,bytes:last.bytes})
+            }else{None}
+        }else if let Some(main)=&main {
             self.before_query()?;
             let extent=self.tx.borrow_mut().query_opt("select octet_length(message_id)::bigint from segments where release_id=$1 and file_id=$2 order by coalesce(part,0) desc,message_id desc limit 1",&[&id,&main.id])?;
             if let Some(extent)=extent {

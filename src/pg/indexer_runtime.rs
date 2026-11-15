@@ -405,6 +405,10 @@ impl Runtime {
         ensure!(locked, "another native indexer owns this PostgreSQL schema");
         owner.batch_execute(&format!("set search_path to \"{}\"", storage.schema))?;
         let epoch=super::stage::open_epoch(&mut owner,&storage,&headers,version)?;
+        // Before any save: the local article store, when config.toml turns it on.
+        // The sole-indexer lock above means every save of an earlier process has ended.
+        let stop = AtomicBool::new(false);
+        crate::article_local::ensure_writer(&mut owner, &storage.schema, &stop).context("opening the local article store")?;
         {
             let mut tx = owner.transaction()?;
             super::history_gate::native(&mut tx).context("historical readiness before native cursor initialization")?;

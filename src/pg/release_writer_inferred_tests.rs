@@ -11,10 +11,10 @@ fn inferred_header_writer_joins_actual_transaction_and_rolls_back_without_partia
     tx.execute("insert into inferred_ids(message_id,next_at,tries) values('part3of4.own@example.invalid',99,1)",&[]).unwrap();
     let mut next=release.clone();next.articles[0].message_id="<part4of4.own@example.invalid>".into();next.articles[0].part=Some(4);
     assert_eq!(save_in(&mut tx,&[next],10).unwrap().parts,1,"second expanded batch shares the original transaction/stage");
-    assert_eq!(tx.query_one("select count(*) from segments",&[]).unwrap().get::<_,i64>(0),2);
-    assert_eq!(tx.query_one("select count(*) from pg_temp.atlas_release_input",&[]).unwrap().get::<_,i64>(0),1,"prior batch input was truncated, never readopted");tx.rollback().unwrap();
-    assert_eq!(client.query_one("select (select count(*) from segments)+(select count(*) from inferred_ids)+(select count(*) from releases)",&[]).unwrap().get::<_,i64>(0),0,"header/result acceptance rollback is atomic");
+    assert_eq!(crate::pg::testing::articles(&mut tx),2);
+    if !crate::pg::testing::articles_are_local(&mut tx) {assert_eq!(tx.query_one("select count(*) from pg_temp.atlas_release_input",&[]).unwrap().get::<_,i64>(0),1,"prior batch input was truncated, never readopted");}tx.rollback().unwrap();
+    assert_eq!(crate::pg::testing::articles(&mut *client)+client.query_one("select (select count(*) from inferred_ids)+(select count(*) from releases)",&[]).unwrap().get::<_,i64>(0),0,"header/result acceptance rollback is atomic");
     let mut tx=client.build_transaction().isolation_level(IsolationLevel::RepeatableRead).start().unwrap();
     assert!(save_in(&mut tx,&[release],10).is_err(),"writer must reject a retained pre-lock snapshot");tx.rollback().unwrap();
-    assert_eq!(client.query_one("select count(*) from segments",&[]).unwrap().get::<_,i64>(0),0);
+    assert_eq!(crate::pg::testing::articles(&mut *client),0);
 }

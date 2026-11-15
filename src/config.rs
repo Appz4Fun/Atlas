@@ -771,6 +771,46 @@ impl HeaderStoreConfig {
     }
 }
 
+/// The `article_store` object of config.toml (`crate::article_local`): the local file that holds each release's
+/// articles (message ids, parts, sizes) so PostgreSQL keeps only releases and files. Off unless enabled. It is a
+/// cache of what Usenet said and can be wiped; the catalogue's articles are then read in again by a new backfill.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ArticleStoreConfig {
+    pub enabled: bool,
+    /// where it lives, `article-store` next to the databases unless set (a relative path is taken from there too)
+    pub dir: String,
+}
+
+impl ArticleStoreConfig {
+    fn from_value(v: Option<&Value>) -> ArticleStoreConfig {
+        let mut c = ArticleStoreConfig::default();
+        let Some(v) = v else { return c };
+        if let Some(b) = v.get("enabled").and_then(as_bool) {
+            c.enabled = b;
+        }
+        if let Some(d) = v.get("dir").and_then(Value::as_str) {
+            c.dir = d.trim().to_string();
+        }
+        c
+    }
+
+    pub fn root(&self) -> std::path::PathBuf {
+        let dir = std::path::PathBuf::from(&self.dir);
+        if self.dir.is_empty() {
+            crate::paths::app_dir().join("article-store")
+        } else if dir.is_absolute() {
+            dir
+        } else {
+            crate::paths::app_dir().join(dir)
+        }
+    }
+}
+
+/// The file's `article_store` object: no keyring.
+pub fn article_store_config() -> ArticleStoreConfig {
+    read_file().map_or_else(ArticleStoreConfig::default, |v| ArticleStoreConfig::from_value(v.get("article_store")))
+}
+
 /// The file's `header_store` object: no keyring.
 pub fn header_store_config() -> HeaderStoreConfig {
     read_file().map_or_else(HeaderStoreConfig::default, |v| HeaderStoreConfig::from_value(v.get("header_store")))

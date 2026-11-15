@@ -21,13 +21,13 @@ fn joined_inferred_lane_cancels_actual_head_before_owner_and_store_close() {
     let mut drain=Drain {owner:&runtime.owner,handles:Some(Vec::new())};
     workers::start_inferred(&runtime.owner,service,net.handle().clone(),drain.handles.as_mut().unwrap()).unwrap();
     assert_eq!(drain.handles.as_ref().unwrap().len(),1);entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    runtime.owner.with(|client| {assert_eq!(client.query_one("select count(*) from segments",&[])?.get::<_,i64>(0),3);Ok(())}).unwrap();
+    runtime.owner.with(|client| {assert_eq!(crate::article_local::Store::articles_for_test(&mut *client).len() as i64,3);Ok(())}).unwrap();
     let before=peer.hits.load(std::sync::atomic::Ordering::Acquire);assert!(before>0);
     let started=Instant::now();join_workers(&runtime.owner,drain.handles.take().unwrap()).unwrap();
     assert!(started.elapsed()<Duration::from_secs(5),"join must cancel and await actual HEAD leases, not wait for provider or the300s cadence");
     assert_eq!(peer.hits.load(std::sync::atomic::Ordering::Acquire),before);assert_eq!(runtime.owner.failure(),None);
     let mut observer=schema.pool.get().unwrap();
-    assert_eq!(observer.query_one("select count(*) from segments",&[]).unwrap().get::<_,i64>(0),3);
+    assert_eq!(crate::article_local::Store::articles_for_test(&mut *observer).len() as i64,3);
     assert_eq!(observer.query_one("select count(*) from inferred_ids",&[]).unwrap().get::<_,i64>(0),0,"unfinished HEAD cannot gain Found acknowledgement");
     release.0.take().unwrap().send(()).unwrap();runtime.owner.close();store.close().unwrap();
 }

@@ -760,7 +760,7 @@ mod tests {
                 );
             });
             let mut c = schema.pool.get().unwrap();
-            assert_eq!(c.query_one("select count(*) from segments", &[]).unwrap().get::<_, i64>(0), 12);
+            assert_eq!(crate::pg::testing::articles(&mut *c), 12);
             assert_eq!(c.query_one("select count(*) from linker_staged_rows s join linker_source_blocks b on b.id=s.source where s.published and b.group_name='a.example'",&[]).unwrap().get::<_,i64>(0),12);
             assert_eq!(c.query_one("select count(*) from linker_linked_ids", &[]).unwrap().get::<_, i64>(0), 12);
             let generation = c.query_one("select min(generation),max(generation) from linker_uploads", &[]).unwrap();
@@ -933,7 +933,7 @@ mod tests {
                 assert!(done, "bounded phase driver failed to progress");
                 drop(pin);
                 let count =
-                    on_native_db(&db, |c| Ok(c.query_one("select count(*) from segments", &[])?.get::<_, i64>(0)))
+                    on_native_db(&db, |c| Ok(crate::pg::testing::articles(c)))
                         .await
                         .unwrap();
                 assert_eq!(count, expected);

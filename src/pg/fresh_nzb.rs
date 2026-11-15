@@ -16,6 +16,8 @@ const INLINE_MESSAGE_BYTES:usize=8192;
 pub(super) struct Message<'a,'c> {view:&'a ReadView<'c>,release:i64,key:[u8;32],at:i64,end:i64,buffer:Vec<u8>,used:usize}
 impl<'a,'c> Message<'a,'c> {
     fn chunk(view:&ReadView<'_>,release:i64,key:&[u8;32],at:i64,n:i32)->Result<Vec<u8>> {
+        // The local store has no key to look an article up by: there a message carries its id (`held`).
+        ensure!(view.local.is_none(),"a native article is read by key only from PostgreSQL");
         view.before_query()?;
         let row=view.tx.borrow_mut().query_opt("select substring(message_id from $3::integer for $4::integer)
             from segments where release_id=$1 and message_key=$2",&[&release,&&key[..],&i32::try_from(at+1)?,&n])?.context("native article disappeared")?;
@@ -24,6 +26,10 @@ impl<'a,'c> Message<'a,'c> {
     pub(super) fn raw(view:&'a ReadView<'c>,release:i64,key:[u8;32],length:i64)->Result<Self> {
         ensure!(length>=0,"negative native article extent");
         Ok(Self {view,release,key,at:0,end:length,buffer:Vec::new(),used:0})
+    }
+    /// A message that carries its whole id, as one read from the local article store does.
+    pub(super) fn held(view:&'a ReadView<'c>,release:i64,id:Vec<u8>)->Self {
+        Self {view,release,key:[0;32],at:0,end:0,buffer:id,used:0}
     }
     fn new(view:&'a ReadView<'c>,release:i64,key:[u8;32],length:i64)->Result<Self> {
         ensure!(length>=0,"negative native article extent");let mut at=0;let mut end=length;
@@ -65,6 +71,21 @@ fn trimmed_message(bytes:&[u8])->&[u8] {
     let end=bytes.iter().rposition(|b|*b!=b'<'&&*b!=b'>').map_or(start,|at|at+1);
     &bytes[start..end]
 }
+/// One article of a local plan: the PostgreSQL record, with the id always behind it whatever its length.
+fn put_local(out:&mut impl Write,segment:&crate::article_local::Segment)->Result<()> {
+    out.write_all(&crate::article_local::message_key(&segment.message_id))?;
+    for value in [i64::from(segment.part.is_some()),segment.part.unwrap_or(0),segment.bytes,i64::try_from(segment.message_id.len())?]{put(out,value)?;}
+    out.write_all(&segment.message_id)?;Ok(())
+}
+fn held_message(input:&mut impl Read,length:i64)->Result<Vec<u8>> {
+    let mut bytes=vec![0;usize::try_from(length)?];input.read_exact(&mut bytes)?;Ok(bytes)
+}
+fn trim_held(mut bytes:Vec<u8>)->Vec<u8> {
+    let kept=trimmed_message(&bytes);let (start,length)=(kept.as_ptr() as usize-bytes.as_ptr() as usize,kept.len());
+    bytes.truncate(start+length);bytes.drain(..start);bytes
+}
+const LOCAL_PAGE_ROWS:usize=4096;
+const LOCAL_PAGE_BYTES:usize=1<<20;
 #[derive(Clone,Copy)]
 struct SparseHeader {key:[u8;32],subject_bytes:i64,poster_bytes:i64,timestamp:i64}
 struct FileDescriptor {file:i64,expected:Option<i64>,name_bytes:i64,count:i64,sparse:Option<SparseHeader>}
@@ -89,11 +110,13 @@ impl FileDescriptor {
 }
 #[derive(Clone,Copy)]
 enum SparseField {Subject,Poster}
-struct SparseText<'view,'client> {view:&'view ReadView<'client>,release:i64,key:[u8;32],field:SparseField,at:i64,end:i64,buffer:Vec<u8>,used:usize}
+struct SparseText<'view,'client> {view:&'view ReadView<'client>,release:i64,key:[u8;32],field:SparseField,at:i64,end:i64,buffer:Vec<u8>,used:usize,
+    /// The article's message id when its envelope is in the local store, which has no key to find it by.
+    local:Option<&'view [u8]>}
 impl<'view,'client> SparseText<'view,'client> {
-    fn new(view:&'view ReadView<'client>,release:i64,header:SparseHeader,field:SparseField)->Self {
+    fn new(view:&'view ReadView<'client>,release:i64,header:SparseHeader,field:SparseField,local:Option<&'view [u8]>)->Self {
         let end=match field {SparseField::Subject=>header.subject_bytes,SparseField::Poster=>header.poster_bytes};
-        Self {view,release,key:header.key,field,at:0,end,buffer:Vec::new(),used:0}
+        Self {view,release,key:header.key,field,at:0,end,buffer:Vec::new(),used:0,local}
     }
 }
 impl Read for SparseText<'_,'_> {
@@ -101,6 +124,12 @@ impl Read for SparseText<'_,'_> {
         if out.is_empty(){return Ok(0);}
         if self.used==self.buffer.len()&&self.at<self.end {
             let fill=||->Result<Vec<u8>> {
+                if let Some(message)=self.local {
+                    self.view.check_deadline()?;let count=(self.end-self.at).min(8192);
+                    let store=self.view.local.as_ref().context("native sparse header has no local article store")?;
+                    let bytes=store.nzb_envelope_range(self.release,message,matches!(self.field,SparseField::Subject),self.at,count)?.context("native sparse header disappeared")?;
+                    ensure!(bytes.len() as i64==count,"native sparse header range changed");return Ok(bytes);
+                }
                 self.view.before_query()?;
                 let query=match self.field {
                     SparseField::Subject=>"select substring(subject from $3::integer for $4::integer) from segment_nzb_metadata where release_id=$1 and message_key=$2",
@@ -131,6 +160,12 @@ impl ReadView<'_> {
     fn nzb_own_mode(&self,id:i64,pick:Pick<'_>,pool:&Arc<Pool>,collect_gaps:bool)->Result<Option<Download>> {
         let Some((group,posted,complete))=self.download_head(id)? else{return Ok(None)};
         let mut files=pool.open()?;self.before_query()?;
+        let local=self.local.clone();
+        let (selected,mut plan)=if let Some(store)=&local {
+            let selected=self.nzb_local_plan(store,id,pick,&mut files)?;
+            if selected==0 && (collect_gaps||!matches!(pick,Pick::Whole)){return Ok(None);}
+            (selected,files.finish()?)
+        }else{
         let mut tx=self.tx.borrow_mut();
         let mut rows=tx.query_raw("with inventory as(
             select f.id,f.expected,f.filename,count(s.message_key) articles,null::bytea singleton_key,null::bigint singleton_part,null::bytea singleton_mid,
@@ -195,14 +230,20 @@ impl ReadView<'_> {
             }
             ensure!(seen==count,"native article inventory changed within snapshot");
         }
-        drop(files);let mut plan=plan.finish()?;
+        drop(files);let plan=plan.finish()?;
+        (selected,plan)
+        };
         let mut xml=XmlWriter::new(pool.open()?,group.as_bytes())?;let mut gaps=0u64;let mut details=collect_gaps.then(Vec::new);
         let mut message_buffer=[0;INLINE_MESSAGE_BYTES];
         for _ in 0..selected {
             let descriptor=FileDescriptor::read(&mut plan)?;let file=descriptor.file;let count=descriptor.count;
             let mut check=GapCheck::new(descriptor.expected);for _ in 0..count{
                 self.check_deadline()?;let (_,part,_,length)=segment(&mut plan)?;
-                inline_message(&mut plan,length,&mut message_buffer)?;check.push(part)?;
+                if inline_message(&mut plan,length,&mut message_buffer)?.is_none()&&local.is_some() {
+                    // A local plan holds every id, the long ones too: step over it.
+                    ensure!(io::copy(&mut (&mut plan).take(length as u64),&mut io::sink())?==length as u64,"native local plan ended early");
+                }
+                check.push(part)?;
             }
             if let Some(gap)=check.finish(){
                 gaps=gaps.checked_add(1).context("native gap count overflow")?;
@@ -228,18 +269,32 @@ impl ReadView<'_> {
         xml.end_head()?;plan.rewind()?;
         for _ in 0..selected {
             let descriptor=FileDescriptor::read(&mut plan)?;let count=descriptor.count;
+            // A nameless article's envelope is found by message id in the local store,
+            // so its one article is read before the file's opening and written after it.
+            let mut envelope=None;
             if let Some(header)=descriptor.sparse {
-                xml.file(SparseText::new(self,id,header,SparseField::Poster),header.timestamp,SparseText::new(self,id,header,SparseField::Subject))?;
+                if local.is_some() {
+                    let(_,part,bytes,length)=segment(&mut plan)?;let message=held_message(&mut plan,length)?;
+                    xml.file(SparseText::new(self,id,header,SparseField::Poster,Some(&message)),header.timestamp,SparseText::new(self,id,header,SparseField::Subject,Some(&message)))?;
+                    envelope=Some((part,bytes,message));
+                }else{
+                xml.file(SparseText::new(self,id,header,SparseField::Poster,None),header.timestamp,SparseText::new(self,id,header,SparseField::Subject,None))?;
+                }
             }else{
                 xml.file(Text::new(self,TextField::ReleasePoster(id)),crate::dates::article_timestamp(&posted),Text::new(self,TextField::FileSubject(descriptor.file)))?;
             }
             xml.group(group.as_bytes())?;xml.segments()?;
+            if let Some((part,bytes,message))=envelope {
+                self.check_deadline()?;xml.segment(bytes,part,Message::held(self,id,trim_held(message)))?;
+            }else{
             for _ in 0..count{
                 self.check_deadline()?;let(key,part,bytes,length)=segment(&mut plan)?;
                 match inline_message(&mut plan,length,&mut message_buffer)? {
                     Some(message)=>xml.segment(bytes,part,trimmed_message(message))?,
+                    None if local.is_some()=>xml.segment(bytes,part,Message::held(self,id,trim_held(held_message(&mut plan,length)?)))?,
                     None=>xml.segment(bytes,part,Message::new(self,id,key,length)?)?,
                 }
+            }
             }
             xml.end_file()?;
         }
@@ -247,6 +302,61 @@ impl ReadView<'_> {
         let body=xml.finish()?.finish()?;
         let disposition=crate::nzb_http::Disposition::prepare(pool,Text::new(self,TextField::ReleaseName(id)),id)?;
         Ok(Some(Download {body,disposition,gaps,details}))
+    }
+    /// A file's articles from the local store in NZB order (unnumbered parts first, then part, then
+    /// message id), a bounded page at a time and no more than `limit` of them. Returns how many it gave.
+    pub(super) fn local_segments(&self,store:&crate::article_local::Store,release:i64,file:i64,limit:i64,
+        mut each:impl FnMut(crate::article_local::Segment)->Result<()>)->Result<i64> {
+        let mut after:Option<(Option<i64>,Vec<u8>)>=None;let mut seen=0i64;
+        loop {
+            self.check_deadline()?;
+            let page=store.nzb_page(release,file,after.as_ref().map(|(part,id)|(*part,id.as_slice())),LOCAL_PAGE_ROWS,LOCAL_PAGE_BYTES)?;
+            let Some(last)=page.last() else{return Ok(seen)};after=Some((last.part,last.message_id.clone()));
+            for segment in page {
+                if seen==limit{return Ok(seen);}
+                self.check_deadline()?;each(segment)?;seen=seen.checked_add(1).context("native article count overflow")?;
+            }
+        }
+    }
+    /// The inventory and the per-file article reads of the PostgreSQL path in one pass: the files come
+    /// from this snapshot, their articles from the local store. Writes the plan; returns the files chosen.
+    fn nzb_local_plan(&self,store:&crate::article_local::Store,id:i64,pick:Pick<'_>,plan:&mut impl Write)->Result<u64> {
+        let mut tx=self.tx.borrow_mut();
+        let mut rows=tx.query_raw("select id,expected,octet_length(filename)::bigint from files
+            where release_id=$1 and($2::text is null or(filename<>'' and filename=$2))
+            order by filename collate \"C\",id",[&id as &(dyn postgres::types::ToSql+Sync),&match pick{Pick::Name(name)=>Some(name),_=>None}])?;
+        let mut ordinal=0u64;let mut selected=0u64;
+        while let Some(row)=rows.next()? {
+            self.check_deadline()?;
+            let file:i64=row.try_get(0)?;let expected:Option<i64>=row.try_get(1)?;let length:i64=row.try_get(2)?;
+            if length!=0 {
+                // A named file is one inventory row, and none at all without an article.
+                let count=store.nzb_file_articles(id,file)?;if count==0{continue;}
+                ordinal=ordinal.checked_add(1).context("native file ordinal overflow")?;
+                if matches!(pick,Pick::Ordinal(wanted) if ordinal!=wanted){continue;}
+                ensure!(file>0&&length>=0&&count>0,"invalid native file descriptor");
+                FileDescriptor {file,expected,name_bytes:length,count,sparse:None}.write(plan)?;
+                // Articles the indexer adds after the count are left for the next request.
+                let seen=self.local_segments(store,id,file,count,|segment|put_local(plan,&segment))?;
+                ensure!(seen==count,"native article inventory changed within snapshot");
+            }else{
+                // Every article of a nameless file is its own inventory row, and its envelope the file's header.
+                let mut chosen=0u64;
+                self.local_segments(store,id,file,i64::MAX,|segment| {
+                    ordinal=ordinal.checked_add(1).context("native file ordinal overflow")?;
+                    if matches!(pick,Pick::Ordinal(wanted) if ordinal!=wanted){return Ok(());}
+                    ensure!(file>0,"invalid native file descriptor");
+                    let extent=store.nzb_envelope_extent(id,&segment.message_id)?.context("native original nameless metadata unavailable")?;
+                    ensure!(extent.subject_bytes>=0&&extent.poster_bytes>=0,"negative original nameless header extent");
+                    let header=SparseHeader {key:crate::article_local::message_key(&segment.message_id),subject_bytes:extent.subject_bytes,poster_bytes:extent.poster_bytes,timestamp:extent.nzb_timestamp};
+                    FileDescriptor {file,expected:extent.expected,name_bytes:0,count:1,sparse:Some(header)}.write(plan)?;
+                    put_local(plan,&segment)?;chosen=chosen.checked_add(1).context("native selected file count overflow")?;Ok(())
+                })?;
+                selected=selected.checked_add(chosen).context("native selected file count overflow")?;continue;
+            }
+            selected=selected.checked_add(1).context("native selected file count overflow")?;
+        }
+        Ok(selected)
     }
 }
 
@@ -303,16 +413,18 @@ mod tests {
         // both sides of the inline boundary; it is never decoded lossily.
         for (original,length) in [(&ids[3],8192),(&ids[4],8193)] {
             let mut invalid=vec![b'a';length];invalid[length-1]=0xff;
-            assert_eq!(client.execute("update segments set message_id=$2 where release_id=$1 and message_id=$3",
-                &[&id,&invalid,&original.as_bytes()]).unwrap(),1);
+            let rewrite=|client:&mut postgres::Client,from:&[u8],to:&[u8]|match crate::article_local::of_schema(&schema.name) {
+                Some(store)=>store.test_rewrite_message_id(id,from,to).unwrap() as u64,
+                None=>client.execute("update segments set message_id=$2 where release_id=$1 and message_id=$3",&[&id,&to,&from]).unwrap(),
+            };
+            assert_eq!(rewrite(&mut client,original.as_bytes(),&invalid),1);
             {
                 let view=ReadView::open(&mut client,&schema.name,Budget::default(),Instant::now()+Duration::from_secs(10)).unwrap();
                 let file=if length==8192 {"case3.bin"}else{"case4.bin"};
                 let error=view.nzb_own(id,Pick::Name(file),&pool).err().expect("invalid UTF-8 cannot become an NZB");
                 assert!(error.chain().any(|cause|cause.to_string().contains("invalid UTF-8 in NZB text")));
             }
-            assert_eq!(client.execute("update segments set message_id=$2 where release_id=$1 and message_id=$3",
-                &[&id,&original.as_bytes(),&invalid]).unwrap(),1);
+            assert_eq!(rewrite(&mut client,&invalid,original.as_bytes()),1);
         }
     }
 
@@ -439,6 +551,7 @@ mod sparse_nameless_tests {
                 Article {filename:Some(String::new()),subject:"another empty filename input".into(),message_id:"another-empty@example.invalid".into(),part:Some(1),total_parts:Some(1),bytes:23,..Default::default()}],..Default::default()};
         assert_eq!(crate::pg::release_writer::save(&mut client,&[release],1).unwrap().parts,2);
         assert_eq!(client.query_one("select count(*) from segment_nzb_metadata",&[]).unwrap().get::<_,i64>(0),0);
+        if let Some(store)=crate::article_local::of_schema(&schema.name){assert_eq!(store.test_envelope_count().unwrap(),0);}
         let id:i64=client.query_one("select id from releases",&[]).unwrap().get(0);
         let root=tempfile::tempdir().unwrap();
         #[cfg(unix)] {use std::os::unix::fs::PermissionsExt;std::fs::set_permissions(root.path(),std::fs::Permissions::from_mode(0o700)).unwrap();}
@@ -482,5 +595,89 @@ mod owned_adapter_tests {
         let built=view.nzb_owned_build(complete,Pick::Whole,&pool).unwrap().unwrap();
         assert!(built.complete());assert_eq!(built.xml,complete_expected.xml);assert_eq!(built.xml.matches("<segment ").count(),2);
         assert!(view.nzb_owned_build(complete,Pick::Ordinal(0),&pool).unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod local_parity_tests {
+    use super::*;
+    use crate::{article_local,parser::{Article,Release},pg::fresh_reader::Budget};
+    use std::time::{Duration,Instant};
+
+    /// Everything the NZB builder and the file lists say about one catalogue, kept in PostgreSQL or in a local store.
+    fn observed(local:bool)->Vec<String> {
+        let schema=crate::pg::testing::Schema::native_writer().expect("explicit isolated PostgreSQL");let mut client=schema.pool.get().unwrap();
+        let mut own=None;
+        if !local {article_local::unregister(&schema.name);}
+        else if article_local::of_schema(&schema.name).is_none() {
+            let dir=tempfile::tempdir().unwrap();
+            article_local::register(&schema.name,article_local::Store::open_writer(dir.path(),&schema.name).unwrap()).unwrap();own=Some(dir);
+        }
+        let article=|file:Option<&str>,mid:&str,part:Option<i64>,total:i64,bytes:i64|Article {filename:file.map(str::to_owned),
+            subject:format!("subject & \"{}\" of {} ({}/{total})",file.unwrap_or("no name"),&mid[..mid.len().min(24)],part.unwrap_or(0)),
+            message_id:mid.into(),part,total_parts:Some(total),bytes,..Default::default()};
+        let long_id=format!("<<{}é&@example.invalid>>","L".repeat(9000));
+        let mut long_subject=article(None,"<nameless-b@example.invalid>",Some(1),1,29);long_subject.subject=format!("{}tail","α & \"long\" ".repeat(900));
+        let whole=Release {name:"Parity.Whole.Release".into(),group:"alt.binaries.test".into(),poster:"poster & <one>".into(),date:"Wed, 01 Jan 2020 00:00:00 +0000".into(),
+            articles:vec![article(Some("a.bin"),"<a-1@example.invalid>",Some(1),3,11),article(Some("a.bin"),"<a-2-z@example.invalid>",Some(2),3,13),
+                article(Some("a.bin"),"<a-2-a@example.invalid>",Some(2),3,17),article(Some("a.bin"),"<<a-3@example.invalid>>",Some(3),3,19),
+                article(Some("z.字幕.bin"),&long_id,Some(1),1,23),article(None,"<nameless-a@example.invalid>",Some(1),1,27),long_subject],..Default::default()};
+        let gaps=Release {name:"Parity.Gaps.Release".into(),group:"alt.binaries.test".into(),poster:"poster two".into(),date:"Thu, 02 Jan 2020 00:00:00 +0000".into(),
+            articles:vec![article(Some("b.bin"),"<b-1@example.invalid>",Some(1),4,31),article(Some("b.bin"),"<b-3-b@example.invalid>",Some(3),4,37),
+                article(Some("b.bin"),"<b-3-a@example.invalid>",Some(3),4,41),article(Some("b.bin"),"<b-unnumbered-z@example.invalid>",None,4,43),
+                article(Some("b.bin"),"<b-unnumbered-a@example.invalid>",None,4,47),article(None,"<nameless-c@example.invalid>",Some(2),2,53),
+                article(None,"<nameless-d@example.invalid>",None,2,59)],..Default::default()};
+        assert_eq!(crate::pg::release_writer::save(&mut client,&[whole,gaps],1).unwrap().parts,14);
+        // The articles really are where this run says they are.
+        let in_postgres:i64=client.query_one("select count(*) from segments",&[]).unwrap().get(0);
+        assert_eq!(in_postgres,if local{0}else{14});
+        assert_eq!(article_local::of_schema(&schema.name).is_some(),local);
+        let root=tempfile::tempdir().unwrap();
+        #[cfg(unix)] {use std::os::unix::fs::PermissionsExt;std::fs::set_permissions(root.path(),std::fs::Permissions::from_mode(0o700)).unwrap();}
+        let pool=Pool::new(root.path().into(),crate::nzb_spool::Limits {requests:8,per_request_bytes:1<<20,total_bytes:8<<20,free_bytes:0}).unwrap();
+        let mut seen=Vec::new();
+        for name in ["Parity.Whole.Release","Parity.Gaps.Release"] {
+            let id:i64=client.query_one("select id from releases where name=$1",&[&name]).unwrap().get(0);
+            let mut say=|what:String,told:Result<Option<String>>|seen.push(format!("{name} #{id} {what}: {}",match told {
+                Ok(Some(text))=>format!("ok {text}"),Ok(None)=>"none".into(),Err(error)=>format!("refused {error}")}));
+            let picks=[Pick::Whole,Pick::Ordinal(0),Pick::Ordinal(1),Pick::Ordinal(2),Pick::Ordinal(3),Pick::Ordinal(4),Pick::Ordinal(5),
+                Pick::Name("a.bin"),Pick::Name("z.字幕.bin"),Pick::Name("b.bin"),Pick::Name(""),Pick::Name("missing.bin")];
+            for (n,pick) in picks.into_iter().enumerate() {
+                let view=ReadView::open(&mut client,&schema.name,Budget::default(),Instant::now()+Duration::from_secs(20)).unwrap();
+                say(format!("stream {n}"),view.nzb_own(id,pick,&pool).and_then(|found|found.map(|mut download| {
+                    let mut xml=String::new();download.body.read_to_string(&mut xml)?;Ok(format!("{} gaps\n{xml}",download.gaps))}).transpose()));
+                drop(view);
+                let view=ReadView::open(&mut client,&schema.name,Budget::default(),Instant::now()+Duration::from_secs(20)).unwrap();
+                say(format!("owned {n}"),view.nzb_owned_build(id,pick,&pool).map(|found|found.map(|built|format!("{:?}\n{}",built.gaps,built.xml))));
+            }
+            let view=ReadView::open(&mut client,&schema.name,Budget::default(),Instant::now()+Duration::from_secs(20)).unwrap();
+            say("files".into(),view.file_list(id,&pool).and_then(|found|found.map(|mut list|{let mut xml=String::new();list.read_to_string(&mut xml)?;Ok(xml)}).transpose()));
+            say("listed".into(),view.nzb_listed_files(id).map(|found|found.map(|files|files.iter().map(|file|format!("{} {:?} {} {}",file.n,file.name,file.bytes,file.articles)).collect::<Vec<_>>().join("|"))));
+            say("download".into(),view.prepare_download(id,&pool).and_then(|found|found.map(|(name,first,mut download)| {
+                let mut xml=String::new();download.body.read_to_string(&mut xml)?;Ok(format!("{name} {first:?}\n{xml}"))}).transpose()));
+            drop(view);
+            let (row,articles)=crate::pg::release_reader::inventory(&mut client,id).unwrap().unwrap().into_nzb_rows();
+            seen.push(format!("{name} inventory {row:?} {}",articles.iter().map(|a|format!("{:?} {:?} {:?} {}",a.filename,a.part,a.bytes,a.message_id)).collect::<Vec<_>>().join("|")));
+        }
+        if own.is_some(){article_local::unregister(&schema.name);}
+        seen
+    }
+
+    #[test]
+    #[ignore="requires explicit isolated PostgreSQL and bounded native spool admission"]
+    fn an_nzb_and_its_file_lists_are_the_same_bytes_from_postgres_and_from_the_local_store() {
+        let postgres=observed(false);let local=observed(true);
+        assert_eq!(postgres.len(),local.len());
+        for (postgres,local) in postgres.iter().zip(&local){assert_eq!(postgres,local);}
+        // The comparison is of real documents, not of two refusals.
+        let whole=postgres.iter().find(|line|line.starts_with("Parity.Whole.Release #1 stream 0: ok 0 gaps")).expect("the whole release builds");
+        assert_eq!(whole.matches("<file ").count(),4);assert_eq!(whole.matches("<segment ").count(),7);
+        assert!(whole.contains(&format!(">{}é&amp;@example.invalid</segment>","L".repeat(9000))));
+        assert!(whole.find("nameless-a@").unwrap()<whole.find("nameless-b@").unwrap()&&whole.find("a-2-a@").unwrap()<whole.find("a-2-z@").unwrap());
+        let gaps=postgres.iter().find(|line|line.starts_with("Parity.Gaps.Release #2 stream 9: ok 1 gaps")).expect("the file with gaps builds");
+        assert!(gaps.find("b-unnumbered-a@").unwrap()<gaps.find("b-unnumbered-z@").unwrap()&&gaps.find("b-unnumbered-z@").unwrap()<gaps.find("b-1@").unwrap());
+        assert!(gaps.contains("number=\"None\"")&&gaps.find("b-3-a@").unwrap()<gaps.find("b-3-b@").unwrap());
+        assert!(postgres.iter().any(|line|line.starts_with("Parity.Gaps.Release #2 files: ok")&&line.contains("count=\"3\"")));
+        assert!(postgres.iter().any(|line|line.starts_with("Parity.Whole.Release #1 listed: ok 1 None 27 1|2 None 29 1|3 Some(\"a.bin\") 60 4|4 Some(\"z.字幕.bin\") 23 1")));
     }
 }

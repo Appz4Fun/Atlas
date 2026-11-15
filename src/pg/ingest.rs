@@ -393,7 +393,7 @@ mod tests {
         assert_eq!(conn.query_one("select generation from pp_queue", &[]).unwrap().get::<_, i64>(0), generation);
         assert_eq!(conn.query_one("select count(*) from releases", &[]).unwrap().get::<_, i64>(0), 1);
         assert_eq!(conn.query_one("select count(*) from files", &[]).unwrap().get::<_, i64>(0), 1);
-        assert_eq!(conn.query_one("select count(*) from segments", &[]).unwrap().get::<_, i64>(0), 40);
+        assert_eq!(crate::pg::testing::articles(&mut *conn), 40);
         assert!(conn.query_one("select complete from files", &[]).unwrap().get::<_, bool>(0));
     }
 

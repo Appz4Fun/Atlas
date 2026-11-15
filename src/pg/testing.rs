@@ -14,6 +14,9 @@ pub struct Schema {
     pub name: String,
     pub url: String,
     pub pool: Pool,
+    /// With `ATLAS_TEST_LOCAL_ARTICLES` set, every test schema keeps its
+    /// articles in a local store of its own, so the whole suite runs that way.
+    local: Option<tempfile::TempDir>,
 }
 
 impl Schema {
@@ -52,16 +55,35 @@ impl Schema {
             allow_plaintext: true,
         })
         .unwrap();
-        Some(Schema { name, url, pool })
+        let local = std::env::var_os("ATLAS_TEST_LOCAL_ARTICLES").filter(|v| !v.is_empty()).map(|_| {
+            let dir = tempfile::tempdir().expect("a directory for the test's local article store");
+            let store = crate::article_local::Store::open_writer(dir.path(), &name).expect("opening the test's local article store");
+            crate::article_local::register(&name, store).expect("registering the test's local article store");
+            dir
+        });
+        Some(Schema { name, url, pool, local })
     }
 }
 
 impl Drop for Schema {
     fn drop(&mut self) {
+        if self.local.is_some() {
+            crate::article_local::unregister(&self.name);
+        }
         if let Ok(mut c) = postgres::Client::connect(&self.url, postgres::NoTls) {
             let _ = c.batch_execute(&format!("drop schema if exists \"{}\" cascade", self.name));
         }
     }
+}
+
+/// How many articles the catalogue `client` reads holds, wherever it keeps them.
+pub(crate) fn articles(client: &mut impl postgres::GenericClient) -> i64 {
+    crate::article_local::Store::articles_for_test(client).len() as i64
+}
+
+/// Whether the catalogue `client` reads keeps its articles in a local store.
+pub(crate) fn articles_are_local(client: &mut impl postgres::GenericClient) -> bool {
+    crate::article_local::of(client).unwrap().is_some()
 }
 
 /// Runs `body` on a fresh migrated PostgreSQL schema. Without explicit test

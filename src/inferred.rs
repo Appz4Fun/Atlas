@@ -264,7 +264,7 @@ Xref: news.example alt.binaries.movies:11666417361 alt.binaries.hdtv:42\r\n";
         assert_eq!(service.tick(net.handle(), answered_at).unwrap().unusable, 1);
         assert_eq!(retry(), (answered_at + 4 * ABSENT_AGAIN, 3));
         assert_eq!(server.hits.load(std::sync::atomic::Ordering::Acquire), 3);
-        assert_eq!(observer.query_one("select count(*) from segments", &[]).unwrap().get::<_, i64>(0), 3);
+        assert_eq!(crate::article_local::Store::articles_for_test(&mut *observer).len() as i64, 3);
         drop(service);
         runtime.owner.close();
         store.close().unwrap();

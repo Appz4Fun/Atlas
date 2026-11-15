@@ -80,8 +80,8 @@ fn owned_alternate_overview_fills_actual_timing_hole_without_advancing_frontiers
     let f=Fixture::new();f.seed();let before=f.frontiers();let mut service=f.service();let plan=service.plan(f.now).unwrap();
     assert_eq!(plan.found.posts.len(),1);assert_eq!(plan.found.posts[0].permille,900);assert_eq!(plan.found.posts[0].windows,[Window {group:GROUP.into(),from:f.now-3*3600+1-300,to:f.now-3*3600+10+300}]);
     let at=f.log.lock().unwrap().len();let progress=service.tick(f.now).unwrap();assert_eq!(progress.posts,1);assert!(progress.headers>=19);assert_eq!(f.frontiers(),before);
-    f.runtime.owner.with(|c| {let r=c.query_one("select (select count(*) from segments),(select count(*) from file_parts),(select articles from file_timing),(select count(*) from repair_tried)",&[])?;
-        assert_eq!((r.get::<_,i64>(0),r.get::<_,i64>(1),r.get::<_,i64>(2),r.get::<_,i64>(3)),(10,10,10,1));Ok(())}).unwrap();
+    f.runtime.owner.with(|c| {let r=c.query_one("select (select articles from file_timing),(select count(*) from repair_tried)",&[])?;
+        assert_eq!((crate::article_local::Store::articles_for_test(&mut *c).len() as i64,crate::article_local::Store::file_parts_for_test(&mut *c),r.get::<_,i64>(0),r.get::<_,i64>(1)),(10,10,10,1));Ok(())}).unwrap();
     let log=f.log.lock().unwrap();let first=log[at..].iter().position(|(i,l)|*i==1&&l.starts_with("XOVER ")).unwrap();let last=log[at..].iter().position(|(i,l)|*i==2&&l.starts_with("XOVER ")).unwrap();assert!(first<last);drop(log);
     crate::nxv_store::live::sync_point(GROUP).unwrap().expect("actual NXV capture required").wait(Duration::from_secs(2)).unwrap();drop(service);
     f.store.close().unwrap();let snap=f.store.segment_snapshot(GROUP,f.now.div_euclid(86400)).unwrap().or_else(||f.store.segment_snapshot(GROUP,(f.now-3*3600).div_euclid(86400)).unwrap()).unwrap();
@@ -105,7 +105,7 @@ fn stop_during_actual_overview_probe_joins_without_mark_or_frontier_advance() {i
     f.peers[1].held.store(true,Ordering::Release);let at=f.log.lock().unwrap().len();let mut service=f.service();let now=f.now;let worker=thread::spawn(move||service.tick(now));
     let until=Instant::now()+Duration::from_secs(3);loop {if f.log.lock().unwrap()[at..].iter().any(|(i,l)|*i==1&&l.starts_with("XOVER ")){break;}assert!(Instant::now()<until);thread::sleep(Duration::from_millis(5));}
     f.runtime.owner.stop.store(true,Ordering::Release);let started=Instant::now();assert!(crate::pg::outage::is_attempt_ended(&worker.join().unwrap().unwrap_err()));assert!(started.elapsed()<Duration::from_secs(2));
-    assert_eq!(observer.query_one("select (select count(*) from segments),(select count(*) from repair_tried)",&[]).unwrap().get::<_,i64>(0),9);
+    assert_eq!(crate::article_local::Store::articles_for_test(&mut observer).len(),9);
     assert_eq!(observer.query_one("select count(*) from repair_tried",&[]).unwrap().get::<_,i64>(0),0);let after=observer.query("select name,live_cursor,backfill_cursor from groups order by name",&[]).unwrap().into_iter().map(|r|(r.get(0),r.get(1),r.get(2))).collect::<Vec<(String,Option<i64>,Option<i64>)>>();assert_eq!(after,before);
 });}
 #[test]

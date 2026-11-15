@@ -19,6 +19,8 @@ impl std::error::Error for SourceChanged {}
 pub(crate) struct Service {
     owner:Arc<Owner>,db:crate::indexer::Db,pool:Arc<crate::nntp::Pool>,store:Arc<Store>,
     epoch:[u8;32],catalog:[u8;32],journal:Journal,next:Instant,
+    /// Where this catalogue's articles are kept when not in PostgreSQL.
+    articles:Option<Arc<crate::article_local::Store>>,
 }
 impl Service {
     pub(crate) fn new(owner:&Arc<Owner>,db:&crate::indexer::Db,pool:Arc<crate::nntp::Pool>,store:Arc<Store>,headers:&crate::config::HeaderStoreConfig)->Result<Self> {
@@ -27,8 +29,8 @@ impl Service {
         let epoch=owner.epoch().context("native inferred owner epoch missing")?;
         let expected=epoch.catalog().header_config(headers)?;
         ensure!(store.root()==expected.root(),"native inferred header store belongs to another catalog");
-        owner.with(|_|Ok(()))?;let journal=Journal::open(store.root(),*epoch.catalog().nonce())?;
-        Ok(Self {owner:owner.clone(),db:db.clone(),pool,store,epoch:*epoch.id(),catalog:*epoch.catalog().nonce(),journal,next:Instant::now()+super::EVERY})
+        let articles=owner.with(|client|crate::article_local::of(client))?;let journal=Journal::open(store.root(),*epoch.catalog().nonce())?;
+        Ok(Self {owner:owner.clone(),db:db.clone(),pool,store,articles,epoch:*epoch.id(),catalog:*epoch.catalog().nonce(),journal,next:Instant::now()+super::EVERY})
     }
     #[cfg(test)]
     pub(crate) fn start_without_delay_for_test(&mut self) {self.next=Instant::now();}
@@ -105,6 +107,28 @@ impl Service {
                         if name_bytes>65536 {deferred+=1;continue;}
                         let filename=String::from_utf8(file.try_get(2)?)?;if filename.is_empty(){continue;}
                         let mut after:Option<Vec<u8>>=None;
+                        if let Some(articles)=&self.articles {
+                            // The proof is the same whatever order its rows come in: one bad row
+                            // voids it for good, every row must carry the one tail, and the parts
+                            // seen are a set. So the file is walked in the store's own order, 16
+                            // rows at a time as below, and the source is checked after each page:
+                            // a save that added rows meanwhile has moved the revision on.
+                            let mut after:Option<(Option<i64>,i64,Vec<u8>)>=None;
+                            loop {
+                                self.stopped()?;
+                                let rows=articles.proof_page(id,65500,after.as_ref().map(|(part,release,mid)|(*part,*release,mid.as_slice())),16)?;
+                                self.read_source(&source,|_|Ok(()))?;
+                                if rows.is_empty(){break;}
+                                let mut oversize=false;
+                                for row in rows {
+                                    let Some(mid)=row.message_id.filter(|_|row.message_id_len<=65500) else {proof.push(None,&[]);oversize=true;break;};
+                                    proof.push(row.part,&mid);after=Some((row.part,row.release_id,mid));
+                                }
+                                // An over-long id has voided the proof and no later row can mend
+                                // it, so the walk ends here instead of carrying that id as a cursor.
+                                if oversize {break;}
+                            }
+                        } else {
                         loop {
                             self.stopped()?;
                             let rows=self.read_source(&source,|tx|Ok(tx.query("select substring(message_key from 1 for 33),octet_length(message_key),part,
@@ -117,12 +141,17 @@ impl Service {
                                 let mid:Vec<u8>=row.try_get(3)?;proof.push(row.try_get(2)?,&mid);
                             }
                         }
+                        }
                         // Same mode/tie rule as legacy common_size: prefer
                         // non-last parts, falling back to all only if absent.
+                        let size=if let Some(articles)=&self.articles {
+                            let size=match articles.common_bytes(id,expected)? {Some(size)=>Some(size),None=>articles.common_bytes(id,None)?};
+                            self.read_source(&source,|_|Ok(()))?;size
+                        } else {
                         let size=self.read_source(&source,|tx|Ok(tx.query_opt("select bytes from segments where file_id=$1 and part is distinct from $2
                             group by bytes order by count(*) desc,bytes desc limit 1",&[&id,&expected])?.map(|row|row.try_get::<_,i64>(0)).transpose()?))?;
-                        let size=match size {Some(size)=>Some(size),None=>self.read_source(&source,|tx|Ok(tx.query_opt("select bytes from segments where file_id=$1
-                            group by bytes order by count(*) desc,bytes desc limit 1",&[&id])?.map(|row|row.try_get::<_,i64>(0)).transpose()?))?};
+                        match size {Some(size)=>Some(size),None=>self.read_source(&source,|tx|Ok(tx.query_opt("select bytes from segments where file_id=$1
+                            group by bytes order by count(*) desc,bytes desc limit 1",&[&id])?.map(|row|row.try_get::<_,i64>(0)).transpose()?))?}};
                         let mut missing=proof.missing();
                         loop {
                             let parts=missing.by_ref().take(16).collect::<Vec<_>>();if parts.is_empty(){break;}potential=true;
@@ -235,9 +264,16 @@ impl Service {
                 // The retry key is deliberately bare. overview_of normalizes
                 // actual HEADs to bracketed MIDs, copied unchanged by writer.
                 let catalog_mid=format!("<{mid}>");
-                let present:bool=tx.query_one("select exists(select 1 from segments s join files f on(f.release_id,f.id)=(s.release_id,s.file_id)
+                let present:bool=if let Some(articles)=&self.articles {
+                    // The save above wrote to the store already, so this sees its article.
+                    match articles.get(request.source.id,catalog_mid.as_bytes())?.filter(|segment|segment.part.is_some()&&segment.part==request.wanted.row.part) {
+                        Some(segment)=>tx.query_one("select exists(select 1 from files f where f.release_id=$1 and f.id=$2 and f.original_filename=$3)",
+                            &[&request.source.id,&segment.file_id,&request.wanted.row.filename.as_ref().map(|name|name.as_bytes())])?.try_get(0)?,
+                        None=>false,
+                    }
+                } else {tx.query_one("select exists(select 1 from segments s join files f on(f.release_id,f.id)=(s.release_id,s.file_id)
                     where s.release_id=$1 and s.message_id=$2 and f.original_filename=$3 and s.part=$4)",
-                    &[&request.source.id,&catalog_mid.as_bytes(),&request.wanted.row.filename.as_ref().map(|name|name.as_bytes()),&request.wanted.row.part])?.try_get(0)?;
+                    &[&request.source.id,&catalog_mid.as_bytes(),&request.wanted.row.filename.as_ref().map(|name|name.as_bytes()),&request.wanted.row.part])?.try_get(0)?};
                 if !present {actual=Outcome::Unusable;}
             }
             self.stopped()?;let old_tries=previous.map_or(0,|(_,tries)|tries);ensure!(old_tries>=0,"inferred retry state is invalid");
@@ -271,12 +307,15 @@ impl Service {
         enum Recovery {Retry,Consumed}
         let status=self.owner.with(|client| {
             let mut tx=client.build_transaction().isolation_level(IsolationLevel::RepeatableRead).read_only(true).start()?;
-            let same=tx.query_opt("select group_name=$2 and identity_key=$3,native_work_revision,
+            let same=if self.articles.is_some() {
+                tx.query_opt("select group_name=$2 and identity_key=$3,native_work_revision from releases r where id=$1",&[&record.release,&record.group,&&record.identity[..]])?
+            } else {tx.query_opt("select group_name=$2 and identity_key=$3,native_work_revision,
                 exists(select 1 from segments s where s.release_id=r.id and s.message_id=$4) from releases r where id=$1",
-                &[&record.release,&record.group,&&record.identity[..],&catalog_mid.as_bytes()])?;
+                &[&record.release,&record.group,&&record.identity[..],&catalog_mid.as_bytes()])?};
             let retry=if let Some(row)=same {
                 let previous=Self::previous(&mut tx,&record.mid,false)?;
-                row.try_get::<_,bool>(0)?&&!row.try_get::<_,bool>(2)?&&row.try_get::<_,i64>(1)?==record.revision&&previous==record.prior
+                let present=match &self.articles {Some(articles)=>articles.get(record.release,catalog_mid.as_bytes())?.is_some(),None=>row.try_get::<_,bool>(2)?};
+                row.try_get::<_,bool>(0)?&&!present&&row.try_get::<_,i64>(1)?==record.revision&&previous==record.prior
             }else{false};
             tx.commit()?;Ok(if retry {Recovery::Retry}else{Recovery::Consumed})
         })?;

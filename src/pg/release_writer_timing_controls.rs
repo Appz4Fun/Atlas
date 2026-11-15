@@ -20,12 +20,12 @@ fn missing_or_null_catalog_key_refuses_without_adopting_or_accepting_payload() {
     let release=release();
     let error=save(&mut client,std::slice::from_ref(&release),1).unwrap_err();
     assert!(format!("{error:#}").contains("existing catalog key_salt"));
-    assert_eq!(client.query_one("select (select count(*) from segments)+(select count(*) from files)+(select count(*) from releases)+(select count(*) from file_timing)",&[]).unwrap().get::<_,i64>(0),0);
+    assert_eq!(crate::pg::testing::articles(&mut *client)+client.query_one("select (select count(*) from files)+(select count(*) from releases)+(select count(*) from file_timing)",&[]).unwrap().get::<_,i64>(0),0);
     assert_eq!(client.query_one("select count(*) from meta where key='key_salt'",&[]).unwrap().get::<_,i64>(0),0,"writer never manufactures a replacement identity");
     client.execute("insert into meta(key,value) values('key_salt',null)",&[]).unwrap();
     let error=save(&mut client,std::slice::from_ref(&release),1).unwrap_err();
     assert!(format!("{error:#}").contains("key_salt is null"));
-    assert_eq!(client.query_one("select count(*) from segments",&[]).unwrap().get::<_,i64>(0),0);
+    assert_eq!(crate::pg::testing::articles(&mut *client),0);
     client.execute("update meta set value=7 where key='key_salt'",&[]).unwrap();
     assert_eq!(save(&mut client,std::slice::from_ref(&release),1).unwrap().parts,1);
     let before:i64=client.query_one("select from_hash from file_timing",&[]).unwrap().get(0);
@@ -57,7 +57,7 @@ fn duplicate_losers_unknown_dates_and_caller_rollback_do_not_invent_timing() {
     let mut tx=client.transaction().unwrap();
     assert_eq!(save_in(&mut tx,std::slice::from_ref(&release),1).unwrap().parts,2);
     check(&mut tx);tx.rollback().unwrap();
-    assert_eq!(client.query_one("select (select count(*) from file_timing)+(select count(*) from segments)+(select count(*) from releases)",&[]).unwrap().get::<_,i64>(0),0);
+    assert_eq!(crate::pg::testing::articles(&mut *client)+client.query_one("select (select count(*) from file_timing)+(select count(*) from releases)",&[]).unwrap().get::<_,i64>(0),0);
     assert_eq!(save(&mut client,&[release],1).unwrap().parts,2);
     let mut tx=client.transaction().unwrap();check(&mut tx);tx.rollback().unwrap();
 }

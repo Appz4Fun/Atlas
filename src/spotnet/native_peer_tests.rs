@@ -166,7 +166,7 @@ fn native_spot_owned_nntp_publishes_real_nzb_and_preserves_comment_originals() {
     assert_eq!(peer.count("BODY"),0,"unkept comment bodies are not fetched");
     let pass=service.spots_tick(1793000000).unwrap();assert_eq!((pass.noted,pass.saved,pass.retry),(1,1,0));
     let mut observer=schema.pool.get().unwrap();
-    assert_eq!(observer.query_one("select count(*) from segments where message_id=$1",&[&b"<actual-part@fixture.test>".as_slice()]).unwrap().get::<_,i64>(0),1);
+    assert_eq!(crate::article_local::Store::articles_for_test(&mut *observer).iter().filter(|a|a.message_id==b"<actual-part@fixture.test>".as_slice()).count() as i64,1);
     let row=observer.query_one("select s.state,s.nzb_key,p.native_original_xml,r.poster from spots_seen s join spots p on p.release_id=s.release_id join releases r on r.id=s.release_id",&[]).unwrap();
     assert_eq!(row.get::<_,i64>(0),store::SAVED);assert!(!row.get::<_,String>(1).is_empty());
     assert_eq!(row.get::<_,Vec<u8>>(2),XML.as_bytes());assert_eq!(row.get::<_,String>(3),"Actual NZB Poster");

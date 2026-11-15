@@ -95,7 +95,21 @@ pub fn inventory(client: &mut Client, id: i64) -> Result<Option<Inventory>> {
         };
         files.insert(info.id, InventoryFile { info, segments: Vec::new() });
     }
-    {
+    if let Some(store) = crate::article_local::of(&mut tx)? {
+        // The same order from the local store: file by file, each a bounded page at a time.
+        for (&file_id, file) in files.iter_mut() {
+            let mut after: Option<(Option<i64>, Vec<u8>)> = None;
+            loop {
+                let page = store.nzb_page(id, file_id, after.as_ref().map(|(part, id)| (*part, id.as_slice())), 4096, 1 << 20)?;
+                let Some(last) = page.last() else { break };
+                after = Some((last.part, last.message_id.clone()));
+                for segment in page {
+                    let message_id = String::from_utf8(segment.message_id).context("segment message ID is not UTF-8")?;
+                    file.segments.push(SegmentRef { message_id, part: segment.part, bytes: segment.bytes });
+                }
+            }
+        }
+    } else {
         let mut rows = tx.query_raw(
             "select file_id, message_id, part, bytes from segments where release_id = $1
              order by file_id, part nulls first, message_id",

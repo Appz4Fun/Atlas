@@ -91,7 +91,10 @@ mod native_preflight_tests {
             assert_eq!((saved.releases,saved.files,saved.parts),(1,1,1));
         }
         let ids=client.query("select name,id from releases",&[]).unwrap().into_iter().map(|row|(row.get::<_,String>(0),row.get::<_,i64>(1))).collect::<std::collections::HashMap<_,_>>();
-        client.execute("delete from segments where release_id=$1",&[&ids["No.Articles.Preflight"]]).unwrap();
+        // The articles are taken from where this schema keeps them.
+        let local=crate::article_local::of_schema(&schema.name);
+        if let Some(store)=&local {assert_eq!(store.forget_releases(&[ids["No.Articles.Preflight"]]).unwrap(),1);}
+        else {client.execute("delete from segments where release_id=$1",&[&ids["No.Articles.Preflight"]]).unwrap();}
         let root=tempfile::tempdir().unwrap();
         #[cfg(unix)] {use std::os::unix::fs::PermissionsExt;std::fs::set_permissions(root.path(),std::fs::Permissions::from_mode(0o700)).unwrap();}
         let pool=crate::nzb_spool::Pool::new(root.path().into(),crate::nzb_spool::Limits {requests:5,per_request_bytes:1<<20,total_bytes:5<<20,free_bytes:0}).unwrap();
@@ -115,7 +118,8 @@ mod native_preflight_tests {
             assert!(download.body.is_complete());
             // This mutation occurs after the readonly preflight transaction has
             // ended. Publishing must use that completed body, not query again.
-            client.execute("delete from segments where release_id=$1",&[&good])?;
+            if let Some(store)=&local {assert_eq!(store.forget_releases(&[good])?,1);}
+            else {client.execute("delete from segments where release_id=$1",&[&good])?;}
             let target=pg::fresh_nzb_tools::publish_download(&name,good,Some(output.path()),download)?;
             let xml=std::fs::read_to_string(&target)?;
             assert_eq!(xml.matches("<file ").count(),1);assert_eq!(xml.matches("<segment bytes=").count(),1);

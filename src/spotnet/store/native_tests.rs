@@ -221,7 +221,7 @@ fn native_placement_uses_the_actual_file_and_mid_pair_before_tagging() {
     let wrong_row = SpotRow { message_id: "different@spot.net".into(), nzb_key: plan.key().into(), ..row };
     assert_ne!(storage.publish(&mut plan, &wrong_row, "different-ref", &permit, 3).unwrap().release_id, Some(original));
     assert_eq!(
-        observer.query_one("select count(*) from segments where release_id=$1", &[&original]).unwrap().get::<_, i64>(0),
+        crate::article_local::Store::articles_for_test(&mut *observer).iter().filter(|a|a.release_id==original).count() as i64,
         1
     );
     assert_eq!(

@@ -180,7 +180,7 @@ fn original_owner_prioritizes_save_and_checkpoint_but_serves_fifo_frontier_and_h
     }
     owner
         .with(|client| {
-            assert_eq!(client.query_one("select count(*),sum(bytes) from segments", &[])?.get::<_, i64>(0), 1);
+            assert_eq!(crate::pg::testing::articles(client), 1);
             assert_eq!(
                 client
                     .query_one("select backfill_cursor from groups where name='example.admission'", &[])?
@@ -230,7 +230,7 @@ fn cancelled_save_keeps_admission_and_slot_until_original_owner_commit_drains() 
     runtime
         .owner
         .with(|client| {
-            assert_eq!(client.query_one("select count(*) from segments", &[])?.get::<_, i64>(0), 1);
+            assert_eq!(crate::pg::testing::articles(client), 1);
             Ok(())
         })
         .unwrap();

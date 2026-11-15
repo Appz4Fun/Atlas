@@ -19,6 +19,7 @@ impl ReadView<'_> {
     }
     pub(crate) fn nzb_listed_files(&self,id:i64)->Result<Option<Vec<crate::nzb::ListedFile>>> {
         if !self.visible(id)?{return Ok(None);}
+        if let Some(store)=self.local.clone(){return self.nzb_listed_files_local(&store,id).map(Some);}
         let inventory="with inventory as(
             select f.id,f.filename,count(*) articles,coalesce(sum(s.bytes),0)::bigint bytes,null::bigint singleton_part,null::bytea singleton_mid,true sparse_present
             from files f join segments s on s.release_id=f.release_id and s.file_id=f.id where f.release_id=$1 and f.filename<>'' group by f.id
@@ -39,6 +40,50 @@ impl ReadView<'_> {
             Ok(crate::nzb::ListedFile {n:index+1,name:(!name.is_empty()).then_some(name),bytes:row.try_get(2)?,articles:usize::try_from(articles)?})
         }).collect::<Result<Vec<_>>>()?))
     }
+    /// The listed files with their articles in the local store. The files come from this snapshot; a
+    /// named file with an article is one row and every article of a nameless file a row of its own.
+    fn nzb_listed_files_local(&self,store:&crate::article_local::Store,id:i64)->Result<Vec<crate::nzb::ListedFile>> {
+        use postgres::fallible_iterator::FallibleIterator;
+        // What the rows will cost is counted before a filename is read. The rows kept meanwhile stay
+        // inside what this request may still own; past that only the count goes on, to be refused below.
+        let mut found:Vec<(i64,i64,i64)>=Vec::new();let mut count=0u64;let mut names=0u64;let mut fits=true;let mut sparse=true;
+        let cost=|count:u64,names:u64|count.checked_mul(256).and_then(|n|names.checked_mul(3).and_then(|bytes|n.checked_add(bytes))).and_then(|n|n.checked_add(4096));
+        self.before_query()?;
+        {
+            let mut tx=self.tx.borrow_mut();
+            let mut rows=tx.query_raw("select id,octet_length(filename)::bigint from files where release_id=$1 order by filename collate \"C\",id",[&id])?;
+            while let Some(row)=rows.next()? {
+                self.check_deadline()?;let file:i64=row.try_get(0)?;let length:i64=row.try_get(1)?;ensure!(length>=0,"negative native listed-file extent");
+                let mut add=|articles:i64,bytes:i64,found:&mut Vec<(i64,i64,i64)>|->Result<()> {
+                    count=count.checked_add(1).context("native listed-file extent overflow")?;names=names.checked_add(length as u64).context("native listed-file extent overflow")?;
+                    if fits&&cost(count,names).is_some_and(|cost|cost<=self.remaining_owned()){found.push((file,articles,bytes));}else{fits=false;found.clear();}
+                    Ok(())
+                };
+                if length!=0 {
+                    let (articles,bytes)=store.nzb_file_totals(id,file)?;if articles>0{add(articles,bytes,&mut found)?;}
+                }else{
+                    self.local_segments(store,id,file,i64::MAX,|segment| {
+                        sparse&=store.nzb_envelope_extent(id,&segment.message_id)?.is_some();add(1,segment.bytes,&mut found)
+                    })?;
+                }
+            }
+        }
+        ensure!(sparse,"native original nameless file metadata unavailable");
+        self.admit_owned(cost(count,names).context("native listed-file extent overflow")?)?;
+        ensure!(fits,"native listed-file inventory changed");
+        self.before_query()?;
+        let rows=self.tx.borrow_mut().query("select id,filename from files where release_id=$1 order by filename collate \"C\",id",&[&id])?;
+        let mut listed=Vec::with_capacity(found.len());let mut found=found.into_iter().peekable();
+        for row in rows {
+            let file:i64=row.try_get(0)?;let name:String=row.try_get(1)?;
+            while let Some((_,articles,bytes))=found.next_if(|(of,_,_)|*of==file) {
+                ensure!(articles>0,"native listed file has no articles");
+                listed.push(crate::nzb::ListedFile {n:listed.len()+1,name:(!name.is_empty()).then(||name.clone()),bytes,articles:usize::try_from(articles)?});
+            }
+        }
+        ensure!(found.next().is_none()&&listed.len() as u64==count,"native listed-file inventory changed");
+        Ok(listed)
+    }
     /// End the same readonly snapshot with a completed, checked NZB. Callers
     /// may only begin downloader effects after this returns successfully.
     pub(crate) fn prepare_download(&self,id:i64,pool:&std::sync::Arc<crate::nzb_spool::Pool>)->Result<Option<PreparedDownload>> {
@@ -51,8 +96,10 @@ impl ReadView<'_> {
             self.before_query()?;
             Some(self.tx.borrow_mut().query_one("select filename from files where release_id=$1 and filename<>'' order by filename collate \"C\",id limit 1",&[&id])?.try_get::<_,String>(0)?)
         }else{None};
+        let exists:bool=if let Some(store)=&self.local {self.check_deadline()?;store.nzb_release_has_articles(id)?}else{
         self.before_query()?;
-        let exists:bool=self.tx.borrow_mut().query_one("select exists(select 1 from segments where release_id=$1 limit 1)",&[&id])?.try_get(0)?;
+        self.tx.borrow_mut().query_one("select exists(select 1 from segments where release_id=$1 limit 1)",&[&id])?.try_get(0)?
+        };
         if !exists {return Ok(None);}
         let download=self.nzb_own(id,Pick::Whole,pool)?.context("native preflight release disappeared")?;
         Ok(Some((name,first,download)))
@@ -115,7 +162,11 @@ mod listed_file_tests {
             assert!(view.nzb_listed_files(bad).is_err(),"uncaptured Some(empty) rows cannot be relabeled as original filename=None");
             assert!(view.nzb_listed_files(i64::MAX).unwrap().is_none());
         }
+        if let Some(store)=crate::article_local::of_schema(&schema.name) {
+            assert_eq!(store.test_forget_envelope(good,b"<none-b@example.invalid>").unwrap(),1);
+        }else{
         client.execute("delete from segment_nzb_metadata where release_id=$1 and message_key=(select message_key from segments where release_id=$1 and message_id=$2)",&[&good,&b"<none-b@example.invalid>".as_slice()]).unwrap();
+        }
         let view=ReadView::open(&mut client,&schema.name,Budget::default(),Instant::now()+Duration::from_secs(10)).unwrap();
         assert!(view.nzb_listed_files(good).is_err(),"a missing original header refuses the whole list, never silently filters or renumbers files");
     }

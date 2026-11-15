@@ -5,6 +5,17 @@ use crate::{store::FileInfo,web_meta::{PartFacts,PartsFacts}};
 use anyhow::{Result,Context,ensure};
 use std::collections::HashMap;
 
+/// The 64-cell coverage map of one file, as the `cells`/`ranges`/`covered`
+/// statement in `metadata_parts` computes it: a cell is set when the file has
+/// every part number of the cell's range.
+fn local_map(store:&crate::article_local::Store,file:&FileInfo)->Result<u64> {
+    let expected=file.expected.unwrap_or(file.parts_seen).max(file.parts_seen);
+    if expected<=0{return Ok(0);}
+    let edge=|cell:i128|i64::try_from(cell*i128::from(expected)/64).context("native part range overflow");
+    let ranges=(0..64).map(|cell|{let lo=edge(cell)?.checked_add(1).context("native part range overflow")?;Ok((lo,edge(cell+1)?.max(lo)))}).collect::<Result<Vec<(i64,i64)>>>()?;
+    let counts=store.file_range_counts(file.id,&ranges)?;
+    Ok(ranges.iter().zip(counts).enumerate().fold(0u64,|map,(cell,((lo,hi),count))|if count==hi-lo+1{map|1u64<<cell}else{map}))
+}
 impl ReadView<'_> {
     pub(crate) fn metadata_files(&self,id:i64)->Result<Vec<FileInfo>> {
         self.before_query()?;
@@ -24,6 +35,15 @@ impl ReadView<'_> {
         }).collect()
     }
     fn metadata_id(&self,id:i64,file:i64,last:bool)->Result<Option<String>> {
+        if let Some(store)=&self.local {
+            // The same two steps as below: the extent is admitted before the ID is owned.
+            self.check_deadline()?;
+            let Some(length)=store.file_edge_len(id,file,last)? else{return Ok(None)};
+            ensure!(length>=0,"negative native metadata ID extent");self.admit_owned((length as u64).checked_mul(4).and_then(|n|n.checked_add(256)).context("native metadata ID overflow")?)?;
+            self.check_deadline()?;
+            let bytes=store.file_edge(id,file,last)?.context("native metadata ID disappeared")?.message_id;
+            ensure!(bytes.len() as i64==length,"native metadata ID extent changed");return Ok(Some(String::from_utf8(bytes).context("native metadata ID is not UTF-8")?));
+        }
         self.before_query()?;
         let order=if last{"coalesce(part,0) desc,message_id desc"}else{"coalesce(part,0),message_id"};
         // Identifiers/order are selected from closed literals, not request SQL.
@@ -57,12 +77,21 @@ impl ReadView<'_> {
     pub(crate) fn metadata_parts(&self,id:i64)->Result<Option<PartsFacts>> {
         if !self.visible(id)?{return Ok(None);}
         let files=self.metadata_files(id)?;
-        self.before_query()?;
-        let count:i64=self.tx.borrow_mut().query_one("select count(*) from(select 1 from segments where release_id=$1 limit 250001) horizon",&[&id])?.try_get(0)?;
+        let count:i64=if let Some(store)=&self.local {self.check_deadline()?;store.release_count(id,250001)?} else {
+            self.before_query()?;
+            self.tx.borrow_mut().query_one("select count(*) from(select 1 from segments where release_id=$1 limit 250001) horizon",&[&id])?.try_get(0)?
+        };
         ensure!((0..=250001).contains(&count),"invalid native parts horizon");let complete=count<=250000;
         let shown:Vec<i64>=files.iter().take(200).map(|file|file.id).collect();
         let mut maps=HashMap::new();let mut numbers=HashMap::new();
-        if complete && !shown.is_empty() {
+        if let (true,Some(store))=(complete,&self.local) {
+            // `files` is this snapshot's own rows; only the articles are elsewhere.
+            for file in files.iter().take(200) {
+                self.check_deadline()?;
+                maps.insert(file.id,local_map(store,file)?);
+                if let Some((smallest,largest,reposted))=store.file_numbers(file.id)? {numbers.insert(file.id,(smallest,largest,usize::try_from(reposted)?));}
+            }
+        } else if complete && !shown.is_empty() {
             self.before_query()?;
             let rows=self.tx.borrow_mut().query("with cells as (
                 select f.id,c.cell, greatest(coalesce(f.expected,f.distinct_parts),f.distinct_parts) expected

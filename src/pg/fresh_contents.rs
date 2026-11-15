@@ -88,13 +88,16 @@ impl ReadView<'_> {
         ensure!(bytes>=0&&count>=0,"negative native contents extent");
         self.admit_owned((bytes as u64).checked_mul(4).and_then(|n|n.checked_add((count.min(MAX_LISTED_FILES as i64) as u64)*256+4096)).context("native contents extent overflow")?)?;
         self.before_query()?;let mut tx=self.tx.borrow_mut();
-        let mut rows=tx.query_raw("select f.filename,f.distinct_parts,greatest(coalesce(f.expected,f.distinct_parts),f.distinct_parts),
+        // With a local article store the fourth column is the file whose bytes it sums.
+        let mut rows=if self.local.is_some() {tx.query_raw("select f.filename,f.distinct_parts,greatest(coalesce(f.expected,f.distinct_parts),f.distinct_parts),f.id
+            from files f where f.release_id=$1 order by f.filename collate \"C\",f.id",[&id])?} else {tx.query_raw("select f.filename,f.distinct_parts,greatest(coalesce(f.expected,f.distinct_parts),f.distinct_parts),
             coalesce((select sum(s.bytes)::bigint from segments s where s.release_id=f.release_id and s.file_id=f.id),0)
-            from files f where f.release_id=$1 order by f.filename collate \"C\",f.id",[&id])?;
+            from files f where f.release_id=$1 order by f.filename collate \"C\",f.id",[&id])?};
         let mut contents=Contents::default();
         while let Some(row)=rows.next()? {
             self.check_deadline()?;
-            let name:String=row.try_get(0)?;let seen:i64=row.try_get(1)?;let expected:i64=row.try_get(2)?;let bytes:i64=row.try_get(3)?;
+            let name:String=row.try_get(0)?;let seen:i64=row.try_get(1)?;let expected:i64=row.try_get(2)?;
+            let bytes:i64=match &self.local {Some(store)=>store.file_bytes(id,row.try_get(3)?)?,None=>row.try_get(3)?};
             ensure!(seen>=0&&expected>=seen&&bytes>=0,"invalid native contents counters");
             let lower=name.to_ascii_lowercase();let par2=lower.ends_with(".par2");let recovery=par2&&lower.contains(".vol");
             add(&mut contents.files,1)?;add(&mut contents.articles_seen,seen)?;add(&mut contents.articles_expected,expected)?;

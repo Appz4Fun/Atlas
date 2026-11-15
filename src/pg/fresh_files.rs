@@ -66,6 +66,31 @@ impl ReadView<'_> {
         if !self.visible(id)? {return Ok(None);}
         let mut descriptors=pool.open()?;
         self.before_query()?;
+        let mut count=0u64;
+        if let Some(store)=self.local.clone() {
+            // The files come from this snapshot and their articles from the local store: a named file
+            // with an article is one row, and every article of a nameless file is a row of its own.
+            let mut tx=self.tx.borrow_mut();
+            let mut rows=tx.query_raw("select id,octet_length(filename)::bigint from files where release_id=$1
+                order by filename collate \"C\",id",[&id])?;
+            while let Some(row)=rows.next()? {
+                self.check_deadline()?;
+                let file:i64=row.try_get(0)?;let length:i64=row.try_get(1)?;
+                if length!=0 {
+                    let (articles,bytes)=store.nzb_file_totals(id,file)?;if articles==0{continue;}
+                    ensure!(file>0 && length>=0 && articles>0,"invalid native file inventory");
+                    for value in [file,length,articles,bytes] {descriptors.write_all(&value.to_le_bytes())?;}
+                    count=count.checked_add(1).context("native file count overflow")?;
+                }else{
+                    self.local_segments(&store,id,file,i64::MAX,|segment| {
+                        ensure!(file>0,"invalid native file inventory");
+                        ensure!(store.nzb_envelope_extent(id,&segment.message_id)?.is_some(),"native original unnamed file metadata unavailable");
+                        for value in [file,0,1,segment.bytes] {descriptors.write_all(&value.to_le_bytes())?;}
+                        count=count.checked_add(1).context("native file count overflow")?;Ok(())
+                    })?;
+                }
+            }
+        }else{
         let mut tx=self.tx.borrow_mut();
         let mut rows=tx.query_raw("with inventory as(
             select f.id,f.filename,count(s.message_key) articles,coalesce(sum(s.bytes),0)::bigint bytes,null::bigint singleton_part,null::bytea singleton_mid,true sparse_present
@@ -78,7 +103,6 @@ impl ReadView<'_> {
             where f.release_id=$1 and f.filename='')
             select id,octet_length(filename)::bigint,articles,bytes,sparse_present from inventory
             order by filename collate \"C\",id,singleton_part nulls first,singleton_mid",[&id])?;
-        let mut count=0u64;
         while let Some(row)=rows.next()? {
             self.check_deadline()?;
             let values:[i64;4]=[row.try_get(0)?,row.try_get(1)?,row.try_get(2)?,row.try_get(3)?];
@@ -88,6 +112,7 @@ impl ReadView<'_> {
             count=count.checked_add(1).context("native file count overflow")?;
         }
         drop(rows);drop(tx);
+        }
         let mut descriptors=descriptors.finish()?;
         let mut xml=FilesWriter::new(pool.open()?,id,count)?;
         for _ in 0..count {
@@ -117,8 +142,14 @@ mod tests {
         let name="A.字幕.\"&.mkv";
         let file:i64=client.query_one("insert into files(release_id,filename_key,filename,expected) values($1,$2,$3,1) returning id",&[&id,&vec![2u8;32],&name]).unwrap().get(0);
         for n in 0..19u8 {
+            let message=format!("<part{n}@example.test>").into_bytes();
+            // The articles go where this schema keeps them.
+            if let Some(store)=crate::article_local::of_schema(&schema.name) {
+                assert_eq!(store.import(&[crate::article_local::NewRow {release_id:id,file_id:file,message_id:&message,part:Some(1),bytes:17,envelope:None}]).unwrap(),1);
+            }else{
             client.execute("insert into segments(release_id,file_id,message_key,message_id,part,bytes) values($1,$2,$3,$4,1,17)",
-                &[&id,&file,&vec![n;32],&format!("<part{n}@example.test>").into_bytes()]).unwrap();
+                &[&id,&file,&vec![n;32],&message]).unwrap();
+            }
         }
         let root=tempfile::tempdir().unwrap();
         #[cfg(unix)] {use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(root.path(),std::fs::Permissions::from_mode(0o700)).unwrap();}
