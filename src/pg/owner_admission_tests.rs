@@ -43,7 +43,8 @@ fn fifo_classes_alternate_without_starving_ordinary_heartbeat_work() {
     }
     drop(held);
     let order: Vec<_> = (0..5).map(|_| received.recv_timeout(Duration::from_secs(5)).unwrap()).collect();
-    assert_eq!(order, ["save", "frontier-1", "cursor", "heartbeat", "frontier-2"]);
+    // up to INGEST_TURNS ingestion turns in a row, then the ordinary queue in FIFO order
+    assert_eq!(order, ["save", "cursor", "frontier-1", "heartbeat", "frontier-2"]);
     for job in jobs {
         job.join().unwrap()
     }
@@ -171,7 +172,8 @@ fn original_owner_prioritizes_save_and_checkpoint_but_serves_fifo_frontier_and_h
     held.join().unwrap().unwrap();
     assert_eq!(
         (0..5).map(|_| received.recv_timeout(Duration::from_secs(5)).unwrap()).collect::<Vec<_>>(),
-        ["save", "frontier-1", "cursor", "heartbeat", "frontier-2"]
+        // both ingestion turns (within INGEST_TURNS), then the ordinary ones in FIFO order
+        ["save", "cursor", "frontier-1", "heartbeat", "frontier-2"]
     );
     save.join().unwrap().unwrap();
     cursor.join().unwrap().unwrap();
@@ -307,7 +309,7 @@ fn ingestion_turn_sql_failure_rolls_back_and_stays_fatal() {
 
 #[test]
 #[ignore = "requires explicit isolated PostgreSQL; real completed observation must progress between ingestion turns"]
-fn ordinary_observation_heartbeat_commits_between_two_waiting_ingestion_callbacks() {
+fn ordinary_observation_heartbeat_commits_after_at_most_three_waiting_ingestion_callbacks() {
     let schema = crate::pg::testing::Schema::new().expect("explicit isolated PostgreSQL required");
     let runtime = crate::pg::stage_queue_tests::runtime(&schema);
     let owner = runtime.owner.clone();
@@ -328,6 +330,15 @@ fn ordinary_observation_heartbeat_commits_between_two_waiting_ingestion_callback
         })
     });
     queued(&owner.admission, [1, 1]);
+    // two more ingestion turns: with INGEST_TURNS of three, the heartbeat goes after them and before the fourth
+    let fillers: Vec<_> = (0..2)
+        .map(|n| {
+            let o = owner.clone();
+            let f = thread::spawn(move || o.with_ingest(|_| Ok(())));
+            queued(&owner.admission, [2 + n, 1]);
+            f
+        })
+        .collect();
     let second = owner.clone();
     let checkpoint = thread::spawn(move || {
         second.with_ingest(|client| {
@@ -338,10 +349,13 @@ fn ordinary_observation_heartbeat_commits_between_two_waiting_ingestion_callback
         Ok(())
     })
     });
-    queued(&owner.admission, [2, 1]);
+    queued(&owner.admission, [4, 1]);
     release.send(()).unwrap();
     held.join().unwrap().unwrap();
     save.join().unwrap().unwrap();
+    for f in fillers {
+        f.join().unwrap().unwrap();
+    }
     heartbeat.join().unwrap().unwrap();
     checkpoint.join().unwrap().unwrap();
     assert_eq!(owner.failure(), None);
@@ -369,7 +383,8 @@ fn nested_turns_preserve_ingestion_share_and_service_selection_fifos() {
     }
     drop(held);
     let actual:Vec<_>=(0..12).map(|_|received.recv_timeout(Duration::from_secs(5)).unwrap()).collect();
-    assert_eq!(actual,["A0","B0","A1","C0","A2","B1","A3","C1","A4","B2","A5","C2"]);
+    // three ingestion turns, then one ordinary (service and selection taking turns), while both wait
+    assert_eq!(actual,["A0","A1","A2","B0","A3","A4","A5","C0","B1","C1","B2","C2"]);
     for job in jobs {job.join().unwrap()}
     queued_three(&gate,[0;3]);assert!(!gate.state.lock().unwrap().active);
     // With no ingestion/service demand, selection is work-conserving, not artificially throttled.

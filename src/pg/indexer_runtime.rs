@@ -77,7 +77,7 @@ pub(crate) struct Owner {
     epoch: Option<super::stage::OwnerEpoch>,
 }
 
-/// Ingestion alternates with ordinary work. Within each ordinary turn,
+/// Ingestion takes up to `INGEST_TURNS` turns, then a waiting ordinary one. Within each ordinary turn,
 /// service/control and scheduler selection alternate, FIFO within each queue.
 /// Neither publication nor ingestion waits behind every queued frontier probe;
 /// each class still progresses. This bounds ordering, never running SQL time.
@@ -90,9 +90,15 @@ struct Admission {
 struct AdmissionState {
     waiting: [std::collections::VecDeque<Arc<()>>; 3],
     active: bool,
+    /// ingestion turns admitted since the last ordinary one (see `INGEST_TURNS`)
     next: usize,
     selection_next: bool,
 }
+
+/// Ingestion turns (saves and their progress) admitted in a row before a waiting ordinary turn gets one. It was one,
+/// soo saves never had more than half the owner session's turns while post-processing, the scheduler and the caches
+/// had work queued, and on prod fetched headers waited on that. Ordinary work still gets every fourth turn.
+const INGEST_TURNS: usize = 3;
 struct OwnerTurn<'a> {
     admission: &'a Admission,
     id: Arc<()>,
@@ -110,17 +116,17 @@ impl Admission {
                 drop(state);
                 return Err(AttemptEnded.into());
             }
-            // Top-level ingestion/ordinary alternation is unchanged. Only an
-            // actual ordinary admission advances the service/selection subturn.
+            // Up to INGEST_TURNS ingestion turns, then a waiting ordinary one. Only
+            // an actual ordinary admission advances the service/selection subturn.
             let ordinary = if state.waiting[1].is_empty() { 2 }
                 else if state.waiting[2].is_empty() || !state.selection_next { 1 } else { 2 };
             let chosen = if state.waiting[0].is_empty() { ordinary }
-                else if state.waiting[ordinary].is_empty() || state.next == 0 { 0 } else { ordinary };
+                else if state.waiting[ordinary].is_empty() || state.next < INGEST_TURNS { 0 } else { ordinary };
             if !state.active && chosen == class
                 && state.waiting[class].front().is_some_and(|id| Arc::ptr_eq(id, &turn.id)) {
                 state.waiting[class].pop_front();
                 state.active = true;
-                state.next = usize::from(class == 0);
+                state.next = if class == 0 { state.next.saturating_add(1) } else { 0 };
                 if class != 0 { state.selection_next = class == 1; }
                 turn.active = true;
                 drop(state);
