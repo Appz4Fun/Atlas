@@ -43,6 +43,8 @@ mod stage_schema_tests;
 #[cfg(test)]
 pub(crate) mod stage_queue_tests;
 #[cfg(test)]
+mod statement_triggers_tests;
+#[cfg(test)]
 mod stage_words_tests;
 #[cfg(test)]
 mod stage_mutation_tests;
