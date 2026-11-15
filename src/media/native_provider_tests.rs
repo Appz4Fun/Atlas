@@ -273,6 +273,11 @@ pub(super) fn run_runtime_case(selector: &'static str, body: impl FnOnce(&crate:
         | "media::steps::tests::a_spots_kind_gives_its_title_to_look_up"
         | "media::steps::tests::each_step_has_its_lane"
         | "postprocess::native::media_settlement_tests::a_files_own_tags_pin_its_ids_against_a_lookup_by_name"
+        | "postprocess::native::predb_revision_tests::no_import_control_persists_buffered_movie_classification"
+        | "postprocess::native::predb_revision_tests::noop_feed_page_keeps_buffered_movie_classification"
+        | "postprocess::native::predb_revision_tests::changed_matcher_metadata_still_supersedes_buffered_classification"
+        | "postprocess::native::predb_revision_tests::matching_title_insert_supersedes_old_no_match_and_retry_applies"
+        | "postprocess::native::predb_revision_tests::noop_multichunk_and_rolled_back_import_preserve_facts"
     ), "closed native runtime fixture selector");
     if std::env::var_os(CHILD_CASE).is_none()
         && (!cfg!(unix) || std::env::var("ATLAS_PG_TEST_URL").ok().filter(|url| !url.is_empty()).is_none())
@@ -281,6 +286,29 @@ pub(super) fn run_runtime_case(selector: &'static str, body: impl FnOnce(&crate:
         return;
     }
     run_owned_case(selector, selector, false, body);
+}
+
+// Only failed owned cases retain the already bounded pipe prefixes. The
+// diagnostic file contains no home/config copy and is private independently of
+// the caller's umask; log persistence cannot change child cleanup or admission.
+fn retain_failed_logs(out: &io::Result<Log>, err: &io::Result<Log>) -> io::Result<PathBuf> {
+    let mut file = tempfile::Builder::new().prefix("atlas-native-case-failure-").suffix(".log").tempfile()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.as_file().set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    for (label, result) in [("stdout", out), ("stderr", err)] {
+        writeln!(file, "--- {label} (bounded prefix) ---")?;
+        match result {
+            Ok(log) => file.write_all(&log.kept)?,
+            Err(_) => writeln!(file, "pipe reader failed")?,
+        }
+        writeln!(file)?;
+    }
+    file.as_file().sync_all()?;
+    let (_, path) = file.keep().map_err(|error| error.error)?;
+    Ok(path)
 }
 
 fn run_owned_case(
@@ -328,6 +356,16 @@ fn run_owned_case(
     let (out, err) = child.logs();
     // Drop reaps on a wait error and joins any remaining readers before Schema.
     drop(child);
+    let marker = completion(case);
+    let failed = waited.as_ref().map_or(true, |(status, timed_out)| !status.success() || *timed_out)
+        || out.as_ref().map_or(true, |log| log.overflow || String::from_utf8_lossy(&log.kept).matches(&marker).count() != 1)
+        || err.as_ref().map_or(true, |log| log.overflow);
+    if failed {
+        match retain_failed_logs(&out, &err) {
+            Ok(path) => eprintln!("owned native case {case} failed; private diagnostic: {}", path.display()),
+            Err(_) => eprintln!("owned native case {case} failed; private diagnostic unavailable"),
+        }
+    }
     let (status, timed_out) = waited.expect("owned provider child wait");
     let out = out.expect("owned provider stdout drain");
     let err = err.expect("owned provider stderr drain");
@@ -337,7 +375,6 @@ fn run_owned_case(
     // diagnostic about the private selected destination. Status/case identifies
     // the exact isolated assertion for Root's separately owned diagnostics.
     assert!(status.success(), "owned native provider case {case} failed: {status}; child output kept private");
-    let marker = completion(case);
     assert_eq!(String::from_utf8_lossy(&out.kept).matches(&marker).count(), 1, "missing owned case completion");
     // stderr is drained and admitted even when successful libtest writes none.
     drop(err);

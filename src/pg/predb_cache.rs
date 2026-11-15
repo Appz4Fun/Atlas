@@ -75,12 +75,13 @@ pub(crate) fn import_in(tx: &mut Transaction<'_>, source: i64, entries: &[crate:
     ensure!(entries.len() <= PAGE as usize, "PreDB import page exceeds admission");
     ensure!(tx.query_one("select current_setting('transaction_isolation')", &[])?.try_get::<_, String>(0)? == "read committed", "PreDB import requires READ COMMITTED");
     tx.batch_execute("lock table ext_predb_titles in share row exclusive mode; lock table ext_predb_title_keys in access exclusive mode")?;
-    let Some(meta) = tx.query_opt("select version,top_id,title_rows,key_rows from ext_predb_key_meta where singleton=1", &[])? else { return Ok(ImportStatus::Pending) };
+    let Some(meta) = tx.query_opt("select version,top_id,title_rows,key_rows,revision from ext_predb_key_meta where singleton=1", &[])? else { return Ok(ImportStatus::Pending) };
     ensure!(meta.try_get::<_,i64>(0)? == 1, "unsupported PreDB matcher key version");
     let mut top: Option<i64> = meta.try_get(1)?;
     let top_before = top;
     let mut titles: i64 = meta.try_get(2)?;
     let mut keys: i64 = meta.try_get(3)?;
+    let previous_revision: i64 = meta.try_get(4)?;
     let mut counts = Counts::default();
     for entry in entries {
         let title = entry.title.trim();
@@ -111,7 +112,13 @@ pub(crate) fn import_in(tx: &mut Transaction<'_>, source: i64, entries: &[crate:
     if counts.inserted > 0 { if let Some((page,floor)) = cursor {
         ensure!(tx.execute("update ext_predb_feeds set resume_page=$1,gap_floor=$2 where source=$3", &[&page,&floor,&source])? == 1, "PreDB feed cursor row unavailable");
     } }
-    let revision: i64 = tx.query_one("select nextval('ext_predb_key_revision')", &[])?.try_get(0)?;
+    // Even a zero-row UPDATE fires the statement trigger that removes key
+    // certification. Restore the locked completed revision for unchanged data.
+    let revision: i64 = if counts.inserted == 0 && counts.updated == 0 {
+        previous_revision
+    } else {
+        tx.query_one("select nextval('ext_predb_key_revision')", &[])?.try_get(0)?
+    };
     tx.batch_execute("delete from ext_predb_key_meta; delete from ext_predb_key_build")?;
     tx.execute("insert into ext_predb_key_meta(singleton,version,revision,top_id,title_rows,key_rows) values(1,1,$1,$2,$3,$4)", &[&revision,&top,&titles,&keys])?;
     Ok(ImportStatus::Applied { counts, revision })
