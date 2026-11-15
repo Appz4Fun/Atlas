@@ -53,6 +53,15 @@ pub(crate) struct Runtime {
     // after this connection has acquired sole indexer ownership of the schema.
 }
 
+/// How long one proof that this session holds the epoch serves the turns after it. Each turn proved it again (three
+/// round trips, one joining `pg_stat_activity` and `pg_locks`), and on prod that was a quarter of the session's time,
+/// more than the saves it fenced. The session holds the exclusive advisory lock all along, soo no other indexer can
+/// take the schema while it lives; what a fresh proof adds is noticing an operator's change to the epoch, schema or
+/// catalog binding, now at most this late. A failed proof is never reused. Migrations take their own lock, not the
+/// indexer's (`migrate::run`), soo a schema migrated under a live owner is noticed up to this much (and one turn)
+/// later than before; writers that verify the epoch inside their own transaction are unaffected.
+const EPOCH_PROOF_FOR: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// The ownership lock and every cursor/catalog write use this same session.
 /// A lost session cannot continue writing through a different pooled client.
 pub(crate) struct Owner {
@@ -62,6 +71,8 @@ pub(crate) struct Owner {
     accepting: AtomicBool,
     failure: AtomicU8,
     busy_since: Mutex<Option<std::time::Instant>>,
+    /// When this session last proved it still holds the epoch (see `EPOCH_PROOF_FOR`).
+    verified_at: Mutex<Option<std::time::Instant>>,
     cache_destination: Option<CacheDestination>,
     epoch: Option<super::stage::OwnerEpoch>,
 }
@@ -172,6 +183,7 @@ impl Owner {
             accepting: AtomicBool::new(true),
             failure: AtomicU8::new(0),
             busy_since: Mutex::new(None),
+            verified_at: Mutex::new(None),
             cache_destination: None,
             epoch: None,
         }
@@ -233,7 +245,7 @@ impl Owner {
         }
         *self.busy_since.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::time::Instant::now());
         let result = match held.as_mut() {
-            Some(client) if !client.is_closed() => self.epoch.as_ref().map_or(Ok(()),|epoch|epoch.verify(client))
+            Some(client) if !client.is_closed() => self.epoch.as_ref().map_or(Ok(()),|epoch|self.verify_epoch(epoch,client))
                 .and_then(|()|{
                     if !self.accepting.load(Ordering::Acquire) || self.stop.load(Ordering::Acquire) {
                         Err(AttemptEnded.into())
@@ -252,6 +264,18 @@ impl Owner {
             }
         }
         result
+    }
+
+    /// `epoch.verify` on this session, unless it passed within `EPOCH_PROOF_FOR`. Called with the session held.
+    fn verify_epoch(&self, epoch: &super::stage::OwnerEpoch, client: &mut postgres::Client) -> Result<()> {
+        let mut at = self.verified_at.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if at.is_some_and(|t| t.elapsed() < EPOCH_PROOF_FOR) {
+            return Ok(());
+        }
+        *at = None;
+        epoch.verify(client)?;
+        *at = Some(std::time::Instant::now());
+        Ok(())
     }
 
     pub(crate) fn fail(&self, failure: Failure) {

@@ -174,7 +174,7 @@ fn drain(runtime:&super::Runtime) {
 
 #[test]
 #[ignore="explicit isolated PostgreSQL; one hundred real canonical Owner callbacks and framed protocol counters"]
-fn one_hundred_guarded_callbacks_use_three_protocol_completions_each() {
+fn guarded_callbacks_reuse_one_epoch_proof_a_second_and_prove_again_after() {
     let schema=crate::pg::testing::Schema::new().expect("explicit isolated PostgreSQL required");
     let proxy=Proxy::new(&schema.url);
     let mut config=crate::config::Config::default();
@@ -193,12 +193,27 @@ fn one_hundred_guarded_callbacks_use_three_protocol_completions_each() {
     // The final unnamed typed barrier contributes exactly one Sync/Ready and
     // one Parse. All deferred Close/Sync completions belong to the workload.
     let ready=delta[0]-1;let boundaries=delta[1]+delta[2]-1;let parses=delta[3]-1;let commands=delta[4]-1;
-    runtime.owner.close();
     assert_eq!(callbacks,100);assert_eq!(runtime.owner.failure(),None);assert!(!proxy.failed.load(Ordering::Acquire));
     println!("owner guard protocol: callbacks={callbacks}, commands={commands}, ready={ready}, boundaries={boundaries}, parses={parses}, elapsed_us={}",elapsed.as_micros());
-    assert_eq!(commands,300,"protocol savings cannot remove any of the three real guard commands");
     assert_eq!(ready,boundaries,"every frontend completion boundary must have a real PostgreSQL ReadyForQuery");
-    assert_eq!(ready,300,"each fresh owner guard must retain its three checks without implicit prepare/close completion cycles");
+    // A proof is three commands, and one serves every callback within EPOCH_PROOF_FOR of it.
+    if elapsed<super::EPOCH_PROOF_FOR/2 {
+        assert_eq!(commands,0,"callbacks within a proof's second must not prove again");
+    } else {
+        let proofs=(elapsed.as_secs_f64()/super::EPOCH_PROOF_FOR.as_secs_f64()).ceil() as u64+1;
+        assert!(commands%3==0 && commands<=3*proofs,"{commands} guard commands in {elapsed:?}");
+    }
+    assert_eq!(ready,commands,"no implicit prepare/close completion cycles");
+    // Once the proof is older than EPOCH_PROOF_FOR the next callback proves again, all three checks.
+    std::thread::sleep(super::EPOCH_PROOF_FOR+std::time::Duration::from_millis(50));
+    let before=proxy.counts.snapshot();
+    runtime.owner.with(|_|Ok(())).unwrap();drain(&runtime);
+    let after=proxy.counts.snapshot();
+    let delta=std::array::from_fn::<_,5,_>(|i|after[i]-before[i]);
+    let (ready,boundaries,parses,commands)=(delta[0]-1,delta[1]+delta[2]-1,delta[3]-1,delta[4]-1);
+    // pg_stat_clear_snapshot goes as a simple query; the other two are parsed once each
+    assert_eq!((commands,ready,boundaries,parses),(3,3,3,2),"a stale proof is proven again with all three checks and no extra cycles");
+    runtime.owner.close();
 }
 
 #[test]
