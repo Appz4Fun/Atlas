@@ -749,6 +749,7 @@ impl<'a> BatchSnapshot<'a> {
         expected: &ReleaseBinding,
         deadline: Instant,
     ) -> Result<Self> {
+        let deadline = deadline.min(session.deadline());
         check(deadline)?;
         if &reference.binding != expected || reference.root.identity != reference.identity {
             return Err(Error::IdentityMismatch);
