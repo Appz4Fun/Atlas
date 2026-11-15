@@ -2220,6 +2220,7 @@ impl Pass<'_> {
         // every retry round in all, progressing or not: what bounds a pass whose rounds keep finishing a little
         let mut rounds = 0;
         let mut done_at_round = 0;
+        let began = Instant::now();
         let mut saved = Progress::default();
         let mut done = 0;
         let mut finished = Finished::default();
@@ -2254,6 +2255,7 @@ impl Pass<'_> {
                 if (!again.is_empty() || !unread.is_empty())
                     && round < SLICE_ROUNDS
                     && rounds < SLICE_ROUNDS_MOST
+                    && began.elapsed() < SLICE_RETRY_FOR
                     && !stopped
                     && !save_failed
                 {
@@ -2657,6 +2659,9 @@ fn name_sources(release: &Release) -> Vec<(String, Extract)> {
 const SLICE_ROUNDS: usize = 3;
 /// The most rounds a pass asks again in all, progressing or not.
 const SLICE_ROUNDS_MOST: usize = 64;
+/// No retry round starts once a pass has run this long: half a day chunk's claim (`chunks::CLAIM_TIMEOUT`), soo no
+/// other worker takes the day over while it is still being read.
+const SLICE_RETRY_FOR: Duration = Duration::from_secs(crate::chunks::CLAIM_TIMEOUT as u64 / 2);
 
 /// The parts of `range` not finished, refused for now or failed (`again`), cut into `size` long slices: the ones a
 /// stream never started after a slice failed.
