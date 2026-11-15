@@ -1753,7 +1753,7 @@ where
             }
             return failed(NotCarried { group: group.to_string(), host: ctx.pool.host(server) }.into()).await;
         }
-        Err(e) => return failed(e.into()).await,
+        Err(e) => return failed(anyhow::Error::new(e).context("selecting the group")).await,
     };
     let (_count, first, last, _name) = found;
 
@@ -2003,6 +2003,8 @@ async fn goes_back_furthest(
     }
 
     let total_conns = ctx.pool.indexing_connections();
+    // a server that couldnt be asked: the answer holds for this chunk but isnt kept for the group
+    let mut unasked = false;
     // every carrier's (whether unsure, since, host)
     let mut found = vec![(!oldest.1, oldest.0, host.clone())];
     for other in servers.into_iter().filter(|&i| i != server) {
@@ -2012,12 +2014,18 @@ async fn goes_back_furthest(
         let (_, low, high, _) = match ctx.pool.group_on(other, group).await {
             Ok(info) => info,
             Err(e) if matches!(e.code(), Some(403 | 411 | 430 | 500 | 501)) => continue,
-            Err(e) => return Err(e.into()),
+            // another server that wont answer just now is left out of this answer, which then isnt kept: the
+            // chunk goes on rather than failing on a server it isnt even read from
+            Err(_) => {
+                unasked = true;
+                continue;
+            }
         };
-        match ctx.pool.retention(other, group, low, high).await? {
-            Retention::Since(t) => found.push((false, t, ctx.pool.host(other))),
-            Retention::Unsure(t) => found.push((true, t, ctx.pool.host(other))),
-            Retention::Empty => {}
+        match ctx.pool.retention(other, group, low, high).await {
+            Ok(Retention::Since(t)) => found.push((false, t, ctx.pool.host(other))),
+            Ok(Retention::Unsure(t)) => found.push((true, t, ctx.pool.host(other))),
+            Ok(Retention::Empty) => {}
+            Err(_) => unasked = true,
         }
     }
     // the deepest of those whose dates agree, a tie to `server` (asked
@@ -2026,6 +2034,9 @@ async fn goes_back_furthest(
     found.sort_by_key(|(unsure, t, h)| (*unsure, *t, *h != host));
     let (_, since, deepest) = found.remove(0);
     let runner_up = found.first().map(|(_, t, _)| *t);
+    if unasked {
+        return Ok((deepest == host, runner_up));
+    }
     let (g, d) = (group.to_string(), deepest.clone());
     on_db(db, move |conn| {
         crate::chunks::set_deepest(conn, &g, &d, since)?;
