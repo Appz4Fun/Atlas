@@ -336,7 +336,7 @@ pub(crate) fn put_probe(tx:&mut postgres::Transaction<'_>,record:&crate::raw_sto
        content_id=excluded.content_id,crc32=excluded.crc32,agent=excluded.agent,info=excluded.info,moviehash=excluded.moviehash,
        parts=excluded.parts,complete=excluded.complete,config_stamp=excluded.config_stamp,probed_at=excluded.probed_at
       where ext_raw_probes.name=excluded.name and ext_raw_probes.group_name=excluded.group_name",
-      &[&record.name,&record.group_name,&record.content_id,&record.crc32,&record.agent,&record.info,&record.moviehash,
+      &[&record.name,&record.group_name,&record.content_id,&record.crc32,&super::nul_free_opt(&record.agent),&super::nul_free(record.info),&super::nul_free_opt(&record.moviehash),
         &record.parts,&i64::from(record.complete),&(record.config_stamp as i64),&chrono::Utc::now().timestamp()])?;
     ensure!(n==1,"natural cache key collision");
     if let Some(password)=record.nfo_password {
@@ -367,7 +367,7 @@ pub(crate) fn put_nfo_password(tx:&mut postgres::Transaction<'_>,key:Key<'_>,pas
     let n=tx.execute("insert into ext_raw_nfo_passwords(name,group_name,content_id,password) values($1,$2,$3,$4)
       on conflict(natural_name_key,natural_group_key) do update set content_id=excluded.content_id,password=excluded.password
       where ext_raw_nfo_passwords.name=excluded.name and ext_raw_nfo_passwords.group_name=excluded.group_name",
-      &[&key.name,&key.group,&key.content_id,&password])?;
+      &[&key.name,&key.group,&key.content_id,&super::nul_free(password)])?;
     ensure!(n==1,"natural cache key collision");Ok(())
 }
 

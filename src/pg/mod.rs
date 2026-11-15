@@ -93,6 +93,26 @@ pub mod sql;
 #[cfg(test)]
 pub mod testing;
 
+/// Text for a PostgreSQL `text` column: NUL characters, which steps can read out of files and API replies and which
+/// PostgreSQL refuses with 22021 (failing the owner session), become U+FFFD.
+pub(crate) fn nul_free(value: &str) -> std::borrow::Cow<'_, str> {
+    if value.contains('\0') { std::borrow::Cow::Owned(value.replace('\0', "\u{fffd}")) } else { std::borrow::Cow::Borrowed(value) }
+}
+
+#[cfg(test)]
+#[test]
+fn nul_free_keeps_text_and_replaces_nul() {
+    assert!(matches!(nul_free("plain"), std::borrow::Cow::Borrowed("plain")));
+    assert_eq!(nul_free("pw\0x"), "pw\u{fffd}x");
+    assert_eq!(nul_free_opt(&Some("a\0".to_string())).as_deref(), Some("a\u{fffd}"));
+    assert_eq!(nul_free_opt::<String>(&None), None);
+}
+
+/// `nul_free` of an optional text.
+pub(crate) fn nul_free_opt<S: AsRef<str>>(value: &Option<S>) -> Option<std::borrow::Cow<'_, str>> {
+    value.as_ref().map(|v| nul_free(v.as_ref()))
+}
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
