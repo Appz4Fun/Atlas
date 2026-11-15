@@ -527,3 +527,149 @@ fn date_probe_budget_split_is_safe_at_the_u64_upper_boundary() {
         );
     });
 }
+
+/// Inconsistent refusal trees and slow successful leaves exercise operation
+/// limits independently of the ordinary consistent article-range fixture.
+#[derive(Clone, Copy)]
+enum DateProbeScript {
+    RefusalTree { gzip: bool, corrupt_first: bool },
+    SlowLeaves,
+}
+
+impl DateProbePeer {
+    async fn scripted(script: DateProbeScript) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let log = asked.clone();
+        let task = tokio::spawn(async move {
+            let serve = async move {
+                let mut oversized = vec![b'x'; OVERVIEW_LINE + 1];
+                oversized.extend_from_slice(b"\r\n.\r\n");
+                let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                encoder.write_all(&oversized).unwrap();
+                let oversized_gzip = encoder.finish().unwrap();
+                for connection in 0..132 {
+                    let (socket, _) = listener.accept().await.unwrap();
+                    let mut socket = BufReader::new(socket);
+                    if socket.get_mut().write_all(b"200 bounded date probe\r\n").await.is_err() { continue; }
+                    let mut compressed = false;
+                    loop {
+                        let mut command = String::new();
+                        if socket.read_line(&mut command).await.unwrap_or(0) == 0 { break; }
+                        if command == "XFEATURE COMPRESS GZIP\r\n" {
+                            assert!(matches!(script, DateProbeScript::RefusalTree { gzip: true, .. }));
+                            compressed = true;
+                            if socket.get_mut().write_all(b"290 enabled\r\n").await.is_err() { break; }
+                            continue;
+                        }
+                        if command == "GROUP g\r\n" {
+                            if socket.get_mut().write_all(b"211 6400 1 1099511627776 g\r\n").await.is_err() { break; }
+                            continue;
+                        }
+                        let range = command.strip_prefix("XOVER ").expect("scripted date XOVER").trim();
+                        let (a, b) = range.split_once('-').unwrap();
+                        let (a, b) = (a.parse::<u64>().unwrap(), b.parse::<u64>().unwrap());
+                        assert!(a <= b);
+                        let attempt = {
+                            let mut log = log.lock().unwrap();
+                            assert!(log.len() < 129, "fixture must stop an unbounded retry tree");
+                            log.push((connection, a, b, compressed));
+                            log.len()
+                        };
+                        // A distinct terminal reply makes the original unbounded
+                        // implementation fail semantically, before its watchdog.
+                        if attempt == 129 {
+                            let _ = socket.get_mut().write_all(b"499 fixture retry sentinel\r\n").await;
+                            continue;
+                        }
+                        match script {
+                            DateProbeScript::RefusalTree { corrupt_first: true, .. } if attempt == 1 => {
+                                if socket.get_mut().write_all(b"224 [COMPRESS=GZIP]\r\nnot a deflate stream at all\r\n.\r\n").await.is_err() { break; }
+                            }
+                            DateProbeScript::RefusalTree { .. } if a == b => {
+                                let reply: &[u8] = if a % 2 == 0 { b"420 empty singleton\r\n" } else { b"423 empty singleton\r\n" };
+                                if socket.get_mut().write_all(reply).await.is_err() { break; }
+                            }
+                            DateProbeScript::RefusalTree { .. } => {
+                                let (status, body): (&[u8], &[u8]) = if compressed {
+                                    (b"224 [COMPRESS=GZIP]\r\n", &oversized_gzip)
+                                } else {
+                                    (b"224 follows\r\n", &oversized)
+                                };
+                                if socket.get_mut().write_all(status).await.is_err() || socket.get_mut().write_all(body).await.is_err() { break; }
+                            }
+                            DateProbeScript::SlowLeaves => {
+                                // Each reply delay is below the configured 150ms
+                                // read timeout; two such replies exceed it in total.
+                                tokio::time::sleep(Duration::from_millis(80)).await;
+                                assert!(1 <= a && b <= 6400);
+                                let mut body = Vec::new();
+                                for n in a..=b { body.extend_from_slice(&date_probe_row(n, n, 256)); }
+                                body.extend_from_slice(b".\r\n");
+                                if socket.get_mut().write_all(b"224 follows\r\n").await.is_err() || socket.get_mut().write_all(&body).await.is_err() { break; }
+                            }
+                        }
+                    }
+                }
+                panic!("scripted date probe exceeded connection bound");
+            };
+            tokio::time::timeout(Duration::from_secs(20), serve).await.expect("scripted date fixture deadline");
+        });
+        Self { port, asked, task: Some(task) }
+    }
+}
+
+async fn refusal_tree_date_probe(gzip: bool, corrupt_first: bool) {
+    let peer = DateProbePeer::scripted(DateProbeScript::RefusalTree { gzip, corrupt_first }).await;
+    let pool = peer.pool(gzip).with_timeout(Duration::from_secs(10));
+    let result = tokio::time::timeout(Duration::from_secs(15), pool.ends(0, "g", 1, 1 << 40)).await;
+    let downgraded = pool.servers[0].no_compress.load(Ordering::Relaxed);
+    drop(pool);
+    let asked = peer.stop().await;
+    let error = result.expect("production retry bound must precede the watchdog").expect_err("an inconsistent refusal tree must not certify empty coverage");
+    assert!(error.is_overview_budget(), "must retain the typed refusal rather than reach the fixture sentinel: {error}");
+    assert_eq!(asked.len(), 128, "the complete operation, including plain fallback, has one literal attempt allowance");
+    assert!(asked.iter().any(|&(_, a, b, _)| a == b), "empty singleton leaves must not reset the attempt allowance");
+    for pair in asked.windows(2) {
+        if pair[0].1 < pair[0].2 { assert_ne!(pair[0].0, pair[1].0, "each refused connection must be discarded"); }
+    }
+    assert_eq!(downgraded, corrupt_first, "budget refusal alone must preserve compression policy");
+    if corrupt_first {
+        assert!(asked[0].3);
+        assert!(asked[1..].iter().all(|r| !r.3));
+    } else {
+        assert!(asked.iter().all(|r| r.3 == gzip));
+    }
+}
+
+#[test]
+fn date_probe_plain_refusal_tree_stops_at_the_total_attempt_allowance() {
+    runtime().block_on(refusal_tree_date_probe(false, false));
+}
+
+#[test]
+fn date_probe_gzip_refusal_tree_stops_at_the_total_attempt_allowance() {
+    runtime().block_on(refusal_tree_date_probe(true, false));
+}
+
+#[test]
+fn date_probe_decompression_fallback_spends_the_same_attempt_allowance() {
+    runtime().block_on(refusal_tree_date_probe(true, true));
+}
+
+#[test]
+fn date_probe_deadline_covers_all_leaves_and_discards_the_busy_connection() {
+    runtime().block_on(async {
+        let peer = DateProbePeer::scripted(DateProbeScript::SlowLeaves).await;
+        let pool = peer.pool(false).with_timeout(Duration::from_millis(150));
+        let result = tokio::time::timeout(Duration::from_secs(3), pool.ends(0, "g", 1, 6400)).await;
+        let idle = pool.servers[0].idle.lock().unwrap().len();
+        drop(pool);
+        let asked = peer.stop().await;
+        let error = result.expect("whole-operation deadline must precede the watchdog").expect_err("individually timely leaves must still share one deadline");
+        assert!(error.is_timeout(), "the operation deadline must produce the typed timeout: {error}");
+        assert_eq!(idle, 0, "a cancelled busy date lease must not be reused");
+        assert_eq!(asked.iter().map(|&(_, a, b, _)| (a, b)).collect::<Vec<_>>(), [(1, 6400), (1, 3200)]);
+    });
+}
