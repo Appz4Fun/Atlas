@@ -9,6 +9,12 @@ use std::sync::atomic::{AtomicBool,Ordering};
 /// Caller owns the read snapshot (or the locked release in its write txn).
 /// Each page and value is admitted before PostgreSQL returns its payload.
 pub(crate) fn read(client:&mut impl GenericClient,release:i64,stop:&AtomicBool)->Result<Option<Vec<u8>>> {
+    let store=crate::article_local::of(client)?;
+    read_with(client,release,stop,store.as_deref())
+}
+/// As `read`, for a caller that already knows where this schema keeps its
+/// articles: `store` when they are in the local article store, else PostgreSQL.
+pub(crate) fn read_with(client:&mut impl GenericClient,release:i64,stop:&AtomicBool,store:Option<&crate::article_local::Store>)->Result<Option<Vec<u8>>> {
     let mut hash=Sha256::new();let mut after:Option<(Vec<u8>,i64)>=None;let mut files=0u64;
     loop {
         if stop.load(Ordering::Acquire) {return Err(super::outage::AttemptEnded.into());}
@@ -34,7 +40,13 @@ pub(crate) fn read(client:&mut impl GenericClient,release:i64,stop:&AtomicBool)-
             let subject:Option<Vec<u8>>=row.try_get(2)?;
             let first=match subject.filter(|mid|!mid.is_empty()) {
                 Some(mid)=>mid,
-                None=>{
+                None=>if let Some(store)=store {
+                    match store.first_message_id(id,release,65536)? {
+                        Some((_,Some(mid)))=>mid,
+                        Some((_,None))=>anyhow::bail!("native first message ID exceeds read admission"),
+                        None=>Vec::new(),
+                    }
+                } else {
                     let row=client.query_opt("select case when octet_length(message_id)<=65536 then message_id else null end,
                         octet_length(message_id) from segments where file_id=$1 and release_id=$2 and octet_length(message_id)>0
                         order by part nulls first,message_id limit 1",&[&id,&release])?;
@@ -49,6 +61,13 @@ pub(crate) fn read(client:&mut impl GenericClient,release:i64,stop:&AtomicBool)-
             let mut seen=Vec::new();let mut part_after=None;
             loop {
                 if stop.load(Ordering::Acquire) {return Err(super::outage::AttemptEnded.into());}
+                if let Some(store)=store {
+                    // The part numbers `file_parts` held: the file's distinct parts within 0..=MAX_PARTS.
+                    let parts=store.file_parts_page(id,part_after,crate::parser::MAX_PARTS,4096)?;
+                    if parts.is_empty() {break;}
+                    for part in parts {crate::catalog_facts::insert_part(&mut seen,part);part_after=Some(part);}
+                    continue;
+                }
                 let parts=client.query("select part from file_parts where file_id=$1 and ($2::bigint is null or part>$2)
                     order by part limit 4096",&[&id,&part_after])?;
                 if parts.is_empty() {break;}
@@ -86,6 +105,11 @@ mod tests {
         // expected count, bitmap length+bytes. Database row IDs never participate.
         let encoded=b"\x06\0\0\0\0\0\0\0a\0.bin\x12\0\0\0\0\0\0\0<one@example.test>\x02\0\0\0\0\0\0\0\x01\0\0\0\0\0\0\0\x06";
         let expected=sha2::Sha256::digest(encoded).to_vec();
+        let mut tx=client.build_transaction().isolation_level(postgres::IsolationLevel::RepeatableRead).read_only(true).start().unwrap();
+        assert_eq!(super::read(&mut tx,id,&std::sync::atomic::AtomicBool::new(false)).unwrap(),Some(expected.clone()));
+        drop(tx);
+        // Without a subject message ID the file's first article by part stands in for it.
+        client.execute("update files set subject_mid=null",&[]).unwrap();
         let mut tx=client.build_transaction().isolation_level(postgres::IsolationLevel::RepeatableRead).read_only(true).start().unwrap();
         assert_eq!(super::read(&mut tx,id,&std::sync::atomic::AtomicBool::new(false)).unwrap(),Some(expected));
     }

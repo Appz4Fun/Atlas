@@ -26,6 +26,8 @@ pub struct StepReads {
     owner:Arc<Owner>,
     epoch:[u8;32],
     targets:std::sync::Mutex<super::stage_queue::participants::ReadTargets>,
+    /// Where this schema keeps its articles when not in PostgreSQL, once a read has found it.
+    local:std::sync::OnceLock<Arc<crate::article_local::Store>>,
 }
 
 pub(crate) struct StepSnapshot {
@@ -42,7 +44,14 @@ impl StepReads {
     pub(crate) fn for_owner(owner:&Arc<Owner>)->Result<Self> {
         ensure!(tokio::runtime::Handle::try_current().is_err(),"native Step reads require a standard worker thread");
         let epoch=*owner.epoch().ok_or_else(||anyhow::anyhow!("native Step reads require the canonical owner"))?.id();
-        Ok(Self {owner:owner.clone(),epoch,targets:std::sync::Mutex::new(super::stage_queue::participants::ReadTargets::for_owner(owner)?)})
+        Ok(Self {owner:owner.clone(),epoch,targets:std::sync::Mutex::new(super::stage_queue::participants::ReadTargets::for_owner(owner)?),local:std::sync::OnceLock::new()})
+    }
+    /// The local article store of this owner's schema, if the process opened
+    /// one. Found inside a read that already holds the owner, so construction
+    /// never queues on it; no query at all while no store is open.
+    fn local_in(&self,tx:&mut Transaction<'_>)->Result<Option<Arc<crate::article_local::Store>>> {
+        if let Some(store)=self.local.get() {return Ok(Some(store.clone()))}
+        Ok(crate::article_local::of(tx)?.map(|store|self.local.get_or_init(||store).clone()))
     }
     fn observe_in(&self,tx:&mut Transaction<'_>,ids:&[i64])->Result<()> {
         self.targets.lock().map_err(|_|anyhow::anyhow!("native participant observations are poisoned"))?.observe_in(tx,ids)
@@ -96,7 +105,7 @@ impl StepReads {
         self.read(|tx|Ok(tx.query_one("select coalesce((select rerun_mask from pp_state where release_id=$1),0)&$2<>0",&[&id,&crate::postprocess::step::mask(step)])?.try_get(0)?))
     }
     pub(crate) fn content_id(&self,id:i64)->Result<Option<Vec<u8>>> {
-        self.read(|tx|super::content_id::read(tx,id,&self.owner.stop))
+        self.read(|tx|{let local=self.local_in(tx)?;super::content_id::read_with(tx,id,&self.owner.stop,local.as_deref())})
     }
     pub(crate) fn snapshot(&self,id:i64)->Result<Option<StepSnapshot>> {
         self.read(|tx| {
@@ -288,6 +297,25 @@ impl StepReads {
     pub(crate) fn segments(&self,id:i64,pick:&crate::catalog_facts::SegmentPick)->Result<Vec<crate::catalog_facts::SegmentRef>> {
         use crate::catalog_facts::SegmentPick;
         self.read(|tx| {
+            if let Some(store)=self.local_in(tx)? {
+                // No key index locally: the picked rows come back in one step,
+                // under the same selection limits and message-ID byte admission.
+                const ID_BYTES:i64=64*1024*1024;
+                let picked=match pick {
+                    SegmentPick::First(n)|SegmentPick::Last(n)=>{
+                        ensure!(*n<=65536,"native Step segment selection exceeds read admission");
+                        store.file_ends(id,matches!(pick,SegmentPick::Last(_)),*n,ID_BYTES)?
+                    },
+                    SegmentPick::Parts(parts)=>{
+                        ensure!(parts.len()<=4096,"native Step part selection exceeds read admission");
+                        store.file_part_copies(id,parts,16,ID_BYTES)?
+                    },
+                };
+                let Some(picked)=picked else {anyhow::bail!("native Step segment inventory exceeds read admission")};
+                return picked.into_iter().map(|row|Ok(crate::catalog_facts::SegmentRef {
+                    message_id:String::from_utf8(row.message_id)?,part:row.part,bytes:row.bytes,
+                })).collect();
+            }
             let (sql,limit,parts)=match pick {
                 SegmentPick::First(n)=>("select message_key,octet_length(message_id) from segments where file_id=$1 order by part nulls first,message_id limit $2",*n,None),
                 SegmentPick::Last(n)=>("select message_key,octet_length(message_id) from segments where file_id=$1 order by part desc nulls last,message_id desc limit $2",*n,None),
@@ -429,6 +457,90 @@ mod tests {
         assert_eq!(segments[0].message_id,"<part@example.test>");
         runtime.owner.close();
         assert!(data.probe_moviehash(id).is_err());
+    }
+
+    fn article(file:&str,id:&str,part:Option<i64>,total:Option<i64>,bytes:i64)->crate::parser::Article {
+        crate::parser::Article {filename:Some(file.into()),message_id:id.into(),part,total_parts:total,bytes,..Default::default()}
+    }
+    fn saved(runtime:&crate::pg::indexer_runtime::Runtime,articles:Vec<crate::parser::Article>)->i64 {
+        runtime.owner.with(|client| {
+            crate::pg::release_writer::save(client,&[crate::parser::Release {name:"Example.Release".into(),group:"example.group".into(),articles,..Default::default()}],1)?;
+            Ok(client.query_one("select id from releases",&[])?.get(0))
+        }).unwrap()
+    }
+
+    // Passes with the articles in PostgreSQL and in the local store alike.
+    #[test]
+    fn native_segment_picks_keep_order_copy_cap_and_selection_admission() {
+        use crate::catalog_facts::SegmentPick;
+        let Some(schema)=crate::pg::testing::Schema::new() else {return};
+        let runtime=runtime(&schema);
+        let mut articles=vec![article("sample.bin","<c@example.test>",Some(3),Some(3),30),article("sample.bin","<b@example.test>",Some(2),Some(3),20)];
+        // Seventeen copies of part 1, saved out of order: only the sixteen lowest IDs are picked.
+        for n in (0..17).rev() {articles.push(article("sample.bin",&format!("<a{n:02}@example.test>"),Some(1),Some(3),10+n));}
+        let id=saved(&runtime,articles);
+        let reads=StepReads::for_owner(&runtime.owner).unwrap();
+        let file=reads.files(id,10).unwrap()[0].id;
+        let ids=|pick:SegmentPick|reads.segments(file,&pick).unwrap().into_iter().map(|s|(s.message_id,s.part,s.bytes)).collect::<Vec<_>>();
+        let copy=|n:i64|(format!("<a{n:02}@example.test>"),Some(1),10+n);
+        assert_eq!(ids(SegmentPick::First(2)),vec![copy(0),copy(1)]);
+        assert_eq!(ids(SegmentPick::Last(3)),vec![copy(16),("<b@example.test>".into(),Some(2),20),("<c@example.test>".into(),Some(3),30)]);
+        assert_eq!(ids(SegmentPick::First(100)).len(),19);
+        assert_eq!(ids(SegmentPick::Last(100)),ids(SegmentPick::First(100)));
+        let mut wanted:Vec<_>=(0..16).map(copy).collect();wanted.push(("<c@example.test>".into(),Some(3),30));
+        assert_eq!(ids(SegmentPick::Parts(vec![3,1,3,7])),wanted);
+        assert!(ids(SegmentPick::Parts(Vec::new())).is_empty());
+        assert!(ids(SegmentPick::First(0)).is_empty());
+        assert!(reads.segments(file+1,&SegmentPick::First(5)).unwrap().is_empty());
+        assert!(reads.segments(file,&SegmentPick::First(65537)).is_err());
+        assert!(reads.segments(file,&SegmentPick::Parts(vec![1;4097])).is_err());
+        runtime.owner.close();
+        assert!(reads.segments(file,&SegmentPick::First(1)).is_err(),"an ended owner must not become an empty file");
+    }
+
+    #[test]
+    fn native_folded_file_crc_takes_each_parts_first_recorded_copy() {
+        let Some(schema)=crate::pg::testing::Schema::new() else {return};
+        let runtime=runtime(&schema);
+        let id=saved(&runtime,vec![
+            article("whole.bin","<a1@example.test>",Some(1),Some(2),10),article("whole.bin","<a0@example.test>",Some(1),Some(2),10),
+            article("whole.bin","<b0@example.test>",Some(2),Some(2),10),
+            article("short.bin","<s1@example.test>",Some(1),Some(2),10),article("short.bin","<s2@example.test>",Some(2),Some(2),10),
+        ]);
+        let crc=|mid:&str,decoded:i64,crc:i64|runtime.owner.with(|client|{client.execute("insert into segment_crc(release_id,message_id,decoded,crc32) values($1,$2,$3,$4)",&[&id,&mid.as_bytes(),&decoded,&crc])?;Ok(())}).unwrap();
+        // Part 1's lowest ID has no CRC, so its second copy counts. short.bin lacks part 2's CRC and folds to nothing.
+        crc("<a1@example.test>",700_000,0x1111_1111);crc("<b0@example.test>",600_000,0x2222_2222);crc("<s1@example.test>",900_000,0x3333_3333);
+        crc("<elsewhere@example.test>",5,5);
+        let reads=StepReads::for_owner(&runtime.owner).unwrap();
+        let whole=crate::keys::FileCrc::new(1_300_000,crate::gf2::crc32_combine(0x1111_1111,0x2222_2222,600_000)).unwrap();
+        assert_eq!(reads.release_lookup(id,None).unwrap().files,vec![whole]);
+        match reads.keys_snapshot(id,None,None,std::time::Instant::now()+std::time::Duration::from_secs(10)).unwrap() {
+            crate::pg::stage_reads::KeysRead::Complete(snapshot)=>assert_eq!(snapshot.computed.file_crc,Some(whole.key())),
+            other=>panic!("unexpected Keys read: {other:?}"),
+        }
+        // The lowest copy wins once it has a CRC of its own.
+        crc("<a0@example.test>",800_000,0x4444_4444);
+        let whole=crate::keys::FileCrc::new(1_400_000,crate::gf2::crc32_combine(0x4444_4444,0x2222_2222,600_000)).unwrap();
+        assert_eq!(reads.release_lookup(id,None).unwrap().files,vec![whole]);
+        runtime.owner.close();
+    }
+
+    #[test]
+    fn native_par2_names_match_leftover_files_by_their_article_bytes() {
+        let Some(schema)=crate::pg::testing::Schema::new() else {return};
+        let runtime=runtime(&schema);
+        let id=saved(&runtime,vec![article("aaa.bin","<one@example.test>",Some(1),Some(1),100_000),article("bbb.bin","<two@example.test>",Some(1),Some(1),500_000)]);
+        runtime.owner.with(|client| {
+            for (n,name,size) in [(1u8,"real-one.mkv",99_000i64),(2,"real-two.mkv",495_000)] {
+                client.execute("insert into par2_files(release_id,file_id,set_id,md5,md5_16k,size,name) values($1,$2,$2,$2,$2,$3,$4)",&[&id,&vec![n;16],&size,&name])?;
+            }
+            Ok(())
+        }).unwrap();
+        let reads=StepReads::for_owner(&runtime.owner).unwrap();
+        let files=reads.files(id,10).unwrap();
+        let names=reads.par2_names(id,&files).unwrap();
+        assert_eq!(names,std::collections::HashMap::from([("aaa.bin".to_owned(),"real-one.mkv".to_owned()),("bbb.bin".to_owned(),"real-two.mkv".to_owned())]));
+        runtime.owner.close();
     }
 
     #[test]

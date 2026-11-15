@@ -108,7 +108,7 @@ fn missing_historical_timing_cannot_be_certified_by_one_later_known_batch() {
     let article=&mut later.articles[0];article.message_id="<MissingTiming.new@utc.fixture.test>".into();article.part=Some(2);
     article.subject=article.subject.replace("(1/20)","(2/20)");f.save(&later);
     assert!(!f.timing(id).4,"new timing cannot prove the old accepted segments' UTC");assert!(f.windows(&[id]).is_none());
-    f.runtime.owner.with(|client| {assert_eq!(client.query_one("select count(*) from segments where release_id=$1",&[&id])?.get::<_,i64>(0),2);Ok(())}).unwrap();
+    f.runtime.owner.with(|client| {assert_eq!(crate::article_local::Store::articles_for_test(&mut *client).iter().filter(|a|a.release_id==id).count() as i64,2);Ok(())}).unwrap();
 }
 
 #[test]

@@ -573,7 +573,7 @@ mod postgres_backend_tests {
         );
         assert_eq!(conn.query_one("select count(*) from releases", &[]).unwrap().get::<_, i64>(0), 1);
         assert_eq!(conn.query_one("select count(*) from files", &[]).unwrap().get::<_, i64>(0), 1);
-        assert_eq!(conn.query_one("select count(*) from segments", &[]).unwrap().get::<_, i64>(0), 1);
+        assert_eq!(crate::pg::testing::articles(&mut *conn), 1);
     }
 }
 

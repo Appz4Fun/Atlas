@@ -129,6 +129,7 @@ fn release_id(tx:&mut Transaction<'_>,plan:&Plan<'_>)->Result<Option<i64>> {
 fn placement(tx:&mut Transaction<'_>,plan:&Plan<'_>)->Result<Placement> {
     let Some(id)=release_id(tx,plan)? else {return Ok(Placement::Free)};
     if tx.query_one("select exists(select 1 from spots where release_id=$1 and nzb_key=$2)",&[&id,&plan.key()])?.get::<_,bool>(0) {return Ok(Placement::SamePost(id))}
+    let articles=crate::article_local::of(&mut *tx)?;
     let mut identities=plan.identities();
     loop {
         let chunk=identities.by_ref().take(512).collect::<Vec<_>>();if chunk.is_empty() {break}
@@ -138,7 +139,15 @@ fn placement(tx:&mut Transaction<'_>,plan:&Plan<'_>)->Result<Placement> {
         let message_keys=messages.iter().map(|mid|Sha256::digest(mid).to_vec()).collect::<Vec<_>>();
         // Hash lookup AND exact original bytes; no digest-only identity and no
         // fetching all existing segments into memory.
-        let same:bool=tx.query_one("select not exists(select 1 from unnest($2::bytea[],$3::bytea[],$4::bytea[],$5::bytea[]) w(filename,mid,file_key,mid_key) where not exists(select 1 from files f join segments s on s.release_id=f.release_id and s.file_id=f.id where f.release_id=$1 and f.filename_key=w.file_key and f.original_filename=w.filename and s.message_key=w.mid_key and s.message_id=w.mid))",&[&id,&files,&messages,&file_keys,&message_keys])?.get(0);
+        let same:bool=if let Some(articles)=&articles {
+            // The files side stays in PostgreSQL: which of the release's files each wanted
+            // name is, by hash and exact bytes. The store then says which file has each id.
+            let mut named=vec![Vec::<i64>::new();chunk.len()];
+            for row in tx.query("select w.at,f.id from unnest($2::bytea[],$3::bytea[]) with ordinality w(filename,file_key,at) join files f on f.release_id=$1 and f.filename_key=w.file_key and f.original_filename=w.filename",&[&id,&files,&file_keys])? {
+                named[usize::try_from(row.get::<_,i64>(0)-1)?].push(row.get(1));
+            }
+            articles.files_of(id,&messages)?.into_iter().zip(&named).all(|(file,named)|file.is_some_and(|file|named.contains(&file)))
+        } else {tx.query_one("select not exists(select 1 from unnest($2::bytea[],$3::bytea[],$4::bytea[],$5::bytea[]) w(filename,mid,file_key,mid_key) where not exists(select 1 from files f join segments s on s.release_id=f.release_id and s.file_id=f.id where f.release_id=$1 and f.filename_key=w.file_key and f.original_filename=w.filename and s.message_key=w.mid_key and s.message_id=w.mid))",&[&id,&files,&messages,&file_keys,&message_keys])?.get(0)};
         if !same {return Ok(Placement::Taken)}
     }
     Ok(Placement::SamePost(id))

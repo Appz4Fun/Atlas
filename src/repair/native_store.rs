@@ -29,6 +29,19 @@ impl Read<'_,'_> {
             result=>result.map_err(Into::into),
         }
     }
+    /// The store this catalogue's articles are in, when they are not in PostgreSQL.
+    fn articles(&mut self)->Result<Option<Arc<crate::article_local::Store>>> {
+        self.gate()?;
+        match crate::article_local::of(&mut *self.tx) {
+            Err(e) if e.downcast_ref::<postgres::Error>().is_some_and(|e|e.code()==Some(&postgres::error::SqlState::QUERY_CANCELED))=>Err(Deferred.into()),
+            result=>result,
+        }
+    }
+    /// What `query` asks before each statement, for a read of the local article store.
+    fn gate(&mut self)->Result<()> {
+        if self.stop.load(Ordering::Acquire){return Err(crate::pg::outage::AttemptEnded.into())}
+        self.budget.charge(0)
+    }
     pub fn head(&mut self,id:i64)->Result<Option<Head>> {
         let extent=self.query("select octet_length(original_name),octet_length(group_name),octet_length(poster),octet_length(identity_key) from releases where id=$1",&[&id])?;
         let Some(extent)=extent.first() else{return Ok(None)};
@@ -50,17 +63,21 @@ impl Read<'_,'_> {
     }
     pub fn union(&mut self,ids:&[i64])->Result<UnionFiles> {
         if ids.len()>crate::release_info::LINKED_ROWS{return Err(Deferred.into())}self.budget.charge(ids.len()*128)?;
+        let articles=self.articles()?;
         let mut union=UnionFiles::default();for &id in ids {
             let Some(head)=self.head(id)? else{return Err(SourceChanged.into())};let mut filenames=BTreeSet::new();let mut after=0i64;
             loop {
-                let rows=self.query("select id,octet_length(original_filename),octet_length(subject),expected,file_total,(select max(part) from file_parts p where p.file_id=f.id),(select min(part) from file_parts p where p.file_id=f.id) from files f where release_id=$1 and id>$2 order by id limit 16",&[&id,&after])?;
+                let rows=if articles.is_some() {self.query("select id,octet_length(original_filename),octet_length(subject),expected,file_total from files f where release_id=$1 and id>$2 order by id limit 16",&[&id,&after])?}
+                else {self.query("select id,octet_length(original_filename),octet_length(subject),expected,file_total,(select max(part) from file_parts p where p.file_id=f.id),(select min(part) from file_parts p where p.file_id=f.id) from files f where release_id=$1 and id>$2 order by id limit 16",&[&id,&after])?};
                 if rows.is_empty(){break;}
                 for row in rows {
                     let file:i64=row.try_get(0)?;after=file;let name:Option<i32>=row.try_get(1)?;let subject:Option<i32>=row.try_get(2)?;
                     let expected:Option<i64>=row.try_get(3)?;let total:Option<i64>=row.try_get(4)?;
                     ensure!(expected.is_none_or(|n|(0..=crate::parser::MAX_PARTS).contains(&n))&&total.is_none_or(|n|(0..i64::MAX).contains(&n)),"native overview file declaration is malformed");
                     if name.is_none_or(|n|!(0..=TEXT as i32).contains(&n))||subject.is_some_and(|n|!(0..=TEXT as i32).contains(&n)){return Err(Deferred.into())}
-                    let last:Option<i64>=row.try_get(5)?;if last.is_some_and(|n|!(0..=crate::parser::MAX_PARTS).contains(&n))||row.try_get::<_,Option<i64>>(6)?.is_some_and(|n|n<0){anyhow::bail!("native overview part bitmap is malformed")}
+                    // Locally a file's parts are the distinct part numbers 0..=MAX_PARTS of its articles.
+                    let (last,first):(Option<i64>,Option<i64>)=match &articles {Some(articles)=>{self.gate()?;articles.file_part_bounds(file,crate::parser::MAX_PARTS)?},None=>(row.try_get(5)?,row.try_get(6)?)};
+                    if last.is_some_and(|n|!(0..=crate::parser::MAX_PARTS).contains(&n))||first.is_some_and(|n|n<0){anyhow::bail!("native overview part bitmap is malformed")}
                     let bitmap=last.map_or(0,|n|n as usize/8+1);
                     // Account the source strings, folded strings/name sets and
                     // possible overlap union growth before any of them exist.
@@ -68,8 +85,11 @@ impl Read<'_,'_> {
                     let raw=self.query("select original_filename,subject from files where id=$1 and release_id=$2",&[&file,&id])?;
                     let raw=raw.first().context("native overview file disappeared inside snapshot")?;let filename=String::from_utf8(raw.try_get(0)?)?;let subject:Option<String>=raw.try_get(1)?;
                     let mut seen=Vec::with_capacity(bitmap);let mut part_after=-1i64;
-                    loop {let parts=self.query("select part from file_parts where file_id=$1 and part>$2 order by part limit 4096",&[&file,&part_after])?;if parts.is_empty(){break;}
-                        for p in parts {let part:i64=p.try_get(0)?;ensure!((0..=crate::parser::MAX_PARTS).contains(&part),"native overview part outside parser bound");crate::store::insert_part(&mut seen,part);part_after=part;}}
+                    loop {let parts:Vec<i64>=match &articles {
+                            Some(articles)=>{self.gate()?;articles.file_parts_within(file,part_after,crate::parser::MAX_PARTS,4096)?},
+                            None=>self.query("select part from file_parts where file_id=$1 and part>$2 order by part limit 4096",&[&file,&part_after])?.iter().map(|p|p.try_get(0)).collect::<std::result::Result<_,_>>()?,
+                        };if parts.is_empty(){break;}
+                        for part in parts {ensure!((0..=crate::parser::MAX_PARTS).contains(&part),"native overview part outside parser bound");crate::store::insert_part(&mut seen,part);part_after=part;}}
                     union.add_file(&mut filenames,filename,expected,seen,total,subject);
                 }
             }union.end_row(Some(head.name),filenames);
@@ -79,16 +99,19 @@ impl Read<'_,'_> {
     /// native part/byte facts. No absent byte cache is invented as a success.
     pub fn repairable(&mut self,id:i64,union:&UnionFiles)->Result<bool> {
         if !union.every_file_here(){return Ok(false)}
+        let articles=self.articles()?;
         let mut facts=crate::release_info::Contents::default();let mut after=0i64;
         loop {
-            let rows=self.query("select id,case when octet_length(original_filename)<=65536 then original_filename end,octet_length(original_filename),distinct_parts,greatest(coalesce(expected,distinct_parts),distinct_parts),coalesce((select sum(s.bytes)::bigint from segments s where s.file_id=f.id and s.release_id=f.release_id),0) from files f where release_id=$1 and id>$2 order by id limit 16",&[&id,&after])?;
+            let rows=if articles.is_some() {self.query("select id,case when octet_length(original_filename)<=65536 then original_filename end,octet_length(original_filename),distinct_parts,greatest(coalesce(expected,distinct_parts),distinct_parts) from files f where release_id=$1 and id>$2 order by id limit 16",&[&id,&after])?}
+            else {self.query("select id,case when octet_length(original_filename)<=65536 then original_filename end,octet_length(original_filename),distinct_parts,greatest(coalesce(expected,distinct_parts),distinct_parts),coalesce((select sum(s.bytes)::bigint from segments s where s.file_id=f.id and s.release_id=f.release_id),0) from files f where release_id=$1 and id>$2 order by id limit 16",&[&id,&after])?};
             if rows.is_empty(){break}
             for row in rows {
                 after=row.try_get(0)?;let extent:Option<i32>=row.try_get(2)?;
                 if extent.is_none_or(|n|!(0..=TEXT as i32).contains(&n)){return Err(Deferred.into())}
                 self.budget.charge(4*extent.unwrap() as usize+256)?;
                 let name=String::from_utf8(row.try_get(1)?)?.to_ascii_lowercase();
-                let seen:i64=row.try_get(3)?;let expected:i64=row.try_get(4)?;let bytes:i64=row.try_get(5)?;
+                let seen:i64=row.try_get(3)?;let expected:i64=row.try_get(4)?;
+                let bytes:i64=match &articles {Some(articles)=>{self.gate()?;articles.file_bytes(id,after)?},None=>row.try_get(5)?};
                 ensure!(seen>=0&&expected>=seen&&bytes>=0,"native overview recovery counters malformed");
                 let add=|to:&mut i64,n:i64|->Result<()> {*to=to.checked_add(n).context("native overview recovery counter overflow")?;Ok(())};
                 if name.ends_with(".par2") {

@@ -79,9 +79,9 @@ fn native_accepted_headers_produce_timing_windows_and_idempotent_mixed_source_me
     }
     runtime.owner.with(|client| {
         assert_eq!(save(client,&[replay,alternate.clone()],13)?.parts,0);
-        assert_eq!(client.query_one("select count(*) from segments s join files f on f.id=s.file_id where f.id=$1",&[&file])?.get::<_,i64>(0),3,
+        assert_eq!(crate::article_local::Store::articles_for_test(client).iter().filter(|a|a.file_id==file).count(),3,
             "the regression requires three real accepted PG parts before timing assertions");
-        assert_eq!(client.query_one("select count(*) from file_parts where file_id=$1",&[&file])?.get::<_,i64>(0),3);
+        assert_eq!(crate::article_local::Store::articles_for_test(client).iter().filter(|a|a.file_id==file).filter_map(|a|a.part).collect::<std::collections::BTreeSet<_>>().len(),3);
         Ok(())
     }).unwrap();
     // Expected genuine baseline assertion failure: current production saved

@@ -31,7 +31,7 @@ impl StepReads {
             let actual:i64=tx.query_one("select value from meta where key='key_salt'",&[])?.try_get(0)?;
             ensure!(actual==salt,"native key input belongs to a different salt");
             let (probe,_)=probe_in(tx,id)?;let mut keys=keys_in(tx,id,parts,Some(salt),probe.as_ref())?;
-            if keys.file_crc.is_none() {keys.file_crc=folded_in(tx,id,&self.owner.stop)?.first().copied().map(FileCrc::key);}
+            if keys.file_crc.is_none() {let local=self.local_in(tx)?;keys.file_crc=folded_in(tx,id,&self.owner.stop,local.as_deref())?.first().copied().map(FileCrc::key);}
             if probe.as_ref().and_then(|p|p.archive.as_ref()).is_some_and(|a|a.encrypted||a.headers_encrypted) {
                 let metadata=tx.query_one("select count(*),coalesce(sum(octet_length(name)),0)::bigint from par2_files where release_id=$1 and bound<>0 and complete<>0",&[&id])?;
                 ensure!(metadata.try_get::<_,i64>(0)?<=10000 && metadata.try_get::<_,i64>(1)?<=64*1024*1024,"native volume keys exceed read admission");
@@ -49,7 +49,8 @@ impl StepReads {
                 let set:Vec<u8>=row.try_get(0)?;ensure!(set.len()==16,"native PAR2 set extent is invalid");Ok(set)
             }).collect::<Result<Vec<_>>>()?;
             let mut files:Vec<FileCrc>=probe.as_ref().and_then(crate::keys::probe_file).into_iter().collect();
-            for file in folded_in(tx,id,&self.owner.stop)? {if !files.contains(&file) {files.push(file);}}
+            let local=self.local_in(tx)?;
+            for file in folded_in(tx,id,&self.owner.stop,local.as_deref())? {if !files.contains(&file) {files.push(file);}}
             for file in crc_rows(tx,"select distinct size,crc32 from par2_files where release_id=$1 and bound<>0 and crc32 is not null and size>=1048576 order by size desc limit 8",id)? {
                 if !files.contains(&file) {files.push(file);}
             }
@@ -102,10 +103,37 @@ fn file_crc(row:&postgres::Row)->Result<Option<FileCrc>> {
 fn crc_rows(tx:&mut Transaction<'_>,sql:&str,id:i64)->Result<Vec<FileCrc>> {
     tx.query(sql,&[&id])?.into_iter().map(|row|file_crc(&row)).collect::<Result<Vec<_>>>().map(|rows|rows.into_iter().flatten().collect())
 }
-fn folded_in(tx:&mut Transaction<'_>,id:i64,stop:&std::sync::atomic::AtomicBool)->Result<Vec<FileCrc>> {
-    folded_in_with_budget(tx,id,stop,None)
+fn folded_in(tx:&mut Transaction<'_>,id:i64,stop:&std::sync::atomic::AtomicBool,local:Option<&crate::article_local::Store>)->Result<Vec<FileCrc>> {
+    folded_in_with_budget(tx,id,stop,None,local)
 }
-fn folded_in_with_budget(tx:&mut Transaction<'_>,id:i64,stop:&std::sync::atomic::AtomicBool,budget:Option<&budget::Budget<'_>>)->Result<Vec<FileCrc>> {
+/// The local-store form of the per-file CRC statement below: for each part
+/// 1..=expected, the first of its sixteen lowest message IDs that has a
+/// recorded CRC, as (part, decoded, crc32) in part order. `None` as soon as a
+/// part has none, where the statement would have returned too few rows.
+fn local_part_crcs(tx:&mut Transaction<'_>,store:&crate::article_local::Store,release:i64,file:i64,expected:i64,budget:Option<&budget::Budget<'_>>)->Result<Option<Vec<(i64,i64,i64)>>> {
+    let crc_sql="select message_id,decoded,crc32 from segment_crc where release_id=$1 and message_id=any($2)";
+    let mut out=Vec::new();let mut from=1i64;
+    while from<=expected {
+        if let Some(budget)=budget {budget.check()?;}
+        // 256 parts a page keeps at most 4096 candidate IDs in memory and on the wire.
+        let to=expected.min(from+255);
+        let candidates=store.file_part_copies_capped(file,from,to,16)?;
+        let ids:Vec<&[u8]>=candidates.iter().map(|(_,mid)|mid.as_slice()).collect();
+        let rows=match budget {Some(b)=>b.rows(tx,crc_sql,&[&release,&ids])?,None=>tx.query(crc_sql,&[&release,&ids])?};
+        let mut known=std::collections::HashMap::with_capacity(rows.len());
+        for row in rows {known.insert(row.try_get::<_,Vec<u8>>(0)?,(row.try_get::<_,i64>(1)?,row.try_get::<_,i64>(2)?));}
+        let before=out.len();
+        // Candidates arrive by part then message ID, so the first hit of a part is the one DISTINCT ON kept.
+        for (part,mid) in &candidates {
+            if out.last().is_some_and(|(last,_,_)|last==part) {continue}
+            if let Some((decoded,crc)) = known.get(mid) {out.push((*part,*decoded,*crc));}
+        }
+        if (out.len()-before) as i64!=to-from+1 {return Ok(None)}
+        from=to+1;
+    }
+    Ok(Some(out))
+}
+fn folded_in_with_budget(tx:&mut Transaction<'_>,id:i64,stop:&std::sync::atomic::AtomicBool,budget:Option<&budget::Budget<'_>>,local:Option<&crate::article_local::Store>)->Result<Vec<FileCrc>> {
     let count_sql="select count(*) from segment_crc where release_id=$1";
     let count:i64=match budget {Some(b)=>b.one(tx,count_sql,&[&id])?,None=>tx.query_one(count_sql,&[&id])?}.try_get(0)?;
     if count==0 {return Ok(Vec::new())}
@@ -117,6 +145,20 @@ fn folded_in_with_budget(tx:&mut Transaction<'_>,id:i64,stop:&std::sync::atomic:
         if let Some(budget)=budget {budget.check()?;}
         let file_id:i64=file.try_get(0)?;let expected:Option<i64>=file.try_get(1)?;let seen:i64=file.try_get(2)?;
         let Some(expected)=expected.filter(|n|(1..=4096).contains(n) && seen>=*n && count>=*n) else {continue};
+        if let Some(store)=local {
+            let Some(rows)=local_part_crcs(tx,store,id,file_id,expected,budget)? else {continue};
+            if rows.len() as i64!=expected {continue}
+            let (mut crc,mut size,mut valid)=(0u32,0i64,true);
+            for (index,&(part,len,got)) in rows.iter().enumerate() {
+                if let Some(budget)=budget {budget.check()?;}
+                let (Ok(bytes),Ok(got))=(usize::try_from(len),u32::try_from(got)) else {valid=false;break};
+                if part!=index as i64+1 {valid=false;break}
+                crc=if index==0 {got}else{crate::gf2::crc32_combine(crc,got,bytes)};
+                size=size.checked_add(len).ok_or_else(||anyhow::anyhow!("native folded file size overflow"))?;
+            }
+            if valid && let Some(file)=FileCrc::new(size,crc) && !out.contains(&file) {out.push(file);}
+            continue;
+        }
         // SegmentPick::Parts keeps the first sixteen MIDs for each part. The
         // first of those with a recorded CRC wins, as in the legacy map fold.
         let rows_sql="select distinct on(s.part) s.part,c.decoded,c.crc32 from (select part,message_id,row_number() over(partition by part order by message_id) as n from segments where file_id=$1 and part between 1 and $2) s join segment_crc c on c.release_id=$3 and c.message_id=s.message_id where s.n<=16 order by s.part,s.message_id";

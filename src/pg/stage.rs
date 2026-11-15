@@ -82,7 +82,12 @@ fn require_pristine_catalog(client:&mut impl GenericClient)->Result<()> {
         when key in ('archive_name_bytes','archive_names_over_quota','sidecar_text_bytes') then value is distinct from 0
         else true end)".into());
     let occupied:bool=client.query_one(&format!("select {}",checks.join(" or ")),&[])?.try_get(0)?;
-    ensure!(!occupied,"native catalog bootstrap refuses preexisting releases, headers, cursors or worker state");Ok(())
+    ensure!(!occupied,"native catalog bootstrap refuses preexisting releases, headers, cursors or worker state");
+    // Articles kept beside the header store are catalogue rows too.
+    if let Some(articles)=crate::article_local::of(client)? {
+        ensure!(articles.holds_nothing()?,"native catalog bootstrap refuses a local article store that already holds articles");
+    }
+    Ok(())
 }
 
 #[derive(Clone)]

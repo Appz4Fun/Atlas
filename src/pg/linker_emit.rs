@@ -255,7 +255,7 @@ mod tests {
         let mut c = connect();
         let ack_pid: i32 = c.query_one("select pg_backend_pid()", &[]).unwrap().get(0);
         assert_ne!(replay_pid, ack_pid);
-        let count: i64 = c.query_one("select count(*) from segments", &[]).unwrap().get(0);
+        let count: i64 = crate::pg::testing::articles(&mut c);
         assert_eq!(count, 3);
         let state = c.query_one("select emitted,phase from linker_epochs where id=$1", &[&epoch]).unwrap();
         assert_eq!(state.get::<_, i64>(0), 3);

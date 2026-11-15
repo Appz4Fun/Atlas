@@ -76,8 +76,13 @@ pub fn save(client: &mut Client, releases: &[Release], now: i64) -> Result<SaveS
 
     // A group writer that waited on the advisory lock must see the preceding commit.
     let mut tx = client.build_transaction().isolation_level(IsolationLevel::ReadCommitted).start()?;
-    let stats=save_grouped(&mut tx,groups,now)?;
+    let (stats, local) = save_grouped(&mut tx, groups, now)?;
     tx.commit()?;
+    // A commit seen here needs no question later; one that failed is asked about.
+    // The save stands either way: one left unconfirmed is asked about later.
+    if let Some(Local { store, xid: Some(xid) }) = local {
+        let _ = store.confirm(&xid);
+    }
     Ok(stats)
 }
 
@@ -92,16 +97,30 @@ pub(crate) fn save_in(tx:&mut Transaction<'_>,releases:&[Release],now:i64)->Resu
             groups.entry(&release.group).or_default().push(release);
         }
     }
-    save_grouped(tx,groups,now)
+    Ok(save_grouped(tx,groups,now)?.0)
 }
 
-fn save_grouped(tx:&mut Transaction<'_>,groups:BTreeMap<&str,Vec<&Release>>,now:i64)->Result<SaveStats> {
+fn save_grouped(tx:&mut Transaction<'_>,groups:BTreeMap<&str,Vec<&Release>>,now:i64)->Result<(SaveStats,Option<Local>)> {
     super::history_gate::native(tx)?;
     tx.batch_execute(CREATE_STAGE)?;
     let mut stats = SaveStats::default();
     let mut timing_key = None;
+    // With a local article store the articles go there and PostgreSQL keeps
+    // the releases, files and counts. A save that died after writing there is
+    // settled first, so its articles are either counted or gone before `has`.
+    let mut local = crate::article_local::of(tx)?.map(|store| Local { store, xid: None });
+    if local.is_some() {
+        tx.batch_execute(CREATE_FOLD_STAGE)?;
+    }
     for (group, releases) in groups {
         tx.query_one("select pg_advisory_xact_lock(hashtextextended(current_schema() || ':' || $1, 7936))", &[&group])?;
+        // Another connection's save of this group has ended now that its lock is ours:
+        // its articles are counted or gone before this save asks which it already has.
+        if let Some(local) = &local
+            && local.store.has_unsettled_besides(local.xid.as_deref())?
+        {
+            local.store.settle(|xid| crate::article_local::pg_ended(tx, xid))?;
+        }
         // A junk marker applies to all fragments with this identity, including
         // fragments that would otherwise fill an earlier COPY batch.
         let identities: Vec<_> = releases.iter().map(|release| identity(release)).collect();
@@ -136,7 +155,7 @@ fn save_grouped(tx:&mut Transaction<'_>,groups:BTreeMap<&str,Vec<&Release>>,now:
                 let row = Incoming { release, release_key: key.1, original_name_key, posted_at, posted_clock, article };
                 let size = row.approx_bytes();
                 if batch.len() == MAX_BATCH_ROWS || (!batch.is_empty() && bytes + size > MAX_BATCH_BYTES) {
-                    flush(tx, group, &batch, now, &mut stats, &mut timing_key)?;
+                    flush(tx, group, &batch, now, &mut stats, &mut timing_key, local.as_mut())?;
                     batch.clear();
                     bytes = 0;
                 }
@@ -145,21 +164,40 @@ fn save_grouped(tx:&mut Transaction<'_>,groups:BTreeMap<&str,Vec<&Release>>,now:
             }
         }
         if !batch.is_empty() {
-            flush(tx, group, &batch, now, &mut stats, &mut timing_key)?;
+            flush(tx, group, &batch, now, &mut stats, &mut timing_key, local.as_mut())?;
         }
     }
-    Ok(stats)
+    Ok((stats, local))
 }
 
 fn pg_text(value: &str) -> Cow<'_, str> {
     if value.as_bytes().contains(&0) { Cow::Owned(value.replace('\0', "\u{fffd}")) } else { Cow::Borrowed(value) }
 }
 
-fn flush(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], now: i64, stats: &mut SaveStats, timing_key: &mut Option<i64>) -> Result<()> {
-    tx.batch_execute("truncate pg_temp.atlas_release_input")?;
+/// The local article store of this save and the PostgreSQL transaction its rows are filed under.
+struct Local {
+    store: std::sync::Arc<crate::article_local::Store>,
+    xid: Option<String>,
+}
+
+impl Local {
+    /// The id of the transaction this save runs in, asked for once.
+    fn xid(&mut self, tx: &mut Transaction<'_>) -> Result<String> {
+        if self.xid.is_none() {
+            self.xid = Some(tx.query_one("select pg_current_xact_id()::text", &[])?.try_get(0)?);
+        }
+        Ok(self.xid.clone().expect("set above"))
+    }
+}
+
+fn flush(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], now: i64, stats: &mut SaveStats, timing_key: &mut Option<i64>, local: Option<&mut Local>) -> Result<()> {
     if timing_key.is_none() && batch.iter().any(|row| row.article.is_some()) {
         *timing_key = Some(timing::key(tx)?);
     }
+    if let Some(local) = local {
+        return flush_local(tx, group, batch, now, stats, *timing_key, local);
+    }
+    tx.batch_execute("truncate pg_temp.atlas_release_input")?;
     copy_input(tx, batch, *timing_key)?;
     let release = tx.query_one(WRITE_RELEASES, &[&group])?;
     stats.releases += release.get::<_, i64>(0) as u64;
@@ -170,6 +208,385 @@ fn flush(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], now: i64
     if parts > 0 {
         timing::write(tx, parts)?;
         tx.execute(UPDATE_FILES, &[&now, &crate::parser::MAX_PARTS])?;
+        finish(tx, now)?;
+    }
+    Ok(())
+}
+
+/// What one file gained from a batch, folded here the way the per-article
+/// statements fold the staged rows, so PostgreSQL is sent one row a file.
+struct FileFold<'a> {
+    release_id: i64,
+    filename: &'a str,
+    filename_key: [u8; 32],
+    expected: Option<i64>,
+    file_total: Option<i64>,
+    /// the article whose subject names the file: first by part, a missing part first, then message id
+    subject: &'a Article,
+    first_date: Option<i64>,
+    last_date: Option<i64>,
+    first_utc: Option<i64>,
+    last_utc: Option<i64>,
+    utc_complete: bool,
+    number_first: Option<i64>,
+    number_last: Option<i64>,
+    lines: i64,
+    references_seen: i64,
+    xref_groups_max: Option<i64>,
+    from_first: i64,
+    from_last: i64,
+    from_variants: i64,
+    encoded_subject: i64,
+    articles: i64,
+    tool: Option<i64>,
+    clock_first: Option<i64>,
+    clock_last: Option<i64>,
+    hw_host: Option<String>,
+    hw_key: Option<String>,
+    hw_n_first: Option<i64>,
+    hw_n_last: Option<i64>,
+}
+
+/// What one release gained from a batch.
+struct ReleaseFold<'a> {
+    parts: i64,
+    bytes: i64,
+    file_total: Option<i64>,
+    /// the release of the last accepted article: its poster and date are the ones kept
+    last: &'a Release,
+    posted_at: i64,
+    posted_clock: Option<i64>,
+    display_name: Option<&'a str>,
+}
+
+fn least(a: Option<i64>, b: Option<i64>) -> Option<i64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+fn greatest(a: Option<i64>, b: Option<i64>) -> Option<i64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// A batch with the articles kept in the local article store: PostgreSQL gets
+/// the releases, then one folded row for each file and each release that
+/// gained an article. No article row goes to PostgreSQL.
+fn flush_local(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], now: i64, stats: &mut SaveStats, timing_key: Option<i64>, local: &mut Local) -> Result<()> {
+    // One row for each release named in the batch: the first staged row of it,
+    // which is the one `distinct on ... order by ordinal` inserted.
+    let mut heads = Vec::new();
+    let mut head_of = HashMap::new();
+    for (ordinal, row) in batch.iter().enumerate() {
+        head_of.entry((row.release.collection.is_some(), row.release_key)).or_insert_with(|| {
+            heads.push(ordinal);
+            heads.len() - 1
+        });
+    }
+    tx.batch_execute("truncate pg_temp.atlas_release_fold, pg_temp.atlas_file_fold")?;
+    {
+        use Type as T;
+        let input = tx.copy_in(
+            "copy pg_temp.atlas_release_fold (ordinal, identity_key, is_collection, name, poster, posted_date, display_name,
+                is_obfuscated, junk, original_name, original_name_key, posted_at, posted_clock) from stdin binary",
+        )?;
+        let mut writer = BinaryCopyInWriter::new(
+            input,
+            &[T::INT8, T::BYTEA, T::BOOL, T::TEXT, T::TEXT, T::TEXT, T::TEXT, T::BOOL, T::BOOL, T::BYTEA, T::BYTEA, T::INT8, T::INT8],
+        );
+        for (head, &ordinal) in heads.iter().enumerate() {
+            let row = &batch[ordinal];
+            let r = row.release;
+            writer.write(&[
+                &(head as i64),
+                &&row.release_key[..],
+                &r.collection.is_some(),
+                &pg_text(&r.name).as_ref(),
+                &pg_text(&r.poster).as_ref(),
+                &pg_text(&r.date).as_ref(),
+                &r.display_name.as_deref().map(pg_text).as_deref(),
+                &r.is_obfuscated,
+                &row.article.is_none(),
+                &r.name.as_bytes(),
+                &&row.original_name_key[..],
+                &row.posted_at,
+                &row.posted_clock,
+            ])?;
+        }
+        writer.finish()?;
+    }
+    // A release with a program is deleted from the catalogue below; its
+    // articles leave the store when this transaction commits.
+    if heads.iter().any(|&ordinal| batch[ordinal].article.is_none()) {
+        let gone: Vec<i64> = tx.query(RETRACTED, &[&group])?.iter().map(|row| row.try_get(0)).collect::<Result<_, _>>()?;
+        if !gone.is_empty() {
+            let xid = local.xid(tx)?;
+            local.store.retract(&xid, &gone)?;
+        }
+    }
+    let release = tx.query_one(&WRITE_RELEASES.replace("pg_temp.atlas_release_input", "pg_temp.atlas_release_fold"), &[&group])?;
+    stats.releases += release.get::<_, i64>(0) as u64;
+    let mut release_of = vec![None; heads.len()];
+    for row in tx.query(RELEASE_IDS, &[&group])? {
+        release_of[usize::try_from(row.try_get::<_, i64>(0)?)?] = Some(row.try_get::<_, i64>(1)?);
+    }
+    // The first copy of a message id in a release wins, and one the release
+    // already has is a replay.
+    let mut firsts = Vec::new();
+    {
+        let mut seen = std::collections::HashSet::new();
+        for row in batch {
+            let Some(article) = row.article else { continue };
+            let Some(release) = release_of[head_of[&(row.release.collection.is_some(), row.release_key)]] else { continue };
+            if seen.insert((release, article.message_id.as_bytes())) {
+                firsts.push((row, article, release));
+            }
+        }
+    }
+    let known = local.store.has(&firsts.iter().map(|&(_, article, release)| (release, article.message_id.as_bytes())).collect::<Vec<_>>())?;
+    let accepted: Vec<_> = firsts.into_iter().zip(known).filter(|(_, known)| !known).map(|(first, _)| first).collect();
+    if accepted.is_empty() {
+        return Ok(());
+    }
+    let timing_key = timing_key.ok_or_else(|| anyhow::anyhow!("native writer timing has no catalog key"))?;
+    let mut files = Vec::<FileFold<'_>>::new();
+    let mut file_of = HashMap::<(i64, &str), usize>::new();
+    let mut file_index = Vec::with_capacity(accepted.len());
+    let mut releases = BTreeMap::<i64, ReleaseFold<'_>>::new();
+    for &(row, article, release_id) in &accepted {
+        let facts = crate::catalog_facts::ArticleFacts::of(article);
+        let id = &facts.id;
+        let hardware = (id.hw_host.is_some() && id.hw_key.is_some() && id.hw_n.is_some()).then_some(id);
+        let number = if article.number > 0 { Some(i64::try_from(article.number)?) } else { None };
+        let from = crate::catalog_facts::keyed_hash(timing_key as u64, 0, &article.author);
+        let filename = article.filename.as_deref().unwrap_or("");
+        let at = *file_of.entry((release_id, filename)).or_insert_with(|| {
+            files.push(FileFold {
+                release_id,
+                filename,
+                filename_key: Sha256::digest(filename).into(),
+                expected: None,
+                file_total: None,
+                subject: article,
+                first_date: None,
+                last_date: None,
+                first_utc: None,
+                last_utc: None,
+                utc_complete: true,
+                number_first: None,
+                number_last: None,
+                lines: 0,
+                references_seen: 0,
+                xref_groups_max: None,
+                from_first: from,
+                from_last: from,
+                from_variants: 0,
+                encoded_subject: 0,
+                articles: 0,
+                tool: None,
+                clock_first: None,
+                clock_last: None,
+                hw_host: None,
+                hw_key: None,
+                hw_n_first: None,
+                hw_n_last: None,
+            });
+            files.len() - 1
+        });
+        file_index.push(at);
+        let f = &mut files[at];
+        f.expected = greatest(f.expected, article.total_parts);
+        f.file_total = greatest(f.file_total, article.file_total);
+        if (article.part.is_some(), article.part.unwrap_or(0), article.message_id.as_bytes())
+            < (f.subject.part.is_some(), f.subject.part.unwrap_or(0), f.subject.message_id.as_bytes())
+        {
+            f.subject = article;
+        }
+        f.first_date = least(f.first_date, facts.date);
+        f.last_date = greatest(f.last_date, facts.date);
+        f.first_utc = least(f.first_utc, facts.utc);
+        f.last_utc = greatest(f.last_utc, facts.utc);
+        f.utc_complete &= facts.utc.is_some();
+        f.number_first = least(f.number_first, number);
+        f.number_last = greatest(f.number_last, number);
+        f.lines = f.lines.checked_add(article.lines.max(0)).ok_or_else(|| anyhow::anyhow!("native timing line count overflow"))?;
+        f.references_seen += i64::from(!article.references.trim().is_empty());
+        f.xref_groups_max = greatest(f.xref_groups_max, article.xref_groups.map(i64::from));
+        // A sender counts once for each run of articles it posted in arrival order.
+        if f.articles == 0 || f.from_last != from {
+            f.from_variants += 1;
+        }
+        f.from_last = from;
+        f.encoded_subject = f.encoded_subject.max(i64::from(article.subject.contains("=?") && article.subject.contains("?=")));
+        f.articles += 1;
+        f.tool = f.tool.or(id.tool.map(|tool| tool.code()));
+        f.clock_first = least(f.clock_first, id.clock_ms);
+        f.clock_last = greatest(f.clock_last, id.clock_ms);
+        if let Some(hw) = hardware {
+            if f.hw_host.is_none() {
+                f.hw_host = hw.hw_host.clone();
+            }
+            if f.hw_key.is_none() {
+                f.hw_key = hw.hw_key.clone();
+            }
+            f.hw_n_first = least(f.hw_n_first, hw.hw_n);
+            f.hw_n_last = greatest(f.hw_n_last, hw.hw_n);
+        }
+        let r = releases.entry(release_id).or_insert(ReleaseFold {
+            parts: 0,
+            bytes: 0,
+            file_total: None,
+            last: row.release,
+            posted_at: row.posted_at,
+            posted_clock: row.posted_clock,
+            display_name: None,
+        });
+        r.parts += 1;
+        r.bytes = r.bytes.checked_add(article.bytes).ok_or_else(|| anyhow::anyhow!("bigint out of range"))?;
+        r.file_total = greatest(r.file_total, article.file_total);
+        (r.last, r.posted_at, r.posted_clock) = (row.release, row.posted_at, row.posted_clock);
+        if let Some(name) = row.release.display_name.as_deref() {
+            r.display_name = Some(name);
+        }
+    }
+    {
+        use Type as T;
+        let input = tx.copy_in(
+            "copy pg_temp.atlas_file_fold (ord, release_id, filename_key, filename, original_filename, expected, file_total,
+                subject, subject_part, subject_mid, zero_file_index, subject_file_index, subject_file_total, subject_expected,
+                first_date, last_date, first_utc, last_utc, utc_complete, number_first, number_last, lines, references_seen,
+                xref_groups_max, from_first, from_last, from_variants, encoded_subject, articles, tool, clock_first,
+                clock_last, hw_host, hw_key, hw_n_first, hw_n_last) from stdin binary",
+        )?;
+        let mut writer = BinaryCopyInWriter::new(
+            input,
+            &[
+                T::INT8, T::INT8, T::BYTEA, T::TEXT, T::BYTEA, T::INT8, T::INT8,
+                T::TEXT, T::INT8, T::BYTEA, T::BOOL, T::INT8, T::INT8, T::INT8,
+                T::INT8, T::INT8, T::INT8, T::INT8, T::BOOL, T::INT8, T::INT8, T::INT8, T::INT8,
+                T::INT8, T::INT8, T::INT8, T::INT8, T::INT8, T::INT8, T::INT8, T::INT8,
+                T::INT8, T::TEXT, T::TEXT, T::INT8, T::INT8,
+            ],
+        );
+        for (ord, f) in files.iter().enumerate() {
+            let s = f.subject;
+            writer.write(&[
+                &(ord as i64),
+                &f.release_id,
+                &&f.filename_key[..],
+                &pg_text(f.filename).as_ref(),
+                &f.filename.as_bytes(),
+                &f.expected,
+                &f.file_total,
+                &pg_text(&s.subject).as_ref(),
+                &s.part,
+                &s.message_id.as_bytes(),
+                &(s.subject.contains('[') && crate::parser::has_zero_file_index(&s.subject)),
+                &s.file_index,
+                &s.file_total,
+                &s.total_parts,
+                &f.first_date,
+                &f.last_date,
+                &f.first_utc,
+                &f.last_utc,
+                &f.utc_complete,
+                &f.number_first,
+                &f.number_last,
+                &f.lines,
+                &f.references_seen,
+                &f.xref_groups_max,
+                &f.from_first,
+                &f.from_last,
+                &f.from_variants,
+                &f.encoded_subject,
+                &f.articles,
+                &f.tool,
+                &f.clock_first,
+                &f.clock_last,
+                &f.hw_host.as_deref(),
+                &f.hw_key.as_deref(),
+                &f.hw_n_first,
+                &f.hw_n_last,
+            ])?;
+        }
+        writer.finish()?;
+    }
+    stats.files += tx.query_one(ADD_FILES, &[])?.try_get::<_, i64>(0)? as u64;
+    let mut file_ids = vec![None; files.len()];
+    for row in tx.query(PLACE_FILES, &[])? {
+        file_ids[usize::try_from(row.try_get::<_, i64>(0)?)?] = Some(row.try_get::<_, i64>(1)?);
+    }
+    let file_ids: Vec<i64> =
+        file_ids.into_iter().map(|id| id.ok_or_else(|| anyhow::anyhow!("an accepted article found no file"))).collect::<Result<_>>()?;
+    let rows: Vec<_> = accepted
+        .iter()
+        .zip(&file_index)
+        .map(|(&(row, article, release_id), &at)| crate::article_local::NewRow {
+            release_id,
+            file_id: file_ids[at],
+            message_id: article.message_id.as_bytes(),
+            part: article.part,
+            bytes: article.bytes,
+            envelope: article.filename.is_none().then(|| crate::article_local::Envelope {
+                subject: article.subject.as_bytes().to_vec(),
+                poster: row.release.poster.as_bytes().to_vec(),
+                posted_date: row.release.date.as_bytes().to_vec(),
+                nzb_timestamp: crate::dates::article_timestamp(&row.release.date),
+                expected: article.total_parts,
+                subject_file_index: article.file_index,
+                subject_file_total: article.file_total,
+            }),
+        })
+        .collect();
+    let xid = local.xid(tx)?;
+    let gained = local.store.add(&xid, &rows, crate::parser::MAX_PARTS)?;
+    let parts = rows.len() as u64;
+    stats.parts += parts;
+    // The trigger on `segments` told post-processing a release's input changed.
+    let changed: Vec<i64> = releases.keys().copied().collect();
+    tx.execute("update releases set native_work_revision = native_work_revision + 1 where id = any($1)", &[&changed])?;
+    // A file's first proof of UTC needs every article it has to be in this batch.
+    let present: Vec<i64> =
+        files.iter().zip(&file_ids).map(|(f, &id)| local.store.file_count(id, f.articles + 1)).collect::<Result<_>>()?;
+    timing::write_local(tx, parts, &file_ids, &present)?;
+    let (ids, counts, firsts, lasts): (Vec<i64>, Vec<i64>, Vec<i64>, Vec<i64>) =
+        gained.iter().fold(Default::default(), |mut all: (Vec<i64>, Vec<i64>, Vec<i64>, Vec<i64>), parts| {
+            all.0.push(parts.file_id);
+            all.1.push(parts.count);
+            all.2.push(parts.first);
+            all.3.push(parts.last);
+            all
+        });
+    tx.execute(UPDATE_FILES_FOLD, &[&now, &ids, &counts, &firsts, &lasts])?;
+    let complete_due = now.saturating_add(crate::catalog_facts::COMPLETE_SETTLE_SECS.load(Ordering::Relaxed).max(1));
+    let incomplete_due = now.saturating_add(crate::catalog_facts::SETTLE_SECS.load(Ordering::Relaxed).max(1));
+    let folds: Vec<&ReleaseFold<'_>> = releases.values().collect();
+    tx.execute(
+        UPDATE_RELEASES_FOLD,
+        &[
+            &complete_due,
+            &incomplete_due,
+            &changed,
+            &folds.iter().map(|r| r.parts).collect::<Vec<_>>(),
+            &folds.iter().map(|r| r.bytes).collect::<Vec<_>>(),
+            &folds.iter().map(|r| r.file_total).collect::<Vec<_>>(),
+            &folds.iter().map(|r| pg_text(&r.last.poster)).collect::<Vec<_>>(),
+            &folds.iter().map(|r| pg_text(&r.last.date)).collect::<Vec<_>>(),
+            &folds.iter().map(|r| r.posted_at).collect::<Vec<_>>(),
+            &folds.iter().map(|r| r.posted_clock).collect::<Vec<_>>(),
+            &folds.iter().map(|r| r.last.is_obfuscated).collect::<Vec<_>>(),
+            &folds.iter().map(|r| r.display_name.map(pg_text)).collect::<Vec<_>>(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn finish(tx: &mut Transaction<'_>, now: i64) -> Result<()> {
+    {
         let complete_due = now.saturating_add(crate::catalog_facts::COMPLETE_SETTLE_SECS.load(Ordering::Relaxed).max(1));
         let incomplete_due = now.saturating_add(crate::catalog_facts::SETTLE_SECS.load(Ordering::Relaxed).max(1));
         tx.execute(UPDATE_RELEASES_AND_QUEUE, &[&complete_due, &incomplete_due])?;
@@ -359,6 +776,64 @@ const CREATE_STAGE: &str = "
         file_id bigint
     ) on commit delete rows";
 
+// With the articles kept locally the writer folds a batch itself: a row for
+// each release it names and a row for each file that gained an article.
+const CREATE_FOLD_STAGE: &str = "
+    create temporary table if not exists pg_temp.atlas_release_fold (
+        ordinal bigint primary key,
+        identity_key bytea not null,
+        is_collection boolean not null,
+        name text not null,
+        poster text not null,
+        posted_date text not null,
+        display_name text,
+        is_obfuscated boolean not null,
+        junk boolean not null,
+        original_name bytea not null,
+        original_name_key bytea not null,
+        posted_at bigint not null,
+        posted_clock bigint
+    ) on commit delete rows;
+    create temporary table if not exists pg_temp.atlas_file_fold (
+        ord bigint primary key,
+        release_id bigint not null,
+        file_id bigint,
+        filename_key bytea not null,
+        filename text not null,
+        original_filename bytea not null,
+        expected bigint,
+        file_total bigint,
+        subject text not null,
+        subject_part bigint,
+        subject_mid bytea not null,
+        zero_file_index boolean not null,
+        subject_file_index bigint,
+        subject_file_total bigint,
+        subject_expected bigint,
+        first_date bigint,
+        last_date bigint,
+        first_utc bigint,
+        last_utc bigint,
+        utc_complete boolean not null,
+        number_first bigint,
+        number_last bigint,
+        lines bigint,
+        references_seen bigint not null,
+        xref_groups_max bigint,
+        from_first bigint not null,
+        from_last bigint not null,
+        from_variants bigint not null,
+        encoded_subject bigint not null,
+        articles bigint not null,
+        tool bigint,
+        clock_first bigint,
+        clock_last bigint,
+        hw_host text,
+        hw_key text,
+        hw_n_first bigint,
+        hw_n_last bigint
+    ) on commit delete rows";
+
 const WRITE_RELEASES: &str = "
     with marked as (
         select distinct is_collection, identity_key from pg_temp.atlas_release_input where junk
@@ -436,23 +911,25 @@ const WRITE_ARTICLES: &str = "
     )
     select (select count(*) from added_files), (select count(*) from accepted)";
 
-const UPDATE_FILES: &str = "
-    with new_parts as (
-        insert into file_parts (file_id, part)
-        select distinct file_id, part from pg_temp.atlas_release_input
-        where file_id is not null and part between 0 and $2
-        on conflict do nothing
-        returning file_id, part
-    ), parts as (
-        select file_id, count(*) as count, min(part) as first, max(part) as last from new_parts group by file_id
-    ), declarations as (
+// The part of `UPDATE_FILES` that reads each file's declarations and naming
+// article from the staged articles.
+macro_rules! update_files_inputs {
+    () => {
+        "), declarations as (
         select file_id, max(expected) as expected, max(file_total) as file_total
         from pg_temp.atlas_release_input where file_id is not null group by file_id
     ), subjects as (
         select distinct on (file_id) file_id, subject, part, message_id, zero_file_index, file_index, file_total, expected
         from pg_temp.atlas_release_input where file_id is not null
         order by file_id, part nulls first, message_id
-    ), combined as (
+"
+    };
+}
+
+// The part of `UPDATE_FILES` after every input of a file is known.
+macro_rules! update_files_combine {
+    () => {
+        "    ), combined as (
         select f.id, greatest(f.expected, d.expected) as expected,
             greatest(f.file_total, d.file_total) as file_total,
             f.distinct_parts + coalesce(p.count, 0) as distinct_parts,
@@ -478,19 +955,75 @@ const UPDATE_FILES: &str = "
         subject_file_total = case when c.better_subject then c.subject_file_total else f.subject_file_total end,
         subject_total_parts = case when c.better_subject then c.subject_total_parts else f.subject_total_parts end,
         zero_file_index = case when c.better_subject then c.zero_file_index else f.zero_file_index end
-    from combined c where c.id = f.id";
+    from combined c where c.id = f.id"
+    };
+}
 
-const UPDATE_RELEASES_AND_QUEUE: &str = "
-    with changes as (
-        select release_id, count(*) as parts, sum(bytes)::bigint as bytes, max(file_total) as file_total
-        from pg_temp.atlas_release_input where release_id is not null group by release_id
-    ), metadata as (
-        select distinct on (release_id) release_id, poster, posted_date, posted_at, posted_clock, is_obfuscated
-        from pg_temp.atlas_release_input where release_id is not null order by release_id, ordinal desc
-    ), display_names as (
-        select distinct on (release_id) release_id, display_name from pg_temp.atlas_release_input
-        where release_id is not null and display_name is not null order by release_id, ordinal desc
-    ), completion as (
+const UPDATE_FILES: &str = concat!(
+    "
+    with new_parts as (
+        insert into file_parts (file_id, part)
+        select distinct file_id, part from pg_temp.atlas_release_input
+        where file_id is not null and part between 0 and $2
+        on conflict do nothing
+        returning file_id, part
+    ), parts as (
+        select file_id, count(*) as count, min(part) as first, max(part) as last from new_parts group by file_id
+    ",
+    update_files_inputs!(),
+    update_files_combine!()
+);
+
+// The same update from the writer's own fold of each file, with the part
+// numbers the local article store said each file gained.
+const UPDATE_FILES_FOLD: &str = concat!(
+    "
+    with parts as (
+        select * from unnest($2::bigint[], $3::bigint[], $4::bigint[], $5::bigint[]) as p(file_id, count, first, last)
+    ), declarations as (
+        select file_id, expected, file_total from pg_temp.atlas_file_fold
+    ), subjects as (
+        select file_id, subject, subject_part as part, subject_mid as message_id, zero_file_index,
+            subject_file_index as file_index, subject_file_total as file_total, subject_expected as expected
+        from pg_temp.atlas_file_fold
+",
+    update_files_combine!()
+);
+
+// The release each folded release row belongs to.
+const RELEASE_IDS: &str = "
+    select s.ordinal, r.id
+    from pg_temp.atlas_release_fold s
+    join releases r on r.group_name = $1 and (r.is_collection, r.identity_key) = (s.is_collection, s.identity_key)
+    where not s.junk";
+
+// The releases the junk markers of a batch are about to delete.
+const RETRACTED: &str = "
+    select r.id
+    from pg_temp.atlas_release_fold s
+    join releases r on r.group_name = $1 and (r.is_collection, r.identity_key) = (s.is_collection, s.identity_key)
+    where s.junk";
+
+// Create the files a batch names for the first time.
+const ADD_FILES: &str = "
+    with added as (
+        insert into files (release_id, filename_key, filename, original_filename)
+        select release_id, filename_key, filename, original_filename from pg_temp.atlas_file_fold
+        on conflict (release_id, filename_key) do nothing
+        returning 1
+    )
+    select count(*) from added";
+
+// Give each folded file row its file.
+const PLACE_FILES: &str = "
+    update pg_temp.atlas_file_fold s set file_id = f.id
+    from files f where (f.release_id, f.filename_key) = (s.release_id, s.filename_key)
+    returning s.ord, s.file_id";
+
+// The part of `UPDATE_RELEASES_AND_QUEUE` after what each release gained is known.
+macro_rules! update_releases_rest {
+    () => {
+        "    ), completion as (
         select c.release_id, count(*) as files, bool_and(f.complete) as all_whole,
             bool_or(f.zero_file_index) as zero_indexed
         from changes c join files f on f.release_id = c.release_id group by c.release_id
@@ -509,7 +1042,41 @@ const UPDATE_RELEASES_AND_QUEUE: &str = "
     )
     insert into pp_queue (release_id, due_at)
     select id, case when complete then $1::bigint else $2::bigint end from updated
-    on conflict (release_id) do update set due_at = excluded.due_at, generation = pp_queue.generation + 1";
+    on conflict (release_id) do update set due_at = excluded.due_at, generation = pp_queue.generation + 1"
+    };
+}
+
+const UPDATE_RELEASES_AND_QUEUE: &str = concat!(
+    "
+    with changes as (
+        select release_id, count(*) as parts, sum(bytes)::bigint as bytes, max(file_total) as file_total
+        from pg_temp.atlas_release_input where release_id is not null group by release_id
+    ), metadata as (
+        select distinct on (release_id) release_id, poster, posted_date, posted_at, posted_clock, is_obfuscated
+        from pg_temp.atlas_release_input where release_id is not null order by release_id, ordinal desc
+    ), display_names as (
+        select distinct on (release_id) release_id, display_name from pg_temp.atlas_release_input
+        where release_id is not null and display_name is not null order by release_id, ordinal desc
+",
+    update_releases_rest!()
+);
+
+// The same update from the writer's own fold of each release.
+const UPDATE_RELEASES_FOLD: &str = concat!(
+    "
+    with gained as (
+        select * from unnest($3::bigint[], $4::bigint[], $5::bigint[], $6::bigint[], $7::text[], $8::text[],
+            $9::bigint[], $10::bigint[], $11::boolean[], $12::text[])
+            as g(release_id, parts, bytes, file_total, poster, posted_date, posted_at, posted_clock, is_obfuscated, display_name)
+    ), changes as (
+        select release_id, parts, bytes, file_total from gained
+    ), metadata as (
+        select release_id, poster, posted_date, posted_at, posted_clock, is_obfuscated from gained
+    ), display_names as (
+        select release_id, display_name from gained where display_name is not null
+",
+    update_releases_rest!()
+);
 
 #[cfg(test)]
 mod tests {
@@ -589,8 +1156,8 @@ mod tests {
         first.articles[0].subject = "a\0.rar".into();
         let second = release("sample", "a\u{fffd}.rar", &"x".repeat(4000), 1);
         assert_eq!(save(&mut client, &[first, second], 100).unwrap(), SaveStats { releases: 1, files: 2, parts: 2 });
-        let row = client.query_one("select message_id from segments where octet_length(message_id) = 7", &[]).unwrap();
-        assert_eq!(row.get::<_, Vec<u8>>(0), b"abc\0def");
+        let kept = crate::article_local::Store::articles_for_test(&mut *client);
+        assert!(kept.iter().any(|article| article.message_id == b"abc\0def"));
     }
 
     #[test]
@@ -663,7 +1230,23 @@ mod sparse_nzb_metadata_tests {
         let empty=release("Empty.Meta.Example",Some(""),"<empty@example.test>");
         let mut duplicate=rare.clone();duplicate.poster="same-batch replacement".into();duplicate.date="2021-01-01 00:00:00".into();duplicate.articles[0].subject="same-batch replacement".into();
         save(&mut client,&[rare.clone(),duplicate,named,empty],1).unwrap();
-        assert_eq!(client.query_one("select count(*) from segments",&[]).unwrap().get::<_,i64>(0),3);
+        assert_eq!(crate::pg::testing::articles(&mut *client),3);
+        if let Some(store)=crate::article_local::of(&mut *client).unwrap() {
+            // The same envelope, kept beside the article in the local store. A deleted
+            // release's articles are left there unread, so the cascade is not asked about.
+            let id:i64=client.query_one("select id from releases where name='Rare.Meta.Example'",&[]).unwrap().get(0);
+            let kept=store.envelope(id,b"<rare@example.test>").unwrap().expect("the nameless article keeps its envelope");
+            assert_eq!((kept.subject.as_slice(),kept.poster.as_slice(),kept.posted_date.as_slice()),(subject.as_bytes(),poster.as_bytes(),&b"Wed, 01 Jan 2020 00:00:00 +0000"[..]));
+            assert_eq!((kept.nzb_timestamp,kept.expected,kept.subject_file_index,kept.subject_file_total),(1577836800,Some(3),Some(2),Some(7)));
+            for (name,mid) in [("Named.Meta.Example","<named@example.test>"),("Empty.Meta.Example","<empty@example.test>")] {
+                let id:i64=client.query_one("select id from releases where name=$1",&[&name]).unwrap().get(0);
+                assert!(store.envelope(id,mid.as_bytes()).unwrap().is_none());
+            }
+            let mut replay=rare;replay.poster="changed poster".into();replay.articles[0].subject="changed subject".into();
+            assert_eq!(save(&mut client,&[replay],2).unwrap().parts,0);
+            assert_eq!(store.envelope(id,b"<rare@example.test>").unwrap().unwrap().subject,subject.as_bytes());
+            return;
+        }
         assert_eq!(client.query_one("select count(*) from segment_nzb_metadata",&[]).unwrap().get::<_,i64>(0),1);
         let row=client.query_one("select m.subject,m.poster,m.posted_date,m.nzb_timestamp,m.expected,m.subject_file_index,m.subject_file_total from segment_nzb_metadata m join releases r on r.id=m.release_id where r.name='Rare.Meta.Example'",&[]).unwrap();
         assert_eq!(row.get::<_,Vec<u8>>(0),subject.as_bytes());assert_eq!(row.get::<_,Vec<u8>>(1),poster.as_bytes());

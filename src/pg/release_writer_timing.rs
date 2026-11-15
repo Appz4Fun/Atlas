@@ -12,6 +12,10 @@ pub(super) fn write(tx:&mut Transaction<'_>,accepted:u64)->Result<()> {
     let rows=tx.execute(WRITE,&[])?;
     ensure!(rows>0&&rows<=accepted,"native timing accepted-file count differs from segment acceptance");Ok(())
 }
+pub(super) fn write_local(tx:&mut Transaction<'_>,accepted:u64,files:&[i64],present:&[i64])->Result<()> {
+    let rows=tx.execute(WRITE_FOLD,&[&files,&present])?;
+    ensure!(rows>0&&rows<=accepted,"native timing accepted-file count differs from segment acceptance");Ok(())
+}
 
 // At most the existing16,384-row/8MiB COPY batch participates. LAG and first
 // facts preserve arrival order after filtering replay losers; each aggregate
@@ -19,7 +23,35 @@ pub(super) fn write(tx:&mut Transaction<'_>,accepted:u64)->Result<()> {
 // A missing old Timing row is not proof of a new file. Its first UTC proof
 // also requires every retained segment to be among this accepted batch: the
 // count stops at batch articles+1 (at most twice COPY rows across all files).
-const WRITE:&str="
+macro_rules! write_sql {
+    ($head:literal, $present:literal) => {
+        concat!($head, "insert into file_timing as old(file_id,release_id,first_date,last_date,number_first,number_last,lines,
+    references_seen,xref_groups_max,from_hash,from_variants,encoded_subject,late_articles,articles,
+    tool,clock_first,clock_last,hw_host,hw_key,hw_n_first,hw_n_last,first_utc,last_utc,utc_complete)
+select file_id,release_id,first_date,last_date,number_first,number_last,lines,references_seen,xref_groups_max,
+    from_last,from_variants,encoded_subject,0,articles,tool,clock_first,clock_last,hw_host,hw_key,hw_n_first,hw_n_last,first_utc,last_utc,
+    utc_complete and (exists(select 1 from file_timing where file_id=folded.file_id)
+        or articles=", $present, ")
+from folded where true
+on conflict(file_id) do update set
+    release_id=excluded.release_id,
+    first_date=least(old.first_date,excluded.first_date),last_date=greatest(old.last_date,excluded.last_date),
+    first_utc=least(old.first_utc,excluded.first_utc),last_utc=greatest(old.last_utc,excluded.last_utc),
+    utc_complete=old.utc_complete and excluded.utc_complete,
+    number_first=least(old.number_first,excluded.number_first),number_last=greatest(old.number_last,excluded.number_last),
+    lines=coalesce(old.lines,0)+excluded.lines,references_seen=old.references_seen+excluded.references_seen,
+    xref_groups_max=greatest(old.xref_groups_max,excluded.xref_groups_max),
+    from_variants=old.from_variants+excluded.from_variants-
+        case when old.from_hash=(select f.from_first from folded f where f.file_id=excluded.file_id) then 1 else 0 end,
+    from_hash=excluded.from_hash,encoded_subject=greatest(old.encoded_subject,excluded.encoded_subject),
+    articles=old.articles+excluded.articles,
+    tool=coalesce(old.tool,excluded.tool),clock_first=least(old.clock_first,excluded.clock_first),
+    clock_last=greatest(old.clock_last,excluded.clock_last),hw_host=coalesce(old.hw_host,excluded.hw_host),
+    hw_key=coalesce(old.hw_key,excluded.hw_key),hw_n_first=least(old.hw_n_first,excluded.hw_n_first),
+    hw_n_last=greatest(old.hw_n_last,excluded.hw_n_last)")
+    };
+}
+const WRITE:&str=write_sql!("
 with ordered as materialized (
     select *,lag(t_from) over(partition by file_id order by ordinal) as previous_from
     from pg_temp.atlas_release_input where file_id is not null
@@ -39,27 +71,9 @@ with ordered as materialized (
         min(t_hw_n) as hw_n_first,max(t_hw_n) as hw_n_last
     from ordered group by file_id,release_id
 )
-insert into file_timing as old(file_id,release_id,first_date,last_date,number_first,number_last,lines,
-    references_seen,xref_groups_max,from_hash,from_variants,encoded_subject,late_articles,articles,
-    tool,clock_first,clock_last,hw_host,hw_key,hw_n_first,hw_n_last,first_utc,last_utc,utc_complete)
-select file_id,release_id,first_date,last_date,number_first,number_last,lines,references_seen,xref_groups_max,
-    from_last,from_variants,encoded_subject,0,articles,tool,clock_first,clock_last,hw_host,hw_key,hw_n_first,hw_n_last,first_utc,last_utc,
-    utc_complete and (exists(select 1 from file_timing where file_id=folded.file_id)
-        or articles=(select count(*) from(select 1 from segments where file_id=folded.file_id limit folded.articles+1) present))
-from folded where true
-on conflict(file_id) do update set
-    release_id=excluded.release_id,
-    first_date=least(old.first_date,excluded.first_date),last_date=greatest(old.last_date,excluded.last_date),
-    first_utc=least(old.first_utc,excluded.first_utc),last_utc=greatest(old.last_utc,excluded.last_utc),
-    utc_complete=old.utc_complete and excluded.utc_complete,
-    number_first=least(old.number_first,excluded.number_first),number_last=greatest(old.number_last,excluded.number_last),
-    lines=coalesce(old.lines,0)+excluded.lines,references_seen=old.references_seen+excluded.references_seen,
-    xref_groups_max=greatest(old.xref_groups_max,excluded.xref_groups_max),
-    from_variants=old.from_variants+excluded.from_variants-
-        case when old.from_hash=(select f.from_first from folded f where f.file_id=excluded.file_id) then 1 else 0 end,
-    from_hash=excluded.from_hash,encoded_subject=greatest(old.encoded_subject,excluded.encoded_subject),
-    articles=old.articles+excluded.articles,
-    tool=coalesce(old.tool,excluded.tool),clock_first=least(old.clock_first,excluded.clock_first),
-    clock_last=greatest(old.clock_last,excluded.clock_last),hw_host=coalesce(old.hw_host,excluded.hw_host),
-    hw_key=coalesce(old.hw_key,excluded.hw_key),hw_n_first=least(old.hw_n_first,excluded.hw_n_first),
-    hw_n_last=greatest(old.hw_n_last,excluded.hw_n_last)";
+", "(select count(*) from(select 1 from segments where file_id=folded.file_id limit folded.articles+1) present)");
+// The writer folded each file's accepted articles itself and the local article
+// store counted the file's articles, no further than this batch's plus one.
+const WRITE_FOLD:&str=write_sql!("
+with folded as (select * from pg_temp.atlas_file_fold)
+", "(select p.present from unnest($1::bigint[],$2::bigint[]) as p(file_id,present) where p.file_id=folded.file_id)");

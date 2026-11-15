@@ -91,7 +91,9 @@ impl StepReads {
                 let mut computed=crate::keys::keys_of(probe.as_ref(),&timing,parts,Some(salt));
                 budget.check()?;
                 if computed.file_crc.is_none() {
-                    computed.file_crc=folded_in_with_budget(&mut tx,id,&self.owner.stop,Some(&budget))?.first().copied().map(FileCrc::key);
+                    let local=self.local_in(&mut tx)?;
+                    budget.check()?;
+                    computed.file_crc=folded_in_with_budget(&mut tx,id,&self.owner.stop,Some(&budget),local.as_deref())?.first().copied().map(FileCrc::key);
                 }
                 if probe.as_ref().and_then(|p|p.archive.as_ref()).is_some_and(|a|a.encrypted||a.headers_encrypted) {
                     let metadata=budget.one(&mut tx,"select count(*),coalesce(sum(octet_length(name)),0)::bigint from par2_files where release_id=$1 and bound<>0 and complete<>0",&[&id])?;

@@ -64,6 +64,8 @@ par-rs = { git = "https://github.com/xbmc4lyfe/par-rs", rev = "4e91c872882a2e39b
 tantivy = "0.27"
 quick-xml = "0.42"
 postgres = "0.19"
+# the local article store (`article_local`): per-article rows live beside the header store, not in PostgreSQL
+rusqlite = { version = "0.40", features = ["bundled"] }
 # the buffer `pg::sql::Value` writes its Postgres parameters into
 bytes = "1"
 

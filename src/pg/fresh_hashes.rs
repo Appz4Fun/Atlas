@@ -11,6 +11,30 @@ impl ReadView<'_> {
     pub(crate) fn metadata_hashes(&self,id:i64,pool:&Arc<Pool>)->Result<Option<(HashFacts,Option<crate::probe::ProbeInfo>)>> {
         if !self.visible(id)?{return Ok(None);}
         let probe=self.probe(id)?;
+        if let Some(store)=&self.local {
+            self.check_deadline()?;
+            let count=store.release_count(id,250001)?;
+            ensure!((0..=250001).contains(&count),"invalid native hash horizon");
+            if count>250000{return Ok(Some((HashFacts {digest:None,articles:250000,complete:false},probe)));}
+            if count==0{return Ok(Some((HashFacts {digest:None,articles:0,complete:true},probe)));}
+            // The plan is still written, so the spool admits and refuses the
+            // same requests; the IDs themselves are hashed as they are paged.
+            let mut plan=pool.open()?;let mut hash=Sha256::new();
+            let mut articles=0usize;let mut after:Option<Vec<u8>>=None;
+            loop {
+                self.check_deadline()?;
+                let mut page=store.release_ids(id,after.as_deref(),4096,1<<20)?;
+                for message in &page {
+                    self.check_deadline()?;
+                    plan.write_all(&crate::article_local::message_key(message))?;plan.write_all(&i64::try_from(message.len())?.to_le_bytes())?;
+                    articles=articles.checked_add(1).context("native hash count overflow")?;
+                    ensure!(articles<=count as usize,"native hash unique IDs exceed source rows");
+                    crate::nzb_stream::text_chunks(&message[..],|text|{hash.update(text.as_bytes());Ok(())})?;hash.update(b"\n");
+                }
+                after=page.pop();if after.is_none(){break;}
+            }
+            return Ok(Some((HashFacts {digest:Some(hash.finalize().into()),articles,complete:true},probe)));
+        }
         self.before_query()?;
         let count:i64=self.tx.borrow_mut().query_one("select count(*) from(select 1 from segments where release_id=$1 limit 250001) bounded",&[&id])?.try_get(0)?;
         ensure!((0..=250001).contains(&count),"invalid native hash horizon");

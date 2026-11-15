@@ -15,6 +15,8 @@ pub(crate) struct ReadView<'client> {
     pub(super) budget: Budget,
     until: Instant,
     owned: Cell<u64>,
+    /// The local article store of this schema, when its articles are kept there and not in PostgreSQL.
+    pub(crate) local: Option<std::sync::Arc<crate::article_local::Store>>,
     #[cfg(test)]
     guard_queries: Cell<u64>,
 }
@@ -27,6 +29,7 @@ impl<'client> ReadView<'client> {
             "invalid native reader admission");
         let tx = client.build_transaction().isolation_level(IsolationLevel::RepeatableRead).read_only(true).start()?;
         let view = Self { tx: RefCell::new(tx), budget, until, owned:Cell::new(0),
+            local: crate::article_local::of_schema(schema),
             #[cfg(test)] guard_queries:Cell::new(0) };
         view.before_query()?;
         let row = view.tx.borrow_mut().query_one("select current_schema()=$1 and current_setting('transaction_read_only')='on'

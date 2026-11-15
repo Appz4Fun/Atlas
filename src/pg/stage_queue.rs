@@ -222,6 +222,8 @@ impl Queue {
                 // Existing FK/accounting/word-queue triggers retract only this
                 // release. Valuable ext_* facts/assets have no release FK.
                 ensure!(tx.execute("delete from releases where id=$1",&[&claim.id])?==1,"native junk release disappeared under its lock");
+                // Its articles leave the local article store once this transaction commits.
+                crate::article_local::retract_in(&mut tx,&[claim.id])?;
                 receipt_in(&mut tx,claim,&visit,&self.epoch)?;
                 if self.owner.stop.load(std::sync::atomic::Ordering::Acquire) {return Err(super::outage::AttemptEnded.into());}
                 tx.commit()?;return Ok(Settlement::Applied)

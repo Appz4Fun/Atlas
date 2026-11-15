@@ -120,11 +120,9 @@ mod tests {
     fn counts(client: &mut postgres::Client) -> (i64, i64, i64) {
         let row = client
             .query_one(
-                "select (select count(*) from releases), (select count(*) from files), (select count(*) from segments)",
-                &[],
-            )
+                "select (select count(*) from releases), (select count(*) from files)", &[])
             .unwrap();
-        (row.get(0), row.get(1), row.get(2))
+        (row.get(0), row.get(1), crate::pg::testing::articles(client))
     }
 
     #[test]

@@ -82,7 +82,14 @@ impl StepReads {
         let pf=rows(tx,"select name,size from par2_files where release_id=$1 order by file_id",&[&id],&["name"],&mut budget)?.into_iter().map(|r|Ok((r.try_get(0)?,u64::try_from(r.try_get::<_,i64>(1)?)?))).collect::<Result<Vec<_>>>()?;
         let (unmatched_files,unmatched_par2)=select::prepare_par2_names(&mut out,input,pf);
         if unmatched_files.is_empty() || unmatched_par2.is_empty() {return Ok(out)}
-        let mut wire=HashMap::new();for r in rows(tx,"select f.id,coalesce((select sum(bytes)::bigint from segments where file_id=f.id),0)::bigint from files f where f.release_id=$1 order by id",&[&id],&[],&mut budget)? {wire.insert(r.try_get(0)?,u64::try_from(r.try_get::<_,i64>(1)?)?);}
+        let mut wire=HashMap::new();
+        if let Some(store)=self.local_in(tx)? {
+            // Same rows charged as the joined statement; the byte sums come from the local articles.
+            let ids=rows(tx,"select f.id from files f where f.release_id=$1 order by id",&[&id],&[],&mut budget)?.into_iter().map(|r|r.try_get(0)).collect::<std::result::Result<Vec<i64>,_>>()?;
+            for (file,bytes) in ids.iter().zip(store.files_bytes(&ids)?) {wire.insert(*file,u64::try_from(bytes)?);}
+            return Ok(select::finish_par2_names(out,unmatched_files,unmatched_par2,&wire))
+        }
+        for r in rows(tx,"select f.id,coalesce((select sum(bytes)::bigint from segments where file_id=f.id),0)::bigint from files f where f.release_id=$1 order by id",&[&id],&[],&mut budget)? {wire.insert(r.try_get(0)?,u64::try_from(r.try_get::<_,i64>(1)?)?);}
         Ok(select::finish_par2_names(out,unmatched_files,unmatched_par2,&wire))
     })}
     pub(crate) fn linked_image_files(&self,id:i64)->Result<Vec<FileInfo>> {self.read(|tx| {

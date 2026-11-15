@@ -113,8 +113,8 @@ fn native_spot_publication_preserves_newest_tag_and_never_mixes_same_title_posts
     assert_ne!(id,second);
     let mut observer=schema.pool.get().unwrap();
     assert_eq!(observer.query_one("select message_id from spots where release_id=$1",&[&id]).unwrap().get::<_,String>(0),"first@spot.net");
-    assert_eq!(observer.query_one("select count(*) from segments where release_id=$1",&[&id]).unwrap().get::<_,i64>(0),4);
-    assert_eq!(observer.query_one("select count(*) from segments where release_id=$1",&[&second]).unwrap().get::<_,i64>(0),4);
+    assert_eq!(crate::article_local::Store::articles_for_test(&mut *observer).iter().filter(|a|a.release_id==id).count() as i64,4);
+    assert_eq!(crate::article_local::Store::articles_for_test(&mut *observer).iter().filter(|a|a.release_id==second).count() as i64,4);
     assert!(observer.query_one("select name from releases where id=$1",&[&second]).unwrap().get::<_,String>(0).ends_with(&format!(" [{}]",&key[..8])));
     assert_eq!(observer.query_one("select count(*) from spots_seen where state=$1",&[&store::SAVED]).unwrap().get::<_,i64>(0),3);
     runtime.owner.close();
@@ -150,7 +150,7 @@ fn native_spot_larger_than_one_job_commits_all_actual_parts_in_one_publication()
     let row=store::SpotRow {message_id:"large@spot.net".into(),kind:Kind::Movie,spot:spot.clone(),spotter_id:None,nzb_key:key,xml:"<Posting><Title>Large</Title></Posting>".into()};
     let saved=storage.publish(&mut plan,&row,"actual-large-ref",&permit,100).unwrap();assert_eq!(saved.state,store::SAVED);
     let mut observer=schema.pool.get().unwrap();
-    assert_eq!(observer.query_one("select count(*) from segments where release_id=$1",&[&saved.release_id.unwrap()]).unwrap().get::<_,i64>(0),count as i64);
+    assert_eq!(crate::article_local::Store::articles_for_test(&mut *observer).iter().filter(|a|a.release_id==saved.release_id.unwrap()).count() as i64,count as i64);
     assert_eq!(observer.query_one("select count(*) from releases",&[]).unwrap().get::<_,i64>(0),1);
     assert_eq!(observer.query_one("select state from spots_seen where message_id='large@spot.net'",&[]).unwrap().get::<_,i64>(0),store::SAVED);
     runtime.owner.close();

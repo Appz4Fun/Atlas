@@ -49,6 +49,7 @@ pub mod nzblnk;
 pub mod overview_archive;
 pub mod par2;
 pub mod parity;
+pub(crate) mod article_local;
 pub mod parser;
 pub mod paths;
 pub mod pg;

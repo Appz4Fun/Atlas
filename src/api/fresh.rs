@@ -43,6 +43,7 @@ pub(crate) fn read_with_budget<T>(storage:&pg::StorageConfig,budget:Budget,work:
     let until=Instant::now()+Duration::from_secs(10);
     let pool=pg::Pool::new(storage)?;
     let mut connection=pool.get_before(until)?;
+    crate::article_local::ensure_reader(&mut *connection,&storage.schema)?;
     let view=ReadView::open(&mut connection,&storage.schema,budget,until)?;
     view.header_config(&crate::config::header_store_config())?;
     work(&view)
