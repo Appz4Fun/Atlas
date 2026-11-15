@@ -393,11 +393,54 @@ pub fn frontier_oldest(db: &dyn Sql, groups: &[(String, i64)], now: i64) -> Resu
     frontier_by(db, groups, now, false)
 }
 
-/// `frontier` when `newest`, else `frontier_oldest`.
+/// How long a frontier worked out for a set of groups is used again. Every claim asked for it, and on prod that
+/// query over every group took a fifth of the indexer's PostgreSQL session; the frontier moves a day at a time. One a
+/// few seconds old holds back at most what finished since, and lets through at most what came back from resting since.
+#[cfg(not(test))]
+const FRONTIER_FOR: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The frontiers worked out lately: (newest, a hash of the groups and their first days) to when and what.
+#[cfg(not(test))]
+static FRONTIERS: std::sync::Mutex<Option<std::collections::HashMap<(bool, u64), (std::time::Instant, Option<i64>)>>> =
+    std::sync::Mutex::new(None);
+
+/// `frontier` when `newest`, else `frontier_oldest`; one worked out in the last `FRONTIER_FOR` for the same groups
+/// is used again. The cache is per process and keyed by the groups alone, not by database or `now`: a process whose
+/// runtime reopens on another catalogue within `FRONTIER_FOR` may use the old one's frontier once, which only moves
+/// what claims are let through for those seconds (the claim itself still checks the rows). Unit tests (`cfg(test)`)
+/// always ask the database, as they change it between calls at a fixed `now`; integration tests under `tests/` build
+/// without `cfg(test)` and do share the cache.
 fn frontier_by(db: &dyn Sql, groups: &[(String, i64)], now: i64, newest: bool) -> Result<Option<i64>> {
     if groups.is_empty() {
         return Ok(None);
     }
+    #[cfg(not(test))]
+    {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        groups.hash(&mut h);
+        let key = (newest, h.finish());
+        if let Some((at, frontier)) = FRONTIERS.lock().ok().and_then(|m| m.as_ref()?.get(&key).copied())
+            && at.elapsed() < FRONTIER_FOR
+        {
+            return Ok(frontier);
+        }
+        let frontier = frontier_asked(db, groups, now, newest)?;
+        if let Ok(mut m) = FRONTIERS.lock() {
+            let m = m.get_or_insert_with(std::collections::HashMap::new);
+            if m.len() > 64 {
+                m.clear();
+            }
+            m.insert(key, (std::time::Instant::now(), frontier));
+        }
+        Ok(frontier)
+    }
+    #[cfg(test)]
+    frontier_asked(db, groups, now, newest)
+}
+
+/// `frontier_by` from the database.
+fn frontier_asked(db: &dyn Sql, groups: &[(String, i64)], now: i64, newest: bool) -> Result<Option<i64>> {
     let (order, most) = if newest { ("desc", "max") } else { ("asc", "min") };
     let rows = values_rows(groups.len(), &["text", "bigint"], 0);
     let sql = format!(
