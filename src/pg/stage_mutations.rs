@@ -4,6 +4,15 @@
 
 use anyhow::{Result,bail};
 use postgres::Transaction;
+use std::borrow::Cow;
+
+/// Text for a PostgreSQL `text` column: what steps read out of files and listings (an NFO, a PAR2 creator, an
+/// archive's inner names) can hold NUL characters, which PostgreSQL refuses with 22021, failing the whole settlement
+/// and with it the owner session. They become U+FFFD, as the release writer does with headers.
+fn t(value:&str)->Cow<'_,str> {
+    if value.contains('\0') {Cow::Owned(value.replace('\0',"\u{fffd}"))} else {Cow::Borrowed(value)}
+}
+fn ot(value:&Option<String>)->Option<Cow<'_,str>> {value.as_deref().map(t)}
 use crate::postprocess::mutation::StepMutation;
 
 pub(super) fn apply(tx:&mut Transaction<'_>,id:i64,mutation:&StepMutation)->Result<u64> {
@@ -13,13 +22,13 @@ pub(super) fn apply(tx:&mut Transaction<'_>,id:i64,mutation:&StepMutation)->Resu
             let f=feature.clone().unwrap_or_default();
             tx.execute("insert into release_opensubtitles(release_id,moviehash,imdb_id,tmdb_id,kind,title,year,season,episode,release_name,checked_at)
                 values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) on conflict(release_id) do update set moviehash=excluded.moviehash,imdb_id=excluded.imdb_id,tmdb_id=excluded.tmdb_id,kind=excluded.kind,title=excluded.title,year=excluded.year,season=excluded.season,episode=excluded.episode,release_name=excluded.release_name,checked_at=excluded.checked_at",
-                &[&id,moviehash,&f.imdb_id,&f.tmdb_id,&f.kind,&f.title,&f.year,&f.season,&f.episode,&f.release_name,checked_at])?
+                &[&id,&t(moviehash),&f.imdb_id,&f.tmdb_id,&ot(&f.kind),&ot(&f.title),&f.year,&f.season,&f.episode,&ot(&f.release_name),checked_at])?
         },
         PinOpenSubtitlesMovieImdb {imdb_id}|PinNfoMovieImdb {imdb_id}=>tx.execute("update media_release set imdb_id=$2,imdb_from_nfo=1 where release_id=$1 and imdb_id is null",&[&id,imdb_id])?,
         SetCategory {category}=>tx.execute("insert into release_category(release_id,category) values($1,$2) on conflict(release_id) do update set category=excluded.category",&[&id,category])?,
         ClearCategory=>tx.execute("delete from release_category where release_id=$1",&[&id])?,
-        SetProbeInfo {json}=>tx.execute("update release_probe set info=$2 where release_id=$1",&[&id,json])?,
-        KeepProbe {crc32,agent,json,moviehash}=>tx.execute("insert into release_probe(release_id,crc32,agent,info,moviehash) values($1,$2,$3,$4,$5) on conflict(release_id) do update set crc32=excluded.crc32,agent=excluded.agent,info=excluded.info,moviehash=excluded.moviehash",&[&id,crc32,agent,json,moviehash])?,
+        SetProbeInfo {json}=>tx.execute("update release_probe set info=$2 where release_id=$1",&[&id,&t(json)])?,
+        KeepProbe {crc32,agent,json,moviehash}=>tx.execute("insert into release_probe(release_id,crc32,agent,info,moviehash) values($1,$2,$3,$4,$5) on conflict(release_id) do update set crc32=excluded.crc32,agent=excluded.agent,info=excluded.info,moviehash=excluded.moviehash",&[&id,crc32,&ot(agent),&t(json),&ot(moviehash)])?,
         ClearMedia=>tx.execute("delete from media_release where release_id=$1",&[&id])?,
         ParseMedia {kind,title_key,parsed}=>{
             let ids=crate::media::native_cached_ids_in(tx,*kind,*title_key,parsed)?;
@@ -46,10 +55,10 @@ pub(super) fn apply(tx:&mut Transaction<'_>,id:i64,mutation:&StepMutation)->Resu
         PinTagTvdb {tvdb_id}=>tx.execute("update media_release set tvdb_id=$2,tvdb_from_tag=1 where release_id=$1 and kind=1",&[&id,tvdb_id])?,
         KeepNfo {file,text}=>{
             let text=text.chars().take(crate::probe::nfo_store::MAX_CHARS).collect::<String>();
-            tx.execute("insert into release_nfo(release_id,file,text) values($1,$2,$3) on conflict(release_id) do nothing",&[&id,file,&text])?
+            tx.execute("insert into release_nfo(release_id,file,text) values($1,$2,$3) on conflict(release_id) do nothing",&[&id,&t(file),&t(&text)])?
         },
-        SetNfoPassword {password}=>tx.execute("insert into release_nfo_password(release_id,password) values($1,$2) on conflict(release_id) do update set password=excluded.password",&[&id,password])?,
-        DropNfoCopy {file}=>tx.execute("delete from release_nfo where release_id=$1 and file=$2",&[&id,file])?,
+        SetNfoPassword {password}=>tx.execute("insert into release_nfo_password(release_id,password) values($1,$2) on conflict(release_id) do update set password=excluded.password",&[&id,&t(password)])?,
+        DropNfoCopy {file}=>tx.execute("delete from release_nfo where release_id=$1 and file=$2",&[&id,&t(file)])?,
         KeepCover {mime,sha256}=>tx.execute("insert into release_cover(release_id,mime,sha256) values($1,$2,$3) on conflict(release_id) do update set mime=excluded.mime,sha256=excluded.sha256",&[&id,mime,sha256])?,
         ClearCover=>tx.execute("delete from release_cover where release_id=$1",&[&id])?,
         ReindexWords=>tx.execute("insert into word_queue(release_id) values($1) on conflict(release_id) do update set n=word_queue.n+1",&[&id])?,
@@ -58,14 +67,14 @@ pub(super) fn apply(tx:&mut Transaction<'_>,id:i64,mutation:&StepMutation)->Resu
         PredbRead {revision}=>{super::predb_cache::verify_read_in(tx,*revision)?;0},
         XrefRead {generation}=>{super::stage_reads::xref::verify_read_in(tx,id,*generation)?;0},
         XrefTried {generation,count}=>super::stage_reads::xref::tried_in(tx,id,*generation,*count)?,
-        KeepPredbMatch {title_id,kind,category,pre_at,nuked,matched_at}=>tx.execute("insert into predb_match(release_id,title_id,kind,category,pre_at,nuked,matched_at) values($1,$2,$3,$4,$5,$6,$7) on conflict(release_id) do update set title_id=excluded.title_id,kind=excluded.kind,category=excluded.category,pre_at=excluded.pre_at,nuked=excluded.nuked,matched_at=excluded.matched_at",&[&id,title_id,&(*kind as i64),category,pre_at,nuked,matched_at])?,
+        KeepPredbMatch {title_id,kind,category,pre_at,nuked,matched_at}=>tx.execute("insert into predb_match(release_id,title_id,kind,category,pre_at,nuked,matched_at) values($1,$2,$3,$4,$5,$6,$7) on conflict(release_id) do update set title_id=excluded.title_id,kind=excluded.kind,category=excluded.category,pre_at=excluded.pre_at,nuked=excluded.nuked,matched_at=excluded.matched_at",&[&id,title_id,&(*kind as i64),&ot(category),pre_at,nuked,matched_at])?,
         KeepSidecar(record)=>tx.execute("insert into sidecars(release_id,name,group_name,file,kind,release_name,segment_uid,text,at) values($1,$2,$3,$4,$5,$6,$7,$8,$9)
             on conflict(release_id) do update set name=excluded.name,group_name=excluded.group_name,
             file=case when excluded.kind='unread' then sidecars.file else excluded.file end,
             kind=case when excluded.kind='unread' then sidecars.kind else excluded.kind end,
             release_name=case when excluded.kind='unread' then sidecars.release_name else excluded.release_name end,
             segment_uid=case when excluded.kind='unread' then sidecars.segment_uid else excluded.segment_uid end,
-            text=coalesce(excluded.text,sidecars.text),at=excluded.at",&[&id,&record.name,&record.group,&record.file,&record.kind,&record.release_name,&record.segment_uid,&record.text,&record.at])?,
+            text=coalesce(excluded.text,sidecars.text),at=excluded.at",&[&id,&t(&record.name),&t(&record.group),&ot(&record.file),&t(&record.kind),&ot(&record.release_name),&ot(&record.segment_uid),&ot(&record.text),&record.at])?,
         EvictSidecarTexts {max_bytes}=>tx.execute("update sidecars set text=null where release_id in(select release_id from(select release_id,octet_length(text) as len,sum(octet_length(text)) over(order by at,release_id rows unbounded preceding) as run from sidecars where text is not null and release_id<>$1) old where run-len<coalesce((select value from meta where key='sidecar_text_bytes'),0)-$2)",&[&id,max_bytes])?,
         RecordSegmentCrc {message_id,decoded,crc32}=>tx.execute("insert into segment_crc(release_id,message_id,decoded,crc32) values($1,$2,$3,$4) on conflict(release_id,message_id) do update set decoded=excluded.decoded,crc32=excluded.crc32",&[&id,&message_id.as_bytes(),decoded,&i64::from(*crc32)])?,
         KeepReleaseKeys {keys}=>tx.execute("insert into release_keys(release_id,account,host,layout,lines,file_crc,body_crc,video,audio,mux,encode,thread,subs,fonts,chapters,volumes) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
@@ -81,16 +90,16 @@ pub(super) fn apply(tx:&mut Transaction<'_>,id:i64,mutation:&StepMutation)->Resu
         KeepAudioAnchor {anchor}=>tx.execute("insert into release_audio_anchor(release_id,anchor) values($1,$2) on conflict(release_id,anchor) do nothing",&[&id,anchor])?,
         ClearImages=>tx.execute("delete from release_images where release_id=$1",&[&id])?,
         KeepImage {position,image}=>tx.execute("insert into release_images(release_id,position,file,sha256,format,width,height,bytes,meta,exif_id,document_id) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) on conflict(release_id,position) do update set file=excluded.file,sha256=excluded.sha256,format=excluded.format,width=excluded.width,height=excluded.height,bytes=excluded.bytes,meta=excluded.meta,exif_id=excluded.exif_id,document_id=excluded.document_id",
-            &[&id,position,&image.file,&image.sha256,&image.format,&i64::from(image.width),&i64::from(image.height),&image.bytes,&image.meta,&image.exif_id,&image.document_id])?,
-        AnswerImageRequest {file,done_at,answer}=>tx.execute("update picture_requests set done_at=$3,outcome=$4 where release_id=$1 and file=$2",&[&id,file,done_at,&answer.word()])?,
+            &[&id,position,&t(&image.file),&image.sha256,&t(&image.format),&i64::from(image.width),&i64::from(image.height),&image.bytes,&ot(&image.meta),&ot(&image.exif_id),&ot(&image.document_id)])?,
+        AnswerImageRequest {file,done_at,answer}=>tx.execute("update picture_requests set done_at=$3,outcome=$4 where release_id=$1 and file=$2",&[&id,&t(file),done_at,&answer.word()])?,
         ClearArchiveSource {source}=>tx.execute("delete from archive_inner_files where release_id=$1 and source=$2",&[&id,source])?,
         KeepArchiveFile {sequence,source,file}=>tx.execute("insert into archive_inner_files(release_id,seq,name,size,source,crc32,mtime,host_os) values($1,$2,$3,$4,$5,$6,$7,$8) on conflict(release_id,seq) do update set name=excluded.name,size=excluded.size,source=excluded.source,crc32=excluded.crc32,mtime=excluded.mtime,host_os=excluded.host_os",
-            &[&id,sequence,&file.name,&file.size.and_then(|n|i64::try_from(n).ok()),source,&file.crc32.map(i64::from),&file.mtime,&file.host_os.map(i64::from)])?,
+            &[&id,sequence,&t(&file.name),&file.size.and_then(|n|i64::try_from(n).ok()),source,&file.crc32.map(i64::from),&file.mtime,&file.host_os.map(i64::from)])?,
         AdjustArchiveNameBytes {delta}=>tx.execute("insert into meta(key,value) values('archive_name_bytes',$1) on conflict(key) do update set value=meta.value+excluded.value",&[delta])?,
         ArchiveNamesOverQuota=>tx.execute("insert into meta(key,value) values('archive_names_over_quota',1) on conflict(key) do update set value=meta.value+1",&[])?,
         SetArchivePassword {password}=>tx.execute("insert into archive_release(release_id,password) values($1,$2) on conflict(release_id) do update set password=excluded.password",&[&id,&password.code()])?,
         SetArchiveEncryption {encryption,names_hidden,check}=>tx.execute("update archive_release set encryption=$2,names_hidden=$3,password_check=$4 where release_id=$1",&[&id,&encryption.map(crate::archive::Encryption::code),&i64::from(*names_hidden),&check.map(|check|check.to_bytes())])?,
-        SetArchiveKeys {keys,facts}=>tx.execute("update archive_release set packer=$2,twin_key=$3,owner_key=$4,zone_key=$5,facts=$6 where release_id=$1",&[&id,&keys.packer,&keys.twin_key,&keys.owner_key,&keys.zone_key,facts])?,
+        SetArchiveKeys {keys,facts}=>tx.execute("update archive_release set packer=$2,twin_key=$3,owner_key=$4,zone_key=$5,facts=$6 where release_id=$1",&[&id,&ot(&keys.packer),&keys.twin_key,&keys.owner_key,&keys.zone_key,facts])?,
         ClearRevVolumes=>tx.execute("delete from rev_volumes where release_id=$1",&[&id])?,
         KeepRevVolume(volume)=>tx.execute("insert into rev_volumes(release_id,volume,size,crc32) values($1,$2,$3,$4) on conflict(release_id,volume) do update set size=excluded.size,crc32=excluded.crc32",&[&id,&i64::from(volume.index),&i64::try_from(volume.size).unwrap_or(i64::MAX),&i64::from(volume.crc32)])?,
         ClearContentFingerprint=>tx.execute("update release_fingerprint set content=null where release_id=$1",&[&id])?,
@@ -100,8 +109,8 @@ pub(super) fn apply(tx:&mut Transaction<'_>,id:i64,mutation:&StepMutation)->Resu
         SetPar2Sizes {block,blocks}=>tx.execute("insert into release_fingerprint(release_id,par2_block,par2_blocks) values($1,$2,$3) on conflict(release_id) do update set par2_block=excluded.par2_block,par2_blocks=excluded.par2_blocks",&[&id,block,blocks])?,
         ClearPar2Files=>tx.execute("delete from par2_files where release_id=$1",&[&id])?,
         KeepPar2File {file,sealed,complete}=>tx.execute("insert into par2_files(release_id,file_id,set_id,md5,md5_16k,size,name,crc32,bound,sealed,complete) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) on conflict(release_id,file_id) do update set set_id=excluded.set_id,md5=excluded.md5,md5_16k=excluded.md5_16k,size=excluded.size,name=excluded.name,crc32=excluded.crc32,bound=excluded.bound,sealed=excluded.sealed,complete=excluded.complete,creator=null",
-            &[&id,&&file.file_id[..],&&file.set_id[..],&&file.md5[..],&&file.md5_16k[..],&i64::try_from(file.size).unwrap_or(i64::MAX),&file.name,&file.crc32.map(i64::from),&i64::from(file.bound),&i64::from(*sealed),&i64::from(*complete)])?,
-        SetPar2Creator {set_id,creator}=>tx.execute("update par2_files set creator=$3 where release_id=$1 and set_id=$2",&[&id,&&set_id[..],creator])?,
+            &[&id,&&file.file_id[..],&&file.set_id[..],&&file.md5[..],&&file.md5_16k[..],&i64::try_from(file.size).unwrap_or(i64::MAX),&t(&file.name),&file.crc32.map(i64::from),&i64::from(file.bound),&i64::from(*sealed),&i64::from(*complete)])?,
+        SetPar2Creator {set_id,creator}=>tx.execute("update par2_files set creator=$3 where release_id=$1 and set_id=$2",&[&id,&&set_id[..],&t(creator)])?,
         VouchComplete=>tx.execute(VOUCH_COMPLETE,&[&id])?,
         DropPcCategory=>tx.execute("delete from release_category where release_id=$1",&[&id])?,
         // An unported result cannot be silently acknowledged. The worker
@@ -117,7 +126,7 @@ pub(super) fn apply_observed(tx:&mut Transaction<'_>,id:i64,mutation:&StepMutati
         RememberUploadCandidate {candidate_id}=>tx.execute("insert into upload_link_tried(release_id,candidate_id) values($1,$2) on conflict do nothing",&[&id,candidate_id])?,
         PlaceBesideFile {row_id,owner_id,par2_file}=>tx.execute("insert into beside_files(row_id,release_id,par2_file) values($1,$2,$3)
             on conflict(row_id) do update set release_id=excluded.release_id,par2_file=excluded.par2_file",&[row_id,owner_id,par2_file])?,
-        NameUploadLead {lead_id,name,source}=>tx.execute("update releases set display_name=$2,name_source=$3 where id=$1 and display_name is null and coalesce(name_source,0)<=$3",&[lead_id,name,&i64::from(*source)])?,
+        NameUploadLead {lead_id,name,source}=>tx.execute("update releases set display_name=$2,name_source=$3 where id=$1 and display_name is null and coalesce(name_source,0)<=$3",&[lead_id,&t(name),&i64::from(*source)])?,
         RerunUploadLead {lead_id,clear,net}=>tx.execute("insert into pp_state as old(release_id,net_wanted,rerun_gen,rerun_mask,net_left)
             values($1,case when $3::bigint<>0 then true end,1,$2,nullif($3::bigint,0)) on conflict(release_id) do update set
             done=old.done & ~$2::bigint,failed=old.failed & ~$2::bigint,net_wanted=case when $3::bigint<>0 then true else old.net_wanted end,
@@ -140,7 +149,7 @@ pub(super) fn apply_observed(tx:&mut Transaction<'_>,id:i64,mutation:&StepMutati
         },
         KeepNfoForLegacyTarget {target_id,file,text}=>{
             let text=text.chars().take(crate::probe::nfo_store::MAX_CHARS).collect::<String>();
-            tx.execute("insert into release_nfo(release_id,file,text) values($1,$2,$3) on conflict(release_id) do nothing",&[target_id,file,&text])?
+            tx.execute("insert into release_nfo(release_id,file,text) values($1,$2,$3) on conflict(release_id) do nothing",&[target_id,&t(file),&t(&text)])?
         },
         MarkPointed {name}=>tx.execute("insert into nzb_pointed(release_id) select unnest($1::bigint[]) on conflict do nothing",&[&locked.pointed(name)?])?,
         RankPointed {name}=>{
@@ -161,7 +170,7 @@ pub(super) fn apply_observed(tx:&mut Transaction<'_>,id:i64,mutation:&StepMutati
                 net_left=coalesce(net_left,0)|$3::bigint,net_next_at=0,net_attempts=0,net_transient=0,rerun_gen=rerun_gen+1,rerun_mask=rerun_mask|$2::bigint
                 where release_id=any($1) and not exists(select 1 from release_nfo_password p where p.release_id=pp_state.release_id) and {condition}"),&[&locked.pointed(name)?,&clear,&net])?
         },
-        SetPointedPassword {name,password}=>tx.execute("insert into release_nfo_password(release_id,password) select unnest($1::bigint[]),$2::text on conflict(release_id) do nothing",&[&locked.pointed(name)?,password])?,
+        SetPointedPassword {name,password}=>tx.execute("insert into release_nfo_password(release_id,password) select unnest($1::bigint[]),$2::text on conflict(release_id) do nothing",&[&locked.pointed(name)?,&t(password)])?,
         _=>apply(tx,id,mutation)?,
     })
 }
@@ -181,3 +190,48 @@ const VOUCH_COMPLETE:&str="update releases set complete=true where id=$1 and not
    and lower(f.filename) not like '%.jpg' and lower(f.filename) not like '%.png'
    and lower(f.filename) not like '%.md5'
    and not exists(select 1 from par2_files p where p.release_id=$1 and p.complete=1 and p.name=f.filename))";
+
+#[cfg(test)]
+mod nul_text_tests {
+    use super::*;
+
+    #[test]
+    fn text_with_nul_is_kept_with_replacement_characters() {
+        assert_eq!(t("plain"), "plain");
+        assert!(matches!(t("plain"), Cow::Borrowed(_)));
+        assert_eq!(t("a\0b\0"), "a\u{fffd}b\u{fffd}");
+        assert_eq!(ot(&Some("x\0".into())).as_deref(), Some("x\u{fffd}"));
+        assert_eq!(ot(&None), None);
+    }
+
+    #[test]
+    #[ignore = "requires an explicit isolated ATLAS_PG_TEST_URL"]
+    fn a_settlement_with_nul_in_file_text_writes_instead_of_failing() {
+        let schema = crate::pg::testing::Schema::native_writer().expect("explicit isolated ATLAS_PG_TEST_URL required");
+        let mut client = schema.pool.get().unwrap();
+        crate::pg::release_writer::save(&mut client, &[crate::parser::Release {
+            name: "Nul.Text.Release".into(),
+            group: "alt.binaries.test".into(),
+            articles: vec![crate::parser::Article {
+                filename: Some("a.nfo".into()),
+                message_id: "<nul-text@example.test>".into(),
+                subject: "a.nfo yEnc (1/1)".into(),
+                part: Some(1),
+                total_parts: Some(1),
+                bytes: 10,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }], 1).unwrap();
+        let id: i64 = client.query_one("select id from releases", &[]).unwrap().get(0);
+        let mut tx = client.transaction().unwrap();
+        apply(&mut tx, id, &StepMutation::KeepNfo { file: "a\0.nfo".into(), text: "line one\0\0line two".into() }).unwrap();
+        apply(&mut tx, id, &StepMutation::SetNfoPassword { password: "pw\0".into() }).unwrap();
+        tx.commit().unwrap();
+        let row = client.query_one("select file, text from release_nfo where release_id = $1", &[&id]).unwrap();
+        assert_eq!(row.get::<_, String>(0), "a\u{fffd}.nfo");
+        assert_eq!(row.get::<_, String>(1), "line one\u{fffd}\u{fffd}line two");
+        let password: String = client.query_one("select password from release_nfo_password where release_id = $1", &[&id]).unwrap().get(0);
+        assert_eq!(password, "pw\u{fffd}");
+    }
+}
