@@ -227,9 +227,15 @@ pub fn want(db: &dyn Sql, group: &str, day: i64, now: i64) -> Result<bool> {
 /// upload spread over several groups are then read together, and linked across them (`xref`).
 pub const LOCKSTEP_DAYS: i64 = 1;
 
-/// `LOCKSTEP_DAYS`, or what config.toml's `backfill_lockstep_days` says (set at the indexer's start). A wider window
-/// keeps workers busy while the slowest groups' days are still being read, at the cost of their uploads' articles
-/// being read further apart in time.
+/// The widest `backfill_lockstep_days` taken. The linker lets an hour go once its rows are a day old (`xref::KEEP_SECS`)
+/// even with backfill days still pending: a window wide enough that the slowest group reaches a day more than a day
+/// after the fastest would have uploads across groups linked in pieces.
+pub const LOCKSTEP_DAYS_MOST: i64 = 7;
+
+/// `LOCKSTEP_DAYS`, or what config.toml's `backfill_lockstep_days` says (1..=`LOCKSTEP_DAYS_MOST`, set at the indexer's
+/// start, per process). A wider window keeps workers busy while the slowest groups' days are still being read, at the
+/// cost of their uploads' articles being read further apart in time and about that many more days of header-store
+/// segments kept.
 pub static LOCKSTEP: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(LOCKSTEP_DAYS);
 
 /// The lockstep window in use (see `LOCKSTEP`).

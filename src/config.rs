@@ -1448,7 +1448,7 @@ impl Config {
             request_size: v.get("request_size").and_then(as_int).and_then(|n| u64::try_from(n).ok()).filter(|n| *n > 0),
             split_min_backlog: v.get("split_min_backlog").and_then(as_int).filter(|n| *n > 0),
             backfill_start_days_back: v.get("backfill_start_days_back").and_then(as_int).filter(|n| *n > 0),
-            backfill_lockstep_days: v.get("backfill_lockstep_days").and_then(as_int).filter(|n| (1..=365).contains(n)),
+            backfill_lockstep_days: v.get("backfill_lockstep_days").and_then(as_int).filter(|n| (1..=crate::chunks::LOCKSTEP_DAYS_MOST).contains(n)),
             parallel_groups: v
                 .get("parallel_groups")
                 .and_then(as_int)
@@ -2384,7 +2384,8 @@ mod tests {
         assert_eq!(cfg(json!({"backfill_lockstep_days": 3})), Some(3));
         assert_eq!(cfg(json!({})), None);
         assert_eq!(cfg(json!({"backfill_lockstep_days": 0})), None);
-        assert_eq!(cfg(json!({"backfill_lockstep_days": 400})), None);
+        assert_eq!(cfg(json!({"backfill_lockstep_days": 8})), None);
+        assert_eq!(cfg(json!({"backfill_lockstep_days": 7})), Some(7));
     }
 
     #[test]
