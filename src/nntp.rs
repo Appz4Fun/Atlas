@@ -1954,6 +1954,8 @@ struct Marks {
 }
 
 const MARK_FOR: Duration = Duration::from_secs(6 * 3600);
+/// day marks are kept only for times at least this long ago (seconds)
+const MARK_AFTER: i64 = 2 * 3600;
 const RETENTION_FOR: Duration = Duration::from_secs(3600);
 /// entries kept at most, each map: past it the map starts again
 const MARKS_MOST: usize = 200_000;
@@ -1967,10 +1969,19 @@ impl Marks {
         (at.elapsed() < MARK_FOR && (low..=high).contains(&n)).then_some(n)
     }
 
-    fn keep_day_mark(&self, i: usize, group: &str, when: i64, n: u64) {
+    /// Keeps `n`, the answer for `when` searched up to `high`, only when it is a real article (`n <= high`, not "none
+    /// yet", which more posts would change) for a time at least `MARK_AFTER` ago (near now, late and forged dates
+    /// can still move it).
+    fn keep_day_mark(&self, i: usize, group: &str, when: i64, n: u64, high: u64, now: i64) {
+        if n > high || when > now.saturating_sub(MARK_AFTER) {
+            return;
+        }
         if let Ok(mut days) = self.days.lock() {
             if days.len() >= MARKS_MOST {
-                days.clear();
+                days.retain(|_, (_, at)| at.elapsed() < MARK_FOR);
+                if days.len() >= MARKS_MOST {
+                    days.clear();
+                }
             }
             days.insert((i, group.to_string(), when), (n, Instant::now()));
         }
@@ -1982,10 +1993,17 @@ impl Marks {
         (at.elapsed() < RETENTION_FOR).then_some(r)
     }
 
+    /// Keeps a retention look, but not `Empty`: a group's first posts can arrive without its first number moving.
     fn keep_retention(&self, i: usize, group: &str, low: u64, r: Retention) {
+        if r == Retention::Empty {
+            return;
+        }
         if let Ok(mut retentions) = self.retentions.lock() {
             if retentions.len() >= MARKS_MOST {
-                retentions.clear();
+                retentions.retain(|_, (_, at)| at.elapsed() < RETENTION_FOR);
+                if retentions.len() >= MARKS_MOST {
+                    retentions.clear();
+                }
             }
             retentions.insert((i, group.to_string(), low), (r, Instant::now()));
         }
@@ -1999,14 +2017,21 @@ mod marks_tests {
     #[test]
     fn a_day_mark_is_used_again_only_while_it_is_a_real_article_of_the_group() {
         let marks = Marks::default();
-        marks.keep_day_mark(0, "g", 86_400, 500);
+        let now = 10 * 86_400;
+        marks.keep_day_mark(0, "g", 86_400, 500, 900, now);
         assert_eq!(marks.day_mark(0, "g", 86_400, 100, 900), Some(500));
         assert_eq!(marks.day_mark(1, "g", 86_400, 100, 900), None, "another server");
         assert_eq!(marks.day_mark(0, "g", 0, 100, 900), None, "another day");
         assert_eq!(marks.day_mark(0, "g", 86_400, 600, 900), None, "expired below the first number");
         assert_eq!(marks.day_mark(0, "g", 86_400, 100, 499), None, "past the last number");
-        marks.keep_day_mark(0, "h", 86_400, 901);
-        assert_eq!(marks.day_mark(0, "h", 86_400, 100, 900), None, "'none yet' is asked again");
+        // "none yet" (past the last number searched) isnt kept, even once the group has grown past it
+        marks.keep_day_mark(0, "h", 86_400, 901, 900, now);
+        assert_eq!(marks.day_mark(0, "h", 86_400, 100, 2000), None, "'none yet' is asked again after growth");
+        // a time near now isnt kept either
+        marks.keep_day_mark(0, "g", now - 60, 800, 900, now);
+        assert_eq!(marks.day_mark(0, "g", now - 60, 100, 900), None, "a time near now is asked again");
+        marks.keep_retention(0, "e", 100, Retention::Empty);
+        assert_eq!(marks.retention(0, "e", 100), None, "an empty group is looked at again");
         marks.keep_retention(0, "g", 100, Retention::Since(5));
         assert_eq!(marks.retention(0, "g", 100), Some(Retention::Since(5)));
         assert_eq!(marks.retention(0, "g", 101), None, "the first article moved");
@@ -3780,12 +3805,12 @@ impl Pool {
     }
 
     async fn article_at_in(&self,i:usize,group:&str,low:u64,high:u64,when:i64,fetch:Option<&HeaderFetch>)->Result<u64> {
-        // tests ask the mock servers every time: their listings change between calls
+        // unit tests ask the mock servers every time: their listings change between calls
         if !cfg!(test) && let Some(n) = self.marks.day_mark(i, group, when, low, high) {
             return Ok(n);
         }
         let n = self.article_at_searched(i, group, low, high, when, fetch).await?;
-        self.marks.keep_day_mark(i, group, when, n);
+        self.marks.keep_day_mark(i, group, when, n, high, chrono::Utc::now().timestamp());
         Ok(n)
     }
 
