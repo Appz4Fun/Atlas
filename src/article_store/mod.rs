@@ -5,7 +5,10 @@
 
 use std::{fmt, io};
 
+mod manifest;
 mod payload;
+#[allow(unused_imports)]
+pub(crate) use manifest::*;
 #[allow(unused_imports)] // The inactive primitive still exposes its planned return type.
 pub(crate) use payload::Chunk;
 pub(crate) use payload::{Reader, Writer};
@@ -108,3 +111,9 @@ impl std::error::Error for Error {
 }
 #[cfg(all(test, unix))]
 mod payload_tests;
+
+#[cfg(all(test, unix))]
+mod manifest_tests;
+
+#[cfg(all(test, unix))]
+mod test_support;
