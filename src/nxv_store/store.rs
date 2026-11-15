@@ -1624,7 +1624,7 @@ fn recover_sealed_log(
 
 fn read_servers(root: &Path, pacer: &mut RecoveryReadPacer) -> Result<Vec<String>> {
     let path = root.join(STATE_DIR).join(SERVERS_FILE);
-    let read = || -> std::io::Result<String> {
+    let mut read = || -> std::io::Result<String> {
         let file = File::open(&path)?;
         let mut text = String::new();
         RecoveryReader { inner: file, pacer: Some(pacer), kind: ReadKind::Servers }.read_to_string(&mut text)?;

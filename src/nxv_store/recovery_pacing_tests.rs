@@ -63,8 +63,8 @@ pub(in crate::nxv_store) fn observe_metadata(len: usize) {
     let page = usize::try_from(page).ok().filter(|p| (4096..=65536).contains(p)).unwrap_or(65536);
     observe(ReadKind::Metadata, len.min(8 * page));
 }
-// Private clock facade reserved for the production pacer's later implementation.
-// The tests-only checkpoint never invokes sleep or changes read scheduling.
+// Scoped clock facade used by the recovery pacer's actual admission path.
+// Only a probe on the calling test thread replaces wall-clock time and sleep.
 #[allow(dead_code)]
 pub(in crate::nxv_store) fn clock_now() -> Option<Instant> {
     PROBE.with(|slot| {
