@@ -197,15 +197,21 @@ fn guarded_callbacks_reuse_one_epoch_proof_a_second_and_prove_again_after() {
     println!("owner guard protocol: callbacks={callbacks}, commands={commands}, ready={ready}, boundaries={boundaries}, parses={parses}, elapsed_us={}",elapsed.as_micros());
     assert_eq!(ready,boundaries,"every frontend completion boundary must have a real PostgreSQL ReadyForQuery");
     // A proof is three commands, and one serves every callback within EPOCH_PROOF_FOR of it.
-    let proofs=(elapsed.as_secs_f64()/super::EPOCH_PROOF_FOR.as_secs_f64()).ceil() as u64+1;
-    assert_eq!(commands%3,0,"a proof keeps all three real guard commands");
-    assert!(commands<=3*proofs,"callbacks within a proof's second must not prove again: {commands} commands in {elapsed:?}");
-    assert_eq!(ready,commands,"no implicit prepare/close completion cycles");
+    if elapsed<super::EPOCH_PROOF_FOR/2 {
+        assert_eq!(commands,0,"callbacks within a proof's second must not prove again");
+    } else {
+        let proofs=(elapsed.as_secs_f64()/super::EPOCH_PROOF_FOR.as_secs_f64()).ceil() as u64+1;
+        assert!(commands%3==0 && commands<=3*proofs,"{commands} guard commands in {elapsed:?}");
+    }
+    assert_eq!((ready,parses),(commands,commands),"no implicit prepare/close completion cycles");
     // Once the proof is older than EPOCH_PROOF_FOR the next callback proves again, all three checks.
     std::thread::sleep(super::EPOCH_PROOF_FOR+std::time::Duration::from_millis(50));
-    let runtime2=&runtime;let before=proxy.counts.snapshot();
-    runtime2.owner.with(|_|Ok(())).unwrap();drain(runtime2);
-    let after=proxy.counts.snapshot();assert_eq!(after[4]-before[4]-1,3,"a stale proof is proven again");
+    let before=proxy.counts.snapshot();
+    runtime.owner.with(|_|Ok(())).unwrap();drain(&runtime);
+    let after=proxy.counts.snapshot();
+    let delta=std::array::from_fn::<_,5,_>(|i|after[i]-before[i]);
+    let (ready,boundaries,parses,commands)=(delta[0]-1,delta[1]+delta[2]-1,delta[3]-1,delta[4]-1);
+    assert_eq!((commands,ready,boundaries,parses),(3,3,3,3),"a stale proof is proven again with all three checks and no extra cycles");
     runtime.owner.close();
 }
 

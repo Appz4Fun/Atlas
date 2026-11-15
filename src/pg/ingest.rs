@@ -59,7 +59,7 @@ impl Source {
 }
 
 /// Admission from the original Native's shared memory/slot limits. This is
-/// resource ownership only; the original Owner still validates every PG write.
+/// resource ownership only; every PG write still goes through the original Owner, whose epoch proof serves one second (`EPOCH_PROOF_FOR`).
 /// Keep it through the caller's commit/rollback, reusing it only after dropping
 /// each previously checked batch before allocating the next one.
 pub(crate) struct NativeSavePermit {

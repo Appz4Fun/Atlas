@@ -57,7 +57,9 @@ pub(crate) struct Runtime {
 /// round trips, one joining `pg_stat_activity` and `pg_locks`), and on prod that was a quarter of the session's time,
 /// more than the saves it fenced. The session holds the exclusive advisory lock all along, soo no other indexer can
 /// take the schema while it lives; what a fresh proof adds is noticing an operator's change to the epoch, schema or
-/// catalog binding, now at most this late. A failed proof is never reused.
+/// catalog binding, now at most this late. A failed proof is never reused. Migrations take their own lock, not the
+/// indexer's (`migrate::run`), soo a schema migrated under a live owner is noticed up to this much (and one turn)
+/// later than before; writers that verify the epoch inside their own transaction are unaffected.
 const EPOCH_PROOF_FOR: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// The ownership lock and every cursor/catalog write use this same session.
