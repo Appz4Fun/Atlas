@@ -79,8 +79,9 @@ pub fn save(client: &mut Client, releases: &[Release], now: i64) -> Result<SaveS
     let (stats, local) = save_grouped(&mut tx, groups, now)?;
     tx.commit()?;
     // A commit seen here needs no question later; one that failed is asked about.
+    // The save stands either way: one left unconfirmed is asked about later.
     if let Some(Local { store, xid: Some(xid) }) = local {
-        store.confirm(&xid)?;
+        let _ = store.confirm(&xid);
     }
     Ok(stats)
 }
@@ -113,6 +114,13 @@ fn save_grouped(tx:&mut Transaction<'_>,groups:BTreeMap<&str,Vec<&Release>>,now:
     }
     for (group, releases) in groups {
         tx.query_one("select pg_advisory_xact_lock(hashtextextended(current_schema() || ':' || $1, 7936))", &[&group])?;
+        // Another connection's save of this group has ended now that its lock is ours:
+        // its articles are counted or gone before this save asks which it already has.
+        if let Some(local) = &local
+            && local.store.has_unsettled_besides(local.xid.as_deref())?
+        {
+            local.store.settle(|xid| crate::article_local::pg_ended(tx, xid))?;
+        }
         // A junk marker applies to all fragments with this identity, including
         // fragments that would otherwise fill an earlier COPY batch.
         let identities: Vec<_> = releases.iter().map(|release| identity(release)).collect();

@@ -28,39 +28,75 @@ fn binding(client: &mut impl postgres::GenericClient, schema: &str) -> Result<St
     Ok(format!("schema:{schema}"))
 }
 
+/// The store PostgreSQL's counts are of, as the catalogue names it.
+fn named(client: &mut impl postgres::GenericClient) -> Result<Option<String>> {
+    Ok(client.query_opt("select text_value from meta where key = 'article_store'", &[])?.and_then(|row| row.get(0)))
+}
+
 /// The store the indexer writes for `schema`, opened and registered on first
 /// use when config.toml turns it on. Saves a dead process left half done are
 /// settled, and a catalogue with articles still in PostgreSQL has them moved.
+/// The catalogue then names the store: its counts are of the articles in it,
+/// so a start with another store, an emptied one or none is refused.
 pub(crate) fn ensure_writer(owner: &mut postgres::Client, schema: &str, stop: &AtomicBool) -> Result<Option<Arc<Store>>> {
     let store = match super::of_schema(schema) {
         Some(store) => store,
         None => {
-            let Some(root) = configured() else { return Ok(None) };
+            let Some(root) = configured() else {
+                ensure!(
+                    named(owner)?.is_none(),
+                    "this catalogue's articles are in a local article store: turn [article_store] back on"
+                );
+                return Ok(None);
+            };
             let store = Store::open_writer(&root, &binding(owner, schema)?)?;
             super::register(schema, store)?
         }
     };
+    ensure!(store.is_writer(), "the local article store of this schema is open for reading only");
+    let id = match store.meta("id")? {
+        Some(id) => id,
+        None => {
+            let mut bytes = [0u8; 16];
+            getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("no randomness for the local article store's id: {e}"))?;
+            let id: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            store.set_meta("id", &id)?;
+            id
+        }
+    };
+    let named = named(owner)?;
+    ensure!(
+        named.as_ref().is_none_or(|named| *named == id),
+        "the catalogue counts the articles of another local article store than {}: put that store back, or start a new catalogue",
+        store.path().display()
+    );
     if store.has_unsettled()? {
         store.settle(|xid| super::pg_ended(owner, xid))?;
     }
     if store.meta("imported")?.is_none() {
+        ensure!(named.is_none(), "the local article store {} lost its place in the move out of PostgreSQL", store.path().display());
         import(owner, &store, stop)?;
+    }
+    if named.is_none() {
+        owner.execute("insert into meta (key, text_value) values ('article_store', $1)", &[&id])?;
     }
     Ok(Some(store))
 }
 
 /// The store a reading process uses for `schema`, opened on first use when
-/// config.toml turns it on. A store filled for another catalogue is refused.
+/// config.toml turns it on. Until the indexer has made it and finished moving
+/// the catalogue's articles into it, reads stay on PostgreSQL, which still has
+/// them all. A store filled for another catalogue is refused.
 pub(crate) fn ensure_reader(client: &mut impl postgres::GenericClient, schema: &str) -> Result<()> {
     if super::of_schema(schema).is_some() {
         return Ok(());
     }
     let Some(root) = configured() else { return Ok(()) };
-    let store = Store::open_reader(&root).context("the local article store is turned on but the indexer has not made it yet")?;
-    let (bound, wanted) = (store.catalogue()?, binding(client, schema)?);
+    let Some(named) = named(client)? else { return Ok(()) };
+    let store = Store::open_reader(&root).context("opening the local article store the catalogue names")?;
     ensure!(
-        bound.as_deref() == Some(wanted.as_str()),
-        "the local article store {} does not belong to this catalogue",
+        store.meta("id")?.as_deref() == Some(named.as_str()) && store.catalogue()?.as_deref() == Some(binding(client, schema)?.as_str()),
+        "the local article store {} is not the one this catalogue counts",
         store.path().display()
     );
     // Two requests may race to open it; the first one registered is the one used.
@@ -293,6 +329,30 @@ mod tests {
         assert_eq!(replay.unwrap().parts, 1);
         assert_eq!((row.get::<_, i64>(0), row.get::<_, bool>(1)), (2, true));
         assert_eq!(store.has(&[(id, b"<kept@x>"), (id, b"<lost@x>")]).unwrap(), vec![true, true]);
+    }
+
+    #[test]
+    fn a_catalogue_names_its_store_and_refuses_another() {
+        let Some(schema) = crate::pg::testing::Schema::native_writer() else { return };
+        if crate::article_local::of_schema(&schema.name).is_some() {
+            crate::article_local::unregister(&schema.name);
+        }
+        let mut owner = postgres::Client::connect(&schema.url, postgres::NoTls).unwrap();
+        owner.batch_execute(&format!("set search_path to \"{}\"", schema.name)).unwrap();
+        let stop = AtomicBool::new(false);
+        assert!(ensure_writer(&mut owner, &schema.name, &stop).unwrap().is_none(), "nothing configured, nothing named");
+        let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        crate::article_local::register(&schema.name, Store::open_writer(first.path(), "test").unwrap()).unwrap();
+        let store = ensure_writer(&mut owner, &schema.name, &stop).unwrap().unwrap();
+        assert_eq!(named(&mut owner).unwrap(), store.meta("id").unwrap());
+        assert!(ensure_writer(&mut owner, &schema.name, &stop).is_ok(), "the same store again");
+        crate::article_local::unregister(&schema.name);
+        // Turned off again, or an emptied store put in its place: the counts would be added twice.
+        assert!(ensure_writer(&mut owner, &schema.name, &stop).is_err());
+        crate::article_local::register(&schema.name, Store::open_writer(second.path(), "test").unwrap()).unwrap();
+        let refused = ensure_writer(&mut owner, &schema.name, &stop);
+        crate::article_local::unregister(&schema.name);
+        assert!(refused.is_err());
     }
 
     /// How fast the writer takes articles, with them local and with them in PostgreSQL.

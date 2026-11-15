@@ -8,8 +8,9 @@
 //! `settle` later asks PostgreSQL how that transaction ended and takes the rows
 //! back out when it rolled back, so the two never disagree after a crash.
 //!
-//! The file is a cache of what Usenet said: it can be wiped and refilled by a
-//! new backfill, and nothing else is kept in it.
+//! The file holds only what Usenet said, but PostgreSQL's counts are of the
+//! articles in it: the catalogue names the one store it counts, and a
+//! different or missing store is refused rather than counted a second time.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -147,7 +148,7 @@ impl Store {
         let path = dir.join(FILE);
         let conn = Connection::open_with_flags(
             &path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .with_context(|| format!("opening {} for reading", path.display()))?;
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
@@ -250,16 +251,21 @@ impl Store {
     /// committed one stay; rows of a rolled-back one are taken out again.
     pub(crate) fn settle(&self, mut ended: impl FnMut(&str) -> Result<Ended>) -> Result<()> {
         ensure!(self.writer, "the local article store is open for reading only");
-        let mut conn = self.lock()?;
         let xids: Vec<String> = {
+            let conn = self.lock()?;
             let mut list = conn.prepare("select distinct xid from unsettled")?;
             list.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?
         };
+        // PostgreSQL is asked with the store unlocked, so readers are not kept waiting on it.
+        let mut answers = Vec::with_capacity(xids.len());
         for xid in xids {
             let how = ended(&xid)?;
-            if how == Ended::Running {
-                continue;
+            if how != Ended::Running {
+                answers.push((xid, how));
             }
+        }
+        let mut conn = self.lock()?;
+        for (xid, how) in answers {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             if how == Ended::RolledBack {
                 let blobs: Vec<Vec<u8>> = {
@@ -279,6 +285,19 @@ impl Store {
             tx.commit()?;
         }
         Ok(())
+    }
+
+    /// Whether a save other than `own` is still waiting to hear how its transaction ended.
+    pub(crate) fn has_unsettled_besides(&self, own: Option<&str>) -> Result<bool> {
+        Ok(self.lock()?.query_row(
+            "select exists(select 1 from unsettled where ?1 is null or xid <> ?1)",
+            [own],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub(crate) fn is_writer(&self) -> bool {
+        self.writer
     }
 
     /// Bulk load rows that PostgreSQL already counted, as the one-time move of
@@ -426,13 +445,20 @@ pub(crate) fn of(client: &mut impl postgres::GenericClient) -> Result<Option<Arc
 }
 
 /// Ask PostgreSQL how the transaction `xid` ended. One too old for PostgreSQL
-/// to remember is taken as committed: its rows were visible long enough to be read.
+/// to remember is taken as committed: its rows were visible long enough to be
+/// read. One PostgreSQL has not handed out yet was lost when the server
+/// crashed before writing it down, so it never committed.
 pub(crate) fn pg_ended(client: &mut impl postgres::GenericClient, xid: &str) -> Result<Ended> {
-    let status: Option<String> =
-        client.query_one("select pg_xact_status($1::text::xid8)", &[&xid])?.try_get(0)?;
+    let status: Option<String> = client
+        .query_one(
+            "select case when $1::text::xid8 >= pg_snapshot_xmax(pg_current_snapshot()) then 'lost'
+                         else pg_xact_status($1::text::xid8) end",
+            &[&xid],
+        )?
+        .try_get(0)?;
     Ok(match status.as_deref() {
         Some("in progress") => Ended::Running,
-        Some("aborted") => Ended::RolledBack,
+        Some("aborted" | "lost") => Ended::RolledBack,
         _ => Ended::Committed,
     })
 }

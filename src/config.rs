@@ -772,8 +772,8 @@ impl HeaderStoreConfig {
 }
 
 /// The `article_store` object of config.toml (`crate::article_local`): the local file that holds each release's
-/// articles (message ids, parts, sizes) so PostgreSQL keeps only releases and files. Off unless enabled. It is a
-/// cache of what Usenet said and can be wiped; the catalogue's articles are then read in again by a new backfill.
+/// articles (message ids, parts, sizes) so PostgreSQL keeps only releases and files. Off unless enabled. The
+/// catalogue's counts are of the articles in it: once on, it stays on, and losing the file means a new catalogue.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ArticleStoreConfig {
     pub enabled: bool,
