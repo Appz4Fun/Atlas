@@ -402,7 +402,8 @@ fn claim_turn_with(
 /// The newest day any of `groups` still has to do or is doing: (group, oldest day the server keeps). A day pending
 /// (not resting after a failure, see `FAIL_REST`) or claimed within `CLAIM_TIMEOUT`: a day being read holds the
 /// groups behind it (`claim`), one whose claim went stale (its worker was killed) doesnt, it is anyone's to take over
-/// (`claim` takes it first). Only when stale claims are all that's left are they the frontier. None when none is left.
+/// (`claim` takes it first). Only when stale claims are all that's left are they the frontier. A live claim that
+/// already failed `FRONTIER_FAILURES` times doesnt hold it. None when none is left.
 pub fn frontier(db: &dyn Sql, groups: &[(String, i64)], now: i64) -> Result<Option<i64>> {
     frontier_by(db, groups, now, true)
 }
@@ -477,7 +478,7 @@ fn frontier_asked(db: &dyn Sql, groups: &[(String, i64)], now: i64, newest: bool
                   from wanted w
                   union all
                   select (select {most}(c.day) filter (where not {live}) from backfill_chunks c
-                          where c.grp = w.g and c.state = {CLAIMED} and c.day >= w.oldest and {healthy}), 1
+                          where c.grp = w.g and c.state = {CLAIMED} and c.day >= w.oldest), 1
                   from wanted w
               )
          select coalesce({most}(case when stale = 0 then day end), {most}(day)) from days",

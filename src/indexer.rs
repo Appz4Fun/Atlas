@@ -1983,7 +1983,7 @@ pub async fn chunk_range(
 /// the day: `index_chunk` forgets it on a 411 or a day older than it keeps).
 /// A server whose first dates disagree goes back furthest only when every
 /// one's do: a forged run could make it look deeper than it is. A server
-/// that cant be asked fails it: the chunk goes back and is tried again later.
+/// that cant be asked is left out of the answer, which then isnt kept and never calls this server alone.
 async fn goes_back_furthest(
     ctx: &PassContext,
     db: &Db,
@@ -2035,6 +2035,12 @@ async fn goes_back_furthest(
     let (_, since, deepest) = found.remove(0);
     let runner_up = found.first().map(|(_, t, _)| *t);
     if unasked {
+        // A server left out may go back further: never call this one alone on that (it would drop older days as
+        // only its own), only that it may read the day. Its own first post stands in as the runner up.
+        let runner_up = runner_up.or(Some(oldest.0)).map(|r| r.min(oldest.0));
+        if deepest != host {
+            println!("[CHUNK] {group}: a carrier didnt answer how far back it keeps it, asking again next time");
+        }
         return Ok((deepest == host, runner_up));
     }
     let (g, d) = (group.to_string(), deepest.clone());
