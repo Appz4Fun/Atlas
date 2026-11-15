@@ -78,6 +78,9 @@ pub(crate) fn ensure_writer(owner: &mut postgres::Client, schema: &str, stop: &A
         import(owner, &store, stop)?;
     }
     if named.is_none() {
+        // the store's id and import mark on disk before the catalogue names it: its commits arent synced one by one,
+        // and a catalogue naming a store that lost them would refuse it on every start
+        store.sync()?;
         owner.execute("insert into meta (key, text_value) values ('article_store', $1)", &[&id])?;
     }
     Ok(Some(store))

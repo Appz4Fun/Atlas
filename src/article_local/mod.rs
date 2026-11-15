@@ -12,7 +12,10 @@
 //! last ones while PostgreSQL kept the transactions that counted them, which
 //! leaves those releases short of articles. That is the loss the store is
 //! allowed (the user accepts up to a rolling day of it); every save syncing
-//! here held the indexer's one PostgreSQL owner session for its fsyncs.
+//! here held the indexer's one PostgreSQL owner session for its fsyncs. After
+//! such a loss a later save of the same articles counts them again, and the
+//! rows of a release deleted meanwhile can stay behind. The catalogue's naming
+//! of the store (`ensure_writer`) is synced first, so it is never lost.
 //!
 //! The file holds only what Usenet said, but PostgreSQL's counts are of the
 //! articles in it: the catalogue names the one store it counts, and a
@@ -135,7 +138,7 @@ impl Store {
         conn.execute_batch(
             "pragma journal_mode = wal;
              pragma synchronous = normal;
-             pragma cache_size = -1048576;
+             pragma cache_size = -524288;
              pragma wal_autocheckpoint = 8192;
              pragma temp_store = memory;",
         )?;
@@ -177,6 +180,22 @@ impl Store {
     }
 
     /// The connection, for the `reads*` modules. One statement at a time: do not hold it across PostgreSQL calls.
+    /// Everything committed so far, on disk: one commit synced in full (in WAL mode that syncs every frame before it
+    /// too). Commits arent otherwise synced one by one (`synchronous = normal`).
+    pub(super) fn sync(&self) -> Result<()> {
+        ensure!(self.writer, "the local article store is open for reading only");
+        let conn = self.lock()?;
+        conn.execute_batch("pragma synchronous = full;")?;
+        let synced = conn.execute(
+            "insert into meta (key, value) values ('synced', cast(strftime('%s', 'now') as text))
+             on conflict (key) do update set value = excluded.value",
+            [],
+        );
+        conn.execute_batch("pragma synchronous = normal;")?;
+        synced?;
+        Ok(())
+    }
+
     pub(super) fn lock(&self) -> Result<MutexGuard<'_, Connection>> {
         self.conn.lock().map_err(|_| anyhow::anyhow!("the local article store lock is poisoned"))
     }
