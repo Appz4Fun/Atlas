@@ -1,10 +1,14 @@
 //! Checked local result inventories. Missing rows and failed reads stay distinct.
 
-use anyhow::{Result,ensure};
+use anyhow::Result;
 use super::StepReads;
 
 fn admit(row:&postgres::Row)->Result<()> {
-    ensure!(row.try_get::<_,i64>(0)?<=10000 && row.try_get::<_,i64>(1)?<=64*1024*1024,"native local inventory exceeds read admission");Ok(())
+    // one release's inventory past the limit fails its step, not the owner session (`OverAdmission`)
+    if row.try_get::<_,i64>(0)?>10000 || row.try_get::<_,i64>(1)?>64*1024*1024 {
+        return Err(crate::pg::outage::OverAdmission("native local inventory exceeds read admission").into());
+    }
+    Ok(())
 }
 fn sixteen(row:&postgres::Row,at:usize)->Result<[u8;16]> {
     row.try_get::<_,Vec<u8>>(at)?.try_into().map_err(|_|anyhow::anyhow!("native PAR2 descriptor extent is invalid"))

@@ -91,6 +91,11 @@ impl Runner {
                         a.rename_clears|=on_rename;a.net_mask|=on_rename & a.net_steps;a.names.push((bit,name));
                     }
                 }
+                // a release past an admission limit fails this step for good; anything else native ends the visit
+                Ran::Error(StepError::Native(error)) if crate::pg::outage::is_over_admission(&error)=>{
+                    a.set_failed|=bit;a.net_attempts=Some(0);a.net_transient=Some(0);a.net_next_at=Some(0);
+                    a.error=Some(engine::step_error(step.name(),&format!("{error:#}")));
+                }
                 Ran::Error(StepError::Native(error))=>return Err(error),
                 Ran::Error(StepError::Stopped)=>return if self.owner.stop.load(std::sync::atomic::Ordering::Acquire) {Err(crate::pg::outage::AttemptEnded.into())} else {Err(anyhow::anyhow!("native Step stopped without an ended attempt"))},
                 Ran::Error(StepError::Retry(error))=>{
