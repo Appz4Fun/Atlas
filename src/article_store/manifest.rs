@@ -67,6 +67,10 @@ pub(crate) struct FieldRef {
 }
 impl FieldRef {
     pub(crate) fn new(logical_bytes: u64, extents: Vec<Extent>) -> Result<Self> {
+        // Spare capacity is owned workspace too, including present-empty fields.
+        if extents.capacity() > MAX_ROW_EXTENTS {
+            return Err(Error::Limit);
+        }
         validate_field(logical_bytes, &extents)?;
         Ok(Self { logical_bytes, extents, token: None })
     }
@@ -249,7 +253,7 @@ impl<'a> BatchManifestBuilder<'a> {
         deadline: Instant,
     ) -> Result<Self> {
         check(deadline)?;
-        if binding.group.len() > 4096 || data.len() > MAX_DATA_CHUNKS {
+        if binding.group.len() > 4096 || binding.group.capacity() > 4096 || data.len() > MAX_DATA_CHUNKS {
             return Err(Error::Limit);
         }
         let identity = writer.identity();
@@ -315,6 +319,15 @@ impl<'a> BatchManifestBuilder<'a> {
     fn push_checked(&mut self, mut row: AcceptedRowV1) -> Result<()> {
         if self.rows as usize >= MAX_BATCH_ROWS {
             return Err(Error::Limit);
+        }
+        // Callers can mutate extent Vecs after construction. Bound aggregate
+        // retained slots before encoding or invoking a nested page publisher.
+        let mut retained_extents = 0usize;
+        for field in row.fields.iter().flatten() {
+            retained_extents = retained_extents.checked_add(field.extents.capacity()).ok_or(Error::Limit)?;
+            if retained_extents > MAX_ROW_EXTENTS {
+                return Err(Error::Limit);
+            }
         }
         let mut extents = 0usize;
         let mut logical = self.logical_bytes;
@@ -884,6 +897,24 @@ impl<'a> BatchSnapshot<'a> {
             return Err(Error::Limit);
         }
         let end = offset.checked_add(out.len() as u64).ok_or(Error::Limit)?.min(field.logical_bytes);
+        // Argument/foreign-token refusals above do not invalidate a good session.
+        // Once storage access begins, any failure is terminal, including a lazy
+        // Missing/Corrupt/Io: restoring the pathname cannot recover this snapshot.
+        let result = self.read_field_checked(field, offset, end, out, deadline);
+        if result.is_err() {
+            self.failed = true;
+            self.current_data = None;
+        }
+        result
+    }
+    fn read_field_checked(
+        &mut self,
+        field: &FieldRef,
+        offset: u64,
+        end: u64,
+        out: &mut [u8],
+        deadline: Instant,
+    ) -> Result<usize> {
         let mut logical = 0u64;
         let mut read = 0usize;
         for extent in &field.extents {
