@@ -16,8 +16,12 @@ pub struct PgWriteLimits {
 }
 
 impl Default for PgWriteLimits {
+    /// Saves queue on the indexer's one owner session, which takes up to three ingestion turns in a row before a
+    /// waiting ordinary one. With two jobs of 8 MiB at most (32 MiB pending) the queue held too little to use them:
+    /// on prod a save did ~10 ms of work after ~120 ms of waiting, fetched headers filled the unsaved budget, and
+    /// ingest stayed near 40k articles a second. Eight jobs of up to 32 MiB (256 MiB pending) keep it supplied.
     fn default() -> Self {
-        Self { max_pending_bytes: 32 * 1024 * 1024, max_job_bytes: 8 * 1024 * 1024, concurrent_saves: 2 }
+        Self { max_pending_bytes: 256 * 1024 * 1024, max_job_bytes: 32 * 1024 * 1024, concurrent_saves: 8 }
     }
 }
 
