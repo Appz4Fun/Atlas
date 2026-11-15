@@ -227,6 +227,16 @@ pub fn want(db: &dyn Sql, group: &str, day: i64, now: i64) -> Result<bool> {
 /// upload spread over several groups are then read together, and linked across them (`xref`).
 pub const LOCKSTEP_DAYS: i64 = 1;
 
+/// `LOCKSTEP_DAYS`, or what config.toml's `backfill_lockstep_days` says (set at the indexer's start). A wider window
+/// keeps workers busy while the slowest groups' days are still being read, at the cost of their uploads' articles
+/// being read further apart in time.
+pub static LOCKSTEP: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(LOCKSTEP_DAYS);
+
+/// The lockstep window in use (see `LOCKSTEP`).
+pub fn lockstep_days() -> i64 {
+    LOCKSTEP.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The first day forward backfill reads (`backfill_start_days_back` in the config, worked out once and kept: see
 /// `set_forward_start`), 0 for the usual newest day first. Forward, only days from then on are claimed, oldest
 /// first, in lockstep: no group goes more than `LOCKSTEP_DAYS` past the oldest day any of them still has to do from
@@ -318,11 +328,11 @@ fn claim_with(
         let from: Vec<(String, i64)> = groups.iter().map(|(g, oldest)| (g.clone(), (*oldest).max(start))).collect();
         let Some(frontier) = frontier_oldest(db, &from, now)? else { return Ok(None) };
         let ranges: Vec<(String, i64, i64)> =
-            from.into_iter().map(|(g, oldest)| (g, oldest, frontier + LOCKSTEP_DAYS)).collect();
+            from.into_iter().map(|(g, oldest)| (g, oldest, frontier + lockstep_days())).collect();
         return claim_ordered(db, &ranges, &media, host, now, true);
     }
     let Some(frontier) = frontier(db, groups, now)? else { return Ok(None) };
-    let floor = frontier - LOCKSTEP_DAYS;
+    let floor = frontier - lockstep_days();
     let groups: Vec<(String, i64)> = groups.iter().map(|(g, oldest)| (g.clone(), (*oldest).max(floor))).collect();
     claim_newest(db, &groups, &media, host, now)
 }
@@ -371,11 +381,11 @@ fn claim_turn_with(
         let from: Vec<(String, i64)> = all.iter().map(|(g, oldest)| (g.clone(), (*oldest).max(start))).collect();
         let Some(frontier) = frontier_oldest(db, &from, now)? else { return Ok(None) };
         let (g, oldest) = group;
-        return claim_ordered(db, &[(g, oldest.max(start), frontier + LOCKSTEP_DAYS)], &[], host, now, true);
+        return claim_ordered(db, &[(g, oldest.max(start), frontier + lockstep_days())], &[], host, now, true);
     }
     let Some(frontier) = frontier(db, all, now)? else { return Ok(None) };
     let (g, oldest) = group;
-    claim_newest(db, &[(g, oldest.max(frontier - LOCKSTEP_DAYS))], &[], host, now)
+    claim_newest(db, &[(g, oldest.max(frontier - lockstep_days()))], &[], host, now)
 }
 
 /// The newest day any of `groups` still has to do or is doing: (group, oldest day the server keeps). A day pending

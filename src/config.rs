@@ -184,6 +184,8 @@ pub struct Config {
     pub split_min_backlog: Option<i64>,
     /// backfill forward from this many days back (`chunks::FORWARD_START_DAY`); None = newest day first
     pub backfill_start_days_back: Option<i64>,
+    /// days a group's backfill may run ahead of the slowest (`chunks::lockstep_days`); None = `chunks::LOCKSTEP_DAYS`
+    pub backfill_lockstep_days: Option<i64>,
     /// groups indexed at the same time, None = worked out from the connections
     pub parallel_groups: Option<usize>,
     /// compact the database every 24 hours from the indexer
@@ -1262,6 +1264,7 @@ impl Default for Config {
             request_size: None,
             split_min_backlog: None,
             backfill_start_days_back: None,
+            backfill_lockstep_days: None,
             parallel_groups: None,
             auto_run_compact: false,
             inferred_parts: true,
@@ -1445,6 +1448,7 @@ impl Config {
             request_size: v.get("request_size").and_then(as_int).and_then(|n| u64::try_from(n).ok()).filter(|n| *n > 0),
             split_min_backlog: v.get("split_min_backlog").and_then(as_int).filter(|n| *n > 0),
             backfill_start_days_back: v.get("backfill_start_days_back").and_then(as_int).filter(|n| *n > 0),
+            backfill_lockstep_days: v.get("backfill_lockstep_days").and_then(as_int).filter(|n| (1..=365).contains(n)),
             parallel_groups: v
                 .get("parallel_groups")
                 .and_then(as_int)
@@ -1790,6 +1794,9 @@ fn config_value(
 
     if let Some(n) = cfg.backfill_start_days_back {
         out.insert("backfill_start_days_back".into(), json!(n));
+    }
+    if let Some(n) = cfg.backfill_lockstep_days {
+        out.insert("backfill_lockstep_days".into(), json!(n));
     }
 
     if cfg.auto_run_compact {
@@ -2369,6 +2376,15 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         }
+    }
+
+    #[test]
+    fn backfill_lockstep_days_from_the_file() {
+        let cfg = |v: Value| Config::from_value(&v).backfill_lockstep_days;
+        assert_eq!(cfg(json!({"backfill_lockstep_days": 3})), Some(3));
+        assert_eq!(cfg(json!({})), None);
+        assert_eq!(cfg(json!({"backfill_lockstep_days": 0})), None);
+        assert_eq!(cfg(json!({"backfill_lockstep_days": 400})), None);
     }
 
     #[test]
