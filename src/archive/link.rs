@@ -608,6 +608,10 @@ impl Step for LinkStep {
             .max_by_key(|&(_, bytes)| bytes)
             .map_or(id, |(lead, _)| lead);
         for (old, _) in uploads.iter().filter(|(old, _)| *old != lead) {
+            // Settlement locks every member of an upload it moves. Reading them here counts them among this visit's
+            // participants, soo an upload too big to move fails this step for the release (`OverAdmission`) instead
+            // of the settlement, which on a big enough upload ended the owner session on every start.
+            ctx.data().upload_members(*old)?;
             writes.push(StepWrite::for_mutation(id, StepMutation::MoveUpload { from_id: *old,to_id: lead }));
         }
         for (candidate, file) in &found {
