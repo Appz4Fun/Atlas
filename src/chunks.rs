@@ -405,7 +405,11 @@ static FRONTIERS: std::sync::Mutex<Option<std::collections::HashMap<(bool, u64),
     std::sync::Mutex::new(None);
 
 /// `frontier` when `newest`, else `frontier_oldest`; one worked out in the last `FRONTIER_FOR` for the same groups
-/// is used again. Tests always ask the database: they change it between calls at a fixed `now`.
+/// is used again. The cache is per process and keyed by the groups alone, not by database or `now`: a process whose
+/// runtime reopens on another catalogue within `FRONTIER_FOR` may use the old one's frontier once, which only moves
+/// what claims are let through for those seconds (the claim itself still checks the rows). Unit tests (`cfg(test)`)
+/// always ask the database, as they change it between calls at a fixed `now`; integration tests under `tests/` build
+/// without `cfg(test)` and do share the cache.
 fn frontier_by(db: &dyn Sql, groups: &[(String, i64)], now: i64, newest: bool) -> Result<Option<i64>> {
     if groups.is_empty() {
         return Ok(None);
