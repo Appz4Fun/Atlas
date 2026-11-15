@@ -19,7 +19,8 @@ fn binding() -> ReleaseBinding {
 fn setup() -> (tempfile::TempDir, PathBuf, Writer) {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap().join("payload");
-    let writer = Writer::create(&root, CatalogId::from_bytes([0x42; 32])).unwrap();
+    let mut writer = Writer::create(&root, CatalogId::from_bytes([0x42; 32])).unwrap();
+    writer.initialize_read_gate().unwrap();
     (temp, root, writer)
 }
 fn object(root: &Path, digest: [u8; 32]) -> PathBuf {
@@ -45,8 +46,9 @@ fn bytes(snapshot: &mut BatchSnapshot<'_>, field: &FieldRef) -> Vec<u8> {
     assert_eq!(snapshot.read_field_range(field, 0, &mut out, deadline()).unwrap(), out.len());
     out
 }
-fn open<'a>(reader: &'a Reader, reference: &BatchRef) -> BatchSnapshot<'a> {
-    BatchSnapshot::open(reader, reference, &binding(), deadline()).expect("open exact batch binding")
+fn open<'a>(reader: &'a SessionReader, reference: &BatchRef) -> BatchSnapshot<'a> {
+    BatchSnapshot::open(reader.begin_read(deadline()).unwrap(), reference, &binding(), deadline())
+        .expect("open exact batch binding")
 }
 
 // Independent v1 fixture: a default row has 78 fixed zero bytes followed by
@@ -151,7 +153,7 @@ fn empty_manifest_matches_independent_golden_wire() {
     assert_eq!(fs::read(object(&root, reference.root.digest)).unwrap(), golden);
     let expected: [u8; 32] = Sha256::digest(&golden).into();
     assert_eq!(reference.generation, Generation(expected));
-    let reader = Reader::open(&root, reference.identity).unwrap();
+    let reader = SessionReader::open(&root, reference.identity).unwrap();
     assert!(open(&reader, &reference).next_row().unwrap().is_none());
 }
 
@@ -216,7 +218,7 @@ fn normalized_rows_preserve_bytes_nulls_copies_and_order() {
     zero.fields[FieldTag::MessageId.index()] = Some(field(0, 0, 5));
     let rows = vec![row, copy, zero, AcceptedRowV1::default()];
     let reference = batch(&mut writer, vec![data], rows.clone());
-    let reader = Reader::open(&root, reference.identity).unwrap();
+    let reader = SessionReader::open(&root, reference.identity).unwrap();
     let mut snapshot = open(&reader, &reference);
     for expected in rows {
         let actual = snapshot.next_row().unwrap().expect("every supplied copy survives");
@@ -313,7 +315,7 @@ fn long_envelope_crosses_chunks() {
     row.fields[FieldTag::NzbSubject.index()] = Some(FieldRef::new(offset, extents).unwrap());
     row.fields[FieldTag::NzbPoster.index()] = Some(field(0, 0, 0));
     let reference = batch(&mut writer, data, vec![row]);
-    let reader = Reader::open(&root, reference.identity).unwrap();
+    let reader = SessionReader::open(&root, reference.identity).unwrap();
     let mut snapshot = open(&reader, &reference);
     let row = snapshot.next_row().unwrap().unwrap();
     assert_eq!(row.nzb, Some(NzbEnvelopeV1 { timestamp: 0, file_index: None }));
@@ -354,7 +356,7 @@ fn canonical_generations_are_immutable() {
         BatchManifestBuilder::new(&mut writer, binding(), vec![a, conflicting], deadline()),
         Err(Error::Corrupt)
     ));
-    let reader = Reader::open(&root, first.identity).unwrap();
+    let reader = SessionReader::open(&root, first.identity).unwrap();
     let mut snapshot = open(&reader, &first);
     let row = snapshot.next_row().unwrap().unwrap();
     assert_eq!(bytes(&mut snapshot, row.fields[0].as_ref().unwrap()), b"alpha");
@@ -368,16 +370,25 @@ fn manifest_rejects_binding_extent_and_budget_errors() {
     let (_temp, root, mut writer) = setup();
     let data = publish(&mut writer, b"abc");
     let good = batch(&mut writer, vec![data], vec![AcceptedRowV1::default()]);
-    let reader = Reader::open(&root, good.identity).unwrap();
+    let reader = SessionReader::open(&root, good.identity).unwrap();
     let mut wrong = binding();
     wrong.identity_key[0] ^= 1;
-    assert!(matches!(BatchSnapshot::open(&reader, &good, &wrong, deadline()), Err(Error::IdentityMismatch)));
+    assert!(matches!(
+        BatchSnapshot::open(reader.begin_read(deadline()).unwrap(), &good, &wrong, deadline()),
+        Err(Error::IdentityMismatch)
+    ));
     wrong = binding();
     wrong.group.push('z');
-    assert!(matches!(BatchSnapshot::open(&reader, &good, &wrong, deadline()), Err(Error::IdentityMismatch)));
+    assert!(matches!(
+        BatchSnapshot::open(reader.begin_read(deadline()).unwrap(), &good, &wrong, deadline()),
+        Err(Error::IdentityMismatch)
+    ));
     wrong = binding();
     wrong.is_collection = true;
-    assert!(matches!(BatchSnapshot::open(&reader, &good, &wrong, deadline()), Err(Error::IdentityMismatch)));
+    assert!(matches!(
+        BatchSnapshot::open(reader.begin_read(deadline()).unwrap(), &good, &wrong, deadline()),
+        Err(Error::IdentityMismatch)
+    ));
     let mut huge = binding();
     huge.group = "x".repeat(4097);
     assert!(matches!(BatchManifestBuilder::new(&mut writer, huge, vec![], deadline()), Err(Error::Limit)));
@@ -471,9 +482,10 @@ fn admitted_deadlines_cannot_be_extended() {
     std::thread::sleep(Duration::from_millis(30));
     assert!(matches!(builder.push(AcceptedRowV1::default()), Err(Error::Deadline)));
     assert!(matches!(builder.finish(), Err(Error::Deadline)));
-    let reader = Reader::open(&root, reference.identity).unwrap();
+    let reader = SessionReader::open(&root, reference.identity).unwrap();
     let admitted = Instant::now() + Duration::from_millis(20);
-    let mut snapshot = BatchSnapshot::open(&reader, &reference, &binding(), admitted).unwrap();
+    let mut snapshot =
+        BatchSnapshot::open(reader.begin_read(deadline()).unwrap(), &reference, &binding(), admitted).unwrap();
     let token = snapshot.next_row().unwrap().unwrap().fields[0].take().unwrap();
     std::thread::sleep(Duration::from_millis(30));
     assert!(matches!(snapshot.next_row(), Err(Error::Deadline)));
@@ -490,9 +502,10 @@ fn decoded_field_tokens_are_bound_to_exact_snapshot() {
     let a = batch(&mut writer, vec![data], vec![row.clone()]);
     row.ordinal = 2;
     let b = batch(&mut writer, vec![data], vec![row]);
-    let reader = Reader::open(&root, a.identity).unwrap();
+    let reader = SessionReader::open(&root, a.identity).unwrap();
     let mut sa = open(&reader, &a);
-    let mut sb = open(&reader, &b);
+    let second_reader = SessionReader::open(&root, b.identity).unwrap();
+    let mut sb = open(&second_reader, &b);
     let token = sa.next_row().unwrap().unwrap().fields[0].take().unwrap();
     assert!(matches!(sb.read_field_range(&token, 0, &mut [0; 3], deadline()), Err(Error::IdentityMismatch)));
     assert!(matches!(sa.read_field_range(&field(0, 0, 3), 0, &mut [0; 3], deadline()), Err(Error::IdentityMismatch)));
@@ -509,18 +522,25 @@ fn decoded_field_tokens_are_bound_to_exact_snapshot() {
     row.fields[0] = Some(field(0, 0, 3));
     builder.push(row).unwrap();
     let other = builder.finish().unwrap();
-    drop(sb); // Keep the shared reader's descriptor budget available.
-    let mut other_snapshot = BatchSnapshot::open(&reader, &other, &other_binding, deadline()).unwrap();
+    drop(sb); // Release the second reader's session before opening another.
+    let mut other_snapshot =
+        BatchSnapshot::open(second_reader.begin_read(deadline()).unwrap(), &other, &other_binding, deadline()).unwrap();
     assert!(matches!(
         other_snapshot.read_field_range(&token, 0, &mut [0; 3], deadline()),
         Err(Error::IdentityMismatch)
     ));
     let mut wrong = a.clone();
     wrong.identity.catalog = CatalogId::from_bytes([9; 32]);
-    assert!(matches!(BatchSnapshot::open(&reader, &wrong, &binding(), deadline()), Err(Error::IdentityMismatch)));
+    assert!(matches!(
+        BatchSnapshot::open(reader.begin_read(deadline()).unwrap(), &wrong, &binding(), deadline()),
+        Err(Error::IdentityMismatch)
+    ));
     let mut wrong = a.clone();
     wrong.identity.store = StoreId::from_bytes([9; 16]);
-    assert!(matches!(BatchSnapshot::open(&reader, &wrong, &binding(), deadline()), Err(Error::IdentityMismatch)));
+    assert!(matches!(
+        BatchSnapshot::open(reader.begin_read(deadline()).unwrap(), &wrong, &binding(), deadline()),
+        Err(Error::IdentityMismatch)
+    ));
 }
 
 // Decoded labels cannot stand in for confirming actual selected inode and directory durability.
@@ -552,7 +572,7 @@ fn lazy_data_reads_refuse_missing_corrupt_and_replaced_children() {
     let mut row = AcceptedRowV1::default();
     row.fields[0] = Some(field(0, 0, 3));
     let reference = batch(&mut writer, vec![data], vec![row]);
-    let reader = Reader::open(&root, reference.identity).unwrap();
+    let reader = SessionReader::open(&root, reference.identity).unwrap();
     let mut snapshot = open(&reader, &reference);
     let token = snapshot.next_row().unwrap().unwrap().fields[0].take().unwrap();
     assert_eq!(bytes(&mut snapshot, &token), b"abc");
@@ -566,7 +586,7 @@ fn lazy_data_reads_refuse_missing_corrupt_and_replaced_children() {
         let mut row = AcceptedRowV1::default();
         row.fields[0] = Some(field(0, 0, 3));
         let reference = batch(&mut writer, vec![data], vec![row]);
-        let reader = Reader::open(&root, reference.identity).unwrap();
+        let reader = SessionReader::open(&root, reference.identity).unwrap();
         let mut snapshot = open(&reader, &reference);
         let token = snapshot.next_row().unwrap().unwrap().fields[0].take().unwrap();
         if corrupt {
@@ -592,7 +612,7 @@ fn assert_lazy_failure_is_terminal(mode: u8) {
     let mut row = AcceptedRowV1::default();
     row.fields[0] = Some(field(0, 0, 3));
     let reference = batch(&mut writer, vec![data], vec![row]);
-    let reader = Reader::open(&root, reference.identity).unwrap();
+    let reader = SessionReader::open(&root, reference.identity).unwrap();
     let mut snapshot = open(&reader, &reference);
     let token = snapshot.next_row().unwrap().unwrap().fields[0].take().unwrap();
     let path = object(&root, data.digest);
@@ -708,7 +728,7 @@ fn many_pages_and_data_chunks_do_not_accumulate_descriptors() {
         })
         .collect();
     let reference = batch(&mut writer, data, rows);
-    let reader = Reader::open(&root, reference.identity).unwrap();
+    let reader = SessionReader::open(&root, reference.identity).unwrap();
     let mut snapshot = open(&reader, &reference);
     for n in 0..2000 {
         let row = snapshot.next_row().unwrap().unwrap();
@@ -728,7 +748,7 @@ fn root_framing_rejects_reserved_trailing_counts_and_binding() {
     let (_temp, root, mut writer) = setup();
     let reference = batch(&mut writer, vec![], vec![]);
     let wire = fs::read(object(&root, reference.root.digest)).unwrap();
-    let reader = Reader::open(&root, reference.identity).unwrap();
+    let reader = SessionReader::open(&root, reference.identity).unwrap();
     let mut vectors = vec![];
     let mut v = wire.clone();
     v[0] ^= 1;
@@ -755,16 +775,22 @@ fn root_framing_rejects_reserved_trailing_counts_and_binding() {
     for wire in vectors {
         let bad = replace_root(&mut writer, &reference, &wire);
         assert!(matches!(
-            BatchSnapshot::open(&reader, &bad, &binding(), deadline()),
+            BatchSnapshot::open(reader.begin_read(deadline()).unwrap(), &bad, &binding(), deadline()),
             Err(Error::Corrupt | Error::Limit)
         ));
     }
     let mut wrong = reference.clone();
     wrong.generation.0[0] ^= 1;
-    assert!(matches!(BatchSnapshot::open(&reader, &wrong, &binding(), deadline()), Err(Error::Corrupt)));
+    assert!(matches!(
+        BatchSnapshot::open(reader.begin_read(deadline()).unwrap(), &wrong, &binding(), deadline()),
+        Err(Error::Corrupt)
+    ));
     let mut wrong = reference.clone();
     wrong.binding.group = "wrong".into();
-    assert!(matches!(BatchSnapshot::open(&reader, &wrong, &wrong.binding, deadline()), Err(Error::IdentityMismatch)));
+    assert!(matches!(
+        BatchSnapshot::open(reader.begin_read(deadline()).unwrap(), &wrong, &wrong.binding, deadline()),
+        Err(Error::IdentityMismatch)
+    ));
 }
 
 // Page corruption and absence are checked on first row access, without exposing a partial descriptor.
@@ -822,7 +848,7 @@ fn page_framing_and_missing_pages_fail_closed() {
             wire[page_at + 32..page_at + 36].copy_from_slice(&child.bytes.to_le_bytes());
             replace_root(&mut writer, &reference, &wire)
         };
-        let reader = Reader::open(&root, bad.identity).unwrap();
+        let reader = SessionReader::open(&root, bad.identity).unwrap();
         let mut snapshot = open(&reader, &bad);
         let result = snapshot.next_row();
         if mode == 0 {
@@ -872,7 +898,7 @@ fn manifest_crash_boundaries_publish_root_last() {
                 generation: Generation(root_digest),
                 root: PayloadRef::from_parts(identity, root_digest, root_wire.len() as u32).unwrap(),
             };
-            let reader = Reader::open(&root, identity).unwrap();
+            let reader = SessionReader::open(&root, identity).unwrap();
             let mut snapshot = open(&reader, &reference);
             assert_eq!(snapshot.next_row().unwrap(), Some(AcceptedRowV1::default()));
             assert!(snapshot.next_row().unwrap().is_none());
@@ -886,7 +912,7 @@ fn manifest_crash_boundaries_publish_root_last() {
         child.wait().unwrap();
         let mut writer = Writer::open(&root, identity).unwrap();
         let reference = batch(&mut writer, vec![], vec![AcceptedRowV1::default()]);
-        let reader = Reader::open(&root, identity).unwrap();
+        let reader = SessionReader::open(&root, identity).unwrap();
         assert!(open(&reader, &reference).next_row().unwrap().is_some());
     }
 }

@@ -30,13 +30,15 @@ mod unix {
     /// Every owned descriptor, including path-walk/transient descriptors and returned
     /// chunks, holds a permit. Chunks keep the originating budget alive after Reader drops.
     #[derive(Default)]
-    struct Budget(AtomicUsize);
+    struct Budget(AtomicUsize, #[cfg(test)] AtomicUsize);
     struct Permit(Arc<Budget>);
     impl Budget {
         fn acquire(self: &Arc<Self>) -> Result<Permit> {
             self.0
                 .try_update(Ordering::AcqRel, Ordering::Acquire, |count| (count < MAX_OWNED_FDS).then_some(count + 1))
                 .map_err(|_| Error::Limit)?;
+            #[cfg(test)]
+            self.1.fetch_max(self.0.load(Ordering::Acquire), Ordering::AcqRel);
             Ok(Permit(self.clone()))
         }
     }
@@ -316,6 +318,10 @@ mod unix {
     }
 
     impl Writer {
+        #[cfg(test)]
+        pub(crate) fn test_descriptor_counts(&self) -> (usize, usize) {
+            (self.budget.0.load(Ordering::Acquire), self.budget.1.load(Ordering::Acquire))
+        }
         fn flush(&self, file: &File, deadline: Option<Instant>, point: SyncPoint) -> Result<()> {
             if let Some(deadline) = deadline {
                 check(deadline)?;
@@ -505,6 +511,10 @@ mod unix {
         }
     }
     impl Reader {
+        #[cfg(test)]
+        pub(crate) fn test_descriptor_counts(&self) -> (usize, usize) {
+            (self.budget.0.load(Ordering::Acquire), self.budget.1.load(Ordering::Acquire))
+        }
         pub(crate) fn open(root: &Path, expected: Identity) -> Result<Self> {
             let budget = Arc::new(Budget::default());
             let (root, _) = root_directory(root, false, &budget)?;

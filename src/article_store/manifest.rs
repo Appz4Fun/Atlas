@@ -1,5 +1,5 @@
 //! Inactive normalized accepted-batch records. These carry no release authority.
-use super::{Chunk, Error, Identity, MAX_CHUNK_BYTES, MAX_RANGE_BYTES, PayloadRef, Reader, Result, Writer};
+use super::{Chunk, Error, Identity, MAX_CHUNK_BYTES, MAX_RANGE_BYTES, PayloadRef, ReadSession, Result, Writer};
 use sha2::{Digest, Sha256};
 use std::time::Instant;
 
@@ -725,7 +725,7 @@ fn decode_row(wire: &[u8], data: &[PayloadRef], token: FieldToken) -> Result<Acc
 /// A decoded field has a compact immutable identity/release/generation seal and
 /// descriptor digest. Caller mutation cannot convert it into another range token.
 pub(crate) struct BatchSnapshot<'a> {
-    reader: &'a Reader,
+    session: ReadSession<'a>,
     _root: Chunk,
     token: FieldToken,
     data: Vec<PayloadRef>,
@@ -744,7 +744,7 @@ pub(crate) struct BatchSnapshot<'a> {
 }
 impl<'a> BatchSnapshot<'a> {
     pub(crate) fn open(
-        reader: &'a Reader,
+        session: ReadSession<'a>,
         reference: &BatchRef,
         expected: &ReleaseBinding,
         deadline: Instant,
@@ -759,7 +759,7 @@ impl<'a> BatchSnapshot<'a> {
         if expected.group.len() > 4096 || reference.root.bytes as usize > MAX_ROOT_BYTES {
             return Err(Error::Limit);
         }
-        let root = reader.open_chunk(reference.root, deadline)?;
+        let root = session.open_chunk(reference.root, deadline)?;
         let mut wire = vec![0; reference.root.bytes as usize];
         if root.read_range(0, &mut wire, deadline)? != wire.len() {
             return Err(Error::Corrupt);
@@ -767,7 +767,7 @@ impl<'a> BatchSnapshot<'a> {
         let decoded = decode_root(&wire, reference)?;
         check(deadline)?;
         Ok(Self {
-            reader,
+            session,
             _root: root,
             token: FieldToken {
                 identity: reference.identity,
@@ -842,7 +842,7 @@ impl<'a> BatchSnapshot<'a> {
         self.current_data = None;
         let reference = *self.pages.get(self.page_index).ok_or(Error::Corrupt)?;
         self.page_wire.clear();
-        let page = self.reader.open_chunk(reference.payload, self.deadline)?;
+        let page = self.session.open_chunk(reference.payload, self.deadline)?;
         self.page_wire.resize(reference.payload.bytes as usize, 0);
         if page.read_range(0, &mut self.page_wire, self.deadline)? != self.page_wire.len() {
             return Err(Error::Corrupt);
@@ -925,7 +925,7 @@ impl<'a> BatchSnapshot<'a> {
                 let bytes = (extent_end.min(end) - offset.max(logical)) as usize;
                 if self.current_data.as_ref().is_none_or(|(index, _)| *index != extent.chunk_index) {
                     self.current_data = None; // Never retain the previous data FD while opening another.
-                    let chunk = self.reader.open_chunk(self.data[extent.chunk_index as usize], deadline)?;
+                    let chunk = self.session.open_chunk(self.data[extent.chunk_index as usize], deadline)?;
                     self.current_data = Some((extent.chunk_index, chunk));
                 }
                 let chunk = &self.current_data.as_ref().ok_or(Error::Corrupt)?.1;
