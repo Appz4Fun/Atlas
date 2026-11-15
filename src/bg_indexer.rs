@@ -897,7 +897,7 @@ impl Scheduler {
                     *c += 1;
                     *c
                 };
-                ui::error(&format!("Indexing error ({}, day chunk on {}): {e}", key.0, self.ctx.pool.host(server)));
+                ui::error(&format!("Indexing error ({}, day chunk on {}): {e:#}", key.0, self.ctx.pool.host(server)));
                 self.skip.lock().unwrap().insert(key, Some(Instant::now() + backoff(count)));
             }
         }
