@@ -104,6 +104,9 @@ pub(crate) fn stage_verified(
     let mut retained_bytes = 0usize;
     let mut read = 0usize;
     let mut ended = false;
+    // The page's rows, inserted with one statement: one round trip a row held the owner session's transaction open
+    // for the whole page, and on prod staging was its biggest user.
+    let mut rows = StagedRows::default();
     while read < budget.rows && retained_bytes < budget.bytes {
         let Some(r) = cursor.next_row() else {
             ended = true;
@@ -146,22 +149,15 @@ pub(crate) fn stage_verified(
         // Reinterpret u64 bits, rather than narrowing its identity. Historical
         // hash-only records use the same representation in PostgreSQL bigint.
         let legacy_hash = nntp_xover_engine::msgid_index::msgid_hash(message.as_bytes()) as i64;
-        tx.execute(
-            "insert into linker_staged_rows(source,ordinal,message_key,legacy_hash,message_id,poster,posted,group_id,article_number,bytes,lines,published) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,exists(select 1 from linker_linked_ids where message_key=$3 and message_id=$5))",
-            &[
-                &id,
-                &scanned,
-                &&key[..],
-                &legacy_hash,
-                &message.as_bytes(),
-                &poster.as_bytes(),
-                &posted,
-                &crate::nxv_store::linker::group_id(group),
-                &(number as i64),
-                &bytes,
-                &lines,
-            ],
-        )?;
+        rows.ordinal.push(scanned);
+        rows.message_key.push(key.to_vec());
+        rows.legacy_hash.push(legacy_hash);
+        rows.message_id.push(message.as_bytes().to_vec());
+        rows.poster.push(poster.as_bytes().to_vec());
+        rows.posted.push(posted);
+        rows.article_number.push(number as i64);
+        rows.bytes.push(bytes);
+        rows.lines.push(lines);
         retained_bytes = retained_bytes.saturating_add(message.len()).saturating_add(poster.len()).saturating_add(128);
     }
     ensure!(scanned <= entry.rows as i64, "native linker source exceeds manifest row count");
@@ -170,9 +166,45 @@ pub(crate) fn stage_verified(
         ended = true;
     }
     ensure!(!ended || scanned == entry.rows as i64, "native linker source ended before manifest row count");
+    if !rows.ordinal.is_empty() {
+        let inserted = tx.execute(
+            "insert into linker_staged_rows(source,ordinal,message_key,legacy_hash,message_id,poster,posted,group_id,article_number,bytes,lines,published)
+             select $1,u.o,u.k,u.h,u.m,u.p,u.t,$2,u.n,u.b,u.l,exists(select 1 from linker_linked_ids x where x.message_key=u.k and x.message_id=u.m)
+             from unnest($3::bigint[],$4::bytea[],$5::bigint[],$6::bytea[],$7::bytea[],$8::bigint[],$9::bigint[],$10::bigint[],$11::bigint[])
+                as u(o,k,h,m,p,t,n,b,l)",
+            &[
+                &id,
+                &crate::nxv_store::linker::group_id(group),
+                &rows.ordinal,
+                &rows.message_key,
+                &rows.legacy_hash,
+                &rows.message_id,
+                &rows.poster,
+                &rows.posted,
+                &rows.article_number,
+                &rows.bytes,
+                &rows.lines,
+            ],
+        )?;
+        ensure!(inserted == rows.ordinal.len() as u64, "native linker staged a different row count");
+    }
     tx.execute("update linker_source_blocks set scanned=$2,complete=$3 where id=$1", &[&id, &scanned, &ended])?;
     tx.commit()?;
     Ok(Progress { source: id, scanned, complete: ended })
+}
+
+/// The rows of one staging page, column by column, for a single `unnest` insert.
+#[derive(Default)]
+struct StagedRows {
+    ordinal: Vec<i64>,
+    message_key: Vec<Vec<u8>>,
+    legacy_hash: Vec<i64>,
+    message_id: Vec<Vec<u8>>,
+    poster: Vec<Vec<u8>>,
+    posted: Vec<i64>,
+    article_number: Vec<i64>,
+    bytes: Vec<i64>,
+    lines: Vec<i64>,
 }
 
 /// A durable contiguous prefix avoids COUNT/DISTINCT over an arbitrary day.
