@@ -308,6 +308,30 @@ fn ingestion_turn_sql_failure_rolls_back_and_stays_fatal() {
 }
 
 #[test]
+#[ignore = "requires explicit isolated PostgreSQL; one release past an admission limit must not end the owner"]
+fn over_admission_fails_the_callback_not_the_owner() {
+    let schema = crate::pg::testing::Schema::new().expect("explicit isolated PostgreSQL required");
+    let runtime = crate::pg::stage_queue_tests::runtime(&schema);
+    let error = runtime
+        .owner
+        .with(|client| {
+            let mut tx = client.transaction()?;
+            tx.execute("insert into meta(key,value) values('over_admission',1)", &[])?;
+            Err::<(), _>(crate::pg::outage::OverAdmission("native participant inventory exceeds admission").into())
+        })
+        .unwrap_err();
+    assert!(crate::pg::outage::is_over_admission(&error));
+    assert_eq!(runtime.owner.failure(), None, "the session stays usable");
+    // the callback's transaction rolled back, and the next callback runs
+    let rows: i64 = runtime
+        .owner
+        .with(|client| Ok(client.query_one("select count(*) from meta where key='over_admission'", &[])?.get(0)))
+        .unwrap();
+    assert_eq!(rows, 0);
+    runtime.owner.close();
+}
+
+#[test]
 #[ignore = "requires explicit isolated PostgreSQL; real completed observation must progress between ingestion turns"]
 fn ordinary_observation_heartbeat_commits_after_at_most_three_waiting_ingestion_callbacks() {
     let schema = crate::pg::testing::Schema::new().expect("explicit isolated PostgreSQL required");

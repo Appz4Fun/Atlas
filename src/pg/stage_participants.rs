@@ -39,7 +39,8 @@ fn include(tx:&mut postgres::Transaction<'_>,expected:&mut BTreeMap<i64,i64>,ids
     for row in rows {
         expected.entry(row.try_get(0)?).or_insert(row.try_get(1)?);
     }
-    ensure!(expected.len()<=LIMIT,"native resolved participant inventory exceeds admission");Ok(complete)
+    if expected.len()>LIMIT {return Err(crate::pg::outage::OverAdmission("native resolved participant inventory exceeds admission").into())}
+    Ok(complete)
 }
 impl ReadTargets {
     pub(crate) fn for_owner(owner:&Arc<Owner>)->Result<Self> {
@@ -58,14 +59,16 @@ impl ReadTargets {
         ensure!(matches!(isolation.as_str(),"repeatable read"|"serializable") && mode.try_get::<_,String>(1)?=="on",
             "native participants require the same readonly repeatable snapshot as their evidence");
         let ids=ids.iter().copied().collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>();
-        ensure!(ids.len()<=LIMIT,"native participant inventory exceeds admission");
+        // The union with what is already observed, plus the claimed release settlement adds (`lock_in`), must fit:
+        // checked before anything is kept, soo a refused read leaves the observed set as it was.
+        let new=ids.iter().filter(|id|!self.observed.rows.contains_key(id)).count();
+        if self.observed.rows.len()+new+1>LIMIT {return Err(crate::pg::outage::OverAdmission("native participant inventory exceeds admission").into())}
         let rows=tx.query("select id,native_work_revision from releases where id=any($1) order by id",&[&ids])?;
         ensure!(rows.len()==ids.len(),"native selected participant is absent from its evidence snapshot");
         for row in rows {
             // Keep the first observation. If later reads see a changed donor,
             // monotonic revisions make settlement refuse the mixed result.
             self.observed.rows.entry(row.try_get(0)?).or_insert(row.try_get(1)?);
-            ensure!(self.observed.rows.len()<=LIMIT,"native participant inventory exceeds admission");
         }Ok(())
     }
     pub(crate) fn snapshot(&self)->Observed {self.observed.clone()}
