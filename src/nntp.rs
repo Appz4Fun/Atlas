@@ -1942,6 +1942,102 @@ const RETENTION_WINDOWS: u64 = 3;
 /// Dates of a window passed over as forged before its earliest counts
 const RETENTION_OUTLIERS: usize = 3;
 
+/// Date searches and retention looks a pool worked out, used again. Day chunks each searched where their day and the
+/// next one start, on every carrier, and how far back each keeps the group: on prod that searching took more of the
+/// connections' time than reading the headers did. Where a day starts on a server doesnt move (article numbers dont
+/// change, new ones come after), soo an answer is used again for `MARK_FOR` while it is still inside the group's
+/// numbers; a retention look is used again for `RETENTION_FOR` while the server's first article is the same.
+#[derive(Default)]
+struct Marks {
+    days: Mutex<HashMap<(usize, String, i64), (u64, Instant)>>,
+    retentions: Mutex<HashMap<(usize, String, u64), (Retention, Instant)>>,
+}
+
+const MARK_FOR: Duration = Duration::from_secs(6 * 3600);
+/// day marks are kept only for times at least this long ago (seconds)
+const MARK_AFTER: i64 = 2 * 3600;
+const RETENTION_FOR: Duration = Duration::from_secs(3600);
+/// entries kept at most, each map: past it the map starts again
+const MARKS_MOST: usize = 200_000;
+
+impl Marks {
+    fn day_mark(&self, i: usize, group: &str, when: i64, low: u64, high: u64) -> Option<u64> {
+        let days = self.days.lock().ok()?;
+        let &(n, at) = days.get(&(i, group.to_string(), when))?;
+        // only a real article still inside the group's numbers: one expired since, or "none yet" (past the last
+        // number then), is searched again
+        (at.elapsed() < MARK_FOR && (low..=high).contains(&n)).then_some(n)
+    }
+
+    /// Keeps `n`, the answer for `when` searched up to `high`, only when it is a real article (`n <= high`, not "none
+    /// yet", which more posts would change) for a time at least `MARK_AFTER` ago (near now, late and forged dates
+    /// can still move it).
+    fn keep_day_mark(&self, i: usize, group: &str, when: i64, n: u64, high: u64, now: i64) {
+        if n > high || when > now.saturating_sub(MARK_AFTER) {
+            return;
+        }
+        if let Ok(mut days) = self.days.lock() {
+            if days.len() >= MARKS_MOST {
+                days.retain(|_, (_, at)| at.elapsed() < MARK_FOR);
+                if days.len() >= MARKS_MOST {
+                    days.clear();
+                }
+            }
+            days.insert((i, group.to_string(), when), (n, Instant::now()));
+        }
+    }
+
+    fn retention(&self, i: usize, group: &str, low: u64) -> Option<Retention> {
+        let retentions = self.retentions.lock().ok()?;
+        let &(r, at) = retentions.get(&(i, group.to_string(), low))?;
+        (at.elapsed() < RETENTION_FOR).then_some(r)
+    }
+
+    /// Keeps a retention look, but not `Empty`: a group's first posts can arrive without its first number moving.
+    fn keep_retention(&self, i: usize, group: &str, low: u64, r: Retention) {
+        if r == Retention::Empty {
+            return;
+        }
+        if let Ok(mut retentions) = self.retentions.lock() {
+            if retentions.len() >= MARKS_MOST {
+                retentions.retain(|_, (_, at)| at.elapsed() < RETENTION_FOR);
+                if retentions.len() >= MARKS_MOST {
+                    retentions.clear();
+                }
+            }
+            retentions.insert((i, group.to_string(), low), (r, Instant::now()));
+        }
+    }
+}
+
+#[cfg(test)]
+mod marks_tests {
+    use super::*;
+
+    #[test]
+    fn a_day_mark_is_used_again_only_while_it_is_a_real_article_of_the_group() {
+        let marks = Marks::default();
+        let now = 10 * 86_400;
+        marks.keep_day_mark(0, "g", 86_400, 500, 900, now);
+        assert_eq!(marks.day_mark(0, "g", 86_400, 100, 900), Some(500));
+        assert_eq!(marks.day_mark(1, "g", 86_400, 100, 900), None, "another server");
+        assert_eq!(marks.day_mark(0, "g", 0, 100, 900), None, "another day");
+        assert_eq!(marks.day_mark(0, "g", 86_400, 600, 900), None, "expired below the first number");
+        assert_eq!(marks.day_mark(0, "g", 86_400, 100, 499), None, "past the last number");
+        // "none yet" (past the last number searched) isnt kept, even once the group has grown past it
+        marks.keep_day_mark(0, "h", 86_400, 901, 900, now);
+        assert_eq!(marks.day_mark(0, "h", 86_400, 100, 2000), None, "'none yet' is asked again after growth");
+        // a time near now isnt kept either
+        marks.keep_day_mark(0, "g", now - 60, 800, 900, now);
+        assert_eq!(marks.day_mark(0, "g", now - 60, 100, 900), None, "a time near now is asked again");
+        marks.keep_retention(0, "e", 100, Retention::Empty);
+        assert_eq!(marks.retention(0, "e", 100), None, "an empty group is looked at again");
+        marks.keep_retention(0, "g", 100, Retention::Since(5));
+        assert_eq!(marks.retention(0, "g", 100), Some(Retention::Since(5)));
+        assert_eq!(marks.retention(0, "g", 101), None, "the first article moved");
+    }
+}
+
 /// How far back a server keeps a group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Retention {
@@ -1999,6 +2095,8 @@ const DATE_PROBE_ATTEMPTS: usize = 2 * u64::BITS as usize;
 pub struct Pool {
     /// tells this pool from the one before it, see `ServerStat::pool`
     id: u64,
+    /// date searches and retention looks worked out lately (see `Marks`)
+    marks: Marks,
     servers: Vec<Arc<Server>>,
     active: AtomicUsize,
     ready: AtomicBool,
@@ -2270,6 +2368,7 @@ impl Pool {
             body_patience: BODY_PATIENCE,
             xover_deadline: XOVER_DEADLINE,
             xzver_cooldown: XZVER_PROBE_COOLDOWN,
+            marks: Marks::default(),
             body_deadline: BODY_DEADLINE,
             body_retries: BODY_RETRIES,
             unsaved: UnsavedBudget::new(crate::config::DEFAULT_MAX_UNSAVED_HEADERS as usize),
@@ -3664,6 +3763,15 @@ impl Pool {
     /// more than a day older than an earlier one): a forged run, or dates too
     /// far out of order to judge by. `low` and `high` are the server's marks.
     pub async fn retention(&self, i: usize, group: &str, low: u64, high: u64) -> Result<Retention> {
+        if !cfg!(test) && let Some(r) = self.marks.retention(i, group, low) {
+            return Ok(r);
+        }
+        let r = self.retention_looked(i, group, low, high).await?;
+        self.marks.keep_retention(i, group, low, r);
+        Ok(r)
+    }
+
+    async fn retention_looked(&self, i: usize, group: &str, low: u64, high: u64) -> Result<Retention> {
         let Some((first, t)) = self.first_in(i, group, low, high + 1).await? else { return Ok(Retention::Empty) };
         let mut earliest = Vec::new();
         for w in 0..RETENTION_WINDOWS {
@@ -3697,6 +3805,16 @@ impl Pool {
     }
 
     async fn article_at_in(&self,i:usize,group:&str,low:u64,high:u64,when:i64,fetch:Option<&HeaderFetch>)->Result<u64> {
+        // unit tests ask the mock servers every time: their listings change between calls
+        if !cfg!(test) && let Some(n) = self.marks.day_mark(i, group, when, low, high) {
+            return Ok(n);
+        }
+        let n = self.article_at_searched(i, group, low, high, when, fetch).await?;
+        self.marks.keep_day_mark(i, group, when, n, high, chrono::Utc::now().timestamp());
+        Ok(n)
+    }
+
+    async fn article_at_searched(&self,i:usize,group:&str,low:u64,high:u64,when:i64,fetch:Option<&HeaderFetch>)->Result<u64> {
         // every article before lo is older than `when`, none from hi on is;
         // first is the first article from hi on (high + 1 when there is none)
         let (mut lo, mut hi, mut first) = (low, high + 1, high + 1);
