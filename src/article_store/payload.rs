@@ -386,8 +386,30 @@ mod unix {
             writer.flush(&parent.file, None, SyncPoint::Parent)?;
             Ok(writer)
         }
-        pub(crate) fn confirm_durable(&mut self, _: PayloadRef, _: Instant) -> Result<()> {
-            Err(Error::Unsupported)
+        /// Reconcile an untrusted decoded ref with the actual selected inode and
+        /// complete parent chain under this writer's held lock. No repair occurs.
+        pub(crate) fn confirm_durable(&mut self, reference: PayloadRef, deadline: Instant) -> Result<()> {
+            if self.poisoned.get() {
+                return Err(Error::Busy);
+            }
+            check(deadline)?;
+            if reference.identity != self.identity {
+                return Err(Error::IdentityMismatch);
+            }
+            if reference.bytes > MAX_CHUNK_BYTES {
+                return Err(Error::Limit);
+            }
+            let (prefix, final_name) = object_names(&reference.digest);
+            let bucket = directory(self.chunks.as_raw_fd(), &prefix, &self.budget)?;
+            check(deadline)?;
+            let selected = open_at(bucket.as_raw_fd(), &final_name, libc::O_RDONLY, &self.budget)?;
+            verify(&selected.file, reference.bytes, &reference.digest, deadline)?;
+            self.flush(&selected.file, Some(deadline), SyncPoint::Selected)?;
+            drop(selected);
+            self.flush(&bucket.file, Some(deadline), SyncPoint::Other)?;
+            self.flush(&self.chunks.file, Some(deadline), SyncPoint::Other)?;
+            self.flush(&self.root.file, Some(deadline), SyncPoint::Other)?;
+            check(deadline)
         }
         pub(crate) fn identity(&self) -> Identity {
             self.identity

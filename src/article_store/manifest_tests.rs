@@ -49,6 +49,95 @@ fn open<'a>(reader: &'a Reader, reference: &BatchRef) -> BatchSnapshot<'a> {
     BatchSnapshot::open(reader, reference, &binding(), deadline()).expect("open exact batch binding")
 }
 
+// Independent v1 fixture: a default row has 78 fixed zero bytes followed by
+// fourteen (closed field tag, absent) pairs. Page header is 13 bytes.
+fn default_page_wire() -> Vec<u8> {
+    let mut page = b"ATAMP001\0\x01\x00\x00\x00\x6a\x00\x00\x00".to_vec();
+    page.extend_from_slice(&[0; 78]);
+    for tag in 1..=14 {
+        page.extend_from_slice(&[tag, 0]);
+    }
+    page
+}
+fn default_root_wire(identity: Identity, page: &[u8]) -> Vec<u8> {
+    let mut root = b"ATAMF001\0".to_vec();
+    root.extend_from_slice(&identity.to_bytes());
+    root.extend_from_slice(b"\x05\x00alt.x\0");
+    root.extend_from_slice(&[0x73; 32]);
+    root.extend_from_slice(b"\x01\x00\x00\x00\x00\x00\x01\x00");
+    root.extend_from_slice(&Sha256::digest(page));
+    root.extend_from_slice(&(page.len() as u32).to_le_bytes());
+    root.extend_from_slice(&1u32.to_le_bytes());
+    root
+}
+
+// Pins nonempty row framing independently: nullable hashes/scalars, presence,
+// signed i64 timing, envelope, empty bytes, and one explicit extent.
+#[test]
+fn representative_page_matches_independent_golden_wire() {
+    let (_temp, root, mut writer) = setup();
+    let data = publish(&mut writer, b"abc");
+    let mut row = AcceptedRowV1 {
+        ordinal: 0x0102030405060708,
+        filename_key: Some([0x11; 32]),
+        part: Some(-1),
+        file_total: Some(0),
+        bytes: -2,
+        posted_at: 9,
+        zero_file_index: true,
+        posted_clock: Some(-3),
+        t_date: Some(10),
+        t_clock: Some(i64::MAX),
+        original_name_key: [0x22; 32],
+        is_obfuscated: true,
+        nzb: Some(NzbEnvelopeV1 { timestamp: -5, file_index: Some(0) }),
+        ..Default::default()
+    };
+    row.fields[0] = Some(field(0, 1, 2));
+    row.fields[1] = Some(field(0, 0, 0));
+    let reference = batch(&mut writer, vec![data], vec![row]);
+    let mut golden = vec![8, 7, 6, 5, 4, 3, 2, 1, 1];
+    golden.extend_from_slice(&[0x11; 32]);
+    golden.extend_from_slice(&[0, 1]); // message key absent, part present.
+    golden.extend_from_slice(&(-1i64).to_le_bytes());
+    golden.extend_from_slice(&[0, 1]); // expected absent, file_total present zero.
+    golden.extend_from_slice(&[0; 8]);
+    golden.push(0); // file_index absent.
+    golden.extend_from_slice(&(-2i64).to_le_bytes());
+    golden.extend_from_slice(&9i64.to_le_bytes());
+    golden.extend_from_slice(&[1, 1]); // zero index true, posted_clock present.
+    golden.extend_from_slice(&(-3i64).to_le_bytes());
+    golden.push(1);
+    golden.extend_from_slice(&10i64.to_le_bytes()); // t_date.
+    golden.extend_from_slice(&[0; 8]); // t_utc through t_tool absent.
+    golden.push(1);
+    golden.extend_from_slice(&i64::MAX.to_le_bytes()); // t_clock.
+    golden.push(0); // t_hw_n absent.
+    golden.extend_from_slice(&[0x22; 32]);
+    golden.extend_from_slice(&[1, 0, 1]); // obfuscated, junk, envelope presence.
+    golden.extend_from_slice(&(-5i64).to_le_bytes());
+    golden.push(1);
+    golden.extend_from_slice(&[0; 8]); // NZB file index present zero.
+    golden.extend_from_slice(&[1, 1]); // MID tag, present.
+    golden.extend_from_slice(&2u64.to_le_bytes());
+    golden.extend_from_slice(&1u16.to_le_bytes()); // One extent, chunk index zero.
+    golden.extend_from_slice(&0u16.to_le_bytes());
+    golden.extend_from_slice(&1u32.to_le_bytes());
+    golden.extend_from_slice(&2u32.to_le_bytes());
+    golden.extend_from_slice(&[2, 1]); // Filename present empty.
+    golden.extend_from_slice(&[0; 10]); // logical length zero, extent count zero.
+    for tag in 3..=14 {
+        golden.extend_from_slice(&[tag, 0]);
+    }
+    let mut page = b"ATAMP001\0\x01\x00\x00\x00".to_vec();
+    page.extend_from_slice(&(golden.len() as u32).to_le_bytes());
+    page.extend_from_slice(&golden);
+    let digest: [u8; 32] = Sha256::digest(&page).into();
+    assert_eq!(fs::read(object(&root, digest)).expect("independent golden page exists"), page);
+    let wire = fs::read(object(&root, reference.root.digest)).unwrap();
+    assert_eq!(&wire[wire.len() - 40..wire.len() - 8], &digest);
+}
+
 // Missing framing, reordered fields, or a sequence-number generation breaks this literal vector.
 #[test]
 fn empty_manifest_matches_independent_golden_wire() {
@@ -349,6 +438,17 @@ fn row_extent_and_logical_caps_are_checked_before_growth() {
     let mut extra = AcceptedRowV1::default();
     extra.fields[0] = Some(field(0, 0, 1));
     assert!(matches!(builder.push(extra), Err(Error::Limit)));
+    drop(builder);
+    let mut page_sized = AcceptedRowV1::default();
+    page_sized.fields[0] =
+        Some(FieldRef::new(1024, vec![Extent { chunk_index: 0, offset: 0, bytes: 1 }; 1024]).unwrap());
+    let mut builder = BatchManifestBuilder::new(&mut writer, binding(), vec![data], deadline()).unwrap();
+    // 106 fixed bytes + 10 field bytes + 10240 extent bytes = 10356;
+    // three framed rows fit a 32768-byte page, four do not.
+    for _ in 0..768 {
+        builder.push(page_sized.clone()).unwrap();
+    }
+    assert!(matches!(builder.push(page_sized), Err(Error::Limit)), "metadata page cap must fail before a 257th page");
 }
 
 // The admitted deadline belongs to the whole session, including CPU-only row access and later reads.
@@ -392,6 +492,29 @@ fn decoded_field_tokens_are_bound_to_exact_snapshot() {
     assert!(matches!(sa.read_field_range(&field(0, 0, 3), 0, &mut [0; 3], deadline()), Err(Error::IdentityMismatch)));
     assert!(matches!(sa.read_field_range(&token, u64::MAX, &mut [0; 3], deadline()), Err(Error::Limit)));
     assert!(matches!(sa.read_field_range(&token, 0, &mut [0; MAX_RANGE_BYTES + 1], deadline()), Err(Error::Limit)));
+    let mut forged = token.clone();
+    forged.extents[0].bytes = 2;
+    forged.logical_bytes = 2;
+    assert!(matches!(sa.read_field_range(&forged, 0, &mut [0; 2], deadline()), Err(Error::Corrupt)));
+    let mut other_binding = binding();
+    other_binding.identity_key[0] ^= 1;
+    let mut builder = BatchManifestBuilder::new(&mut writer, other_binding.clone(), vec![data], deadline()).unwrap();
+    let mut row = AcceptedRowV1::default();
+    row.fields[0] = Some(field(0, 0, 3));
+    builder.push(row).unwrap();
+    let other = builder.finish().unwrap();
+    drop(sb); // Keep the shared reader's descriptor budget available.
+    let mut other_snapshot = BatchSnapshot::open(&reader, &other, &other_binding, deadline()).unwrap();
+    assert!(matches!(
+        other_snapshot.read_field_range(&token, 0, &mut [0; 3], deadline()),
+        Err(Error::IdentityMismatch)
+    ));
+    let mut wrong = a.clone();
+    wrong.identity.catalog = CatalogId::from_bytes([9; 32]);
+    assert!(matches!(BatchSnapshot::open(&reader, &wrong, &binding(), deadline()), Err(Error::IdentityMismatch)));
+    let mut wrong = a.clone();
+    wrong.identity.store = StoreId::from_bytes([9; 16]);
+    assert!(matches!(BatchSnapshot::open(&reader, &wrong, &binding(), deadline()), Err(Error::IdentityMismatch)));
 }
 
 // Decoded labels cannot stand in for confirming actual selected inode and directory durability.
@@ -418,6 +541,19 @@ fn decoded_data_requires_actual_durability_and_preserves_poisoning() {
 // Child content is checked lazily; missing/corrupt data is a typed failure, never healthy empty bytes.
 #[test]
 fn lazy_data_reads_refuse_missing_corrupt_and_replaced_children() {
+    let (_temp, root, mut writer) = setup();
+    let data = publish(&mut writer, b"abc");
+    let mut row = AcceptedRowV1::default();
+    row.fields[0] = Some(field(0, 0, 3));
+    let reference = batch(&mut writer, vec![data], vec![row]);
+    let reader = Reader::open(&root, reference.identity).unwrap();
+    let mut snapshot = open(&reader, &reference);
+    let token = snapshot.next_row().unwrap().unwrap().fields[0].take().unwrap();
+    assert_eq!(bytes(&mut snapshot, &token), b"abc");
+    let path = object(&root, data.digest);
+    fs::rename(&path, path.with_extension("old")).unwrap();
+    fs::write(&path, b"xyz").unwrap();
+    assert_eq!(bytes(&mut snapshot, &token), b"abc", "selected data inode stays pinned after pathname replacement");
     for corrupt in [false, true] {
         let (_temp, root, mut writer) = setup();
         let data = publish(&mut writer, b"abc");
@@ -516,7 +652,7 @@ fn root_framing_rejects_reserved_trailing_counts_and_binding() {
 // Page corruption and absence are checked on first row access, without exposing a partial descriptor.
 #[test]
 fn page_framing_and_missing_pages_fail_closed() {
-    for mode in 0..5 {
+    for mode in 0..15 {
         let (_temp, root, mut writer) = setup();
         let reference = batch(&mut writer, vec![], vec![AcceptedRowV1::default()]);
         let mut wire = fs::read(object(&root, reference.root.digest)).unwrap();
@@ -534,6 +670,32 @@ fn page_framing_and_missing_pages_fail_closed() {
                 3 => page.truncate(page.len() - 1),
                 4 => {
                     page[13..17].copy_from_slice(&u32::MAX.to_le_bytes());
+                }
+                5 => page[17 + 78] = 15, // Unknown closed field tag.
+                6 => page[17 + 8] = 2,   // Unknown nullable hash presence tag.
+                7 => page[9..13].copy_from_slice(&2u32.to_le_bytes()),
+                8 => page[13..17].copy_from_slice(&16_385u32.to_le_bytes()),
+                9 => page[17 + 79] = 2, // Reserved field presence tag.
+                10..=14 => {
+                    page[17 + 79] = 1; // Present first field.
+                    let mut descriptor = vec![];
+                    let logical: u64 = if mode == 10 {
+                        u64::MAX
+                    } else if mode == 13 {
+                        0
+                    } else {
+                        1
+                    };
+                    descriptor.extend_from_slice(&logical.to_le_bytes());
+                    descriptor.extend_from_slice(&(if mode == 11 { 1025u16 } else { 1u16 }).to_le_bytes());
+                    if mode >= 12 {
+                        descriptor.extend_from_slice(&0u16.to_le_bytes()); // No data chunks exist.
+                        descriptor.extend_from_slice(&(if mode == 14 { u32::MAX } else { 0u32 }).to_le_bytes());
+                        descriptor.extend_from_slice(&(if mode == 13 { 0u32 } else { 1u32 }).to_le_bytes());
+                    }
+                    let length = 106 + descriptor.len();
+                    page.splice(17 + 80..17 + 80, descriptor);
+                    page[13..17].copy_from_slice(&(length as u32).to_le_bytes());
                 }
                 _ => unreachable!(),
             }
@@ -579,6 +741,29 @@ fn manifest_crash_boundaries_publish_root_last() {
         );
         wait_marker(&mut child, &marker, boundary.as_bytes());
         assert!(!marker.with_extension("returned").exists());
+        let page = default_page_wire();
+        let root_wire = default_root_wire(identity, &page);
+        let page_digest: [u8; 32] = Sha256::digest(&page).into();
+        let root_digest: [u8; 32] = Sha256::digest(&root_wire).into();
+        assert_eq!(fs::read(object(&root, page_digest)).unwrap(), page);
+        if boundary == "manifest-root-durable" {
+            assert_eq!(fs::read(object(&root, root_digest)).unwrap(), root_wire);
+            let reference = BatchRef {
+                identity,
+                binding: binding(),
+                generation: Generation(root_digest),
+                root: PayloadRef::from_parts(identity, root_digest, root_wire.len() as u32).unwrap(),
+            };
+            let reader = Reader::open(&root, identity).unwrap();
+            let mut snapshot = open(&reader, &reference);
+            assert_eq!(snapshot.next_row().unwrap(), Some(AcceptedRowV1::default()));
+            assert!(snapshot.next_row().unwrap().is_none());
+        } else {
+            assert!(
+                !object(&root, root_digest).exists(),
+                "root must not be installed before durable children and root publication"
+            );
+        }
         child.kill().unwrap();
         child.wait().unwrap();
         let mut writer = Writer::open(&root, identity).unwrap();
