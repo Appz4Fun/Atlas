@@ -445,6 +445,9 @@ impl Runtime {
             tx.commit()?;
             let pg = super::sql::Pg::new(&mut owner);
             let sql: &dyn super::sql::Sql = &pg;
+            let lockstep = config.backfill_lockstep_days.unwrap_or(crate::chunks::LOCKSTEP_DAYS);
+            crate::chunks::LOCKSTEP.store(lockstep, Ordering::Relaxed);
+            println!("backfill lockstep window: {lockstep} day(s)");
             sql.tx(|connection| {
                 crate::chunks::set_forward_start(
                     connection,
