@@ -148,6 +148,25 @@ impl<'a> Fixture<'a> {
     }
 }
 
+// Negative importer admission controls inspect the real error within the
+// guarded transaction. Returning a Service error through Owner::with would
+// correctly end that attempt; these controls do not change that policy.
+fn import_admission_error(runtime: &Runtime, entries: &[Entry]) -> String {
+    runtime
+        .owner
+        .with(|client| {
+            let mut tx = client.transaction()?;
+            crate::pg::guard_native_transaction(&mut tx)?;
+            tx.batch_execute("set local statement_timeout='3s'; set local lock_timeout='250ms'")?;
+            let error = crate::pg::predb_cache::import_page_in(&mut tx, SOURCE, entries, 30, None)
+                .expect_err("oversized parsed page must fail actual importer admission");
+            tx.rollback()?;
+            Ok(error)
+        })
+        .unwrap()
+        .to_string()
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct Durable {
     revision: i64,
@@ -420,17 +439,15 @@ fn noop_multichunk_and_rolled_back_import_preserve_facts() {
             let old = lookup(runtime, MOVIE);
             let counters = fixture.service.counters.snapshot();
             let oversized_page = vec![fixture.known.clone(); 5001];
-            assert_eq!(
-                fixture.service.import_page_for_test(SOURCE, &oversized_page, 30, None).unwrap_err().to_string(),
-                "PreDB parsed page exceeds row admission"
-            );
-            let oversized_text = Entry { title: "x".repeat(8 * 1024 * 1024 + 1), ..Default::default() };
-            assert_eq!(
-                fixture.service.import_page_for_test(SOURCE, &[oversized_text], 30, None).unwrap_err().to_string(),
-                "PreDB parsed page exceeds byte admission"
-            );
+            assert_eq!(import_admission_error(runtime, &oversized_page), "PreDB parsed page exceeds row admission");
             assert_eq!(catalog(runtime), saved);
             assert_eq!(fixture.service.counters.snapshot(), counters);
+            fixture.sentinels();
+            let oversized_text = Entry { title: "x".repeat(8 * 1024 * 1024 + 1), ..Default::default() };
+            assert_eq!(import_admission_error(runtime, &[oversized_text]), "PreDB parsed page exceeds byte admission");
+            assert_eq!(catalog(runtime), saved);
+            assert_eq!(fixture.service.counters.snapshot(), counters);
+            fixture.sentinels();
             let page = vec![fixture.known.clone(); 513];
             assert_eq!(
                 fixture.import(&page, 30),
