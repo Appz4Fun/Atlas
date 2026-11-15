@@ -7,11 +7,14 @@ use std::{fmt, io};
 
 mod manifest;
 mod payload;
+mod session;
 #[allow(unused_imports)]
 pub(crate) use manifest::*;
 #[allow(unused_imports)] // The inactive primitive still exposes its planned return type.
 pub(crate) use payload::Chunk;
 pub(crate) use payload::{Reader, Writer};
+#[allow(unused_imports)]
+pub(crate) use session::{GcExclusive, ReadSession, SessionReader, WriteSession};
 
 pub(crate) const MAX_CHUNK_BYTES: u32 = 1024 * 1024;
 pub(crate) const MAX_RANGE_BYTES: usize = 64 * 1024;
@@ -117,3 +120,6 @@ mod manifest_tests;
 
 #[cfg(all(test, unix))]
 mod test_support;
+
+#[cfg(all(test, unix))]
+mod session_tests;

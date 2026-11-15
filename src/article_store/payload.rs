@@ -30,13 +30,15 @@ mod unix {
     /// Every owned descriptor, including path-walk/transient descriptors and returned
     /// chunks, holds a permit. Chunks keep the originating budget alive after Reader drops.
     #[derive(Default)]
-    struct Budget(AtomicUsize);
+    struct Budget(AtomicUsize, #[cfg(test)] AtomicUsize);
     struct Permit(Arc<Budget>);
     impl Budget {
         fn acquire(self: &Arc<Self>) -> Result<Permit> {
             self.0
                 .try_update(Ordering::AcqRel, Ordering::Acquire, |count| (count < MAX_OWNED_FDS).then_some(count + 1))
                 .map_err(|_| Error::Limit)?;
+            #[cfg(test)]
+            self.1.fetch_max(self.0.load(Ordering::Acquire), Ordering::AcqRel);
             Ok(Permit(self.clone()))
         }
     }
@@ -236,15 +238,118 @@ mod unix {
     fn lock_at(root: &Pinned, create: bool, budget: &Arc<Budget>) -> Result<Pinned> {
         let flags = libc::O_RDWR | if create { libc::O_CREAT | libc::O_EXCL } else { 0 };
         let lock = open_at(root.as_raw_fd(), c"writer.lock", flags, budget)?;
-        // SAFETY: the descriptor is a regular file owned by lock.
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        try_flock(&lock, libc::LOCK_EX)?;
+        Ok(lock)
+    }
+    fn try_flock(file: &Pinned, operation: i32) -> Result<()> {
+        // SAFETY: the descriptor is a regular file exclusively owned by file.
+        if unsafe { libc::flock(file.as_raw_fd(), operation | libc::LOCK_NB) } != 0 {
             let error = io::Error::last_os_error();
-            if matches!(error.raw_os_error(), Some(libc::EWOULDBLOCK)) {
+            if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
                 return Err(Error::Busy);
             }
             return Err(Error::Io(error));
         }
-        Ok(lock)
+        Ok(())
+    }
+
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    struct GateIdentity {
+        dev: u64,
+        ino: u64,
+    }
+    fn gate_identity(file: &File) -> Result<GateIdentity> {
+        let metadata = file.metadata()?;
+        // This private persistent inode has no mutable record or replaceable generation.
+        if !metadata.is_file()
+            || metadata.mode() & 0o7777 != 0o600
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.nlink() != 1
+            || metadata.len() != 0
+        {
+            return Err(Error::Corrupt);
+        }
+        Ok(GateIdentity { dev: metadata.dev(), ino: metadata.ino() })
+    }
+    fn gate_name_identity(root: &Pinned) -> Result<GateIdentity> {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: root stays pinned; the name is fixed and stat is initialized on success.
+        if unsafe {
+            libc::fstatat(root.as_raw_fd(), c"read-gc.lock".as_ptr(), stat.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW)
+        } != 0
+        {
+            return Err(path_error(io::Error::last_os_error()));
+        }
+        // SAFETY: successful fstatat initialized the complete stat record.
+        let stat = unsafe { stat.assume_init() };
+        if stat.st_mode & libc::S_IFMT != libc::S_IFREG
+            || stat.st_mode & 0o7777 != 0o600
+            || stat.st_uid != unsafe { libc::geteuid() }
+            || stat.st_nlink != 1
+            || stat.st_size != 0
+        {
+            return Err(Error::Corrupt);
+        }
+        Ok(GateIdentity { dev: stat.st_dev as u64, ino: stat.st_ino as u64 })
+    }
+    /// Pins the existing lock domain independently of every acquired flock.
+    pub(crate) struct GateAnchor {
+        file: Pinned,
+        identity: GateIdentity,
+    }
+    pub(crate) struct GateGuard {
+        _file: Pinned,
+    }
+    impl GateAnchor {
+        fn open(root: &Pinned, budget: &Arc<Budget>) -> Result<Self> {
+            let file = open_at(root.as_raw_fd(), c"read-gc.lock", libc::O_RDONLY, budget)?;
+            let identity = gate_identity(&file.file)?;
+            let anchor = Self { file, identity };
+            anchor.validate(root)?;
+            Ok(anchor)
+        }
+        fn validate(&self, root: &Pinned) -> Result<()> {
+            if gate_identity(&self.file.file)? != self.identity || gate_name_identity(root)? != self.identity {
+                return Err(Error::Corrupt);
+            }
+            Ok(())
+        }
+        fn acquire(
+            &self,
+            root: &Pinned,
+            budget: &Arc<Budget>,
+            exclusive: bool,
+            deadline: Instant,
+        ) -> Result<GateGuard> {
+            check(deadline)?;
+            // Every session needs a new open-file description. Cloning would share
+            // one flock and let a second acquisition convert/release the first.
+            let file = open_at(root.as_raw_fd(), c"read-gc.lock", libc::O_RDONLY, budget)?;
+            self.validate(root)?;
+            if gate_identity(&file.file)? != self.identity {
+                return Err(Error::Corrupt);
+            }
+            let operation = if exclusive { libc::LOCK_EX } else { libc::LOCK_SH };
+            loop {
+                check(deadline)?;
+                match try_flock(&file, operation) {
+                    Ok(()) => break,
+                    Err(Error::Io(error)) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) => {
+                        check(deadline)?;
+                        return Err(error);
+                    }
+                }
+            }
+            // A pathname substitution concurrent with flock cannot create a second
+            // admitted lock domain. fstatat needs no extra owned descriptor.
+            self.validate(root)?;
+            if gate_identity(&file.file)? != self.identity {
+                return Err(Error::Corrupt);
+            }
+            check(deadline)?;
+            Ok(GateGuard { _file: file })
+        }
     }
 
     /// Private temporary-name cleanup only. This never scans or collects crash leftovers.
@@ -300,6 +405,7 @@ mod unix {
         identity: Identity,
         budget: Arc<Budget>,
         poisoned: Cell<bool>,
+        gate: Option<GateAnchor>,
     }
     pub(crate) struct Reader {
         root: Pinned,
@@ -316,6 +422,10 @@ mod unix {
     }
 
     impl Writer {
+        #[cfg(test)]
+        pub(crate) fn test_descriptor_counts(&self) -> (usize, usize) {
+            (self.budget.0.load(Ordering::Acquire), self.budget.1.load(Ordering::Acquire))
+        }
         fn flush(&self, file: &File, deadline: Option<Instant>, point: SyncPoint) -> Result<()> {
             if let Some(deadline) = deadline {
                 check(deadline)?;
@@ -343,7 +453,7 @@ mod unix {
             let chunks = directory(root.as_raw_fd(), c"chunks", &budget)?;
             let lock = lock_at(&root, true, &budget)?;
             let identity = Identity::from_parts(catalog, StoreId::from_bytes(random()?));
-            let writer = Self { root, chunks, _lock: lock, identity, budget, poisoned: Cell::new(false) };
+            let writer = Self { root, chunks, _lock: lock, identity, budget, poisoned: Cell::new(false), gate: None };
             let (mut temp, mut file) = TempName::create(&writer.root, &writer.budget)?;
             let mut bytes = [0; 88];
             bytes[..8].copy_from_slice(b"ATART001");
@@ -375,7 +485,7 @@ mod unix {
             if identity != expected {
                 return Err(Error::IdentityMismatch);
             }
-            let writer = Self { root, chunks, _lock: lock, identity, budget, poisoned: Cell::new(false) };
+            let writer = Self { root, chunks, _lock: lock, identity, budget, poisoned: Cell::new(false), gate: None };
             // Visible valid identity bytes can precede completion of initialization.
             // Admit a writer only after the actual pinned inode and complete required
             // directory chain are durable under the acquired single-writer lock.
@@ -410,6 +520,41 @@ mod unix {
             self.flush(&self.chunks.file, Some(deadline), SyncPoint::Other)?;
             self.flush(&self.root.file, Some(deadline), SyncPoint::Other)?;
             check(deadline)
+        }
+        /// Explicitly reconcile the persistent gate under the held writer lock.
+        /// Its inode is never replaced or unlinked, including after a failed flush.
+        pub(crate) fn initialize_read_gate(&mut self) -> Result<()> {
+            if self.poisoned.get() {
+                return Err(Error::Busy);
+            }
+            if self.gate.is_none() {
+                match GateAnchor::open(&self.root, &self.budget) {
+                    Ok(anchor) => self.gate = Some(anchor),
+                    Err(Error::Missing) => {
+                        let file = open_at(
+                            self.root.as_raw_fd(),
+                            c"read-gc.lock",
+                            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+                            &self.budget,
+                        )?;
+                        let identity = gate_identity(&file.file)?;
+                        self.gate = Some(GateAnchor { file, identity });
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            let anchor = self.gate.as_ref().ok_or(Error::Missing)?;
+            anchor.validate(&self.root)?;
+            self.flush(&anchor.file.file, None, SyncPoint::Other)?;
+            self.flush(&self.root.file, None, SyncPoint::Other)?;
+            anchor.validate(&self.root)
+        }
+        pub(crate) fn acquire_write_gate(&self, deadline: Instant) -> Result<GateGuard> {
+            if self.poisoned.get() {
+                return Err(Error::Busy);
+            }
+            check(deadline)?;
+            self.gate.as_ref().ok_or(Error::Missing)?.acquire(&self.root, &self.budget, false, deadline)
         }
         pub(crate) fn identity(&self) -> Identity {
             self.identity
@@ -505,6 +650,10 @@ mod unix {
         }
     }
     impl Reader {
+        #[cfg(test)]
+        pub(crate) fn test_descriptor_counts(&self) -> (usize, usize) {
+            (self.budget.0.load(Ordering::Acquire), self.budget.1.load(Ordering::Acquire))
+        }
         pub(crate) fn open(root: &Path, expected: Identity) -> Result<Self> {
             let budget = Arc::new(Budget::default());
             let (root, _) = root_directory(root, false, &budget)?;
@@ -514,6 +663,17 @@ mod unix {
             }
             let chunks = directory(root.as_raw_fd(), c"chunks", &budget)?;
             Ok(Self { root, chunks, identity, budget })
+        }
+        pub(crate) fn pin_read_gate(&self) -> Result<GateAnchor> {
+            GateAnchor::open(&self.root, &self.budget)
+        }
+        pub(crate) fn acquire_read_gate(
+            &self,
+            anchor: &GateAnchor,
+            exclusive: bool,
+            deadline: Instant,
+        ) -> Result<GateGuard> {
+            anchor.acquire(&self.root, &self.budget, exclusive, deadline)
         }
         pub(crate) fn open_chunk(&self, reference: PayloadRef, deadline: Instant) -> Result<Chunk> {
             check(deadline)?;
@@ -614,7 +774,7 @@ mod unix {
     }
 }
 #[cfg(unix)]
-pub(crate) use unix::{Chunk, Reader, Writer};
+pub(crate) use unix::{Chunk, GateAnchor, GateGuard, Reader, Writer};
 #[cfg(all(test, unix))]
 pub(super) use unix::{
     test_clear_sync_failure, test_fail_final_sync, test_fail_next_sync, test_fail_parent_sync, test_sync_calls,
@@ -627,6 +787,8 @@ mod unsupported {
     pub(crate) struct Writer;
     pub(crate) struct Reader;
     pub(crate) struct Chunk;
+    pub(crate) struct GateAnchor;
+    pub(crate) struct GateGuard;
     impl Writer {
         pub(crate) fn create(_: &Path, _: CatalogId) -> Result<Self> {
             Err(Error::Unsupported)
@@ -635,6 +797,12 @@ mod unsupported {
             Err(Error::Unsupported)
         }
         pub(crate) fn confirm_durable(&mut self, _: PayloadRef, _: Instant) -> Result<()> {
+            Err(Error::Unsupported)
+        }
+        pub(crate) fn initialize_read_gate(&mut self) -> Result<()> {
+            Err(Error::Unsupported)
+        }
+        pub(crate) fn acquire_write_gate(&self, _: Instant) -> Result<GateGuard> {
             Err(Error::Unsupported)
         }
         pub(crate) fn identity(&self) -> Identity {
@@ -648,6 +816,12 @@ mod unsupported {
         pub(crate) fn open(_: &Path, _: Identity) -> Result<Self> {
             Err(Error::Unsupported)
         }
+        pub(crate) fn pin_read_gate(&self) -> Result<GateAnchor> {
+            Err(Error::Unsupported)
+        }
+        pub(crate) fn acquire_read_gate(&self, _: &GateAnchor, _: bool, _: Instant) -> Result<GateGuard> {
+            Err(Error::Unsupported)
+        }
         pub(crate) fn open_chunk(&self, _: PayloadRef, _: Instant) -> Result<Chunk> {
             Err(Error::Unsupported)
         }
@@ -659,4 +833,4 @@ mod unsupported {
     }
 }
 #[cfg(not(unix))]
-pub(crate) use unsupported::{Chunk, Reader, Writer};
+pub(crate) use unsupported::{Chunk, GateAnchor, GateGuard, Reader, Writer};
