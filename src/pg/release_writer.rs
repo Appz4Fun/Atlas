@@ -180,6 +180,16 @@ struct Local {
     xid: Option<String>,
 }
 
+impl Local {
+    /// The id of the transaction this save runs in, asked for once.
+    fn xid(&mut self, tx: &mut Transaction<'_>) -> Result<String> {
+        if self.xid.is_none() {
+            self.xid = Some(tx.query_one("select pg_current_xact_id()::text", &[])?.try_get(0)?);
+        }
+        Ok(self.xid.clone().expect("set above"))
+    }
+}
+
 fn flush(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], now: i64, stats: &mut SaveStats, timing_key: &mut Option<i64>, local: Option<&mut Local>) -> Result<()> {
     if timing_key.is_none() && batch.iter().any(|row| row.article.is_some()) {
         *timing_key = Some(timing::key(tx)?);
@@ -308,6 +318,15 @@ fn flush_local(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], no
             ])?;
         }
         writer.finish()?;
+    }
+    // A release with a program is deleted from the catalogue below; its
+    // articles leave the store when this transaction commits.
+    if heads.iter().any(|&ordinal| batch[ordinal].article.is_none()) {
+        let gone: Vec<i64> = tx.query(RETRACTED, &[&group])?.iter().map(|row| row.try_get(0)).collect::<Result<_, _>>()?;
+        if !gone.is_empty() {
+            let xid = local.xid(tx)?;
+            local.store.retract(&xid, &gone)?;
+        }
     }
     let release = tx.query_one(&WRITE_RELEASES.replace("pg_temp.atlas_release_input", "pg_temp.atlas_release_fold"), &[&group])?;
     stats.releases += release.get::<_, i64>(0) as u64;
@@ -523,10 +542,8 @@ fn flush_local(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], no
             }),
         })
         .collect();
-    if local.xid.is_none() {
-        local.xid = Some(tx.query_one("select pg_current_xact_id()::text", &[])?.try_get(0)?);
-    }
-    let gained = local.store.add(local.xid.as_deref().expect("set above"), &rows, crate::parser::MAX_PARTS)?;
+    let xid = local.xid(tx)?;
+    let gained = local.store.add(&xid, &rows, crate::parser::MAX_PARTS)?;
     let parts = rows.len() as u64;
     stats.parts += parts;
     // The trigger on `segments` told post-processing a release's input changed.
@@ -979,6 +996,13 @@ const RELEASE_IDS: &str = "
     from pg_temp.atlas_release_fold s
     join releases r on r.group_name = $1 and (r.is_collection, r.identity_key) = (s.is_collection, s.identity_key)
     where not s.junk";
+
+// The releases the junk markers of a batch are about to delete.
+const RETRACTED: &str = "
+    select r.id
+    from pg_temp.atlas_release_fold s
+    join releases r on r.group_name = $1 and (r.is_collection, r.identity_key) = (s.is_collection, s.identity_key)
+    where s.junk";
 
 // Create the files a batch names for the first time.
 const ADD_FILES: &str = "

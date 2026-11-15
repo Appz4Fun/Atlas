@@ -110,6 +110,12 @@ const SCHEMA: &str = "
         xid text not null,
         keys blob not null
     );
+    -- Releases a save deleted from the catalogue: their articles go once it commits.
+    create table if not exists retracted (
+        op integer primary key,
+        xid text not null,
+        release_id integer not null
+    );
 ";
 
 impl Store {
@@ -238,13 +244,40 @@ impl Store {
 
     /// The caller saw PostgreSQL commit `xid`: its rows stay and stop waiting.
     pub(crate) fn confirm(&self, xid: &str) -> Result<()> {
-        self.lock()?.execute("delete from unsettled where xid = ?1", [xid])?;
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        Self::committed(&tx, xid)?;
+        Ok(tx.commit()?)
+    }
+
+    /// `xid` committed: its rows stop waiting and the releases it deleted lose their articles.
+    fn committed(tx: &rusqlite::Transaction<'_>, xid: &str) -> Result<()> {
+        tx.execute("delete from segments where release_id in (select release_id from retracted where xid = ?1)", [xid])?;
+        tx.execute("delete from envelopes where release_id in (select release_id from retracted where xid = ?1)", [xid])?;
+        tx.execute("delete from retracted where xid = ?1", [xid])?;
+        tx.execute("delete from unsettled where xid = ?1", [xid])?;
         Ok(())
+    }
+
+    /// The save under `xid` deleted these releases from the catalogue. Their
+    /// articles are dropped when it commits and kept if it rolls back.
+    pub(crate) fn retract(&self, xid: &str, releases: &[i64]) -> Result<()> {
+        ensure!(self.writer, "the local article store is open for reading only");
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        for release in releases {
+            tx.execute("insert into retracted (xid, release_id) values (?1, ?2)", params![xid, release])?;
+        }
+        Ok(tx.commit()?)
     }
 
     /// Whether any save is still waiting to hear how its transaction ended.
     pub(crate) fn has_unsettled(&self) -> Result<bool> {
-        Ok(self.lock()?.query_row("select exists(select 1 from unsettled)", [], |row| row.get(0))?)
+        Ok(self.lock()?.query_row(
+            "select exists(select 1 from unsettled) or exists(select 1 from retracted)",
+            [],
+            |row| row.get(0),
+        )?)
     }
 
     /// Ask `ended` about every transaction with rows still waiting. Rows of a
@@ -253,7 +286,7 @@ impl Store {
         ensure!(self.writer, "the local article store is open for reading only");
         let xids: Vec<String> = {
             let conn = self.lock()?;
-            let mut list = conn.prepare("select distinct xid from unsettled")?;
+            let mut list = conn.prepare("select xid from unsettled union select xid from retracted")?;
             list.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?
         };
         // PostgreSQL is asked with the store unlocked, so readers are not kept waiting on it.
@@ -280,8 +313,12 @@ impl Store {
                         envelope.execute(params![release, id])?;
                     }
                 }
+                drop((segment, envelope));
+                tx.execute("delete from retracted where xid = ?1", [&xid])?;
+                tx.execute("delete from unsettled where xid = ?1", [&xid])?;
+            } else {
+                Self::committed(&tx, &xid)?;
             }
-            tx.execute("delete from unsettled where xid = ?1", [&xid])?;
             tx.commit()?;
         }
         Ok(())
@@ -290,7 +327,8 @@ impl Store {
     /// Whether a save other than `own` is still waiting to hear how its transaction ended.
     pub(crate) fn has_unsettled_besides(&self, own: Option<&str>) -> Result<bool> {
         Ok(self.lock()?.query_row(
-            "select exists(select 1 from unsettled where ?1 is null or xid <> ?1)",
+            "select exists(select 1 from unsettled where ?1 is null or xid <> ?1)
+                 or exists(select 1 from retracted where ?1 is null or xid <> ?1)",
             [own],
             |row| row.get(0),
         )?)
@@ -349,17 +387,15 @@ impl Store {
         Ok(())
     }
 
-    /// Drop every article of these releases, as a retracted release's cascade did.
+    /// A fixture's `delete from segments where release_id = ..`.
+    #[cfg(test)]
     pub(crate) fn forget_releases(&self, releases: &[i64]) -> Result<u64> {
-        ensure!(self.writer, "the local article store is open for reading only");
-        let mut conn = self.lock()?;
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let conn = self.lock()?;
         let mut gone = 0;
         for release in releases {
-            gone += tx.execute("delete from segments where release_id = ?1", [release])? as u64;
-            tx.execute("delete from envelopes where release_id = ?1", [release])?;
+            gone += conn.execute("delete from segments where release_id = ?1", [release])? as u64;
+            conn.execute("delete from envelopes where release_id = ?1", [release])?;
         }
-        tx.commit()?;
         Ok(gone)
     }
 }
@@ -444,18 +480,27 @@ pub(crate) fn of(client: &mut impl postgres::GenericClient) -> Result<Option<Arc
     Ok(Some(store))
 }
 
+/// The transaction `tx` deleted these releases from the catalogue: when the
+/// schema keeps its articles locally, theirs are dropped once it commits.
+pub(crate) fn retract_in(tx: &mut postgres::Transaction<'_>, releases: &[i64]) -> Result<()> {
+    let Some(store) = of(tx)? else { return Ok(()) };
+    let xid: String = tx.query_one("select pg_current_xact_id()::text", &[])?.try_get(0)?;
+    store.retract(&xid, releases)
+}
+
 /// Ask PostgreSQL how the transaction `xid` ended. One too old for PostgreSQL
 /// to remember is taken as committed: its rows were visible long enough to be
-/// read. One PostgreSQL has not handed out yet was lost when the server
-/// crashed before writing it down, so it never committed.
+/// read. One PostgreSQL says it has never handed out was lost when the server
+/// crashed before writing it down, so it never committed; that answer is an
+/// error, asked under a savepoint so the caller's transaction survives it.
 pub(crate) fn pg_ended(client: &mut impl postgres::GenericClient, xid: &str) -> Result<Ended> {
-    let status: Option<String> = client
-        .query_one(
-            "select case when $1::text::xid8 >= pg_snapshot_xmax(pg_current_snapshot()) then 'lost'
-                         else pg_xact_status($1::text::xid8) end",
-            &[&xid],
-        )?
-        .try_get(0)?;
+    let mut ask = client.transaction()?;
+    let status: Option<String> = match ask.query_one("select pg_xact_status($1::text::xid8)", &[&xid]) {
+        Ok(row) => row.try_get(0)?,
+        Err(error) if error.code() == Some(&postgres::error::SqlState::INVALID_PARAMETER_VALUE) => Some("lost".into()),
+        Err(error) => return Err(error.into()),
+    };
+    ask.rollback()?;
     Ok(match status.as_deref() {
         Some("in progress") => Ended::Running,
         Some("aborted" | "lost") => Ended::RolledBack,
