@@ -386,6 +386,9 @@ mod unix {
             writer.flush(&parent.file, None, SyncPoint::Parent)?;
             Ok(writer)
         }
+        pub(crate) fn confirm_durable(&mut self, _: PayloadRef, _: Instant) -> Result<()> {
+            Err(Error::Unsupported)
+        }
         pub(crate) fn identity(&self) -> Identity {
             self.identity
         }
@@ -607,6 +610,9 @@ mod unsupported {
             Err(Error::Unsupported)
         }
         pub(crate) fn open(_: &Path, _: Identity) -> Result<Self> {
+            Err(Error::Unsupported)
+        }
+        pub(crate) fn confirm_durable(&mut self, _: PayloadRef, _: Instant) -> Result<()> {
             Err(Error::Unsupported)
         }
         pub(crate) fn identity(&self) -> Identity {
