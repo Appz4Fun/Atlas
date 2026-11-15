@@ -885,6 +885,10 @@ impl Scheduler {
     /// After a day chunk of `group` on `server`. Errors count like a pass error
     /// and rest the pair; a server that doesnt carry the group skips its chunks for good.
     fn finish_chunk(&self, group: String, server: usize, result: anyhow::Result<Progress>) {
+        // a day done may open the next lockstep day or make a sweep due, a failed one goes back to pending: every
+        // server's workers look again at once rather than wait out a hold set before
+        self.no_chunk_until.lock().unwrap().clear();
+        self.no_sweep_until.lock().unwrap().clear();
         let key = (group, server);
         match result {
             Ok(_) => {
@@ -1067,7 +1071,8 @@ async fn take_sweep(sched: &Scheduler, server: usize, db: &Db) -> Option<String>
     found
 }
 
-/// How long a server's look for a split group to sweep that found none holds before the next. Every idle worker
+/// How long a server's look for a split group to sweep that found none (or failed) holds before the next, unless a
+/// day chunk finishes first (`finish_chunk`). Every idle worker
 /// looked, each time, on the indexer's one owner session: on prod it was that session's biggest single user, ahead of
 /// the saves. A sweep is due only once every day chunk of a split group is done, which these seconds barely delay.
 #[cfg(not(test))]
@@ -1076,7 +1081,8 @@ const SWEEP_RECHECK: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const SWEEP_RECHECK: Duration = Duration::ZERO;
 
-/// How long a server's look for a day chunk that found none holds before its workers look again: each idle worker
+/// How long a server's look for a day chunk that found none (or failed) holds before its workers look again, unless a
+/// day chunk finishes first (`finish_chunk`): each idle worker
 /// looked straight away, with a claim over every group on the owner session. A chunk that becomes claimable in the
 /// meantime waits at most this long.
 #[cfg(not(test))]
