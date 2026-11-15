@@ -1984,6 +1984,9 @@ const DATE_SCAN_MAX: u64 = DATE_LOOK << 6;
 /// for (stepped over numbers can hide a crowd), it holds no more. A window
 /// of `DATE_SCAN_MAX` numbers is always read whole
 const DATE_ROWS: usize = DATE_SCAN_MAX as usize;
+/// One date probe, including plain fallbacks, may spend two attempts per
+/// possible u64 bisection level, never a complete refusal tree.
+const DATE_PROBE_ATTEMPTS: usize = 2 * u64::BITS as usize;
 
 /// Several providers tried in priority order, each with up to `connections`
 /// requests in flight.
@@ -3363,19 +3366,36 @@ impl Pool {
     /// only their scalar ends. A listing cut short costs its connection,
     /// which still has the rest of it on the wire.
     async fn ends(&self, i: usize, group: &str, start: u64, end: u64) -> Result<Ends> {
+        tokio::time::timeout(self.timeout, self.ends_bounded(i, group, start, end)).await.map_err(|_| timed_out())?
+    }
+
+    /// All retries share one operation deadline and one wire-attempt allowance.
+    async fn ends_bounded(&self, i: usize, group: &str, start: u64, end: u64) -> Result<Ends> {
         let mut todo = vec![(start, end)];
         let mut combined = Ends::empty();
+        let mut attempts = 0;
+        let mut first_refusal = None;
         while let Some((a, b)) = todo.pop() {
             let rows = DATE_ROWS - combined.rows;
-            let r = match self.ends_once(i, group, a, b, rows, false).await {
-                Err(NntpError::Decompress(e)) => {
-                    self.no_compression(i, &e);
-                    self.ends_once(i, group, a, b, rows, true).await
+            let mut plain = false;
+            let r = loop {
+                if attempts == DATE_PROBE_ATTEMPTS {
+                    return Err(first_refusal.unwrap_or_else(overview_budget));
                 }
-                r => r,
+                attempts += 1;
+                match self.ends_once(i, group, a, b, rows, plain).await {
+                    Err(NntpError::Decompress(e)) if !plain => {
+                        self.no_compression(i, &e);
+                        plain = true;
+                    }
+                    r => break r,
+                }
             };
             let ends = match r {
                 Err(e) if e.is_overview_budget() && a < b => {
+                    if first_refusal.is_none() {
+                        first_refusal = Some(e);
+                    }
                     // The refused lease is already gone. Read left first;
                     // at most one right sibling per u64 bisection is held.
                     let mid = a + (b - a) / 2;
