@@ -71,7 +71,7 @@ pub(crate) enum ImportStatus { Pending, Applied { counts: crate::predb::import::
 /// policy as the SQLite importer run inside the original owner's RC transaction.
 /// Never starts a provider request, advances a release cursor or prunes a row.
 pub(crate) fn import_in(tx: &mut Transaction<'_>, source: i64, entries: &[crate::predb::import::Entry], now: i64, cursor: Option<(i64,i64)>) -> Result<ImportStatus> {
-    use crate::predb::{import::{Counts, MAX_CATEGORY, MAX_NUKE_REASON}, keys::{valid_title,name_key}};
+    use crate::predb::{import::Counts, keys::name_key};
     ensure!(entries.len() <= PAGE as usize, "PreDB import page exceeds admission");
     ensure!(tx.query_one("select current_setting('transaction_isolation')", &[])?.try_get::<_, String>(0)? == "read committed", "PreDB import requires READ COMMITTED");
     tx.batch_execute("lock table ext_predb_titles in share row exclusive mode; lock table ext_predb_title_keys in access exclusive mode")?;
@@ -83,30 +83,29 @@ pub(crate) fn import_in(tx: &mut Transaction<'_>, source: i64, entries: &[crate:
     let mut keys: i64 = meta.try_get(3)?;
     let previous_revision: i64 = meta.try_get(4)?;
     let mut counts = Counts::default();
-    for entry in entries {
-        let title = entry.title.trim();
-        if !valid_title(title) { counts.skipped += 1; continue }
-        let candidates = rows_for_key(tx, name_key(title))?;
-        ensure!(candidates.len() <= matcher::MAX_ROWS_PER_KEY, "PreDB importer candidate key exceeds admission");
-        let lower = title.to_lowercase();
-        let id = candidates.into_iter().find(|row| row.title.to_lowercase() == lower).map(|row| row.id);
-        let category = entry.category.as_deref().filter(|c| !c.is_empty() && c.len() <= MAX_CATEGORY);
-        let reason = entry.nuke_reason.as_deref().filter(|r| !r.is_empty()).map(|r| {
-            let mut end = r.len().min(MAX_NUKE_REASON); while !r.is_char_boundary(end) { end -= 1; } &r[..end]
-        });
-        let Some(id) = id else {
-            let id: i64 = tx.query_one("insert into ext_predb_titles(title,source,category,size_bytes,files,pre_at,nuked,nuke_reason,added_at)
-                values($1,$2,$3,$4,$5,$6,$7,$8,$9) returning id", &[&title,&source,&category,&entry.size_bytes,&entry.files,&entry.pre_at,&entry.nuked,&if entry.nuked != 0 { reason } else { None },&now])?.try_get(0)?;
-            for key in title_keys(title) { keys += i64::try_from(tx.execute("insert into ext_predb_title_keys(key,title_id) values($1,$2) on conflict do nothing", &[&key,&id])?)?; }
-            titles += 1; top = Some(top.map_or(id, |old| old.max(id))); counts.inserted += 1;
-            continue;
-        };
-        if top_before.is_some_and(|before| id <= before) { counts.min_known_id = Some(counts.min_known_id.map_or(id, |old| old.min(id))); }
-        let mut changed = tx.execute("update ext_predb_titles set category=coalesce(category,$2),size_bytes=coalesce(size_bytes,$3),files=coalesce(files,$4),pre_at=coalesce(pre_at,$5)
-            where id=$1 and ((category is null and $2::text is not null) or (size_bytes is null and $3::bigint is not null) or (files is null and $4::bigint is not null) or (pre_at is null and $5::bigint is not null))", &[&id,&category,&entry.size_bytes,&entry.files,&entry.pre_at])?;
-        if entry.nuked != 0 { changed += tx.execute("update ext_predb_titles set nuked=$2,nuke_reason=coalesce($3,nuke_reason)
-            where id=$1 and (nuked != $2 or ($3::text is not null and nuke_reason is distinct from $3))", &[&id,&entry.nuked,&reason])?; }
-        if changed > 0 { counts.updated += 1; } else { counts.skipped += 1; }
+    if let Some(unchanged) = unchanged::unchanged_chunk_in(tx, entries, top_before)? {
+        counts = unchanged;
+    } else {
+        for entry in entries {
+            let Some(NormalizedEntry { title, category, reason }) = normalize_entry(entry) else { counts.skipped += 1; continue };
+            let candidates = rows_for_key(tx, name_key(title))?;
+            ensure!(candidates.len() <= matcher::MAX_ROWS_PER_KEY, "PreDB importer candidate key exceeds admission");
+            let lower = title.to_lowercase();
+            let id = candidates.into_iter().find(|row| row.title.to_lowercase() == lower).map(|row| row.id);
+            let Some(id) = id else {
+                let id: i64 = tx.query_one("insert into ext_predb_titles(title,source,category,size_bytes,files,pre_at,nuked,nuke_reason,added_at)
+                    values($1,$2,$3,$4,$5,$6,$7,$8,$9) returning id", &[&title,&source,&category,&entry.size_bytes,&entry.files,&entry.pre_at,&entry.nuked,&if entry.nuked != 0 { reason } else { None },&now])?.try_get(0)?;
+                for key in title_keys(title) { keys += i64::try_from(tx.execute("insert into ext_predb_title_keys(key,title_id) values($1,$2) on conflict do nothing", &[&key,&id])?)?; }
+                titles += 1; top = Some(top.map_or(id, |old| old.max(id))); counts.inserted += 1;
+                continue;
+            };
+            if top_before.is_some_and(|before| id <= before) { counts.min_known_id = Some(counts.min_known_id.map_or(id, |old| old.min(id))); }
+            let mut changed = tx.execute("update ext_predb_titles set category=coalesce(category,$2),size_bytes=coalesce(size_bytes,$3),files=coalesce(files,$4),pre_at=coalesce(pre_at,$5)
+                where id=$1 and ((category is null and $2::text is not null) or (size_bytes is null and $3::bigint is not null) or (files is null and $4::bigint is not null) or (pre_at is null and $5::bigint is not null))", &[&id,&category,&entry.size_bytes,&entry.files,&entry.pre_at])?;
+            if entry.nuked != 0 { changed += tx.execute("update ext_predb_titles set nuked=$2,nuke_reason=coalesce($3,nuke_reason)
+                where id=$1 and (nuked != $2 or ($3::text is not null and nuke_reason is distinct from $3))", &[&id,&entry.nuked,&reason])?; }
+            if changed > 0 { counts.updated += 1; } else { counts.skipped += 1; }
+        }
     }
     tx.execute("insert into ext_predb_meta(key,value) values('titles',$1) on conflict(key) do update set value=excluded.value", &[&titles])?;
     if counts.inserted > 0 { if let Some((page,floor)) = cursor {
@@ -123,6 +122,21 @@ pub(crate) fn import_in(tx: &mut Transaction<'_>, source: i64, entries: &[crate:
     tx.execute("insert into ext_predb_key_meta(singleton,version,revision,top_id,title_rows,key_rows) values(1,1,$1,$2,$3,$4)", &[&revision,&top,&titles,&keys])?;
     Ok(ImportStatus::Applied { counts, revision })
 }
+
+// Borrow the same normalized values for both the proof and sequential path.
+struct NormalizedEntry<'a> { title: &'a str, category: Option<&'a str>, reason: Option<&'a str> }
+fn normalize_entry(entry: &crate::predb::import::Entry) -> Option<NormalizedEntry<'_>> {
+    use crate::predb::{import::{MAX_CATEGORY, MAX_NUKE_REASON}, keys::valid_title};
+    let title = entry.title.trim();
+    if !valid_title(title) { return None }
+    let category = entry.category.as_deref().filter(|c| !c.is_empty() && c.len() <= MAX_CATEGORY);
+    let reason = entry.nuke_reason.as_deref().filter(|r| !r.is_empty()).map(|r| {
+        let mut end = r.len().min(MAX_NUKE_REASON); while !r.is_char_boundary(end) { end -= 1; } &r[..end]
+    });
+    Some(NormalizedEntry { title, category, reason })
+}
+#[path="predb_cache_unchanged.rs"]
+mod unchanged;
 
 /// One admitted parsed feed page commits atomically. Internal key batches keep
 /// their <=512-entry bound, but none can commit without the page's aggregate
