@@ -43,6 +43,21 @@ impl std::fmt::Display for AttemptEnded {
 }
 impl std::error::Error for AttemptEnded {}
 
+/// One release's input is past an admission limit (e.g. linked participants): the release's step fails, the owner
+/// session does not. On prod one release with too many linked participants ended the session on every start.
+#[derive(Debug)]
+pub(crate) struct OverAdmission(pub(crate) &'static str);
+impl std::fmt::Display for OverAdmission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for OverAdmission {}
+
+pub(crate) fn is_over_admission(error: &anyhow::Error) -> bool {
+    error.chain().any(|source| source.is::<OverAdmission>())
+}
+
 pub(crate) fn is_attempt_ended(error: &anyhow::Error) -> bool {
     error.chain().any(|source| source.is::<AttemptEnded>())
 }

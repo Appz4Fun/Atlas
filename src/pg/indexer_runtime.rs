@@ -264,7 +264,9 @@ impl Owner {
             // A bounded read can observe the operator's stop between pages.
             // It did no new work; preserve any independently recorded failure.
             let canceled=super::outage::is_attempt_ended(error) && self.stop.load(Ordering::Acquire);
-            if !canceled || self.failure().is_some() {
+            // One release past an admission limit fails that release's step, not the session.
+            if super::outage::is_over_admission(error) {
+            } else if !canceled || self.failure().is_some() {
                 eprintln!("native owner callback failed; caller={}; prior_failure={:?}; cause={}", caller_diagnostic(), self.failure(), super::linker_runtime::failure_diagnostic(error));
                 self.fail(classify(error));
             }
