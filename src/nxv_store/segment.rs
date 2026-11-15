@@ -81,7 +81,16 @@ impl Entry {
     /// entry's range.
     fn of_block(map: &[u8], offset: u64, seq: u32, day: i64) -> Option<Entry> {
         let at = usize::try_from(offset).ok()?;
+        #[cfg(test)]
+        super::store::recovery_pacing_tests::observe_metadata(map.len().saturating_sub(at));
         let view = NxvBlockView::from_mmap_slice(map.get(at..)?).ok()?;
+        #[cfg(test)]
+        if !view.is_cold() {
+            super::store::recovery_pacing_tests::observe(
+                super::store::recovery_pacing_tests::ReadKind::Body,
+                view.header.total_block_bytes as usize - nntp_xover_engine::container::DATA_START,
+            );
+        }
         if !view.verify_body() {
             return None;
         }
@@ -410,6 +419,8 @@ fn recovery_entry(arena: &File, arena_len: u64, offset: u64, seq: u32, day: i64)
         return Ok(None);
     }
     let mut header = [0; 64];
+    #[cfg(test)]
+    super::store::recovery_pacing_tests::observe(super::store::recovery_pacing_tests::ReadKind::Header, header.len());
     arena.read_exact_at(&mut header, offset)?;
     let len = u32::from_le_bytes(header[48..52].try_into().expect("fixed header field")) as usize;
     if len < nntp_xover_engine::container::DATA_START
@@ -436,6 +447,8 @@ fn heal(arena: &File, index: &File, day: i64) -> Result<(Vec<Entry>, u64, Healed
     let count = (index_len / ENTRY_LEN as u64) as usize;
     let mut raw = vec![0u8; count * ENTRY_LEN];
     if count > 0 {
+        #[cfg(test)]
+        super::store::recovery_pacing_tests::observe(super::store::recovery_pacing_tests::ReadKind::Index, raw.len());
         index.read_exact_at(&mut raw, 0)?;
     }
     let mut entries: Vec<Entry> = Vec::with_capacity(count);

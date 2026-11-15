@@ -1539,6 +1539,8 @@ fn open_group(
             let len = file.metadata()?.len();
             anyhow::ensure!(len <= MAX_RECOVERY_LOG_BYTES, "slab log is too large: {}", path.display());
             let mut bytes = Vec::with_capacity(len as usize);
+            #[cfg(test)]
+            recovery_pacing_tests::observe(recovery_pacing_tests::ReadKind::Log, len as usize);
             file.take(MAX_RECOVERY_LOG_BYTES + 1)
                 .read_to_end(&mut bytes)
                 .with_context(|| format!("reading {}", path.display()))?;
@@ -1595,6 +1597,10 @@ fn recover_sealed_log(
 
 fn read_servers(root: &Path) -> Result<Vec<String>> {
     let path = root.join(STATE_DIR).join(SERVERS_FILE);
+    #[cfg(test)]
+    if let Ok(metadata) = path.metadata() {
+        recovery_pacing_tests::observe(recovery_pacing_tests::ReadKind::Servers, metadata.len() as usize);
+    }
     match std::fs::read_to_string(&path) {
         // a torn last name (no newline) is dropped: it was never handed out
         Ok(s) => Ok(s.split_inclusive('\n').filter_map(|l| l.strip_suffix('\n')).map(str::to_string).collect()),
@@ -1711,6 +1717,10 @@ fn commit(batch: &[Pending]) -> Result<usize> {
     // the logs' names gone durably is not needed: a log left behind is found committed at the next start
     Ok(reserved.len())
 }
+
+#[cfg(test)]
+#[path="recovery_pacing_tests.rs"]
+pub(super) mod recovery_pacing_tests;
 
 #[cfg(test)]
 #[path="fetch_finish_tests.rs"]
