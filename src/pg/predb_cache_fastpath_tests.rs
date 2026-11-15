@@ -97,6 +97,14 @@ fn unchanged_chunk_avoids_per_entry_title_update_statements() {
     let (seed_counts, _) = import(&mut client, 1, &[seeded.clone()], 5, None);
     assert_eq!(seed_counts, Counts { inserted: 1, ..Default::default() });
     let known = id(&mut *client, TITLE);
+    // Maximum-width success must be covered independently of the duplicate-key
+    // proof below and the separate over-budget fallback fixture.
+    let distinct_page = (0..512).map(|index| entry(&format!("Distinct.Small.Title.{index:04}-GRP"))).collect::<Vec<_>>();
+    assert_eq!(distinct_page.iter().map(|e| name_key(&e.title)).collect::<std::collections::HashSet<_>>().len(), 512);
+    let (distinct_seed, _) = import(&mut client, 1, &distinct_page, 5, None);
+    assert_eq!(distinct_seed, Counts { inserted: 512, ..Default::default() });
+    let distinct_titles = distinct_page.iter().map(|e| e.title.clone()).collect::<Vec<_>>();
+    let distinct_known: i64 = client.query_one("select min(id) from ext_predb_titles where title=any($1::text[])", &[&distinct_titles]).unwrap().get(0);
     install_observer(&mut client);
     // A positive affected-row control makes a broken observer fail before the cost assertion.
     let changed = Entry { category: Some("TV".into()), ..seeded };
@@ -113,6 +121,14 @@ fn unchanged_chunk_avoids_per_entry_title_update_statements() {
     println!("predb unchanged primary: entries=512 inserted={} updated={} skipped={} title_update_statements={statements} affected_rows={affected}", counts.inserted, counts.updated, counts.skipped);
     assert_eq!(affected, 0, "unchanged entries must not affect title rows");
     assert_eq!(statements, 0, "unchanged chunk must avoid per-entry title UPDATE statements");
+    reset_observer(&mut client);
+    let distinct_before = facts(&mut *client);
+    let distinct_revision = revision(&mut *client);
+    let (distinct_counts, same_revision) = import(&mut client, 9, &distinct_page, 100, Some((901, 901)));
+    assert_eq!(distinct_counts, Counts { inserted: 0, updated: 0, skipped: 512, min_known_id: Some(distinct_known) });
+    assert_eq!(facts(&mut *client), distinct_before, "512-distinct-key unchanged page altered durable facts");
+    assert_eq!(same_revision, distinct_revision);
+    assert_eq!(observed(&mut *client), (0, 0), "512 admitted distinct keys must avoid title UPDATE statements");
 }
 
 #[test]
@@ -176,7 +192,9 @@ fn mixed_chunk_falls_back_before_any_effect_and_preserves_order() {
     assert_eq!(counts, Counts { inserted: 1, updated: 3, skipped: 2, min_known_id: Some(known) });
     assert_eq!(title_fact(&mut *client, TITLE), (TITLE.into(), 1, Some("TV".into()), None, Some(4), None, 0, None, 5));
     assert_eq!(title_fact(&mut *client, new), (new.into(), 9, Some("TV".into()), None, Some(1), None, 2, Some("later.reason".into()), 10));
-    assert_eq!(observed(&mut *client).1, 3);
+    // Sequential fallback issues 1+0+1+2+2+1 statements in entry order;
+    // the known fill and the two nuke/reason writes affect one row each.
+    assert_eq!(observed(&mut *client), (7, 3));
     // Reversing fill-only duplicates changes which value wins; no speculative probe write may win first.
     for (name, first, second) in [("Order.Forward.Title-GRP", "TV", "MOVIE"), ("Order.Reversed.Title-GRP", "MOVIE", "TV")] {
         let (counts, _) = import(&mut client, 1, &[Entry { category: Some(first.into()), ..entry(name) }, Entry { category: Some(second.into()), ..entry(name) }], 11, None);
