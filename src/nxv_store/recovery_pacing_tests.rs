@@ -67,7 +67,15 @@ pub(in crate::nxv_store) fn observe_metadata(len: usize) {
 // The tests-only checkpoint never invokes sleep or changes read scheduling.
 #[allow(dead_code)]
 pub(in crate::nxv_store) fn clock_now() -> Option<Instant> {
-    PROBE.with(|slot| slot.borrow().as_ref().map(|p| p.start + p.elapsed))
+    PROBE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let probe = slot.as_mut()?;
+        if probe.idle_after == Some(probe.trace.events.len()) {
+            probe.elapsed += Duration::from_secs(60);
+            probe.idle_after = None;
+        }
+        Some(probe.start + probe.elapsed)
+    })
 }
 #[allow(dead_code)]
 pub(in crate::nxv_store) fn clock_sleep(wait: Duration) -> bool {
@@ -344,4 +352,44 @@ fn startup_recovery_admission_discards_idle_credit_and_rechecks_early_wakes() {
     assert_paced(&trace);
     assert_eq!(trace.early_wakes, 3, "actual admission must recheck each deterministic early wake");
     assert!(trace.sleeps.len() > trace.early_wakes);
+}
+
+
+#[test]
+fn startup_recovery_paces_orphan_manifest_opened_by_log_commit() {
+    let root = tempfile::tempdir().unwrap();
+    let (arena, index) = paths(root.path(), "g", day());
+    let orphan_len = CHUNK + ENTRY_LEN;
+    std::fs::write(&index, vec![0; orphan_len]).unwrap();
+    assert!(!arena.exists());
+    let log = root.path().join("g").join(slab::log_name(3, day(), 9));
+    let mut random = 7;
+    let lines: Vec<_> = [31, 32].into_iter().map(|art| line(art, &noise(&mut random, 600000))).collect();
+    let mut log_bytes = Vec::new();
+    for line in &lines { slab::frame(day() * DAY, line, &mut log_bytes); }
+    assert!(log_bytes.len() > CHUNK);
+    std::fs::write(&log, &log_bytes).unwrap();
+    let mut config = cfg(root.path());
+    config.memory_budget = 1;
+    assert!(lines.iter().map(|line| row_charge(line)).sum::<usize>() > config.memory_budget);
+    let scope = Scope::new(None, 0, None);
+    let (store, opened) = Store::open(config, keep()).unwrap();
+    let trace = scope.trace(); drop(scope);
+    assert_eq!(opened, Opened { segments: 1, blocks: 1, logs_replayed: 1, rows_replayed: 2, ..Default::default() });
+    let entries = entries(&store, "g", day());
+    assert_eq!(entries.len(), 1);
+    assert_eq!((entries[0].rows, entries[0].slab_gen, entries[0].server, entries[0].seq), (2, 9, 3, 0));
+    assert_eq!(index.metadata().unwrap().len(), ENTRY_LEN as u64);
+    assert_eq!(std::fs::read(&index).unwrap(), entries[0].to_bytes());
+    assert_eq!(arena.metadata().unwrap().len(), u64::from(entries[0].len));
+    assert!(!log.exists());
+    assert!(store.groups.read().unwrap()["g"].slabs.lock().unwrap().open.is_empty());
+    check_block(&store, "g", day(), entries[0], false);
+    assert_eq!(kind_bytes(&trace, ReadKind::Index), orphan_len);
+    assert!(kind_bytes(&trace, ReadKind::Log) >= log_bytes.len());
+    let last_log = trace.events.iter().rposition(|event| event.kind == ReadKind::Log).unwrap();
+    let first_index = trace.events.iter().position(|event| event.kind == ReadKind::Index).unwrap();
+    assert!(last_log < first_index, "the orphan manifest must be opened by the recovered-log commit");
+    store.close().unwrap();
+    assert_paced(&trace);
 }

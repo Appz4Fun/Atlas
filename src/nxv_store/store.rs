@@ -28,6 +28,7 @@ use nntp_xover_engine::container::{BlockMeta, MAX_BLOCK_ROWS, NxvBlockBuilder};
 use nntp_xover_engine::date::parse_rfc2822_to_epoch;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
+use super::recovery_read::{ReadKind, RecoveryReadPacer, RecoveryReader};
 use super::segment::{ENTRY_LEN, Entry, Reserved, Segment, parse_day_name};
 use super::slab::{self, Sealed, Slab};
 use super::sync::sync_all_durable;
@@ -249,6 +250,9 @@ struct Group {
 
 impl Group {
     fn segment(&self, day: i64) -> Result<Arc<Segment>> {
+        self.segment_with_recovery_read(day, None)
+    }
+    fn segment_with_recovery_read(&self, day: i64, pacer: Option<&mut RecoveryReadPacer>) -> Result<Arc<Segment>> {
         if let Some(s) = self.segments.read().unwrap_or_else(|e| e.into_inner()).get(&day) {
             return Ok(Arc::clone(s));
         }
@@ -256,7 +260,7 @@ impl Group {
         if let Some(s) = segs.get(&day) {
             return Ok(Arc::clone(s));
         }
-        let (seg, _) = Segment::open_with_mapping(&self.dir, day, self.bounded_maps)?;
+        let (seg, _) = Segment::open_with_recovery_read(&self.dir, day, self.bounded_maps, pacer)?;
         segs.insert(day, Arc::clone(&seg));
         Ok(seg)
     }
@@ -494,8 +498,9 @@ impl Store {
         );
         std::fs::create_dir_all(cfg.root.join(STATE_DIR)).with_context(|| format!("making {}", cfg.root.display()))?;
         let lock = lock_store(&cfg.root)?;
+        let mut read_pacer = RecoveryReadPacer::new();
         let _ = super::sync::raise_open_files(65_536);
-        let servers = read_servers(&cfg.root)?;
+        let servers = read_servers(&cfg.root, &mut read_pacer)?;
         let mut opened = Opened::default();
         let mut groups = BTreeMap::new();
         let memory = Arc::new(Semaphore::new(cfg.memory_budget));
@@ -514,9 +519,12 @@ impl Store {
             // nothing is deleted at open: what the keep set no longer holds goes once expiry is armed (after the
             // linker's first pass), soo a day the linker hasn't linked survives a restart
             let everything = KeepSet { live_from: i64::MIN / 2, ..KeepSet::default() };
-            let group = open_group(&dir, &name, &everything, &mut opened, &mut recovery, cfg.bounded_maps)?;
+            let group = open_group_with_recovery_read(
+                &dir, &name, &everything, &mut opened, &mut recovery, cfg.bounded_maps, Some(&mut read_pacer),
+            )?;
             groups.insert(name, group);
         }
+        drop(read_pacer);
         let mut pending_slabs = PendingSlabs::default();
         // Recovery bounds the remaining open logs; sealed recovery has already
         // committed and needs no barrier entry.
@@ -1474,7 +1482,8 @@ struct RecoveryOpen<'a> {
     logs: usize,
 }
 
-/// A group at open: kept segments healed, others deleted; its logs deleted or replayed.
+// Retain the focused recovery-budget controls' unpaced entry point.
+#[cfg(test)]
 fn open_group(
     dir: &Path,
     name: &str,
@@ -1482,6 +1491,19 @@ fn open_group(
     opened: &mut Opened,
     recovery: &mut RecoveryOpen<'_>,
     bounded_maps: bool,
+) -> Result<Arc<Group>> {
+    open_group_with_recovery_read(dir, name, keep, opened, recovery, bounded_maps, None)
+}
+
+/// A group at open: kept segments healed, others deleted; its logs deleted or replayed.
+fn open_group_with_recovery_read(
+    dir: &Path,
+    name: &str,
+    keep: &KeepSet,
+    opened: &mut Opened,
+    recovery: &mut RecoveryOpen<'_>,
+    bounded_maps: bool,
+    mut pacer: Option<&mut RecoveryReadPacer>,
 ) -> Result<Arc<Group>> {
     let mut segments = BTreeMap::new();
     let mut logs: Vec<(PathBuf, u16, i64, u32)> = Vec::new();
@@ -1493,7 +1515,7 @@ fn open_group(
             && let Some(day) = parse_day_name(stem)
         {
             if keep.keeps(day) {
-                let (seg, healed) = Segment::open_with_mapping(dir, day, bounded_maps)?;
+                let (seg, healed) = Segment::open_with_recovery_read(dir, day, bounded_maps, pacer.as_deref_mut())?;
                 opened.segments += 1;
                 opened.blocks += healed.blocks;
                 max_gen = max_gen.max(seg.highest_slab_gen());
@@ -1539,9 +1561,11 @@ fn open_group(
             let len = file.metadata()?.len();
             anyhow::ensure!(len <= MAX_RECOVERY_LOG_BYTES, "slab log is too large: {}", path.display());
             let mut bytes = Vec::with_capacity(len as usize);
-            #[cfg(test)]
-            recovery_pacing_tests::observe(recovery_pacing_tests::ReadKind::Log, len as usize);
-            file.take(MAX_RECOVERY_LOG_BYTES + 1)
+            RecoveryReader {
+                inner: file.take(MAX_RECOVERY_LOG_BYTES + 1),
+                pacer: pacer.as_deref_mut(),
+                kind: ReadKind::Log,
+            }
                 .read_to_end(&mut bytes)
                 .with_context(|| format!("reading {}", path.display()))?;
             anyhow::ensure!(bytes.len() as u64 <= MAX_RECOVERY_LOG_BYTES, "slab log is too large: {}", path.display());
@@ -1566,7 +1590,7 @@ fn open_group(
                 recovery.bytes -= charge;
                 recovery.logs -= 1;
             } else {
-                recover_sealed_log(&g, path, server, day, slab_gen, rows, opened)?;
+                recover_sealed_log(&g, path, server, day, slab_gen, rows, opened, pacer.as_deref_mut())?;
             }
         }
     }
@@ -1581,6 +1605,7 @@ fn recover_sealed_log(
     slab_gen: u32,
     mut rows: Vec<(u64, i64, &[u8])>,
     opened: &mut Opened,
+    pacer: Option<&mut RecoveryReadPacer>,
 ) -> Result<()> {
     rows.sort_by_key(|(art, ..)| *art);
     rows.dedup_by_key(|(art, ..)| *art);
@@ -1588,20 +1613,24 @@ fn recover_sealed_log(
     let lines: Vec<_> = rows.into_iter().map(|(_, _, line)| line).collect();
     let block = NxvBlockBuilder::build_hot_block_meta(&lines, BlockMeta { server_id: server, slab_gen })?;
     let existed = group.segments.read().unwrap_or_else(|e| e.into_inner()).contains_key(&day);
-    opened.blocks += commit(&[Pending { group: Arc::clone(group), day, slab_gen, block, log: path, _memory: None }])?;
+    opened.blocks += commit_with_recovery_read(
+        &[Pending { group: Arc::clone(group), day, slab_gen, block, log: path, _memory: None }], pacer,
+    )?;
     opened.segments += usize::from(!existed);
     // Sequential startup recovery can touch many segments before housekeeping first runs.
     group.segments.read().unwrap_or_else(|e| e.into_inner())[&day].close_if_idle(Duration::ZERO);
     Ok(())
 }
 
-fn read_servers(root: &Path) -> Result<Vec<String>> {
+fn read_servers(root: &Path, pacer: &mut RecoveryReadPacer) -> Result<Vec<String>> {
     let path = root.join(STATE_DIR).join(SERVERS_FILE);
-    #[cfg(test)]
-    if let Ok(metadata) = path.metadata() {
-        recovery_pacing_tests::observe(recovery_pacing_tests::ReadKind::Servers, metadata.len() as usize);
-    }
-    match std::fs::read_to_string(&path) {
+    let read = || -> std::io::Result<String> {
+        let file = File::open(&path)?;
+        let mut text = String::new();
+        RecoveryReader { inner: file, pacer: Some(pacer), kind: ReadKind::Servers }.read_to_string(&mut text)?;
+        Ok(text)
+    };
+    match read() {
         // a torn last name (no newline) is dropped: it was never handed out
         Ok(s) => Ok(s.split_inclusive('\n').filter_map(|l| l.strip_suffix('\n')).map(str::to_string).collect()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
@@ -1673,12 +1702,19 @@ fn committer(rx: Receiver<Pending>, shared: Arc<Shared>) {
 
 /// One batch: reserve, write, sync, write entries, sync, publish, delete logs. Returns blocks committed.
 fn commit(batch: &[Pending]) -> Result<usize> {
+    commit_with_recovery_read(batch, None)
+}
+fn commit_with_recovery_read(batch: &[Pending], mut pacer: Option<&mut RecoveryReadPacer>) -> Result<usize> {
     let _span = crate::metrics::span("header_store.commit");
     let mut reserved: Vec<(Reserved, &Pending)> = Vec::with_capacity(batch.len());
     let mut new_dirs: Vec<PathBuf> = Vec::new();
     for p in batch {
         let existed = p.group.segments.read().unwrap_or_else(|e| e.into_inner()).contains_key(&p.day);
-        let seg = p.group.segment(p.day)?;
+        let seg = if let Some(pacer) = pacer.as_deref_mut() {
+            p.group.segment_with_recovery_read(p.day, Some(pacer))?
+        } else {
+            p.group.segment(p.day)?
+        };
         if !existed {
             new_dirs.push(p.group.dir.clone());
         }
