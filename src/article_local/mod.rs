@@ -126,6 +126,13 @@ const CHECKPOINT_FALLBACK: i64 = 131_072;
 /// passes, so a long reader doesnt stall the writer pass after pass.
 const CHECKPOINT_RESTART_AT: i64 = 32_768;
 const CHECKPOINT_BACKOFF_MOST: u32 = 64;
+/// WAL frames past which a RESTART waits `CHECKPOINT_LONG_WAIT` for readers rather than the connection's 1 s: with
+/// sixteen helper writers looking articles up, some read is always under way, and a RESTART that gave up after 1 s
+/// every time let the WAL grow on prod (1.3 GB) until the writer checkpointed on its own commits again and ingest
+/// slowed by half over minutes. Past this it is worth holding writes off a few seconds once.
+const CHECKPOINT_LONG_AT: i64 = 4 * CHECKPOINT_RESTART_AT;
+const CHECKPOINT_LONG_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+const CHECKPOINT_SHORT_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl Checkpointer {
     fn start(path: &Path) -> Result<Self> {
@@ -147,7 +154,8 @@ impl Checkpointer {
                 let passive = conn.query_row("pragma wal_checkpoint(PASSIVE)", [], |row| row.get::<_, i64>(1));
                 let result = match passive {
                     Ok(frames) if frames > CHECKPOINT_RESTART_AT && wait == 0 => conn
-                        .query_row("pragma wal_checkpoint(RESTART)", [], |row| row.get::<_, i64>(0))
+                        .busy_timeout(if frames > CHECKPOINT_LONG_AT { CHECKPOINT_LONG_WAIT } else { CHECKPOINT_SHORT_WAIT })
+                        .and_then(|()| conn.query_row("pragma wal_checkpoint(RESTART)", [], |row| row.get::<_, i64>(0)))
                         .map(|gave_up| {
                             if gave_up != 0 {
                                 if !busy {
