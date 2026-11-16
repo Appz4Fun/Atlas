@@ -77,11 +77,15 @@ pub fn save(client: &mut Client, releases: &[Release], now: i64) -> Result<SaveS
     // A group writer that waited on the advisory lock must see the preceding commit.
     let mut tx = client.build_transaction().isolation_level(IsolationLevel::ReadCommitted).start()?;
     let (stats, local) = save_grouped(&mut tx, groups, now)?;
+    // no longer certainly running once the commit is sent: a failed commit has rolled back before anything here runs
+    if let Some(Local { store, xid: Some(xid), .. }) = &local {
+        store.end(xid);
+    }
     tx.commit()?;
     // A commit seen here needs no question later; one that failed is asked about.
     // The save stands either way: one left unconfirmed is asked about later.
-    if let Some(Local { store, xid: Some(xid) }) = local {
-        let _ = store.confirm(&xid);
+    if let Some(Local { store, xid: Some(xid), .. }) = &local {
+        let _ = store.confirm(xid);
     }
     Ok(stats)
 }
@@ -112,7 +116,7 @@ fn save_grouped(tx:&mut Transaction<'_>,groups:BTreeMap<&str,Vec<&Release>>,now:
     // With a local article store the articles go there and PostgreSQL keeps
     // the releases, files and counts. A save that died after writing there is
     // settled first, so its articles are either counted or gone before `has`.
-    let mut local = crate::article_local::of(tx)?.map(|store| Local { store, xid: None });
+    let mut local = crate::article_local::of(tx)?.map(|store| Local { store, xid: None, groups: Vec::new() });
     if local.is_some() {
         tx.batch_execute(CREATE_FOLD_STAGE)?;
     }
@@ -126,10 +130,11 @@ fn save_grouped(tx:&mut Transaction<'_>,groups:BTreeMap<&str,Vec<&Release>>,now:
         }
         // Another connection's save of this group has ended now that its lock is ours:
         // its articles are counted or gone before this save asks which it already has.
-        if let Some(local) = &local
-            && local.store.has_unsettled_besides(local.xid.as_deref())?
-        {
-            local.store.settle(|xid| crate::article_local::pg_ended(tx, xid))?;
+        if let Some(local) = &mut local {
+            local.locked(group);
+            if local.store.has_unsettled_besides(local.xid.as_deref(), Some(group))? {
+                local.store.settle_under(Some(group), |xid| crate::article_local::pg_ended(tx, xid))?;
+            }
         }
         // A junk marker applies to all fragments with this identity, including
         // fragments that would otherwise fill an earlier COPY batch.
@@ -188,15 +193,37 @@ fn pg_text(value: &str) -> Cow<'_, str> {
 struct Local {
     store: std::sync::Arc<crate::article_local::Store>,
     xid: Option<String>,
+    /// the groups whose lock this save took
+    groups: Vec<String>,
 }
 
 impl Local {
-    /// The id of the transaction this save runs in, asked for once.
+    /// The id of the transaction this save runs in, asked for once. The store takes it for running (`Store::begin`)
+    /// until `save` sends the commit or this is dropped, which on a failed save is before its transaction rolls back
+    /// (it drops on the way out of the error).
     fn xid(&mut self, tx: &mut Transaction<'_>) -> Result<String> {
         if self.xid.is_none() {
-            self.xid = Some(tx.query_one("select pg_current_xact_id()::text", &[])?.try_get(0)?);
+            let xid: String = tx.query_one("select pg_current_xact_id()::text", &[])?.try_get(0)?;
+            self.store.begin(&xid, &self.groups);
+            self.xid = Some(xid);
         }
         Ok(self.xid.clone().expect("set above"))
+    }
+
+    /// This save took `group`'s lock: a save holding it later asks about this one even while it seems to run.
+    fn locked(&mut self, group: &str) {
+        self.groups.push(group.to_owned());
+        if let Some(xid) = &self.xid {
+            self.store.locked(xid, group);
+        }
+    }
+}
+
+impl Drop for Local {
+    fn drop(&mut self) {
+        if let Some(xid) = &self.xid {
+            self.store.end(xid);
+        }
     }
 }
 

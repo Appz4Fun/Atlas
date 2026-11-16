@@ -71,3 +71,29 @@ fn a_store_is_bound_to_its_catalogue_and_readers_see_the_writer() {
     assert!(Store::open_writer(dir.path(), "another").is_err());
     assert!(Store::open_writer(dir.path(), "test").is_ok());
 }
+
+#[test]
+fn a_save_still_running_here_is_not_asked_about_unless_it_held_the_group() {
+    let (_dir, store) = store();
+    store.add("5", &[row(1, 7, b"<a>", Some(1))], 100).unwrap();
+    store.begin("5", &[]);
+    store.locked("5", "alt.binaries.held");
+    // running here: nothing to ask about, by `of` or under another group's lock
+    assert!(!store.has_unsettled().unwrap());
+    assert!(!store.has_unsettled_besides(None, Some("alt.binaries.other")).unwrap());
+    let mut asked = Vec::new();
+    store.settle_under(Some("alt.binaries.other"), |xid| { asked.push(xid.to_owned()); Ok(Ended::RolledBack) }).unwrap();
+    assert!(asked.is_empty());
+    assert_eq!(store.has(&[(1, b"<a>")]).unwrap(), vec![true]);
+    // under the lock it took it has ended, perhaps on the server's side: asked, and taken out when rolled back
+    assert!(store.has_unsettled_besides(None, Some("alt.binaries.held")).unwrap());
+    store.settle_under(Some("alt.binaries.held"), |xid| { asked.push(xid.to_owned()); Ok(Ended::RolledBack) }).unwrap();
+    assert_eq!(asked, vec!["5".to_string()]);
+    assert_eq!(store.has(&[(1, b"<a>")]).unwrap(), vec![false]);
+    // once ended here it is asked about like any other
+    store.add("6", &[row(2, 8, b"<b>", Some(1))], 100).unwrap();
+    store.begin("6", &[]);
+    assert!(!store.has_unsettled().unwrap());
+    store.end("6");
+    assert!(store.has_unsettled().unwrap());
+}
