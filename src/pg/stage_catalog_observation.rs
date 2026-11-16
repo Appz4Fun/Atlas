@@ -39,7 +39,8 @@ pub(super) fn append(tx:&mut postgres::Transaction<'_>,out:&mut Inventory,stoppi
     let mut after=None::<String>;let mut seen=0;let mut totals=[0i128;7];
     loop {
         stop(stopping)?;
-        let rows=tx.query("select case when octet_length(group_name)<=4096 then group_name end,total,complete,nzb_ready,named,still_obfuscated,predb_matched,bytes from native_metric_catalog_groups where ($1::text is null or group_name>$1) order by group_name limit 128",&[&after])?;
+        // a group's totals are kept per shard (migration 0018): summed here, a page of whole groups at a time
+        let rows=tx.query("select case when octet_length(group_name)<=4096 then group_name end,sum(total)::bigint,sum(complete)::bigint,sum(nzb_ready)::bigint,sum(named)::bigint,sum(still_obfuscated)::bigint,sum(predb_matched)::bigint,sum(bytes)::bigint from native_metric_catalog_groups where ($1::text is null or group_name>$1) group by group_name order by group_name limit 128",&[&after])?;
         let count=rows.len();
         for row in rows {
             seen+=1;capacity(seen<=MAX_GROUP_ROWS)?;

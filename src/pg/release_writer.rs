@@ -43,6 +43,30 @@ pub(crate) fn identity(release: &Release) -> (bool, [u8; 32]) {
     (release.collection.is_some(), key)
 }
 
+/// Shards a group's releases are saved in, each under a lock of its own (`save_grouped`), so saves of one group run
+/// side by side as saves of different groups do: a few groups are orders of magnitude bigger than the rest, and
+/// saving each group one save at a time left most helper writers waiting behind them.
+pub(crate) const SHARDS: u32 = 16;
+
+/// The shard of `release` within its group, by its identity: every fragment of a release lands in the same one.
+pub(crate) fn shard(release: &Release) -> u32 {
+    let (_, key) = identity(release);
+    (u64::from_le_bytes(key[..8].try_into().expect("32 bytes")) % u64::from(SHARDS)) as u32
+}
+
+type Parts<'a> = BTreeMap<(&'a str, u32), Vec<&'a Release>>;
+
+fn parts(releases: &[Release]) -> Result<Parts<'_>> {
+    let mut parts = Parts::new();
+    for release in releases {
+        if !crate::filters::group_blocked(&release.group) {
+            ensure!(!release.group.as_bytes().contains(&0), "release group contains a NUL byte");
+            parts.entry((release.group.as_str(), shard(release))).or_default().push(release);
+        }
+    }
+    Ok(parts)
+}
+
 impl Incoming<'_> {
     fn approx_bytes(&self) -> usize {
         let r = self.release;
@@ -63,13 +87,7 @@ impl Incoming<'_> {
 /// commits. The exact article identity is independent of the file name, so a
 /// replay or concurrent retry cannot change counts or queue generation.
 pub fn save(client: &mut Client, releases: &[Release], now: i64) -> Result<SaveStats> {
-    let mut groups = BTreeMap::<&str, Vec<&Release>>::new();
-    for release in releases {
-        if !crate::filters::group_blocked(&release.group) {
-            ensure!(!release.group.as_bytes().contains(&0), "release group contains a NUL byte");
-            groups.entry(&release.group).or_default().push(release);
-        }
-    }
+    let groups = parts(releases)?;
     if groups.is_empty() {
         return Ok(SaveStats::default());
     }
@@ -94,17 +112,10 @@ pub fn save(client: &mut Client, releases: &[Release], now: i64) -> Result<SaveS
 /// its original owner transaction. This entry neither commits nor retries.
 /// The same RC/history gate and exact COPY/winner SQL as ordinary saves apply.
 pub(crate) fn save_in(tx:&mut Transaction<'_>,releases:&[Release],now:i64)->Result<SaveStats> {
-    let mut groups=BTreeMap::<&str,Vec<&Release>>::new();
-    for release in releases {
-        if !crate::filters::group_blocked(&release.group) {
-            ensure!(!release.group.as_bytes().contains(&0),"release group contains a NUL byte");
-            groups.entry(&release.group).or_default().push(release);
-        }
-    }
-    Ok(save_grouped(tx,groups,now)?.0)
+    Ok(save_grouped(tx,parts(releases)?,now)?.0)
 }
 
-fn save_grouped(tx:&mut Transaction<'_>,groups:BTreeMap<&str,Vec<&Release>>,now:i64)->Result<(SaveStats,Option<Local>)> {
+fn save_grouped(tx:&mut Transaction<'_>,groups:Parts<'_>,now:i64)->Result<(SaveStats,Option<Local>)> {
     super::history_gate::native(tx)?;
     // a helper writer beside the owner (`pg::ingest::Helpers`) waits for a group's lock as long as it takes, then for
     // row locks only `HELPER_LOCK_WAIT`
@@ -120,20 +131,24 @@ fn save_grouped(tx:&mut Transaction<'_>,groups:BTreeMap<&str,Vec<&Release>>,now:
     if local.is_some() {
         tx.batch_execute(CREATE_FOLD_STAGE)?;
     }
-    for (group, releases) in groups {
+    for ((group, shard), releases) in groups {
         if helper {
             tx.batch_execute("set local lock_timeout = 0")?;
         }
-        tx.query_one("select pg_advisory_xact_lock(hashtextextended(current_schema() || ':' || $1, 7936))", &[&group])?;
+        // The group's key shared, then the shard's alone: shards of a group save side by side, and a writer that takes
+        // the whole group (inferred, spotnet, repair: its key exclusively) still has every release of it to itself.
+        let part = format!("{group}#{shard}");
+        tx.query_one("select pg_advisory_xact_lock_shared(hashtextextended(current_schema() || ':' || $1, 7936))", &[&group])?;
+        tx.query_one("select pg_advisory_xact_lock(hashtextextended(current_schema() || ':' || $1, 7936))", &[&part])?;
         if helper {
             tx.batch_execute(&format!("set local lock_timeout = '{}'", super::ingest::HELPER_LOCK_WAIT))?;
         }
-        // Another connection's save of this group has ended now that its lock is ours:
+        // Another connection's save of this shard has ended now that its lock is ours:
         // its articles are counted or gone before this save asks which it already has.
         if let Some(local) = &mut local {
-            local.locked(group);
-            if local.store.has_unsettled_besides(local.xid.as_deref(), Some(group))? {
-                local.store.settle_under(Some(group), |xid| crate::article_local::pg_ended(tx, xid))?;
+            local.locked(&part);
+            if local.store.has_unsettled_besides(local.xid.as_deref(), Some(&part))? {
+                local.store.settle_under(Some(&part), |xid| crate::article_local::pg_ended(tx, xid))?;
             }
         }
         // A junk marker applies to all fragments with this identity, including
