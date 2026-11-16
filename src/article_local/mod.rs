@@ -111,6 +111,8 @@ pub(crate) struct Store {
     seen_above: std::sync::atomic::AtomicI64,
     /// when `fill_seen` last ran
     seen_filled_at: Mutex<Option<std::time::Instant>>,
+    /// a save is reading the next fill ahead (`warm_fill`): the others go straight on
+    warming: std::sync::atomic::AtomicBool,
 }
 
 /// Copies the WAL back into a writer store's file in the background, on a connection of its own, so the writer's
@@ -306,6 +308,7 @@ impl Store {
             restart_wanted,
             seen_above: std::sync::atomic::AtomicI64::new(seen_above),
             seen_filled_at: Mutex::new(None),
+            warming: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -330,6 +333,7 @@ impl Store {
             restart_wanted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             seen_above: std::sync::atomic::AtomicI64::new(i64::MAX),
             seen_filled_at: Mutex::new(None),
+            warming: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -491,6 +495,8 @@ impl Store {
             })?;
             had.extend(keys.iter().zip(found).filter(|(_, found)| *found).map(|(key, _)| *key));
         }
+        // the next fill's rows read here first, off the write lock: the fill under it then finds their pages cached
+        self.warm_fill();
         let mut conn = self.lock()?;
         if self.restart_wanted.swap(false, Ordering::AcqRel) {
             restart_wal(&conn);
@@ -742,6 +748,44 @@ impl Store {
         Ok(added)
     }
 
+    /// Read, on a read connection and without the write lock, the rows the next `fill_seen` will copy, when one is
+    /// due: on prod the fill's reads of cold `segments` pages held the write lock every save waits for (the copy itself
+    /// still reads them again inside its write transaction, so what it copies is what is there). Best effort.
+    fn warm_fill(&self) {
+        let above = self.seen_above.load(Ordering::Acquire);
+        if above == i64::MIN
+            || self.seen_filled_at.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some_and(|t| t.elapsed() < SEEN_FILL_EVERY)
+        {
+            return;
+        }
+        // one at a time, and none while a WAL restart is wanted (its checkpoint waits for readers)
+        if self.restart_wanted.load(Ordering::Acquire)
+            || self.warming.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err()
+        {
+            return;
+        }
+        struct Done<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for Done<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _done = Done(&self.warming);
+        let _ = self.read(|conn| {
+            let cursor: Option<Vec<u8>> = conn
+                .query_row("select value from meta where key = 'seen_cursor'", [], |row| row.get::<_, String>(0))
+                .optional()?
+                .map(|v| decode_hex(&v))
+                .transpose()?;
+            let mut read = conn.prepare_cached(
+                FILL_ROWS_SQL,
+            )?;
+            let mut rows = read.query(params![above, cursor, SEEN_FILL_ROWS])?;
+            while rows.next()?.is_some() {}
+            Ok(())
+        });
+    }
+
     /// Copy into `seen` the next `SEEN_FILL_ROWS` articles saved before it existed, newest release first, on the write
     /// connection under its lock (so no save or rollback runs between reading `segments` and writing `seen`). Each
     /// release is copied whole before `seen_above` passes below it; then `has` asks `seen` for it.
@@ -763,9 +807,7 @@ impl Store {
             tx.query_row("select value from meta where key = 'seen_cursor'", [], |row| row.get::<_, String>(0)).optional()?.map(|v| decode_hex(&v)).transpose()?;
         let rows: Vec<(i64, Vec<u8>)> = {
             let mut read = tx.prepare_cached(
-                "select release_id, message_id from segments
-                 where release_id < ?1 or (release_id = ?1 and (?2 is null or message_id < ?2))
-                 order by release_id desc, message_id desc limit ?3",
+                FILL_ROWS_SQL,
             )?;
             let mut rows = read.query(params![above, cursor, SEEN_FILL_ROWS])?;
             let mut out = Vec::new();
@@ -842,6 +884,11 @@ fn decode_hex(text: &str) -> Result<Vec<u8>> {
     ensure!(text.len() % 2 == 0, "odd hex length");
     (0..text.len()).step_by(2).map(|i| Ok(u8::from_str_radix(&text[i..i + 2], 16)?)).collect()
 }
+
+/// The rows `fill_seen` copies next, and `warm_fill` reads ahead of it: one text, so both read the same pages.
+const FILL_ROWS_SQL: &str = "select release_id, message_id from segments
+    where release_id < ?1 or (release_id = ?1 and (?2 is null or message_id < ?2))
+    order by release_id desc, message_id desc limit ?3";
 
 /// Rows `fill_seen` copies at most at once, and how often it runs at most.
 const SEEN_FILL_ROWS: i64 = 20_000;
