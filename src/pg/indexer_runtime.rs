@@ -265,8 +265,8 @@ impl Owner {
             // It did no new work; preserve any independently recorded failure.
             let canceled=super::outage::is_attempt_ended(error) && self.stop.load(Ordering::Acquire);
             // One release past an admission limit fails that release's step, not the session.
-            if super::outage::is_over_admission(error) {
-                eprintln!("native owner callback refused one release; caller={}; cause={error:#}", caller_diagnostic());
+            if super::outage::is_over_admission(error) || super::outage::is_step_timed_out(error) {
+                eprintln!("native owner callback failed one step; caller={}; cause={error:#}", caller_diagnostic());
             } else if !canceled || self.failure().is_some() {
                 eprintln!("native owner callback failed; caller={}; prior_failure={:?}; cause={}", caller_diagnostic(), self.failure(), super::linker_runtime::failure_diagnostic(error));
                 self.fail(classify(error));
