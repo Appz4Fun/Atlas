@@ -1790,12 +1790,12 @@ where
         // furthest one's alone: a server only looks deep enough by the dates
         // its posters set
         Some(t) if t <= day * 86_400 => match goes_back_furthest(ctx, db, group, server, (t, sure)).await {
-            Ok((true, runner_up)) => {
+            Ok((true, runner_up, _)) => {
                 alone = runner_up.is_none_or(|r| r >= (day + 1) * 86_400);
                 runner_up_day = runner_up.filter(|_| alone).map(crate::chunks::unix_day);
                 true
             }
-            Ok((false, runner_up)) => {
+            Ok((false, runner_up, _)) => {
                 keeps_from = keeps_from.max(runner_up);
                 runner_up.is_none_or(|r| r <= day * 86_400)
             }
@@ -1811,7 +1811,14 @@ where
                 false
             } else {
                 match goes_back_furthest(ctx, db, group, server, (t, sure)).await {
-                    Ok((furthest, _)) => furthest,
+                    // a carrier left out may keep this day whole where this server starts part way through it: the
+                    // day goes back to be read once every carrier answers, not finished from this server's half
+                    Ok((_, _, true)) => {
+                        let c = chunk.clone();
+                        on_db(db, move |conn| Ok(crate::chunks::release(conn, &c)?)).await?;
+                        return Ok(Progress::default());
+                    }
+                    Ok((furthest, _, false)) => furthest,
                     Err(e) => return failed(e).await,
                 }
             }
@@ -1979,6 +1986,9 @@ pub async fn chunk_range(
     Ok((start, end))
 }
 
+/// How long a day chunk waits for another carrier's answer on how far back it keeps a group (`goes_back_furthest`).
+const PROBE_FOR: Duration = Duration::from_secs(10);
+
 /// Whether `server`, which keeps split `group` from `oldest` (see
 /// `Pool::retention`; with whether its first dates agree), goes back furthest of the indexing servers: the one to
 /// index the split's oldest day, and the days before the second furthest
@@ -1990,16 +2000,13 @@ pub async fn chunk_range(
 /// A server whose first dates disagree goes back furthest only when every
 /// one's do: a forged run could make it look deeper than it is. A server
 /// that cant be asked is left out of the answer, which then isnt kept and never calls this server alone.
-/// How long a day chunk waits for another carrier's answer on how far back it keeps a group (`goes_back_furthest`).
-const PROBE_FOR: Duration = Duration::from_secs(10);
-
 async fn goes_back_furthest(
     ctx: &PassContext,
     db: &Db,
     group: &str,
     server: usize,
     oldest: (i64, bool),
-) -> Result<(bool, Option<i64>)> {
+) -> Result<(bool, Option<i64>, bool)> {
     let host = ctx.pool.host(server);
     let servers = ctx.pool.indexing_servers();
     let g = group.to_string();
@@ -2008,7 +2015,7 @@ async fn goes_back_furthest(
     if let (Some(deepest), runner_up) = known
         && servers.iter().any(|&i| ctx.pool.host(i) == deepest)
     {
-        return Ok((deepest == host, runner_up));
+        return Ok((deepest == host, runner_up, false));
     }
 
     let total_conns = ctx.pool.indexing_connections();
@@ -2022,7 +2029,7 @@ async fn goes_back_furthest(
         }
         // A carrier with requests already queued for its connections, or that doesnt answer within `PROBE_FOR`, is
         // left out like one that failed: on prod the day chunks of idle servers sat behind the busiest ones' queues.
-        if ctx.pool.waiting(other) > 0 {
+        if ctx.pool.saturated(other) {
             unasked = true;
             continue;
         }
@@ -2054,8 +2061,8 @@ async fn goes_back_furthest(
         // only its own), only that it may read the day. Its own first post stands in as the runner up.
         // Only where this server came out deepest: elsewhere the runner up decides whether it keeps the day at all.
         let runner_up = if deepest == host { Some(runner_up.map_or(oldest.0, |r| r.min(oldest.0))) } else { runner_up };
-        println!("[CHUNK] {group}: a carrier didnt answer how far back it keeps it, asking again next time");
-        return Ok((deepest == host, runner_up));
+        println!("[CHUNK] {group}: a carrier was busy or didnt answer how far back it keeps it, asking again next time");
+        return Ok((deepest == host, runner_up, true));
     }
     let (g, d) = (group.to_string(), deepest.clone());
     on_db(db, move |conn| {
@@ -2067,7 +2074,7 @@ async fn goes_back_furthest(
     })
     .await?;
     println!("[CHUNK] {group}: {deepest} goes back furthest, it does the oldest day");
-    Ok((deepest == host, runner_up))
+    Ok((deepest == host, runner_up, false))
 }
 
 struct Pass<'a> {
