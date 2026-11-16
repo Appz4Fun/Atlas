@@ -101,8 +101,16 @@ const MERGE_JOBS: usize = 8;
 const MERGE_BYTES: usize = 64 << 20;
 const DRAIN_ROUNDS: usize = 4;
 
-/// Articles from which a job is split by shard (`by_part`).
+/// Articles each part of a split job holds at least (`by_part`).
 const SPLIT_ARTICLES: usize = 2000;
+
+/// Parts a job of `articles` is split into: a power of two up to `release_writer::SHARDS`, each part at least
+/// `SPLIT_ARTICLES`. Split into all sixteen shards, a job's parts were ~125-300 articles each on prod and each paid a
+/// transaction's fixed statements (guard, stage, locks), which outweighed the parallelism.
+fn parts_for(articles: usize) -> u32 {
+    let k = (articles / SPLIT_ARTICLES).clamp(1, super::release_writer::SHARDS as usize);
+    1 << (usize::BITS - 1 - k.leading_zeros())
+}
 
 /// Run `futures` side by side, their outputs in their order.
 async fn join_all<F: std::future::Future>(futures: Vec<F>) -> Vec<F::Output> {
@@ -127,15 +135,16 @@ async fn join_all<F: std::future::Future>(futures: Vec<F>) -> Vec<F::Output> {
 /// `releases` by the shard of its group each is saved under (`release_writer::shard`), keyed `group#shard` as the
 /// writer's lock is: the parts of one job save side by side, each after the running save of its shard.
 fn by_part(releases: Vec<Release>) -> Vec<(String, Vec<Release>)> {
-    // a small job is one transaction, queued by its group: split, each part pays a transaction of its own
+    // a small job is one transaction, queued by its group; a bigger one goes in `parts_for` parts, each the shards s
+    // with s mod k = b (k a power of two, so parts of different jobs nest), saved side by side
     let articles: usize = releases.iter().map(|r| r.articles.len()).sum();
-    let split = articles >= SPLIT_ARTICLES;
+    let k = parts_for(articles);
     let mut parts = HashMap::<String, Vec<Release>>::new();
     for release in releases {
-        let key = if split {
-            format!("{}#{}", release.group, super::release_writer::shard(&release))
-        } else {
+        let key = if k == 1 {
             release.group.clone()
+        } else {
+            format!("{}#{k}/{}", release.group, super::release_writer::shard(&release) % k)
         };
         parts.entry(key).or_default().push(release);
     }
@@ -877,5 +886,20 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "both admitted saves must finish");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    #[test]
+    fn a_job_is_split_into_powers_of_two_of_at_least_split_articles() {
+        assert_eq!(super::parts_for(0), 1);
+        assert_eq!(super::parts_for(3999), 1);
+        assert_eq!(super::parts_for(4000), 2);
+        assert_eq!(super::parts_for(5000), 2);
+        assert_eq!(super::parts_for(12_000), 4);
+        assert_eq!(super::parts_for(20_000), 8);
+        assert_eq!(super::parts_for(60_000), 16);
+        assert_eq!(super::parts_for(10_000_000), 16);
     }
 }
