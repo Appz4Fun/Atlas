@@ -3,6 +3,7 @@ use std::process::ExitCode;
 use atlas::{app, bg_indexer, procs};
 
 fn main() -> ExitCode {
+    atlas::configure_sqlite();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let has = |flag: &str| args.iter().any(|arg| arg == flag);
 

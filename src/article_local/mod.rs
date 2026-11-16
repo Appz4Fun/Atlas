@@ -43,6 +43,20 @@ pub(crate) use runtime::{ensure_reader, ensure_writer};
 
 pub(crate) const FILE: &str = "articles.db";
 
+/// Turn off SQLite's memory statistics, before any connection opens (later it is too late, and the call does nothing).
+/// With them on every page SQLite allocates or frees takes one global mutex, and the local store's read connections
+/// do that all the time (each starts its cache over when another connection commits): on prod the lookup threads spent
+/// a fifth of their time waiting on it. Nothing here reads those statistics.
+pub fn configure_sqlite() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: sqlite3_config is called before SQLite is initialized, with an int argument as MEMSTATUS takes.
+        unsafe {
+            rusqlite::ffi::sqlite3_config(rusqlite::ffi::SQLITE_CONFIG_MEMSTATUS, 0 as std::os::raw::c_int);
+        }
+    });
+}
+
 /// What a nameless article said about itself, kept only for the article that won.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Envelope {
