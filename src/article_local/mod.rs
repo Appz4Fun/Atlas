@@ -88,10 +88,12 @@ pub(crate) struct Store {
     conn: Mutex<Connection>,
     path: PathBuf,
     writer: bool,
-    /// PostgreSQL transactions of this process whose save is still writing (`begin`/`end`): certainly running, so
-    /// settling doesnt ask about them. With helper writers saving side by side every save found the others' rows
-    /// waiting and asked PostgreSQL about each, holding the store meanwhile.
-    running: Mutex<HashSet<String>>,
+    /// PostgreSQL transactions of this process whose save is still writing (`begin`/`end`), with the groups whose
+    /// lock each took (`locked`): settling doesnt ask about them, as they are running, unless it holds the lock of a
+    /// group one took (then that one ended, though perhaps on the server's side before this process heard). With helper
+    /// writers saving side by side every save found the others' rows waiting and asked PostgreSQL about each, holding
+    /// the store meanwhile.
+    running: Mutex<HashMap<String, HashSet<String>>>,
 }
 
 const SCHEMA: &str = "
@@ -159,7 +161,7 @@ impl Store {
                 conn.execute("insert into meta (key, value) values ('catalogue', ?1)", [catalogue])?;
             }
         }
-        Ok(Self { conn: Mutex::new(conn), path, writer: true, running: Mutex::new(HashSet::new()) })
+        Ok(Self { conn: Mutex::new(conn), path, writer: true, running: Mutex::new(HashMap::new()) })
     }
 
     /// Open the store for reading only, as the web process does. The file must exist.
@@ -172,7 +174,7 @@ impl Store {
         .with_context(|| format!("opening {} for reading", path.display()))?;
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
         conn.execute_batch("pragma cache_size = -32768; pragma temp_store = memory;")?;
-        Ok(Self { conn: Mutex::new(conn), path, writer: false, running: Mutex::new(HashSet::new()) })
+        Ok(Self { conn: Mutex::new(conn), path, writer: false, running: Mutex::new(HashMap::new()) })
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -314,38 +316,57 @@ impl Store {
 
     /// Whether any save is still waiting to hear how its transaction ended.
     pub(crate) fn has_unsettled(&self) -> Result<bool> {
-        self.has_unsettled_besides(None)
+        self.has_unsettled_besides(None, None)
     }
 
-    /// Transaction `xid` of this process is saving: until `end`, settling takes it for running without asking. Call
-    /// only while its transaction is certainly open (before its commit or rollback), and `end` before a rollback.
-    pub(crate) fn begin(&self, xid: &str) {
-        self.running.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(xid.to_owned());
+    /// Transaction `xid` of this process is saving, having taken the locks of `groups` so far: until `end`, settling
+    /// takes it for running without asking, except under one of those groups' locks. Call only while its transaction
+    /// is open as far as this process knows (before its commit is sent or its rollback), and `end` before either.
+    pub(crate) fn begin(&self, xid: &str, groups: &[String]) {
+        let mut running = self.running.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        running.entry(xid.to_owned()).or_default().extend(groups.iter().cloned());
+    }
+
+    /// Transaction `xid`, saving, took `group`'s lock.
+    pub(crate) fn locked(&self, xid: &str, group: &str) {
+        let mut running = self.running.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(groups) = running.get_mut(xid) {
+            groups.insert(group.to_owned());
+        }
     }
 
     pub(crate) fn end(&self, xid: &str) {
         self.running.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(xid);
     }
 
-    fn running(&self, xid: &str) -> bool {
-        self.running.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(xid)
+    /// Whether settling may take `xid` for running without asking: it is saving in this process, and didnt take the
+    /// lock of `under`, the group whose lock the settling transaction holds (an `xid` that did has ended since).
+    fn skips(&self, xid: &str, under: Option<&str>) -> bool {
+        let running = self.running.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        running.get(xid).is_some_and(|groups| under.is_none_or(|group| !groups.contains(group)))
     }
 
-    /// The transactions with rows waiting, but those of this process still saving.
-    fn waiting(&self) -> Result<Vec<String>> {
+    /// The transactions with rows waiting, but those `skips` lets be.
+    fn waiting(&self, under: Option<&str>) -> Result<Vec<String>> {
         let xids: Vec<String> = {
             let conn = self.lock()?;
             let mut list = conn.prepare_cached("select xid from unsettled union select xid from retracted")?;
             list.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?
         };
-        Ok(xids.into_iter().filter(|xid| !self.running(xid)).collect())
+        Ok(xids.into_iter().filter(|xid| !self.skips(xid, under)).collect())
     }
 
     /// Ask `ended` about every transaction with rows still waiting. Rows of a
     /// committed one stay; rows of a rolled-back one are taken out again.
-    pub(crate) fn settle(&self, mut ended: impl FnMut(&str) -> Result<Ended>) -> Result<()> {
+    pub(crate) fn settle(&self, ended: impl FnMut(&str) -> Result<Ended>) -> Result<()> {
+        self.settle_under(None, ended)
+    }
+
+    /// `settle`, by a transaction holding the lock of group `under`: a save of this process that took it is asked
+    /// about too, though it hasnt said it ended.
+    pub(crate) fn settle_under(&self, under: Option<&str>, mut ended: impl FnMut(&str) -> Result<Ended>) -> Result<()> {
         ensure!(self.writer, "the local article store is open for reading only");
-        let xids = self.waiting()?;
+        let xids = self.waiting(under)?;
         // PostgreSQL is asked with the store unlocked, so readers are not kept waiting on it.
         let mut answers = Vec::with_capacity(xids.len());
         for xid in xids {
@@ -382,8 +403,9 @@ impl Store {
     }
 
     /// Whether a save other than `own` is still waiting to hear how its transaction ended.
-    pub(crate) fn has_unsettled_besides(&self, own: Option<&str>) -> Result<bool> {
-        Ok(self.waiting()?.iter().any(|xid| Some(xid.as_str()) != own))
+    /// (`under`: the group whose lock the asking transaction holds, see `settle_under`.)
+    pub(crate) fn has_unsettled_besides(&self, own: Option<&str>, under: Option<&str>) -> Result<bool> {
+        Ok(self.waiting(under)?.iter().any(|xid| Some(xid.as_str()) != own))
     }
 
     pub(crate) fn is_writer(&self) -> bool {
