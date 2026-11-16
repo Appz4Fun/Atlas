@@ -24,7 +24,8 @@ fn agree(client: &mut postgres::Client, step: &str) -> Result<()> {
 }
 
 fn revision(client: &mut postgres::Client) -> Result<i64> {
-    Ok(client.query_one("select revision from native_catalog_revision", &[])?.get(0))
+    // a sequence since migration 0016; nextval in this session moves last_value
+    Ok(client.query_one("select last_value from native_catalog_revision_seq", &[])?.get(0))
 }
 
 fn marks(client: &mut postgres::Client) -> Result<Vec<(i64, i64)>> {

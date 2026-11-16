@@ -463,7 +463,14 @@ impl Runtime {
             .context("initializing native indexer cursors")?;
         }
         let owner = Arc::new(Owner::with_cache_destination(owner, storage.clone(), identity.clone(), version,epoch));
-        let db = crate::indexer::owned_postgres_db(db, owner.clone(), PgWriteLimits::default())?;
+        let mut db = crate::indexer::owned_postgres_db(db, owner.clone(), PgWriteLimits::default())?;
+        if let Some(n) = config.native_helper_writers.filter(|&n| n > 0).map(|n| n.min(super::ingest::HELPER_WRITERS_MOST)) {
+            // saves beside the owner session, fenced on its epoch by the write guard (migration 0016)
+            let epoch = *owner.epoch().context("native owner epoch is unavailable")?.id();
+            let pool = Arc::new(super::Pool::new(&super::StorageConfig { max_connections: n, ..storage.clone() })?);
+            db = crate::indexer::with_helper_writers(db, super::ingest::Helpers::new(pool, &epoch).of(owner.clone()));
+            println!("native saves: {n} helper writer sessions beside the owner");
+        }
         Ok(Self { db, profile: Profile { storage, headers }, owner, identity })
     }
 

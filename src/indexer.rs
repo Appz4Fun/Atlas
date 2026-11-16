@@ -400,6 +400,12 @@ pub(crate) fn owned_postgres_db(
     Ok(db)
 }
 
+/// Ordinary saves of an owned `db` go to helper writer sessions beside its owner (`pg::ingest::Helpers`).
+pub(crate) fn with_helper_writers(mut db: Db, helpers: crate::pg::ingest::Helpers) -> Db {
+    db.native = db.native.take().map(|native| native.with_helpers(helpers));
+    db
+}
+
 /// Native indexer storage. The destination must already exist and be migrated; this never creates a schema.
 /// Call during synchronous startup or on a blocking thread, as with the synchronous PostgreSQL pool itself.
 pub fn shared_postgres_db(

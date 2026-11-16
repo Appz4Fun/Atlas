@@ -140,6 +140,8 @@ pub(crate) fn open_epoch(
         and mode='ExclusiveLock' and granted and classid=(hashtext('atlas.indexer')::bigint & 4294967295)::oid
         and objid=(hashtext($1)::bigint & 4294967295)::oid and objsubid=2)",&[&storage.schema])?.try_get(0)?;
     ensure!(held,"native Stage initialization requires canonical owner acquisition");
+    // helper writers of an earlier owner hold this shared for each transaction (migration 0016): theirs end first
+    tx.execute("select pg_advisory_xact_lock(hashtext('atlas.indexer.helpers'),hashtext($1))",&[&storage.schema])?;
     let slot=tx.query_one("select epoch from native_runtime_current where singleton for update",&[])?;
     if let Some(old)=slot.try_get::<_,Option<Vec<u8>>>(0)? {
         tx.execute("select pg_stat_clear_snapshot()",&[])?;
