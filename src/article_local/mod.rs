@@ -115,18 +115,24 @@ const CHECKPOINT_EVERY: std::time::Duration = std::time::Duration::from_millis(5
 const CHECKPOINT_FALLBACK: i64 = 131_072;
 /// WAL frames past which a checkpoint waits for the writer to finish its transaction and resets the WAL (RESTART): with
 /// commits arriving all the time a PASSIVE pass never catches the end of the WAL, so it never starts over, and on prod
-/// it grew to `CHECKPOINT_FALLBACK`, where the writer checkpointed on its commits again.
+/// it grew to `CHECKPOINT_FALLBACK`, where the writer checkpointed on its commits again. A RESTART waits at most the
+/// checkpoint connection's busy timeout (1 s), meanwhile holding off new write transactions, and says only in its row
+/// that it gave up (a reader holding an old snapshot): then the next ones wait longer, up to `CHECKPOINT_BACKOFF_MOST`
+/// passes, so a long reader doesnt stall the writer pass after pass.
 const CHECKPOINT_RESTART_AT: i64 = 32_768;
+const CHECKPOINT_BACKOFF_MOST: u32 = 64;
 
 impl Checkpointer {
     fn start(path: &Path) -> Result<Self> {
         let conn = Connection::open(path).with_context(|| format!("opening {} for checkpoints", path.display()))?;
         // a RESTART waits this long for the writer's transaction and readers' snapshots before giving up this time
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.busy_timeout(std::time::Duration::from_secs(1))?;
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stopping = stop.clone();
         let thread = std::thread::Builder::new().name("article-store-checkpoint".into()).spawn(move || {
-            let mut failing = false;
+            let (mut failing, mut busy) = (false, false);
+            // passes to skip a RESTART for after one gave up, and how many that is now
+            let (mut wait, mut backoff) = (0u32, 1u32);
             while !stopping.load(Ordering::Acquire) {
                 std::thread::sleep(CHECKPOINT_EVERY);
                 if stopping.load(Ordering::Acquire) {
@@ -135,10 +141,25 @@ impl Checkpointer {
                 // PASSIVE: copies what no reader still needs and waits for nobody; its row says how long the WAL is
                 let passive = conn.query_row("pragma wal_checkpoint(PASSIVE)", [], |row| row.get::<_, i64>(1));
                 let result = match passive {
-                    Ok(frames) if frames > CHECKPOINT_RESTART_AT => {
-                        conn.query_row("pragma wal_checkpoint(RESTART)", [], |_| Ok(()))
+                    Ok(frames) if frames > CHECKPOINT_RESTART_AT && wait == 0 => conn
+                        .query_row("pragma wal_checkpoint(RESTART)", [], |row| row.get::<_, i64>(0))
+                        .map(|gave_up| {
+                            if gave_up != 0 {
+                                if !busy {
+                                    eprintln!("local article store checkpoint couldnt start the WAL over ({frames} frames): a reader holds it, trying again later");
+                                }
+                                busy = true;
+                                wait = backoff;
+                                backoff = (backoff * 2).min(CHECKPOINT_BACKOFF_MOST);
+                            } else {
+                                busy = false;
+                                backoff = 1;
+                            }
+                        }),
+                    other => {
+                        wait = wait.saturating_sub(1);
+                        other.map(|_| ())
                     }
-                    other => other.map(|_| ()),
                 };
                 // said once per run of failures, not every pass
                 match result {
