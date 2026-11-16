@@ -100,8 +100,16 @@ pub(crate) struct Store {
     running: Mutex<HashMap<String, HashSet<String>>>,
 }
 
-/// Read connections a writer's store keeps open when idle (`Store::read`).
-const READERS_KEPT: usize = 16;
+/// Read connections a writer's store keeps open when idle (`Store::read`): `has` takes up to `HAS_SPLIT` at once for
+/// each of the helper writers' saves.
+const READERS_KEPT: usize = 64;
+
+/// Keys `has` looks up on one connection at most before it splits them over several, `HAS_SPLIT` at most. The store is
+/// far bigger than memory, so most lookups of an existing release read the disk at random, one after another on one
+/// connection: on prod `has` spent two thirds of its time in pread with the disk doing a few thousand reads a second,
+/// a fraction of what it does with more requests in flight.
+const HAS_ALONE: usize = 256;
+const HAS_SPLIT: usize = 8;
 
 const SCHEMA: &str = "
     create table if not exists meta (key text primary key, value text not null) without rowid;
@@ -225,7 +233,8 @@ impl Store {
                 )
                 .with_context(|| format!("opening {} for reading", self.path.display()))?;
                 conn.busy_timeout(std::time::Duration::from_secs(30))?;
-                conn.execute_batch("pragma cache_size = -32768; pragma temp_store = memory;")?;
+                // a reader's cache starts over whenever another connection committed, which writers do all the time
+                conn.execute_batch("pragma cache_size = -4096; pragma temp_store = memory;")?;
                 conn
             }
         };
@@ -255,10 +264,34 @@ impl Store {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
-        self.read(|conn| {
-            let mut find = conn.prepare_cached("select 1 from segments where release_id = ?1 and message_id = ?2")?;
-            keys.iter().map(|(release, id)| Ok(find.exists(params![release, id])?)).collect()
-        })
+        let look = |keys: &[&(i64, &[u8])]| -> Result<Vec<bool>> {
+            self.read(|conn| {
+                let mut find = conn.prepare_cached("select 1 from segments where release_id = ?1 and message_id = ?2")?;
+                keys.iter().map(|(release, id)| Ok(find.exists(params![release, id])?)).collect()
+            })
+        };
+        // in key order, so each connection walks one stretch of the index
+        let mut order: Vec<usize> = (0..keys.len()).collect();
+        order.sort_unstable_by(|&a, &b| keys[a].cmp(&keys[b]));
+        let sorted: Vec<&(i64, &[u8])> = order.iter().map(|&i| &keys[i]).collect();
+        let found: Vec<bool> = if !self.writer || keys.len() <= HAS_ALONE {
+            look(&sorted)?
+        } else {
+            let each = keys.len().div_ceil(HAS_SPLIT.min(keys.len().div_ceil(HAS_ALONE)));
+            std::thread::scope(|scope| {
+                let parts: Vec<_> = sorted.chunks(each).map(|part| scope.spawn(move || look(part))).collect();
+                let mut found = Vec::with_capacity(keys.len());
+                for part in parts {
+                    found.extend(part.join().map_err(|_| anyhow::anyhow!("a local store lookup panicked"))??);
+                }
+                Ok::<_, anyhow::Error>(found)
+            })?
+        };
+        let mut answers = vec![false; keys.len()];
+        for (&i, known) in order.iter().zip(found) {
+            answers[i] = known;
+        }
+        Ok(answers)
     }
 
     /// Write the accepted articles of one batch and remember them under `xid`,
