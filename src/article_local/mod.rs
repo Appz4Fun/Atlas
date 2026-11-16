@@ -769,8 +769,10 @@ impl Store {
         {
             return;
         }
-        // one at a time, and none while a WAL restart is wanted (its checkpoint waits for readers)
+        // one at a time, none while a WAL restart is wanted (its checkpoint waits for readers), and none while a save
+        // waits for the write lock: the fill then doesnt run (`add_fresh`), and the read would be for nothing
         if self.restart_wanted.load(Ordering::Acquire)
+            || self.waiting.load(Ordering::Acquire) > 0
             || self.warming.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err()
         {
             return;
