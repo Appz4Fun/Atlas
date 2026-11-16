@@ -3,7 +3,7 @@
 //! keep round trips proportional to batches instead of articles.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::Ordering;
 
 use anyhow::{Result, ensure};
@@ -330,6 +330,8 @@ fn flush_local(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], no
     }
     let release = tx.query_one(&WRITE_RELEASES.replace("pg_temp.atlas_release_input", "pg_temp.atlas_release_fold"), &[&group])?;
     stats.releases += release.get::<_, i64>(0) as u64;
+    // releases made by this statement have no articles in the local store yet: theirs arent looked up
+    let fresh_releases: HashSet<i64> = release.try_get::<_, Vec<i64>>(1)?.into_iter().collect();
     let mut release_of = vec![None; heads.len()];
     for row in tx.query(RELEASE_IDS, &[&group])? {
         release_of[usize::try_from(row.try_get::<_, i64>(0)?)?] = Some(row.try_get::<_, i64>(1)?);
@@ -347,8 +349,19 @@ fn flush_local(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], no
             }
         }
     }
-    let known = local.store.has(&firsts.iter().map(|&(_, article, release)| (release, article.message_id.as_bytes())).collect::<Vec<_>>())?;
-    let accepted: Vec<_> = firsts.into_iter().zip(known).filter(|(_, known)| !known).map(|(first, _)| first).collect();
+    let asked: Vec<_> = firsts
+        .iter()
+        .filter(|&&(_, _, release)| !fresh_releases.contains(&release))
+        .map(|&(_, article, release)| (release, article.message_id.as_bytes()))
+        .collect();
+    let mut known = local.store.has(&asked)?.into_iter();
+    let mut accepted = Vec::with_capacity(firsts.len());
+    for first in firsts {
+        if fresh_releases.contains(&first.2) || !known.next().ok_or_else(|| anyhow::anyhow!("the local store answered too few"))? {
+            accepted.push(first);
+        }
+    }
+    ensure!(known.next().is_none(), "the local store answered too many");
     if accepted.is_empty() {
         return Ok(());
     }
@@ -518,7 +531,10 @@ fn flush_local(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], no
     // Every release whose files or timing this batch changes is in `changed` and bumped once below: the input
     // triggers on files and file_timing leave the bump to this writer meanwhile (migration 0015).
     tx.batch_execute("set local atlas.writer_bumps_inputs = 'on'")?;
-    stats.files += tx.query_one(ADD_FILES, &[])?.try_get::<_, i64>(0)? as u64;
+    let added = tx.query_one(ADD_FILES, &[])?;
+    stats.files += added.try_get::<_, i64>(0)? as u64;
+    // files made by this statement have no parts in the local store yet
+    let fresh_files: HashSet<i64> = added.try_get::<_, Vec<i64>>(1)?.into_iter().collect();
     let mut file_ids = vec![None; files.len()];
     for row in tx.query(PLACE_FILES, &[])? {
         file_ids[usize::try_from(row.try_get::<_, i64>(0)?)?] = Some(row.try_get::<_, i64>(1)?);
@@ -546,7 +562,7 @@ fn flush_local(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], no
         })
         .collect();
     let xid = local.xid(tx)?;
-    let gained = local.store.add(&xid, &rows, crate::parser::MAX_PARTS)?;
+    let gained = local.store.add_fresh(&xid, &rows, crate::parser::MAX_PARTS, &fresh_files)?;
     let parts = rows.len() as u64;
     stats.parts += parts;
     // The trigger on `segments` told post-processing a release's input changed.
@@ -863,7 +879,7 @@ const WRITE_RELEASES: &str = "
         on conflict (group_name, is_collection, identity_key) do nothing
         returning id
     )
-    select count(*) from added";
+    select count(*), coalesce(array_agg(id), '{}')::bigint[] from added";
 
 const WRITE_ARTICLES: &str = "
     with candidates as materialized (
@@ -1014,9 +1030,9 @@ const ADD_FILES: &str = "
         insert into files (release_id, filename_key, filename, original_filename)
         select release_id, filename_key, filename, original_filename from pg_temp.atlas_file_fold
         on conflict (release_id, filename_key) do nothing
-        returning 1
+        returning id
     )
-    select count(*) from added";
+    select count(*), coalesce(array_agg(id), '{}')::bigint[] from added";
 
 // Give each folded file row its file.
 const PLACE_FILES: &str = "
