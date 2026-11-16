@@ -113,6 +113,8 @@ pub(crate) struct Store {
     seen_filled_at: Mutex<Option<std::time::Instant>>,
     /// a save is reading the next fill ahead (`warm_fill`): the others go straight on
     warming: std::sync::atomic::AtomicBool,
+    /// saves waiting for the write lock in `add_fresh`: the fill runs only when none is (`fill_seen`)
+    waiting: AtomicUsize,
 }
 
 /// Copies the WAL back into a writer store's file in the background, on a connection of its own, so the writer's
@@ -309,6 +311,7 @@ impl Store {
             seen_above: std::sync::atomic::AtomicI64::new(seen_above),
             seen_filled_at: Mutex::new(None),
             warming: std::sync::atomic::AtomicBool::new(false),
+            waiting: AtomicUsize::new(0),
         })
     }
 
@@ -334,6 +337,7 @@ impl Store {
             seen_above: std::sync::atomic::AtomicI64::new(i64::MAX),
             seen_filled_at: Mutex::new(None),
             warming: std::sync::atomic::AtomicBool::new(false),
+            waiting: AtomicUsize::new(0),
         })
     }
 
@@ -497,12 +501,19 @@ impl Store {
         }
         // the next fill's rows read here first, off the write lock: the fill under it then finds their pages cached
         self.warm_fill();
-        let mut conn = self.lock()?;
+        self.waiting.fetch_add(1, Ordering::AcqRel);
+        let locked = self.lock();
+        self.waiting.fetch_sub(1, Ordering::AcqRel);
+        let mut conn = locked?;
         if self.restart_wanted.swap(false, Ordering::AcqRel) {
             restart_wal(&conn);
         }
-        // the fill is best effort: a save never fails for it, and it goes on from `meta` next time
-        if let Err(error) = self.fill_seen(&mut conn) {
+        // the fill is best effort: a save never fails for it, and it goes on from `meta` next time. Only when no other
+        // save waits for this lock: it only speeds up `has`, which reads off the lock, and on prod its reads of cold
+        // pages under the lock held every save back
+        if self.waiting.load(Ordering::Acquire) == 0
+            && let Err(error) = self.fill_seen(&mut conn)
+        {
             eprintln!("local article store: couldnt fill the lookup index this time: {error:#}");
         }
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
