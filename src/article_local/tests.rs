@@ -149,3 +149,43 @@ fn an_add_starts_the_wal_over_when_the_checkpointer_asks() {
     assert!(after < before, "the WAL started over: {before} then {after}");
     assert_eq!(store.has(&[(10, b"<wal-0@x>"), (99, b"<after>")]).unwrap(), vec![true, true]);
 }
+
+#[test]
+fn a_store_from_before_seen_is_filled_newest_release_first_and_answers_the_same() {
+    let dir = tempfile::tempdir().unwrap();
+    let ids: Vec<Vec<u8>> = (0..12_000).map(|n| format!("<old-{n}@x>").into_bytes()).collect();
+    {
+        let store = Store::open_writer(dir.path(), "test").unwrap();
+        // three releases, the middle one bigger than a fill batch
+        for (release, ids) in [(5, &ids[..1000]), (6, &ids[1000..11_000]), (7, &ids[11_000..])] {
+            let rows: Vec<NewRow<'_>> = ids.iter().map(|id| row(release, release * 10, id, None)).collect();
+            store.add(&format!("{release}"), &rows, 100).unwrap();
+            store.confirm(&format!("{release}")).unwrap();
+        }
+        // as a store written before `seen` was
+        let conn = store.lock().unwrap();
+        conn.execute_batch("delete from seen; delete from meta where key in ('seen_above', 'seen_cursor');").unwrap();
+    }
+    let store = Store::open_writer(dir.path(), "test").unwrap();
+    assert_eq!(store.seen_above.load(Ordering::Acquire), 7);
+    let asked: Vec<(i64, &[u8])> =
+        vec![(5, &ids[0][..]), (6, &ids[5000][..]), (7, &ids[11_500][..]), (6, &ids[0][..]), (8, b"<new>")];
+    let want = vec![true, true, true, false, false];
+    assert_eq!(store.has(&asked).unwrap(), want);
+    let mut rounds = 0;
+    while store.seen_above.load(Ordering::Acquire) != i64::MIN {
+        *store.seen_filled_at.lock().unwrap() = None;
+        store.fill_seen(&mut store.lock().unwrap()).unwrap();
+        // releases above the mark are whole in seen whenever it moves
+        assert_eq!(store.has(&asked).unwrap(), want);
+        rounds += 1;
+        assert!(rounds < 10, "the fill finishes");
+    }
+    let count: i64 = store.lock().unwrap().query_row("select count(*) from seen", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 12_000);
+    // a rolled back save leaves seen too
+    store.add("20", &[row(6, 60, b"<late>", None)], 100).unwrap();
+    assert_eq!(store.has(&[(6, b"<late>")]).unwrap(), vec![true]);
+    store.settle(|_| Ok(Ended::RolledBack)).unwrap();
+    assert_eq!(store.has(&[(6, b"<late>")]).unwrap(), vec![false]);
+}
