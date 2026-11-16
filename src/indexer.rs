@@ -66,7 +66,17 @@ pub struct GroupRunState {
     pub refused: Vec<Refused>,
     /// its last backfill turn went live instead (`live_first`): the next one is its own
     pub backfill_deferred: bool,
+    /// per server key, the overview rows its listings of the group returned per article number asked, averaged
+    /// (`RunStates::slice_size`)
+    pub density: HashMap<String, f64>,
 }
+
+/// Overview rows a slice is sized to return once a server's density in a group is known: under the listing's
+/// budget (`OverviewBudget`), which `request_size` 20000 overran in dense groups.
+const SLICE_ROWS: f64 = 3_000.0;
+/// Article numbers a slice spans at most, however sparse: its room in the unsaved budget is taken by numbers until
+/// it is read.
+const SLICE_NUMBERS_MOST: u64 = 40_000;
 
 /// A slice of `key`'s numbers (a cursor key, soo one server's) its server
 /// answered XOVER with a 5xx: when that was first, and how many times since.
@@ -118,6 +128,7 @@ impl Default for GroupRunState {
             first_post_days: HashMap::new(),
             refused: Vec::new(),
             backfill_deferred: false,
+            density: HashMap::new(),
         }
     }
 }
@@ -133,6 +144,29 @@ pub struct RunStates(
 );
 
 impl RunStates {
+    /// Article numbers a slice of `group` on server `key` spans: `base` (`request_size`) until its density there is
+    /// known, then enough for `SLICE_ROWS` rows, `base` to `SLICE_NUMBERS_MOST`. On prod most servers' days were
+    /// sparse (~4% of the numbers held an article): a 5000-number listing took 1.7 s for ~200 rows.
+    fn slice_size(&self, group: &str, key: &str, base: u64) -> u64 {
+        let density = self.0.lock().unwrap().get(group).and_then(|st| st.density.get(key).copied());
+        match density {
+            Some(d) if d > 0.0 => ((SLICE_ROWS / d) as u64).clamp(base, SLICE_NUMBERS_MOST.max(base)),
+            Some(_) => SLICE_NUMBERS_MOST.max(base),
+            None => base,
+        }
+    }
+
+    /// A listing of `group` on server `key` over `span` article numbers returned `rows`.
+    fn saw_rows(&self, group: &str, key: &str, span: u64, rows: usize) {
+        if span == 0 {
+            return;
+        }
+        let seen = rows as f64 / span as f64;
+        let mut states = self.0.lock().unwrap();
+        let d = states.entry(group.to_string()).or_default().density.entry(key.to_string()).or_insert(seen);
+        *d = 0.7 * *d + 0.3 * seen;
+    }
+
     /// The time read through elsewhere the cursor `key` was last moved up to by date (`time_cursor_start`).
     fn aligned(&self, key: &str) -> Option<i64> {
         self.2.lock().unwrap().get(key).copied()
@@ -2273,7 +2307,7 @@ impl Pass<'_> {
         }
         // no slice bigger than the whole unsaved budget: it would hold more
         // headers than the cap allows
-        let size = self.settings.request_size.min(pool.max_unsaved() as u64);
+        let size = self.ctx.states.slice_size(group, &self.key, self.settings.request_size).min(pool.max_unsaved() as u64);
         let slices = make_slices(start.max(0) as u64, end.max(0) as u64, size, kind == "BACKFILL");
         let total = slices.len();
 
@@ -2359,11 +2393,13 @@ impl Pass<'_> {
             let headers: Vec<Overview> = match slice.result {
                 Ok(h) => {
                     self.ctx.states.read(group, &self.key, (slice.start, slice.end));
+                    self.ctx.states.saw_rows(group, &self.key, slice.end - slice.start + 1, h.len());
                     h
                 }
                 // 423 (or 420) = no articles in that slice
                 Err(e) if e.is_empty_range() => {
                     self.ctx.states.read(group, &self.key, (slice.start, slice.end));
+                    self.ctx.states.saw_rows(group, &self.key, slice.end - slice.start + 1, 0);
                     done += 1;
                     finished.add(slice.start, slice.end);
                     continue;
@@ -3518,3 +3554,26 @@ mod native_blocked_contract;
 #[cfg(test)]
 #[path = "indexer/scheduler_read_selection_tests.rs"]
 mod scheduler_read_selection_tests;
+
+#[cfg(test)]
+mod slice_size_tests {
+    #[test]
+    fn a_sparse_group_gets_wider_slices_and_a_dense_one_keeps_the_configured_size() {
+        let states = super::RunStates::default();
+        assert_eq!(states.slice_size("g", "s", 5000), 5000);
+        // ~4% of numbers hold an article
+        for _ in 0..10 {
+            states.saw_rows("g", "s", 5000, 200);
+        }
+        assert_eq!(states.slice_size("g", "s", 5000), 40_000);
+        states.saw_rows("g", "t", 5000, 1000);
+        assert_eq!(states.slice_size("g", "t", 5000), 15_000);
+        for _ in 0..10 {
+            states.saw_rows("g", "u", 5000, 5000);
+        }
+        assert_eq!(states.slice_size("g", "u", 5000), 5000);
+        // an empty listing: as wide as allowed
+        states.saw_rows("h", "s", 5000, 0);
+        assert_eq!(states.slice_size("h", "s", 5000), 40_000);
+    }
+}
