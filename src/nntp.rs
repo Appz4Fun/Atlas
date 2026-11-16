@@ -3565,6 +3565,24 @@ impl Pool {
     /// listings are sorted, the first rows say.
     async fn posted_at(&self, i: usize, group: &str, number: u64, look: u64) -> Result<Option<Dated>> {
         let end = number.saturating_add(look - 1);
+        // A dense span is longer than a listing is read (`DATE_ROWS`), and a listing cut short costs its connection: on
+        // prod day searches reconnected about once per probe. Its first `DATE_SCAN_MAX` numbers are always read whole
+        // and hold its first article unless they hold no dated one, which only then are stepped over at once.
+        if end - number >= DATE_SCAN_MAX {
+            let window = self.ends(i, group, number, number + DATE_SCAN_MAX - 1).await?;
+            if window.first.is_some() {
+                return Ok(window.first);
+            }
+            // read whole with no dated article (a gap, or undated rows): the rest of the span, past it
+            if window.whole {
+                return self.posted_at_wide(i, group, number + DATE_SCAN_MAX, end).await;
+            }
+        }
+        self.posted_at_wide(i, group, number, end).await
+    }
+
+    /// `posted_at` over `number..=end` in one request, a cut short listing whose rows had no date read on past them.
+    async fn posted_at_wide(&self, i: usize, group: &str, number: u64, end: u64) -> Result<Option<Dated>> {
         let mut from = number;
         loop {
             let ends = self.ends(i, group, from, end).await?;
@@ -3588,7 +3606,14 @@ impl Pool {
             /// the last article below the spans above it in the stack
             Found(Dated),
         }
-        let mut todo = vec![Todo::Span(start, start.saturating_add(look))];
+        let b = start.saturating_add(look);
+        // its top `DATE_SCAN_MAX` numbers first, a listing always read whole (see `posted_at`): they hold the last
+        // article unless they are a gap
+        let mut todo = if b - start > DATE_SCAN_MAX {
+            vec![Todo::Span(start, b - DATE_SCAN_MAX), Todo::Span(b - DATE_SCAN_MAX, b)]
+        } else {
+            vec![Todo::Span(start, b)]
+        };
         while let Some(next) = todo.pop() {
             let (a, b) = match next {
                 Todo::Found(d) => return Ok(Some(d)),
