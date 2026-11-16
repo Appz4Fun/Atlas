@@ -102,6 +102,10 @@ pub(crate) fn save_in(tx:&mut Transaction<'_>,releases:&[Release],now:i64)->Resu
 
 fn save_grouped(tx:&mut Transaction<'_>,groups:BTreeMap<&str,Vec<&Release>>,now:i64)->Result<(SaveStats,Option<Local>)> {
     super::history_gate::native(tx)?;
+    // a helper writer beside the owner (`pg::ingest::Helpers`) waits for a group's lock as long as it takes, then for
+    // row locks only `HELPER_LOCK_WAIT`
+    let helper: bool =
+        tx.query_one("select coalesce(current_setting('atlas.helper_epoch', true), '') <> ''", &[])?.try_get(0)?;
     tx.batch_execute(CREATE_STAGE)?;
     let mut stats = SaveStats::default();
     let mut timing_key = None;
@@ -113,7 +117,13 @@ fn save_grouped(tx:&mut Transaction<'_>,groups:BTreeMap<&str,Vec<&Release>>,now:
         tx.batch_execute(CREATE_FOLD_STAGE)?;
     }
     for (group, releases) in groups {
+        if helper {
+            tx.batch_execute("set local lock_timeout = 0")?;
+        }
         tx.query_one("select pg_advisory_xact_lock(hashtextextended(current_schema() || ':' || $1, 7936))", &[&group])?;
+        if helper {
+            tx.batch_execute(&format!("set local lock_timeout = '{}'", super::ingest::HELPER_LOCK_WAIT))?;
+        }
         // Another connection's save of this group has ended now that its lock is ours:
         // its articles are counted or gone before this save asks which it already has.
         if let Some(local) = &local

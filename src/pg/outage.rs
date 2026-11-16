@@ -71,8 +71,10 @@ pub(crate) fn classify(error: &anyhow::Error) -> Failure {
         }
         if let Some(pg) = source.downcast_ref::<postgres::Error>() {
             if let Some(code) = pg.code() {
+                // 40P01/40001: PostgreSQL rolled this transaction back to break a deadlock or a serialization
+                // conflict (helper writers save beside the owner): the attempt pauses and reopens, the session is fine
                 return if (code.code().starts_with("08") && *code != postgres::error::SqlState::PROTOCOL_VIOLATION)
-                    || matches!(code.code(), "57P01" | "57P02" | "57P03" | "57P05" | "53300")
+                    || matches!(code.code(), "57P01" | "57P02" | "57P03" | "57P05" | "53300" | "40P01" | "40001")
                 {
                     Failure::Unavailable
                 } else {

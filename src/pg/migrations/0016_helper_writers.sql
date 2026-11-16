@@ -1,10 +1,11 @@
 -- Helper writer sessions. Every native mutation took a shared advisory lock on `atlas.indexer`, which the owner
 -- session holds exclusively, so only the owner could write: on prod every save queued on that one session, which
 -- spent 84% of its save time waiting on PostgreSQL while the server had cores to spare. A session that names the
--- current owner epoch (`atlas.helper_epoch`) now writes beside it: once per transaction it holds the current-epoch
--- row FOR SHARE (a new owner registers with FOR UPDATE on that row, so it waits for this transaction to end) and checks
--- that the epoch is active and its owner backend alive and still holding the exclusive lock. Without the setting the
--- guard is what it was.
+-- current owner epoch (`atlas.helper_epoch`) now writes beside it: once per transaction it takes the shared advisory
+-- lock `atlas.indexer.helpers` (a new owner takes it exclusively before it registers, `stage::open_epoch`, so it
+-- waits for this transaction to end) and checks that the epoch is active and its owner backend alive and still
+-- holding the exclusive lock. Without the setting the guard is what it was. (A lock rather than a row FOR SHARE: every
+-- concurrent save sharing one row would make a MultiXact each time.)
 create or replace function atlas_native_write_guard(p_schema text) returns void language plpgsql volatile
 security definer set search_path to 'pg_catalog' as $$
 declare blocked boolean; helper text; alive boolean;
@@ -18,7 +19,7 @@ begin
     if helper is null or helper='' then
         perform pg_catalog.pg_advisory_xact_lock_shared(pg_catalog.hashtext('atlas.indexer'),pg_catalog.hashtext(p_schema));
     elsif coalesce(current_setting('atlas.helper_fenced',true),'')<>pg_catalog.txid_current()::text then
-        execute format('select 1 from %I.native_runtime_current where singleton for share',p_schema);
+        perform pg_catalog.pg_advisory_xact_lock_shared(pg_catalog.hashtext('atlas.indexer.helpers'),pg_catalog.hashtext(p_schema));
         perform pg_catalog.pg_stat_clear_snapshot();
         execute format('select exists(select 1 from %1$I.native_runtime_current c join %1$I.native_runtime_epochs e on e.epoch=c.epoch
             join pg_catalog.pg_stat_activity a on a.pid=e.backend_pid and a.backend_start=e.backend_start

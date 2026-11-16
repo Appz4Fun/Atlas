@@ -62,5 +62,12 @@ fn helper_writers_save_beside_the_owner_only_on_its_epoch() {
         .with(|client| Ok(client.query_one("select count(*) from releases where name <> 'Helper.Saved'", &[])?.get(0)))
         .unwrap();
     assert_eq!(refused, 0);
+
+    // none starts once the owner stops
     runtime.owner.close();
+    let error = helpers(&schema, &epoch)
+        .of(runtime.owner.clone())
+        .save(&[release("Helper.AfterStop", "<after@example.test>")], 1)
+        .unwrap_err();
+    assert!(crate::pg::outage::is_attempt_ended(&error), "{error:#}");
 }
