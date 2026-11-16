@@ -70,6 +70,14 @@ pub(crate) fn classify(error: &anyhow::Error) -> Failure {
             return Failure::Unavailable;
         }
         if let Some(pg) = source.downcast_ref::<postgres::Error>() {
+            // A statement past its own statement_timeout (the stage's reads set 5-10 s) on a busy server: the attempt
+            // pauses and reopens; on prod one ended the whole indexer at ~300k articles/s. An administrative cancel
+            // ("due to user request") and every other 57014 stay fatal.
+            if pg.code() == Some(&postgres::error::SqlState::QUERY_CANCELED)
+                && pg.as_db_error().is_some_and(|db| db.message() == "canceling statement due to statement timeout")
+            {
+                return Failure::Unavailable;
+            }
             if let Some(code) = pg.code() {
                 // 40P01/40001: PostgreSQL rolled this transaction back to break a deadlock or a serialization
                 // conflict (helper writers save beside the owner): the attempt pauses and reopens, the session is fine
