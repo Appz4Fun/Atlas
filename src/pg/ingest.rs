@@ -43,9 +43,54 @@ pub(crate) struct Native {
     source: Source,
     /// sessions that save ordinary jobs beside the owner (`with_helpers`); permits for owner work stay on the owner
     helpers: Option<Arc<Helpers>>,
+    /// jobs of one group waiting for that group's running save (`save_coalesced`)
+    queues: Arc<std::sync::Mutex<HashMap<String, GroupQueue>>>,
     memory: Arc<Semaphore>,
     slots: Arc<Semaphore>,
     limits: PgWriteLimits,
+}
+
+/// Jobs of one group waiting while a save of that group runs: saves of a group take its lock one after another, and
+/// each waiting one held a helper session and a save slot meanwhile. They are saved together once it ends.
+#[derive(Default)]
+struct GroupQueue {
+    pending: Vec<Waiting>,
+}
+
+struct Waiting {
+    releases: Vec<Release>,
+    now: i64,
+    bytes: usize,
+    done: tokio::sync::oneshot::Sender<std::result::Result<(), Shared>>,
+}
+
+/// A merged save's failure, told to every job in it.
+#[derive(Clone)]
+enum Shared {
+    Ended,
+    Failed(String),
+}
+
+impl Shared {
+    fn of(error: &anyhow::Error) -> Self {
+        if super::outage::is_attempt_ended(error) { Shared::Ended } else { Shared::Failed(format!("{error:#}")) }
+    }
+    fn error(self) -> anyhow::Error {
+        match self {
+            Shared::Ended => super::outage::AttemptEnded.into(),
+            Shared::Failed(message) => anyhow::anyhow!("saving releases to PostgreSQL (merged with other jobs of the group): {message}"),
+        }
+    }
+}
+
+/// Jobs and bytes one merged save takes at most from a group's queue.
+const MERGE_JOBS: usize = 8;
+const MERGE_BYTES: usize = 64 << 20;
+
+/// The group every release of `releases` is in, if they share one.
+fn one_group(releases: &[Release]) -> Option<&str> {
+    let first = releases.first()?.group.as_str();
+    releases.iter().all(|r| r.group == first).then_some(first)
 }
 
 /// The most helper writer sessions a runtime opens (`config.native_helper_writers`): no more save jobs run at once
@@ -171,6 +216,7 @@ impl Native {
         Ok(Self {
             source,
             helpers: None,
+            queues: Arc::new(std::sync::Mutex::new(HashMap::new())),
             memory: Arc::new(Semaphore::new(limits.max_pending_bytes as usize)),
             slots: Arc::new(Semaphore::new(usize::from(limits.concurrent_saves))),
             limits,
@@ -319,6 +365,13 @@ impl Native {
         let bytes = payload_bytes(&releases, releases.capacity());
         ensure!(bytes <= self.limits.max_job_bytes as usize, "native job exceeds max_job_bytes");
         let memory = self.memory.clone().acquire_many_owned(bytes as u32).await?;
+        if let Some(helpers) = &self.helpers
+            && let Some(group) = one_group(&releases).map(str::to_owned)
+        {
+            let result = self.save_coalesced(helpers.clone(), group, releases, bytes, logical_now).await;
+            drop(memory);
+            return result;
+        }
         let slot = self.slots.clone().acquire_owned().await?;
         let source = self.source.clone();
         let helpers = self.helpers.clone();
@@ -341,6 +394,103 @@ impl Native {
         .await
         .context("native PostgreSQL save task failed")?
         .context("saving releases to PostgreSQL")
+    }
+}
+
+impl Native {
+    /// Save `releases` of `group` on the helpers, after the group's running save if there is one: a job arriving while
+    /// one runs waits in the group's queue without a slot or session, and the running save's task then saves the queue
+    /// in merged batches (`MERGE_JOBS`, `MERGE_BYTES`) until it is empty. The task owns the whole drain, so a caller
+    /// going away never leaves a queue unserved.
+    async fn save_coalesced(
+        &self,
+        helpers: Arc<Helpers>,
+        group: String,
+        releases: Vec<Release>,
+        bytes: usize,
+        logical_now: Option<i64>,
+    ) -> Result<()> {
+        let now = logical_now.unwrap_or_else(|| chrono::Utc::now().timestamp());
+        let (done, result) = tokio::sync::oneshot::channel();
+        let waiting = Waiting { releases, now, bytes, done };
+        // queued behind a running save of the group
+        let waiting = {
+            let mut queues = self.queues.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            match queues.get_mut(&group) {
+                Some(queue) => {
+                    queue.pending.push(waiting);
+                    None
+                }
+                None => Some(waiting),
+            }
+        };
+        let Some(waiting) = waiting else {
+            return match result.await {
+                Ok(outcome) => outcome.map_err(Shared::error),
+                Err(_) => Err(anyhow::anyhow!("the save of the group this job waited on ended without saying how")),
+            };
+        };
+        let slot = self.slots.clone().acquire_owned().await?;
+        // another job of the group may have started while this one waited for its slot: then it queues behind that
+        let waiting = {
+            let mut queues = self.queues.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(queue) = queues.get_mut(&group) {
+                queue.pending.push(waiting);
+                None
+            } else {
+                queues.insert(group.clone(), GroupQueue::default());
+                Some(waiting)
+            }
+        };
+        let Some(first) = waiting else {
+            drop(slot);
+            return match result.await {
+                Ok(outcome) => outcome.map_err(Shared::error),
+                Err(_) => Err(anyhow::anyhow!("the save of the group this job waited on ended without saying how")),
+            };
+        };
+        let queues = self.queues.clone();
+        // the group is this task's from here: nothing awaits between taking it and starting the task
+        tokio::task::spawn_blocking(move || {
+            let _slot = slot;
+            // should the save panic, the group is let go and what waited for it told so, not left waiting forever
+            struct LetGo(Arc<std::sync::Mutex<HashMap<String, GroupQueue>>>, String);
+            impl Drop for LetGo {
+                fn drop(&mut self) {
+                    if std::thread::panicking() {
+                        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&self.1);
+                    }
+                }
+            }
+            let _release = LetGo(queues.clone(), group.clone());
+            let mut batch = vec![first];
+            loop {
+                let now = batch[0].now;
+                let releases: Vec<Release> = batch.iter_mut().flat_map(|w| std::mem::take(&mut w.releases)).collect();
+                let outcome = helpers.save(&releases, now).map_err(|error| Shared::of(&error));
+                drop(releases);
+                for waiting in batch.drain(..) {
+                    let _ = waiting.done.send(outcome.clone());
+                }
+                let mut queues = queues.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let Some(queue) = queues.get_mut(&group) else { break };
+                if queue.pending.is_empty() {
+                    queues.remove(&group);
+                    break;
+                }
+                let mut taken = 0;
+                let mut size = 0usize;
+                while taken < queue.pending.len() && taken < MERGE_JOBS && (taken == 0 || size + queue.pending[taken].bytes <= MERGE_BYTES) {
+                    size += queue.pending[taken].bytes;
+                    taken += 1;
+                }
+                batch.extend(queue.pending.drain(..taken));
+            }
+        });
+        match result.await {
+            Ok(outcome) => outcome.map_err(Shared::error),
+            Err(_) => Err(anyhow::anyhow!("the save task of this job ended without saying how")),
+        }
     }
 }
 

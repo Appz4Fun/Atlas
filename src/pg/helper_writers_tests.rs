@@ -71,3 +71,32 @@ fn helper_writers_save_beside_the_owner_only_on_its_epoch() {
         .unwrap_err();
     assert!(crate::pg::outage::is_attempt_ended(&error), "{error:#}");
 }
+
+#[test]
+#[ignore = "requires isolated PostgreSQL"]
+fn concurrent_saves_of_one_group_are_merged_and_all_land() {
+    let schema = super::testing::Schema::new().expect("explicit isolated PostgreSQL");
+    let runtime = super::stage_queue_tests::runtime(&schema);
+    let epoch = *runtime.owner.epoch().expect("owner epoch").id();
+    let native = super::ingest::Native::with_owner(runtime.owner.clone(), super::ingest::PgWriteLimits::default())
+        .unwrap()
+        .with_helpers(helpers(&schema, &epoch).of(runtime.owner.clone()));
+    let jobs = 24;
+    tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap().block_on(async {
+        let saves: Vec<_> = (0..jobs)
+            .map(|n| {
+                let native = native.clone();
+                tokio::spawn(async move { native.save(vec![release(&format!("Merged.{n}"), &format!("<m{n}@example.test>"))]).await })
+            })
+            .collect();
+        for save in saves {
+            save.await.unwrap().unwrap();
+        }
+    });
+    let saved: i64 = runtime
+        .owner
+        .with(|client| Ok(client.query_one("select count(*) from releases where name like 'Merged.%'", &[])?.get(0)))
+        .unwrap();
+    assert_eq!(saved, jobs as i64, "every job of the group landed");
+    runtime.owner.close();
+}
