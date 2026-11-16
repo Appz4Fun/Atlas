@@ -107,6 +107,10 @@ pub(crate) struct Store {
     confirmed: Mutex<HashSet<String>>,
     /// set by the checkpointer when the WAL should start over; the next `add` does it under the write lock
     restart_wanted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// releases above this have every article in `seen`; below and at it `has` reads `segments` (`fill_seen`)
+    seen_above: std::sync::atomic::AtomicI64,
+    /// when `fill_seen` last ran
+    seen_filled_at: Mutex<Option<std::time::Instant>>,
 }
 
 /// Copies the WAL back into a writer store's file in the background, on a connection of its own, so the writer's
@@ -214,6 +218,13 @@ const SCHEMA: &str = "
         primary key (release_id, message_id)
     ) without rowid;
     create index if not exists segments_file_part on segments (file_id, part);
+    -- What `has` asks, small enough to stay in memory: a release's articles by the first 8 bytes of their message
+    -- key (`seen_hash`). Filled for the articles saved before it existed newest release first (`fill_seen`).
+    create table if not exists seen (
+        release_id integer not null,
+        h          integer not null,
+        primary key (release_id, h)
+    ) without rowid;
     create table if not exists envelopes (
         release_id integer not null,
         message_id blob not null,
@@ -268,6 +279,19 @@ impl Store {
                 conn.execute("insert into meta (key, value) values ('catalogue', ?1)", [catalogue])?;
             }
         }
+        // a store from before `seen`: every release up to the newest is filled in by `fill_seen`
+        let cursor: Option<i64> =
+            conn.query_row("select value from meta where key = 'seen_above'", [], |row| row.get::<_, String>(0)).optional()?.map(|v| v.parse()).transpose()?;
+        let seen_above = match cursor {
+            Some(above) => above,
+            None => {
+                let newest: Option<i64> = conn.query_row("select max(release_id) from segments", [], |row| row.get(0))?;
+                let above = newest.unwrap_or(i64::MIN);
+                conn.execute("insert into meta (key, value) values ('seen_above', ?1)", [above.to_string()])?;
+                conn.execute("delete from meta where key = 'seen_cursor'", [])?;
+                above
+            }
+        };
         let restart_wanted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let checkpointer = Some(Checkpointer::start(&path, restart_wanted.clone())?);
 
@@ -280,6 +304,8 @@ impl Store {
             confirmed: Mutex::new(HashSet::new()),
             readers: Mutex::new(Vec::new()),
             restart_wanted,
+            seen_above: std::sync::atomic::AtomicI64::new(seen_above),
+            seen_filled_at: Mutex::new(None),
         })
     }
 
@@ -302,6 +328,8 @@ impl Store {
             confirmed: Mutex::new(HashSet::new()),
             readers: Mutex::new(Vec::new()),
             restart_wanted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            seen_above: std::sync::atomic::AtomicI64::new(i64::MAX),
+            seen_filled_at: Mutex::new(None),
         })
     }
 
@@ -377,12 +405,22 @@ impl Store {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
+        let above = self.seen_above.load(Ordering::Acquire);
         let look = |keys: &[&(i64, &[u8])]| -> Result<Vec<bool>> {
             let mut found = Vec::with_capacity(keys.len());
             for keys in keys.chunks(HAS_PER_READ) {
                 found.extend(self.read(|conn| {
+                    let mut seen = conn.prepare_cached("select 1 from seen where release_id = ?1 and h = ?2")?;
                     let mut find = conn.prepare_cached("select 1 from segments where release_id = ?1 and message_id = ?2")?;
-                    keys.iter().map(|(release, id)| Ok(find.exists(params![release, id])?)).collect::<Result<Vec<bool>>>()
+                    keys.iter()
+                        .map(|(release, id)| {
+                            Ok(if *release > above {
+                                seen.exists(params![release, seen_hash(id)])?
+                            } else {
+                                find.exists(params![release, id])?
+                            })
+                        })
+                        .collect::<Result<Vec<bool>>>()
                 })?);
             }
             Ok(found)
@@ -436,6 +474,7 @@ impl Store {
         if self.restart_wanted.swap(false, Ordering::AcqRel) {
             restart_wal(&conn);
         }
+        self.fill_seen(&mut conn)?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         // commits seen since the last add, marked here (`confirm_later`); should this transaction roll back they are
         // left waiting, and asked about as any unsettled transaction is
@@ -464,6 +503,7 @@ impl Store {
             let mut insert = tx.prepare_cached(
                 "insert into segments (release_id, message_id, file_id, part, bytes) values (?1, ?2, ?3, ?4, ?5)",
             )?;
+            let mut mark = tx.prepare_cached("insert or ignore into seen (release_id, h) values (?1, ?2)")?;
             let mut envelope = tx.prepare_cached(
                 "insert or ignore into envelopes (release_id, message_id, subject, poster, posted_date, nzb_timestamp,
                     expected, subject_file_index, subject_file_total) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -472,6 +512,7 @@ impl Store {
                 insert
                     .execute(params![row.release_id, row.message_id, row.file_id, row.part, row.bytes])
                     .context("an article the release already has reached the local article store")?;
+                mark.execute(params![row.release_id, seen_hash(row.message_id)])?;
                 if let Some(e) = &row.envelope {
                     envelope.execute(params![
                         row.release_id,
@@ -510,6 +551,7 @@ impl Store {
     fn committed(tx: &rusqlite::Transaction<'_>, xid: &str) -> Result<()> {
         tx.execute("delete from segments where release_id in (select release_id from retracted where xid = ?1)", [xid])?;
         tx.execute("delete from envelopes where release_id in (select release_id from retracted where xid = ?1)", [xid])?;
+        tx.execute("delete from seen where release_id in (select release_id from retracted where xid = ?1)", [xid])?;
         tx.execute("delete from retracted where xid = ?1", [xid])?;
         tx.execute("delete from unsettled where xid = ?1", [xid])?;
         Ok(())
@@ -610,13 +652,15 @@ impl Store {
                 };
                 let mut segment = tx.prepare_cached("delete from segments where release_id = ?1 and message_id = ?2")?;
                 let mut envelope = tx.prepare_cached("delete from envelopes where release_id = ?1 and message_id = ?2")?;
+                let mut unmark = tx.prepare_cached("delete from seen where release_id = ?1 and h = ?2")?;
                 for blob in blobs {
                     for (release, id) in decode_keys(&blob)? {
                         segment.execute(params![release, id])?;
                         envelope.execute(params![release, id])?;
+                        unmark.execute(params![release, seen_hash(id)])?;
                     }
                 }
-                drop((segment, envelope));
+                drop((segment, envelope, unmark));
                 tx.execute("delete from retracted where xid = ?1", [&xid])?;
                 tx.execute("delete from unsettled where xid = ?1", [&xid])?;
             } else {
@@ -648,12 +692,14 @@ impl Store {
             let mut insert = tx.prepare_cached(
                 "insert or ignore into segments (release_id, message_id, file_id, part, bytes) values (?1, ?2, ?3, ?4, ?5)",
             )?;
+            let mut mark = tx.prepare_cached("insert or ignore into seen (release_id, h) values (?1, ?2)")?;
             let mut envelope = tx.prepare_cached(
                 "insert or ignore into envelopes (release_id, message_id, subject, poster, posted_date, nzb_timestamp,
                     expected, subject_file_index, subject_file_total) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?;
             for row in rows {
                 added += insert.execute(params![row.release_id, row.message_id, row.file_id, row.part, row.bytes])? as u64;
+                mark.execute(params![row.release_id, seen_hash(row.message_id)])?;
                 if let Some(e) = &row.envelope {
                     envelope.execute(params![
                         row.release_id,
@@ -671,6 +717,65 @@ impl Store {
         }
         tx.commit()?;
         Ok(added)
+    }
+
+    /// Copy into `seen` the next `SEEN_FILL_ROWS` articles saved before it existed, newest release first, on the write
+    /// connection under its lock (so no save or rollback runs between reading `segments` and writing `seen`). Each
+    /// release is copied whole before `seen_above` passes below it; then `has` asks `seen` for it.
+    fn fill_seen(&self, conn: &mut Connection) -> Result<()> {
+        let above = self.seen_above.load(Ordering::Acquire);
+        if above == i64::MIN {
+            return Ok(());
+        }
+        {
+            let mut at = self.seen_filled_at.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if at.is_some_and(|t| t.elapsed() < SEEN_FILL_EVERY) {
+                return Ok(());
+            }
+            *at = Some(std::time::Instant::now());
+        }
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // where the copy of release `above` got to: its message ids above this are in `seen`
+        let cursor: Option<Vec<u8>> =
+            tx.query_row("select value from meta where key = 'seen_cursor'", [], |row| row.get::<_, String>(0)).optional()?.map(|v| decode_hex(&v)).transpose()?;
+        let rows: Vec<(i64, Vec<u8>)> = {
+            let mut read = tx.prepare_cached(
+                "select release_id, message_id from segments
+                 where release_id < ?1 or (release_id = ?1 and (?2 is null or message_id < ?2))
+                 order by release_id desc, message_id desc limit ?3",
+            )?;
+            let mut rows = read.query(params![above, cursor, SEEN_FILL_ROWS])?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next()? {
+                out.push((row.get(0)?, row.get(1)?));
+            }
+            out
+        };
+        {
+            let mut mark = tx.prepare_cached("insert or ignore into seen (release_id, h) values (?1, ?2)")?;
+            for (release, id) in &rows {
+                mark.execute(params![release, seen_hash(id)])?;
+            }
+        }
+        let next = match rows.last() {
+            // the last release read may go on past this batch: it is the cursor's; every one above it is whole
+            Some((release, id)) if rows.len() as i64 == SEEN_FILL_ROWS => {
+                tx.execute(
+                    "insert into meta (key, value) values ('seen_cursor', ?1) on conflict (key) do update set value = excluded.value",
+                    [encode_hex(id)],
+                )?;
+                *release
+            }
+            // the oldest article is in: every release is
+            _ => {
+                tx.execute("delete from meta where key = 'seen_cursor'", [])?;
+                i64::MIN
+            }
+        };
+        tx.execute("update meta set value = ?1 where key = 'seen_above'", [next.to_string()])?;
+        tx.commit()?;
+        self.seen_above.store(next, Ordering::Release);
+        Ok(())
     }
 
     pub(crate) fn meta(&self, key: &str) -> Result<Option<String>> {
@@ -693,11 +798,31 @@ impl Store {
         let mut gone = 0;
         for release in releases {
             gone += conn.execute("delete from segments where release_id = ?1", [release])? as u64;
+            conn.execute("delete from seen where release_id = ?1", [release])?;
             conn.execute("delete from envelopes where release_id = ?1", [release])?;
         }
         Ok(gone)
     }
 }
+
+/// An article's key in `seen`: the first 8 bytes of its message key. Two message ids of one release sharing it (about
+/// n²/2⁶⁵ for a release of n articles) would leave the second taken for one the release has.
+pub(crate) fn seen_hash(message_id: &[u8]) -> i64 {
+    i64::from_le_bytes(message_key(message_id)[..8].try_into().expect("8 bytes"))
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn decode_hex(text: &str) -> Result<Vec<u8>> {
+    ensure!(text.len() % 2 == 0, "odd hex length");
+    (0..text.len()).step_by(2).map(|i| Ok(u8::from_str_radix(&text[i..i + 2], 16)?)).collect()
+}
+
+/// Rows `fill_seen` copies at most at once, and how often it runs at most.
+const SEEN_FILL_ROWS: i64 = 5_000;
+const SEEN_FILL_EVERY: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// The key PostgreSQL kept beside each article: the SHA-256 of its message id.
 pub(crate) fn message_key(message_id: &[u8]) -> [u8; 32] {
