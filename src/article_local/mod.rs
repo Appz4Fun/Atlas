@@ -94,7 +94,14 @@ pub(crate) struct Store {
     /// writers saving side by side every save found the others' rows waiting and asked PostgreSQL about each, holding
     /// the store meanwhile.
     running: Mutex<HashMap<String, HashSet<String>>>,
+    /// Read connections of a writer's store (`read`): in WAL mode they dont wait for the writer, and the writer's
+    /// saves asked which articles a release had through the one connection their inserts held, side by side with
+    /// every helper writer's.
+    readers: Mutex<Vec<Connection>>,
 }
+
+/// Read connections a writer's store keeps open when idle (`Store::read`).
+const READERS_KEPT: usize = 16;
 
 const SCHEMA: &str = "
     create table if not exists meta (key text primary key, value text not null) without rowid;
@@ -161,7 +168,7 @@ impl Store {
                 conn.execute("insert into meta (key, value) values ('catalogue', ?1)", [catalogue])?;
             }
         }
-        Ok(Self { conn: Mutex::new(conn), path, writer: true, running: Mutex::new(HashMap::new()) })
+        Ok(Self { conn: Mutex::new(conn), path, writer: true, running: Mutex::new(HashMap::new()), readers: Mutex::new(Vec::new()) })
     }
 
     /// Open the store for reading only, as the web process does. The file must exist.
@@ -174,7 +181,7 @@ impl Store {
         .with_context(|| format!("opening {} for reading", path.display()))?;
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
         conn.execute_batch("pragma cache_size = -32768; pragma temp_store = memory;")?;
-        Ok(Self { conn: Mutex::new(conn), path, writer: false, running: Mutex::new(HashMap::new()) })
+        Ok(Self { conn: Mutex::new(conn), path, writer: false, running: Mutex::new(HashMap::new()), readers: Mutex::new(Vec::new()) })
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -202,15 +209,47 @@ impl Store {
         Ok(())
     }
 
+    /// Run `f` on a read connection: one of the writer store's own (see `readers`), or a reader store's connection.
+    /// It sees every commit made before it starts.
+    pub(super) fn read<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        if !self.writer {
+            return f(&*self.lock()?);
+        }
+        let idle = self.readers.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pop();
+        let conn = match idle {
+            Some(conn) => conn,
+            None => {
+                let conn = Connection::open_with_flags(
+                    &self.path,
+                    OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                )
+                .with_context(|| format!("opening {} for reading", self.path.display()))?;
+                conn.busy_timeout(std::time::Duration::from_secs(30))?;
+                conn.execute_batch("pragma cache_size = -32768; pragma temp_store = memory;")?;
+                conn
+            }
+        };
+        let out = f(&conn);
+        let mut idle = self.readers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if idle.len() < READERS_KEPT {
+            idle.push(conn);
+        }
+        out
+    }
+
     pub(super) fn lock(&self) -> Result<MutexGuard<'_, Connection>> {
         self.conn.lock().map_err(|_| anyhow::anyhow!("the local article store lock is poisoned"))
     }
 
     /// For each `(release_id, message_id)`, whether the release already has that article.
     pub(crate) fn has(&self, keys: &[(i64, &[u8])]) -> Result<Vec<bool>> {
-        let conn = self.lock()?;
-        let mut find = conn.prepare_cached("select 1 from segments where release_id = ?1 and message_id = ?2")?;
-        keys.iter().map(|(release, id)| Ok(find.exists(params![release, id])?)).collect()
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.read(|conn| {
+            let mut find = conn.prepare_cached("select 1 from segments where release_id = ?1 and message_id = ?2")?;
+            keys.iter().map(|(release, id)| Ok(find.exists(params![release, id])?)).collect()
+        })
     }
 
     /// Write the accepted articles of one batch and remember them under `xid`,
@@ -348,11 +387,10 @@ impl Store {
 
     /// The transactions with rows waiting, but those `skips` lets be.
     fn waiting(&self, under: Option<&str>) -> Result<Vec<String>> {
-        let xids: Vec<String> = {
-            let conn = self.lock()?;
+        let xids: Vec<String> = self.read(|conn| {
             let mut list = conn.prepare_cached("select xid from unsettled union select xid from retracted")?;
-            list.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?
-        };
+            Ok(list.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?)
+        })?;
         Ok(xids.into_iter().filter(|xid| !self.skips(xid, under)).collect())
     }
 
