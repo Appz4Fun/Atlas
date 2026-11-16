@@ -138,23 +138,34 @@ def swap_bytes():
 
 
 def available_bytes():
-    """Memory the system could hand out without swapping: free, inactive, speculative and purgeable pages on macOS,
-    MemAvailable on Linux. 0 when it cannot be read, which lets no read burst through."""
+    """Memory the system can hand out by dropping clean file pages, as the macOS kernel counts it
+    (memorystatus_available_pages): free + file-backed pageable + speculative pages; MemAvailable on Linux. Inactive
+    anonymous pages are left out, as getting them back means compressing or swapping. 0 when it cannot be read, which
+    lets no read burst through (said once)."""
+    global _AVAILABLE_FAILED
     try:
         if sys.platform == "darwin":
-            result = subprocess.run(["/usr/bin/vm_stat"], capture_output=True, text=True, timeout=2, check=True)
-            page = int(re.search(r"page size of (\d+) bytes", result.stdout)[1])
-            pages = {key.strip(): int(value.strip().rstrip(".")) for key, value in
-                     (line.split(":", 1) for line in result.stdout.splitlines()[1:] if ":" in line)}
-            return page * sum(pages.get(key, 0) for key in
-                              ("Pages free", "Pages inactive", "Pages speculative", "Pages purgeable"))
+            names = ["hw.pagesize", "vm.page_free_count", "vm.page_pageable_external_count", "vm.page_speculative_count"]
+            result = subprocess.run(["/usr/sbin/sysctl", "-n", *names], capture_output=True, text=True, timeout=2,
+                                    check=True)
+            page, *counts = (int(value) for value in result.stdout.split())
+            if len(counts) != 3:
+                raise ValueError("unexpected sysctl output")
+            return page * sum(counts)
         if sys.platform.startswith("linux"):
             for line in Path("/proc/meminfo").read_text().splitlines():
                 if line.startswith("MemAvailable:"):
                     return int(line.split()[1]) * 1024
-    except (OSError, ValueError, TypeError, IndexError, subprocess.SubprocessError):
-        pass
+            raise ValueError("no MemAvailable")
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        if not _AVAILABLE_FAILED:
+            _AVAILABLE_FAILED = True
+            print(f"Atlas resource guard: cannot measure available memory ({type(error).__name__}); "
+                  "disk reads keep their strict cap", file=sys.stderr)
     return 0
+
+
+_AVAILABLE_FAILED = False
 
 
 class Sampler:
