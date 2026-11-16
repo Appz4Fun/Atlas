@@ -87,6 +87,12 @@ impl Incoming<'_> {
 /// commits. The exact article identity is independent of the file name, so a
 /// replay or concurrent retry cannot change counts or queue generation.
 pub fn save(client: &mut Client, releases: &[Release], now: i64) -> Result<SaveStats> {
+    save_as(client, releases, now, None)
+}
+
+/// `save` on a helper writer session (`pg::ingest::Helpers`): `helper_epoch` (hex) is set for the session in the
+/// save's first round trip, before the write guard reads it, instead of a statement of its own.
+pub(crate) fn save_as(client: &mut Client, releases: &[Release], now: i64, helper_epoch: Option<&str>) -> Result<SaveStats> {
     let groups = parts(releases)?;
     if groups.is_empty() {
         return Ok(SaveStats::default());
@@ -94,7 +100,7 @@ pub fn save(client: &mut Client, releases: &[Release], now: i64) -> Result<SaveS
 
     // A group writer that waited on the advisory lock must see the preceding commit.
     let mut tx = client.build_transaction().isolation_level(IsolationLevel::ReadCommitted).start()?;
-    let (stats, local) = save_grouped(&mut tx, groups, now)?;
+    let (stats, local) = save_grouped(&mut tx, groups, now, helper_epoch)?;
     // no longer certainly running once the commit is sent: a failed commit has rolled back before anything here runs
     if let Some(Local { store, xid: Some(xid), .. }) = &local {
         store.end(xid);
@@ -112,36 +118,51 @@ pub fn save(client: &mut Client, releases: &[Release], now: i64) -> Result<SaveS
 /// its original owner transaction. This entry neither commits nor retries.
 /// The same RC/history gate and exact COPY/winner SQL as ordinary saves apply.
 pub(crate) fn save_in(tx:&mut Transaction<'_>,releases:&[Release],now:i64)->Result<SaveStats> {
-    Ok(save_grouped(tx,parts(releases)?,now)?.0)
+    Ok(save_grouped(tx,parts(releases)?,now,None)?.0)
 }
 
-fn save_grouped(tx:&mut Transaction<'_>,groups:Parts<'_>,now:i64)->Result<(SaveStats,Option<Local>)> {
-    super::history_gate::native(tx)?;
+fn save_grouped(tx:&mut Transaction<'_>,groups:Parts<'_>,now:i64,helper_epoch:Option<&str>)->Result<(SaveStats,Option<Local>)> {
+    // One round trip for the fixed setup: the helper epoch (session-wide, as `Helpers` set it before; a rolled-back
+    // try loses it and the next try sets it again), then the stage tables. Neither takes a shared lock, so the write
+    // guard below still precedes every group and row lock. The fold stage is made whenever some local store is open;
+    // its truncate covers rows an earlier save in the same transaction (`save_in`) left.
+    let mut setup = String::new();
+    if let Some(epoch) = helper_epoch {
+        ensure!(!epoch.is_empty() && epoch.bytes().all(|b| b.is_ascii_hexdigit()), "a helper epoch is hex");
+        setup.push_str(&format!("select pg_catalog.set_config('atlas.helper_epoch', '{epoch}', false);"));
+    }
+    setup.push_str(CREATE_STAGE);
+    let fold_stage = crate::article_local::any_open();
+    if fold_stage {
+        setup.push(';');
+        setup.push_str(CREATE_FOLD_STAGE);
+        setup.push_str(";truncate pg_temp.atlas_release_fold, pg_temp.atlas_file_fold");
+    }
+    tx.batch_execute(&setup)?;
     // a helper writer beside the owner (`pg::ingest::Helpers`) waits for a group's lock as long as it takes, then for
-    // row locks only `HELPER_LOCK_WAIT`
-    let helper: bool =
-        tx.query_one("select coalesce(current_setting('atlas.helper_epoch', true), '') <> ''", &[])?.try_get(0)?;
-    tx.batch_execute(CREATE_STAGE)?;
+    // row locks only `HELPER_LOCK_WAIT`; the gate's query reads both that and the schema
+    let super::history_gate::Gate { schema, helper } = super::history_gate::native_gate(tx)?;
     let mut stats = SaveStats::default();
     let mut timing_key = None;
     // With a local article store the articles go there and PostgreSQL keeps
     // the releases, files and counts. A save that died after writing there is
     // settled first, so its articles are either counted or gone before `has`.
-    let mut local = crate::article_local::of(tx)?.map(|store| Local { store, xid: None, groups: Vec::new() });
-    if local.is_some() {
+    let mut local = crate::article_local::of_named(tx, &schema)?.map(|store| Local { store, xid: None, groups: Vec::new(), folded: false });
+    if local.is_some() && !fold_stage {
+        // a store opened between the check above and now
         tx.batch_execute(CREATE_FOLD_STAGE)?;
+        tx.batch_execute("truncate pg_temp.atlas_release_fold, pg_temp.atlas_file_fold")?;
     }
     for ((group, shard), releases) in groups {
-        if helper {
-            tx.batch_execute("set local lock_timeout = 0")?;
-        }
         // The group's key shared, then the shard's alone: shards of a group save side by side, and a writer that takes
         // the whole group (inferred, spotnet, repair: its key exclusively) still has every release of it to itself.
+        // One statement takes both in that order (each materialized CTE runs before the one reading it); a helper's
+        // lock_timeout is 0 (no limit) while it waits for them and `HELPER_LOCK_WAIT` after, set local as before.
         let part = format!("{group}#{shard}");
-        tx.query_one("select pg_advisory_xact_lock_shared(hashtextextended(current_schema() || ':' || $1, 7936))", &[&group])?;
-        tx.query_one("select pg_advisory_xact_lock(hashtextextended(current_schema() || ':' || $1, 7936))", &[&part])?;
         if helper {
-            tx.batch_execute(&format!("set local lock_timeout = '{}'", super::ingest::HELPER_LOCK_WAIT))?;
+            tx.query_typed_one(LOCK_PART_HELPER, &[(&group, Type::TEXT), (&part, Type::TEXT), (&super::ingest::HELPER_LOCK_WAIT, Type::TEXT)])?;
+        } else {
+            tx.query_typed_one(LOCK_PART, &[(&group, Type::TEXT), (&part, Type::TEXT)])?;
         }
         // Another connection's save of this shard has ended now that its lock is ours:
         // its articles are counted or gone before this save asks which it already has.
@@ -210,6 +231,8 @@ struct Local {
     xid: Option<String>,
     /// the groups whose lock this save took
     groups: Vec<String>,
+    /// the fold stage holds an earlier batch's rows
+    folded: bool,
 }
 
 impl Local {
@@ -218,7 +241,7 @@ impl Local {
     /// (it drops on the way out of the error).
     fn xid(&mut self, tx: &mut Transaction<'_>) -> Result<String> {
         if self.xid.is_none() {
-            let xid: String = tx.query_one("select pg_current_xact_id()::text", &[])?.try_get(0)?;
+            let xid: String = tx.query_typed_one("select pg_current_xact_id()::text", &[])?.try_get(0)?;
             self.store.begin(&xid, &self.groups);
             self.xid = Some(xid);
         }
@@ -251,15 +274,15 @@ fn flush(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], now: i64
     }
     tx.batch_execute("truncate pg_temp.atlas_release_input")?;
     copy_input(tx, batch, *timing_key)?;
-    let release = tx.query_one(WRITE_RELEASES, &[&group])?;
+    let release = tx.query_typed_one(WRITE_RELEASES, &[(&group, Type::TEXT)])?;
     stats.releases += release.get::<_, i64>(0) as u64;
-    let articles = tx.query_one(WRITE_ARTICLES, &[&group])?;
+    let articles = tx.query_typed_one(WRITE_ARTICLES, &[(&group, Type::TEXT)])?;
     stats.files += articles.get::<_, i64>(0) as u64;
     let parts = articles.get::<_, i64>(1) as u64;
     stats.parts += parts;
     if parts > 0 {
         timing::write(tx, parts)?;
-        tx.execute(UPDATE_FILES, &[&now, &crate::parser::MAX_PARTS])?;
+        tx.execute_typed(UPDATE_FILES, &[(&now, Type::INT8), (&crate::parser::MAX_PARTS, Type::INT8)])?;
         finish(tx, now)?;
     }
     Ok(())
@@ -339,7 +362,10 @@ fn flush_local(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], no
             heads.len() - 1
         });
     }
-    tx.batch_execute("truncate pg_temp.atlas_release_fold, pg_temp.atlas_file_fold")?;
+    // empty at the first batch of a save (truncated in its setup)
+    if std::mem::replace(&mut local.folded, true) {
+        tx.batch_execute("truncate pg_temp.atlas_release_fold, pg_temp.atlas_file_fold")?;
+    }
     {
         use Type as T;
         let input = tx.copy_in(
@@ -374,18 +400,18 @@ fn flush_local(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], no
     // A release with a program is deleted from the catalogue below; its
     // articles leave the store when this transaction commits.
     if heads.iter().any(|&ordinal| batch[ordinal].article.is_none()) {
-        let gone: Vec<i64> = tx.query(RETRACTED, &[&group])?.iter().map(|row| row.try_get(0)).collect::<Result<_, _>>()?;
+        let gone: Vec<i64> = tx.query_typed(RETRACTED, &[(&group, Type::TEXT)])?.iter().map(|row| row.try_get(0)).collect::<Result<_, _>>()?;
         if !gone.is_empty() {
             let xid = local.xid(tx)?;
             local.store.retract(&xid, &gone)?;
         }
     }
-    let release = tx.query_one(&WRITE_RELEASES.replace("pg_temp.atlas_release_input", "pg_temp.atlas_release_fold"), &[&group])?;
+    let release = tx.query_typed_one(&WRITE_RELEASES.replace("pg_temp.atlas_release_input", "pg_temp.atlas_release_fold"), &[(&group, Type::TEXT)])?;
     stats.releases += release.get::<_, i64>(0) as u64;
     // releases made by this statement have no articles in the local store yet: theirs arent looked up
     let fresh_releases: HashSet<i64> = release.try_get::<_, Vec<i64>>(1)?.into_iter().collect();
     let mut release_of = vec![None; heads.len()];
-    for row in tx.query(RELEASE_IDS, &[&group])? {
+    for row in tx.query_typed(RELEASE_IDS, &[(&group, Type::TEXT)])? {
         release_of[usize::try_from(row.try_get::<_, i64>(0)?)?] = Some(row.try_get::<_, i64>(1)?);
     }
     // The first copy of a message id in a release wins, and one the release
@@ -588,12 +614,12 @@ fn flush_local(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], no
     // Every release whose files or timing this batch changes is in `changed` and bumped once below: the input
     // triggers on files and file_timing leave the bump to this writer meanwhile (migration 0015).
     tx.batch_execute("set local atlas.writer_bumps_inputs = 'on'")?;
-    let added = tx.query_one(ADD_FILES, &[])?;
+    let added = tx.query_typed_one(ADD_FILES, &[])?;
     stats.files += added.try_get::<_, i64>(0)? as u64;
     // files made by this statement have no parts in the local store yet
     let fresh_files: HashSet<i64> = added.try_get::<_, Vec<i64>>(1)?.into_iter().collect();
     let mut file_ids = vec![None; files.len()];
-    for row in tx.query(PLACE_FILES, &[])? {
+    for row in tx.query_typed(PLACE_FILES, &[])? {
         file_ids[usize::try_from(row.try_get::<_, i64>(0)?)?] = Some(row.try_get::<_, i64>(1)?);
     }
     let file_ids: Vec<i64> =
@@ -624,7 +650,7 @@ fn flush_local(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], no
     stats.parts += parts;
     // The trigger on `segments` told post-processing a release's input changed.
     let changed: Vec<i64> = releases.keys().copied().collect();
-    tx.execute("update releases set native_work_revision = native_work_revision + 1 where id = any($1)", &[&changed])?;
+    tx.execute_typed("update releases set native_work_revision = native_work_revision + 1 where id = any($1)", &[(&changed, Type::INT8_ARRAY)])?;
     // A file's first proof of UTC needs every article it has to be in this batch.
     let present: Vec<i64> =
         local.store.file_counts(&files.iter().zip(&file_ids).map(|(f, &id)| (f.release_id, id, f.articles + 1)).collect::<Vec<_>>())?;
@@ -637,26 +663,37 @@ fn flush_local(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], no
             all.3.push(parts.last);
             all
         });
-    tx.execute(UPDATE_FILES_FOLD, &[&now, &ids, &counts, &firsts, &lasts])?;
+    tx.execute_typed(
+        UPDATE_FILES_FOLD,
+        &[(&now, Type::INT8), (&ids, Type::INT8_ARRAY), (&counts, Type::INT8_ARRAY), (&firsts, Type::INT8_ARRAY), (&lasts, Type::INT8_ARRAY)],
+    )?;
     tx.batch_execute("set local atlas.writer_bumps_inputs = 'off'")?;
     let complete_due = now.saturating_add(crate::catalog_facts::COMPLETE_SETTLE_SECS.load(Ordering::Relaxed).max(1));
     let incomplete_due = now.saturating_add(crate::catalog_facts::SETTLE_SECS.load(Ordering::Relaxed).max(1));
     let folds: Vec<&ReleaseFold<'_>> = releases.values().collect();
-    tx.execute(
+    let (parts, bytes, file_totals): (Vec<i64>, Vec<i64>, Vec<Option<i64>>) =
+        (folds.iter().map(|r| r.parts).collect(), folds.iter().map(|r| r.bytes).collect(), folds.iter().map(|r| r.file_total).collect());
+    let (posters, dates): (Vec<Cow<'_, str>>, Vec<Cow<'_, str>>) =
+        (folds.iter().map(|r| pg_text(&r.last.poster)).collect(), folds.iter().map(|r| pg_text(&r.last.date)).collect());
+    let (posted_ats, posted_clocks): (Vec<i64>, Vec<Option<i64>>) =
+        (folds.iter().map(|r| r.posted_at).collect(), folds.iter().map(|r| r.posted_clock).collect());
+    let obfuscated: Vec<bool> = folds.iter().map(|r| r.last.is_obfuscated).collect();
+    let display_names: Vec<Option<Cow<'_, str>>> = folds.iter().map(|r| r.display_name.map(pg_text)).collect();
+    tx.execute_typed(
         UPDATE_RELEASES_FOLD,
         &[
-            &complete_due,
-            &incomplete_due,
-            &changed,
-            &folds.iter().map(|r| r.parts).collect::<Vec<_>>(),
-            &folds.iter().map(|r| r.bytes).collect::<Vec<_>>(),
-            &folds.iter().map(|r| r.file_total).collect::<Vec<_>>(),
-            &folds.iter().map(|r| pg_text(&r.last.poster)).collect::<Vec<_>>(),
-            &folds.iter().map(|r| pg_text(&r.last.date)).collect::<Vec<_>>(),
-            &folds.iter().map(|r| r.posted_at).collect::<Vec<_>>(),
-            &folds.iter().map(|r| r.posted_clock).collect::<Vec<_>>(),
-            &folds.iter().map(|r| r.last.is_obfuscated).collect::<Vec<_>>(),
-            &folds.iter().map(|r| r.display_name.map(pg_text)).collect::<Vec<_>>(),
+            (&complete_due, Type::INT8),
+            (&incomplete_due, Type::INT8),
+            (&changed, Type::INT8_ARRAY),
+            (&parts, Type::INT8_ARRAY),
+            (&bytes, Type::INT8_ARRAY),
+            (&file_totals, Type::INT8_ARRAY),
+            (&posters, Type::TEXT_ARRAY),
+            (&dates, Type::TEXT_ARRAY),
+            (&posted_ats, Type::INT8_ARRAY),
+            (&posted_clocks, Type::INT8_ARRAY),
+            (&obfuscated, Type::BOOL_ARRAY),
+            (&display_names, Type::TEXT_ARRAY),
         ],
     )?;
     Ok(())
@@ -666,7 +703,7 @@ fn finish(tx: &mut Transaction<'_>, now: i64) -> Result<()> {
     {
         let complete_due = now.saturating_add(crate::catalog_facts::COMPLETE_SETTLE_SECS.load(Ordering::Relaxed).max(1));
         let incomplete_due = now.saturating_add(crate::catalog_facts::SETTLE_SECS.load(Ordering::Relaxed).max(1));
-        tx.execute(UPDATE_RELEASES_AND_QUEUE, &[&complete_due, &incomplete_due])?;
+        tx.execute_typed(UPDATE_RELEASES_AND_QUEUE, &[(&complete_due, Type::INT8), (&incomplete_due, Type::INT8)])?;
     }
     Ok(())
 }
@@ -800,6 +837,19 @@ fn copy_input(tx: &mut Transaction<'_>, batch: &[Incoming<'_>], timing_key: Opti
         create unique index atlas_release_input_ordinal_idx on pg_temp.atlas_release_input(ordinal)")?;
     Ok(())
 }
+
+// Both advisory locks of a save part in one statement: the group's shared, then the part's exclusive. A materialized
+// CTE is computed before the query that reads it, so the order holds as with two statements.
+const LOCK_PART: &str = "
+    with g as materialized (select pg_advisory_xact_lock_shared(hashtextextended(current_schema() || ':' || $1, 7936)))
+    select pg_advisory_xact_lock(hashtextextended(current_schema() || ':' || $2, 7936)) from g";
+
+// A helper's: `set local lock_timeout = 0` before the locks and `= HELPER_LOCK_WAIT` ($3) after, as set_config(.., true).
+const LOCK_PART_HELPER: &str = "
+    with t as materialized (select pg_catalog.set_config('lock_timeout', '0', true)),
+    g as materialized (select pg_advisory_xact_lock_shared(hashtextextended(current_schema() || ':' || $1, 7936)) from t),
+    p as materialized (select pg_advisory_xact_lock(hashtextextended(current_schema() || ':' || $2, 7936)) from g)
+    select pg_catalog.set_config('lock_timeout', $3, true) from p";
 
 // The connection-local table is reused when a pool connection is reused. A
 // commit or rollback leaves no rows for the next save.

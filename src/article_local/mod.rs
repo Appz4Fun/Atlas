@@ -1091,6 +1091,11 @@ pub(crate) fn unregister(schema: &str) {
     }
 }
 
+/// Some local store is open in this process.
+pub(crate) fn any_open() -> bool {
+    OPEN.load(Ordering::Acquire) != 0
+}
+
 /// The store for a schema, if this process opened one.
 pub(crate) fn of_schema(schema: &str) -> Option<Arc<Store>> {
     if OPEN.load(Ordering::Acquire) == 0 {
@@ -1107,7 +1112,15 @@ pub(crate) fn of(client: &mut impl postgres::GenericClient) -> Result<Option<Arc
         return Ok(None);
     }
     let schema: Option<String> = client.query_one("select current_schema()::text", &[])?.try_get(0)?;
-    let Some(store) = schema.and_then(|schema| of_schema(&schema)) else { return Ok(None) };
+    match schema {
+        Some(schema) => of_named(client, &schema),
+        None => Ok(None),
+    }
+}
+
+/// `of` for a connection whose schema the caller already read in this transaction.
+pub(crate) fn of_named(client: &mut impl postgres::GenericClient, schema: &str) -> Result<Option<Arc<Store>>> {
+    let Some(store) = of_schema(schema) else { return Ok(None) };
     // A save PostgreSQL rolled back must not be read as stored. The writer
     // confirms a commit it saw, so this finds something only after a failure.
     if store.is_writer() && store.has_unsettled()? {

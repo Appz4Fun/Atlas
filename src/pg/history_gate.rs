@@ -7,7 +7,20 @@ use postgres::GenericClient;
 /// The owner fence precedes the persistent gate and all group/row locks.
 /// No history state currently permits native mutation, including identity_ready.
 pub(crate) fn native(tx: &mut impl GenericClient) -> Result<()> {
-    let row=tx.query_typed_one("select current_schema()::text,exists(select 1 from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid=p.pronamespace where n.nspname=current_schema() and p.proname='atlas_native_write_guard'),to_regclass(format('%I.history_imports',current_schema())) is not null,current_setting('transaction_isolation')",&[])?;
+    native_gate(tx).map(drop)
+}
+
+/// What the gate's own first query also read, so a writer needs no further round trip for it.
+pub(crate) struct Gate {
+    pub schema: String,
+    /// this session names a helper epoch (`atlas.helper_epoch`, `pg::ingest::Helpers`)
+    pub helper: bool,
+}
+
+/// `native`, returning the schema and whether the session is a helper writer as read before the guard ran.
+pub(crate) fn native_gate(tx: &mut impl GenericClient) -> Result<Gate> {
+    let row=tx.query_typed_one("select current_schema()::text,exists(select 1 from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid=p.pronamespace where n.nspname=current_schema() and p.proname='atlas_native_write_guard'),to_regclass(format('%I.history_imports',current_schema())) is not null,current_setting('transaction_isolation'),coalesce(current_setting('atlas.helper_epoch', true), '') <> ''",&[])?;
+    let helper: bool = row.get(4);
     let schema: String = row.get(0);
     ensure!(super::valid_schema(&schema), "native mutation schema is not supported");
     // A fixed transaction snapshot cannot observe registration after waiting
@@ -25,7 +38,7 @@ pub(crate) fn native(tx: &mut impl GenericClient) -> Result<()> {
         );
         tx.query_typed_one("select pg_catalog.pg_advisory_xact_lock_shared(pg_catalog.hashtext('atlas.indexer'),pg_catalog.hashtext($1))",&[(&schema,postgres::types::Type::TEXT)])?;
     }
-    Ok(())
+    Ok(Gate { schema, helper })
 }
 
 #[cfg(test)]
