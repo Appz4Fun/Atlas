@@ -1,7 +1,8 @@
 -- The word keeper's acknowledgement deleted many word_queue rows at once while helper writers' release triggers
 -- upserted many in their own order, and on prod the two deadlocked (40P01 on the owner session, a paused and reopened
--- indexing attempt each time). Both now lock word_queue rows in release id order: these upserts insert in it, and the
--- acknowledgement locks its rows in it before deleting them (stage_words).
+-- indexing attempt each time). The acknowledgement now passes over rows a writer holds (stage_words, skip locked), so it
+-- never waits; these upserts insert in release id order, so writers conflicting with each other within one statement
+-- take the rows in one order.
 create or replace function atlas_native_known_as_dirty() returns trigger language plpgsql as $$
 declare changed bigint;
 begin

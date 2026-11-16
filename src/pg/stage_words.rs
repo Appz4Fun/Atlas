@@ -71,9 +71,10 @@ impl Source for Delivery {
             let mut tx=client.transaction()?;super::history_gate::native(&mut tx)?;
             let ids=receipts.iter().map(|claim|claim.id).collect::<Vec<_>>();
             let versions=receipts.iter().map(|claim|claim.version).collect::<Vec<_>>();
-            // rows locked in release id order first, as the release triggers' upserts take them (migration 0019), so the
-            // two never deadlock; a row whose n moved on meanwhile drops out when its lock is had
-            tx.execute("with doomed as (select q.release_id from word_queue q join unnest($1::bigint[],$2::bigint[]) as sent(id,n) on q.release_id=sent.id and q.n=sent.n order by q.release_id for update of q)
+            // Rows a writer holds are passed over (skip locked): the keeper never waits on one, so it is never part of a
+            // deadlock, however a writer's statements lock them. Such a row is being marked again, so it would drop out
+            // anyway once that writer commits; should it roll back instead, the release is indexed once more.
+            tx.execute("with doomed as (select q.release_id from word_queue q join unnest($1::bigint[],$2::bigint[]) as sent(id,n) on q.release_id=sent.id and q.n=sent.n order by q.release_id for update of q skip locked)
                 delete from word_queue q using doomed d where q.release_id=d.release_id",&[&ids,&versions])?;
             if self.owner.stop.load(std::sync::atomic::Ordering::Acquire) {return Err(super::outage::AttemptEnded.into());}
             tx.commit()?;Ok(())
