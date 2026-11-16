@@ -58,16 +58,17 @@ impl std::error::Error for OverAdmission {}
 /// owner session goes on. Ending the attempt for it, as before, dropped every backfill chunk under way, read again from
 /// its start: on prod ~87% of the articles saves looked up were ones saved already.
 #[derive(Debug)]
-pub(crate) struct StepTimedOut(pub(crate) String);
+/// A context on the PostgreSQL error, which stays in the chain: outside a step's run (a visit's snapshot) the error
+/// still ends the attempt as `Unavailable`, as any statement timeout did before.
+pub(crate) struct StepTimedOut;
 impl std::fmt::Display for StepTimedOut {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "a step's read ran past its statement timeout: {}", self.0)
+        f.write_str("a step's read ran past its statement timeout")
     }
 }
-impl std::error::Error for StepTimedOut {}
 
 pub(crate) fn is_step_timed_out(error: &anyhow::Error) -> bool {
-    error.chain().any(|source| source.is::<StepTimedOut>())
+    error.downcast_ref::<StepTimedOut>().is_some()
 }
 
 /// Whether `error` is PostgreSQL canceling a statement for its statement timeout.
@@ -171,9 +172,14 @@ mod tests {
         client.batch_execute("set statement_timeout = '20ms'").unwrap();
         let timed_out = anyhow::Error::from(client.query("select pg_sleep(1)", &[]).unwrap_err());
         assert!(is_statement_timeout(&timed_out));
-        let step = anyhow::Error::new(StepTimedOut(format!("{timed_out:#}"))).context("reading a release");
+        let step = anyhow::Error::from(client.query("select pg_sleep(1)", &[]).unwrap_err()).context(StepTimedOut);
         assert!(is_step_timed_out(&step));
         assert!(!is_step_timed_out(&timed_out));
+        // outside a step's run it still pauses indexing, never ends it as fatal
+        assert_eq!(classify(&step), Failure::Unavailable);
+        let wrapped = step.context("reading a visit's snapshot");
+        assert!(is_step_timed_out(&wrapped));
+        assert_eq!(classify(&wrapped), Failure::Unavailable);
         // the session is fine after it
         assert_eq!(client.query_one("select 1", &[]).unwrap().get::<_, i32>(0), 1);
     }

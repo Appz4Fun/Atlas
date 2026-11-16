@@ -67,7 +67,7 @@ impl StepReads {
             let mut tx=client.build_transaction().isolation_level(postgres::IsolationLevel::RepeatableRead).read_only(true).start()?;
             // a read past its statement timeout fails its step, not the session (the transaction rolls back on drop)
             let value=work(&mut tx).map_err(|error| if super::outage::is_statement_timeout(&error) {
-                anyhow::Error::new(super::outage::StepTimedOut(format!("{error:#}")))
+                error.context(super::outage::StepTimedOut)
             } else {error})?;
             tx.commit()?;
             Ok(value)

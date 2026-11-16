@@ -97,7 +97,7 @@ impl Runner {
                     a.error=Some(engine::step_error(step.name(),&format!("{error:#}")));
                 }
                 Ran::Error(StepError::Native(error)) if crate::pg::outage::is_step_timed_out(&error)=>{
-                    a.net_attempts=Some(row.net_attempts);a.net_transient=Some(row.net_transient+1);a.net_next_at=Some(now+300);a.error=Some(engine::step_error(step.name(),&format!("{error:#}")));
+                    a.net_attempts=Some(row.net_attempts);a.net_next_at=Some(now+300);a.error=Some(engine::step_error(step.name(),&format!("{error:#}")));
                 }
                 Ran::Error(StepError::Native(error))=>return Err(error),
                 Ran::Error(StepError::Stopped)=>return if self.owner.stop.load(std::sync::atomic::Ordering::Acquire) {Err(crate::pg::outage::AttemptEnded.into())} else {Err(anyhow::anyhow!("native Step stopped without an ended attempt"))},
