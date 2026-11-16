@@ -49,7 +49,7 @@ impl Store {
         limit: usize,
         max_id_bytes: i64,
     ) -> Result<Option<Vec<StepSegment>>> {
-        let conn = self.lock()?;
+        let conn = self.home(file)?.lock()?;
         // SQLite's own NULL placement (first ascending, last descending) is
         // the one PostgreSQL was asked for here, so the index order serves both.
         let mut read = conn.prepare_cached(if last {
@@ -82,7 +82,7 @@ impl Store {
         let mut parts = parts.to_vec();
         parts.sort_unstable();
         parts.dedup();
-        let conn = self.lock()?;
+        let conn = self.home(file)?.lock()?;
         let mut read = conn.prepare_cached(
             "select message_id, part, bytes from segments where file_id = ?1 and part = ?2
              order by release_id, message_id limit ?3",
@@ -99,7 +99,7 @@ impl Store {
     /// The message ids of up to `per_part` articles, lowest first, of each part
     /// `from..=to` of a file, ordered by part then message id.
     pub(crate) fn file_part_copies_capped(&self, file: i64, from: i64, to: i64, per_part: usize) -> Result<Vec<(i64, Vec<u8>)>> {
-        let conn = self.lock()?;
+        let conn = self.home(file)?.lock()?;
         let mut read = conn.prepare_cached(
             "select part, message_id from segments where file_id = ?1 and part between ?2 and ?3
              order by part, release_id, message_id",
@@ -124,16 +124,21 @@ impl Store {
     /// The summed `bytes` of each file's articles, 0 for a file with none, in
     /// the order the files were named.
     pub(crate) fn files_bytes(&self, files: &[i64]) -> Result<Vec<i64>> {
-        let conn = self.lock()?;
-        let mut read = conn.prepare_cached("select coalesce(sum(bytes), 0) from segments where file_id = ?1")?;
-        files.iter().map(|file| Ok(read.query_row([file], |row| row.get(0))?)).collect()
+        files
+            .iter()
+            .map(|&file| {
+                let conn = self.home(file)?.lock()?;
+                let mut read = conn.prepare_cached("select coalesce(sum(bytes), 0) from segments where file_id = ?1")?;
+                Ok(read.query_row([file], |row| row.get(0))?)
+            })
+            .collect()
     }
 
     /// The first non-empty message id of a release's file by part (unnumbered
     /// first) then message id: its length, and the id itself unless it is
     /// longer than `max_len`.
     pub(crate) fn first_message_id(&self, file: i64, release: i64, max_len: usize) -> Result<Option<(usize, Option<Vec<u8>>)>> {
-        let conn = self.lock()?;
+        let conn = self.on(release).lock()?;
         let mut read = conn.prepare_cached(
             "select message_id from segments where file_id = ?1 and release_id = ?2 and length(message_id) > 0
              order by part asc nulls first, release_id, message_id limit 1",
@@ -149,7 +154,7 @@ impl Store {
     /// The distinct part numbers `0..=max_part` a file has above `after`,
     /// ascending: what PostgreSQL's `file_parts` held for the file.
     pub(crate) fn file_parts_page(&self, file: i64, after: Option<i64>, max_part: i64, limit: usize) -> Result<Vec<i64>> {
-        let conn = self.lock()?;
+        let conn = self.home(file)?.lock()?;
         let mut read = conn.prepare_cached(
             "select distinct part from segments where file_id = ?1 and part between 0 and ?2 and (?3 is null or part > ?3)
              order by part limit ?4",

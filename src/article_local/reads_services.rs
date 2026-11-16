@@ -33,7 +33,7 @@ impl Store {
         after: Option<(Option<i64>, i64, &[u8])>,
         limit: usize,
     ) -> Result<Vec<ProofRow>> {
-        let conn = self.lock()?;
+        let conn = self.home(file)?.lock()?;
         let numbered = |limit: usize| -> Result<Vec<ProofRow>> {
             let mut read = conn.prepare_cached(&format!(
                 "{PROOF} where file_id = ?1 and part is not null order by part, release_id, message_id limit ?3"
@@ -76,7 +76,7 @@ impl Store {
     /// The article size a file has most often, the larger of two equally
     /// common ones. `except` leaves out the articles of that one part number.
     pub(crate) fn common_bytes(&self, file: i64, except: Option<i64>) -> Result<Option<i64>> {
-        let conn = self.lock()?;
+        let conn = self.home(file)?.lock()?;
         Ok(match except {
             Some(part) => conn
                 .prepare_cached(
@@ -97,7 +97,7 @@ impl Store {
     /// The highest and the lowest part number a file has within `0..=max_part`,
     /// the range `file_parts` kept.
     pub(crate) fn file_part_bounds(&self, file: i64, max_part: i64) -> Result<(Option<i64>, Option<i64>)> {
-        let conn = self.lock()?;
+        let conn = self.home(file)?.lock()?;
         let mut read = conn
             .prepare_cached("select max(part), min(part) from segments where file_id = ?1 and part between 0 and ?2")?;
         Ok(read.query_row(params![file, max_part], |row| Ok((row.get(0)?, row.get(1)?)))?)
@@ -106,7 +106,7 @@ impl Store {
     /// The distinct part numbers a file has above `after` and within
     /// `0..=max_part`, ascending: a page of what `file_parts` kept.
     pub(crate) fn file_parts_within(&self, file: i64, after: i64, max_part: i64, limit: usize) -> Result<Vec<i64>> {
-        let conn = self.lock()?;
+        let conn = self.home(file)?.lock()?;
         let mut read = conn.prepare_cached(
             "select distinct part from segments where file_id = ?1 and part > ?2 and part between 0 and ?3
              order by part limit ?4",
@@ -116,7 +116,7 @@ impl Store {
 
     /// The bytes of every article one file of a release has; 0 when it has none.
     pub(crate) fn file_bytes(&self, release: i64, file: i64) -> Result<i64> {
-        let conn = self.lock()?;
+        let conn = self.on(release).lock()?;
         let mut read =
             conn.prepare_cached("select coalesce(sum(bytes), 0) from segments where file_id = ?1 and release_id = ?2")?;
         Ok(read.query_row(params![file, release], |row| row.get(0))?)
@@ -124,24 +124,33 @@ impl Store {
 
     /// For each message id, the file of `release` that has that article.
     pub(crate) fn files_of(&self, release: i64, message_ids: &[Vec<u8>]) -> Result<Vec<Option<i64>>> {
-        let conn = self.lock()?;
+        let conn = self.on(release).lock()?;
         let mut read = conn.prepare_cached("select file_id from segments where release_id = ?1 and message_id = ?2")?;
         message_ids.iter().map(|id| Ok(read.query_row(params![release, id], |row| row.get(0)).optional()?)).collect()
     }
 
     /// Whether the store holds no article and no envelope at all.
     pub(crate) fn holds_nothing(&self) -> Result<bool> {
-        let conn = self.lock()?;
-        Ok(conn.query_row(
-            "select not exists(select 1 from segments) and not exists(select 1 from envelopes)",
-            [],
-            |row| row.get(0),
-        )?)
+        for shard in self.shards() {
+            let empty: bool = shard.lock()?.query_row(
+                "select not exists(select 1 from segments) and not exists(select 1 from envelopes)",
+                [],
+                |row| row.get(0),
+            )?;
+            if !empty {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// How many articles the store holds.
     pub(crate) fn segment_count(&self) -> Result<i64> {
-        Ok(self.lock()?.query_row("select count(*) from segments", [], |row| row.get(0))?)
+        let mut count = 0;
+        for shard in self.shards() {
+            count += shard.lock()?.query_row("select count(*) from segments", [], |row| row.get::<_, i64>(0))?;
+        }
+        Ok(count)
     }
 }
 
@@ -169,15 +178,21 @@ impl Store {
             .map(|row| (row.get(0), row.get::<_, Option<Vec<u8>>>(1).unwrap_or_default()))
             .collect();
         let rows: Vec<(i64, i64, Vec<u8>, Option<i64>)> = match super::of(client).unwrap() {
+            // every file of the store, merged back into one order
             Some(store) => {
-                let conn = store.lock().unwrap();
-                let mut read = conn
-                    .prepare("select release_id, file_id, message_id, part from segments order by release_id, message_id")
-                    .unwrap();
-                read.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
-                    .unwrap()
-                    .collect::<rusqlite::Result<_>>()
-                    .unwrap()
+                let mut rows = Vec::new();
+                for shard in store.shards() {
+                    let conn = shard.lock().unwrap();
+                    let mut read = conn.prepare("select release_id, file_id, message_id, part from segments").unwrap();
+                    rows.extend(
+                        read.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+                            .unwrap()
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                            .unwrap(),
+                    );
+                }
+                rows.sort_by(|a: &(i64, i64, Vec<u8>, Option<i64>), b| (a.0, &a.2).cmp(&(b.0, &b.2)));
+                rows
             }
             None => client
                 .query("select release_id, file_id, message_id, part from segments order by release_id, message_id", &[])
