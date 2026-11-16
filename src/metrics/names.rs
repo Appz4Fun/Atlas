@@ -71,6 +71,7 @@ families! {
     NNTP_HEADERS "atlas_nntp_headers_total" Counter &[], "Headers read per server.";
     NNTP_OVERVIEW_ROWS "atlas_nntp_overview_rows_total" Counter &[], "Header listing rows read per server, by method: xover (plain), xover_gzip (XFEATURE COMPRESS GZIP), xzver.";
     NNTP_TRAFFIC "atlas_nntp_traffic_bytes_total" Counter &[], "Bytes per server: wire (off the socket), text (after decompression).";
+    LOCAL_STORE_LOOKUPS "atlas_local_store_lookups_total" Counter &[], "Articles a save checked against the local article store, by result: found (already saved, a replay), new (not there), fresh (of a release made by that save, not looked up).";
     HEADER_STORE_DROPPED "atlas_header_store_dropped_rows_total" Counter &[], "Overview rows the header store didn't keep, by reason: unkept (their day outside the keep set), repeat (read twice, dropped at seal).";
 
     // indexing

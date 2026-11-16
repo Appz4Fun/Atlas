@@ -407,6 +407,7 @@ fn flush_local(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], no
         .map(|&(_, article, release)| (release, article.message_id.as_bytes()))
         .collect();
     let mut known = local.store.has(&asked)?.into_iter();
+    let firsts_len = firsts.len();
     let mut accepted = Vec::with_capacity(firsts.len());
     for first in firsts {
         if fresh_releases.contains(&first.2) || !known.next().ok_or_else(|| anyhow::anyhow!("the local store answered too few"))? {
@@ -414,6 +415,10 @@ fn flush_local(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], no
         }
     }
     ensure!(known.next().is_none(), "the local store answered too many");
+    let (fresh, new) = (firsts_len - asked.len(), accepted.len() - (firsts_len - asked.len()));
+    for (result, count) in [("fresh", fresh), ("new", new), ("found", asked.len() - new)] {
+        crate::metrics::names::LOCAL_STORE_LOOKUPS.inc(&[("result", result)], count as u64);
+    }
     if accepted.is_empty() {
         return Ok(());
     }
