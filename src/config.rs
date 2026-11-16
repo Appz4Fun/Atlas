@@ -2406,8 +2406,8 @@ mod tests {
         assert_eq!(cfg(json!({"native_helper_writers": 6})), Some(6));
         assert_eq!(cfg(json!({})), None);
         assert_eq!(cfg(json!({"native_helper_writers": 0})), None);
-        assert_eq!(cfg(json!({"native_helper_writers": 9})), None);
-        assert_eq!(cfg(json!({"native_helper_writers": 8})), Some(8));
+        assert_eq!(cfg(json!({"native_helper_writers": 17})), None);
+        assert_eq!(cfg(json!({"native_helper_writers": 16})), Some(16));
     }
 
     #[test]

@@ -19,9 +19,11 @@ impl Default for PgWriteLimits {
     /// Saves queue on the indexer's one owner session, which takes up to three ingestion turns in a row before a
     /// waiting ordinary one. With two jobs of 8 MiB at most (32 MiB pending) the queue held too little to use them:
     /// on prod a save did ~10 ms of work after ~120 ms of waiting, fetched headers filled the unsaved budget, and
-    /// ingest stayed near 40k articles a second. Eight jobs of up to 32 MiB (256 MiB pending) keep it supplied.
+    /// ingest stayed near 40k articles a second. Eight jobs of up to 32 MiB (256 MiB pending) kept it supplied; with
+    /// helper writers saving side by side (`Helpers`, one session per job) sixteen at once, 512 MiB pending: at eight
+    /// prod's saves waited ~0.7 s each for a slot at ~270k articles a second.
     fn default() -> Self {
-        Self { max_pending_bytes: 256 * 1024 * 1024, max_job_bytes: 32 * 1024 * 1024, concurrent_saves: 8 }
+        Self { max_pending_bytes: 512 * 1024 * 1024, max_job_bytes: 32 * 1024 * 1024, concurrent_saves: 16 }
     }
 }
 
@@ -48,7 +50,7 @@ pub(crate) struct Native {
 
 /// The most helper writer sessions a runtime opens (`config.native_helper_writers`): no more save jobs run at once
 /// (`PgWriteLimits::concurrent_saves`).
-pub(crate) const HELPER_WRITERS_MOST: usize = 8;
+pub(crate) const HELPER_WRITERS_MOST: usize = 16;
 
 /// Times a helper's save is tried again after PostgreSQL broke a deadlock or a serialization conflict with it: saves
 /// of different groups and the owner's own work now run side by side, and either one can be the one picked.
