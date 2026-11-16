@@ -187,7 +187,7 @@ impl Drop for Checkpointer {
 
 /// Read connections a writer's store keeps open when idle (`Store::read`): `has` takes up to `HAS_SPLIT` at once for
 /// each of the helper writers' saves.
-const READERS_KEPT: usize = 64;
+const READERS_KEPT: usize = 128;
 
 /// Keys `has` looks up on one connection at most before it splits them over several, `HAS_SPLIT` at most. The store is
 /// far bigger than memory, so most lookups of an existing release read the disk at random, one after another on one
