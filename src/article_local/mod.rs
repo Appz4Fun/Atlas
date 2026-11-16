@@ -105,6 +105,8 @@ pub(crate) struct Store {
     /// confirmed in a write transaction of its own, queued for the one writer behind every helper's insert, and every
     /// other save asked PostgreSQL about it meanwhile.
     confirmed: Mutex<HashSet<String>>,
+    /// set by the checkpointer when the WAL should start over; the next `add` does it under the write lock
+    restart_wanted: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Copies the WAL back into a writer store's file in the background, on a connection of its own, so the writer's
@@ -118,70 +120,43 @@ struct Checkpointer {
 
 const CHECKPOINT_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
 const CHECKPOINT_FALLBACK: i64 = 131_072;
-/// WAL frames past which a checkpoint waits for the writer to finish its transaction and resets the WAL (RESTART): with
-/// commits arriving all the time a PASSIVE pass never catches the end of the WAL, so it never starts over, and on prod
-/// it grew to `CHECKPOINT_FALLBACK`, where the writer checkpointed on its commits again. A RESTART waits at most the
-/// checkpoint connection's busy timeout (1 s), meanwhile holding off new write transactions, and says only in its row
-/// that it gave up (a reader holding an old snapshot): then the next ones wait longer, up to `CHECKPOINT_BACKOFF_MOST`
-/// passes, so a long reader doesnt stall the writer pass after pass.
+/// WAL frames past which the WAL is started over (RESTART): with commits arriving all the time a PASSIVE pass never
+/// catches its end, so it never starts over, and on prod it grew to `CHECKPOINT_FALLBACK`, where the writer
+/// checkpointed on its own commits again. A RESTART needs the WAL's write lock free, which sixteen helpers committing
+/// back to back on the one write connection almost never left it from another connection: it is run on the write
+/// connection itself, by the next `add` under its lock (`restart_wanted`, `Store::restart_wal`), where no other write
+/// transaction can be under way.
 const CHECKPOINT_RESTART_AT: i64 = 32_768;
-const CHECKPOINT_BACKOFF_MOST: u32 = 64;
-/// WAL frames past which a RESTART waits `CHECKPOINT_LONG_WAIT` for readers rather than the connection's 1 s: with
-/// sixteen helper writers looking articles up, some read is always under way, and a RESTART that gave up after 1 s
-/// every time let the WAL grow on prod (1.3 GB) until the writer checkpointed on its own commits again and ingest
-/// slowed by half over minutes. Past this it is worth holding writes off a few seconds once.
-const CHECKPOINT_LONG_AT: i64 = 4 * CHECKPOINT_RESTART_AT;
-const CHECKPOINT_LONG_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
-const CHECKPOINT_SHORT_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+/// How long a RESTART waits for readers already under way (lookups hold a read transaction for `HAS_PER_READ` keys
+/// at most).
+const RESTART_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl Checkpointer {
-    fn start(path: &Path) -> Result<Self> {
+    fn start(path: &Path, restart_wanted: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Result<Self> {
         let conn = Connection::open(path).with_context(|| format!("opening {} for checkpoints", path.display()))?;
-        // a RESTART waits this long for the writer's transaction and readers' snapshots before giving up this time
-        conn.busy_timeout(std::time::Duration::from_secs(1))?;
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stopping = stop.clone();
         let thread = std::thread::Builder::new().name("article-store-checkpoint".into()).spawn(move || {
-            let (mut failing, mut busy) = (false, false);
-            // passes to skip a RESTART for after one gave up, and how many that is now
-            let (mut wait, mut backoff) = (0u32, 1u32);
+            let mut failing = false;
             while !stopping.load(Ordering::Acquire) {
                 std::thread::sleep(CHECKPOINT_EVERY);
                 if stopping.load(Ordering::Acquire) {
                     break;
                 }
                 // PASSIVE: copies what no reader still needs and waits for nobody; its row says how long the WAL is
-                let passive = conn.query_row("pragma wal_checkpoint(PASSIVE)", [], |row| row.get::<_, i64>(1));
-                let result = match passive {
-                    Ok(frames) if frames > CHECKPOINT_RESTART_AT && wait == 0 => conn
-                        .busy_timeout(if frames > CHECKPOINT_LONG_AT { CHECKPOINT_LONG_WAIT } else { CHECKPOINT_SHORT_WAIT })
-                        .and_then(|()| conn.query_row("pragma wal_checkpoint(RESTART)", [], |row| row.get::<_, i64>(0)))
-                        .map(|gave_up| {
-                            if gave_up != 0 {
-                                if !busy {
-                                    eprintln!("local article store checkpoint couldnt start the WAL over ({frames} frames): a reader holds it, trying again later");
-                                }
-                                busy = true;
-                                wait = backoff;
-                                backoff = (backoff * 2).min(CHECKPOINT_BACKOFF_MOST);
-                            } else {
-                                busy = false;
-                                backoff = 1;
-                            }
-                        }),
-                    other => {
-                        wait = wait.saturating_sub(1);
-                        other.map(|_| ())
+                match conn.query_row("pragma wal_checkpoint(PASSIVE)", [], |row| row.get::<_, i64>(1)) {
+                    Ok(frames) => {
+                        failing = false;
+                        if frames > CHECKPOINT_RESTART_AT {
+                            restart_wanted.store(true, Ordering::Release);
+                        }
                     }
-                };
-                // said once per run of failures, not every pass
-                match result {
+                    // said once per run of failures, not every pass
                     Err(error) if !failing => {
                         failing = true;
                         eprintln!("local article store checkpoint failed: {error}");
                     }
                     Err(_) => {}
-                    Ok(()) => failing = false,
                 }
             }
         })?;
@@ -197,6 +172,25 @@ impl Drop for Checkpointer {
         }
     }
 }
+
+/// Start the WAL over (RESTART) on the write connection, under its lock: no write transaction is under way, so it
+/// waits only for readers already reading (`RESTART_WAIT`). Gave up or failed: said, and asked again by the
+/// checkpointer's next pass.
+fn restart_wal(conn: &Connection) {
+    let restarted = conn
+        .busy_timeout(RESTART_WAIT)
+        .and_then(|()| conn.query_row("pragma wal_checkpoint(RESTART)", [], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))));
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(30));
+    match restarted {
+        Ok((0, _, _)) => {}
+        Ok((_, log, done)) => eprintln!("local article store couldnt start the WAL over: {done} of {log} frames copied, readers still on the rest"),
+        Err(error) => eprintln!("local article store couldnt start the WAL over: {error}"),
+    }
+}
+
+/// Keys `has` looks up in one read transaction at most: a reader holds its snapshot, and so the WAL, for as long as
+/// its transaction lasts.
+const HAS_PER_READ: usize = 512;
 
 /// Read connections a writer's store keeps open when idle (`Store::read`): `has` takes up to `HAS_SPLIT` at once for
 /// each of the helper writers' saves.
@@ -274,7 +268,9 @@ impl Store {
                 conn.execute("insert into meta (key, value) values ('catalogue', ?1)", [catalogue])?;
             }
         }
-        let checkpointer = Some(Checkpointer::start(&path)?);
+        let restart_wanted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let checkpointer = Some(Checkpointer::start(&path, restart_wanted.clone())?);
+
         Ok(Self {
             checkpointer,
             conn: Mutex::new(conn),
@@ -283,6 +279,7 @@ impl Store {
             running: Mutex::new(HashMap::new()),
             confirmed: Mutex::new(HashSet::new()),
             readers: Mutex::new(Vec::new()),
+            restart_wanted,
         })
     }
 
@@ -304,6 +301,7 @@ impl Store {
             running: Mutex::new(HashMap::new()),
             confirmed: Mutex::new(HashSet::new()),
             readers: Mutex::new(Vec::new()),
+            restart_wanted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -380,10 +378,14 @@ impl Store {
             return Ok(Vec::new());
         }
         let look = |keys: &[&(i64, &[u8])]| -> Result<Vec<bool>> {
-            self.read(|conn| {
-                let mut find = conn.prepare_cached("select 1 from segments where release_id = ?1 and message_id = ?2")?;
-                keys.iter().map(|(release, id)| Ok(find.exists(params![release, id])?)).collect()
-            })
+            let mut found = Vec::with_capacity(keys.len());
+            for keys in keys.chunks(HAS_PER_READ) {
+                found.extend(self.read(|conn| {
+                    let mut find = conn.prepare_cached("select 1 from segments where release_id = ?1 and message_id = ?2")?;
+                    keys.iter().map(|(release, id)| Ok(find.exists(params![release, id])?)).collect::<Result<Vec<bool>>>()
+                })?);
+            }
+            Ok(found)
         };
         // in key order, so each connection walks one stretch of the index
         let mut order: Vec<usize> = (0..keys.len()).collect();
@@ -431,6 +433,9 @@ impl Store {
             return Ok(Vec::new());
         }
         let mut conn = self.lock()?;
+        if self.restart_wanted.swap(false, Ordering::AcqRel) {
+            restart_wal(&conn);
+        }
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         // commits seen since the last add, marked here (`confirm_later`); should this transaction roll back they are
         // left waiting, and asked about as any unsettled transaction is
