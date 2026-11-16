@@ -1713,6 +1713,8 @@ struct Server {
     heal: Mutex<Heal>,
     /// requests waiting for a free connection right now
     waiting: AtomicUsize,
+    /// header slices let through to take budget, a fetch slot and then a connection here (see `Admission`)
+    admission: Admission,
     /// for the stats dashboard
     headers: AtomicU64,
     wire: AtomicU64,
@@ -1810,7 +1812,62 @@ impl Drop for Waiting<'_> {
     }
 }
 
+/// Header slices past a server's door: those that may take room in the unsaved budget and a header-store fetch slot
+/// before waiting for one of this server's connections.
+///
+/// Without it a slice took its room and its fetch slot first and only then queued for a connection, soo a server with
+/// every connection busy kept a pile of slices waiting on it that held global room and fetch slots the other servers'
+/// idle connections were starved of (on prod one newshosting entry: 25/25 busy, 71 waiting, holding 71 of the 128 fetch
+/// slots and ~355k of the bulk budget, while ~110 connections elsewhere sat idle). Now a slice waits here first, holding
+/// nothing global; only about as many as the server has connections get through.
+///
+/// A bulk slice gets through while fewer than `limit + ADMIT_SLACK` are through, a live one while fewer than
+/// `limit + ADMIT_SLACK + ADMIT_LIVE` are: backfill can fill the server's door but never the last `ADMIT_LIVE` places,
+/// soo a live pass on a busy server waits behind at most the slices already through, not behind the backlog. The limit
+/// is read each time, soo it follows `limit` shrinking and healing.
+#[derive(Default)]
+struct Admission {
+    through: AtomicUsize,
+    freed: tokio::sync::Notify,
+}
+
+/// slices let through past a server's connection limit, soo the next one has its budget ready when a connection frees
+const ADMIT_SLACK: usize = 2;
+/// places past the bulk ones that only a live slice takes
+const ADMIT_LIVE: usize = 2;
+
+/// a place through a server's `Admission`, given back when dropped
+struct Admitted(Arc<Server>);
+
+impl Drop for Admitted {
+    fn drop(&mut self) {
+        self.0.admission.through.fetch_sub(1, Ordering::AcqRel);
+        self.0.admission.freed.notify_waiters();
+    }
+}
+
 impl Server {
+    /// a place through this server's door (see `Admission`)
+    async fn admit(self: &Arc<Self>, bulk: bool) -> Admitted {
+        loop {
+            let freed = self.admission.freed.notified();
+            tokio::pin!(freed);
+            // registered before looking, soo a place freed between the look and the wait still wakes it
+            freed.as_mut().enable();
+            let limit = self.limit.load(Ordering::Relaxed).max(1);
+            let most = limit + ADMIT_SLACK + if bulk { 0 } else { ADMIT_LIVE };
+            let through = &self.admission.through;
+            let mut now = through.load(Ordering::Acquire);
+            while now < most {
+                match through.compare_exchange_weak(now, now + 1, Ordering::AcqRel, Ordering::Acquire) {
+                    Ok(_) => return Admitted(self.clone()),
+                    Err(seen) => now = seen,
+                }
+            }
+            freed.await;
+        }
+    }
+
     /// Whether a new connection asks for compressed headers: as configured, unless they couldnt be read lately (see
     /// `COMPRESS_RETRY`).
     fn compress(&self, retry: Duration) -> bool {
@@ -2349,6 +2406,7 @@ impl Pool {
                         limit: AtomicUsize::new(cfg.connections().max(1) as usize),
                         heal: Mutex::new(Heal { next: None, every: LIMIT_HEAL, climbed: false }),
                         waiting: AtomicUsize::new(0),
+                        admission: Admission::default(),
                         headers: AtomicU64::new(0),
                         wire: AtomicU64::new(0),
                         text: AtomicU64::new(0),
@@ -4266,7 +4324,9 @@ impl Pool {
     /// until the receiver drops it, soo a receiver keeps it until the slice is
     /// parsed. At most `width` (`STREAM_SLICES`, `CHUNK_STREAM_SLICES` for a day chunk) of a
     /// stream hold room at once, soo one stream cant take the whole budget while its receiver saves slice after
-    /// slice. A slice takes its slot, then its room, then a connection, and the
+    /// slice. A slice takes its slot, then its place through the server's door (`Admission`, about as many as the
+    /// server has connections, soo slices queued on a busy server hold no room or fetch slot), then its room, then a
+    /// fetch slot, then a connection, and the
     /// slices of one stream take room in order, one waiting at a time. Nothing
     /// that holds room waits for more: a slice holding some is fetching (and
     /// needs only a connection, which no one waiting for room holds), waiting
@@ -4304,6 +4364,10 @@ impl Pool {
                     let Some(slot) = unless_stopped(&stop, slots.clone().acquire_owned()).await else { return };
                     let slot = slot.expect("semaphore closed");
 
+                    // through the server's door before anything global: a slice queued on a busy server holds no
+                    // room and no fetch slot (see `Admission`)
+                    let Some(admitted) = unless_stopped(&stop, pool.servers[i].admit(bulk)).await else { return };
+
                     // the next slice and its room, the queue held meanwhile
                     let ((start, end), mut unsaved) = {
                         let mut queue = queue.lock().await;
@@ -4332,6 +4396,8 @@ impl Pool {
                         Err(error)=>Err(NntpError::HeaderStore(format!("{error:#}"))),
                         Ok(())=>match result {Some(result)=>result,None=>return},
                     };
+                    // fetched: its place goes to the next slice, also when it is halved and queued again
+                    drop(admitted);
                     if result.as_ref().err().is_some_and(NntpError::is_overview_budget) && start<end {
                         drop(unsaved);
                         let mid=start+(end-start)/2;
@@ -6607,3 +6673,129 @@ mod ranked_tests {
 #[cfg(test)]
 #[path = "nntp/body_wire_tests.rs"]
 mod body_wire_tests;
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    /// a plain server that lists articles 1 and 2 for any XOVER
+    async fn serve() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else { return };
+                tokio::spawn(async move {
+                    let (read, mut write) = sock.into_split();
+                    let mut lines = tokio::io::BufReader::new(read);
+                    let _ = write.write_all(b"200 hi\r\n").await;
+                    loop {
+                        let mut line = String::new();
+                        if tokio::io::AsyncBufReadExt::read_line(&mut lines, &mut line).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let reply: &[u8] = match line.split_whitespace().next().unwrap_or("") {
+                            "AUTHINFO" if line.contains("USER") => b"381 more\r\n",
+                            "AUTHINFO" => b"281 ok\r\n",
+                            "GROUP" => b"211 2 1 2 g\r\n",
+                            "XOVER" => b"224 ok\r\n1\ts1\tp\tdate\t<1@x>\t\t10\t1\r\n2\ts2\tp\tdate\t<2@x>\t\t10\t1\r\n.\r\n",
+                            _ => b"500 what\r\n",
+                        };
+                        let _ = write.write_all(reply).await;
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    fn server(port: u16, connections: u32) -> UsenetServer {
+        let mut s = UsenetServer::new("127.0.0.1", "u", "p", port);
+        s.ssl = Some(false);
+        s.compress = Some(false);
+        s.connections = Some(connections);
+        s.key = Some(port.to_string());
+        s
+    }
+
+    fn run<F: Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap().block_on(f)
+    }
+
+    async fn fill(pool: &Pool, i: usize, bulk: bool, n: usize) -> Vec<Admitted> {
+        let mut held = Vec::new();
+        for _ in 0..n {
+            held.push(pool.servers[i].admit(bulk).await);
+        }
+        held
+    }
+
+    async fn admits(pool: &Pool, i: usize, bulk: bool) -> Option<Admitted> {
+        tokio::time::timeout(Duration::from_millis(100), pool.servers[i].admit(bulk)).await.ok()
+    }
+
+    /// Slices waiting on a server with every place taken hold no room in the unsaved budget (nor the header-store
+    /// fetch slot, taken only after the room), and another server's slices are fetched meanwhile.
+    #[test]
+    fn a_busy_servers_queued_slices_hold_nothing_global_and_another_server_streams() {
+        run(async {
+            let (a, b) = (serve().await, serve().await);
+            let pool = Arc::new(Pool::new(&[server(a, 2), server(b, 2)]));
+            let held = fill(&pool, 0, true, 2 + ADMIT_SLACK).await;
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let slices: Vec<(u64, u64)> = (0..8).map(|n| (n * 100 + 1, n * 100 + 100)).collect();
+            let mut busy = pool.stream_headers("g", 0, slices.clone(), 8, true, stop.clone());
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(busy.try_recv().is_err(), "nothing gets past a full door");
+            assert_eq!(pool.unsaved_headers(), 0, "slices queued on the busy server hold no room");
+
+            let mut other = pool.stream_headers("g", 1, slices.clone(), 8, true, stop.clone());
+            for _ in 0..slices.len() {
+                let slice = tokio::time::timeout(Duration::from_secs(10), other.recv()).await.unwrap().unwrap();
+                assert_eq!(slice.result.unwrap().len(), 2);
+            }
+            assert_eq!(pool.unsaved_headers(), 0, "still none held for the busy server");
+
+            // places freed: the busy server's slices go through, and give their places back
+            drop(held);
+            for _ in 0..slices.len() {
+                let slice = tokio::time::timeout(Duration::from_secs(10), busy.recv()).await.unwrap().unwrap();
+                assert!(slice.result.is_ok());
+            }
+            assert!(busy.recv().await.is_none());
+            assert!(other.recv().await.is_none());
+            assert_eq!(pool.servers[0].admission.through.load(Ordering::SeqCst), 0);
+            assert_eq!(pool.servers[1].admission.through.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    /// Backfill fills a server's door up to its bulk places; a live slice still gets one of the places kept for live.
+    #[test]
+    fn live_slices_get_past_a_door_backfill_filled() {
+        run(async {
+            let pool = Pool::new(&[server(1, 3)]);
+            let _bulk = fill(&pool, 0, true, 3 + ADMIT_SLACK).await;
+            assert!(admits(&pool, 0, true).await.is_none(), "backfill stops at limit + slack");
+            let live = fill(&pool, 0, false, ADMIT_LIVE).await;
+            assert!(admits(&pool, 0, false).await.is_none(), "live stops at its own places");
+            drop(live);
+            assert!(admits(&pool, 0, false).await.is_some(), "a place given back lets the next one through");
+        });
+    }
+
+    /// The door follows the server's limit as it shrinks and heals.
+    #[test]
+    fn the_door_follows_the_limit() {
+        run(async {
+            let pool = Pool::new(&[server(1, 4)]);
+            pool.servers[0].limit.store(1, Ordering::Relaxed);
+            let held = fill(&pool, 0, true, 1 + ADMIT_SLACK).await;
+            assert!(admits(&pool, 0, true).await.is_none());
+            pool.servers[0].limit.store(4, Ordering::Relaxed);
+            assert!(admits(&pool, 0, true).await.is_some());
+            drop(held);
+        });
+    }
+}
