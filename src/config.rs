@@ -186,6 +186,9 @@ pub struct Config {
     pub backfill_start_days_back: Option<i64>,
     /// days a group's backfill may run ahead of the slowest (`chunks::lockstep_days`); None = `chunks::LOCKSTEP_DAYS`
     pub backfill_lockstep_days: Option<i64>,
+    /// PostgreSQL sessions that save releases beside the indexer's owner session (`pg::ingest::Helpers`); None or 0 =
+    /// every save goes through the owner
+    pub native_helper_writers: Option<usize>,
     /// groups indexed at the same time, None = worked out from the connections
     pub parallel_groups: Option<usize>,
     /// compact the database every 24 hours from the indexer
@@ -1265,6 +1268,7 @@ impl Default for Config {
             split_min_backlog: None,
             backfill_start_days_back: None,
             backfill_lockstep_days: None,
+            native_helper_writers: None,
             parallel_groups: None,
             auto_run_compact: false,
             inferred_parts: true,
@@ -1449,6 +1453,11 @@ impl Config {
             split_min_backlog: v.get("split_min_backlog").and_then(as_int).filter(|n| *n > 0),
             backfill_start_days_back: v.get("backfill_start_days_back").and_then(as_int).filter(|n| *n > 0),
             backfill_lockstep_days: v.get("backfill_lockstep_days").and_then(as_int).filter(|n| (1..=crate::chunks::LOCKSTEP_DAYS_MOST).contains(n)),
+            native_helper_writers: v
+                .get("native_helper_writers")
+                .and_then(as_int)
+                .filter(|n| (1..=crate::pg::ingest::HELPER_WRITERS_MOST as i64).contains(n))
+                .map(|n| n as usize),
             parallel_groups: v
                 .get("parallel_groups")
                 .and_then(as_int)
@@ -1797,6 +1806,9 @@ fn config_value(
     }
     if let Some(n) = cfg.backfill_lockstep_days {
         out.insert("backfill_lockstep_days".into(), json!(n));
+    }
+    if let Some(n) = cfg.native_helper_writers {
+        out.insert("native_helper_writers".into(), json!(n));
     }
 
     if cfg.auto_run_compact {
@@ -2386,6 +2398,15 @@ mod tests {
         assert_eq!(cfg(json!({"backfill_lockstep_days": 0})), None);
         assert_eq!(cfg(json!({"backfill_lockstep_days": 8})), None);
         assert_eq!(cfg(json!({"backfill_lockstep_days": 7})), Some(7));
+    }
+
+    #[test]
+    fn native_helper_writers_from_the_file() {
+        let cfg = |v: Value| Config::from_value(&v).native_helper_writers;
+        assert_eq!(cfg(json!({"native_helper_writers": 6})), Some(6));
+        assert_eq!(cfg(json!({})), None);
+        assert_eq!(cfg(json!({"native_helper_writers": 0})), None);
+        assert_eq!(cfg(json!({"native_helper_writers": 1000})), None);
     }
 
     #[test]

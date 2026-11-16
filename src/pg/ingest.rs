@@ -39,9 +39,54 @@ impl PgWriteLimits {
 #[derive(Clone)]
 pub(crate) struct Native {
     source: Source,
+    /// sessions that save ordinary jobs beside the owner (`with_helpers`); permits for owner work stay on the owner
+    helpers: Option<Arc<Helpers>>,
     memory: Arc<Semaphore>,
     slots: Arc<Semaphore>,
     limits: PgWriteLimits,
+}
+
+/// The most helper writer sessions a runtime opens (`config.native_helper_writers`).
+pub(crate) const HELPER_WRITERS_MOST: usize = 32;
+
+/// Times a helper's save is tried again after PostgreSQL broke a deadlock or a serialization conflict with it: saves
+/// of different groups and the owner's own work now run side by side, and either one can be the one picked.
+const HELPER_RETRIES: usize = 4;
+
+/// PostgreSQL sessions that save releases beside the owner session. Each names the owner's epoch
+/// (`atlas.helper_epoch`); the write guard (migration 0016) then fences every transaction of it on that epoch: the
+/// owner backend alive and holding its exclusive lock, and the current-epoch row held FOR SHARE until it ends, so no
+/// new owner takes over meanwhile. Saves of one group still queue on that group's lock.
+pub(crate) struct Helpers {
+    pool: Arc<super::Pool>,
+    epoch: String,
+}
+
+impl Helpers {
+    pub(crate) fn new(pool: Arc<super::Pool>, epoch: &[u8; 32]) -> Self {
+        Helpers { pool, epoch: epoch.iter().map(|b| format!("{b:02x}")).collect() }
+    }
+
+    pub(crate) fn save(&self, releases: &[Release], now: i64) -> Result<()> {
+        let mut tries = 0;
+        loop {
+            let mut client = self.pool.get()?;
+            client.execute("select set_config('atlas.helper_epoch', $1, false)", &[&self.epoch])?;
+            match super::release_writer::save(&mut client, releases, now) {
+                Ok(_) => return Ok(()),
+                Err(error) if tries < HELPER_RETRIES && retryable(&error) => tries += 1,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+/// A deadlock or serialization failure PostgreSQL resolved by rolling this transaction back: trying it again is safe.
+fn retryable(error: &anyhow::Error) -> bool {
+    use postgres::error::SqlState;
+    error.chain().filter_map(|e| e.downcast_ref::<postgres::Error>()).any(|e| {
+        e.code().is_some_and(|code| *code == SqlState::T_R_DEADLOCK_DETECTED || *code == SqlState::T_R_SERIALIZATION_FAILURE)
+    })
 }
 
 #[derive(Clone)]
@@ -90,10 +135,17 @@ impl Native {
         Self::from_source(Source::Owner(owner), limits)
     }
 
+    /// Ordinary save jobs go to `helpers` from now on; owner permits and everything else stay on the owner.
+    pub(crate) fn with_helpers(mut self, helpers: Helpers) -> Self {
+        self.helpers = Some(Arc::new(helpers));
+        self
+    }
+
     fn from_source(source: Source, limits: PgWriteLimits) -> Result<Self> {
         limits.check()?;
         Ok(Self {
             source,
+            helpers: None,
             memory: Arc::new(Semaphore::new(limits.max_pending_bytes as usize)),
             slots: Arc::new(Semaphore::new(usize::from(limits.concurrent_saves))),
             limits,
@@ -244,10 +296,14 @@ impl Native {
         let memory = self.memory.clone().acquire_many_owned(bytes as u32).await?;
         let slot = self.slots.clone().acquire_owned().await?;
         let source = self.source.clone();
+        let helpers = self.helpers.clone();
         // The blocking save owns admission, including while queued in Tokio. Cancelling its caller cannot free
         // memory/worker capacity while the payload or a transaction is still in flight.
         tokio::task::spawn_blocking(move || {
             let (_memory, _slot) = (memory, slot);
+            if let Some(helpers) = helpers {
+                return helpers.save(&releases, logical_now.unwrap_or_else(|| chrono::Utc::now().timestamp()));
+            }
             source.with(|conn| {
                 super::release_writer::save(
                     conn,
