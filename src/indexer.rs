@@ -1990,6 +1990,9 @@ pub async fn chunk_range(
 /// A server whose first dates disagree goes back furthest only when every
 /// one's do: a forged run could make it look deeper than it is. A server
 /// that cant be asked is left out of the answer, which then isnt kept and never calls this server alone.
+/// How long a day chunk waits for another carrier's answer on how far back it keeps a group (`goes_back_furthest`).
+const PROBE_FOR: Duration = Duration::from_secs(10);
+
 async fn goes_back_furthest(
     ctx: &PassContext,
     db: &Db,
@@ -2017,21 +2020,27 @@ async fn goes_back_furthest(
         if total_conns >= 50 && ctx.pool.connections(other) * 20 < total_conns {
             continue;
         }
-        let (_, low, high, _) = match ctx.pool.group_on(other, group).await {
-            Ok(info) => info,
-            Err(e) if matches!(e.code(), Some(403 | 411 | 430 | 500 | 501)) => continue,
+        // A carrier with requests already queued for its connections, or that doesnt answer within `PROBE_FOR`, is
+        // left out like one that failed: on prod the day chunks of idle servers sat behind the busiest ones' queues.
+        if ctx.pool.waiting(other) > 0 {
+            unasked = true;
+            continue;
+        }
+        let (_, low, high, _) = match tokio::time::timeout(PROBE_FOR, ctx.pool.group_on(other, group)).await {
+            Ok(Ok(info)) => info,
+            Ok(Err(e)) if matches!(e.code(), Some(403 | 411 | 430 | 500 | 501)) => continue,
             // another server that wont answer just now is left out of this answer, which then isnt kept: the
             // chunk goes on rather than failing on a server it isnt even read from
-            Err(_) => {
+            Ok(Err(_)) | Err(_) => {
                 unasked = true;
                 continue;
             }
         };
-        match ctx.pool.retention(other, group, low, high).await {
-            Ok(Retention::Since(t)) => found.push((false, t, ctx.pool.host(other))),
-            Ok(Retention::Unsure(t)) => found.push((true, t, ctx.pool.host(other))),
-            Ok(Retention::Empty) => {}
-            Err(_) => unasked = true,
+        match tokio::time::timeout(PROBE_FOR, ctx.pool.retention(other, group, low, high)).await {
+            Ok(Ok(Retention::Since(t))) => found.push((false, t, ctx.pool.host(other))),
+            Ok(Ok(Retention::Unsure(t))) => found.push((true, t, ctx.pool.host(other))),
+            Ok(Ok(Retention::Empty)) => {}
+            Ok(Err(_)) | Err(_) => unasked = true,
         }
     }
     // the deepest of those whose dates agree, a tie to `server` (asked

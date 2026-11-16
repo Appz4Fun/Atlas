@@ -2746,6 +2746,11 @@ impl Pool {
         self.servers.get(i).map(|s| s.limit.load(Ordering::Relaxed)).unwrap_or(1)
     }
 
+    /// requests waiting for a free connection to server `i` right now
+    pub fn waiting(&self, i: usize) -> usize {
+        self.servers.get(i).map_or(0, |s| s.waiting.load(Ordering::Relaxed))
+    }
+
     fn is_down(&self, i: usize) -> bool {
         self.servers[i].down_until.lock().unwrap().is_some_and(|t| Instant::now() < t)
     }
