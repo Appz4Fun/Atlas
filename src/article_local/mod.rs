@@ -491,6 +491,8 @@ impl Store {
             })?;
             had.extend(keys.iter().zip(found).filter(|(_, found)| *found).map(|(key, _)| *key));
         }
+        // the next fill's rows read here first, off the write lock: the fill under it then finds their pages cached
+        self.warm_fill();
         let mut conn = self.lock()?;
         if self.restart_wanted.swap(false, Ordering::AcqRel) {
             restart_wal(&conn);
@@ -740,6 +742,33 @@ impl Store {
         }
         tx.commit()?;
         Ok(added)
+    }
+
+    /// Read, on a read connection and without the write lock, the rows the next `fill_seen` will copy, when one is
+    /// due: on prod the fill's reads of cold `segments` pages held the write lock every save waits for (the copy itself
+    /// still reads them again inside its write transaction, so what it copies is what is there). Best effort.
+    fn warm_fill(&self) {
+        let above = self.seen_above.load(Ordering::Acquire);
+        if above == i64::MIN
+            || self.seen_filled_at.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some_and(|t| t.elapsed() < SEEN_FILL_EVERY)
+        {
+            return;
+        }
+        let _ = self.read(|conn| {
+            let cursor: Option<Vec<u8>> = conn
+                .query_row("select value from meta where key = 'seen_cursor'", [], |row| row.get::<_, String>(0))
+                .optional()?
+                .map(|v| decode_hex(&v))
+                .transpose()?;
+            let mut read = conn.prepare_cached(
+                "select release_id, message_id from segments
+                 where release_id < ?1 or (release_id = ?1 and (?2 is null or message_id < ?2))
+                 order by release_id desc, message_id desc limit ?3",
+            )?;
+            let mut rows = read.query(params![above, cursor, SEEN_FILL_ROWS])?;
+            while rows.next()?.is_some() {}
+            Ok(())
+        });
     }
 
     /// Copy into `seen` the next `SEEN_FILL_ROWS` articles saved before it existed, newest release first, on the write
