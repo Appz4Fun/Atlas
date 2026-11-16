@@ -66,7 +66,7 @@ impl Store {
     /// names the PostgreSQL catalogue whose ids the rows carry; a store filled for another one is refused.
     pub(crate) fn open_writer(dir: &Path, catalogue: &str) -> Result<Self> {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        let home = Shard::open_writer(&dir.join(FILE), catalogue)?;
+        let home = Shard::open_writer(&dir.join(FILE), catalogue, super::HOME_CACHE_KIB)?;
         let (boundary, count, token) = match split_of(&home)? {
             Some(split) => {
                 // an older build that doesnt split wrote here meanwhile: its newer releases would be looked for in shards
@@ -98,7 +98,7 @@ impl Store {
         };
         let mut shards = vec![home];
         for n in 0..count {
-            let shard = Shard::open_writer(&dir.join(shard_file(n)), catalogue)?;
+            let shard = Shard::open_writer(&dir.join(shard_file(n)), catalogue, super::SHARD_CACHE_KIB)?;
             match shard.meta("shard_token")? {
                 Some(theirs) => ensure!(theirs == token, "{} belongs to another split of the local article store", shard.path().display()),
                 None => {

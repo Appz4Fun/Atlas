@@ -214,6 +214,11 @@ const READERS_KEPT: usize = 128;
 const HAS_ALONE: usize = 256;
 const HAS_SPLIT: usize = 8;
 
+/// The write connections' page caches: 2 GiB for `articles.db`, whose existing releases keep most of the writes for a
+/// while after the split, 256 MiB for each of the shards (all of them together within the indexer guard's memory).
+pub(super) const HOME_CACHE_KIB: i64 = 2_097_152;
+pub(super) const SHARD_CACHE_KIB: i64 = 262_144;
+
 const SCHEMA: &str = "
     create table if not exists meta (key text primary key, value text not null) without rowid;
     create table if not exists segments (
@@ -261,14 +266,15 @@ const SCHEMA: &str = "
 impl Shard {
     /// Open one file of the store the indexer writes, made when missing. `catalogue` names the PostgreSQL
     /// catalogue whose ids the rows carry; a file filled for another one is refused.
-    fn open_writer(path: &Path, catalogue: &str) -> Result<Self> {
+    /// `cache_kib`: the write connection's page cache (`HOME_CACHE_KIB` for `articles.db`, `SHARD_CACHE_KIB` for a shard).
+    fn open_writer(path: &Path, catalogue: &str, cache_kib: i64) -> Result<Self> {
         let path = path.to_path_buf();
         let conn = Connection::open(&path).with_context(|| format!("opening {}", path.display()))?;
         conn.busy_timeout(std::time::Duration::from_secs(30))?;
         conn.execute_batch(&format!(
             "pragma journal_mode = wal;
              pragma synchronous = normal;
-             pragma cache_size = -2097152;
+             pragma cache_size = -{cache_kib};
              pragma wal_autocheckpoint = {CHECKPOINT_FALLBACK};
              pragma temp_store = memory;"
         ))?;

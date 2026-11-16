@@ -204,7 +204,7 @@ fn a_store_from_before_seen_is_filled_newest_release_first_and_answers_the_same(
 
 /// A store as a build before the split wrote it: `articles.db` alone, without the split in its `meta`.
 fn unsplit(dir: &std::path::Path, rows: &[NewRow<'_>]) {
-    let old = Shard::open_writer(&dir.join(FILE), "test").unwrap();
+    let old = Shard::open_writer(&dir.join(FILE), "test", SHARD_CACHE_KIB).unwrap();
     let rows: Vec<&NewRow<'_>> = rows.iter().collect();
     old.add("1", &rows, 100, &HashSet::new()).unwrap();
     old.confirm("1").unwrap();
@@ -260,7 +260,7 @@ fn an_unsplit_store_keeps_its_releases_and_sends_newer_ones_to_the_shards() {
     drop(store);
     // a build that doesnt split wrote a newer release into articles.db: refused, not looked for in a shard
     {
-        let old = Shard::open_writer(&dir.path().join(FILE), "test").unwrap();
+        let old = Shard::open_writer(&dir.path().join(FILE), "test", SHARD_CACHE_KIB).unwrap();
         old.add("4", &[&row(12, 120, b"<stray>", Some(1))], 100, &HashSet::new()).unwrap();
     }
     assert!(Store::open_writer(dir.path(), "test").is_err());
