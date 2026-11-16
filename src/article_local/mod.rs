@@ -469,6 +469,28 @@ impl Store {
         if rows.is_empty() {
             return Ok(Vec::new());
         }
+        // The parts the files of `rows` had already, looked up on the read connections before the write lock is
+        // taken: on prod these random reads, one per article, held the lock every save waits for. Saves of one file
+        // run one at a time (one release, one shard of its PostgreSQL group lock), and the save before this one
+        // committed here before it let go of that lock, so a new read transaction sees its parts.
+        let asked: Vec<(i64, i64)> = {
+            let mut asked: Vec<(i64, i64)> = rows
+                .iter()
+                .filter(|row| !fresh.contains(&row.file_id))
+                .filter_map(|row| row.part.filter(|part| (0..=max_part).contains(part)).map(|part| (row.file_id, part)))
+                .collect();
+            asked.sort_unstable();
+            asked.dedup();
+            asked
+        };
+        let mut had = HashSet::new();
+        for keys in asked.chunks(HAS_PER_READ) {
+            let found = self.read(|conn| {
+                let mut find = conn.prepare_cached("select 1 from segments where file_id = ?1 and part = ?2 limit 1")?;
+                keys.iter().map(|(file, part)| Ok(find.exists(params![file, part])?)).collect::<Result<Vec<bool>>>()
+            })?;
+            had.extend(keys.iter().zip(found).filter(|(_, found)| *found).map(|(key, _)| *key));
+        }
         let mut conn = self.lock()?;
         if self.restart_wanted.swap(false, Ordering::AcqRel) {
             restart_wal(&conn);
@@ -487,11 +509,10 @@ impl Store {
         let mut gained = HashMap::<i64, NewParts>::new();
         let mut order = Vec::new();
         {
-            let mut had = tx.prepare_cached("select 1 from segments where file_id = ?1 and part = ?2 limit 1")?;
             let mut seen = HashSet::new();
             for row in rows {
                 let Some(part) = row.part.filter(|part| (0..=max_part).contains(part)) else { continue };
-                if !seen.insert((row.file_id, part)) || (!fresh.contains(&row.file_id) && had.exists(params![row.file_id, part])?) {
+                if !seen.insert((row.file_id, part)) || had.contains(&(row.file_id, part)) {
                     continue;
                 }
                 let entry = gained.entry(row.file_id).or_insert_with(|| {
