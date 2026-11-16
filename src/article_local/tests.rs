@@ -97,3 +97,21 @@ fn a_save_still_running_here_is_not_asked_about_unless_it_held_the_group() {
     store.end("6");
     assert!(store.has_unsettled().unwrap());
 }
+
+#[test]
+fn a_big_has_split_over_connections_answers_in_the_order_asked() {
+    let (_dir, store) = store();
+    let ids: Vec<Vec<u8>> = (0..3000).map(|n| format!("<{n}@x>").into_bytes()).collect();
+    // every third article stored, over a few releases
+    let stored: Vec<NewRow<'_>> =
+        ids.iter().enumerate().filter(|(n, _)| n % 3 == 0).map(|(n, id)| row(1 + (n % 5) as i64, 7, id, None)).collect();
+    store.add("1", &stored, 100).unwrap();
+    store.confirm("1").unwrap();
+    // asked in an order unlike the index's, past HAS_ALONE so it splits
+    let keys: Vec<(i64, &[u8])> = ids.iter().enumerate().rev().map(|(n, id)| (1 + (n % 5) as i64, id.as_slice())).collect();
+    let answers = store.has(&keys).unwrap();
+    for (key, known) in keys.iter().zip(&answers) {
+        let n: usize = std::str::from_utf8(key.1).unwrap().trim_start_matches('<').split('@').next().unwrap().parse().unwrap();
+        assert_eq!(*known, n % 3 == 0, "article {n}");
+    }
+}
