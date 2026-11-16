@@ -78,6 +78,22 @@ class ResourceGuardTests(unittest.TestCase):
             monitor.check(self.observation(read_bytes=count), now=now)
         self.assertIsNone(monitor.check(self.observation(read_bytes=100), now=11))
 
+    def test_reads_burst_past_the_cap_only_while_memory_stays_available(self):
+        limits = guard.Limits(guard.GIB, guard.GIB, guard.MIB, 100 * guard.MIB, 10, 2 * guard.GIB)
+        roomy = guard.Monitor(limits, 0)
+        self.assertIsNone(roomy.check(guard.Observation(1, 0, guard.GIB, 0, 4 * guard.GIB), 0))
+        self.assertIsNone(roomy.check(guard.Observation(1, 0, guard.GIB, 5000 * guard.MIB, 4 * guard.GIB), 10))
+        short = guard.Monitor(limits, 0)
+        self.assertIsNone(short.check(guard.Observation(1, 0, guard.GIB, 0, guard.GIB), 0))
+        self.assertEqual(short.check(guard.Observation(1, 0, guard.GIB, 5000 * guard.MIB, guard.GIB), 10), "disk_reads")
+        # no reserve set: the cap holds whatever memory says
+        strict = guard.Monitor(guard.Limits(guard.GIB, guard.GIB, guard.MIB, 100 * guard.MIB, 10), 0)
+        strict.check(guard.Observation(1, 0, guard.GIB, 0, 64 * guard.GIB), 0)
+        self.assertEqual(strict.check(guard.Observation(1, 0, guard.GIB, 5000 * guard.MIB, 64 * guard.GIB), 10), "disk_reads")
+
+    def test_available_memory_is_measured(self):
+        self.assertGreater(guard.available_bytes(), 0)
+
     def test_linux_zombie_is_distinguished_from_running_descendant(self):
         with patch.object(sys, "platform", "linux"), patch.object(os, "kill"):
             with patch.object(Path, "read_text", return_value="123 (worker name) Z 1 123"):

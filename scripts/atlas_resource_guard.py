@@ -32,10 +32,17 @@ class Limits:
     minimum_free_bytes: int
     read_bytes_per_second: int
     read_window_seconds: float
+    # Reads past `read_bytes_per_second` are let burst while the system still has this much memory available (0: never):
+    # the cost of heavy reads is the page cache they take, which only hurts once memory runs short.
+    read_burst_reserve_bytes: int = 0
 
     def __post_init__(self):
-        if any(not math.isfinite(value) or value <= 0 for value in asdict(self).values()):
+        values = asdict(self)
+        reserve = values.pop("read_burst_reserve_bytes")
+        if any(not math.isfinite(value) or value <= 0 for value in values.values()):
             raise ValueError("all resource limits must be finite and positive")
+        if not math.isfinite(reserve) or reserve < 0:
+            raise ValueError("the read burst reserve must be finite and not negative")
 
 
 @dataclass(frozen=True)
@@ -44,6 +51,8 @@ class Observation:
     swap_bytes: int
     free_bytes: int
     read_bytes: int
+    # memory the system has available (free, inactive or reclaimable), 0 when unknown
+    available_bytes: int = 0
 
 
 class Monitor:
@@ -70,7 +79,9 @@ class Monitor:
         elapsed = now - first_time
         if elapsed >= limits.read_window_seconds:
             if (observation.read_bytes - first_bytes) / elapsed > limits.read_bytes_per_second:
-                return "disk_reads"
+                burst = limits.read_burst_reserve_bytes
+                if not (burst and observation.available_bytes >= burst):
+                    return "disk_reads"
         return None
 
 
@@ -126,11 +137,32 @@ def swap_bytes():
     raise RuntimeError("resource supervision requires macOS or Linux")
 
 
+def available_bytes():
+    """Memory the system could hand out without swapping: free, inactive, speculative and purgeable pages on macOS,
+    MemAvailable on Linux. 0 when it cannot be read, which lets no read burst through."""
+    try:
+        if sys.platform == "darwin":
+            result = subprocess.run(["/usr/bin/vm_stat"], capture_output=True, text=True, timeout=2, check=True)
+            page = int(re.search(r"page size of (\d+) bytes", result.stdout)[1])
+            pages = {key.strip(): int(value.strip().rstrip(".")) for key, value in
+                     (line.split(":", 1) for line in result.stdout.splitlines()[1:] if ":" in line)}
+            return page * sum(pages.get(key, 0) for key in
+                              ("Pages free", "Pages inactive", "Pages speculative", "Pages purgeable"))
+        if sys.platform.startswith("linux"):
+            for line in Path("/proc/meminfo").read_text().splitlines():
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, TypeError, IndexError, subprocess.SubprocessError):
+        pass
+    return 0
+
+
 class Sampler:
     def __init__(self, storage_paths):
         self.volumes = [(path, path.stat().st_dev) for path in storage_paths]
         self.last_disk_sample = float("-inf")
         self.free = self.swap = None
+        self.available = 0
 
     def system_usage(self, now):
         if now - self.last_disk_sample >= 5:
@@ -142,13 +174,14 @@ class Sampler:
                 free.append(space.f_bavail * space.f_frsize)
             self.free = min(free)
             self.swap = swap_bytes()
+            self.available = available_bytes()
             self.last_disk_sample = now
         return self.swap, self.free
 
     def sample(self, pid, now):
         memory, reads = process_usage(pid)
         swap, free = self.system_usage(now)
-        return Observation(memory, swap, free, reads)
+        return Observation(memory, swap, free, reads, self.available)
 
 
 def require_unreaped_leader(child):
@@ -354,6 +387,8 @@ def main():
     parser.add_argument("--min-free-gib", type=int, default=128)
     parser.add_argument("--max-read-mib-s", type=int, default=256)
     parser.add_argument("--read-window-seconds", type=float, default=30)
+    parser.add_argument("--read-burst-reserve-mib", type=int, default=0,
+                        help="let reads past --max-read-mib-s burst while this much memory stays available (0: never)")
     parser.add_argument("--storage-path", action="append", type=Path, required=True)
     parser.add_argument("--stop-file", type=Path, required=True)
     parser.add_argument("command", nargs=argparse.REMAINDER)
@@ -364,7 +399,7 @@ def main():
     try:
         limits = Limits(args.max_memory_mib * MIB, args.max_swap_growth_mib * MIB,
                         args.min_free_gib * GIB, args.max_read_mib_s * MIB,
-                        args.read_window_seconds)
+                        args.read_window_seconds, args.read_burst_reserve_mib * MIB)
         paths = [path.resolve(strict=True) for path in args.storage_path]
         stop_file = args.stop_file.absolute()
         if not stop_file.parent.is_dir():
