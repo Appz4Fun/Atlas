@@ -410,14 +410,13 @@ impl Store {
             let mut found = Vec::with_capacity(keys.len());
             for keys in keys.chunks(HAS_PER_READ) {
                 found.extend(self.read(|conn| {
-                    let mut seen = conn.prepare_cached("select 1 from seen where release_id = ?1 and h = ?2")?;
-                    let mut find = conn.prepare_cached("select 1 from segments where release_id = ?1 and message_id = ?2")?;
                     keys.iter()
                         .map(|(release, id)| {
+                            // prepared when used: a reader's store from before `seen` has no such table
                             Ok(if *release > above {
-                                seen.exists(params![release, seen_hash(id)])?
+                                conn.prepare_cached("select 1 from seen where release_id = ?1 and h = ?2")?.exists(params![release, seen_hash(id)])?
                             } else {
-                                find.exists(params![release, id])?
+                                conn.prepare_cached("select 1 from segments where release_id = ?1 and message_id = ?2")?.exists(params![release, id])?
                             })
                         })
                         .collect::<Result<Vec<bool>>>()
@@ -474,7 +473,10 @@ impl Store {
         if self.restart_wanted.swap(false, Ordering::AcqRel) {
             restart_wal(&conn);
         }
-        self.fill_seen(&mut conn)?;
+        // the fill is best effort: a save never fails for it, and it goes on from `meta` next time
+        if let Err(error) = self.fill_seen(&mut conn) {
+            eprintln!("local article store: couldnt fill the lookup index this time: {error:#}");
+        }
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         // commits seen since the last add, marked here (`confirm_later`); should this transaction roll back they are
         // left waiting, and asked about as any unsettled transaction is
@@ -821,7 +823,7 @@ fn decode_hex(text: &str) -> Result<Vec<u8>> {
 }
 
 /// Rows `fill_seen` copies at most at once, and how often it runs at most.
-const SEEN_FILL_ROWS: i64 = 5_000;
+const SEEN_FILL_ROWS: i64 = 20_000;
 const SEEN_FILL_EVERY: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// The key PostgreSQL kept beside each article: the SHA-256 of its message id.
