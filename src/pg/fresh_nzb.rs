@@ -670,14 +670,15 @@ mod local_parity_tests {
         assert_eq!(postgres.len(),local.len());
         for (postgres,local) in postgres.iter().zip(&local){assert_eq!(postgres,local);}
         // The comparison is of real documents, not of two refusals.
-        let whole=postgres.iter().find(|line|line.starts_with("Parity.Whole.Release #1 stream 0: ok 0 gaps")).expect("the whole release builds");
+        // by name: which release gets the lower id follows the order saves of a group's shards land in
+        let whole=postgres.iter().find(|line|line.starts_with("Parity.Whole.Release #")&&line.contains(" stream 0: ok 0 gaps")).expect("the whole release builds");
         assert_eq!(whole.matches("<file ").count(),4);assert_eq!(whole.matches("<segment ").count(),7);
         assert!(whole.contains(&format!(">{}é&amp;@example.invalid</segment>","L".repeat(9000))));
         assert!(whole.find("nameless-a@").unwrap()<whole.find("nameless-b@").unwrap()&&whole.find("a-2-a@").unwrap()<whole.find("a-2-z@").unwrap());
-        let gaps=postgres.iter().find(|line|line.starts_with("Parity.Gaps.Release #2 stream 9: ok 1 gaps")).expect("the file with gaps builds");
+        let gaps=postgres.iter().find(|line|line.starts_with("Parity.Gaps.Release #")&&line.contains(" stream 9: ok 1 gaps")).expect("the file with gaps builds");
         assert!(gaps.find("b-unnumbered-a@").unwrap()<gaps.find("b-unnumbered-z@").unwrap()&&gaps.find("b-unnumbered-z@").unwrap()<gaps.find("b-1@").unwrap());
         assert!(gaps.contains("number=\"None\"")&&gaps.find("b-3-a@").unwrap()<gaps.find("b-3-b@").unwrap());
-        assert!(postgres.iter().any(|line|line.starts_with("Parity.Gaps.Release #2 files: ok")&&line.contains("count=\"3\"")));
-        assert!(postgres.iter().any(|line|line.starts_with("Parity.Whole.Release #1 listed: ok 1 None 27 1|2 None 29 1|3 Some(\"a.bin\") 60 4|4 Some(\"z.字幕.bin\") 23 1")));
+        assert!(postgres.iter().any(|line|line.starts_with("Parity.Gaps.Release #")&&line.contains(" files: ok")&&line.contains("count=\"3\"")));
+        assert!(postgres.iter().any(|line|line.starts_with("Parity.Whole.Release #")&&line.contains(" listed: ok 1 None 27 1|2 None 29 1|3 Some(\"a.bin\") 60 4|4 Some(\"z.字幕.bin\") 23 1")));
     }
 }
