@@ -50,7 +50,6 @@ pub mod overview_archive;
 pub mod par2;
 pub mod parity;
 pub(crate) mod article_local;
-pub use article_local::configure_sqlite;
 pub mod parser;
 pub mod paths;
 pub mod pg;

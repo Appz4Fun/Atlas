@@ -4,9 +4,13 @@
 ATLAS_HOME = { value = ".", relative = true }
 
 # bundled sqlite without the process wide locks it takes by default around
-# every allocation (memory statistics) and every page cache access (one shared
-# cache group): with a writer per shard plus readers, threads queued on them
-LIBSQLITE3_FLAGS = "-USQLITE_ENABLE_MEMORY_MANAGEMENT -DSQLITE_DEFAULT_MEMSTATUS=0"
+# every allocation (memory statistics), every page cache access (one shared
+# cache group) and every page cache allocation and free past the first few
+# pages (the overflow counters, STATIC_PMEM): with a writer per shard plus
+# readers, threads queued on them. The local article store's readers start
+# their caches over whenever another connection commits, and on prod its
+# lookups spent a fifth of their time waiting on the overflow counter's lock.
+LIBSQLITE3_FLAGS = "-USQLITE_ENABLE_MEMORY_MANAGEMENT -DSQLITE_DEFAULT_MEMSTATUS=0 -DSQLITE_DISABLE_PAGECACHE_OVERFLOW_STATS"
 
 # Apple Silicon builds use every instruction the building Mac has (prod is an
 # M5 and builds itself, so this is apple-m5 there). A binary built this way may
