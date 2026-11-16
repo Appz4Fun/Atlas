@@ -85,6 +85,8 @@ pub(crate) enum Ended {
 }
 
 pub(crate) struct Store {
+    /// A writer's background checkpoints (`Checkpointer`); stopped first when the store drops.
+    checkpointer: Option<Checkpointer>,
     /// Read connections of a writer's store (`read`): in WAL mode they dont wait for the writer, and the writer's
     /// saves asked which articles a release had through the one connection their inserts held, side by side with
     /// every helper writer's. Declared before `conn`, so they close first and the writer's close checkpoints the WAL.
@@ -98,6 +100,46 @@ pub(crate) struct Store {
     /// writers saving side by side every save found the others' rows waiting and asked PostgreSQL about each, holding
     /// the store meanwhile.
     running: Mutex<HashMap<String, HashSet<String>>>,
+}
+
+/// Copies the WAL back into a writer store's file in the background, on a connection of its own, so the writer's
+/// commits dont: with `wal_autocheckpoint` at its old 8192 pages the commit that crossed it copied pages into the 44
+/// GB file and synced it holding the store's one write connection, which every helper writer's save waits for.
+/// `CHECKPOINT_FALLBACK` pages still make the writer checkpoint should this fall far behind.
+struct Checkpointer {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+const CHECKPOINT_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
+const CHECKPOINT_FALLBACK: i64 = 131_072;
+
+impl Checkpointer {
+    fn start(path: &Path) -> Result<Self> {
+        let conn = Connection::open(path).with_context(|| format!("opening {} for checkpoints", path.display()))?;
+        conn.busy_timeout(std::time::Duration::from_secs(1))?;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopping = stop.clone();
+        let thread = std::thread::Builder::new().name("article-store-checkpoint".into()).spawn(move || {
+            while !stopping.load(Ordering::Acquire) {
+                std::thread::sleep(CHECKPOINT_EVERY);
+                // PASSIVE: copies what no reader still needs and waits for nobody
+                if let Err(error) = conn.query_row("pragma wal_checkpoint(PASSIVE)", [], |_| Ok(())) {
+                    eprintln!("local article store checkpoint failed: {error}");
+                }
+            }
+        })?;
+        Ok(Checkpointer { stop, thread: Some(thread) })
+    }
+}
+
+impl Drop for Checkpointer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 /// Read connections a writer's store keeps open when idle (`Store::read`): `has` takes up to `HAS_SPLIT` at once for
@@ -156,13 +198,13 @@ impl Store {
         let path = dir.join(FILE);
         let conn = Connection::open(&path).with_context(|| format!("opening {}", path.display()))?;
         conn.busy_timeout(std::time::Duration::from_secs(30))?;
-        conn.execute_batch(
+        conn.execute_batch(&format!(
             "pragma journal_mode = wal;
              pragma synchronous = normal;
              pragma cache_size = -524288;
-             pragma wal_autocheckpoint = 8192;
-             pragma temp_store = memory;",
-        )?;
+             pragma wal_autocheckpoint = {CHECKPOINT_FALLBACK};
+             pragma temp_store = memory;"
+        ))?;
         conn.execute_batch(SCHEMA)?;
         let bound: Option<String> =
             conn.query_row("select value from meta where key = 'catalogue'", [], |row| row.get(0)).optional()?;
@@ -176,7 +218,15 @@ impl Store {
                 conn.execute("insert into meta (key, value) values ('catalogue', ?1)", [catalogue])?;
             }
         }
-        Ok(Self { conn: Mutex::new(conn), path, writer: true, running: Mutex::new(HashMap::new()), readers: Mutex::new(Vec::new()) })
+        let checkpointer = Some(Checkpointer::start(&path)?);
+        Ok(Self {
+            checkpointer,
+            conn: Mutex::new(conn),
+            path,
+            writer: true,
+            running: Mutex::new(HashMap::new()),
+            readers: Mutex::new(Vec::new()),
+        })
     }
 
     /// Open the store for reading only, as the web process does. The file must exist.
@@ -189,7 +239,14 @@ impl Store {
         .with_context(|| format!("opening {} for reading", path.display()))?;
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
         conn.execute_batch("pragma cache_size = -32768; pragma temp_store = memory;")?;
-        Ok(Self { conn: Mutex::new(conn), path, writer: false, running: Mutex::new(HashMap::new()), readers: Mutex::new(Vec::new()) })
+        Ok(Self {
+            checkpointer: None,
+            conn: Mutex::new(conn),
+            path,
+            writer: false,
+            running: Mutex::new(HashMap::new()),
+            readers: Mutex::new(Vec::new()),
+        })
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -454,6 +511,10 @@ impl Store {
             if how != Ended::Running {
                 answers.push((xid, how));
             }
+        }
+        // nothing ended: the write connection, which every save waits for, isnt taken
+        if answers.is_empty() {
+            return Ok(());
         }
         let mut conn = self.lock()?;
         for (xid, how) in answers {
