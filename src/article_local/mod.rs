@@ -113,19 +113,41 @@ struct Checkpointer {
 
 const CHECKPOINT_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
 const CHECKPOINT_FALLBACK: i64 = 131_072;
+/// WAL frames past which a checkpoint waits for the writer to finish its transaction and resets the WAL (RESTART): with
+/// commits arriving all the time a PASSIVE pass never catches the end of the WAL, so it never starts over, and on prod
+/// it grew to `CHECKPOINT_FALLBACK`, where the writer checkpointed on its commits again.
+const CHECKPOINT_RESTART_AT: i64 = 32_768;
 
 impl Checkpointer {
     fn start(path: &Path) -> Result<Self> {
         let conn = Connection::open(path).with_context(|| format!("opening {} for checkpoints", path.display()))?;
-        conn.busy_timeout(std::time::Duration::from_secs(1))?;
+        // a RESTART waits this long for the writer's transaction and readers' snapshots before giving up this time
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stopping = stop.clone();
         let thread = std::thread::Builder::new().name("article-store-checkpoint".into()).spawn(move || {
+            let mut failing = false;
             while !stopping.load(Ordering::Acquire) {
                 std::thread::sleep(CHECKPOINT_EVERY);
-                // PASSIVE: copies what no reader still needs and waits for nobody
-                if let Err(error) = conn.query_row("pragma wal_checkpoint(PASSIVE)", [], |_| Ok(())) {
-                    eprintln!("local article store checkpoint failed: {error}");
+                if stopping.load(Ordering::Acquire) {
+                    break;
+                }
+                // PASSIVE: copies what no reader still needs and waits for nobody; its row says how long the WAL is
+                let passive = conn.query_row("pragma wal_checkpoint(PASSIVE)", [], |row| row.get::<_, i64>(1));
+                let result = match passive {
+                    Ok(frames) if frames > CHECKPOINT_RESTART_AT => {
+                        conn.query_row("pragma wal_checkpoint(RESTART)", [], |_| Ok(()))
+                    }
+                    other => other.map(|_| ()),
+                };
+                // said once per run of failures, not every pass
+                match result {
+                    Err(error) if !failing => {
+                        failing = true;
+                        eprintln!("local article store checkpoint failed: {error}");
+                    }
+                    Err(_) => {}
+                    Ok(()) => failing = false,
                 }
             }
         })?;
