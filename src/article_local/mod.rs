@@ -122,6 +122,9 @@ pub(crate) struct Shard {
     queue: Mutex<Vec<Pending>>,
     /// Group commits made (`commit_group`).
     commits: std::sync::atomic::AtomicU64,
+    /// lookups `has` split over threads (tests)
+    #[cfg(test)]
+    pub(super) has_splits: std::sync::atomic::AtomicU64,
     /// Idle read connections kept over every file of the store (`READERS_KEPT`), shared by them (`Store::of_shards`).
     idle_readers: Arc<AtomicUsize>,
 }
@@ -238,7 +241,8 @@ const HAS_PER_READ: usize = 512;
 /// cache) it took the indexer toward its 8 GiB guard.
 const READERS_KEPT: usize = 128;
 
-/// Keys `has` looks up on one connection at most before it splits them over several, `HAS_SPLIT` at most. The store is
+/// Keys of releases not yet in `seen` that `has` looks up on one connection at most before it splits them over several,
+/// `HAS_SPLIT` at most. The store is
 /// far bigger than memory, so most lookups of an existing release read the disk at random, one after another on one
 /// connection: on prod `has` spent two thirds of its time in pread with the disk doing a few thousand reads a second,
 /// a fraction of what it does with more requests in flight.
@@ -353,6 +357,8 @@ impl Shard {
             waiting: AtomicUsize::new(0),
             queue: Mutex::new(Vec::new()),
             commits: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            has_splits: std::sync::atomic::AtomicU64::new(0),
             idle_readers: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -381,6 +387,8 @@ impl Shard {
             waiting: AtomicUsize::new(0),
             queue: Mutex::new(Vec::new()),
             commits: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            has_splits: std::sync::atomic::AtomicU64::new(0),
             idle_readers: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -483,12 +491,23 @@ impl Shard {
         let mut order: Vec<usize> = (0..keys.len()).collect();
         order.sort_unstable_by(|&a, &b| keys[a].cmp(&keys[b]));
         let sorted: Vec<&(i64, &[u8])> = order.iter().map(|&i| &keys[i]).collect();
-        let found: Vec<bool> = if !self.writer || keys.len() <= HAS_ALONE {
+        // only keys of releases not yet in `seen` read `segments` at random (`above`); those in `seen` are answered
+        // from a small index mostly in memory, where splitting them over threads cost more than it saved (on prod the
+        // saves' waits for these threads outweighed their PostgreSQL round trips). In key order the cold keys come first
+        // (release at or below `above`): they are split, the rest are one more part.
+        let cold = sorted.partition_point(|(release, _)| *release <= above);
+        let found: Vec<bool> = if !self.writer || cold <= HAS_ALONE {
             look(&sorted)?
         } else {
-            let each = keys.len().div_ceil(HAS_SPLIT.min(keys.len().div_ceil(HAS_ALONE)));
+            let each = cold.div_ceil(HAS_SPLIT.min(cold.div_ceil(HAS_ALONE)));
+            #[cfg(test)]
+            self.has_splits.fetch_add(1, Ordering::Relaxed);
             std::thread::scope(|scope| {
-                let parts: Vec<_> = sorted.chunks(each).map(|part| scope.spawn(move || look(part))).collect();
+                let mut parts: Vec<_> = sorted[..cold].chunks(each).map(|part| scope.spawn(move || look(part))).collect();
+                if cold < sorted.len() {
+                    let warm = &sorted[cold..];
+                    parts.push(scope.spawn(move || look(warm)));
+                }
                 let mut found = Vec::with_capacity(keys.len());
                 for part in parts {
                     found.extend(part.join().map_err(|_| anyhow::anyhow!("a local store lookup panicked"))??);

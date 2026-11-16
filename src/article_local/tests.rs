@@ -107,9 +107,18 @@ fn a_big_has_split_over_connections_answers_in_the_order_asked() {
         ids.iter().enumerate().filter(|(n, _)| n % 3 == 0).map(|(n, id)| row(1 + (n % 5) as i64, 7, id, None)).collect();
     store.add("1", &stored, 100).unwrap();
     store.confirm("1").unwrap();
-    // asked in an order unlike the index's, past HAS_ALONE so it splits
-    let keys: Vec<(i64, &[u8])> = ids.iter().enumerate().rev().map(|(n, id)| (1 + (n % 5) as i64, id.as_slice())).collect();
+    // asked in an order unlike the index's, past HAS_ALONE so it splits: every release taken for one not yet in
+    // `seen`, so all of its keys read `segments` (cold), and one release above it that `seen` answers
+    for shard in store.shards() {
+        shard.seen_above.store(4, Ordering::Release);
+    }
+    let mut keys: Vec<(i64, &[u8])> = ids.iter().enumerate().rev().map(|(n, id)| (1 + (n % 5) as i64, id.as_slice())).collect();
+    keys.push((5, b"<missing@x>"));
     let answers = store.has(&keys).unwrap();
+    assert!(store.shards().iter().map(|s| s.has_splits.load(Ordering::Relaxed)).sum::<u64>() > 0, "the cold keys were split");
+    assert!(!answers.last().unwrap());
+    keys.pop();
+    let answers = answers[..keys.len()].to_vec();
     for (key, known) in keys.iter().zip(&answers) {
         let n: usize = std::str::from_utf8(key.1).unwrap().trim_start_matches('<').split('@').next().unwrap().parse().unwrap();
         assert_eq!(*known, n % 3 == 0, "article {n}");
