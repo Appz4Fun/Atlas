@@ -77,11 +77,15 @@ pub fn save(client: &mut Client, releases: &[Release], now: i64) -> Result<SaveS
     // A group writer that waited on the advisory lock must see the preceding commit.
     let mut tx = client.build_transaction().isolation_level(IsolationLevel::ReadCommitted).start()?;
     let (stats, local) = save_grouped(&mut tx, groups, now)?;
+    // no longer certainly running once the commit is sent: a failed commit has rolled back before anything here runs
+    if let Some(Local { store, xid: Some(xid) }) = &local {
+        store.end(xid);
+    }
     tx.commit()?;
     // A commit seen here needs no question later; one that failed is asked about.
     // The save stands either way: one left unconfirmed is asked about later.
-    if let Some(Local { store, xid: Some(xid) }) = local {
-        let _ = store.confirm(&xid);
+    if let Some(Local { store, xid: Some(xid) }) = &local {
+        let _ = store.confirm(xid);
     }
     Ok(stats)
 }
@@ -191,12 +195,24 @@ struct Local {
 }
 
 impl Local {
-    /// The id of the transaction this save runs in, asked for once.
+    /// The id of the transaction this save runs in, asked for once. The store takes it for running until this is
+    /// dropped: that is before a failed save's transaction rolls back (it drops on the way out of the error), and after
+    /// a commit was confirmed.
     fn xid(&mut self, tx: &mut Transaction<'_>) -> Result<String> {
         if self.xid.is_none() {
-            self.xid = Some(tx.query_one("select pg_current_xact_id()::text", &[])?.try_get(0)?);
+            let xid: String = tx.query_one("select pg_current_xact_id()::text", &[])?.try_get(0)?;
+            self.store.begin(&xid);
+            self.xid = Some(xid);
         }
         Ok(self.xid.clone().expect("set above"))
+    }
+}
+
+impl Drop for Local {
+    fn drop(&mut self) {
+        if let Some(xid) = &self.xid {
+            self.store.end(xid);
+        }
     }
 }
 

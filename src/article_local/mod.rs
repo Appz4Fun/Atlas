@@ -88,6 +88,10 @@ pub(crate) struct Store {
     conn: Mutex<Connection>,
     path: PathBuf,
     writer: bool,
+    /// PostgreSQL transactions of this process whose save is still writing (`begin`/`end`): certainly running, so
+    /// settling doesnt ask about them. With helper writers saving side by side every save found the others' rows
+    /// waiting and asked PostgreSQL about each, holding the store meanwhile.
+    running: Mutex<HashSet<String>>,
 }
 
 const SCHEMA: &str = "
@@ -155,7 +159,7 @@ impl Store {
                 conn.execute("insert into meta (key, value) values ('catalogue', ?1)", [catalogue])?;
             }
         }
-        Ok(Self { conn: Mutex::new(conn), path, writer: true })
+        Ok(Self { conn: Mutex::new(conn), path, writer: true, running: Mutex::new(HashSet::new()) })
     }
 
     /// Open the store for reading only, as the web process does. The file must exist.
@@ -168,7 +172,7 @@ impl Store {
         .with_context(|| format!("opening {} for reading", path.display()))?;
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
         conn.execute_batch("pragma cache_size = -32768; pragma temp_store = memory;")?;
-        Ok(Self { conn: Mutex::new(conn), path, writer: false })
+        Ok(Self { conn: Mutex::new(conn), path, writer: false, running: Mutex::new(HashSet::new()) })
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -310,22 +314,38 @@ impl Store {
 
     /// Whether any save is still waiting to hear how its transaction ended.
     pub(crate) fn has_unsettled(&self) -> Result<bool> {
-        Ok(self.lock()?.query_row(
-            "select exists(select 1 from unsettled) or exists(select 1 from retracted)",
-            [],
-            |row| row.get(0),
-        )?)
+        self.has_unsettled_besides(None)
+    }
+
+    /// Transaction `xid` of this process is saving: until `end`, settling takes it for running without asking. Call
+    /// only while its transaction is certainly open (before its commit or rollback), and `end` before a rollback.
+    pub(crate) fn begin(&self, xid: &str) {
+        self.running.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(xid.to_owned());
+    }
+
+    pub(crate) fn end(&self, xid: &str) {
+        self.running.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(xid);
+    }
+
+    fn running(&self, xid: &str) -> bool {
+        self.running.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(xid)
+    }
+
+    /// The transactions with rows waiting, but those of this process still saving.
+    fn waiting(&self) -> Result<Vec<String>> {
+        let xids: Vec<String> = {
+            let conn = self.lock()?;
+            let mut list = conn.prepare_cached("select xid from unsettled union select xid from retracted")?;
+            list.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?
+        };
+        Ok(xids.into_iter().filter(|xid| !self.running(xid)).collect())
     }
 
     /// Ask `ended` about every transaction with rows still waiting. Rows of a
     /// committed one stay; rows of a rolled-back one are taken out again.
     pub(crate) fn settle(&self, mut ended: impl FnMut(&str) -> Result<Ended>) -> Result<()> {
         ensure!(self.writer, "the local article store is open for reading only");
-        let xids: Vec<String> = {
-            let conn = self.lock()?;
-            let mut list = conn.prepare("select xid from unsettled union select xid from retracted")?;
-            list.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?
-        };
+        let xids = self.waiting()?;
         // PostgreSQL is asked with the store unlocked, so readers are not kept waiting on it.
         let mut answers = Vec::with_capacity(xids.len());
         for xid in xids {
@@ -363,12 +383,7 @@ impl Store {
 
     /// Whether a save other than `own` is still waiting to hear how its transaction ended.
     pub(crate) fn has_unsettled_besides(&self, own: Option<&str>) -> Result<bool> {
-        Ok(self.lock()?.query_row(
-            "select exists(select 1 from unsettled where ?1 is null or xid <> ?1)
-                 or exists(select 1 from retracted where ?1 is null or xid <> ?1)",
-            [own],
-            |row| row.get(0),
-        )?)
+        Ok(self.waiting()?.iter().any(|xid| Some(xid.as_str()) != own))
     }
 
     pub(crate) fn is_writer(&self) -> bool {
