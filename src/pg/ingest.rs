@@ -281,8 +281,8 @@ impl Helpers {
                 return Err(super::outage::AttemptEnded.into());
             }
             let mut client = self.pool.get()?;
-            client.execute("select set_config('atlas.helper_epoch', $1, false)", &[&self.epoch])?;
-            match super::release_writer::save(&mut client, releases, now) {
+            // the epoch is set in the save's first round trip
+            match super::release_writer::save_as(&mut client, releases, now, Some(&self.epoch)) {
                 Ok(_) => return Ok(()),
                 Err(error) if tries < HELPER_RETRIES && retryable(&error) => tries += 1,
                 Err(error) => return Err(error),

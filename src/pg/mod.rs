@@ -47,6 +47,8 @@ mod statement_triggers_tests;
 #[cfg(test)]
 mod helper_writers_tests;
 #[cfg(test)]
+mod release_writer_roundtrips_tests;
+#[cfg(test)]
 mod stage_words_tests;
 #[cfg(test)]
 mod stage_mutation_tests;

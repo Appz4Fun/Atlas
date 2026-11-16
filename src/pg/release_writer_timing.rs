@@ -4,16 +4,16 @@ use anyhow::{Context,Result,ensure};
 use postgres::Transaction;
 
 pub(super) fn key(tx:&mut Transaction<'_>)->Result<i64> {
-    tx.query_opt("select value from meta where key='key_salt' for share",&[])?
+    tx.query_typed_opt("select value from meta where key='key_salt' for share",&[])?
         .context("native writer timing requires the existing catalog key_salt")?
         .try_get::<_,Option<i64>>(0)?.context("native writer catalog key_salt is null")
 }
 pub(super) fn write(tx:&mut Transaction<'_>,accepted:u64)->Result<()> {
-    let rows=tx.execute(WRITE,&[])?;
+    let rows=tx.execute_typed(WRITE,&[])?;
     ensure!(rows>0&&rows<=accepted,"native timing accepted-file count differs from segment acceptance");Ok(())
 }
 pub(super) fn write_local(tx:&mut Transaction<'_>,accepted:u64,files:&[i64],present:&[i64])->Result<()> {
-    let rows=tx.execute(WRITE_FOLD,&[&files,&present])?;
+    let rows=tx.execute_typed(WRITE_FOLD,&[(&files,postgres::types::Type::INT8_ARRAY),(&present,postgres::types::Type::INT8_ARRAY)])?;
     ensure!(rows>0&&rows<=accepted,"native timing accepted-file count differs from segment acceptance");Ok(())
 }
 
