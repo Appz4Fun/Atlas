@@ -132,7 +132,11 @@ impl Store {
         Ok(Self::of_shards(shards, boundary, false))
     }
 
-    fn of_shards(shards: Vec<Shard>, boundary: i64, writer: bool) -> Self {
+    fn of_shards(mut shards: Vec<Shard>, boundary: i64, writer: bool) -> Self {
+        let idle = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for shard in &mut shards {
+            shard.share_idle_readers(&idle);
+        }
         Self {
             shards,
             boundary,

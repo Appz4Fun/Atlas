@@ -118,7 +118,37 @@ pub(crate) struct Shard {
     warming: std::sync::atomic::AtomicBool,
     /// saves waiting for the write lock in `add_fresh`: the fill runs only when none is (`fill_seen`)
     waiting: AtomicUsize,
+    /// Saves handed over for the next group commit (`add`): whoever takes the write lock next commits them all.
+    queue: Mutex<Vec<Pending>>,
+    /// Group commits made (`commit_group`).
+    commits: std::sync::atomic::AtomicU64,
+    /// Idle read connections kept over every file of the store (`READERS_KEPT`), shared by them (`Store::of_shards`).
+    idle_readers: Arc<AtomicUsize>,
 }
+
+/// A save waiting for its rows to be committed by a group commit (`Shard::add`).
+struct Pending {
+    xid: String,
+    /// its keys for `unsettled` (`encode_keys`)
+    keys: Vec<u8>,
+    /// its rows, in key order
+    rows: Vec<OwnedRow>,
+    /// set once the transaction that carried its rows committed (`Ok`) or failed
+    done: Arc<Mutex<Option<Result<(), String>>>>,
+}
+
+/// A `NewRow` the group commit's writer, on another save's thread, can hold.
+struct OwnedRow {
+    release_id: i64,
+    file_id: i64,
+    message_id: Vec<u8>,
+    part: Option<i64>,
+    bytes: i64,
+    envelope: Option<Envelope>,
+}
+
+/// Rows a group commit carries at most; a save bigger than this goes alone.
+const GROUP_ROWS: usize = 50_000;
 
 /// Copies the WAL back into a writer store's file in the background, on a connection of its own, so the writer's
 /// commits dont: with `wal_autocheckpoint` at its old 8192 pages the commit that crossed it copied pages into the 44
@@ -203,8 +233,9 @@ fn restart_wal(conn: &Connection) {
 /// its transaction lasts.
 const HAS_PER_READ: usize = 512;
 
-/// Read connections a writer's store keeps open when idle (`Store::read`): `has` takes up to `HAS_SPLIT` at once for
-/// each of the helper writers' saves.
+/// Read connections a writer's store keeps open when idle (`Shard::read`), over all its files together: `has` takes up
+/// to `HAS_SPLIT` at once for each of the helper writers' saves. Once per file (nine files, each reader up to 4 MiB of
+/// cache) it took the indexer toward its 8 GiB guard.
 const READERS_KEPT: usize = 128;
 
 /// Keys `has` looks up on one connection at most before it splits them over several, `HAS_SPLIT` at most. The store is
@@ -320,6 +351,9 @@ impl Shard {
             seen_filled_at: Mutex::new(None),
             warming: std::sync::atomic::AtomicBool::new(false),
             waiting: AtomicUsize::new(0),
+            queue: Mutex::new(Vec::new()),
+            commits: std::sync::atomic::AtomicU64::new(0),
+            idle_readers: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -345,6 +379,9 @@ impl Shard {
             seen_filled_at: Mutex::new(None),
             warming: std::sync::atomic::AtomicBool::new(false),
             waiting: AtomicUsize::new(0),
+            queue: Mutex::new(Vec::new()),
+            commits: std::sync::atomic::AtomicU64::new(0),
+            idle_readers: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -380,6 +417,9 @@ impl Shard {
             return f(&*self.lock()?);
         }
         let idle = self.readers.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pop();
+        if idle.is_some() {
+            self.idle_readers.fetch_sub(1, Ordering::AcqRel);
+        }
         let conn = match idle {
             Some(conn) => conn,
             None => {
@@ -405,7 +445,7 @@ impl Shard {
             Err(error) => Err(error.into()),
         };
         let mut idle = self.readers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if idle.len() < READERS_KEPT {
+        if self.idle_readers.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < READERS_KEPT).then_some(n + 1)).is_ok() {
             idle.push(conn);
         }
         out
@@ -499,30 +539,8 @@ impl Shard {
             })?;
             had.extend(keys.iter().zip(found).filter(|(_, found)| *found).map(|(key, _)| *key));
         }
-        // the next fill's rows read here first, off the write lock: the fill under it then finds their pages cached
-        self.warm_fill();
-        self.waiting.fetch_add(1, Ordering::AcqRel);
-        let locked = self.lock();
-        self.waiting.fetch_sub(1, Ordering::AcqRel);
-        let mut conn = locked?;
-        if self.restart_wanted.swap(false, Ordering::AcqRel) {
-            restart_wal(&conn);
-        }
-        // the fill is best effort: a save never fails for it, and it goes on from `meta` next time. Only when no other
-        // save waits for this lock: it only speeds up `has`, which reads off the lock, and on prod its reads of cold
-        // pages under the lock held every save back
-        if self.waiting.load(Ordering::Acquire) == 0
-            && let Err(error) = self.fill_seen(&mut conn)
-        {
-            eprintln!("local article store: couldnt fill the lookup index this time: {error:#}");
-        }
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        // commits seen since the last add, marked here (`confirm_later`); should this transaction roll back they are
-        // left waiting, and asked about as any unsettled transaction is
-        let seen: Vec<String> = self.confirmed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().cloned().collect();
-        for xid in &seen {
-            Self::committed(&tx, xid)?;
-        }
+        // what this save gains is its own rows against `had`: nothing another save in the same commit writes changes
+        // it, as two saves of one file never run side by side (see above)
         let mut gained = HashMap::<i64, NewParts>::new();
         let mut order = Vec::new();
         {
@@ -540,43 +558,193 @@ impl Shard {
                 entry.first = entry.first.min(part);
                 entry.last = entry.last.max(part);
             }
-            let mut insert = tx.prepare_cached(
-                "insert into segments (release_id, message_id, file_id, part, bytes) values (?1, ?2, ?3, ?4, ?5)",
-            )?;
-            let mut mark = tx.prepare_cached("insert or ignore into seen (release_id, h) values (?1, ?2)")?;
-            let mut envelope = tx.prepare_cached(
-                "insert or ignore into envelopes (release_id, message_id, subject, poster, posted_date, nzb_timestamp,
-                    expected, subject_file_index, subject_file_total) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            )?;
-            for row in rows {
-                insert
-                    .execute(params![row.release_id, row.message_id, row.file_id, row.part, row.bytes])
-                    .context("an article the release already has reached the local article store")?;
-                mark.execute(params![row.release_id, seen_hash(row.message_id)])?;
-                if let Some(e) = &row.envelope {
-                    envelope.execute(params![
-                        row.release_id,
-                        row.message_id,
-                        e.subject,
-                        e.poster,
-                        e.posted_date,
-                        e.nzb_timestamp,
-                        e.expected,
-                        e.subject_file_index,
-                        e.subject_file_total
-                    ])?;
-                }
-            }
-            tx.execute("insert into unsettled (xid, keys) values (?1, ?2)", params![xid, encode_keys(rows)?])?;
         }
-        tx.commit()?;
-        {
+        let mut owned: Vec<OwnedRow> = rows
+            .iter()
+            .map(|row| OwnedRow {
+                release_id: row.release_id,
+                file_id: row.file_id,
+                message_id: row.message_id.to_vec(),
+                part: row.part,
+                bytes: row.bytes,
+                envelope: row.envelope.clone(),
+            })
+            .collect();
+        owned.sort_unstable_by(|a, b| (a.release_id, &a.message_id).cmp(&(b.release_id, &b.message_id)));
+        let done: Arc<Mutex<Option<Result<(), String>>>> = Arc::new(Mutex::new(None));
+        let request = Pending { xid: xid.to_owned(), keys: encode_keys(rows)?, rows: owned, done: done.clone() };
+        self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(request);
+        // the next fill's rows read here first, off the write lock: the fill under it then finds their pages cached
+        self.warm_fill();
+        self.waiting.fetch_add(1, Ordering::AcqRel);
+        let locked = self.lock();
+        self.waiting.fetch_sub(1, Ordering::AcqRel);
+        let mut conn = match locked {
+            Ok(conn) => conn,
+            Err(error) => {
+                // taken back out, unless a writer already took it (then its answer stands)
+                self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|p| !Arc::ptr_eq(&p.done, &done));
+                if let Some(answer) = done.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
+                    answer.map_err(|e| anyhow::anyhow!(e))?;
+                    return Ok(order.into_iter().map(|(at, file)| (at, gained[&file])).collect());
+                }
+                return Err(error);
+            }
+        };
+        // Group commit: whoever holds the write lock commits every save queued so far in one transaction, so a save
+        // may find its rows committed by the one before it. Its answer is final once set: only a writer under this
+        // lock sets it, after its transaction committed or failed.
+        loop {
+            if let Some(answer) = done.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
+                drop(conn);
+                answer.map_err(|e| anyhow::anyhow!(e))?;
+                return Ok(order.into_iter().map(|(at, file)| (at, gained[&file])).collect());
+            }
+            if self.restart_wanted.swap(false, Ordering::AcqRel) {
+                restart_wal(&conn);
+            }
+            // the fill is best effort: a save never fails for it, and it goes on from `meta` next time. Only when no
+            // other save waits for this lock: it only speeds up `has`, which reads off the lock, and on prod its reads
+            // of cold pages under the lock held every save back
+            if self.waiting.load(Ordering::Acquire) == 0
+                && let Err(error) = self.fill_seen(&mut conn)
+            {
+                eprintln!("local article store: couldnt fill the lookup index this time: {error:#}");
+            }
+            let batch = {
+                let mut queue = self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut take = 0;
+                let mut count = 0;
+                while take < queue.len() && (take == 0 || count + queue[take].rows.len() <= GROUP_ROWS) {
+                    count += queue[take].rows.len();
+                    take += 1;
+                }
+                queue.drain(..take).collect::<Vec<Pending>>()
+            };
+            self.commit_group(&mut conn, batch);
+        }
+    }
+
+    /// Commit the saves of `batch` in one transaction, each save's rows and `unsettled` entry under a savepoint of its
+    /// own only when a first try of them all together failed: a save whose rows cannot go in (an article its release
+    /// has already) fails alone and the others commit. Should the transaction itself fail, every save in it fails.
+    /// Each save's answer is set before this returns.
+    fn commit_group(&self, conn: &mut Connection, mut batch: Vec<Pending>) {
+        if batch.is_empty() {
+            return;
+        }
+        // in key order, so the commit walks each B-tree once rather than leaping about
+        batch.sort_by(|a, b| {
+            let first = |p: &Pending| p.rows.first().map(|r| (r.release_id, r.message_id.clone()));
+            first(a).cmp(&first(b))
+        });
+        let seen: Vec<String> = self.confirmed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().cloned().collect();
+        let mut answers = match Self::write_group(conn, &batch, &seen, false) {
+            Ok(Some(answers)) => Ok(answers),
+            Ok(None) => Self::write_group(conn, &batch, &seen, true).map(|answers| answers.expect("an isolated group always answers")),
+            Err(error) => Err(error),
+        };
+        if answers.is_ok() {
+            self.commits.fetch_add(1, Ordering::Relaxed);
             let mut confirmed = self.confirmed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             for xid in &seen {
                 confirmed.remove(xid);
             }
         }
-        Ok(order.into_iter().map(|(at, file)| (at, gained[&file])).collect())
+        let failed = answers.as_ref().err().map(|error| format!("{error:#}"));
+        for (at, pending) in batch.into_iter().enumerate() {
+            let answer = match (&failed, answers.as_mut()) {
+                (Some(error), _) => Err(error.clone()),
+                (None, Ok(answers)) => std::mem::replace(&mut answers[at], Ok(())),
+                (None, Err(_)) => unreachable!(),
+            };
+            *pending.done.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(answer);
+        }
+    }
+
+    /// One transaction of `batch`'s saves, marking the commits in `seen` (`confirm_later`) too. Not `isolate`d: the
+    /// first save that fails rolls it all back (`None`). `isolate`d: each save under a savepoint, its failure its own.
+    fn write_group(conn: &mut Connection, batch: &[Pending], seen: &[String], isolate: bool) -> Result<Option<Vec<Result<(), String>>>> {
+        let mut tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // commits seen since the last add, marked here (`confirm_later`); should this transaction roll back they are
+        // left waiting, and asked about as any unsettled transaction is
+        for xid in seen {
+            Self::committed(&tx, xid)?;
+        }
+        let mut answers = Vec::with_capacity(batch.len());
+        for pending in batch {
+            if isolate {
+                let sp = tx.savepoint()?;
+                match Self::write_one(&sp, pending) {
+                    Ok(()) => {
+                        sp.commit()?;
+                        answers.push(Ok(()));
+                    }
+                    // a duplicate is this save's own failure; any other error (full disk, I/O, memory) may have rolled
+                    // the whole transaction back, leaving the rest to run outside one: the batch fails whole
+                    Err(error) if is_constraint(&error) && !sp.is_autocommit() => {
+                        drop(sp); // rolls the savepoint back
+                        answers.push(Err(format!("{error:#}")));
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else {
+                match Self::write_one(&tx, pending) {
+                    Ok(()) => answers.push(Ok(())),
+                    // a duplicate: tried again a save at a time, so only its save fails (dropping `tx` rolls it back)
+                    Err(error) if is_constraint(&error) => return Ok(None),
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(Some(answers))
+    }
+
+    /// One save's rows, and its keys in `unsettled` under its own `xid`.
+    /// (See `is_constraint`: only a constraint error is a single save's own failure.)
+    fn write_one(conn: &Connection, pending: &Pending) -> Result<()> {
+        let mut insert =
+            conn.prepare_cached("insert into segments (release_id, message_id, file_id, part, bytes) values (?1, ?2, ?3, ?4, ?5)")?;
+        let mut mark = conn.prepare_cached("insert or ignore into seen (release_id, h) values (?1, ?2)")?;
+        let mut envelope = conn.prepare_cached(
+            "insert or ignore into envelopes (release_id, message_id, subject, poster, posted_date, nzb_timestamp,
+                expected, subject_file_index, subject_file_total) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        )?;
+        for row in &pending.rows {
+            insert
+                .execute(params![row.release_id, row.message_id, row.file_id, row.part, row.bytes])
+                .context("an article the release already has reached the local article store")?;
+            mark.execute(params![row.release_id, seen_hash(&row.message_id)])?;
+            if let Some(e) = &row.envelope {
+                envelope.execute(params![
+                    row.release_id,
+                    row.message_id,
+                    e.subject,
+                    e.poster,
+                    e.posted_date,
+                    e.nzb_timestamp,
+                    e.expected,
+                    e.subject_file_index,
+                    e.subject_file_total
+                ])?;
+            }
+        }
+        conn.execute("insert into unsettled (xid, keys) values (?1, ?2)", params![pending.xid, pending.keys])?;
+        Ok(())
+    }
+
+    /// Group commits this file made.
+    #[cfg(test)]
+    pub(super) fn commits(&self) -> u64 {
+        self.commits.load(Ordering::Relaxed)
+    }
+
+    /// Share `total` as the count of idle readers kept over every file (`READERS_KEPT`).
+    fn share_idle_readers(&mut self, total: &Arc<AtomicUsize>) {
+        let mine = self.readers.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner).len();
+        total.fetch_add(mine, Ordering::AcqRel);
+        self.idle_readers = total.clone();
     }
 
     /// The caller saw PostgreSQL commit `xid`: its rows here stay and stop waiting.
@@ -815,6 +983,14 @@ impl Shard {
         }
         Ok(gone)
     }
+}
+
+/// Whether `error` is SQLite refusing a row for a constraint (a duplicate key): the one error a save in a group commit
+/// fails alone for. Any other leaves the whole group failed.
+fn is_constraint(error: &anyhow::Error) -> bool {
+    error.chain().any(|source| {
+        matches!(source.downcast_ref::<rusqlite::Error>(), Some(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::ConstraintViolation)
+    })
 }
 
 /// An article's key in `seen`: the first 8 bytes of its message key. Two message ids of one release sharing it (about

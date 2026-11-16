@@ -460,3 +460,122 @@ fn reads_by_file_find_its_shard_and_answer_as_one_file_did() {
     store.add("2", &[row(4, 99, b"<late>", Some(1))], 100).unwrap();
     assert_eq!(store.file_parts_within(99, -1, 100, 10).unwrap(), vec![1]);
 }
+
+/// Saves queued behind a held write lock: `n` threads each save its own release (all in one file), and the lock is let
+/// go once every one of them waits for it.
+fn queued_saves<'a>(store: &'a Store, home: i64, saves: Vec<(String, Vec<NewRow<'a>>)>) -> Vec<Result<Vec<NewParts>>> {
+    let shard = store.on(home);
+    let held = shard.lock().unwrap();
+    std::thread::scope(|scope| {
+        let threads: Vec<_> = saves.into_iter().map(|(xid, rows)| scope.spawn(move || store.add(&xid, &rows, 100))).collect();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while shard.queue.lock().unwrap().len() < threads.len() {
+            assert!(std::time::Instant::now() < deadline, "the saves never queued");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        drop(held);
+        threads.into_iter().map(|t| t.join().unwrap()).collect()
+    })
+}
+
+#[test]
+fn saves_queued_together_commit_in_one_transaction_each_with_its_own_parts() {
+    let (_dir, store) = store();
+    // releases of one shard: 9, 17, 25, ... with eight shards past articles.db
+    let releases: Vec<i64> = (0..12).map(|n| 9 + n * 8).collect();
+    assert!(releases.iter().all(|&r| store.index_of(r) == store.index_of(releases[0])));
+    store.add("0", &[row(releases[0], releases[0] * 10, b"<pre>", Some(2))], 100).unwrap();
+    let before = store.on(releases[0]).commits();
+    let ids: Vec<Vec<Vec<u8>>> = releases.iter().map(|r| (0..5).map(|n| format!("<{r}-{n}>").into_bytes()).collect()).collect();
+    let saves = releases
+        .iter()
+        .zip(&ids)
+        .map(|(&r, ids)| (format!("x{r}"), ids.iter().enumerate().map(|(n, id)| row(r, r * 10, id, Some(n as i64))).collect()))
+        .collect();
+    let answers = queued_saves(&store, releases[0], saves);
+    for (&r, answer) in releases.iter().zip(answers) {
+        let want = if r == releases[0] {
+            // part 2 the file had already
+            vec![NewParts { file_id: r * 10, count: 4, first: 0, last: 4 }]
+        } else {
+            vec![NewParts { file_id: r * 10, count: 5, first: 0, last: 4 }]
+        };
+        assert_eq!(answer.unwrap(), want, "release {r}");
+    }
+    let commits = store.on(releases[0]).commits() - before;
+    assert!(commits < releases.len() as u64, "{commits} commits for {} saves", releases.len());
+    assert_eq!(store.segment_count().unwrap(), 1 + 12 * 5);
+    // each save waits under its own transaction
+    let mut asked = Vec::new();
+    store.settle(|xid| { asked.push(xid.to_owned()); Ok(Ended::Running) }).unwrap();
+    asked.sort();
+    let mut want: Vec<String> = std::iter::once("0".to_owned()).chain(releases.iter().map(|r| format!("x{r}"))).collect();
+    want.sort();
+    assert_eq!(asked, want);
+}
+
+#[test]
+fn a_save_of_an_article_already_there_fails_alone_in_its_group() {
+    let (_dir, store) = store();
+    let (a, b, c) = (9, 17, 25);
+    store.add("0", &[row(b, 170, b"<dup>", Some(1))], 100).unwrap();
+    let saves = vec![
+        ("xa".to_owned(), vec![row(a, 90, b"<a1>", Some(1))]),
+        ("xb".to_owned(), vec![row(b, 170, b"<b2>", Some(2)), row(b, 170, b"<dup>", Some(1))]),
+        ("xc".to_owned(), vec![row(c, 250, b"<c1>", Some(1))]),
+    ];
+    let answers = queued_saves(&store, a, saves);
+    assert_eq!(answers[0].as_ref().unwrap(), &vec![NewParts { file_id: 90, count: 1, first: 1, last: 1 }]);
+    let error = format!("{:#}", answers[1].as_ref().unwrap_err());
+    assert!(error.contains("already has"), "{error}");
+    assert_eq!(answers[2].as_ref().unwrap(), &vec![NewParts { file_id: 250, count: 1, first: 1, last: 1 }]);
+    // the failed save left nothing: not its other row, nor an unsettled entry
+    assert_eq!(store.has(&[(a, b"<a1>"), (b, b"<b2>"), (b, b"<dup>"), (c, b"<c1>")]).unwrap(), vec![true, false, true, true]);
+    let mut asked = Vec::new();
+    store.settle(|xid| { asked.push(xid.to_owned()); Ok(Ended::Running) }).unwrap();
+    asked.sort();
+    assert_eq!(asked, vec!["0", "xa", "xc"]);
+}
+
+#[test]
+fn a_rolled_back_save_in_a_shared_group_takes_out_only_its_rows() {
+    let (_dir, store) = store();
+    let (a, b, c) = (9, 17, 25);
+    let saves = vec![
+        ("xa".to_owned(), vec![row(a, 90, b"<a1>", Some(1)), row(a, 90, b"<a2>", Some(2))]),
+        ("xb".to_owned(), vec![row(b, 170, b"<b1>", Some(1))]),
+        ("xc".to_owned(), vec![row(c, 250, b"<c1>", Some(1))]),
+    ];
+    let before = store.on(a).commits();
+    for answer in queued_saves(&store, a, saves) {
+        answer.unwrap();
+    }
+    assert!(store.on(a).commits() - before < 3);
+    store.confirm("xc").unwrap();
+    store
+        .settle(|xid| Ok(match xid {
+            "xb" => Ended::RolledBack,
+            "xa" => Ended::Running,
+            other => panic!("{other} was confirmed"),
+        }))
+        .unwrap();
+    assert_eq!(store.has(&[(a, b"<a1>"), (a, b"<a2>"), (b, b"<b1>"), (c, b"<c1>")]).unwrap(), vec![true, true, false, true]);
+    store.settle(|xid| { assert_eq!(xid, "xa"); Ok(Ended::Committed) }).unwrap();
+    assert!(!store.has_unsettled().unwrap());
+    assert_eq!(store.has(&[(a, b"<a1>"), (a, b"<a2>")]).unwrap(), vec![true, true]);
+}
+
+#[test]
+fn idle_readers_are_kept_up_to_one_total_over_every_file() {
+    let (_dir, store) = store();
+    std::thread::scope(|scope| {
+        for shard in store.shards() {
+            for _ in 0..40 {
+                scope.spawn(move || shard.read(|_| { std::thread::sleep(std::time::Duration::from_millis(50)); Ok(()) }).unwrap());
+            }
+        }
+    });
+    let kept: usize = store.shards().iter().map(|s| s.readers.lock().unwrap().len()).sum();
+    assert!(kept <= READERS_KEPT, "{kept} idle readers kept");
+    assert_eq!(kept, store.shards()[0].idle_readers.load(Ordering::Acquire));
+}
