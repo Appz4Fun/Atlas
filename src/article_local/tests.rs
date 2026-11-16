@@ -129,3 +129,23 @@ fn a_commit_confirmed_later_is_not_asked_about_and_is_marked_by_the_next_add() {
     assert_eq!(asked, vec!["8".to_string()]);
     assert_eq!(store.has(&[(1, b"<a>"), (2, b"<b>")]).unwrap(), vec![true, true]);
 }
+
+#[test]
+fn an_add_starts_the_wal_over_when_the_checkpointer_asks() {
+    let (dir, store) = store();
+    let ids: Vec<Vec<u8>> = (0..20_000).map(|n| format!("<wal-{n}@x>").into_bytes()).collect();
+    for (chunk, ids) in ids.chunks(2000).enumerate() {
+        let rows: Vec<NewRow<'_>> = ids.iter().map(|id| row(10 + chunk as i64, 7, id, None)).collect();
+        store.add(&format!("{}", 100 + chunk), &rows, 100).unwrap();
+    }
+    let frames = |dir: &std::path::Path| -> i64 {
+        Connection::open(dir.join(FILE)).unwrap().query_row("pragma wal_checkpoint(PASSIVE)", [], |row| row.get(1)).unwrap()
+    };
+    let before = frames(dir.path());
+    assert!(before > 50, "the WAL grew: {before}");
+    store.restart_wanted.store(true, Ordering::Release);
+    store.add("200", &[row(99, 9, b"<after>", Some(1))], 100).unwrap();
+    let after = frames(dir.path());
+    assert!(after < before, "the WAL started over: {before} then {after}");
+    assert_eq!(store.has(&[(10, b"<wal-0@x>"), (99, b"<after>")]).unwrap(), vec![true, true]);
+}
