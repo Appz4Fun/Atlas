@@ -20,6 +20,12 @@
 //! The file holds only what Usenet said, but PostgreSQL's counts are of the
 //! articles in it: the catalogue names the one store it counts, and a
 //! different or missing store is refused rather than counted a second time.
+//!
+//! The store is several SQLite files (`Store`, store.rs), each a `Shard` with its own write connection, so saves of
+//! releases in different files write side by side: on prod sixteen helper writers waited about nine tenths of their
+//! save time for the one write connection of a single 220 GB file. `articles.db` keeps every release it held when the
+//! store was first split, and gets the later articles of those releases too; a newer release goes to one of the
+//! `articles.s{n}.db` files by its id. Every row of a release, and so of each of its files, is in one file.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -35,11 +41,13 @@ mod reads_nzb;
 mod reads_services;
 mod reads_stage;
 mod runtime;
+mod store;
 #[cfg(test)]
 mod tests;
 
 pub(crate) use reads::*;
 pub(crate) use runtime::{ensure_reader, ensure_writer};
+pub(crate) use store::Store;
 
 pub(crate) const FILE: &str = "articles.db";
 
@@ -84,7 +92,8 @@ pub(crate) enum Ended {
     Running,
 }
 
-pub(crate) struct Store {
+/// One SQLite file of the store, with its own write connection, readers, checkpoints, unsettled saves and `seen` fill.
+pub(crate) struct Shard {
     /// A writer's background checkpoints (`Checkpointer`); stopped first when the store drops.
     checkpointer: Option<Checkpointer>,
     /// Read connections of a writer's store (`read`): in WAL mode they dont wait for the writer, and the writer's
@@ -94,16 +103,10 @@ pub(crate) struct Store {
     conn: Mutex<Connection>,
     path: PathBuf,
     writer: bool,
-    /// PostgreSQL transactions of this process whose save is still writing (`begin`/`end`), with the groups whose
-    /// lock each took (`locked`): settling doesnt ask about them, as they are running, unless it holds the lock of a
-    /// group one took (then that one ended, though perhaps on the server's side before this process heard). With helper
-    /// writers saving side by side every save found the others' rows waiting and asked PostgreSQL about each, holding
-    /// the store meanwhile.
-    running: Mutex<HashMap<String, HashSet<String>>>,
-    /// Transactions of this process seen to commit (`confirm_later`) whose rows still wait in `unsettled`: settling
-    /// takes them for committed without asking, and the next save's `add` marks them in its own transaction. Each save
-    /// confirmed in a write transaction of its own, queued for the one writer behind every helper's insert, and every
-    /// other save asked PostgreSQL about it meanwhile.
+    /// Transactions of this process seen to commit (`Store::confirm_later`) whose rows still wait in this file's
+    /// `unsettled`: settling takes them for committed without asking, and the next save's `add` here marks them in its
+    /// own transaction. Each save confirmed in a write transaction of its own, queued for the one writer behind every
+    /// helper's insert, and every other save asked PostgreSQL about it meanwhile.
     confirmed: Mutex<HashSet<String>>,
     /// set by the checkpointer when the WAL should start over; the next `add` does it under the write lock
     restart_wanted: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -211,6 +214,11 @@ const READERS_KEPT: usize = 128;
 const HAS_ALONE: usize = 256;
 const HAS_SPLIT: usize = 8;
 
+/// The write connections' page caches: 2 GiB for `articles.db`, whose existing releases keep most of the writes for a
+/// while after the split, 256 MiB for each of the shards (all of them together within the indexer guard's memory).
+pub(super) const HOME_CACHE_KIB: i64 = 2_097_152;
+pub(super) const SHARD_CACHE_KIB: i64 = 262_144;
+
 const SCHEMA: &str = "
     create table if not exists meta (key text primary key, value text not null) without rowid;
     create table if not exists segments (
@@ -255,18 +263,18 @@ const SCHEMA: &str = "
     );
 ";
 
-impl Store {
-    /// Open the store the indexer writes. `catalogue` names the PostgreSQL
-    /// catalogue whose ids the rows carry; a store filled for another one is refused.
-    pub(crate) fn open_writer(dir: &Path, catalogue: &str) -> Result<Self> {
-        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        let path = dir.join(FILE);
+impl Shard {
+    /// Open one file of the store the indexer writes, made when missing. `catalogue` names the PostgreSQL
+    /// catalogue whose ids the rows carry; a file filled for another one is refused.
+    /// `cache_kib`: the write connection's page cache (`HOME_CACHE_KIB` for `articles.db`, `SHARD_CACHE_KIB` for a shard).
+    fn open_writer(path: &Path, catalogue: &str, cache_kib: i64) -> Result<Self> {
+        let path = path.to_path_buf();
         let conn = Connection::open(&path).with_context(|| format!("opening {}", path.display()))?;
         conn.busy_timeout(std::time::Duration::from_secs(30))?;
         conn.execute_batch(&format!(
             "pragma journal_mode = wal;
              pragma synchronous = normal;
-             pragma cache_size = -2097152;
+             pragma cache_size = -{cache_kib};
              pragma wal_autocheckpoint = {CHECKPOINT_FALLBACK};
              pragma temp_store = memory;"
         ))?;
@@ -304,7 +312,6 @@ impl Store {
             conn: Mutex::new(conn),
             path,
             writer: true,
-            running: Mutex::new(HashMap::new()),
             confirmed: Mutex::new(HashSet::new()),
             readers: Mutex::new(Vec::new()),
             restart_wanted,
@@ -315,9 +322,9 @@ impl Store {
         })
     }
 
-    /// Open the store for reading only, as the web process does. The file must exist.
-    pub(crate) fn open_reader(dir: &Path) -> Result<Self> {
-        let path = dir.join(FILE);
+    /// Open one file for reading only, as the web process does. The file must exist.
+    fn open_reader(path: &Path) -> Result<Self> {
+        let path = path.to_path_buf();
         let conn = Connection::open_with_flags(
             &path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -330,7 +337,6 @@ impl Store {
             conn: Mutex::new(conn),
             path,
             writer: false,
-            running: Mutex::new(HashMap::new()),
             confirmed: Mutex::new(HashSet::new()),
             readers: Mutex::new(Vec::new()),
             restart_wanted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -345,7 +351,7 @@ impl Store {
         &self.path
     }
 
-    pub(crate) fn catalogue(&self) -> Result<Option<String>> {
+    fn catalogue(&self) -> Result<Option<String>> {
         Ok(self.lock()?.query_row("select value from meta where key = 'catalogue'", [], |row| row.get(0)).optional()?)
     }
 
@@ -456,23 +462,16 @@ impl Store {
         Ok(answers)
     }
 
-    /// Write the accepted articles of one batch and remember them under `xid`,
-    /// the PostgreSQL transaction that counts them. Returns the part numbers
-    /// each file gained, `0..=max_part` only, as `file_parts` used to report.
-    /// A row the release already has is an error: the caller asked `has` first.
-    pub(crate) fn add(&self, xid: &str, rows: &[NewRow<'_>], max_part: i64) -> Result<Vec<NewParts>> {
-        self.add_fresh(xid, rows, max_part, &HashSet::new())
-    }
-
-    /// `add`, where the files in `fresh` were made in the same PostgreSQL transaction and have no articles here yet:
-    /// their parts arent looked up.
-    pub(crate) fn add_fresh(
+    /// Write the accepted articles of one batch, every one of a release of this file, and remember them under `xid`,
+    /// the PostgreSQL transaction that counts them (see `Store::add_fresh`). Returns the parts each file gained with the
+    /// place in `rows` of the row that first counted for it.
+    fn add(
         &self,
         xid: &str,
-        rows: &[NewRow<'_>],
+        rows: &[&NewRow<'_>],
         max_part: i64,
         fresh: &HashSet<i64>,
-    ) -> Result<Vec<NewParts>> {
+    ) -> Result<Vec<(usize, NewParts)>> {
         ensure!(self.writer, "the local article store is open for reading only");
         if rows.is_empty() {
             return Ok(Vec::new());
@@ -527,13 +526,13 @@ impl Store {
         let mut order = Vec::new();
         {
             let mut seen = HashSet::new();
-            for row in rows {
+            for (at, row) in rows.iter().enumerate() {
                 let Some(part) = row.part.filter(|part| (0..=max_part).contains(part)) else { continue };
                 if !seen.insert((row.file_id, part)) || had.contains(&(row.file_id, part)) {
                     continue;
                 }
                 let entry = gained.entry(row.file_id).or_insert_with(|| {
-                    order.push(row.file_id);
+                    order.push((at, row.file_id));
                     NewParts { file_id: row.file_id, count: 0, first: part, last: part }
                 });
                 entry.count += 1;
@@ -576,11 +575,11 @@ impl Store {
                 confirmed.remove(xid);
             }
         }
-        Ok(order.into_iter().map(|file| gained[&file]).collect())
+        Ok(order.into_iter().map(|(at, file)| (at, gained[&file])).collect())
     }
 
-    /// The caller saw PostgreSQL commit `xid`: its rows stay and stop waiting.
-    pub(crate) fn confirm(&self, xid: &str) -> Result<()> {
+    /// The caller saw PostgreSQL commit `xid`: its rows here stay and stop waiting.
+    fn confirm(&self, xid: &str) -> Result<()> {
         let mut conn = self.lock()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         Self::committed(&tx, xid)?;
@@ -597,9 +596,9 @@ impl Store {
         Ok(())
     }
 
-    /// The save under `xid` deleted these releases from the catalogue. Their
+    /// The save under `xid` deleted these releases, all of this file, from the catalogue. Their
     /// articles are dropped when it commits and kept if it rolls back.
-    pub(crate) fn retract(&self, xid: &str, releases: &[i64]) -> Result<()> {
+    fn retract(&self, xid: &str, releases: &[i64]) -> Result<()> {
         ensure!(self.writer, "the local article store is open for reading only");
         let mut conn = self.lock()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -609,86 +608,30 @@ impl Store {
         Ok(tx.commit()?)
     }
 
-    /// Whether any save is still waiting to hear how its transaction ended.
-    pub(crate) fn has_unsettled(&self) -> Result<bool> {
-        self.has_unsettled_besides(None, None)
-    }
-
-    /// Transaction `xid` of this process is saving, having taken the locks of `groups` so far: until `end`, settling
-    /// takes it for running without asking, except under one of those groups' locks. Call only while its transaction
-    /// is open as far as this process knows (before its commit is sent or its rollback), and `end` before either.
-    pub(crate) fn begin(&self, xid: &str, groups: &[String]) {
-        let mut running = self.running.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        running.entry(xid.to_owned()).or_default().extend(groups.iter().cloned());
-    }
-
-    /// Transaction `xid`, saving, took `group`'s lock.
-    pub(crate) fn locked(&self, xid: &str, group: &str) {
-        let mut running = self.running.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(groups) = running.get_mut(xid) {
-            groups.insert(group.to_owned());
-        }
-    }
-
-    pub(crate) fn end(&self, xid: &str) {
-        self.running.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(xid);
-    }
-
-    /// Whether settling may take `xid` for running without asking: it is saving in this process, and didnt take the
-    /// lock of `under`, the group whose lock the settling transaction holds (an `xid` that did has ended since).
-    fn skips(&self, xid: &str, under: Option<&str>) -> bool {
-        if self.confirmed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(xid) {
-            return true;
-        }
-        let running = self.running.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        running.get(xid).is_some_and(|groups| under.is_none_or(|group| !groups.contains(group)))
-    }
-
-    /// The caller saw PostgreSQL commit `xid`: as `confirm`, marked in the next `add`'s transaction instead of one of
-    /// its own. Lost if the process ends first, then asked about as any unsettled transaction is.
-    pub(crate) fn confirm_later(&self, xid: &str) {
-        self.confirmed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(xid.to_owned());
-    }
-
-    /// The transactions with rows waiting, but those `skips` lets be.
-    fn waiting(&self, under: Option<&str>) -> Result<Vec<String>> {
+    /// The transactions with rows or retractions waiting in this file, but those seen to commit here
+    /// (`confirmed`): the caller leaves out the ones still running.
+    fn unsettled(&self) -> Result<Vec<String>> {
         let xids: Vec<String> = self.read(|conn| {
             let mut list = conn.prepare_cached("select xid from unsettled union select xid from retracted")?;
             Ok(list.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?)
         })?;
-        Ok(xids.into_iter().filter(|xid| !self.skips(xid, under)).collect())
+        let confirmed = self.confirmed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(xids.into_iter().filter(|xid| !confirmed.contains(xid)).collect())
     }
 
-    /// Ask `ended` about every transaction with rows still waiting. Rows of a
-    /// committed one stay; rows of a rolled-back one are taken out again.
-    pub(crate) fn settle(&self, ended: impl FnMut(&str) -> Result<Ended>) -> Result<()> {
-        self.settle_under(None, ended)
-    }
-
-    /// `settle`, by a transaction holding the lock of group `under`: a save of this process that took it is asked
-    /// about too, though it hasnt said it ended.
-    pub(crate) fn settle_under(&self, under: Option<&str>, mut ended: impl FnMut(&str) -> Result<Ended>) -> Result<()> {
-        ensure!(self.writer, "the local article store is open for reading only");
-        let xids = self.waiting(under)?;
-        // PostgreSQL is asked with the store unlocked, so readers are not kept waiting on it.
-        let mut answers = Vec::with_capacity(xids.len());
-        for xid in xids {
-            let how = ended(&xid)?;
-            if how != Ended::Running {
-                answers.push((xid, how));
-            }
-        }
-        // nothing ended: the write connection, which every save waits for, isnt taken
+    /// Settle in this file the transactions PostgreSQL said ended: rows of a committed one stay; rows of a rolled-back
+    /// one are taken out again. One write transaction each.
+    fn settle(&self, answers: &[(String, Ended)]) -> Result<()> {
         if answers.is_empty() {
             return Ok(());
         }
         let mut conn = self.lock()?;
         for (xid, how) in answers {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            if how == Ended::RolledBack {
+            if *how == Ended::RolledBack {
                 let blobs: Vec<Vec<u8>> = {
                     let mut list = tx.prepare("select keys from unsettled where xid = ?1 order by op")?;
-                    list.query_map([&xid], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?
+                    list.query_map([xid], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?
                 };
                 let mut segment = tx.prepare_cached("delete from segments where release_id = ?1 and message_id = ?2")?;
                 let mut envelope = tx.prepare_cached("delete from envelopes where release_id = ?1 and message_id = ?2")?;
@@ -701,29 +644,19 @@ impl Store {
                     }
                 }
                 drop((segment, envelope, unmark));
-                tx.execute("delete from retracted where xid = ?1", [&xid])?;
-                tx.execute("delete from unsettled where xid = ?1", [&xid])?;
+                tx.execute("delete from retracted where xid = ?1", [xid])?;
+                tx.execute("delete from unsettled where xid = ?1", [xid])?;
             } else {
-                Self::committed(&tx, &xid)?;
+                Self::committed(&tx, xid)?;
             }
             tx.commit()?;
         }
         Ok(())
     }
 
-    /// Whether a save other than `own` is still waiting to hear how its transaction ended.
-    /// (`under`: the group whose lock the asking transaction holds, see `settle_under`.)
-    pub(crate) fn has_unsettled_besides(&self, own: Option<&str>, under: Option<&str>) -> Result<bool> {
-        Ok(self.waiting(under)?.iter().any(|xid| Some(xid.as_str()) != own))
-    }
-
-    pub(crate) fn is_writer(&self) -> bool {
-        self.writer
-    }
-
-    /// Bulk load rows that PostgreSQL already counted, as the one-time move of
-    /// an existing catalogue does. Rows the store already has are skipped.
-    pub(crate) fn import(&self, rows: &[NewRow<'_>]) -> Result<u64> {
+    /// Bulk load rows that PostgreSQL already counted, every one of a release of this file (see `Store::import`).
+    /// Rows the file already has are skipped.
+    fn import(&self, rows: &[&NewRow<'_>]) -> Result<u64> {
         ensure!(self.writer, "the local article store is open for reading only");
         let mut conn = self.lock()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -856,11 +789,11 @@ impl Store {
         Ok(())
     }
 
-    pub(crate) fn meta(&self, key: &str) -> Result<Option<String>> {
+    fn meta(&self, key: &str) -> Result<Option<String>> {
         Ok(self.lock()?.query_row("select value from meta where key = ?1", [key], |row| row.get(0)).optional()?)
     }
 
-    pub(crate) fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+    fn set_meta(&self, key: &str, value: &str) -> Result<()> {
         ensure!(self.writer, "the local article store is open for reading only");
         self.lock()?.execute(
             "insert into meta (key, value) values (?1, ?2) on conflict (key) do update set value = excluded.value",
@@ -871,7 +804,7 @@ impl Store {
 
     /// A fixture's `delete from segments where release_id = ..`.
     #[cfg(test)]
-    pub(crate) fn forget_releases(&self, releases: &[i64]) -> Result<u64> {
+    fn forget_releases(&self, releases: &[i64]) -> Result<u64> {
         let conn = self.lock()?;
         let mut gone = 0;
         for release in releases {
@@ -913,7 +846,7 @@ pub(crate) fn message_key(message_id: &[u8]) -> [u8; 32] {
     Sha256::digest(message_id).into()
 }
 
-fn encode_keys(rows: &[NewRow<'_>]) -> Result<Vec<u8>> {
+fn encode_keys(rows: &[&NewRow<'_>]) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(rows.iter().map(|row| 12 + row.message_id.len()).sum());
     for row in rows {
         out.extend_from_slice(&row.release_id.to_le_bytes());
@@ -981,7 +914,7 @@ pub(crate) fn of(client: &mut impl postgres::GenericClient) -> Result<Option<Arc
     let Some(store) = schema.and_then(|schema| of_schema(&schema)) else { return Ok(None) };
     // A save PostgreSQL rolled back must not be read as stored. The writer
     // confirms a commit it saw, so this finds something only after a failure.
-    if store.writer && store.has_unsettled()? {
+    if store.is_writer() && store.has_unsettled()? {
         store.settle(|xid| pg_ended(client, xid))?;
     }
     Ok(Some(store))

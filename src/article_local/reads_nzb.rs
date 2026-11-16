@@ -40,21 +40,21 @@ fn fill(
 impl Store {
     /// Whether a release has any article.
     pub(crate) fn nzb_release_has_articles(&self, release: i64) -> Result<bool> {
-        let conn = self.lock()?;
+        let conn = self.on(release).lock()?;
         let mut read = conn.prepare_cached("select exists(select 1 from segments where release_id = ?1)")?;
         Ok(read.query_row(params![release], |row| row.get(0))?)
     }
 
     /// How many articles of a release one file holds.
     pub(crate) fn nzb_file_articles(&self, release: i64, file: i64) -> Result<i64> {
-        let conn = self.lock()?;
+        let conn = self.on(release).lock()?;
         let mut read = conn.prepare_cached("select count(*) from segments where file_id = ?1 and release_id = ?2")?;
         Ok(read.query_row(params![file, release], |row| row.get(0))?)
     }
 
     /// How many articles of a release one file holds, and the bytes they add up to.
     pub(crate) fn nzb_file_totals(&self, release: i64, file: i64) -> Result<(i64, i64)> {
-        let conn = self.lock()?;
+        let conn = self.on(release).lock()?;
         let mut read = conn.prepare_cached(
             "select count(*), coalesce(sum(bytes), 0) from segments where file_id = ?1 and release_id = ?2",
         )?;
@@ -73,7 +73,7 @@ impl Store {
         limit: usize,
         max_bytes: usize,
     ) -> Result<Vec<Segment>> {
-        let conn = self.lock()?;
+        let conn = self.on(release).lock()?;
         let limit = limit.max(1);
         let mut out = Vec::new();
         let mut held = 0;
@@ -123,7 +123,7 @@ impl Store {
 
     /// The sizes of the envelope kept for a nameless article, if one was kept.
     pub(crate) fn nzb_envelope_extent(&self, release: i64, message_id: &[u8]) -> Result<Option<EnvelopeExtent>> {
-        let conn = self.lock()?;
+        let conn = self.on(release).lock()?;
         let mut read = conn.prepare_cached(
             "select expected, length(subject), length(poster), nzb_timestamp
              from envelopes where release_id = ?1 and message_id = ?2",
@@ -149,7 +149,7 @@ impl Store {
         at: i64,
         count: i64,
     ) -> Result<Option<Vec<u8>>> {
-        let conn = self.lock()?;
+        let conn = self.on(release).lock()?;
         let mut read = conn.prepare_cached(if subject {
             "select substr(subject, ?3, ?4) from envelopes where release_id = ?1 and message_id = ?2"
         } else {
@@ -161,7 +161,7 @@ impl Store {
     /// Give an article another message id, as a test's fixture SQL did in PostgreSQL.
     #[cfg(test)]
     pub(crate) fn test_rewrite_message_id(&self, release: i64, from: &[u8], to: &[u8]) -> Result<usize> {
-        let conn = self.lock()?;
+        let conn = self.on(release).lock()?;
         conn.execute(
             "update envelopes set message_id = ?3 where release_id = ?1 and message_id = ?2",
             params![release, from, to],
@@ -175,13 +175,17 @@ impl Store {
     /// Drop one article's envelope and leave the article.
     #[cfg(test)]
     pub(crate) fn test_forget_envelope(&self, release: i64, message_id: &[u8]) -> Result<usize> {
-        let conn = self.lock()?;
+        let conn = self.on(release).lock()?;
         Ok(conn.execute("delete from envelopes where release_id = ?1 and message_id = ?2", params![release, message_id])?)
     }
 
     #[cfg(test)]
     pub(crate) fn test_envelope_count(&self) -> Result<i64> {
-        Ok(self.lock()?.query_row("select count(*) from envelopes", [], |row| row.get(0))?)
+        let mut count = 0;
+        for shard in self.shards() {
+            count += shard.lock()?.query_row("select count(*) from envelopes", [], |row| row.get::<_, i64>(0))?;
+        }
+        Ok(count)
     }
 }
 
