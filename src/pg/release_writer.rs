@@ -607,7 +607,7 @@ fn flush_local(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], no
     tx.execute("update releases set native_work_revision = native_work_revision + 1 where id = any($1)", &[&changed])?;
     // A file's first proof of UTC needs every article it has to be in this batch.
     let present: Vec<i64> =
-        files.iter().zip(&file_ids).map(|(f, &id)| local.store.file_count(id, f.articles + 1)).collect::<Result<_>>()?;
+        local.store.file_counts(&files.iter().zip(&file_ids).map(|(f, &id)| (id, f.articles + 1)).collect::<Vec<_>>())?;
     timing::write_local(tx, parts, &file_ids, &present)?;
     let (ids, counts, firsts, lasts): (Vec<i64>, Vec<i64>, Vec<i64>, Vec<i64>) =
         gained.iter().fold(Default::default(), |mut all: (Vec<i64>, Vec<i64>, Vec<i64>, Vec<i64>), parts| {

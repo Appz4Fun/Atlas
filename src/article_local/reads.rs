@@ -46,10 +46,19 @@ impl Store {
 
     /// How many articles a file has, counting no further than `cap`.
     pub(crate) fn file_count(&self, file: i64, cap: i64) -> Result<i64> {
-        let conn = self.lock()?;
-        let mut read =
-            conn.prepare_cached("select count(*) from (select 1 from segments where file_id = ?1 limit ?2)")?;
-        Ok(read.query_row(params![file, cap], |row| row.get(0))?)
+        Ok(self.file_counts(&[(file, cap)])?[0])
+    }
+
+    /// `file_count` of each `(file, cap)`, on one read connection.
+    pub(crate) fn file_counts(&self, files: &[(i64, i64)]) -> Result<Vec<i64>> {
+        if files.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.read(|conn| {
+            let mut read =
+                conn.prepare_cached("select count(*) from (select 1 from segments where file_id = ?1 limit ?2)")?;
+            files.iter().map(|&(file, cap)| Ok(read.query_row(params![file, cap], |row| row.get(0))?)).collect()
+        })
     }
 
     pub(crate) fn get(&self, release: i64, message_id: &[u8]) -> Result<Option<Segment>> {
