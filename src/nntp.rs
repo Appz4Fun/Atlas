@@ -2565,7 +2565,7 @@ impl Pool {
 
     /// whether server `i` is short of connections: more requests waiting for one than a tenth of its limit (two at
     /// least), soo a group the best server can't serve now goes to the next
-    fn saturated(&self, i: usize) -> bool {
+    pub fn saturated(&self, i: usize) -> bool {
         let s = &self.servers[i];
         s.waiting.load(Ordering::Relaxed) > (s.limit.load(Ordering::Relaxed) / 10).max(2)
     }
@@ -2745,6 +2745,7 @@ impl Pool {
     pub fn connections(&self, i: usize) -> usize {
         self.servers.get(i).map(|s| s.limit.load(Ordering::Relaxed)).unwrap_or(1)
     }
+
 
     fn is_down(&self, i: usize) -> bool {
         self.servers[i].down_until.lock().unwrap().is_some_and(|t| Instant::now() < t)

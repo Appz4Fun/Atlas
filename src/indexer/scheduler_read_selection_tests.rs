@@ -110,7 +110,7 @@ impl Fixture {
             jobs.push(thread::spawn(move || {
                 tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async move {
                     match case {
-                        0 => assert_eq!(goes_back_furthest(&ctx, &db, CACHED, 0, (10, true)).await?, (true, Some(100))),
+                        0 => assert_eq!(goes_back_furthest(&ctx, &db, CACHED, 0, (10, true)).await?, (true, Some(100), false)),
                         1 => reach_back(&ctx, &db, EMPTY, 0, (1, 10)).await?,
                         2 => assert!(maybe_split(&ctx, &PassSettings::default(), &db, SPLIT, 0, (1, 10), 5).await?),
                         3 => assert!(!sweep_due(&ctx, &db, SPLIT, &ctx.pool.host(0)).await?),
