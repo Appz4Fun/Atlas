@@ -680,15 +680,21 @@ impl Shard {
                         sp.commit()?;
                         answers.push(Ok(()));
                     }
-                    Err(error) => {
+                    // a duplicate is this save's own failure; any other error (full disk, I/O, memory) may have rolled
+                    // the whole transaction back, leaving the rest to run outside one: the batch fails whole
+                    Err(error) if is_constraint(&error) && !sp.is_autocommit() => {
                         drop(sp); // rolls the savepoint back
                         answers.push(Err(format!("{error:#}")));
                     }
+                    Err(error) => return Err(error),
                 }
-            } else if Self::write_one(&tx, pending).is_err() {
-                return Ok(None); // dropping `tx` rolls it back
             } else {
-                answers.push(Ok(()));
+                match Self::write_one(&tx, pending) {
+                    Ok(()) => answers.push(Ok(())),
+                    // a duplicate: tried again a save at a time, so only its save fails (dropping `tx` rolls it back)
+                    Err(error) if is_constraint(&error) => return Ok(None),
+                    Err(error) => return Err(error),
+                }
             }
         }
         tx.commit()?;
@@ -696,6 +702,7 @@ impl Shard {
     }
 
     /// One save's rows, and its keys in `unsettled` under its own `xid`.
+    /// (See `is_constraint`: only a constraint error is a single save's own failure.)
     fn write_one(conn: &Connection, pending: &Pending) -> Result<()> {
         let mut insert =
             conn.prepare_cached("insert into segments (release_id, message_id, file_id, part, bytes) values (?1, ?2, ?3, ?4, ?5)")?;
@@ -976,6 +983,14 @@ impl Shard {
         }
         Ok(gone)
     }
+}
+
+/// Whether `error` is SQLite refusing a row for a constraint (a duplicate key): the one error a save in a group commit
+/// fails alone for. Any other leaves the whole group failed.
+fn is_constraint(error: &anyhow::Error) -> bool {
+    error.chain().any(|source| {
+        matches!(source.downcast_ref::<rusqlite::Error>(), Some(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::ConstraintViolation)
+    })
 }
 
 /// An article's key in `seen`: the first 8 bytes of its message key. Two message ids of one release sharing it (about
