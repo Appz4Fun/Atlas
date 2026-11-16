@@ -21,9 +21,11 @@ impl Default for PgWriteLimits {
     /// on prod a save did ~10 ms of work after ~120 ms of waiting, fetched headers filled the unsaved budget, and
     /// ingest stayed near 40k articles a second. Eight jobs of up to 32 MiB (256 MiB pending) kept it supplied; with
     /// helper writers saving side by side (`Helpers`, one session per job) sixteen at once, 512 MiB pending: at eight
-    /// prod's saves waited ~0.7 s each for a slot at ~270k articles a second.
+    /// prod's saves waited ~0.7 s each for a slot at ~270k articles a second. Since the local store takes saves of
+    /// different releases in parallel (shards, group commit), thirty-two at once, 1 GiB pending: on prod sixteen held
+    /// the unsaved budget full with PostgreSQL nearly idle, each save mostly waiting on its own ~20 round trips.
     fn default() -> Self {
-        Self { max_pending_bytes: 512 * 1024 * 1024, max_job_bytes: 32 * 1024 * 1024, concurrent_saves: 16 }
+        Self { max_pending_bytes: 1024 * 1024 * 1024, max_job_bytes: 32 * 1024 * 1024, concurrent_saves: 32 }
     }
 }
 
@@ -241,7 +243,7 @@ fn drain(handle: tokio::runtime::Handle, slots: Arc<Semaphore>, helpers: Arc<Hel
 
 /// The most helper writer sessions a runtime opens (`config.native_helper_writers`): no more save jobs run at once
 /// (`PgWriteLimits::concurrent_saves`).
-pub(crate) const HELPER_WRITERS_MOST: usize = 16;
+pub(crate) const HELPER_WRITERS_MOST: usize = 32;
 
 /// Times a helper's save is tried again after PostgreSQL broke a deadlock or a serialization conflict with it: saves
 /// of different groups and the owner's own work now run side by side, and either one can be the one picked.
