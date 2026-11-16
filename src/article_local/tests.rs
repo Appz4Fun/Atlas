@@ -115,3 +115,17 @@ fn a_big_has_split_over_connections_answers_in_the_order_asked() {
         assert_eq!(*known, n % 3 == 0, "article {n}");
     }
 }
+
+#[test]
+fn a_commit_confirmed_later_is_not_asked_about_and_is_marked_by_the_next_add() {
+    let (_dir, store) = store();
+    store.add("7", &[row(1, 7, b"<a>", Some(1))], 100).unwrap();
+    store.confirm_later("7");
+    assert!(!store.has_unsettled().unwrap(), "a commit seen here is not asked about");
+    store.add("8", &[row(2, 8, b"<b>", Some(1))], 100).unwrap();
+    // the add marked 7; 8 still waits
+    let mut asked = Vec::new();
+    store.settle(|xid| { asked.push(xid.to_owned()); Ok(Ended::Committed) }).unwrap();
+    assert_eq!(asked, vec!["8".to_string()]);
+    assert_eq!(store.has(&[(1, b"<a>"), (2, b"<b>")]).unwrap(), vec![true, true]);
+}

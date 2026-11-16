@@ -103,7 +103,7 @@ pub fn save(client: &mut Client, releases: &[Release], now: i64) -> Result<SaveS
     // A commit seen here needs no question later; one that failed is asked about.
     // The save stands either way: one left unconfirmed is asked about later.
     if let Some(Local { store, xid: Some(xid), .. }) = &local {
-        let _ = store.confirm(xid);
+        store.confirm_later(xid);
     }
     Ok(stats)
 }

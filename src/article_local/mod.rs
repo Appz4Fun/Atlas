@@ -100,6 +100,11 @@ pub(crate) struct Store {
     /// writers saving side by side every save found the others' rows waiting and asked PostgreSQL about each, holding
     /// the store meanwhile.
     running: Mutex<HashMap<String, HashSet<String>>>,
+    /// Transactions of this process seen to commit (`confirm_later`) whose rows still wait in `unsettled`: settling
+    /// takes them for committed without asking, and the next save's `add` marks them in its own transaction. Each save
+    /// confirmed in a write transaction of its own, queued for the one writer behind every helper's insert, and every
+    /// other save asked PostgreSQL about it meanwhile.
+    confirmed: Mutex<HashSet<String>>,
 }
 
 /// Copies the WAL back into a writer store's file in the background, on a connection of its own, so the writer's
@@ -268,6 +273,7 @@ impl Store {
             path,
             writer: true,
             running: Mutex::new(HashMap::new()),
+            confirmed: Mutex::new(HashSet::new()),
             readers: Mutex::new(Vec::new()),
         })
     }
@@ -288,6 +294,7 @@ impl Store {
             path,
             writer: false,
             running: Mutex::new(HashMap::new()),
+            confirmed: Mutex::new(HashSet::new()),
             readers: Mutex::new(Vec::new()),
         })
     }
@@ -417,6 +424,12 @@ impl Store {
         }
         let mut conn = self.lock()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // commits seen since the last add, marked here (`confirm_later`); should this transaction roll back they are
+        // left waiting, and asked about as any unsettled transaction is
+        let seen: Vec<String> = self.confirmed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().cloned().collect();
+        for xid in &seen {
+            Self::committed(&tx, xid)?;
+        }
         let mut gained = HashMap::<i64, NewParts>::new();
         let mut order = Vec::new();
         {
@@ -463,6 +476,12 @@ impl Store {
             tx.execute("insert into unsettled (xid, keys) values (?1, ?2)", params![xid, encode_keys(rows)?])?;
         }
         tx.commit()?;
+        {
+            let mut confirmed = self.confirmed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            for xid in &seen {
+                confirmed.remove(xid);
+            }
+        }
         Ok(order.into_iter().map(|file| gained[&file]).collect())
     }
 
@@ -523,8 +542,17 @@ impl Store {
     /// Whether settling may take `xid` for running without asking: it is saving in this process, and didnt take the
     /// lock of `under`, the group whose lock the settling transaction holds (an `xid` that did has ended since).
     fn skips(&self, xid: &str, under: Option<&str>) -> bool {
+        if self.confirmed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(xid) {
+            return true;
+        }
         let running = self.running.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         running.get(xid).is_some_and(|groups| under.is_none_or(|group| !groups.contains(group)))
+    }
+
+    /// The caller saw PostgreSQL commit `xid`: as `confirm`, marked in the next `add`'s transaction instead of one of
+    /// its own. Lost if the process ends first, then asked about as any unsettled transaction is.
+    pub(crate) fn confirm_later(&self, xid: &str) {
+        self.confirmed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(xid.to_owned());
     }
 
     /// The transactions with rows waiting, but those `skips` lets be.
