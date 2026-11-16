@@ -85,6 +85,10 @@ pub(crate) enum Ended {
 }
 
 pub(crate) struct Store {
+    /// Read connections of a writer's store (`read`): in WAL mode they dont wait for the writer, and the writer's
+    /// saves asked which articles a release had through the one connection their inserts held, side by side with
+    /// every helper writer's. Declared before `conn`, so they close first and the writer's close checkpoints the WAL.
+    readers: Mutex<Vec<Connection>>,
     conn: Mutex<Connection>,
     path: PathBuf,
     writer: bool,
@@ -94,10 +98,6 @@ pub(crate) struct Store {
     /// writers saving side by side every save found the others' rows waiting and asked PostgreSQL about each, holding
     /// the store meanwhile.
     running: Mutex<HashMap<String, HashSet<String>>>,
-    /// Read connections of a writer's store (`read`): in WAL mode they dont wait for the writer, and the writer's
-    /// saves asked which articles a release had through the one connection their inserts held, side by side with
-    /// every helper writer's.
-    readers: Mutex<Vec<Connection>>,
 }
 
 /// Read connections a writer's store keeps open when idle (`Store::read`).
@@ -229,7 +229,16 @@ impl Store {
                 conn
             }
         };
-        let out = f(&conn);
+        // one read transaction for the whole call: a new read after another connection's commit throws this
+        // connection's page cache away, and helper writers commit all the time
+        let out = match conn.unchecked_transaction() {
+            Ok(tx) => {
+                let out = f(&tx);
+                let _ = tx.finish();
+                out
+            }
+            Err(error) => Err(error.into()),
+        };
         let mut idle = self.readers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if idle.len() < READERS_KEPT {
             idle.push(conn);
