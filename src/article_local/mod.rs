@@ -214,10 +214,11 @@ const READERS_KEPT: usize = 128;
 const HAS_ALONE: usize = 256;
 const HAS_SPLIT: usize = 8;
 
-/// The write connections' page caches: 2 GiB for `articles.db`, whose existing releases keep most of the writes for a
-/// while after the split, 256 MiB for each of the shards (all of them together within the indexer guard's memory).
-pub(super) const HOME_CACHE_KIB: i64 = 2_097_152;
-pub(super) const SHARD_CACHE_KIB: i64 = 262_144;
+/// The write connections' page caches: 512 MiB for `articles.db`, 64 MiB for each shard. #469's 2 GiB (and 256 MiB per
+/// shard) brought no measured gain, and with the readers and the unsaved headers took the indexer past its guard's
+/// 8 GiB on prod after ~16 minutes; the OS page cache serves the same pages.
+pub(super) const HOME_CACHE_KIB: i64 = 524_288;
+pub(super) const SHARD_CACHE_KIB: i64 = 65_536;
 
 const SCHEMA: &str = "
     create table if not exists meta (key text primary key, value text not null) without rowid;
