@@ -3567,13 +3567,14 @@ impl Pool {
         let end = number.saturating_add(look - 1);
         // A dense span is longer than a listing is read (`DATE_ROWS`), and a listing cut short costs its connection: on
         // prod day searches reconnected about once per probe. Its first `DATE_SCAN_MAX` numbers are always read whole
-        // and hold its first article unless they are a gap, which only then is stepped over at once.
+        // and hold its first article unless they hold no dated one, which only then are stepped over at once.
         if end - number >= DATE_SCAN_MAX {
             let window = self.ends(i, group, number, number + DATE_SCAN_MAX - 1).await?;
             if window.first.is_some() {
                 return Ok(window.first);
             }
-            if window.rows == 0 {
+            // read whole with no dated article (a gap, or undated rows): the rest of the span, past it
+            if window.whole {
                 return self.posted_at_wide(i, group, number + DATE_SCAN_MAX, end).await;
             }
         }
