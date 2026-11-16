@@ -100,3 +100,62 @@ fn concurrent_saves_of_one_group_are_merged_and_all_land() {
     assert_eq!(saved, jobs as i64, "every job of the group landed");
     runtime.owner.close();
 }
+
+#[test]
+#[ignore = "requires isolated PostgreSQL"]
+fn big_jobs_of_one_group_save_by_shard_side_by_side_without_lock_timeouts() {
+    let schema = super::testing::Schema::new().expect("explicit isolated PostgreSQL");
+    let runtime = super::stage_queue_tests::runtime(&schema);
+    let epoch = *runtime.owner.epoch().expect("owner epoch").id();
+    let native = super::ingest::Native::with_owner(runtime.owner.clone(), super::ingest::PgWriteLimits::default())
+        .unwrap()
+        .with_helpers(helpers(&schema, &epoch).of(runtime.owner.clone()));
+    let big = |job: usize| -> Vec<Release> {
+        (0..300)
+            .map(|n| {
+                let mut release = release(&format!("Big.{job}.{n}"), &format!("<big-{job}-{n}-0@example.test>"));
+                release.articles = (0..8)
+                    .map(|part| Article {
+                        filename: Some(format!("Big.{job}.{n}.rar")),
+                        message_id: format!("<big-{job}-{n}-{part}@example.test>"),
+                        subject: format!("Big.{job}.{n}.rar yEnc ({}/8)", part + 1),
+                        part: Some(part + 1),
+                        total_parts: Some(8),
+                        bytes: 1000,
+                        ..Article::default()
+                    })
+                    .collect();
+                release
+            })
+            .collect()
+    };
+    let jobs = 8;
+    tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap().block_on(async {
+        let saves: Vec<_> = (0..jobs)
+            .map(|job| {
+                let (native, releases) = (native.clone(), big(job));
+                tokio::spawn(async move { native.save(releases).await })
+            })
+            .collect();
+        for save in saves {
+            save.await.unwrap().expect("every shard save of the group succeeds, no lock wait runs out");
+        }
+    });
+    runtime
+        .owner
+        .with(|client| {
+            let saved: i64 = client.query_one("select count(*) from releases where name like 'Big.%'", &[])?.get(0);
+            assert_eq!(saved, (jobs * 300) as i64);
+            let kept: i64 = client
+                .query_one("select coalesce(sum(total),0)::bigint from native_metric_catalog_groups where group_name='alt.binaries.helpers'", &[])?
+                .get(0);
+            let shards: i64 = client
+                .query_one("select count(*) from native_metric_catalog_groups where group_name='alt.binaries.helpers'", &[])?
+                .get(0);
+            assert_eq!(kept, saved, "the group's shards sum to its releases");
+            assert!(shards > 1, "kept per shard");
+            Ok(())
+        })
+        .unwrap();
+    runtime.owner.close();
+}

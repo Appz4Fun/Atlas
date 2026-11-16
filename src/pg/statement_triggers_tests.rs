@@ -7,8 +7,9 @@ const RECOUNT: &str = "select group_name,count(*)::bigint,sum(greatest(size,0)):
     sum((is_obfuscated and display_name is null)::int)::bigint,
     sum((exists(select 1 from predb_match p where p.release_id=r.id))::int)::bigint
     from releases r group by group_name order by group_name";
-const KEPT: &str = "select group_name,total,bytes,complete,nzb_ready,named,still_obfuscated,predb_matched
-    from native_metric_catalog_groups order by group_name";
+const KEPT: &str = "select group_name,sum(total)::bigint,sum(bytes)::bigint,sum(complete)::bigint,sum(nzb_ready)::bigint,
+    sum(named)::bigint,sum(still_obfuscated)::bigint,sum(predb_matched)::bigint
+    from native_metric_catalog_groups group by group_name order by group_name";
 
 fn rows(client: &mut postgres::Client, sql: &str) -> Result<Vec<(String, Vec<i64>)>> {
     Ok(client

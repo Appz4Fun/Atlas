@@ -101,6 +101,9 @@ const MERGE_JOBS: usize = 8;
 const MERGE_BYTES: usize = 64 << 20;
 const DRAIN_ROUNDS: usize = 4;
 
+/// Articles from which a job is split by shard (`by_part`).
+const SPLIT_ARTICLES: usize = 2000;
+
 /// Run `futures` side by side, their outputs in their order.
 async fn join_all<F: std::future::Future>(futures: Vec<F>) -> Vec<F::Output> {
     let mut futures: Vec<_> = futures.into_iter().map(Box::pin).collect();
@@ -124,9 +127,16 @@ async fn join_all<F: std::future::Future>(futures: Vec<F>) -> Vec<F::Output> {
 /// `releases` by the shard of its group each is saved under (`release_writer::shard`), keyed `group#shard` as the
 /// writer's lock is: the parts of one job save side by side, each after the running save of its shard.
 fn by_part(releases: Vec<Release>) -> Vec<(String, Vec<Release>)> {
+    // a small job is one transaction, queued by its group: split, each part pays a transaction of its own
+    let articles: usize = releases.iter().map(|r| r.articles.len()).sum();
+    let split = articles >= SPLIT_ARTICLES;
     let mut parts = HashMap::<String, Vec<Release>>::new();
     for release in releases {
-        let key = format!("{}#{}", release.group, super::release_writer::shard(&release));
+        let key = if split {
+            format!("{}#{}", release.group, super::release_writer::shard(&release))
+        } else {
+            release.group.clone()
+        };
         parts.entry(key).or_default().push(release);
     }
     let mut parts: Vec<_> = parts.into_iter().collect();
@@ -175,9 +185,13 @@ fn next_batch(queues: &Queues, group: &str) -> Vec<Waiting> {
 /// again job by job, so one job's bad data fails only that job.
 fn save_batch(helpers: &Helpers, mut batch: Vec<Waiting>) {
     let now = batch[0].now;
-    let releases: Vec<Release> = batch.iter().flat_map(|w| w.releases.iter().cloned()).collect();
-    let outcome = helpers.save(&releases, now);
-    drop(releases);
+    // one job saves its own releases; only a merged batch is gathered into one list
+    let outcome = if batch.len() == 1 {
+        helpers.save(&batch[0].releases, now)
+    } else {
+        let releases: Vec<Release> = batch.iter().flat_map(|w| w.releases.iter().cloned()).collect();
+        helpers.save(&releases, now)
+    };
     match outcome {
         Err(error) if batch.len() > 1 && !super::outage::is_attempt_ended(&error) => {
             for waiting in batch.drain(..) {
@@ -541,10 +555,16 @@ impl Native {
             };
             saves.push(self.save_coalesced(helpers.clone(), key, releases, bytes, share, logical_now));
         }
+        // a part that failed for itself says more than one whose attempt ended
+        let mut ended = None;
         for outcome in join_all(saves).await {
-            outcome?;
+            match outcome {
+                Err(error) if super::outage::is_attempt_ended(&error) => ended = ended.or(Some(error)),
+                Err(error) => return Err(error),
+                Ok(()) => {}
+            }
         }
-        Ok(())
+        ended.map_or(Ok(()), Err)
     }
 
     /// Save `releases` of `group` on the helpers, after the group's running save if there is one: a job arriving while
