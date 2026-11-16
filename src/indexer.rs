@@ -513,6 +513,7 @@ mod postgres_backend_tests {
                     server: "provider.test".into(),
                     claimed_at: 50,
                     reread: false,
+                    resume: None,
                 };
                 let guard = GiveBackOnDrop { db: &db, chunk: &claim, armed: true };
                 ready.send(()).unwrap();
@@ -1124,7 +1125,7 @@ where
                     let (g, host) = (group.to_string(), ctx.pool.host(server));
                     on_db(db, move |conn| Ok(crate::chunks::set_swept(conn, &g, &host, generation)?)).await?;
                 }
-                let pass = Pass { ctx, settings, db, group, server, key };
+                let pass = Pass { ctx, settings, db, group, server, key, chunk: None };
                 pass.backfill(state, first, last, progress).await
             }
             None => {
@@ -1142,7 +1143,7 @@ where
         return r;
     }
 
-    let pass = Pass { ctx, settings, db, group, server, key };
+    let pass = Pass { ctx, settings, db, group, server, key, chunk: None };
 
     match settings.mode.as_str() {
         "live" => pass.live(state, last, progress).await,
@@ -1544,7 +1545,7 @@ where
     // the cursor backfill's batch, without touching the group's run state:
     // that is the home's
     let start = first.max(cursor - settings.batch_size.max(1) + 1);
-    let pass = Pass { ctx, settings, db, group, server, key: key.clone() };
+    let pass = Pass { ctx, settings, db, group, server, key: key.clone(), chunk: None };
     let ranged = pass.process_range(start, cursor, "SWEEP", progress).await;
     // done down from the cursor: the cursor moves past it, failed or not
     if let Some(high) = ranged.high_done {
@@ -1918,7 +1919,17 @@ where
         return Ok(Progress::default());
     }
 
-    let pass = Pass { ctx, settings, db, group, server, key: cursor_key(&ctx.pool, server, group) };
+    // a read of this day given back part way on this server goes on from where it got to. Not a day only this server
+    // has: whether it holds articles (`finish_chunk`) is judged over the whole day
+    let start = match &chunk.resume {
+        Some((host, at)) if !alone && *host == chunk.server && *at > start as i64 && *at <= end as i64 => {
+            println!("[CHUNK] {group} day {day}: going on from {at}, {} articles in from {start}", *at as u64 - start);
+            *at as u64
+        }
+        _ => start,
+    };
+    let pass =
+        Pass { ctx, settings, db, group, server, key: cursor_key(&ctx.pool, server, group), chunk: Some(chunk) };
     let window = alone.then_some((day * 86_400, (day + 1) * 86_400));
     let ranged = pass.process_range_dated(start as i64, end as i64, "CHUNK", window, progress).await;
     match ranged {
@@ -2084,7 +2095,12 @@ struct Pass<'a> {
     group: &'a str,
     server: usize,
     key: String,
+    /// the day chunk this pass reads, whose resume point it notes as slices are saved (`chunks::note_resume`)
+    chunk: Option<&'a crate::chunks::Claim>,
 }
+
+/// How often a day chunk's pass notes how far it has got, at most.
+const RESUME_NOTE_EVERY: Duration = Duration::from_secs(5);
 
 impl Pass<'_> {
     async fn live<P>(&self, state: db::GroupState, last: i64, progress: &mut P) -> Result<Progress>
@@ -2209,6 +2225,25 @@ impl Pass<'_> {
         }
     }
 
+    /// Notes where the day chunk's read has got to: past what `finished` holds done of `start..=end` from its start,
+    /// when that moved since `noted` and `RESUME_NOTE_EVERY` has passed. Best effort: one not written is written later.
+    async fn note_resume(
+        &self,
+        chunk: &crate::chunks::Claim,
+        finished: &Finished,
+        (start, end): (i64, i64),
+        noted: &mut (Option<u64>, Option<Instant>),
+    ) {
+        let (Some(low), _) = finished.ends(start.max(0) as u64, end.max(0) as u64) else { return };
+        if noted.0 == Some(low) || noted.1.is_some_and(|at| at.elapsed() < RESUME_NOTE_EVERY) {
+            return;
+        }
+        let (c, at) = (chunk.clone(), low as i64 + 1);
+        if on_ingest_progress(self.db, move |conn| Ok(crate::chunks::note_resume(conn, &c, at)?)).await.is_ok() {
+            *noted = (Some(low), Some(Instant::now()));
+        }
+    }
+
     /// `process_range`, also how many articles retrieved are dated within
     /// `window` (unix seconds, from up to before), 0 when there is none.
     async fn process_range_dated<P>(
@@ -2276,9 +2311,13 @@ impl Pass<'_> {
             _ => None,
         };
         let mut moved = None;
+        let mut noted: (Option<u64>, Option<Instant>) = (None, None);
         loop {
             if let Some(side) = side {
                 self.advance(side, &finished, (start, end), &mut moved).await;
+            }
+            if let Some(chunk) = self.chunk {
+                self.note_resume(chunk, &finished, (start, end), &mut noted).await;
             }
             let Some(slice) = rx.recv().await else {
                 let stopped = self.ctx.stop.load(std::sync::atomic::Ordering::Acquire);
@@ -2467,7 +2506,7 @@ pub(crate) async fn reread_range(ctx:&PassContext,settings:&PassSettings,db:&Db,
     }
     // a key no cursor has: the dates this pass finds are noted nowhere
     let key = format!("repair:{group}@{}", ctx.pool.host(server));
-    let pass = Pass { ctx, settings, db, group, server, key };
+    let pass = Pass { ctx, settings, db, group, server, key, chunk: None };
     let mut quiet = no_progress;
     pass.process_range(start as i64, end as i64, "repair", &mut quiet).await.into_result()
 }

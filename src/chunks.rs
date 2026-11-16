@@ -206,6 +206,9 @@ pub struct Claim {
     /// a day read before, put back by `reopen_done`: read whole again, not up to where this server's backfill
     /// cursor has got since (`indexer::chunk_range`)
     pub reread: bool,
+    /// where a read of this day given back part way got to (`note_resume`): the server's host and the first article
+    /// number it hadnt saved
+    pub resume: Option<(String, i64)>,
 }
 
 /// Ask for a day of a group's backfill before the others: one a post found
@@ -546,7 +549,7 @@ fn claim_wanted(db: &dyn Sql, groups: &[(String, i64)], host: &str, now: i64) ->
                     &format!(
                         "update backfill_chunks set state = $1, server = $2, claimed_at = $3
                          where grp = $4 and day = $5 and (state = {PENDING} or (state = {CLAIMED} and claimed_at < $6))
-                         returning grp, day, coalesce(reread, 0)"
+                         returning grp, day, coalesce(reread, 0), resume_host, resume_at"
                     ),
                     vals![CLAIMED, host, now, grp.as_str(), day, stale],
                 )?
@@ -560,7 +563,8 @@ fn claim_wanted(db: &dyn Sql, groups: &[(String, i64)], host: &str, now: i64) ->
         Ok(None)
     })?;
     let Some(r) = row else { return Ok(None) };
-    Ok(Some(Claim { group: r.get(0)?, day: r.get(1)?, server: host.to_string(), claimed_at: now, reread: r.get(2)? }))
+    let resume = r.get::<Option<String>>(3)?.zip(r.get::<Option<i64>>(4)?);
+    Ok(Some(Claim { group: r.get(0)?, day: r.get(1)?, server: host.to_string(), claimed_at: now, reread: r.get(2)?, resume }))
 }
 
 /// The chunk `claim` takes after the days asked for: of each group its newest day pending or with a stale claim, then
@@ -616,7 +620,7 @@ fn claim_ordered(
              order by day {best}, media desc, grp limit 1)
            -- as in `claim_wanted`: still claimable when the update gets to it, and not failed and resting since
            and ((state = {PENDING} and {rested}) or (state = {CLAIMED} and claimed_at < ${stale}))
-         returning grp, day, coalesce(reread, 0)",
+         returning grp, day, coalesce(reread, 0), resume_host, resume_at",
         resting = not_resting(now),
         rested = not_resting_of("", now),
         stale = n + 1,
@@ -640,7 +644,8 @@ fn claim_one(db: &dyn Sql, sql: &str, values: &[crate::pg::sql::Value], host: &s
         Ok(tx.query_uncached(sql, values)?.into_iter().next())
     })?;
     let Some(r) = row else { return Ok(None) };
-    Ok(Some(Claim { group: r.get(0)?, day: r.get(1)?, server: host.to_string(), claimed_at: now, reread: r.get(2)? }))
+    let resume = r.get::<Option<String>>(3)?.zip(r.get::<Option<i64>>(4)?);
+    Ok(Some(Claim { group: r.get(0)?, day: r.get(1)?, server: host.to_string(), claimed_at: now, reread: r.get(2)?, resume }))
 }
 
 /// The first of `rows`; an error past one, which a query here never returns.
@@ -708,7 +713,7 @@ pub fn reopen_done(db: &dyn Sql, since: i64, done_before: Option<i64>, groups: &
         &format!(
             "{staged}
              update backfill_chunks set state = {PENDING}, server = null, claimed_at = null, done_at = null,
-                    failures = null, failed_at = null, reread = 1
+                    failures = null, failed_at = null, reread = 1, resume_host = null, resume_at = null
              where {reopens}",
             staged = staged(groups),
             reopens = reopens(),
@@ -743,12 +748,25 @@ pub fn done_since(db: &dyn Sql, since: i64, done_before: Option<i64>, groups: &[
     Ok((chunks, over, untracked))
 }
 
+/// Note that the read of `claim` has saved every article number from its start below `at`, on its server: read from
+/// there when that server claims the day again (`Claim::resume`). False when the claim was taken over.
+pub fn note_resume(db: &dyn Sql, claim: &Claim, at: i64) -> Result<bool> {
+    let n = db.execute(
+        &format!(
+            "update backfill_chunks set resume_host = $1, resume_at = $2
+             where grp = $3 and day = $4 and state = {CLAIMED} and server = $1 and claimed_at = $5"
+        ),
+        vals![&claim.server, at, &claim.group, claim.day, claim.claimed_at],
+    )?;
+    Ok(n > 0)
+}
+
 /// Mark a claimed chunk as done at `now`. False when the claim was taken over.
 pub fn finish(db: &dyn Sql, claim: &Claim, now: i64) -> Result<bool> {
     db.tx(|tx| {
         let n = tx.execute(
             &format!(
-                "update backfill_chunks set state = $1, done_at = $2
+                "update backfill_chunks set state = $1, done_at = $2, resume_host = null, resume_at = null
                  where grp = $3 and day = $4 and state = {CLAIMED} and server = $5 and claimed_at = $6"
             ),
             vals![DONE, now, &claim.group, claim.day, &claim.server, claim.claimed_at],
@@ -1098,7 +1116,7 @@ mod tests {
             let a = claim(c, &groups, "a", 1000).unwrap().unwrap();
             assert_eq!(
                 a,
-                Claim { group: "g".into(), day: 20_000, server: "a".into(), claimed_at: 1000, reread: false }
+                Claim { group: "g".into(), day: 20_000, server: "a".into(), claimed_at: 1000, reread: false, resume: None }
             );
             let b = claim(c, &groups, "b", 1000).unwrap().unwrap();
             assert_eq!(b.day, 19_999);
@@ -1426,6 +1444,32 @@ mod tests {
                 (r.get::<i64>(0).unwrap(), r.get::<Option<String>>(1).unwrap(), r.get::<Option<i64>>(2).unwrap())
             };
             assert_eq!(row(c), (DONE, Some("b".to_string()), Some(done_at)));
+        });
+    }
+
+    #[test]
+    fn a_day_given_back_part_way_goes_on_from_where_its_server_got_to() {
+        both(|c| {
+            add(c, "g", 5, 5).unwrap();
+            let groups = vec![("g".to_string(), i64::MIN)];
+            let a = claim(c, &groups, "a", 1000).unwrap().unwrap();
+            assert_eq!(a.resume, None);
+            assert!(note_resume(c, &a, 4_000).unwrap());
+            assert!(note_resume(c, &a, 9_000).unwrap());
+            assert!(release(c, &a).unwrap());
+            // claimed again: where it got to, on which server
+            let again = claim(c, &groups, "b", 2000).unwrap().unwrap();
+            assert_eq!(again.resume, Some(("a".to_string(), 9_000)));
+            // a claim taken over notes nothing
+            assert!(!note_resume(c, &a, 12_000).unwrap());
+            // failed and claimed again keeps it; finished clears it
+            assert!(fail(c, &again, 2100).unwrap());
+            let third = claim(c, &groups, "a", 2100 + 30 * 86_400).unwrap().unwrap();
+            assert_eq!(third.resume, Some(("a".to_string(), 9_000)));
+            assert!(finish(c, &third, 2100 + 30 * 86_400 + 1).unwrap());
+            let r = c.row("select resume_host, resume_at from backfill_chunks where grp = 'g' and day = 5", vals![]);
+            let r = r.unwrap().unwrap();
+            assert_eq!((r.get::<Option<String>>(0).unwrap(), r.get::<Option<i64>>(1).unwrap()), (None, None));
         });
     }
 
