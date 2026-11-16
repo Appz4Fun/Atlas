@@ -266,7 +266,7 @@ impl Store {
         conn.execute_batch(&format!(
             "pragma journal_mode = wal;
              pragma synchronous = normal;
-             pragma cache_size = -524288;
+             pragma cache_size = -2097152;
              pragma wal_autocheckpoint = {CHECKPOINT_FALLBACK};
              pragma temp_store = memory;"
         ))?;
