@@ -212,6 +212,18 @@ impl Store {
     /// each file gained, `0..=max_part` only, as `file_parts` used to report.
     /// A row the release already has is an error: the caller asked `has` first.
     pub(crate) fn add(&self, xid: &str, rows: &[NewRow<'_>], max_part: i64) -> Result<Vec<NewParts>> {
+        self.add_fresh(xid, rows, max_part, &HashSet::new())
+    }
+
+    /// `add`, where the files in `fresh` were made in the same PostgreSQL transaction and have no articles here yet:
+    /// their parts arent looked up.
+    pub(crate) fn add_fresh(
+        &self,
+        xid: &str,
+        rows: &[NewRow<'_>],
+        max_part: i64,
+        fresh: &HashSet<i64>,
+    ) -> Result<Vec<NewParts>> {
         ensure!(self.writer, "the local article store is open for reading only");
         if rows.is_empty() {
             return Ok(Vec::new());
@@ -225,7 +237,7 @@ impl Store {
             let mut seen = HashSet::new();
             for row in rows {
                 let Some(part) = row.part.filter(|part| (0..=max_part).contains(part)) else { continue };
-                if !seen.insert((row.file_id, part)) || had.exists(params![row.file_id, part])? {
+                if !seen.insert((row.file_id, part)) || (!fresh.contains(&row.file_id) && had.exists(params![row.file_id, part])?) {
                     continue;
                 }
                 let entry = gained.entry(row.file_id).or_insert_with(|| {
