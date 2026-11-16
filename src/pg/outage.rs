@@ -54,6 +54,32 @@ impl std::fmt::Display for OverAdmission {
 }
 impl std::error::Error for OverAdmission {}
 
+/// A post-processing step's read ran past its statement timeout on a busy server: that step is tried again later, the
+/// owner session goes on. Ending the attempt for it, as before, dropped every backfill chunk under way, read again from
+/// its start: on prod ~87% of the articles saves looked up were ones saved already.
+#[derive(Debug)]
+pub(crate) struct StepTimedOut(pub(crate) String);
+impl std::fmt::Display for StepTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "a step's read ran past its statement timeout: {}", self.0)
+    }
+}
+impl std::error::Error for StepTimedOut {}
+
+pub(crate) fn is_step_timed_out(error: &anyhow::Error) -> bool {
+    error.chain().any(|source| source.is::<StepTimedOut>())
+}
+
+/// Whether `error` is PostgreSQL canceling a statement for its statement timeout.
+pub(crate) fn is_statement_timeout(error: &anyhow::Error) -> bool {
+    error.chain().any(|source| {
+        source.downcast_ref::<postgres::Error>().is_some_and(|pg| {
+            pg.code() == Some(&postgres::error::SqlState::QUERY_CANCELED)
+                && pg.as_db_error().is_some_and(|db| db.message() == "canceling statement due to statement timeout")
+        })
+    })
+}
+
 pub(crate) fn is_over_admission(error: &anyhow::Error) -> bool {
     error.chain().any(|source| source.is::<OverAdmission>())
 }
@@ -137,6 +163,20 @@ impl Backoff {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "needs ATLAS_PG_TEST_URL"]
+    fn a_statement_past_its_timeout_is_told_apart_from_a_cancel() {
+        let url = std::env::var("ATLAS_PG_TEST_URL").expect("ATLAS_PG_TEST_URL");
+        let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        client.batch_execute("set statement_timeout = '20ms'").unwrap();
+        let timed_out = anyhow::Error::from(client.query("select pg_sleep(1)", &[]).unwrap_err());
+        assert!(is_statement_timeout(&timed_out));
+        let step = anyhow::Error::new(StepTimedOut(format!("{timed_out:#}"))).context("reading a release");
+        assert!(is_step_timed_out(&step));
+        assert!(!is_step_timed_out(&timed_out));
+        // the session is fine after it
+        assert_eq!(client.query_one("select 1", &[]).unwrap().get::<_, i32>(0), 1);
+    }
     #[test]
     fn attempt_end_provenance_is_typed_not_a_matching_message() {
         let canceled = anyhow::Error::new(AttemptEnded).context("queued owner callback");

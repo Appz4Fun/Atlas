@@ -279,6 +279,7 @@ impl Runner {
                 Ran::Error(StepError::Native(error)) if crate::pg::outage::is_over_admission(&error)=>{
                     a.set_failed|=bit;failed|=bit;a.error=Some(engine::step_error(step.name(),&format!("{error:#}")));
                 }
+                Ran::Error(StepError::Native(error)) if crate::pg::outage::is_step_timed_out(&error)=>{soonest(now+300);a.error=Some(engine::step_error(step.name(),&format!("{error:#}")));}
                 Ran::Error(StepError::Native(error))=>return Err(error),
                 Ran::Error(StepError::Stopped)=>return if self.owner.stop.load(std::sync::atomic::Ordering::Acquire) {
                     Err(crate::pg::outage::AttemptEnded.into())
