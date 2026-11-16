@@ -515,6 +515,9 @@ fn flush_local(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], no
         }
         writer.finish()?;
     }
+    // Every release whose files or timing this batch changes is in `changed` and bumped once below: the input
+    // triggers on files and file_timing leave the bump to this writer meanwhile (migration 0015).
+    tx.batch_execute("set local atlas.writer_bumps_inputs = 'on'")?;
     stats.files += tx.query_one(ADD_FILES, &[])?.try_get::<_, i64>(0)? as u64;
     let mut file_ids = vec![None; files.len()];
     for row in tx.query(PLACE_FILES, &[])? {
@@ -562,6 +565,7 @@ fn flush_local(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], no
             all
         });
     tx.execute(UPDATE_FILES_FOLD, &[&now, &ids, &counts, &firsts, &lasts])?;
+    tx.batch_execute("set local atlas.writer_bumps_inputs = 'off'")?;
     let complete_due = now.saturating_add(crate::catalog_facts::COMPLETE_SETTLE_SECS.load(Ordering::Relaxed).max(1));
     let incomplete_due = now.saturating_add(crate::catalog_facts::SETTLE_SECS.load(Ordering::Relaxed).max(1));
     let folds: Vec<&ReleaseFold<'_>> = releases.values().collect();
