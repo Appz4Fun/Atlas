@@ -43,6 +43,21 @@ pub(crate) fn identity(release: &Release) -> (bool, [u8; 32]) {
     (release.collection.is_some(), key)
 }
 
+/// SQL emptying the save's temp `tables`: a DELETE, except about one time in `TEMP_TRUNCATE_EVERY`, a TRUNCATE. On prod
+/// TRUNCATE was PostgreSQL's busiest statement (~10 sessions at once, in file truncation), run for every batch of
+/// every save on a few rows; a DELETE of those rows costs next to nothing. Temp tables are never vacuumed, so the
+/// occasional TRUNCATE gives back what the deleted rows left behind.
+fn clear_temp(tables: &[&str]) -> String {
+    let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
+    if n % TEMP_TRUNCATE_EVERY == 0 {
+        format!("truncate {}", tables.join(", "))
+    } else {
+        tables.iter().map(|t| format!("delete from {t}")).collect::<Vec<_>>().join(";")
+    }
+}
+const TEMP_TRUNCATE_EVERY: u32 = 100;
+
+
 /// Shards a group's releases are saved in, each under a lock of its own (`save_grouped`), so saves of one group run
 /// side by side as saves of different groups do: a few groups are orders of magnitude bigger than the rest, and
 /// saving each group one save at a time left most helper writers waiting behind them. 64, not 16: at 16, saves of the
@@ -204,7 +219,7 @@ fn save_grouped(tx:&mut Transaction<'_>,groups:Parts<'_>,now:i64,helper_epoch:Op
     if fold_stage {
         setup.push(';');
         setup.push_str(CREATE_FOLD_STAGE);
-        setup.push_str(";truncate pg_temp.atlas_release_fold, pg_temp.atlas_file_fold");
+        setup.push_str(&format!(";{}", clear_temp(&["pg_temp.atlas_release_fold", "pg_temp.atlas_file_fold"])));
     }
     tx.batch_execute(&setup)?;
     // a helper writer beside the owner (`pg::ingest::Helpers`) waits for a group's lock as long as it takes, then for
@@ -219,7 +234,7 @@ fn save_grouped(tx:&mut Transaction<'_>,groups:Parts<'_>,now:i64,helper_epoch:Op
     if local.is_some() && !fold_stage {
         // a store opened between the check above and now
         tx.batch_execute(CREATE_FOLD_STAGE)?;
-        tx.batch_execute("truncate pg_temp.atlas_release_fold, pg_temp.atlas_file_fold")?;
+        tx.batch_execute(&clear_temp(&["pg_temp.atlas_release_fold", "pg_temp.atlas_file_fold"]))?;
     }
     for ((group, shard), releases) in groups {
         // The group's key shared, then the shard's alone: shards of a group save side by side, and a writer that takes
@@ -340,7 +355,7 @@ fn flush(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], now: i64
     if let Some(local) = local {
         return flush_local(tx, group, batch, now, stats, *timing_key, local);
     }
-    tx.batch_execute("truncate pg_temp.atlas_release_input")?;
+    tx.batch_execute(&clear_temp(&["pg_temp.atlas_release_input"]))?;
     copy_input(tx, batch, *timing_key)?;
     let release = tx.query_typed_one(WRITE_RELEASES, &[(&group, Type::TEXT)])?;
     stats.releases += release.get::<_, i64>(0) as u64;
@@ -432,7 +447,7 @@ fn flush_local(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], no
     }
     // empty at the first batch of a save (truncated in its setup)
     if std::mem::replace(&mut local.folded, true) {
-        tx.batch_execute("truncate pg_temp.atlas_release_fold, pg_temp.atlas_file_fold")?;
+        tx.batch_execute(&clear_temp(&["pg_temp.atlas_release_fold", "pg_temp.atlas_file_fold"]))?;
     }
     {
         use Type as T;
