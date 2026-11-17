@@ -108,11 +108,16 @@ const DRAIN_ROUNDS: usize = 4;
 /// Articles each part of a split job holds at least (`by_part`).
 const SPLIT_ARTICLES: usize = 2000;
 
-/// Parts a job of `articles` is split into: a power of two up to `release_writer::SHARDS`, each part at least
+/// Parts a split job goes in at most: 16, as when it was `release_writer::SHARDS`; raising the shards to 64 was for
+/// lock collisions, not for splitting jobs finer. A power of two dividing SHARDS, so a part (shard mod k) is whole shards.
+const MAX_PARTS: usize = 16;
+const _: () = assert!(MAX_PARTS.is_power_of_two() && MAX_PARTS <= super::release_writer::SHARDS as usize);
+
+/// Parts a job of `articles` is split into: a power of two up to `MAX_PARTS`, each part at least
 /// `SPLIT_ARTICLES`. Split into all sixteen shards, a job's parts were ~125-300 articles each on prod and each paid a
 /// transaction's fixed statements (guard, stage, locks), which outweighed the parallelism.
 fn parts_for(articles: usize) -> u32 {
-    let k = (articles / SPLIT_ARTICLES).clamp(1, super::release_writer::SHARDS as usize);
+    let k = (articles / SPLIT_ARTICLES).clamp(1, MAX_PARTS);
     1 << (usize::BITS - 1 - k.leading_zeros())
 }
 
@@ -904,6 +909,7 @@ mod split_tests {
         assert_eq!(super::parts_for(12_000), 4);
         assert_eq!(super::parts_for(20_000), 8);
         assert_eq!(super::parts_for(60_000), 16);
+        assert_eq!(super::parts_for(200_000), 16, "capped at MAX_PARTS, not the 64 writer shards");
         assert_eq!(super::parts_for(10_000_000), 16);
     }
 }

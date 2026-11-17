@@ -45,8 +45,12 @@ pub(crate) fn identity(release: &Release) -> (bool, [u8; 32]) {
 
 /// Shards a group's releases are saved in, each under a lock of its own (`save_grouped`), so saves of one group run
 /// side by side as saves of different groups do: a few groups are orders of magnitude bigger than the rest, and
-/// saving each group one save at a time left most helper writers waiting behind them.
-pub(crate) const SHARDS: u32 = 16;
+/// saving each group one save at a time left most helper writers waiting behind them. 64, not 16: at 16, saves of the
+/// busiest groups queued on their shard keys (prod: ~12 sessions waiting on advisory locks, ~21 idle in transaction
+/// holding them). A power of two, so `pg::ingest::by_part`'s parts (shard mod k) nest; the catalog metrics rows'
+/// shard (`atlas_native_catalog_shard`, migration 0021) must be the same function.
+pub(crate) const SHARDS: u32 = 64;
+const _: () = assert!(SHARDS.is_power_of_two() && SHARDS <= 256, "a shard is the identity key's first byte mod SHARDS");
 
 /// The shard of `release` within its group, by its identity: every fragment of a release lands in the same one.
 pub(crate) fn shard(release: &Release) -> u32 {
@@ -1289,6 +1293,20 @@ mod tests {
             }],
             ..Release::default()
         }
+    }
+
+    #[test]
+    fn a_shard_is_the_first_identity_byte_mod_64_as_the_metric_rows_take_it() {
+        // `atlas_native_catalog_shard` (migration 0021) is get_byte(identity_key,0)%64: the same function, or a save
+        // would update another shard's metric row than the one its lock is for
+        let mut seen = std::collections::BTreeSet::new();
+        for n in 0..2000 {
+            let r = release(&format!("Shard.{n}"), "f.rar", "<x@y>", 1);
+            let (_, key) = identity(&r);
+            assert_eq!(shard(&r), u32::from(key[0]) % 64);
+            seen.insert(shard(&r));
+        }
+        assert_eq!(seen.len(), SHARDS as usize, "every one of the 64 shards is used");
     }
 
     #[test]

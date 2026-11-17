@@ -1,0 +1,13 @@
+
+running 1 test
+closed multipart writer phase:seed_target
+closed multipart writer phase:probe_before_background
+closed multipart writer phase:seed_background
+closed multipart writer phase:probe_after_background
+closed multipart writer phase:whole_save
+closed multipart writer phase:replay
+closed multipart writer phase:linear_work_assertion
+test pg::release_writer::multipart_plan_experiment::one_multipart_file_retains_bounded_winner_work_with_background_segments ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2374 filtered out; finished in 40.86s
+
