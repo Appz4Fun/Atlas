@@ -43,19 +43,26 @@ pub(crate) fn identity(release: &Release) -> (bool, [u8; 32]) {
     (release.collection.is_some(), key)
 }
 
-/// SQL emptying the save's temp `tables`: a DELETE, except about one time in `TEMP_TRUNCATE_EVERY`, a TRUNCATE. On prod
-/// TRUNCATE was PostgreSQL's busiest statement (~10 sessions at once, in file truncation), run for every batch of
-/// every save on a few rows; a DELETE of those rows costs next to nothing. Temp tables are never vacuumed, so the
-/// occasional TRUNCATE gives back what the deleted rows left behind.
-fn clear_temp(tables: &[&str]) -> String {
-    let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
-    if n % TEMP_TRUNCATE_EVERY == 0 {
+/// SQL emptying the save's temp `tables`, made `on commit delete rows`: a transaction starts with them empty. On prod
+/// TRUNCATE was PostgreSQL's busiest statement (~10 sessions at once, part in file truncation), run for every batch of
+/// every save on a few rows; a DELETE costs next to nothing. A DELETE's rows stay until the transaction ends, though,
+/// and one save of a big group flushes many batches in one transaction, each scanning the tables: one call in
+/// `TEMP_TRUNCATE_EVERY` on this thread (a helper's session) truncates, so a transaction scans at most that many
+/// batches' dead rows. `first`: the transaction's first emptying, of tables its start already emptied: a DELETE.
+fn clear_temp(tables: &[&str], first: bool) -> String {
+    thread_local!(static CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) });
+    let truncate = !first && CALLS.with(|calls| {
+        let n = calls.get().wrapping_add(1);
+        calls.set(n);
+        n % TEMP_TRUNCATE_EVERY == 0
+    });
+    if truncate {
         format!("truncate {}", tables.join(", "))
     } else {
         tables.iter().map(|t| format!("delete from {t}")).collect::<Vec<_>>().join(";")
     }
 }
-const TEMP_TRUNCATE_EVERY: u32 = 100;
+const TEMP_TRUNCATE_EVERY: u32 = 4;
 
 
 /// Shards a group's releases are saved in, each under a lock of its own (`save_grouped`), so saves of one group run
@@ -219,7 +226,7 @@ fn save_grouped(tx:&mut Transaction<'_>,groups:Parts<'_>,now:i64,helper_epoch:Op
     if fold_stage {
         setup.push(';');
         setup.push_str(CREATE_FOLD_STAGE);
-        setup.push_str(&format!(";{}", clear_temp(&["pg_temp.atlas_release_fold", "pg_temp.atlas_file_fold"])));
+        setup.push_str(&format!(";{}", clear_temp(&["pg_temp.atlas_release_fold", "pg_temp.atlas_file_fold"], true)));
     }
     tx.batch_execute(&setup)?;
     // a helper writer beside the owner (`pg::ingest::Helpers`) waits for a group's lock as long as it takes, then for
@@ -234,7 +241,7 @@ fn save_grouped(tx:&mut Transaction<'_>,groups:Parts<'_>,now:i64,helper_epoch:Op
     if local.is_some() && !fold_stage {
         // a store opened between the check above and now
         tx.batch_execute(CREATE_FOLD_STAGE)?;
-        tx.batch_execute(&clear_temp(&["pg_temp.atlas_release_fold", "pg_temp.atlas_file_fold"]))?;
+        tx.batch_execute(&clear_temp(&["pg_temp.atlas_release_fold", "pg_temp.atlas_file_fold"], false))?;
     }
     for ((group, shard), releases) in groups {
         // The group's key shared, then the shard's alone: shards of a group save side by side, and a writer that takes
@@ -355,7 +362,7 @@ fn flush(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], now: i64
     if let Some(local) = local {
         return flush_local(tx, group, batch, now, stats, *timing_key, local);
     }
-    tx.batch_execute(&clear_temp(&["pg_temp.atlas_release_input"]))?;
+    tx.batch_execute(&clear_temp(&["pg_temp.atlas_release_input"], false))?;
     copy_input(tx, batch, *timing_key)?;
     let release = tx.query_typed_one(WRITE_RELEASES, &[(&group, Type::TEXT)])?;
     stats.releases += release.get::<_, i64>(0) as u64;
@@ -447,7 +454,7 @@ fn flush_local(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], no
     }
     // empty at the first batch of a save (truncated in its setup)
     if std::mem::replace(&mut local.folded, true) {
-        tx.batch_execute(&clear_temp(&["pg_temp.atlas_release_fold", "pg_temp.atlas_file_fold"]))?;
+        tx.batch_execute(&clear_temp(&["pg_temp.atlas_release_fold", "pg_temp.atlas_file_fold"], false))?;
     }
     {
         use Type as T;
