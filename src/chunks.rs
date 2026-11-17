@@ -406,7 +406,10 @@ fn claim_turn_with(
 /// (not resting after a failure, see `FAIL_REST`) or claimed within `CLAIM_TIMEOUT`: a day being read holds the
 /// groups behind it (`claim`), one whose claim went stale (its worker was killed) doesnt, it is anyone's to take over
 /// (`claim` takes it first). Only when stale claims are all that's left are they the frontier. A live claim that
-/// already failed `FRONTIER_FAILURES` times doesnt hold it. None when none is left.
+/// already failed `FRONTIER_FAILURES` times doesnt hold it, nor does a pending one that has: on prod the biggest
+/// groups' days kept failing, and each time they came back from resting they pinned forward backfill's frontier to
+/// their day, every worker idle with thousands of chunks ready a week on. Like stale claims, such days are the
+/// frontier only when nothing else is left, so they are still read. None when none is left.
 pub fn frontier(db: &dyn Sql, groups: &[(String, i64)], now: i64) -> Result<Option<i64>> {
     frontier_by(db, groups, now, true)
 }
@@ -472,8 +475,14 @@ fn frontier_asked(db: &dyn Sql, groups: &[(String, i64)], now: i64, newest: bool
         "with wanted (g, oldest) as (values {rows}),
               days (day, stale) as (
                   select (select c.day from backfill_chunks c
-                          where c.grp = w.g and c.state = {PENDING} and c.day >= w.oldest and {resting}
+                          where c.grp = w.g and c.state = {PENDING} and c.day >= w.oldest and {resting} and {healthy}
                           order by c.day {order} limit 1), 0
+                  from wanted w
+                  union all
+                  select (select c.day from backfill_chunks c
+                          where c.grp = w.g and c.state = {PENDING} and c.day >= w.oldest and {resting}
+                            and not ({healthy})
+                          order by c.day {order} limit 1), 1
                   from wanted w
                   union all
                   select (select {most}(c.day) filter (where {live}) from backfill_chunks c
@@ -1632,6 +1641,28 @@ mod tests {
             let k = claim_with(c, &all, "h2", late, Some(20_000)).unwrap().unwrap();
             assert_eq!((k.group.as_str(), k.day), ("big", 20_000));
             assert!(!finish(c, &big, late).unwrap(), "the dead run's claim is no longer its own");
+        });
+    }
+
+    /// A pending day that already failed `FRONTIER_FAILURES` times, back from resting, doesnt hold the frontier
+    /// while other days are left: on prod the biggest groups' failing days pinned forward backfill to them and every
+    /// worker sat idle. When they are all that's left they are the frontier, so they are still claimed and read.
+    #[test]
+    fn a_failing_pending_day_holds_the_frontier_only_when_nothing_else_is_left() {
+        both(|c| {
+            let f = FRONTIER_FAILURES;
+            c.execute(&format!("insert into backfill_chunks(grp,day,state,claimed_at,failed_at,failures) values
+                ('big',10,0,null,1,{f}),('big',11,0,null,1,{}),('small',12,0,null,null,null),
+                ('small',13,0,null,null,null)", f + 5), vals![]).unwrap();
+            let all: Vec<(String, i64)> = ["big", "small"].iter().map(|g| (g.to_string(), i64::MIN)).collect();
+            let now = 2 + FAIL_REST_MOST;
+            assert_eq!(frontier_oldest(c, &all, now).unwrap(), Some(12), "the failing days dont hold it");
+            assert_eq!(frontier(c, &all, now).unwrap(), Some(13));
+            c.execute("delete from backfill_chunks where grp = 'small'", vals![]).unwrap();
+            assert_eq!(frontier_oldest(c, &all, now).unwrap(), Some(10), "alone, they are the frontier");
+            assert_eq!(frontier(c, &all, now).unwrap(), Some(11));
+            let k = claim_with(c, &all, "h", now, Some(10)).unwrap().unwrap();
+            assert_eq!((k.group.as_str(), k.day), ("big", 10), "and still claimed");
         });
     }
 
