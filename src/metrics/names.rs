@@ -74,6 +74,7 @@ families! {
     LOCAL_STORE_LOOKUPS "atlas_local_store_lookups_total" Counter &[], "Articles a save checked against the local article store, by result: found (already saved, a replay), new (not there), fresh (of a release made by that save, not looked up).";
     LOCAL_STORE_PREWARMED "atlas_local_store_prewarmed_total" Counter &[], "Articles a save asked of the local article store before taking its locks, to read the pages its locked lookups need.";
     HEADER_STORE_DROPPED "atlas_header_store_dropped_rows_total" Counter &[], "Overview rows the header store didn't keep, by reason: unkept (their day outside the keep set), repeat (read twice, dropped at seal).";
+    HEADER_STORE_RETIRED_UNSTAGED "atlas_header_store_retired_unstaged_blocks_total" Counter &[], "Blocks the header store's age retention deleted before the native linker staged them (counted when the linker passes over the retired source).";
 
     // indexing
     ARTICLES "atlas_articles_total" Counter &[], "Articles indexed, per group.";

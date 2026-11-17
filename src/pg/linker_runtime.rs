@@ -669,6 +669,86 @@ mod tests {
     }
 
     #[test]
+    fn a_source_the_retention_sweep_deletes_mid_epoch_counts_as_consumed() {
+        let Some(schema) = crate::pg::testing::Schema::native_writer() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = Store::open(
+            StoreConfig { sealers: 1, retention: Some(Duration::from_secs(24 * 3600)), ..StoreConfig::new(dir.path()) },
+            KeepSet { live_from: i64::MIN / 2, ..KeepSet::default() },
+        )
+        .unwrap();
+        let date = chrono::DateTime::from_timestamp(99000, 0).unwrap().format("%a, %d %b %Y %H:%M:%S +0000");
+        for group in ["a.example", "b.example"] {
+            let lines: Vec<_> = (1..=13)
+                .map(|n| {
+                    format!("{n}\tpart{n}\tposter@example.invalid\t{date}\t<{group}{n}@ngPost>\t\t700000\t5000")
+                        .into_bytes()
+                })
+                .collect();
+            let ticket = store.record("server.example", group, &lines, Clamp::Unknown { now: 200000 }).unwrap();
+            store.tick().unwrap();
+            ticket.wait(Duration::from_secs(5)).unwrap();
+        }
+        store.flush_days(&[1], Duration::from_secs(5)).unwrap();
+        let state = dir.path().join("_state");
+        std::fs::write(state.join("linker.rec"), "L\t-14\t100\nE\n").unwrap();
+        let database: String = schema.pool.get().unwrap().query_one("select current_database()", &[]).unwrap().get(0);
+        let db = crate::indexer::shared_postgres_db(
+            &crate::pg::StorageConfig {
+                backend: crate::pg::Backend::Postgres,
+                url: schema.url.clone(),
+                schema: schema.name.clone(),
+                allow_plaintext: true,
+                ..Default::default()
+            },
+            &database,
+            crate::indexer::PgWriteLimits::default(),
+        )
+        .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let mut cache = super::super::linker_source::Cache::default();
+            let source_dir = state.clone();
+            on_native_db(&db, move |c| super::super::linker_bootstrap::import(c, &source_dir, 120000)).await.unwrap();
+            let epoch = on_native_db(&db, |c| super::super::linker_epoch::open(c, 120000)).await.unwrap();
+            let _pin = store.pin_linker_retention();
+            for turn in 0..200 {
+                assert!(turn < 199, "inventory stopped making progress");
+                let sealed = on_native_db(&db, move |c| {
+                    Ok(c.query_one("select inventory_sealed from linker_epochs where id=$1", &[&epoch])?
+                        .get::<_, bool>(0))
+                })
+                .await
+                .unwrap();
+                if sealed {
+                    break;
+                }
+                step(&db, &store, epoch, Budget { rows: 2, bytes: 1024 }, &mut cache).await.unwrap();
+            }
+            // a day later, while the pin is held: retention goes ahead, the linker moves past what it took
+            let r = store.retention_sweep(std::time::SystemTime::now() + Duration::from_secs(48 * 3600));
+            assert_eq!(r.removed, 2);
+            for turn in 0..400 {
+                assert!(turn < 399, "staging stopped making progress");
+                if step(&db, &store, epoch, Budget { rows: 2, bytes: 1024 }, &mut cache).await.unwrap() {
+                    break;
+                }
+            }
+            let left = on_native_db(&db, move |c| {
+                Ok(c.query_one(
+                    "select count(*) from linker_epoch_inventory where epoch=$1 and scanned_blocks<blocks",
+                    &[&epoch],
+                )?
+                .get::<_, i64>(0))
+            })
+            .await
+            .unwrap();
+            assert_eq!(left, 0);
+        });
+        store.close().unwrap();
+    }
+
+    #[test]
     fn unknown_generation_same_and_larger_counts_reconcile_unpublished_ids_once() {
         for blocks in [1, 2] {
             let Some(schema) = crate::pg::testing::Schema::native_writer() else { return };

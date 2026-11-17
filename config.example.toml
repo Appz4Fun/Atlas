@@ -164,6 +164,9 @@ offload_mb_per_second = 50
 enabled = false
 # where: empty is `header-store` next to the databases
 dir = ""
+# hours a day file (one group's rows of one posting day) is kept after its last write; older files are deleted every
+# few minutes unless a slab of that day is still open or on its way to disk. 0 keeps everything
+retention_hours = 24
 
 [overview_archive]
 # keep every fetched XOVER row, byte for byte, in compressed .nxv files outside SQLite (nntp-xover-engine/)
