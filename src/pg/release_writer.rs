@@ -43,26 +43,41 @@ pub(crate) fn identity(release: &Release) -> (bool, [u8; 32]) {
     (release.collection.is_some(), key)
 }
 
-/// SQL emptying the save's temp `tables`, made `on commit delete rows`: a transaction starts with them empty. On prod
-/// TRUNCATE was PostgreSQL's busiest statement (~10 sessions at once, part in file truncation), run for every batch of
-/// every save on a few rows; a DELETE costs next to nothing. A DELETE's rows stay until the transaction ends, though,
-/// and one save of a big group flushes many batches in one transaction, each scanning the tables: one call in
-/// `TEMP_TRUNCATE_EVERY` on this thread (a helper's session) truncates, so a transaction scans at most that many
-/// batches' dead rows. `first`: the transaction's first emptying, of tables its start already emptied: a DELETE.
-fn clear_temp(tables: &[&str], first: bool) -> String {
-    thread_local!(static CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) });
-    let truncate = !first && CALLS.with(|calls| {
-        let n = calls.get().wrapping_add(1);
-        calls.set(n);
-        n % TEMP_TRUNCATE_EVERY == 0
-    });
-    if truncate {
-        format!("truncate {}", tables.join(", "))
+/// SQL emptying the save's temp `tables`, made `on commit delete rows`: a transaction starts with them empty and its
+/// commit empties them again. On prod TRUNCATE was PostgreSQL's busiest statement, then (run every fourth batch) still
+/// 8% of its time at 7.4 ms a call, for tables holding a batch of rows; a DELETE costs next to nothing. A DELETE's
+/// rows stay until the transaction ends, though, and every batch scans the tables, so a transaction truncates once
+/// the rows it staged in them since it began or last truncated reach `TEMP_TRUNCATE_ROWS`: the tables never hold
+/// more than that plus one batch. A save of ~8 batches of ~1k rows never truncates; one big group's long save does,
+/// every ~64 such batches. `staging`: the rows about to be staged after this emptying.
+fn clear_temp(tables: &[&str], staging: usize) -> String {
+    let key = tables.join(", ");
+    if stage_rows(&key, staging) {
+        format!("truncate {key}")
     } else {
         tables.iter().map(|t| format!("delete from {t}")).collect::<Vec<_>>().join(";")
     }
 }
-const TEMP_TRUNCATE_EVERY: u32 = 4;
+const TEMP_TRUNCATE_ROWS: usize = 65_536;
+const FOLD_TABLES: [&str; 2] = ["pg_temp.atlas_release_fold", "pg_temp.atlas_file_fold"];
+
+thread_local!(static STAGED: std::cell::RefCell<HashMap<String, usize>> = std::cell::RefCell::new(HashMap::new()));
+
+/// Counts `rows` about to be staged in the temp tables `key` names; true when they are to be truncated first.
+fn stage_rows(key: &str, rows: usize) -> bool {
+    STAGED.with(|staged| {
+        let mut staged = staged.borrow_mut();
+        let staged = staged.entry(key.to_owned()).or_insert(0);
+        let truncate = *staged + rows > TEMP_TRUNCATE_ROWS;
+        *staged = if truncate { rows } else { *staged + rows };
+        truncate
+    })
+}
+
+/// A transaction's temp tables start empty (on this thread's session): their staged-row counts start again.
+fn temp_transaction_starts() {
+    STAGED.with(|staged| staged.borrow_mut().clear());
+}
 
 
 /// Shards a group's releases are saved in, each under a lock of its own (`save_grouped`), so saves of one group run
@@ -216,6 +231,7 @@ fn save_grouped(tx:&mut Transaction<'_>,groups:Parts<'_>,now:i64,helper_epoch:Op
     // try loses it and the next try sets it again), then the stage tables. Neither takes a shared lock, so the write
     // guard below still precedes every group and row lock. The fold stage is made whenever some local store is open;
     // its truncate covers rows an earlier save in the same transaction (`save_in`) left.
+    temp_transaction_starts();
     let mut setup = String::new();
     if let Some(epoch) = helper_epoch {
         ensure!(!epoch.is_empty() && epoch.bytes().all(|b| b.is_ascii_hexdigit()), "a helper epoch is hex");
@@ -226,7 +242,7 @@ fn save_grouped(tx:&mut Transaction<'_>,groups:Parts<'_>,now:i64,helper_epoch:Op
     if fold_stage {
         setup.push(';');
         setup.push_str(CREATE_FOLD_STAGE);
-        setup.push_str(&format!(";{}", clear_temp(&["pg_temp.atlas_release_fold", "pg_temp.atlas_file_fold"], true)));
+        setup.push_str(&format!(";{}", clear_temp(&FOLD_TABLES, 0)));
     }
     tx.batch_execute(&setup)?;
     // a helper writer beside the owner (`pg::ingest::Helpers`) waits for a group's lock as long as it takes, then for
@@ -241,7 +257,7 @@ fn save_grouped(tx:&mut Transaction<'_>,groups:Parts<'_>,now:i64,helper_epoch:Op
     if local.is_some() && !fold_stage {
         // a store opened between the check above and now
         tx.batch_execute(CREATE_FOLD_STAGE)?;
-        tx.batch_execute(&clear_temp(&["pg_temp.atlas_release_fold", "pg_temp.atlas_file_fold"], false))?;
+        tx.batch_execute(&clear_temp(&FOLD_TABLES, 0))?;
     }
     for ((group, shard), releases) in groups {
         // The group's key shared, then the shard's alone: shards of a group save side by side, and a writer that takes
@@ -362,7 +378,7 @@ fn flush(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], now: i64
     if let Some(local) = local {
         return flush_local(tx, group, batch, now, stats, *timing_key, local);
     }
-    tx.batch_execute(&clear_temp(&["pg_temp.atlas_release_input"], false))?;
+    tx.batch_execute(&clear_temp(&["pg_temp.atlas_release_input"], batch.len()))?;
     copy_input(tx, batch, *timing_key)?;
     let release = tx.query_typed_one(WRITE_RELEASES, &[(&group, Type::TEXT)])?;
     stats.releases += release.get::<_, i64>(0) as u64;
@@ -454,7 +470,10 @@ fn flush_local(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], no
     }
     // empty at the first batch of a save (truncated in its setup)
     if std::mem::replace(&mut local.folded, true) {
-        tx.batch_execute(&clear_temp(&["pg_temp.atlas_release_fold", "pg_temp.atlas_file_fold"], false))?;
+        tx.batch_execute(&clear_temp(&FOLD_TABLES, batch.len()))?;
+    } else {
+        // the first batch's rows count all the same; it starts on an empty stage, so this never truncates
+        stage_rows(&FOLD_TABLES.join(", "), batch.len());
     }
     {
         use Type as T;
@@ -714,9 +733,11 @@ fn flush_local(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], no
     }
     let file_ids: Vec<i64> =
         file_ids.into_iter().map(|id| id.ok_or_else(|| anyhow::anyhow!("an accepted article found no file"))).collect::<Result<_>>()?;
-    // Real row counts for the stage the timing and file updates join on: without them the planner takes it for a
-    // few rows and nests a loop over every file of the batch inside another.
-    tx.batch_execute("analyze pg_temp.atlas_file_fold")?;
+    // No ANALYZE of the stage (prod: 4 ms a batch, 10% of PostgreSQL's time). It was there because the timing and
+    // file updates joined the stage to an unnest of per-file arrays, and to itself, on file_id, and without statistics
+    // the planner nested a loop over the batch's files inside another. Both now read the arrays by the stage row's
+    // `ord` (`$n[ord + 1]`, aligned with `files` below) and scan the stage once, so the only joins left are the stage
+    // to `files` and `file_timing` by their primary keys: no plan of theirs is quadratic in the batch.
     let rows: Vec<_> = accepted
         .iter()
         .zip(&file_index)
@@ -749,18 +770,22 @@ fn flush_local(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], no
     let present: Vec<i64> =
         local.store.file_counts(&files.iter().zip(&file_ids).map(|(f, &id)| (f.release_id, id, f.articles + 1)).collect::<Vec<_>>())?;
     timing::write_local(tx, parts, &file_ids, &present)?;
+    // What each stage row's file gained, by `ord`: a file that gained nothing has count 0 and bounds the SQL ignores.
+    let gained_of: HashMap<i64, &crate::article_local::NewParts> = gained.iter().map(|parts| (parts.file_id, parts)).collect();
     let (ids, counts, firsts, lasts): (Vec<i64>, Vec<i64>, Vec<i64>, Vec<i64>) =
-        gained.iter().fold(Default::default(), |mut all: (Vec<i64>, Vec<i64>, Vec<i64>, Vec<i64>), parts| {
-            all.0.push(parts.file_id);
-            all.1.push(parts.count);
-            all.2.push(parts.first);
-            all.3.push(parts.last);
+        file_ids.iter().fold(Default::default(), |mut all: (Vec<i64>, Vec<i64>, Vec<i64>, Vec<i64>), id| {
+            let parts = gained_of.get(id);
+            all.0.push(*id);
+            all.1.push(parts.map_or(0, |p| p.count));
+            all.2.push(parts.map_or(i64::MAX, |p| p.first));
+            all.3.push(parts.map_or(i64::MIN, |p| p.last));
             all
         });
-    tx.execute_typed(
+    let updated = tx.execute_typed(
         UPDATE_FILES_FOLD,
         &[(&now, Type::INT8), (&ids, Type::INT8_ARRAY), (&counts, Type::INT8_ARRAY), (&firsts, Type::INT8_ARRAY), (&lasts, Type::INT8_ARRAY)],
     )?;
+    ensure!(updated == ids.len() as u64, "a folded file row found no file of its own ({updated} of {})", ids.len());
     tx.batch_execute("set local atlas.writer_bumps_inputs = 'off'")?;
     let complete_due = now.saturating_add(crate::catalog_facts::COMPLETE_SETTLE_SECS.load(Ordering::Relaxed).max(1));
     let incomplete_due = now.saturating_add(crate::catalog_facts::SETTLE_SECS.load(Ordering::Relaxed).max(1));
@@ -1151,7 +1176,7 @@ macro_rules! update_files_inputs {
 // The part of `UPDATE_FILES` after every input of a file is known.
 macro_rules! update_files_combine {
     () => {
-        "    ), combined as (
+        concat!("    ), combined as (
         select f.id, greatest(f.expected, d.expected) as expected,
             greatest(f.file_total, d.file_total) as file_total,
             f.distinct_parts + coalesce(p.count, 0) as distinct_parts,
@@ -1164,7 +1189,14 @@ macro_rules! update_files_combine {
             (f.subject_part is not null, coalesce(f.subject_part, 0), f.subject_mid) as better_subject
         from declarations d join files f on f.id = d.file_id
         join subjects s on s.file_id = d.file_id left join parts p on p.file_id = d.file_id
-    )
+", update_files_set!())
+    };
+}
+
+// The update of each file from its row of `combined`.
+macro_rules! update_files_set {
+    () => {
+        "    )
     update files f set expected = c.expected, file_total = c.file_total,
         distinct_parts = c.distinct_parts, first_part = c.first_part, last_part = c.last_part,
         touched_at = $1,
@@ -1200,16 +1232,21 @@ const UPDATE_FILES: &str = concat!(
 // numbers the local article store said each file gained.
 const UPDATE_FILES_FOLD: &str = concat!(
     "
-    with parts as (
-        select * from unnest($2::bigint[], $3::bigint[], $4::bigint[], $5::bigint[]) as p(file_id, count, first, last)
-    ), declarations as (
-        select file_id, expected, file_total from pg_temp.atlas_file_fold
-    ), subjects as (
-        select file_id, subject, subject_part as part, subject_mid as message_id, zero_file_index,
-            subject_file_index as file_index, subject_file_total as file_total, subject_expected as expected
-        from pg_temp.atlas_file_fold
+    with combined as (
+        select f.id, greatest(f.expected, d.expected) as expected,
+            greatest(f.file_total, d.file_total) as file_total,
+            f.distinct_parts + ($3::bigint[])[d.ord + 1] as distinct_parts,
+            least(f.first_part, nullif(($4::bigint[])[d.ord + 1], 9223372036854775807)) as first_part,
+            greatest(f.last_part, nullif(($5::bigint[])[d.ord + 1], -9223372036854775808)) as last_part,
+            d.subject, d.subject_part as part, d.subject_mid as message_id, d.zero_file_index,
+            d.subject_file_index, d.subject_file_total, d.subject_expected as subject_total_parts,
+            f.subject_mid is null or
+            (d.subject_part is not null, coalesce(d.subject_part, 0), d.subject_mid) <
+            (f.subject_part is not null, coalesce(f.subject_part, 0), f.subject_mid) as better_subject
+        from pg_temp.atlas_file_fold d join files f on f.id = d.file_id
+        where ($2::bigint[])[d.ord + 1] = d.file_id
 ",
-    update_files_combine!()
+    update_files_set!()
 );
 
 // The release each folded release row belongs to.
@@ -1609,3 +1646,132 @@ mod plan_experiment;
 #[cfg(test)]
 #[path="release_writer_multipart_plan_tests.rs"]
 mod multipart_plan_experiment;
+
+#[cfg(test)]
+mod fold_stage_costs {
+    use super::*;
+
+    #[test]
+    fn the_temp_stage_is_deleted_and_truncated_only_past_its_row_budget() {
+        temp_transaction_starts();
+        let key = "pg_temp.atlas_test_stage";
+        // a save's usual ~8 batches of ~1k rows: only deletes
+        for _ in 0..8 {
+            assert!(clear_temp(&[key], 960).starts_with("delete from pg_temp.atlas_test_stage"));
+        }
+        // a long save: a truncate once the rows staged since the last one would pass the budget, then deletes again
+        let mut truncates = 0;
+        for _ in 0..200 {
+            let sql = clear_temp(&[key], 16_384);
+            if sql.starts_with("truncate") {
+                assert_eq!(sql, format!("truncate {key}"));
+                truncates += 1;
+            }
+            assert!(STAGED.with(|s| s.borrow()[key]) <= TEMP_TRUNCATE_ROWS);
+        }
+        assert_eq!(truncates, 200 / (TEMP_TRUNCATE_ROWS / 16_384));
+        // a new transaction starts with an empty stage and a count of its own
+        temp_transaction_starts();
+        assert!(clear_temp(&[key], TEMP_TRUNCATE_ROWS).starts_with("delete"));
+        assert!(clear_temp(&[key, "pg_temp.other"], 1).contains("delete from pg_temp.other"));
+    }
+
+    // UPDATE_FILES_FOLD as it was before: the stage joined to itself and to an unnest of the files that gained parts.
+    const UPDATE_FILES_FOLD_JOINED: &str = concat!(
+        "
+    with parts as (
+        select * from unnest($2::bigint[], $3::bigint[], $4::bigint[], $5::bigint[]) as p(file_id, count, first, last)
+    ), declarations as (
+        select file_id, expected, file_total from pg_temp.atlas_file_fold
+    ), subjects as (
+        select file_id, subject, subject_part as part, subject_mid as message_id, zero_file_index,
+            subject_file_index as file_index, subject_file_total as file_total, subject_expected as expected
+        from pg_temp.atlas_file_fold
+",
+        update_files_combine!()
+    );
+
+    fn plan(tx: &mut Transaction<'_>, sql: &str, types: &[Type], params: &[&(dyn postgres::types::ToSql + Sync)]) -> String {
+        let typed: Vec<_> = params.iter().zip(types).map(|(p, t)| (*p, t.clone())).collect();
+        tx.query_typed(&format!("explain {sql}"), &typed).unwrap().iter().map(|r| r.get::<_, String>(0)).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    #[ignore = "needs ATLAS_PG_TEST_URL"]
+    fn unanalyzed_fold_updates_scan_the_stage_once_and_match_the_joined_update() {
+        let Some(s) = crate::pg::testing::Schema::new() else { return };
+        let mut c = s.pool.get().unwrap();
+        const N: i64 = 3000;
+        c.batch_execute(&format!(
+            "insert into releases(id,group_name,is_collection,identity_key,name,poster,posted_date,is_obfuscated)
+                values(1,'a.b',false,'\\x01','R','p','d',false),(2,'a.b',false,'\\x02','S','p','d',false);
+            insert into files(id,release_id,filename_key,filename,expected,distinct_parts,first_part,last_part,subject,subject_part,subject_mid)
+            select n,1+n%2,int8send(n),'f',case when n%3=0 then 4 end,n%3,case when n%3>0 then 1 end,case when n%3>0 then n%3 end,
+                case when n%5=0 then null else 'old' end,case when n%5=0 then null else 2 end,case when n%5=0 then null else '\\x05'::bytea end
+            from generate_series(1,{N}) n"
+        ))
+        .unwrap();
+        let mut tx = c.transaction().unwrap();
+        tx.batch_execute(CREATE_FOLD_STAGE).unwrap();
+        // stage row ord n-1 is file n: the order `PLACE_FILES` hands back and the arrays follow
+        tx.batch_execute(&format!(
+            "insert into pg_temp.atlas_file_fold(ord,release_id,file_id,filename_key,filename,original_filename,expected,file_total,
+                subject,subject_part,subject_mid,zero_file_index,subject_file_index,subject_file_total,subject_expected,
+                utc_complete,lines,references_seen,from_first,from_last,from_variants,encoded_subject,articles)
+            select n-1,1+n%2,n,int8send(n),'f','\\x00',case when n%4=0 then 5 end,case when n%7=0 then 9 end,
+                's'||n,case when n%6=0 then null else 1 end,int8send(n),n%9=0,n%4,n%8,case when n%4=0 then 5 end,
+                false,1,0,1,1,1,0,1
+            from generate_series(1,{N}) n"
+        ))
+        .unwrap();
+        let ids: Vec<i64> = (1..=N).collect();
+        let gained = |n: i64| n % 2 == 0;
+        let counts: Vec<i64> = ids.iter().map(|&n| if gained(n) { 1 + n % 3 } else { 0 }).collect();
+        let firsts: Vec<i64> = ids.iter().map(|&n| if gained(n) { n % 3 } else { i64::MAX }).collect();
+        let lasts: Vec<i64> = ids.iter().map(|&n| if gained(n) { 2 + n % 3 } else { i64::MIN }).collect();
+        let a = Type::INT8_ARRAY;
+        let types = [Type::INT8, a.clone(), a.clone(), a.clone(), a.clone()];
+        let now = 7_i64;
+        let new_plan = plan(&mut tx, UPDATE_FILES_FOLD, &types, &[&now, &ids, &counts, &firsts, &lasts]);
+        assert_eq!(new_plan.matches("atlas_file_fold").count(), 1, "the stage is scanned once:\n{new_plan}");
+        assert!(!new_plan.contains("Function Scan"), "no unnest is joined:\n{new_plan}");
+        let present: Vec<i64> = ids.iter().map(|&n| n % 2).collect();
+        let timing_plan = plan(&mut tx, timing::WRITE_FOLD, &[a.clone(), a.clone()], &[&ids, &present]);
+        assert_eq!(timing_plan.matches("Scan on atlas_file_fold").count(), 1, "the stage is scanned once:\n{timing_plan}");
+        assert!(!timing_plan.contains("Function Scan"), "no unnest is joined:\n{timing_plan}");
+        // the same files as the joined update, which got only the files that gained parts
+        let read = |tx: &mut Transaction<'_>| -> Vec<String> {
+            tx.query("select f::text from files f order by id", &[]).unwrap().iter().map(|r| r.get(0)).collect()
+        };
+        tx.batch_execute("savepoint a").unwrap();
+        let (gids, gcounts, gfirsts, glasts): (Vec<i64>, Vec<i64>, Vec<i64>, Vec<i64>) = ids
+            .iter()
+            .enumerate()
+            .filter(|&(_, &n)| gained(n))
+            .fold(Default::default(), |mut all: (Vec<i64>, Vec<i64>, Vec<i64>, Vec<i64>), (i, &n)| {
+                all.0.push(n);
+                all.1.push(counts[i]);
+                all.2.push(firsts[i]);
+                all.3.push(lasts[i]);
+                all
+            });
+        let old_rows = tx
+            .execute_typed(UPDATE_FILES_FOLD_JOINED, &[(&now, Type::INT8), (&gids, a.clone()), (&gcounts, a.clone()), (&gfirsts, a.clone()), (&glasts, a.clone())])
+            .unwrap();
+        let old = read(&mut tx);
+        tx.batch_execute("rollback to savepoint a").unwrap();
+        let new_rows = tx
+            .execute_typed(UPDATE_FILES_FOLD, &[(&now, Type::INT8), (&ids, a.clone()), (&counts, a.clone()), (&firsts, a.clone()), (&lasts, a.clone())])
+            .unwrap();
+        assert_eq!((old_rows, new_rows), (N as u64, N as u64));
+        let new = read(&mut tx);
+        assert_eq!(old, new, "the by-ord update leaves files exactly as the joined one");
+        // a stage row the arrays are not aligned with updates nothing (flush_local refuses the batch then)
+        tx.batch_execute("rollback to savepoint a").unwrap();
+        let shifted: Vec<i64> = ids.iter().map(|n| n + 1).collect();
+        let none = tx
+            .execute_typed(UPDATE_FILES_FOLD, &[(&now, Type::INT8), (&shifted, a.clone()), (&counts, a.clone()), (&firsts, a.clone()), (&lasts, a)])
+            .unwrap();
+        assert_eq!(none, 0);
+    }
+}
