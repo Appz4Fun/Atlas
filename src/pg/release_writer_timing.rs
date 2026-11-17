@@ -75,19 +75,22 @@ with ordered as materialized (
         case when old.from_hash=(select f.from_first from folded f where f.file_id=excluded.file_id) then 1 else 0 end");
 // The writer folded each file's accepted articles itself and the local article
 // store counted the file's articles, no further than this batch's plus one.
-// Each file's local count and its old Timing row (whether there was one, and
-// its last sender) are joined once up front instead of looked up per row by
-// correlated subqueries, which made this statement quadratic in the batch. The
+// Each file's local count is read from the arrays by the stage row's `ord`
+// (`files`/`present` are aligned with the stage, `files` checks it) and its old
+// Timing row (whether there was one, and its last sender) joined by primary key
+// once up front, instead of looked up per row by correlated subqueries, which
+// made this statement quadratic in the batch; no join on an unanalyzed stage is
+// left for the planner to misjudge (the stage is not analyzed). The
 // sender run joined across batches is taken off here, so a conflict only adds
 // `excluded`'s count. Reading file_timing before the insert is the same as
 // reading it in ON CONFLICT only because no other writer changes these files'
 // Timing meanwhile: every save of them holds the group#shard advisory lock
 // (`LOCK_PART`/`LOCK_PART_HELPER`) for the whole transaction.
-const WRITE_FOLD:&str=write_sql!("
+pub(super) const WRITE_FOLD:&str=write_sql!("
 with folded as materialized (
-    select f.*,p.present,o.from_hash as old_from,o.file_id is not null as had
+    select f.*,case when ($1::bigint[])[f.ord+1]=f.file_id then ($2::bigint[])[f.ord+1] end as present,
+        o.from_hash as old_from,o.file_id is not null as had
     from pg_temp.atlas_file_fold f
-    left join unnest($1::bigint[],$2::bigint[]) as p(file_id,present) on p.file_id=f.file_id
     left join file_timing o on o.file_id=f.file_id
 )
 ", "from_variants-case when old_from=from_first then 1 else 0 end", "utc_complete and (had or articles=present)",
@@ -133,7 +136,7 @@ with folded as (select * from pg_temp.atlas_file_fold)
                 subject,subject_mid,zero_file_index,first_date,last_date,first_utc,last_utc,utc_complete,number_first,number_last,
                 lines,references_seen,xref_groups_max,from_first,from_last,from_variants,encoded_subject,articles,tool,
                 clock_first,clock_last,hw_host,hw_key,hw_n_first,hw_n_last)
-            select n,1,n*2,'\\x00','f','\\x00','s','\\x00',false,90+n,300,
+            select n-1,1,n*2,'\\x00','f','\\x00','s','\\x00',false,90+n,300,
                 case when n%3=0 then null else 40 end,case when n%3=0 then null else 70 end,n%3<>0,
                 n-1,n+9,5,n%2,n%7,n%3+1,(n+1)%3+1,1+n%2,n%2,2+n%3,case when n%2=0 then 7 end,
                 n,n+1,case when n%3=0 then 'h' end,null,n,n+2
