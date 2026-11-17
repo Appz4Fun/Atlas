@@ -403,9 +403,12 @@ fn claim_turn_with(
 }
 
 /// The newest day any of `groups` still has to do or is doing: (group, oldest day the server keeps). A day pending
-/// (not resting after a failure, see `FAIL_REST`) or claimed within `CLAIM_TIMEOUT`: a day being read holds the
-/// groups behind it (`claim`), one whose claim went stale (its worker was killed) doesnt, it is anyone's to take over
-/// (`claim` takes it first). Only when stale claims are all that's left are they the frontier. A live claim that
+/// (not resting after a failure, see `FAIL_REST`). A day being read (claimed) doesnt hold it while any day is pending:
+/// on prod one big group's day, claimed and read for minutes, held forward backfill's frontier there while every
+/// other pending day in the window rested after failures, and 280 ready chunks a day past the window waited with
+/// most servers' connections idle. How long a group's day takes to read must not limit how many run at once; the
+/// group's own next day, pending, still holds the others to it, soo the lockstep gives at most a day. Live claims are
+/// the frontier only when nothing pending is left, stale ones (and failing days, below) only when nothing else is. A live claim that
 /// already failed `FRONTIER_FAILURES` times doesnt hold it, nor does a pending one that has: on prod the biggest
 /// groups' days kept failing, and each time they came back from resting they pinned forward backfill's frontier to
 /// their day, every worker idle with thousands of chunks ready a week on. Like stale claims, such days are the
@@ -482,18 +485,19 @@ fn frontier_asked(db: &dyn Sql, groups: &[(String, i64)], now: i64, newest: bool
                   select (select c.day from backfill_chunks c
                           where c.grp = w.g and c.state = {PENDING} and c.day >= w.oldest and {resting}
                             and not ({healthy})
-                          order by c.day {order} limit 1), 1
+                          order by c.day {order} limit 1), 2
                   from wanted w
                   union all
                   select (select {most}(c.day) filter (where {live}) from backfill_chunks c
-                          where c.grp = w.g and c.state = {CLAIMED} and c.day >= w.oldest and {healthy}), 0
+                          where c.grp = w.g and c.state = {CLAIMED} and c.day >= w.oldest and {healthy}), 1
                   from wanted w
                   union all
                   select (select {most}(c.day) filter (where not {live}) from backfill_chunks c
-                          where c.grp = w.g and c.state = {CLAIMED} and c.day >= w.oldest), 1
+                          where c.grp = w.g and c.state = {CLAIMED} and c.day >= w.oldest), 2
                   from wanted w
               )
-         select coalesce({most}(case when stale = 0 then day end), {most}(day)) from days",
+         select coalesce({most}(case when stale = 0 then day end), {most}(case when stale = 1 then day end),
+                         {most}(day)) from days",
         resting = not_resting(now),
         live = claim_live(now),
         healthy = format!("coalesce(c.failures, 0) < {FRONTIER_FAILURES}")
@@ -1187,7 +1191,8 @@ mod tests {
             assert!(got.windows(2).all(|w| w[0].1 >= w[1].1), "newest day first over both: {got:?}");
             assert_eq!(got[10], ("deep".to_string(), 20_020), "a media group first among equals");
 
-            // a day being read holds the rest: the next day goes, not one further back
+            // a day being read holds none back: only days pending do (on prod one big group's day, read for minutes,
+            // held hundreds of chunks ready a day on)
             wipe(c);
             add(c, "big", 20_030, 20_020).unwrap();
             add(c, "small", 20_030, 20_020).unwrap();
@@ -1199,18 +1204,17 @@ mod tests {
                 assert!(finish(c, &k, 1000).unwrap());
                 small.push((k.group, k.day));
             }
-            assert!(small.iter().all(|(_, d)| *d >= 20_030 - LOCKSTEP_DAYS), "{small:?}");
-            assert_eq!(small.len(), 3, "small's 20030 and 20029, big's 20029: {small:?}");
-            // once big's day is read, the rest move on a day
+            assert_eq!(small.len(), 21, "every day but big's 20030: {small:?}");
+            assert!(small.windows(2).all(|w| w[0].1 >= w[1].1), "newest day first: {small:?}");
             assert!(finish(c, &big, 1000).unwrap());
-            assert_eq!(day(claim(c, &groups, "b", 1000)), Some(20_028));
+            assert_eq!(claim(c, &groups, "b", 1000).unwrap(), None);
             // a stale claim is taken over first, and holds the rest meanwhile
             wipe(c);
             add(c, "g", 20_030, 20_026).unwrap();
             let groups = vec![("g".to_string(), i64::MIN)];
             let first = claim(c, &groups, "a", 1000).unwrap().unwrap();
             assert_eq!(day(claim(c, &groups, "a", 1000)), Some(20_029));
-            assert_eq!(claim(c, &groups, "a", 1000).unwrap(), None, "20030 is still being read");
+            assert_eq!(day(claim(c, &groups, "a", 1000)), Some(20_028), "20030 being read doesnt hold it");
             let late = claim(c, &groups, "b", 1000 + CLAIM_TIMEOUT + 1).unwrap().unwrap();
             assert_eq!(late.day, first.day, "the stale claim first");
         });
@@ -1540,13 +1544,14 @@ mod tests {
             let mut read = Vec::new();
             while let Some(k) = claim_with(c, &all, "h", 0, Some(20_000)).unwrap() {
                 if k.group == "a" && k.day == 20_003 {
-                    // `a`'s day 20_003 is slow: the rest may go a day past it, no further
+                    // `a`'s day 20_003 is slow: it holds nothing back, every other day is read meanwhile, oldest first
                     let mut ahead = Vec::new();
                     while let Some(k2) = claim_with(c, &all, "h", 0, Some(20_000)).unwrap() {
                         ahead.push(k2.day);
                         assert!(finish(c, &k2, 0).unwrap());
                     }
-                    assert!(!ahead.is_empty() && ahead.iter().all(|d| *d <= 20_004), "{ahead:?}");
+                    assert_eq!(ahead.len(), 15, "{ahead:?}");
+                    assert!(ahead.windows(2).all(|w| w[0] <= w[1]), "{ahead:?}");
                     read.extend(ahead);
                 }
                 assert!(k.day >= 20_000);
@@ -1631,8 +1636,12 @@ mod tests {
                 assert!(finish(c, &k, 1000).unwrap());
             }
             let small = || claim_turn_with(c, ("small".into(), i64::MIN), &all, "h", 2000, Some(20_000)).unwrap();
-            assert_eq!(frontier_oldest(c, &all, 2000).unwrap(), Some(20_000), "a fresh claim holds it");
-            assert_eq!(small(), None);
+            // a fresh claim doesnt hold it either, big's next pending day does
+            assert_eq!(frontier_oldest(c, &all, 2000).unwrap(), Some(20_001));
+            let k = small().unwrap();
+            assert_eq!(k.day, 20_002, "a day past big's next pending day");
+            assert!(finish(c, &k, 2000).unwrap());
+            assert_eq!(small(), None, "no further");
             // past the timeout big's claim no longer counts: the frontier is big's next pending day
             let late = 1000 + CLAIM_TIMEOUT + 1;
             assert_eq!(frontier_oldest(c, &all, late).unwrap(), Some(20_001));
@@ -1666,6 +1675,41 @@ mod tests {
         });
     }
 
+    /// Prod, forward from 20741 with a 7-day lockstep: one big group's day 20743, claimed and never failed, was
+    /// being read for minutes; every other day up to 20750 was failing and resting, and the small groups' days from
+    /// 20751 on (never failed) waited, nothing claimed for minutes with most servers' connections idle. A day being
+    /// read doesnt hold the frontier while days are pending: any idle worker takes the next ready day, whatever group.
+    #[test]
+    fn a_big_groups_day_being_read_doesnt_starve_the_ready_days_past_it() {
+        both(|c| {
+            let lockstep = 7;
+            let now = 100_000;
+            c.execute(&format!("insert into backfill_chunks(grp,day,state,server,claimed_at,failed_at,failures) values
+                ('big',20743,1,'nh',{now},null,null),('big',20744,0,null,null,{now},3),
+                ('failing',20745,1,'nh',{now},null,4),('failing',20746,0,null,null,{now},5),
+                ('big',20751,0,null,null,null,null),('small1',20751,0,null,null,null,null),
+                ('small2',20752,0,null,null,null,null),('small3',20758,0,null,null,null,null),
+                ('small3',20759,0,null,null,null,null)"), vals![]).unwrap();
+            let all: Vec<(String, i64)> =
+                ["big", "failing", "small1", "small2", "small3"].iter().map(|g| (g.to_string(), i64::MIN)).collect();
+            assert_eq!(frontier_oldest(c, &all, now).unwrap(), Some(20751), "big's day being read doesnt hold it");
+            let mut got = Vec::new();
+            for _ in 0..4 {
+                let from: Vec<(String, i64)> = all.iter().map(|(g, o)| (g.clone(), (*o).max(20741))).collect();
+                let frontier = frontier_oldest(c, &from, now).unwrap().unwrap();
+                let ranges: Vec<(String, i64, i64)> = from.into_iter().map(|(g, o)| (g, o, frontier + lockstep)).collect();
+                let k = claim_ordered(c, &ranges, &[], "idle", now, true).unwrap().unwrap();
+                got.push((k.group, k.day));
+            }
+            let want = [("big", 20751), ("small1", 20751), ("small2", 20752), ("small3", 20758)];
+            assert_eq!(got, want.map(|(g, d)| (g.to_string(), d)), "every ready day in the window, on idle workers");
+            // and claim, by any server, gets the same: none of them is held to a group or its size
+            c.execute("update backfill_chunks set state = 0, server = null, claimed_at = null where day >= 20751", vals![]).unwrap();
+            assert!(claim_with(c, &all, "eweka", now, Some(20741)).unwrap().is_some_and(|k| k.day == 20751));
+            assert!(claim_with(c, &all, "frugal", now, Some(20741)).unwrap().is_some_and(|k| k.day == 20751));
+        });
+    }
+
     #[test]
     fn claimed_frontiers_preserve_expiry_nulls_bounds_and_stale_fallback() {
         both(|c| {
@@ -1679,11 +1723,12 @@ mod tests {
                 ('stale',10,1,8199,null,null),('stale',20,1,8198,null,null),
                 ('unknown',10,1,null,null,null)", vals![]).unwrap();
             for (groups, now, oldest, newest) in [
-                (vec![("mixed", 0)], 10000, Some(20), Some(30)),
+                // a pending day goes before live claims
+                (vec![("mixed", 0)], 10000, Some(25), Some(25)),
                 (vec![("mixed", 26)], 10000, Some(30), Some(30)),
                 (vec![("mixed", 31)], 10000, Some(40), Some(40)),
                 (vec![("mixed", 41)], 10000, None, None),
-                (vec![("mixed", 26), ("mixed", 0)], 10000, Some(20), Some(30)),
+                (vec![("mixed", 26), ("mixed", 0)], 10000, Some(25), Some(25)),
                 (vec![("mixed", 0)], 10300, Some(5), Some(60)),
                 (vec![("boundary", 0)], 10000, Some(20), Some(20)),
                 (vec![("boundary", 0)], 10001, Some(10), Some(20)),
