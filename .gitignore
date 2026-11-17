@@ -76,3 +76,7 @@ dev_nntp_server.py
 /.worktrees/
 /.superpowers/
 /stills/
+
+# test scratch output
+multipart-writer-*/
+writer-stage-plan-*/
