@@ -154,6 +154,18 @@ fn big_jobs_of_one_group_save_by_shard_side_by_side_without_lock_timeouts() {
                 .get(0);
             assert_eq!(kept, saved, "the group's shards sum to its releases");
             assert!(shards > 1, "kept per shard");
+            // the rows' shard is the writer's (migration 0021: mod 64), each row counting exactly its shard's releases
+            let (top, off): (i16, i64) = {
+                let row = client.query_one(
+                    "select (select max(shard) from native_metric_catalog_groups where group_name='alt.binaries.helpers'),
+                            (select count(*) from native_metric_catalog_groups m where m.group_name='alt.binaries.helpers' and m.total <>
+                              (select count(*) from releases r where r.group_name=m.group_name and get_byte(r.identity_key,0)%64=m.shard))",
+                    &[],
+                )?;
+                (row.get(0), row.get(1))
+            };
+            assert!(top >= 16 && top < 64, "shards past the old 16 are kept, none past 64: {top}");
+            assert_eq!(off, 0, "every shard row counts its shard's releases");
             Ok(())
         })
         .unwrap();
