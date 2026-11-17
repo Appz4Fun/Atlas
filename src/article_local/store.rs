@@ -241,20 +241,14 @@ impl Store {
             }
             return Ok(answers);
         }
-        std::thread::scope(|scope| {
-            let asks: Vec<_> = busy.iter().map(|&at| (at, scope.spawn({
-                let groups = &groups;
-                let ask = &ask;
-                move || ask(at, &groups[at])
-            }))).collect();
-            for (at, ask) in asks {
-                let found = ask.join().map_err(|_| anyhow::anyhow!("a local store lookup panicked"))??;
-                for (&i, known) in groups[at].iter().zip(found) {
-                    answers[i] = known;
-                }
+        // on the store's lookup threads (`super::lookups`), not threads spawned for each call
+        use rayon::prelude::*;
+        let found: Vec<Vec<bool>> = super::lookups().install(|| busy.par_iter().map(|&at| ask(at, &groups[at])).collect::<Result<_>>())?;
+        for (&at, found) in busy.iter().zip(found) {
+            for (&i, known) in groups[at].iter().zip(found) {
+                answers[i] = known;
             }
-            Ok::<_, anyhow::Error>(())
-        })?;
+        }
         Ok(answers)
     }
 

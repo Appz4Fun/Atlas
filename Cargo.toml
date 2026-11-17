@@ -24,6 +24,7 @@ indexmap = "2"
 lzma-rs = "0.3"
 md-5 = "0.10"
 ratatui = "0.30"
+rayon = "1.12"
 regex = "1"
 fancy-regex = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }

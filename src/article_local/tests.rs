@@ -478,7 +478,7 @@ fn queued_saves<'a>(store: &'a Store, home: i64, saves: Vec<(String, Vec<NewRow<
     std::thread::scope(|scope| {
         let threads: Vec<_> = saves.into_iter().map(|(xid, rows)| scope.spawn(move || store.add(&xid, &rows, 100))).collect();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        while shard.queue.lock().unwrap().len() < threads.len() {
+        while shard.queue.lock().unwrap().pending.len() < threads.len() {
             assert!(std::time::Instant::now() < deadline, "the saves never queued");
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
@@ -587,4 +587,112 @@ fn idle_readers_are_kept_up_to_one_total_over_every_file() {
     let kept: usize = store.shards().iter().map(|s| s.readers.lock().unwrap().len()).sum();
     assert!(kept <= READERS_KEPT, "{kept} idle readers kept");
     assert_eq!(kept, store.shards()[0].idle_readers.load(Ordering::Acquire));
+}
+
+/// Many saves at once over a few files, `per` each from `threads` threads: every save sees its own rows when its `add`
+/// returns, and every row is there at the end. Returns how long they took.
+fn many_saves_at_once(store: &Store, threads: i64, per: i64, rows_each: i64) -> std::time::Duration {
+    let started = std::time::Instant::now();
+    std::thread::scope(|scope| {
+        for t in 0..threads {
+            scope.spawn(move || {
+                // three releases per thread, each in a file shared with other threads' releases
+                for n in 0..per {
+                    let release = 9 + (t * 3 + n % 3) * 8 % 64 + (t * 3 + n % 3) * 64;
+                    let ids: Vec<Vec<u8>> = (0..rows_each).map(|k| format!("<{t}-{n}-{k}>").into_bytes()).collect();
+                    let rows: Vec<NewRow<'_>> = ids.iter().enumerate().map(|(k, id)| row(release, release * 100 + n, id, Some(k as i64))).collect();
+                    let parts = store.add(&format!("x{t}-{n}"), &rows, 1000).unwrap();
+                    assert_eq!(parts, vec![NewParts { file_id: release * 100 + n, count: rows_each, first: 0, last: rows_each - 1 }]);
+                    let keys: Vec<(i64, &[u8])> = ids.iter().map(|id| (release, id.as_slice())).collect();
+                    assert!(store.has(&keys).unwrap().into_iter().all(|known| known), "save {t}-{n} doesnt see its rows");
+                }
+            });
+        }
+    });
+    let took = started.elapsed();
+    assert_eq!(store.segment_count().unwrap() as i64, threads * per * rows_each);
+    took
+}
+
+#[test]
+fn many_saves_at_once_each_see_their_rows_committed() {
+    let (_dir, store) = store();
+    let took = many_saves_at_once(&store, 48, 40, 20);
+    eprintln!("48 threads x 40 saves x 20 rows: {took:?}");
+    // each save waits under its own transaction
+    let mut asked = 0;
+    store.settle(|_| { asked += 1; Ok(Ended::Running) }).unwrap();
+    assert_eq!(asked, 48 * 40);
+}
+
+/// Saves contending for one file, timed: `cargo test --release -- --ignored --nocapture saves_contending`.
+#[test]
+#[ignore]
+fn saves_contending_for_files_timed() {
+    for (threads, rows) in [(32, 20), (32, 200), (64, 20)] {
+        let (_dir, store) = store();
+        let took = many_saves_at_once(&store, threads, 100, rows);
+        eprintln!("{threads} threads x 100 saves x {rows} rows: {took:?}, {} saves/s", (threads * 100) as f64 / took.as_secs_f64());
+    }
+}
+
+#[test]
+fn saves_of_one_release_one_after_another_each_see_the_last() {
+    let (_dir, store) = store();
+    let store = &store;
+    // one release saved in turn (as its PostgreSQL group lock has it) while other threads save into the same file
+    std::thread::scope(|scope| {
+        for t in 0..16i64 {
+            scope.spawn(move || {
+                for n in 0..30 {
+                    let id = format!("<o{t}-{n}>").into_bytes();
+                    store.add(&format!("o{t}-{n}"), &[row(17 + 8 * 8 * (t + 1), 5, &id, Some(n))], 100).unwrap();
+                }
+            });
+        }
+        for n in 0..60i64 {
+            let id = format!("<mine-{n}>").into_bytes();
+            // the file's parts so far count: a part saved earlier isnt gained again
+            let part = n / 2;
+            let gained = store.add(&format!("m{n}"), &[row(17, 170, &id, Some(part))], 100).unwrap();
+            let want = if n % 2 == 0 { vec![NewParts { file_id: 170, count: 1, first: part, last: part }] } else { Vec::new() };
+            assert_eq!(gained, want, "save {n}");
+        }
+    });
+}
+
+#[test]
+fn a_failing_write_connection_fails_every_queued_save() {
+    let (_dir, store) = store();
+    let store = &store;
+    let (a, b, c) = (9, 17, 25);
+    let shard = store.on(a);
+    let held = &std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        // a thread holds the write lock and panics with it, poisoning it, once every save queued behind it
+        let holder = scope.spawn(move || {
+            let _conn = shard.lock().unwrap();
+            held.wait();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while shard.queue.lock().unwrap().pending.len() < 3 {
+                assert!(std::time::Instant::now() < deadline, "the saves never queued");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            panic!("poisoning the write lock");
+        });
+        held.wait();
+        let saves: Vec<_> = [a, b, c]
+            .into_iter()
+            .map(|r| scope.spawn(move || {
+                let id = format!("<{r}>").into_bytes();
+                store.add(&format!("x{r}"), &[row(r, r * 10, &id, Some(1))], 100).map(|_| ())
+            }))
+            .collect();
+        assert!(holder.join().is_err());
+        for save in saves {
+            let error = format!("{:#}", save.join().unwrap().unwrap_err());
+            assert!(error.contains("poisoned"), "{error}");
+        }
+    });
+    assert!(!store.on(a).queue.lock().unwrap().leading, "the lead was let go");
 }
