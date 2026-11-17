@@ -197,16 +197,24 @@ impl Fetch {
         self.0.is_some()
     }
 
-    /// Keep a fetched listing, waiting for byte capacity before copying it into the store.
+    /// Keep a fetched listing's linker rows (`linker_rows`), waiting for byte capacity before copying them into the
+    /// store. The whole listing comes back as it was fetched; the claimed days are refreshed from all its rows.
     pub async fn record(&self, server: &str, group: &str, lines: Vec<Vec<u8>>) -> anyhow::Result<Vec<Vec<u8>>> {
         let Some((store, fetch)) = &self.0 else { return Ok(lines) };
         if lines.is_empty() {
             return Ok(lines);
         }
         let now = now();
-        let (lines, ticket) =
-            store.record_live_for_fetch(server, group, lines, Clamp::Unknown { now }, Arc::clone(fetch)).await?;
-        refresh_claimed(&ticket.days, now);
+        let (lines, kept, days) = tokio::task::spawn_blocking(move || {
+            let kept = linker_rows(&lines);
+            let days = listing_days(&lines);
+            (lines, kept, days)
+        })
+        .await?;
+        refresh_claimed(&days, now);
+        if !kept.is_empty() {
+            store.record_live_for_fetch(server, group, kept, Clamp::Unknown { now }, Arc::clone(fetch)).await?;
+        }
         Ok(lines)
     }
 
@@ -215,6 +223,33 @@ impl Fetch {
     pub async fn finish(self)->anyhow::Result<()> {
         if let Some((store,request))=self.0 {request.finish(store).await?;}Ok(())
     }
+}
+
+/// Whether an overview row is one the linkers read: obfuscated per article (`xref::keeps_fields` on its subject,
+/// poster and message-id, the test both the store's linker and the native linker apply to every row). Only those are
+/// stored; the indexer saves every other row itself, and nothing reads them from the store. A row too short to have
+/// those fields is kept, as before.
+pub fn linker_row(line: &[u8]) -> bool {
+    let mut f = line.splitn(6, |&b| b == b'\t');
+    let (_, Some(subject), Some(author), _, Some(message_id)) = (f.next(), f.next(), f.next(), f.next(), f.next())
+    else {
+        return true;
+    };
+    crate::xref::keeps_fields(subject, author, message_id)
+}
+
+/// The rows of a listing the store keeps (`linker_row`).
+pub fn linker_rows(lines: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    lines.iter().filter(|l| linker_row(l)).cloned().collect()
+}
+
+/// A listing's rows by posting day, kept or not (`refresh_claimed`).
+fn listing_days(lines: &[Vec<u8>]) -> Vec<(i64, usize)> {
+    let mut days = BTreeMap::new();
+    for day in lines.iter().filter_map(|l| super::store::row_day(l)) {
+        *days.entry(day).or_insert(0usize) += 1;
+    }
+    days.into_iter().collect()
 }
 
 /// What a slice waits on before it counts as read: every row recorded for `group` so far durable. None when the
@@ -347,6 +382,94 @@ pub(crate) mod tests {
     #[test]
     fn public_spawn_never_opens_legacy_linker_metadata() {
         metadata_startup("nxv_store::live::tests::public_spawn_never_opens_legacy_linker_metadata", "public");
+    }
+
+    #[test]
+    fn a_fetch_stores_only_the_linker_rows_and_hands_back_the_whole_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = Store::open(
+            StoreConfig { sealers: 1, ..StoreConfig::new(dir.path()) },
+            KeepSet { live_from: i64::MIN / 2, ..KeepSet::default() },
+        )
+        .unwrap();
+        let date = "Fri, 02 Jan 1970 03:30:00 +0000";
+        let obfuscated = |n: u64| format!("{n}\ta{n}b8c7d6e5f4\tq{n}@x.y\t{date}\t<a{n}b8c7d6e5f4@ngPost>\t\t740000\t5692");
+        let plain = |n: u64| {
+            format!("{n}\tSome.Show.S01E01.1080p.WEB-GRP [01/10] - \"s.part01.rar\" yEnc ({n}/50)\tp@x.y\t{date}\t<p{n}@x.y>\t\t740000\t5692")
+        };
+        let lines: Vec<Vec<u8>> = (1..=6u64)
+            .map(|n| if n % 3 == 0 { obfuscated(n) } else { plain(n) }.into_bytes())
+            .collect();
+        assert_eq!(lines.iter().filter(|l| linker_row(l)).count(), 2);
+        assert!(linker_row(b"1\tshort"), "a row too short to judge is kept");
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let back = rt.block_on(async {
+            let fetch = Fetch::begin_on(Arc::clone(&store)).await.unwrap();
+            let back = fetch.record("server.example", "group.example", lines.clone()).await.unwrap();
+            // a listing with nothing the linkers read stores nothing
+            let none: Vec<Vec<u8>> = vec![plain(10).into_bytes()];
+            assert_eq!(fetch.record("server.example", "other.example", none.clone()).await.unwrap(), none);
+            fetch.finish().await.unwrap();
+            back
+        });
+        assert_eq!(back, lines, "the indexer gets every row it fetched");
+        store.close().unwrap();
+        assert_eq!(store.segment_snapshot("group.example", 1).unwrap().unwrap().count, 1, "one block");
+        let rows: u64 = store.blocks("group.example", i64::MIN / 4, i64::MAX / 4).iter().map(|(_, e)| e.rows as u64).sum();
+        assert_eq!(rows, 2, "only the obfuscated rows stored");
+        assert!(store.blocks("other.example", i64::MIN / 4, i64::MAX / 4).is_empty());
+    }
+
+    /// Read-only sample of live day files: `ATLAS_NXV_SAMPLE=<day.nxv>[:<day.nxv>...]` (each with its `.nxvi`), at
+    /// most `ATLAS_NXV_SAMPLE_BLOCKS` blocks spread across each (default 64). Prints the share of rows and of wire
+    /// bytes `linker_row` keeps. Nothing is written.
+    #[test]
+    #[ignore]
+    fn sample_linker_row_share_of_live_day_files() {
+        use nntp_xover_engine::container::NxvBlockView;
+        use nntp_xover_engine::streamer::{NxvRangeCursor, XoverStreamScratch};
+        use std::io::Read;
+        let Ok(paths) = std::env::var("ATLAS_NXV_SAMPLE") else { return };
+        let want: usize = std::env::var("ATLAS_NXV_SAMPLE_BLOCKS").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
+        let (mut rows, mut kept, mut bytes, mut kept_bytes) = (0u64, 0u64, 0u64, 0u64);
+        for path in paths.split(':').filter(|p| !p.is_empty()) {
+            let arena = std::fs::File::open(path).unwrap();
+            let mut index = Vec::new();
+            std::fs::File::open(Path::new(path).with_extension("nxvi")).unwrap().read_to_end(&mut index).unwrap();
+            let entries: Vec<_> = index
+                .chunks_exact(super::super::segment::ENTRY_LEN)
+                .map(super::super::segment::Entry::from_bytes)
+                .collect();
+            let step = (entries.len() / want.max(1)).max(1);
+            let (mut r, mut k, mut b, mut kb) = (0u64, 0u64, 0u64, 0u64);
+            let mut scratch = XoverStreamScratch::new();
+            for e in entries.iter().step_by(step).take(want) {
+                let map = unsafe { memmap2::MmapOptions::new().offset(e.offset).len(e.len as usize).map(&arena) };
+                let Ok(map) = map else { continue };
+                let Ok(view) = NxvBlockView::from_mmap_slice(&map) else { continue };
+                let Ok(mut cur) = NxvRangeCursor::new_for_art_range(view, 0, u64::MAX) else { continue };
+                loop {
+                    scratch.wire_buf.clear();
+                    if !cur.format_next_row(&mut scratch) {
+                        break;
+                    }
+                    let line = &scratch.wire_buf[..scratch.wire_buf.len().saturating_sub(2)];
+                    r += 1;
+                    b += line.len() as u64;
+                    if linker_row(line) {
+                        k += 1;
+                        kb += line.len() as u64;
+                    }
+                }
+            }
+            println!("{path}: {} blocks of {}, rows {k}/{r}, wire bytes {kb}/{b}", entries.len().min(want), entries.len());
+            (rows, kept, bytes, kept_bytes) = (rows + r, kept + k, bytes + b, kept_bytes + kb);
+        }
+        println!(
+            "total: rows kept {kept}/{rows} ({:.2}%), wire bytes kept {kept_bytes}/{bytes} ({:.2}%)",
+            100.0 * kept as f64 / rows.max(1) as f64,
+            100.0 * kept_bytes as f64 / bytes.max(1) as f64
+        );
     }
 
     fn aged_input(root: &Path) {

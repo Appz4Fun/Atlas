@@ -1438,6 +1438,57 @@ mod tests {
         assert_eq!(std::fs::metadata(&path).unwrap().ino(), ino, "not rewritten");
     }
 
+    /// An ordinary overview line, one a subject rule reads: the indexer saves it, the store doesn't keep it.
+    fn plain(art: u64, secs: i64, n: u64) -> Vec<u8> {
+        let date = chrono::DateTime::from_timestamp(secs, 0).unwrap().format("%a, %d %b %Y %H:%M:%S +0000");
+        format!("{art}\tSome.Show.S01E01.1080p.WEB-GRP [01/10] - \"some.show.s01e01.part01.rar\" yEnc ({n}/50)\tposter@example.invalid\t{date}\t<plain{n}.{secs}@example.invalid>\t\t740000\t5692").into_bytes()
+    }
+
+    fn link_all(store: &Store, state: &Path, now: i64) -> Vec<Release> {
+        let mut lk = Linker::open_in(state, now).unwrap();
+        let mut releases = Vec::new();
+        while let Some(f) = lk.pass(store, now, &HashSet::new(), &|| false).unwrap() {
+            releases.extend(f.releases.clone());
+            lk.ack(f).unwrap();
+        }
+        releases
+    }
+
+    #[test]
+    fn the_store_keeping_only_linker_rows_links_the_same_releases() {
+        let mut rows = upload("aa", T0 + 600, 5, 4, 2);
+        // ordinary rows among the obfuscated ones, in both groups and across the same hours
+        let mixed: Vec<(usize, Vec<u8>)> =
+            (0..40u64).map(|n| ((n % 2) as usize, plain(0, T0 + 600 + n as i64 * 30, n + 1))).collect();
+        for (i, r) in mixed.iter().enumerate() {
+            rows.insert((i * 3).min(rows.len()), r.clone());
+        }
+        let filtered: Vec<(usize, Vec<u8>)> =
+            rows.iter().filter(|(_, l)| crate::nxv_store::live::linker_row(l)).cloned().collect();
+        assert_eq!(filtered.len(), rows.len() - mixed.len(), "every ordinary row dropped, every obfuscated one kept");
+        assert!(mixed.iter().all(|(_, l)| !crate::nxv_store::live::linker_row(l)));
+        let now = T0 + 6 * 3600;
+        let (all_dir, kept_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (all, _) = Store::open(cfg(all_dir.path()), keep_all()).unwrap();
+        let (kept, _) = Store::open(cfg(kept_dir.path()), keep_all()).unwrap();
+        record(&all, &rows, 1000);
+        record(&kept, &filtered, 1000);
+        let a = link_all(&all, &all_dir.path().join("lstate"), now);
+        let b = link_all(&kept, &kept_dir.path().join("lstate"), now);
+        assert_eq!(a.len(), 1, "the upload linked");
+        let shape = |rs: &[Release]| -> Vec<(String, Vec<(String, String)>)> {
+            rs.iter()
+                .map(|r| {
+                    let mut arts: Vec<_> = r.articles.iter().map(|x| (x.message_id.clone(), x.subject.clone())).collect();
+                    arts.sort();
+                    (r.name.clone(), arts)
+                })
+                .collect()
+        };
+        assert_eq!(shape(&a), shape(&b), "the same releases, names, articles and subjects");
+        assert_eq!(b[0].articles.len(), 2 * (1 + 5 * 4));
+    }
+
     #[test]
     fn a_day_pass_links_an_upload_across_groups_once_and_late_parts_join_it() {
         let dir = tempfile::tempdir().unwrap();

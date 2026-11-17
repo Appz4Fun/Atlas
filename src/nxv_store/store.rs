@@ -402,6 +402,11 @@ fn listing_charge(lines: &[Vec<u8>]) -> usize {
     lines.iter().fold(0, |sum, line| sum.saturating_add(row_charge(line)))
 }
 
+/// The unix posting day of an overview row, when its date reads (`live::Fetch::record`'s day tally).
+pub(super) fn row_day(line: &[u8]) -> Option<i64> {
+    Some(parse_row(line)?.1?.div_euclid(DAY))
+}
+
 fn parse_row(line: &[u8]) -> Option<(u64, Option<i64>)> {
     if line.len() > slab::MAX_LINE || line.contains(&b'\n') || line.contains(&b'\r') {
         return None;
