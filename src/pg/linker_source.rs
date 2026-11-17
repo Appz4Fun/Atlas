@@ -1,6 +1,8 @@
 //! Bounded source capture and staging steps. The caller holds the store's
 //! retention pin until this phase finishes; source receipts are not publication
 //! acknowledgements. Every inventory page and every block mapping is durable.
+//! The pin holds off keep-set and coverage expiry only: the store's age retention deletes regardless, and a source it
+//! retired (`Store::retired`) counts as consumed instead of as damage.
 
 use super::linker_stage::Budget;
 use crate::indexer::{Db, on_native_db};
@@ -75,8 +77,11 @@ pub(crate) async fn step(db: &Db, store: &Arc<Store>, epoch: i64, budget: Budget
         let page = store.segment_inventory_page(after, INVENTORY_PAGE);
         let mut captured = Vec::with_capacity(page.entries.len());
         for (group, day, _) in page.entries {
-            let snapshot =
-                store.segment_snapshot(&group, day)?.context("native source disappeared while retention was pinned")?;
+            let Some(snapshot) = store.segment_snapshot(&group, day)? else {
+                // deleted for age between the page and now: nothing left to stage
+                ensure!(store.retired(&group, day, None), "native source disappeared while retention was pinned");
+                continue;
+            };
             captured.push((group, day, snapshot.identity, i64::try_from(snapshot.count)?));
         }
         let now = state.1;
@@ -146,12 +151,28 @@ pub(crate) async fn step(db: &Db, store: &Arc<Store>, epoch: i64, budget: Budget
         cache.block = None;
         return Ok(true);
     };
-    let snapshot =
-        store.segment_snapshot(&group, day)?.context("native source disappeared before durable staging completed")?;
-    ensure!(
-        snapshot.identity.as_slice() == generation.as_slice(),
-        "native source generation changed before staging completed"
-    );
+    let snapshot = match store.segment_snapshot(&group, day)? {
+        Some(snapshot) if snapshot.identity.as_slice() == generation.as_slice() => snapshot,
+        found if store.retired(&group, day, Some(&generation)) => {
+            // the header store's retention deleted this source for age (`Store::retention_sweep`): what wasn't staged
+            // of it is gone by design, soo the row counts as scanned and the epoch moves on
+            drop(found);
+            cache.block = None;
+            on_native_db(db, move |c| {
+                super::linker::durable_execute(
+                    c,
+                    "update linker_epoch_inventory set scanned_blocks=blocks
+                    where epoch=$1 and group_name=$2 and day=$3 and generation=$4",
+                    &[&epoch, &group, &day, &generation],
+                )?;
+                Ok(())
+            })
+            .await?;
+            return Ok(false);
+        }
+        Some(_) => anyhow::bail!("native source generation changed before staging completed"),
+        None => anyhow::bail!("native source disappeared before durable staging completed"),
+    };
     ensure!(snapshot.count >= usize::try_from(blocks)?, "native source prefix shrank before staging completed");
     let entry = snapshot
         .entries(usize::try_from(index)?, 1)

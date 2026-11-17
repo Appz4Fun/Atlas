@@ -152,6 +152,8 @@ struct Writer {
     /// commits holding space here: the idle closer and expiry leave the segment alone while any are
     in_flight: usize,
     last_write: Instant,
+    /// a block was reserved here since open
+    wrote: bool,
     expired: bool,
 }
 
@@ -310,6 +312,7 @@ impl Segment {
                 next_seq: entries.len() as u32,
                 in_flight: 0,
                 last_write: Instant::now(),
+                wrote: false,
                 expired: false,
             }),
             view: RwLock::new(View { map, entries, committed }),
@@ -365,6 +368,7 @@ impl Segment {
         w.index_tail += ENTRY_LEN as u64;
         w.next_seq += 1;
         w.in_flight += 1;
+        w.wrote = true;
         w.last_write = Instant::now();
         let (a, i) = w.files.clone().expect("opened above");
         Ok(Some(Reserved { seg: Arc::clone(self), arena: a, index: i, entry }))
@@ -402,6 +406,32 @@ impl Segment {
             return true;
         }
         false
+    }
+
+    /// The arena's identity (device, inode, birth): what a snapshot of it pins.
+    pub fn identity(&self) -> [u8; 32] {
+        self.identity
+    }
+
+    /// When the segment was last written: the later modification time of its two files, or of a commit made by this
+    /// process (which the files' times already show, unless the clock moved). None when neither file can be read.
+    pub fn written_at(&self) -> Option<std::time::SystemTime> {
+        let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+        let files = mtime(&self.arena_path).into_iter().chain(mtime(&self.index_path)).max()?;
+        let w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let here = if w.in_flight > 0 {
+            std::time::SystemTime::now()
+        } else {
+            std::time::SystemTime::now().checked_sub(w.last_write.elapsed()).unwrap_or(std::time::UNIX_EPOCH)
+        };
+        // last_write starts at open, soo it only ever makes a segment look younger, never older
+        Some(if w.wrote { files.max(here) } else { files })
+    }
+
+    /// Bytes its two files take on disk.
+    pub fn disk_bytes(&self) -> u64 {
+        let size = |p: &Path| std::fs::metadata(p).map_or(0, |m| m.blocks() * 512);
+        size(&self.arena_path) + size(&self.index_path)
     }
 
     /// Marks the segment expired and deletes its files, unless a commit holds it (then false: try again later).

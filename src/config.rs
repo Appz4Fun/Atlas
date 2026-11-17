@@ -816,6 +816,24 @@ pub fn article_store_config() -> ArticleStoreConfig {
     read_file().map_or_else(ArticleStoreConfig::default, |v| ArticleStoreConfig::from_value(v.get("article_store")))
 }
 
+/// How long the header store keeps a day file after its last write (`header_store.retention_hours`, default 24; 0 or
+/// less keeps everything). Read apart from `HeaderStoreConfig` so a change doesn't restart the indexer's store.
+pub fn header_store_retention() -> Option<std::time::Duration> {
+    header_store_retention_from(read_file().as_ref().and_then(|v| v.get("header_store")))
+}
+
+fn header_store_retention_from(v: Option<&Value>) -> Option<std::time::Duration> {
+    let hours = match v.and_then(|v| v.get("retention_hours")) {
+        None | Some(Value::Null) => DEFAULT_HEADER_STORE_RETENTION_HOURS,
+        Some(Value::Number(n)) => n.as_f64().unwrap_or(DEFAULT_HEADER_STORE_RETENTION_HOURS),
+        Some(Value::String(s)) => s.trim().parse().unwrap_or(DEFAULT_HEADER_STORE_RETENTION_HOURS),
+        Some(_) => DEFAULT_HEADER_STORE_RETENTION_HOURS,
+    };
+    (hours.is_finite() && hours > 0.0).then(|| std::time::Duration::from_secs_f64(hours * 3600.0))
+}
+
+pub const DEFAULT_HEADER_STORE_RETENTION_HOURS: f64 = 24.0;
+
 /// The file's `header_store` object: no keyring.
 pub fn header_store_config() -> HeaderStoreConfig {
     read_file().map_or_else(HeaderStoreConfig::default, |v| HeaderStoreConfig::from_value(v.get("header_store")))
@@ -2685,5 +2703,16 @@ mod tests {
         );
         assert_eq!(IndexingConfig::from_value(None), IndexingConfig::default());
         assert!(!IndexingConfig::default().ranks());
+    }
+
+    #[test]
+    fn header_store_retention_defaults_to_a_day_and_zero_turns_it_off() {
+        let day = Some(std::time::Duration::from_secs(24 * 3600));
+        assert_eq!(header_store_retention_from(None), day);
+        assert_eq!(header_store_retention_from(Some(&json!({"enabled": true}))), day);
+        assert_eq!(header_store_retention_from(Some(&json!({"retention_hours": 6}))), Some(std::time::Duration::from_secs(6 * 3600)));
+        assert_eq!(header_store_retention_from(Some(&json!({"retention_hours": "1.5"}))), Some(std::time::Duration::from_secs(5400)));
+        assert_eq!(header_store_retention_from(Some(&json!({"retention_hours": 0}))), None);
+        assert_eq!(header_store_retention_from(Some(&json!({"retention_hours": -3}))), None);
     }
 }

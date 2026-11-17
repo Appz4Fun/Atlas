@@ -1,7 +1,8 @@
 //! The day-segment header store: every overview line Atlas fetches, from every server, kept as immutable `.nxv` blocks
 //! in one file per group per UTC day, with no database. Rows wait in per-slab logs (durable within about 100 ms, soo
 //! read cursors can move) until a slab is sealed into a block, which a single committer appends with one full drive
-//! flush per batch. Days leave as whole files once nothing keeps them.
+//! flush per batch. Days leave as whole files once nothing keeps them, and in any case once not written for
+//! `[header_store] retention_hours` (default 24: `Store::retention_sweep`).
 //!
 //! The design is written up in the architecture plan ("Atlas header store without SQLite").
 

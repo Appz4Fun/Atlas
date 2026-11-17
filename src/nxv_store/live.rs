@@ -135,7 +135,10 @@ pub fn spawn(cfg: &crate::config::HeaderStoreConfig) -> anyhow::Result<()> {
     let state_dir: PathBuf = root.join("_state");
     load_claimed(&state_dir);
     use anyhow::Context;
-    let (store, opened) = Store::open(StoreConfig { bounded_maps: true, ..StoreConfig::new(&root) }, keep_now())
+    let (store, opened) = Store::open(
+        StoreConfig { bounded_maps: true, retention: crate::config::header_store_retention(), ..StoreConfig::new(&root) },
+        keep_now(),
+    )
         .with_context(|| format!("opening header store {}", root.display()))?;
     eprintln!(
         "header store: {} segments, {} blocks; {} logs replayed ({} rows), {} already committed",

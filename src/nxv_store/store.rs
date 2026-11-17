@@ -71,6 +71,9 @@ pub struct StoreConfig {
     pub memory_budget: usize,
     /// Native reads map only the current format-bounded block.
     pub bounded_maps: bool,
+    /// A day file not written for this long is deleted (`retention_sweep`), whatever the keep set says. None keeps
+    /// files until the keep set and the linker let them go.
+    pub retention: Option<Duration>,
 }
 
 impl StoreConfig {
@@ -84,8 +87,29 @@ impl StoreConfig {
             sealers: std::thread::available_parallelism().map_or(2, |n| n.get().clamp(1, 4)),
             memory_budget: LIVE_MEMORY_BUDGET,
             bounded_maps: false,
+            retention: None,
         }
     }
+}
+
+/// How often the retention thread sweeps.
+pub const RETENTION_EVERY: Duration = Duration::from_secs(300);
+/// How long a retired segment is remembered for the linker (an epoch older than this restarts anyway).
+const RETIRED_MEMORY: i64 = 14 * DAY;
+const RETIRED_FILE: &str = "retention-retired";
+/// Segments expired per hold of a group's locks.
+const RETENTION_CHUNK: usize = 32;
+
+/// What one retention sweep did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RetentionReport {
+    /// segments deleted, and the bytes their files took
+    pub removed: usize,
+    pub freed: u64,
+    /// segments old enough that stayed: a slab of their day open or on its way to disk, or a commit holding them
+    pub held: usize,
+    /// the oldest and newest posting day among those deleted
+    pub days: Option<(i64, i64)>,
 }
 
 /// What a fetch was reading, for clamping the dates of a slice too small to have a useful median.
@@ -420,6 +444,9 @@ pub struct Store {
     linker_pins: AtomicUsize,
     retention_gate: Mutex<()>,
     linker_coverage: RwLock<Option<LinkerCoverage>>,
+    /// segments the retention sweep deleted: (group, day) -> (identity, when), soo the linker can tell a source retired
+    /// for age from one that vanished by mistake. Kept in `_state/retention-retired` across restarts.
+    retired: Mutex<HashMap<(String, i64), Vec<([u8; 32], i64)>>>,
     coverage_cursor: Mutex<Option<(String, i64)>>,
     /// where a fresh keep set comes from (`live::keep_now`): housekeeping and a refused row ask it, soo a keep set set
     /// earlier never wins over a newer one
@@ -544,6 +571,7 @@ impl Store {
                 }
             }
         }
+        let retired = load_retired(&cfg.root)?;
         let mut barrier_identity = [0; 16];
         getrandom::fill(&mut barrier_identity).map_err(|e| anyhow!("barrier identity: {e}"))?;
         let shared = Arc::new(Shared {
@@ -578,6 +606,7 @@ impl Store {
             linker_pins: AtomicUsize::new(0),
             retention_gate: Mutex::new(()),
             linker_coverage: RwLock::new(None),
+            retired: Mutex::new(retired),
             coverage_cursor: Mutex::new(None),
             keep_source: Mutex::new(None),
             recent_claims: Mutex::new(BTreeMap::new()),
@@ -621,7 +650,139 @@ impl Store {
                 .spawn(move || guarded("the batcher", &shared, move || me.batcher()))
                 .expect("spawning the batcher"),
         );
+        if let Some(age) = self.cfg.retention {
+            let weak = Arc::downgrade(self);
+            threads.push(
+                std::thread::Builder::new()
+                    .name("nxv-retention".into())
+                    .spawn(move || retention_thread(weak, age))
+                    .expect("spawning the retention sweeper"),
+            );
+        }
         *self.threads.lock().unwrap_or_else(|e| e.into_inner()) = threads;
+    }
+
+    /// Deletes every segment not written for the configured retention (`StoreConfig::retention`), as of `now`.
+    /// Age is the segment's last write (its files' modification time), not its posting day: a backfill day captured
+    /// an hour ago stays, and today's day file stays while rows still land in it.
+    ///
+    /// The keep set and the linker's coverage are not consulted: retention is the bound on what the store holds. What
+    /// still needs a segment is: a slab of its day open, full or with the sealers/committer (its rows aren't in the
+    /// file yet, and the committer would stop on an expired segment), and a commit holding space in it; those
+    /// segments stay until the next sweep. Readers are safe without a check: snapshots and maps hold the open file,
+    /// which outlives its name, and the linker treats a source retired here as consumed (`retired`).
+    pub fn retention_sweep(&self, now: std::time::SystemTime) -> RetentionReport {
+        let mut report = RetentionReport::default();
+        let Some(age) = self.cfg.retention else { return report };
+        let groups: Vec<Arc<Group>> = self.groups.read().unwrap_or_else(|e| e.into_inner()).values().cloned().collect();
+        for g in groups {
+            if self.shared.stopping.load(Ordering::Acquire) || self.failure().is_some() {
+                break;
+            }
+            let segments: Vec<(i64, Arc<Segment>)> =
+                g.segments.read().unwrap_or_else(|e| e.into_inner()).iter().map(|(d, s)| (*d, Arc::clone(s))).collect();
+            // stat outside every lock: a group can have hundreds of day files
+            let old: Vec<(i64, Arc<Segment>, u64)> = segments
+                .into_iter()
+                .filter(|(_, seg)| {
+                    seg.written_at().and_then(|at| now.duration_since(at).ok()).is_some_and(|idle| idle >= age)
+                })
+                .map(|(d, seg)| {
+                    let bytes = seg.disk_bytes();
+                    (d, seg, bytes)
+                })
+                .collect();
+            if old.is_empty() {
+                continue;
+            }
+            // a first look at what's still filling, soo those aren't remembered as retired (rechecked under the locks)
+            let (filling, on_way) = self.filling_days(&g);
+            let (busy, old): (Vec<_>, Vec<_>) =
+                old.into_iter().partition(|(d, _, _)| filling.contains(d) || on_way.contains(d));
+            report.held += busy.len();
+            if old.is_empty() {
+                continue;
+            }
+            // remembered (durably) before any file goes: a crash in between leaves a retired entry for a segment
+            // still there, which the linker only looks at when the segment is gone or replaced
+            let at = now.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+            if let Err(e) = self.remember_retired(&g.name, old.iter().map(|(d, seg, _)| (*d, seg.identity())), at) {
+                eprintln!("header store retention: couldnt record what {} would retire, skipping it: {e:#}", g.name);
+                continue;
+            }
+            // a few at a time: the batcher's tick waits on the group's slabs lock meanwhile
+            let mut old = old.into_iter().peekable();
+            while old.peek().is_some() {
+                let chunk: Vec<(i64, Arc<Segment>, u64)> = old.by_ref().take(RETENTION_CHUNK).collect();
+                // the lock order of covered expiry: the group's slabs, the inflight set, the gate, the segment map
+                let slabs = g.slabs.lock().unwrap_or_else(|e| e.into_inner());
+                let filling: BTreeSet<i64> = slabs.open.values().chain(slabs.full.iter()).map(|sl| sl.day).collect();
+                let inflight = self.shared.inflight.lock().unwrap_or_else(|e| e.into_inner());
+                let on_way: BTreeSet<i64> =
+                    inflight.iter().filter(|((name, _), _)| *name == g.name).map(|(_, d)| *d).collect();
+                let _gate = self.retention_gate.lock().unwrap_or_else(|e| e.into_inner());
+                let mut map = g.segments.write().unwrap_or_else(|e| e.into_inner());
+                for (day, seg, bytes) in chunk {
+                    let current = map.get(&day).is_some_and(|s| Arc::ptr_eq(s, &seg));
+                    if !current {
+                        continue;
+                    }
+                    if filling.contains(&day) || on_way.contains(&day) || !seg.expire() {
+                        report.held += 1;
+                        continue;
+                    }
+                    map.remove(&day);
+                    report.removed += 1;
+                    report.freed += bytes;
+                    report.days = Some(report.days.map_or((day, day), |(lo, hi)| (lo.min(day), hi.max(day))));
+                }
+            }
+        }
+        report
+    }
+
+    /// The days of `g` with a slab open or full, and with one on its way to the committer.
+    fn filling_days(&self, g: &Group) -> (BTreeSet<i64>, BTreeSet<i64>) {
+        let slabs = g.slabs.lock().unwrap_or_else(|e| e.into_inner());
+        let filling = slabs.open.values().chain(slabs.full.iter()).map(|sl| sl.day).collect();
+        let inflight = self.shared.inflight.lock().unwrap_or_else(|e| e.into_inner());
+        let on_way = inflight.iter().filter(|((name, _), _)| *name == g.name).map(|(_, d)| *d).collect();
+        (filling, on_way)
+    }
+
+    /// Whether the retention sweep deleted `group`'s segment of `day` (the one with `identity`, when given): the
+    /// linker then counts a source that's gone or replaced as consumed rather than as damage.
+    pub fn retired(&self, group: &str, day: i64, identity: Option<&[u8]>) -> bool {
+        self.retired
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(group.to_owned(), day))
+            .is_some_and(|v| v.iter().any(|(id, _)| identity.is_none_or(|want| want == id.as_slice())))
+    }
+
+    fn remember_retired(&self, group: &str, segments: impl Iterator<Item = (i64, [u8; 32])>, at: i64) -> Result<()> {
+        use std::io::Write;
+        let mut retired = self.retired.lock().unwrap_or_else(|e| e.into_inner());
+        let mut text = String::new();
+        let mut fresh = Vec::new();
+        for (day, identity) in segments {
+            let known = retired.get(&(group.to_owned(), day)).is_some_and(|v| v.iter().any(|(id, _)| *id == identity));
+            if !known {
+                text.push_str(&retired_line(group, day, &identity, at));
+                fresh.push((day, identity));
+            }
+        }
+        if text.is_empty() {
+            return Ok(());
+        }
+        let path = self.cfg.root.join(STATE_DIR).join(RETIRED_FILE);
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+        f.write_all(text.as_bytes())?;
+        super::sync::full_flush(&f)?;
+        for (day, identity) in fresh {
+            retired.entry((group.to_owned(), day)).or_default().push((identity, at));
+        }
+        Ok(())
     }
 
     pub fn failure(&self) -> Option<String> {
@@ -1433,6 +1594,92 @@ impl Store {
 impl Drop for Store {
     fn drop(&mut self) {
         self.shared.stopping.store(true, Ordering::Release);
+    }
+}
+
+fn retired_line(group: &str, day: i64, identity: &[u8; 32], at: i64) -> String {
+    let hex: String = identity.iter().map(|b| format!("{b:02x}")).collect();
+    format!("{at}\t{day}\t{hex}\t{group}\n")
+}
+
+fn parse_retired(line: &str) -> Option<(String, i64, [u8; 32], i64)> {
+    let mut f = line.splitn(4, '\t');
+    let at = f.next()?.parse().ok()?;
+    let day = f.next()?.parse().ok()?;
+    let hex = f.next()?;
+    let group = f.next()?;
+    if hex.len() != 64 || group.is_empty() {
+        return None;
+    }
+    let mut id = [0u8; 32];
+    for (i, b) in id.iter_mut().enumerate() {
+        *b = u8::from_str_radix(hex.get(2 * i..2 * i + 2)?, 16).ok()?;
+    }
+    Some((group.to_owned(), day, id, at))
+}
+
+/// The segments retired lately, from `_state/retention-retired`; the file is rewritten without the ones older than
+/// `RETIRED_MEMORY` (and a torn last line) when it had any.
+fn load_retired(root: &Path) -> Result<HashMap<(String, i64), Vec<([u8; 32], i64)>>> {
+    let path = root.join(STATE_DIR).join(RETIRED_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let since = chrono::Utc::now().timestamp() - RETIRED_MEMORY;
+    let mut out: HashMap<(String, i64), Vec<([u8; 32], i64)>> = HashMap::new();
+    let mut kept = String::new();
+    let mut dropped = false;
+    for line in text.split_inclusive('\n') {
+        match parse_retired(line.strip_suffix('\n').unwrap_or("")) {
+            Some((group, day, id, at)) if at >= since => {
+                kept.push_str(line);
+                out.entry((group, day)).or_default().push((id, at));
+            }
+            _ => dropped = true,
+        }
+    }
+    if dropped {
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, &kept)?;
+        super::sync::full_flush(&File::open(&tmp)?)?;
+        std::fs::rename(&tmp, &path)?;
+        sync_all_durable(&[&File::open(root.join(STATE_DIR))?])?;
+    }
+    Ok(out)
+}
+
+/// Sweeps every `RETENTION_EVERY` until the store goes or stops, logging what each sweep freed.
+fn retention_thread(store: std::sync::Weak<Store>, age: Duration) {
+    let mut next = Instant::now() + Duration::from_secs(60);
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+        let Some(s) = store.upgrade() else { return };
+        if s.shared.stopping.load(Ordering::Acquire) || s.failure().is_some() {
+            return;
+        }
+        if Instant::now() < next {
+            continue;
+        }
+        let started = Instant::now();
+        let r = s.retention_sweep(std::time::SystemTime::now());
+        drop(s);
+        next = Instant::now() + RETENTION_EVERY;
+        if r.removed > 0 || r.held > 0 {
+            let days = r.days.map_or(String::new(), |(lo, hi)| {
+                format!(", posting days {}..{}", super::segment::day_name(lo), super::segment::day_name(hi))
+            });
+            eprintln!(
+                "header store retention: removed {} day files not written in {:.1}h, freeing {:.2} GiB{days}; {} \
+                 kept for now (a slab of their day still open or committing); {:.1}s",
+                r.removed,
+                age.as_secs_f64() / 3600.0,
+                r.freed as f64 / (1u64 << 30) as f64,
+                r.held,
+                started.elapsed().as_secs_f64()
+            );
+        }
     }
 }
 
@@ -2358,5 +2605,123 @@ mod tests {
         );
         store.set_keep(keep_all());
         store.close().unwrap();
+    }
+
+    fn age(dir: &Path, group: &str, day: &str, by: Duration) {
+        let at = std::time::SystemTime::now() - by;
+        for ext in ["nxv", "nxvi"] {
+            let f = std::fs::OpenOptions::new().write(true).open(dir.join(group).join(format!("{day}.{ext}"))).unwrap();
+            f.set_modified(at).unwrap();
+        }
+    }
+
+    fn retaining(root: &Path) -> StoreConfig {
+        StoreConfig { retention: Some(Duration::from_secs(24 * 3600)), ..cfg(root) }
+    }
+
+    #[test]
+    fn retention_deletes_day_files_not_written_for_a_day_but_not_ones_in_use_and_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (nov1, nov3, nov8) = (day_of("2026-11-01"), day_of("2026-11-03"), day_of("2026-11-08"));
+        {
+            let (store, _) = Store::open(retaining(dir.path()), keep_all()).unwrap();
+            let a: Vec<Vec<u8>> = (0..20).map(|k| line(1 + k, "p@x", "Sun, 01 Nov 2026 10:00:00 +0000")).collect();
+            store.record("s", "g", &a, Clamp::Live { now: NOW - 7 * DAY }).unwrap();
+            let b: Vec<Vec<u8>> = (0..20).map(|k| line(100 + k, "p@x", "Tue, 03 Nov 2026 10:00:00 +0000")).collect();
+            store.record("s", "g", &b, Clamp::Live { now: NOW - 5 * DAY }).unwrap();
+            store.seal_days(&[nov1, nov3]);
+            store.tick().unwrap();
+            wait_blocks(&store, 2);
+            store.close().unwrap();
+        }
+        // captured two days ago (whatever their posting days), then a restart
+        age(dir.path(), "g", "2026-11-01", Duration::from_secs(48 * 3600));
+        age(dir.path(), "g", "2026-11-03", Duration::from_secs(48 * 3600));
+        let (store, _) = Store::open(retaining(dir.path()), keep_all()).unwrap();
+        // a day captured now: young, whatever its posting day
+        let c: Vec<Vec<u8>> = (0..20).map(|k| line(200 + k, "p@x", NOV8)).collect();
+        store.record("s", "g", &c, Clamp::Live { now: NOW }).unwrap();
+        store.seal_days(&[nov8]);
+        store.tick().unwrap();
+        wait_blocks(&store, 1);
+        // an old day with a slab of it still filling: its rows aren't in the file yet
+        let more: Vec<Vec<u8>> = (0..20).map(|k| line(300 + k, "p@x", "Tue, 03 Nov 2026 11:00:00 +0000")).collect();
+        store.record("s", "g", &more, Clamp::Live { now: NOW - 5 * DAY }).unwrap();
+        store.tick().unwrap();
+        // a reader holding the old day across its deletion
+        let snap = store.segment_snapshot("g", nov1).unwrap().unwrap();
+        let entry = snap.entries(0, 1)[0];
+
+        let r = store.retention_sweep(std::time::SystemTime::now());
+        assert_eq!((r.removed, r.held, r.days), (1, 1, Some((nov1, nov1))));
+        assert!(r.freed > 0);
+        assert!(!dir.path().join("g/2026-11-01.nxv").exists() && !dir.path().join("g/2026-11-01.nxvi").exists());
+        assert!(dir.path().join("g/2026-11-03.nxv").exists(), "a day with a slab still filling stays");
+        assert!(dir.path().join("g/2026-11-08.nxv").exists(), "a day written lately stays");
+        assert_eq!(snap.map_block(entry).unwrap().len(), entry.len as usize, "an open reader still reads");
+        assert!(store.retired("g", nov1, None) && store.retired("g", nov1, Some(&snap.identity)));
+        assert!(!store.retired("g", nov1, Some(&[0u8; 32])) && !store.retired("g", nov3, None));
+        assert!(store.blocks("g", nov1 * DAY, nov1 * DAY + DAY - 1).is_empty());
+
+        // once its slab lands the day was just written: it stays another day
+        store.seal_days(&[nov3]);
+        store.tick().unwrap();
+        wait_blocks(&store, 2);
+        let r = store.retention_sweep(std::time::SystemTime::now());
+        assert_eq!((r.removed, r.held), (0, 0));
+        // and goes when that day has passed too
+        let r = store.retention_sweep(std::time::SystemTime::now() + Duration::from_secs(25 * 3600));
+        assert_eq!(r.removed, 2);
+        // rows for a retired day start a fresh file
+        let late: Vec<Vec<u8>> = (0..20).map(|k| line(400 + k, "p@x", "Sun, 01 Nov 2026 12:00:00 +0000")).collect();
+        store.record("s", "g", &late, Clamp::Live { now: NOW - 7 * DAY }).unwrap();
+        store.seal_days(&[nov1]);
+        store.tick().unwrap();
+        wait_blocks(&store, 3);
+        let fresh = store.segment_snapshot("g", nov1).unwrap().unwrap();
+        assert_ne!(fresh.identity, snap.identity);
+        assert!(!store.retired("g", nov1, Some(&fresh.identity)));
+        store.close().unwrap();
+        drop(store);
+
+        // a restart remembers what was retired and doesn't bring it back
+        let (store, _) = Store::open(retaining(dir.path()), keep_all()).unwrap();
+        assert!(store.retired("g", nov1, Some(&snap.identity)) && store.retired("g", nov3, None));
+        assert!(store.segment_snapshot("g", nov3).unwrap().is_none());
+        assert_eq!(store.segment_snapshot("g", nov1).unwrap().unwrap().identity, fresh.identity);
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn retention_off_keeps_everything_and_the_retired_list_drops_old_and_torn_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = Store::open(cfg(dir.path()), keep_all()).unwrap();
+        let a: Vec<Vec<u8>> = (0..20).map(|k| line(1 + k, "p@x", NOV8)).collect();
+        store.record("s", "g", &a, Clamp::Live { now: NOW }).unwrap();
+        store.seal_days(&[day_of("2026-11-08")]);
+        store.tick().unwrap();
+        wait_blocks(&store, 1);
+        let r = store.retention_sweep(std::time::SystemTime::now() + Duration::from_secs(365 * 86_400));
+        assert_eq!(r, RetentionReport::default());
+        assert!(dir.path().join("g/2026-11-08.nxv").exists());
+        store.close().unwrap();
+        drop(store);
+
+        let now = chrono::Utc::now().timestamp();
+        let id = [7u8; 32];
+        let text = format!(
+            "{}{}{}",
+            retired_line("a.b", 5, &id, now),
+            retired_line("old.group", 6, &id, now - 30 * DAY),
+            "123\t4\tdead"
+        );
+        std::fs::write(dir.path().join(STATE_DIR).join(RETIRED_FILE), text).unwrap();
+        let loaded = load_retired(dir.path()).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[&("a.b".to_owned(), 5)], vec![(id, now)]);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(STATE_DIR).join(RETIRED_FILE)).unwrap(),
+            retired_line("a.b", 5, &id, now)
+        );
     }
 }
