@@ -27,6 +27,7 @@ pub const MIGRATIONS: &[(i32, &str, &str)] = &[
     (19, "word_queue_order", include_str!("migrations/0019_word_queue_order.sql")),
     (20, "chunk_resume", include_str!("migrations/0020_chunk_resume.sql")),
     (21, "metric_shards_64", include_str!("migrations/0021_metric_shards_64.sql")),
+    (22, "save_sql_costs", include_str!("migrations/0022_save_sql_costs.sql")),
 ];
 
 /// Bring the schema `schema` up to the last migration. Returns the versions applied now.

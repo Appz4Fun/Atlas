@@ -714,6 +714,9 @@ fn flush_local(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], no
     }
     let file_ids: Vec<i64> =
         file_ids.into_iter().map(|id| id.ok_or_else(|| anyhow::anyhow!("an accepted article found no file"))).collect::<Result<_>>()?;
+    // Real row counts for the stage the timing and file updates join on: without them the planner takes it for a
+    // few rows and nests a loop over every file of the batch inside another.
+    tx.batch_execute("analyze pg_temp.atlas_file_fold")?;
     let rows: Vec<_> = accepted
         .iter()
         .zip(&file_index)
@@ -738,9 +741,10 @@ fn flush_local(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], no
     let gained = local.store.add_fresh(&xid, &rows, crate::parser::MAX_PARTS, &fresh_files)?;
     let parts = rows.len() as u64;
     stats.parts += parts;
-    // The trigger on `segments` told post-processing a release's input changed.
+    // No explicit native_work_revision bump: every release listed here gained at least one part (`r.parts += 1`
+    // above), so UPDATE_RELEASES_FOLD below raises its `parts` and the BEFORE trigger native_release_input_changed
+    // bumps the revision in the same transaction.
     let changed: Vec<i64> = releases.keys().copied().collect();
-    tx.execute_typed("update releases set native_work_revision = native_work_revision + 1 where id = any($1)", &[(&changed, Type::INT8_ARRAY)])?;
     // A file's first proof of UTC needs every article it has to be in this batch.
     let present: Vec<i64> =
         local.store.file_counts(&files.iter().zip(&file_ids).map(|(f, &id)| (f.release_id, id, f.articles + 1)).collect::<Vec<_>>())?;
@@ -945,6 +949,7 @@ const LOCK_PART_HELPER: &str = "
 // commit or rollback leaves no rows for the next save.
 const CREATE_STAGE: &str = "
     set local synchronous_commit = on;
+    set local jit = off;
     create temporary table if not exists pg_temp.atlas_release_input (
         ordinal bigint not null,
         identity_key bytea not null,

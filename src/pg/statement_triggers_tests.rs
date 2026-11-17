@@ -97,3 +97,37 @@ fn statement_release_triggers_keep_metrics_and_search_marks() {
         .unwrap();
     runtime.owner.close();
 }
+
+#[test]
+#[ignore = "requires isolated PostgreSQL"]
+fn predb_name_triggers_fire_on_real_changes_and_evidence_once_per_statement() {
+    // Migration 0022: a name update that changes nothing marks no release; size and files bump the PreDB name
+    // revision once per statement, however many rows the statement touches.
+    let Some(schema) = crate::pg::testing::Schema::new() else { return };
+    let mut c = schema.pool.get().unwrap();
+    let names = |c: &mut postgres::Client| -> i64 { c.query_one("select last_value from predb_name_revision", &[]).unwrap().get(0) };
+    c.batch_execute(
+        "insert into releases(group_name,is_collection,identity_key,name,poster,posted_date,is_obfuscated,display_name)
+         select 'a.group',false,decode(lpad(to_hex(n),64,'0'),'hex'),'Release.'||n,'p','d',false,'D'||n from generate_series(1,5) n;
+         delete from predb_name_pending",
+    )
+    .unwrap();
+    let before = names(&mut c);
+    c.batch_execute("update releases set display_name=display_name, name=name").unwrap();
+    assert_eq!(names(&mut c), before, "an update that changes no name column bumps nothing");
+    assert_eq!(c.query_one("select count(*) from predb_name_pending", &[]).unwrap().get::<_, i64>(0), 0);
+    c.batch_execute("update releases set display_name='X' where name='Release.2'").unwrap();
+    assert_eq!(names(&mut c), before + 1);
+    let pending: Vec<i64> = c.query("select release_id from predb_name_pending", &[]).unwrap().iter().map(|r| r.get(0)).collect();
+    assert_eq!(pending.len(), 1, "only the release whose name changed is pending");
+    let before = names(&mut c);
+    c.batch_execute("update releases set size=size+1").unwrap();
+    assert_eq!(names(&mut c), before + 1, "five size changes, one bump");
+    let before = names(&mut c);
+    c.batch_execute(
+        "insert into files(release_id,filename_key,filename,original_filename)
+         select id,decode(lpad(to_hex(id),8,'0'),'hex'),'f','\\x66' from releases",
+    )
+    .unwrap();
+    assert_eq!(names(&mut c), before + 1, "five files inserted, one bump");
+}
