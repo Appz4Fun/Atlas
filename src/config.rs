@@ -189,6 +189,9 @@ pub struct Config {
     /// PostgreSQL sessions that save releases beside the indexer's owner session (`pg::ingest::Helpers`); None or 0 =
     /// every save goes through the owner
     pub native_helper_writers: Option<usize>,
+    /// read-only PostgreSQL sessions beside the owner session for the repair scan and post-processing step reads
+    /// (`pg::indexer_runtime::Owner::read_only`); None = `READER_SESSIONS`, 0 = every read through the owner
+    pub native_reader_sessions: Option<usize>,
     /// groups indexed at the same time, None = worked out from the connections
     pub parallel_groups: Option<usize>,
     /// compact the database every 24 hours from the indexer
@@ -1287,6 +1290,7 @@ impl Default for Config {
             backfill_start_days_back: None,
             backfill_lockstep_days: None,
             native_helper_writers: None,
+            native_reader_sessions: None,
             parallel_groups: None,
             auto_run_compact: false,
             inferred_parts: true,
@@ -1476,6 +1480,17 @@ impl Config {
                 .and_then(as_int)
                 .filter(|n| (1..=crate::pg::ingest::HELPER_WRITERS_MOST as i64).contains(n))
                 .map(|n| n as usize),
+            native_reader_sessions: v
+                .get("native_reader_sessions")
+                .and_then(as_int)
+                .filter(|n| *n >= 0)
+                .map(|n| {
+                    let most = crate::pg::indexer_runtime::READER_SESSIONS_MOST;
+                    if n as u64 > most as u64 {
+                        eprintln!("native_reader_sessions = {n} is more than {most}; using {most}");
+                    }
+                    (n as u64).min(most as u64) as usize
+                }),
             parallel_groups: v
                 .get("parallel_groups")
                 .and_then(as_int)
@@ -1827,6 +1842,9 @@ fn config_value(
     }
     if let Some(n) = cfg.native_helper_writers {
         out.insert("native_helper_writers".into(), json!(n));
+    }
+    if let Some(n) = cfg.native_reader_sessions {
+        out.insert("native_reader_sessions".into(), json!(n));
     }
 
     if cfg.auto_run_compact {
@@ -2416,6 +2434,16 @@ mod tests {
         assert_eq!(cfg(json!({"backfill_lockstep_days": 0})), None);
         assert_eq!(cfg(json!({"backfill_lockstep_days": 8})), None);
         assert_eq!(cfg(json!({"backfill_lockstep_days": 7})), Some(7));
+    }
+
+    #[test]
+    fn native_reader_sessions_from_the_file_clamped() {
+        let cfg = |v: Value| Config::from_value(&v).native_reader_sessions;
+        assert_eq!(cfg(json!({"native_reader_sessions": 2})), Some(2));
+        assert_eq!(cfg(json!({"native_reader_sessions": 0})), Some(0));
+        assert_eq!(cfg(json!({"native_reader_sessions": 20})), Some(crate::pg::indexer_runtime::READER_SESSIONS_MOST));
+        assert_eq!(cfg(json!({"native_reader_sessions": -1})), None);
+        assert_eq!(cfg(json!({})), None);
     }
 
     #[test]

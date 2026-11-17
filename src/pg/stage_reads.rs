@@ -62,15 +62,13 @@ impl StepReads {
 
     fn read<T>(&self,work:impl FnOnce(&mut Transaction<'_>)->Result<T>)->Result<T> {
         ensure!(tokio::runtime::Handle::try_current().is_err(),"native Step reads require a standard worker thread");
-        self.owner.with(|client| {
-            ensure!(self.owner.epoch().is_some_and(|epoch|epoch.id()==&self.epoch),"native Step read epoch changed");
-            let mut tx=client.build_transaction().isolation_level(postgres::IsolationLevel::RepeatableRead).read_only(true).start()?;
+        ensure!(self.owner.epoch().is_some_and(|epoch|epoch.id()==&self.epoch),"native Step read epoch changed");
+        // On a reader session beside the owner when one is configured (`Owner::read_only`), which proves the epoch.
+        self.owner.read_only(|tx| {
             // a read past its statement timeout fails its step, not the session (the transaction rolls back on drop)
-            let value=work(&mut tx).map_err(|error| if super::outage::is_statement_timeout(&error) {
+            work(tx).map_err(|error| if super::outage::is_statement_timeout(&error) {
                 error.context(super::outage::StepTimedOut)
-            } else {error})?;
-            tx.commit()?;
-            Ok(value)
+            } else {error})
         })
     }
 
@@ -389,6 +387,88 @@ mod tests {
             max_connections:1,allow_plaintext:true};
         let headers=crate::config::HeaderStoreConfig {enabled:true,dir:std::env::temp_dir().join("native-step-read-fixture").to_str().unwrap().into()};
         crate::pg::indexer_runtime::Runtime::open(&config,storage,headers,&[],&mut None).unwrap()
+    }
+
+    #[test]
+    fn native_step_reads_run_on_a_reader_session_not_the_owner() {
+        let Some(schema)=crate::pg::testing::Schema::new() else {return};
+        let runtime=runtime(&schema);
+        let reads=StepReads::for_owner(&runtime.owner).unwrap();
+        let owner_pid:i32=runtime.owner.with(|client|Ok(client.query_one("select pg_backend_pid()",&[])?.get(0))).unwrap();
+        let before=runtime.owner.reader_reads();
+        let (pid,read_only):(i32,String)=reads.read(|tx|{let row=tx.query_one("select pg_backend_pid(),current_setting('transaction_read_only')",&[])?;Ok((row.get(0),row.get(1)))}).unwrap();
+        assert_ne!(pid,owner_pid,"a Step read must not run on the owner session");
+        assert_eq!(read_only,"on");
+        assert_eq!(reads.probe_moviehash(1).unwrap(),None);
+        assert_eq!(runtime.owner.reader_reads(),before+2,"each Step read is one reader transaction");
+        // the reader's epoch proof: the current epoch passes, another (a successor's view of a stale one) is refused
+        let epoch=runtime.owner.epoch().unwrap().clone();
+        let mut client=schema.pool.get().unwrap();
+        {let mut tx=client.build_transaction().isolation_level(postgres::IsolationLevel::RepeatableRead).read_only(true).start().unwrap();
+            epoch.verify_reader(&mut tx).unwrap();
+            assert!(epoch.other_for_test().verify_reader(&mut tx).is_err(),"a stale epoch must be refused");}
+        assert_eq!(runtime.owner.failure(),None);
+        runtime.owner.close();
+        // once the owner session has ended (its exclusive lock gone), the reader proof fails for its epoch
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(10);
+        loop {
+            let mut tx=client.build_transaction().isolation_level(postgres::IsolationLevel::RepeatableRead).read_only(true).start().unwrap();
+            if epoch.verify_reader(&mut tx).is_err() {break}
+            assert!(std::time::Instant::now()<deadline,"an ended owner's epoch still verified for a reader");
+            drop(tx);std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(reads.probe_moviehash(1).is_err(),"a closed owner's reads end");
+    }
+
+    #[test]
+    fn native_step_reads_take_an_owner_turn_when_every_reader_is_busy() {
+        let Some(schema)=crate::pg::testing::Schema::new() else {return};
+        let runtime=runtime(&schema);
+        let reads=StepReads::for_owner(&runtime.owner).unwrap();
+        let owner_pid:i32=runtime.owner.with(|client|Ok(client.query_one("select pg_backend_pid()",&[])?.get(0))).unwrap();
+        let held=runtime.owner.hold_readers_for_test();
+        assert_eq!(held.len(),crate::pg::indexer_runtime::READER_SESSIONS);
+        let before=runtime.owner.reader_reads();let started=std::time::Instant::now();
+        let pid:i32=reads.read(|tx|Ok(tx.query_one("select pg_backend_pid()",&[])?.get(0))).unwrap();
+        assert_eq!(pid,owner_pid,"a full reader pool falls back to the owner turn");
+        assert!(started.elapsed()<std::time::Duration::from_secs(10),"a full reader pool must not hang a read");
+        assert_eq!(runtime.owner.reader_reads(),before);
+        assert_eq!(runtime.owner.failure(),None,"a full reader pool never ends the owner");
+        drop(held);
+        let pid:i32=reads.read(|tx|Ok(tx.query_one("select pg_backend_pid()",&[])?.get(0))).unwrap();
+        assert_ne!(pid,owner_pid);
+        runtime.owner.close();
+    }
+
+    #[test]
+    fn native_reader_statement_timeout_fails_one_step_not_the_owner() {
+        let Some(schema)=crate::pg::testing::Schema::new() else {return};
+        let runtime=runtime(&schema);
+        let reads=StepReads::for_owner(&runtime.owner).unwrap();
+        let error=reads.read(|tx|{tx.batch_execute("set local statement_timeout='100ms'")?;tx.batch_execute("select pg_sleep(2)")?;Ok(())}).unwrap_err();
+        assert!(super::super::outage::is_step_timed_out(&error),"{error:#}");
+        assert_eq!(runtime.owner.failure(),None);
+        assert_eq!(reads.probe_moviehash(1).unwrap(),None,"the next read still runs");
+        runtime.owner.close();
+    }
+
+    #[test]
+    fn native_step_reads_fall_back_to_the_owner_without_reader_sessions() {
+        let Some(schema)=crate::pg::testing::Schema::new() else {return};
+        let mut config=crate::config::Config::default();
+        config.postprocess.enabled=false;config.predb.enabled=false;config.spots.enabled=false;config.inferred_parts=false;
+        config.media.tvmaze.enabled=false;config.media.allocine.enabled=false;config.media.details_per_minute=0;
+        config.native_reader_sessions=Some(0);
+        let storage=crate::pg::StorageConfig {backend:crate::pg::Backend::Postgres,url:schema.url.clone(),schema:schema.name.clone(),
+            max_connections:1,allow_plaintext:true};
+        let headers=crate::config::HeaderStoreConfig {enabled:true,dir:std::env::temp_dir().join("native-step-read-fixture").to_str().unwrap().into()};
+        let runtime=crate::pg::indexer_runtime::Runtime::open(&config,storage,headers,&[],&mut None).unwrap();
+        let reads=StepReads::for_owner(&runtime.owner).unwrap();
+        let owner_pid:i32=runtime.owner.with(|client|Ok(client.query_one("select pg_backend_pid()",&[])?.get(0))).unwrap();
+        let pid:i32=reads.read(|tx|Ok(tx.query_one("select pg_backend_pid()",&[])?.get(0))).unwrap();
+        assert_eq!(pid,owner_pid);
+        assert_eq!(runtime.owner.reader_reads(),0);
+        runtime.owner.close();
     }
 
     #[test]

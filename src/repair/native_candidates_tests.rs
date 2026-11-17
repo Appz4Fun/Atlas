@@ -87,7 +87,9 @@ fn isolated(name:&str,work:fn()) {
 #[ignore="explicit isolated PG; real sub64MiB native rows/observed links/Timing"]
 fn recent_and_older_candidates_use_genuine_assembled_post_size() {isolated("repair::native::candidate_tests::recent_and_older_candidates_use_genuine_assembled_post_size",|| {
     let f=Fixture::new();let recent=f.linked("Recent.Assembly",f.now-3*3600);let older=f.linked("Older.Assembly",f.now-7*86400);
+    let reader_reads=f.runtime.owner.reader_reads();
     let selected=storage::candidate_plan(&f.runtime.owner,f.now,&mut Service::budget()).unwrap();
+    assert!(f.runtime.owner.reader_reads()>reader_reads,"the candidate scan runs on reader sessions, not the owner");
     let picked_recent=selected.recent.keys.iter().map(|(id,_)|*id).collect::<Vec<_>>();let picked_older=&selected.found.older[0].keys;
     assert_eq!(picked_recent.len(),1,"recent qualification must assemble all real sub64MiB linked rows first");
     assert_eq!(picked_older.len(),1,"older qualification must use the same actual post-size predicate");
