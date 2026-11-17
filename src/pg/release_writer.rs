@@ -98,6 +98,8 @@ pub(crate) fn save_as(client: &mut Client, releases: &[Release], now: i64, helpe
         return Ok(SaveStats::default());
     }
 
+    // Outside any transaction and lock: read the local store's pages this save's lookups will need (`prewarm`).
+    prewarm(client, &groups);
     // A group writer that waited on the advisory lock must see the preceding commit.
     let mut tx = client.build_transaction().isolation_level(IsolationLevel::ReadCommitted).start()?;
     let (stats, local) = save_grouped(&mut tx, groups, now, helper_epoch)?;
@@ -113,6 +115,68 @@ pub(crate) fn save_as(client: &mut Client, releases: &[Release], now: i64, helpe
     }
     Ok(stats)
 }
+
+/// Before a save opens its transaction: the ids of the releases it names that already exist, read on autocommit
+/// in one statement, and its articles of them asked of the local store with the answers thrown away. `Store::has`
+/// on keys whose `seen` pages are cold reads them from disk; asked here, that wait no longer happens while the save
+/// holds its group#shard lock with a transaction open (seen on prod: sessions idle in transaction, the rest waiting
+/// on their locks). Only the page cache changes: the save asks `has` again under its lock and goes by that answer,
+/// so a release made, retracted or written by someone else in between costs nothing but a wasted read. Best effort:
+/// any failure here is ignored. Returns the keys asked (for tests).
+fn prewarm(client: &mut Client, groups: &Parts<'_>) -> usize {
+    if !crate::article_local::any_open() {
+        return 0;
+    }
+    let mut names = Vec::new();
+    let mut collections = Vec::new();
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    let mut named = Vec::new();
+    let mut at_of = HashMap::new();
+    for ((group, _), releases) in groups {
+        for &release in releases {
+            let (collection, key) = identity(release);
+            let at = *at_of.entry((*group, collection, key)).or_insert_with(|| {
+                names.push(*group);
+                collections.push(collection);
+                keys.push(key.to_vec());
+                named.push(Vec::new());
+                named.len() - 1
+            });
+            named[at].push(release);
+        }
+    }
+    let row = match client.query_typed_one(PREWARM_IDS, &[(&names, Type::TEXT_ARRAY), (&collections, Type::BOOL_ARRAY), (&keys, Type::BYTEA_ARRAY)]) {
+        Ok(row) => row,
+        Err(_) => return 0,
+    };
+    let (Ok(schema), Ok(ordinals), Ok(ids)) = (row.try_get::<_, Option<String>>(0), row.try_get::<_, Vec<i64>>(1), row.try_get::<_, Vec<i64>>(2)) else { return 0 };
+    let Some(store) = schema.as_deref().and_then(crate::article_local::of_schema) else { return 0 };
+    let mut asked = HashSet::new();
+    for (ordinal, id) in ordinals.into_iter().zip(ids) {
+        let Some(releases) = usize::try_from(ordinal - 1).ok().and_then(|at| named.get(at)) else { continue };
+        for release in releases {
+            for article in &release.articles {
+                if !article.message_id.is_empty() {
+                    asked.insert((id, article.message_id.as_bytes()));
+                }
+            }
+        }
+    }
+    let asked: Vec<_> = asked.into_iter().collect();
+    if store.has(&asked).is_ok() {
+        crate::metrics::names::LOCAL_STORE_PREWARMED.inc(&[], asked.len() as u64);
+    }
+    asked.len()
+}
+
+// The ids of the releases a save names that exist already, by the order `prewarm` named them (1-based), and the
+// schema whose store holds their articles.
+const PREWARM_IDS: &str = "
+    select current_schema()::text,
+        coalesce(array_agg(k.ord order by k.ord) filter (where r.id is not null), '{}')::bigint[],
+        coalesce(array_agg(r.id order by k.ord) filter (where r.id is not null), '{}')::bigint[]
+    from unnest($1::text[], $2::bool[], $3::bytea[]) with ordinality as k(group_name, is_collection, identity_key, ord)
+    left join releases r on r.group_name = k.group_name and r.is_collection = k.is_collection and r.identity_key = k.identity_key";
 
 /// The repair service checks its observed source and commits header/results on
 /// its original owner transaction. This entry neither commits nor retries.
@@ -1259,6 +1323,26 @@ mod tests {
             row.get::<_, i64>("due_at"),
             103 + crate::catalog_facts::COMPLETE_SETTLE_SECS.load(std::sync::atomic::Ordering::Relaxed)
         );
+    }
+
+    #[test]
+    fn prewarm_asks_the_store_only_for_articles_of_releases_that_exist() {
+        let Some(test) = crate::pg::testing::Schema::native_writer() else { return };
+        let mut client = test.pool.get().unwrap();
+        let first = release("sample", "sample.rar", "<first@example.test>", 1);
+        let late = release("sample", "sample.rar", "<late@example.test>", 2);
+        let unknown = release("other", "other.rar", "<other@example.test>", 1);
+        let local = crate::article_local::of(&mut *client).unwrap().is_some();
+        let warmed = |client: &mut Client, releases: &[Release]| prewarm(client, &parts(releases).unwrap());
+        // nothing exists yet: no release id, nothing to ask
+        assert_eq!(warmed(&mut client, std::slice::from_ref(&first)), 0);
+        save(&mut client, std::slice::from_ref(&first), 100).unwrap();
+        // the saved release's articles (a replay and a new one) are asked; the unknown release's are not
+        let asked = warmed(&mut client, &[first.clone(), late.clone(), unknown.clone()]);
+        assert_eq!(asked, if local { 2 } else { 0 });
+        // the save after it still goes by its own locked lookups: the replay is dropped, the new part counted
+        let stats = save(&mut client, &[first, late, unknown], 101).unwrap();
+        assert_eq!(stats, SaveStats { releases: 1, files: 1, parts: 2 });
     }
 
     #[test]
