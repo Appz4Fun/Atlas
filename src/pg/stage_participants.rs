@@ -53,7 +53,8 @@ impl ReadTargets {
         if ids.is_empty() {return Ok(())}
         let epoch=self.owner.epoch().context("native participant owner ended")?;
         ensure!(epoch.id()==&self.observed.epoch && epoch.catalog().nonce()==&self.observed.catalog,"native participant owner changed");
-        epoch.verify(tx)?;
+        // the owner's own proof on its session, a reader's beside it (`Owner::read_only`)
+        epoch.verify_on(tx)?;
         let mode=tx.query_one("select current_setting('transaction_isolation'),current_setting('transaction_read_only')",&[])?;
         let isolation:String=mode.try_get(0)?;
         ensure!(matches!(isolation.as_str(),"repeatable read"|"serializable") && mode.try_get::<_,String>(1)?=="on",

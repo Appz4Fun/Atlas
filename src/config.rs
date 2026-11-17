@@ -189,6 +189,9 @@ pub struct Config {
     /// PostgreSQL sessions that save releases beside the indexer's owner session (`pg::ingest::Helpers`); None or 0 =
     /// every save goes through the owner
     pub native_helper_writers: Option<usize>,
+    /// read-only PostgreSQL sessions beside the owner session for the repair scan and post-processing step reads
+    /// (`pg::indexer_runtime::Owner::read_only`); None = `READER_SESSIONS`, 0 = every read through the owner
+    pub native_reader_sessions: Option<usize>,
     /// groups indexed at the same time, None = worked out from the connections
     pub parallel_groups: Option<usize>,
     /// compact the database every 24 hours from the indexer
@@ -1287,6 +1290,7 @@ impl Default for Config {
             backfill_start_days_back: None,
             backfill_lockstep_days: None,
             native_helper_writers: None,
+            native_reader_sessions: None,
             parallel_groups: None,
             auto_run_compact: false,
             inferred_parts: true,
@@ -1475,6 +1479,11 @@ impl Config {
                 .get("native_helper_writers")
                 .and_then(as_int)
                 .filter(|n| (1..=crate::pg::ingest::HELPER_WRITERS_MOST as i64).contains(n))
+                .map(|n| n as usize),
+            native_reader_sessions: v
+                .get("native_reader_sessions")
+                .and_then(as_int)
+                .filter(|n| (0..=crate::pg::indexer_runtime::READER_SESSIONS_MOST as i64).contains(n))
                 .map(|n| n as usize),
             parallel_groups: v
                 .get("parallel_groups")
@@ -1827,6 +1836,9 @@ fn config_value(
     }
     if let Some(n) = cfg.native_helper_writers {
         out.insert("native_helper_writers".into(), json!(n));
+    }
+    if let Some(n) = cfg.native_reader_sessions {
+        out.insert("native_reader_sessions".into(), json!(n));
     }
 
     if cfg.auto_run_compact {

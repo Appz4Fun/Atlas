@@ -60,6 +60,10 @@ pub(crate) struct Runtime {
 /// catalog binding, now at most this late. A failed proof is never reused. Migrations take their own lock, not the
 /// indexer's (`migrate::run`), soo a schema migrated under a live owner is noticed up to this much (and one turn)
 /// later than before; writers that verify the epoch inside their own transaction are unaffected.
+/// Read-only sessions beside the owner (`Owner::read_only`) unless `native_reader_sessions` says otherwise.
+pub(crate) const READER_SESSIONS: usize = 3;
+pub(crate) const READER_SESSIONS_MOST: usize = 8;
+
 const EPOCH_PROOF_FOR: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// The ownership lock and every cursor/catalog write use this same session.
@@ -75,6 +79,10 @@ pub(crate) struct Owner {
     verified_at: Mutex<Option<std::time::Instant>>,
     cache_destination: Option<CacheDestination>,
     epoch: Option<super::stage::OwnerEpoch>,
+    /// Read-only sessions beside the owner for long read-only transactions (`read_only`); unset, they take an owner turn.
+    readers: std::sync::OnceLock<Arc<super::Pool>>,
+    /// Read-only transactions run on `readers` (`read_only`), counted for tests and diagnostics.
+    reader_reads: std::sync::atomic::AtomicU64,
 }
 
 /// Ingestion takes up to `INGEST_TURNS` turns, then a waiting ordinary one. Within each ordinary turn,
@@ -192,6 +200,8 @@ impl Owner {
             verified_at: Mutex::new(None),
             cache_destination: None,
             epoch: None,
+            readers: std::sync::OnceLock::new(),
+            reader_reads: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -269,6 +279,69 @@ impl Owner {
                 eprintln!("native owner callback failed one step; caller={}; cause={error:#}", caller_diagnostic());
             } else if !canceled || self.failure().is_some() {
                 eprintln!("native owner callback failed; caller={}; prior_failure={:?}; cause={}", caller_diagnostic(), self.failure(), super::linker_runtime::failure_diagnostic(error));
+                self.fail(classify(error));
+            }
+        }
+        result
+    }
+
+    /// Read-only sessions for `read_only`; set once, when the runtime opens.
+    pub(crate) fn set_readers(&self, pool: Arc<super::Pool>) {
+        let _ = self.readers.set(pool);
+    }
+
+    /// Read-only transactions that ran on the reader sessions rather than the owner.
+    pub(crate) fn reader_reads(&self) -> u64 {
+        self.reader_reads.load(Ordering::Acquire)
+    }
+
+    /// `work` in one READ ONLY REPEATABLE READ transaction. With reader sessions (`set_readers`) and an epoch, on one
+    /// of those, never taking an owner turn: on prod the repair candidate scan and the post-processing step reads held
+    /// the owner session more than half its time, and backfill claims and saves queued behind them. The transaction's
+    /// first and last statements prove the epoch as a reader (`OwnerEpoch::verify_reader`): its snapshot is taken by
+    /// the first, so every row it reads was read while this epoch was current and its owner backend held the
+    /// exclusive lock, and the last proves no successor took over before the result is handed back. Without readers,
+    /// it runs on the owner session as before. Errors are classified as an owner callback's: a statement timeout or
+    /// an admission limit fails one step, a stop ends the attempt, anything else fails the owner.
+    #[track_caller]
+    pub(crate) fn read_only<T>(&self, work: impl FnOnce(&mut postgres::Transaction<'_>) -> Result<T>) -> Result<T> {
+        fn start(client: &mut postgres::Client) -> Result<postgres::Transaction<'_>, postgres::Error> {
+            client.build_transaction().isolation_level(postgres::IsolationLevel::RepeatableRead).read_only(true).start()
+        }
+        let (Some(pool), Some(epoch)) = (self.readers.get(), self.epoch.as_ref()) else {
+            return self.with(|client| {
+                let mut tx = start(client)?;
+                let value = work(&mut tx)?;
+                tx.commit()?;
+                Ok(value)
+            });
+        };
+        let caller = caller_diagnostic();
+        let result = (|| {
+            if !self.accepting.load(Ordering::Acquire) || self.stop.load(Ordering::Acquire) {
+                return Err(AttemptEnded.into());
+            }
+            let mut client = pool.get_before(std::time::Instant::now() + std::time::Duration::from_secs(30))?;
+            if !self.accepting.load(Ordering::Acquire) || self.stop.load(Ordering::Acquire) {
+                return Err(AttemptEnded.into());
+            }
+            let mut tx = start(&mut client)?;
+            epoch.verify_reader(&mut tx)?;
+            self.reader_reads.fetch_add(1, Ordering::AcqRel);
+            let value = work(&mut tx)?;
+            // `work` may have left a nearly spent statement timeout (the repair reads bound each statement by their
+            // remaining budget); the closing proof gets its own
+            tx.batch_execute("set local statement_timeout = '10s'")?;
+            epoch.verify_reader(&mut tx)?;
+            tx.commit()?;
+            Ok(value)
+        })();
+        if let Err(error) = &result {
+            let canceled = super::outage::is_attempt_ended(error) && self.stop.load(Ordering::Acquire);
+            if super::outage::is_over_admission(error) || super::outage::is_step_timed_out(error) {
+                eprintln!("native reader failed one step; caller={caller}; cause={error:#}");
+            } else if !canceled || self.failure().is_some() {
+                eprintln!("native reader failed; caller={caller}; prior_failure={:?}; cause={}", self.failure(), super::linker_runtime::failure_diagnostic(error));
                 self.fail(classify(error));
             }
         }
@@ -470,6 +543,11 @@ impl Runtime {
             let pool = Arc::new(super::Pool::new(&super::StorageConfig { max_connections: n, ..storage.clone() })?);
             db = crate::indexer::with_helper_writers(db, super::ingest::Helpers::new(pool, &epoch).of(owner.clone()));
             println!("native saves: {n} helper writer sessions beside the owner");
+        }
+        let readers = config.native_reader_sessions.unwrap_or(READER_SESSIONS).min(READER_SESSIONS_MOST);
+        if readers > 0 {
+            owner.set_readers(Arc::new(super::Pool::new(&super::StorageConfig { max_connections: readers, ..storage.clone() })?));
+            println!("native reads: {readers} read-only sessions beside the owner");
         }
         Ok(Self { db, profile: Profile { storage, headers }, owner, identity })
     }

@@ -195,15 +195,14 @@ impl Service {
 // observation ends its transaction before the next starts, so a deferred query
 // can roll back without losing the already classified prefix's continuation.
 fn owned_read<T>(owner:&Arc<Owner>,budget:&mut Budget,work:impl FnOnce(&mut Read<'_,'_>)->Result<T>)->Result<T> {
-        // An explicit bounded/deferred observation is returned outside with(),
-        // so it cannot poison the owner as an invariant/storage failure. Actual
-        // PG/protocol/local-store errors still cross the original classifier.
-        owner.with(|client| {
-            let mut tx=client.build_transaction().isolation_level(IsolationLevel::RepeatableRead).read_only(true).start()?;
-            let result=work(&mut Read {tx:&mut tx,budget,stop:&owner.stop});
-            match result {
-                Err(e) if e.is::<Deferred>()||e.is::<SourceChanged>()=>{tx.rollback()?;Ok(Err(e))},
-                Err(e)=>Err(e),Ok(value)=>{tx.commit()?;Ok(Ok(value))},
+        // An explicit bounded/deferred observation is returned outside the
+        // read, so it cannot poison the owner as an invariant/storage failure.
+        // Actual PG/protocol/local-store errors still cross the classifier.
+        // Runs on a reader session beside the owner when one is configured.
+        owner.read_only(|tx| {
+            match work(&mut Read {tx,budget,stop:&owner.stop}) {
+                Err(e) if e.is::<Deferred>()||e.is::<SourceChanged>()=>Ok(Err(e)),
+                Err(e)=>Err(e),Ok(value)=>Ok(Ok(value)),
             }
         })?
 }

@@ -124,6 +124,49 @@ impl OwnerEpoch {
     }
 }
 
+impl OwnerEpoch {
+    /// `verify` for a pooled read-only session beside the owner (`Owner::read_only`): this epoch is still the
+    /// current active one, of this database, schema, role, schema version and code, its original backend alive and
+    /// still holding the exclusive indexer lock, this session's search path on the owner's schema, and the catalog
+    /// binding unchanged. Only `backend_pid=pg_backend_pid()` is left out, as the reader is not that backend; it grants
+    /// no mutation (the session is READ ONLY, and every write still goes through a fenced session).
+    /// `verify` on the owner backend itself, `verify_reader` on a read-only session beside it (`Owner::read_only`).
+    pub(crate) fn verify_on(&self,client:&mut impl GenericClient)->Result<()> {
+        let own:i32=client.query_one("select pg_backend_pid()",&[])?.try_get(0)?;
+        if own==self.pid {self.verify(client)} else {
+            let read_only:String=client.query_one("select current_setting('transaction_read_only')",&[])?.try_get(0)?;
+            ensure!(read_only=="on","native owner epoch: only a read-only transaction may run beside the owner");
+            self.verify_reader(client)
+        }
+    }
+    /// This epoch under another id: one that is not (or no longer) the current epoch.
+    #[cfg(test)]
+    pub(crate) fn other_for_test(&self)->Self {let mut other=self.clone();other.id[0]^=0xff;other}
+    pub(crate) fn verify_reader(&self,client:&mut impl GenericClient)->Result<()> {
+        client.batch_execute("select pg_stat_clear_snapshot()")?;
+        let valid:bool=client.query_typed_one("select current_schema()=$7 and exists(select 1 from native_runtime_current c join native_runtime_epochs e on e.epoch=c.epoch
+            join pg_stat_activity a on a.pid=e.backend_pid and a.backend_start=e.backend_start
+            where c.singleton and e.epoch=$1 and e.catalog_nonce=$2 and e.state='active'
+            and e.backend_pid=$3 and e.backend_start=$4::text::timestamptz
+            and e.schema_version=$5 and e.code_digest=$6
+            and e.schema_version=(select max(version) from schema_migrations)
+            and e.database_oid=(select oid from pg_database where datname=current_database())
+            and e.schema_oid=(select oid from pg_namespace where nspname=$7)
+            and e.role_oid=(select oid from pg_roles where rolname=current_user)
+            and e.schema_owner_oid=(select nspowner from pg_namespace where nspname=$7)
+            and e.migrations_oid=(select c.oid from pg_class c join pg_namespace n on n.oid=c.relnamespace where n.nspname=$7 and c.relname='schema_migrations')
+            and exists(select 1 from pg_locks l where l.pid=a.pid and l.locktype='advisory' and l.mode='ExclusiveLock' and l.granted
+              and l.database=a.datid and l.classid=(hashtext('atlas.indexer')::bigint & 4294967295)::oid
+              and l.objid=(hashtext($7)::bigint & 4294967295)::oid and l.objsubid=2))",
+            &[(&&self.id[..],Type::BYTEA),(&&self.catalog.nonce[..],Type::BYTEA),(&self.pid,Type::INT4),
+                (&self.started,Type::TEXT),(&self.version,Type::INT4),(&&self.code[..],Type::BYTEA),(&self.schema,Type::TEXT)])?.try_get::<_,Option<bool>>(0)?.unwrap_or(false);
+        ensure!(valid,"native owner epoch or original session ended");
+        let actual=CatalogIdentity::read_in(client)?;
+        ensure!(actual.nonce==self.catalog.nonce && actual.header_root==self.catalog.header_root,"native catalog binding changed");
+        Ok(())
+    }
+}
+
 fn bytes32(row:&postgres::Row,column:usize)->Result<[u8;32]> {
     row.try_get::<_,Vec<u8>>(column)?.try_into().map_err(|_|anyhow::anyhow!("native identity extent"))
 }

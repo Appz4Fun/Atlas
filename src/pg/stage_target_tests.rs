@@ -69,14 +69,27 @@ fn native_cross_result_refuses_donor_facts_committed_by_another_real_visit() {
 }
 
 #[test]
-fn native_target_observation_rejects_a_pooled_session_without_poisoning_the_owner() {
+fn native_target_observation_beside_the_owner_needs_a_read_only_session_proving_the_epoch() {
     let Some(schema)=crate::pg::testing::Schema::new() else {return};let runtime=crate::pg::stage_queue_tests::runtime(&schema);
     crate::pg::stage_queue_tests::push(&runtime);let donor=donor(&runtime);
     let mut targets=super::participants::ReadTargets::for_owner(&runtime.owner).unwrap();let mut other=schema.pool.get().unwrap();
+    // a writable pooled transaction is never an owner snapshot
+    let mut tx=other.build_transaction().isolation_level(postgres::IsolationLevel::RepeatableRead).start().unwrap();
+    assert!(targets.observe_in(&mut tx,&[donor]).is_err(),"a writable pool transaction is not a reader beside the owner");drop(tx);
+    // a read-only one proves the live epoch as a reader (`Owner::read_only`); settlement rechecks the revisions it saw
     let mut tx=other.build_transaction().isolation_level(postgres::IsolationLevel::RepeatableRead).read_only(true).start().unwrap();
-    assert!(targets.observe_in(&mut tx,&[donor]).is_err(),"a pool transaction is not the real selected owner's snapshot");drop(tx);
+    targets.observe_in(&mut tx,&[donor]).unwrap();drop(tx);
     assert_eq!(runtime.owner.failure(),None);
     runtime.owner.with(|client|{assert_eq!(client.query_one("select count(*) from beside_files",&[])?.get::<_,i64>(0),0);Ok(())}).unwrap();runtime.owner.close();
+    // once the owner has ended, a reader cannot observe for its epoch
+    let deadline=std::time::Instant::now()+std::time::Duration::from_secs(10);
+    let mut targets=targets;
+    loop {
+        let mut tx=other.build_transaction().isolation_level(postgres::IsolationLevel::RepeatableRead).read_only(true).start().unwrap();
+        if targets.observe_in(&mut tx,&[donor]).is_err() {break}
+        assert!(std::time::Instant::now()<deadline,"an ended owner's epoch still observed");
+        drop(tx);std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 fn add(runtime:&crate::pg::indexer_runtime::Runtime,name:&str,group:&str,mid:&str)->i64 {
