@@ -24,14 +24,13 @@ pub(super) fn write_local(tx:&mut Transaction<'_>,accepted:u64,files:&[i64],pres
 // also requires every retained segment to be among this accepted batch: the
 // count stops at batch articles+1 (at most twice COPY rows across all files).
 macro_rules! write_sql {
-    ($head:literal, $present:literal) => {
+    ($head:literal, $variants:literal, $complete:literal, $variants_on_conflict:literal) => {
         concat!($head, "insert into file_timing as old(file_id,release_id,first_date,last_date,number_first,number_last,lines,
     references_seen,xref_groups_max,from_hash,from_variants,encoded_subject,late_articles,articles,
     tool,clock_first,clock_last,hw_host,hw_key,hw_n_first,hw_n_last,first_utc,last_utc,utc_complete)
 select file_id,release_id,first_date,last_date,number_first,number_last,lines,references_seen,xref_groups_max,
-    from_last,from_variants,encoded_subject,0,articles,tool,clock_first,clock_last,hw_host,hw_key,hw_n_first,hw_n_last,first_utc,last_utc,
-    utc_complete and (exists(select 1 from file_timing where file_id=folded.file_id)
-        or articles=", $present, ")
+    from_last,", $variants, ",encoded_subject,0,articles,tool,clock_first,clock_last,hw_host,hw_key,hw_n_first,hw_n_last,first_utc,last_utc,
+    ", $complete, "
 from folded where true
 on conflict(file_id) do update set
     release_id=excluded.release_id,
@@ -41,8 +40,7 @@ on conflict(file_id) do update set
     number_first=least(old.number_first,excluded.number_first),number_last=greatest(old.number_last,excluded.number_last),
     lines=coalesce(old.lines,0)+excluded.lines,references_seen=old.references_seen+excluded.references_seen,
     xref_groups_max=greatest(old.xref_groups_max,excluded.xref_groups_max),
-    from_variants=old.from_variants+excluded.from_variants-
-        case when old.from_hash=(select f.from_first from folded f where f.file_id=excluded.file_id) then 1 else 0 end,
+    from_variants=", $variants_on_conflict, ",
     from_hash=excluded.from_hash,encoded_subject=greatest(old.encoded_subject,excluded.encoded_subject),
     articles=old.articles+excluded.articles,
     tool=coalesce(old.tool,excluded.tool),clock_first=least(old.clock_first,excluded.clock_first),
@@ -71,9 +69,85 @@ with ordered as materialized (
         min(t_hw_n) as hw_n_first,max(t_hw_n) as hw_n_last
     from ordered group by file_id,release_id
 )
-", "(select count(*) from(select 1 from segments where file_id=folded.file_id limit folded.articles+1) present)");
+", "from_variants", "utc_complete and (exists(select 1 from file_timing where file_id=folded.file_id)
+        or articles=(select count(*) from(select 1 from segments where file_id=folded.file_id limit folded.articles+1) present))",
+"old.from_variants+excluded.from_variants-
+        case when old.from_hash=(select f.from_first from folded f where f.file_id=excluded.file_id) then 1 else 0 end");
 // The writer folded each file's accepted articles itself and the local article
 // store counted the file's articles, no further than this batch's plus one.
+// Each file's local count and its old Timing row (whether there was one, and
+// its last sender) are joined once up front instead of looked up per row by
+// correlated subqueries, which made this statement quadratic in the batch. The
+// sender run joined across batches is taken off here, so a conflict only adds
+// `excluded`'s count. Reading file_timing before the insert is the same as
+// reading it in ON CONFLICT only because no other writer changes these files'
+// Timing meanwhile: every save of them holds the group#shard advisory lock
+// (`LOCK_PART`/`LOCK_PART_HELPER`) for the whole transaction.
 const WRITE_FOLD:&str=write_sql!("
+with folded as materialized (
+    select f.*,p.present,o.from_hash as old_from,o.file_id is not null as had
+    from pg_temp.atlas_file_fold f
+    left join unnest($1::bigint[],$2::bigint[]) as p(file_id,present) on p.file_id=f.file_id
+    left join file_timing o on o.file_id=f.file_id
+)
+", "from_variants-case when old_from=from_first then 1 else 0 end", "utc_complete and (had or articles=present)",
+"old.from_variants+excluded.from_variants");
+
+#[cfg(test)]
+mod fold_tests {
+    use super::*;
+    use postgres::types::Type;
+
+    // WRITE_FOLD as it was before its per-row lookups were joined up front.
+    const WRITE_FOLD_CORRELATED:&str=write_sql!("
 with folded as (select * from pg_temp.atlas_file_fold)
-", "(select p.present from unnest($1::bigint[],$2::bigint[]) as p(file_id,present) where p.file_id=folded.file_id)");
+", "from_variants", "utc_complete and (exists(select 1 from file_timing where file_id=folded.file_id)
+        or articles=(select p.present from unnest($1::bigint[],$2::bigint[]) as p(file_id,present) where p.file_id=folded.file_id))",
+"old.from_variants+excluded.from_variants-
+        case when old.from_hash=(select f.from_first from folded f where f.file_id=excluded.file_id) then 1 else 0 end");
+
+    fn run(tx:&mut Transaction<'_>,sql:&str,files:&[i64],present:&[i64])->(u64,Vec<String>) {
+        let n=tx.execute_typed(sql,&[(&files,Type::INT8_ARRAY),(&present,Type::INT8_ARRAY)]).unwrap();
+        let rows=tx.query("select t::text from file_timing t order by file_id",&[]).unwrap();
+        (n,rows.iter().map(|r|r.get(0)).collect())
+    }
+
+    #[test]
+    #[ignore = "needs ATLAS_PG_TEST_URL"]
+    fn joined_fold_writes_the_same_timing_as_the_correlated_one() {
+        let Some(s)=crate::pg::testing::Schema::new() else {return};
+        let mut c=s.pool.get().unwrap();
+        c.batch_execute("insert into releases(id,group_name,is_collection,identity_key,name,poster,posted_date,is_obfuscated)
+            values(1,'a.b',false,'\\x01','R','p','d',false),(2,'a.b',false,'\\x02','S','p','d',false);
+            insert into files(id,release_id,filename_key,filename)
+            select n,1+n%2,int8send(n),'f' from generate_series(1,120) n").unwrap();
+        // Files 1..=60 had Timing (last sender 1..=3 or none); 61..=120 are new. Senders repeat across the batch.
+        c.batch_execute("insert into file_timing(file_id,release_id,first_date,last_date,number_first,number_last,lines,
+                references_seen,xref_groups_max,from_hash,from_variants,encoded_subject,articles,first_utc,last_utc,utc_complete)
+            select n,1+n%2,100+n,200+n,n,n+5,10,1,2,case when n%4=0 then null else n%3+1 end,2,0,3,
+                case when n%5=0 then null else 50 end,case when n%5=0 then null else 60 end,n%5<>0 and n%2=0
+            from generate_series(1,60) n").unwrap();
+        let mut tx=c.transaction().unwrap();
+        tx.batch_execute(super::super::CREATE_FOLD_STAGE).unwrap();
+        tx.batch_execute("insert into pg_temp.atlas_file_fold(ord,release_id,file_id,filename_key,filename,original_filename,
+                subject,subject_mid,zero_file_index,first_date,last_date,first_utc,last_utc,utc_complete,number_first,number_last,
+                lines,references_seen,xref_groups_max,from_first,from_last,from_variants,encoded_subject,articles,tool,
+                clock_first,clock_last,hw_host,hw_key,hw_n_first,hw_n_last)
+            select n,1,n*2,'\\x00','f','\\x00','s','\\x00',false,90+n,300,
+                case when n%3=0 then null else 40 end,case when n%3=0 then null else 70 end,n%3<>0,
+                n-1,n+9,5,n%2,n%7,n%3+1,(n+1)%3+1,1+n%2,n%2,2+n%3,case when n%2=0 then 7 end,
+                n,n+1,case when n%3=0 then 'h' end,null,n,n+2
+            from generate_series(1,60) n").unwrap();
+        // fold file ids 2,4,..,120: half existing, half new; present matches articles for some new ones only
+        let files:Vec<i64>=(1..=60).map(|n|n*2).collect();
+        let present:Vec<i64>=(1..=60).map(|n|if n%4==0 {2+n%3} else {2+n%3+1}).collect();
+        tx.batch_execute("savepoint a").unwrap();
+        let old=run(&mut tx,WRITE_FOLD_CORRELATED,&files,&present);
+        tx.batch_execute("rollback to savepoint a").unwrap();
+        let new=run(&mut tx,WRITE_FOLD,&files,&present);
+        assert_eq!(old.0,60);
+        assert_eq!(old,new,"the joined fold must leave file_timing exactly as the correlated one");
+        // the data covered each branch: a sender run joined across batches, a new file proved whole, and one not
+        assert!(new.1.len()==90);
+    }
+}
