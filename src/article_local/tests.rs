@@ -696,3 +696,34 @@ fn a_failing_write_connection_fails_every_queued_save() {
     });
     assert!(!store.on(a).queue.lock().unwrap().leading, "the lead was let go");
 }
+
+#[test]
+fn a_leader_that_panics_mid_commit_leaves_later_saves_to_complete() {
+    let (_dir, store) = store();
+    let store = &store;
+    let (a, b, c) = (9, 17, 25);
+    let shard = store.on(a);
+    shard.panic_next_commit.store(true, Ordering::Release);
+    std::thread::scope(|scope| {
+        // alone in the queue, it leads with its own save still queued, and panics
+        let dying = scope.spawn(move || store.add("xa", &[row(a, 90, b"<a1>", Some(1))], 100));
+        assert!(dying.join().is_err(), "the leader panicked");
+    });
+    assert!(!shard.queue.lock().unwrap().leading, "the lead was let go");
+    assert!(shard.queue.lock().unwrap().pending.is_empty(), "its save was taken out");
+    assert_eq!(shard.waiting.load(Ordering::Acquire), 0, "the panicked save isnt counted waiting");
+    // later saves of the file, several at once, are answered rather than left waiting for a lead nobody holds: the
+    // panic under the write lock poisoned it, so they fail as any save behind a poisoned write lock does
+    std::thread::scope(|scope| {
+        let saves: Vec<_> = [(b, &b"<b1>"[..]), (c, &b"<c1>"[..]), (a, &b"<a2>"[..])]
+            .into_iter()
+            .map(|(r, id)| scope.spawn(move || store.add(&format!("x{r}"), &[row(r, r * 10, id, Some(1))], 100).map(|_| ())))
+            .collect();
+        for save in saves {
+            let error = format!("{:#}", save.join().unwrap().unwrap_err());
+            assert!(error.contains("poisoned"), "{error}");
+        }
+    });
+    assert!(!shard.queue.lock().unwrap().leading && shard.queue.lock().unwrap().pending.is_empty());
+    assert_eq!(shard.waiting.load(Ordering::Acquire), 0);
+}

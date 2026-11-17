@@ -125,6 +125,9 @@ pub(crate) struct Shard {
     /// lookups `has` split over threads (tests)
     #[cfg(test)]
     pub(super) has_splits: std::sync::atomic::AtomicU64,
+    /// the next leader panics before its commit (tests)
+    #[cfg(test)]
+    pub(super) panic_next_commit: std::sync::atomic::AtomicBool,
     /// Idle read connections kept over every file of the store (`READERS_KEPT`), shared by them (`Store::of_shards`).
     idle_readers: Arc<AtomicUsize>,
 }
@@ -214,12 +217,26 @@ impl Drop for Pending {
 }
 
 /// Hands the lead on when a leading save stops (`Shard::lead`), however it stops: to the oldest save still queued,
-/// or, with none queued, to whichever save comes next.
-struct Handoff<'a>(&'a Shard);
+/// or, with none queued, to whichever save comes next. A leader that panicked with its own save still queued takes it
+/// out first (it fails), so the lead isnt handed to the thread that is going away.
+struct Handoff<'a>(&'a Shard, &'a Arc<Completion>);
 
 impl Drop for Handoff<'_> {
     fn drop(&mut self) {
         let mut queue = self.0.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let own: Vec<Pending> = {
+            let mut own = Vec::new();
+            let mut at = 0;
+            while at < queue.pending.len() {
+                if Arc::ptr_eq(&queue.pending[at].done, self.1) {
+                    own.push(queue.pending.remove(at));
+                } else {
+                    at += 1;
+                }
+            }
+            own
+        };
+        drop(own); // answered with an error by `Pending`'s drop
         match queue.pending.first() {
             Some(next) => next.done.set(Turn::Lead),
             None => queue.leading = false,
@@ -462,6 +479,8 @@ impl Shard {
             commits: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             has_splits: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            panic_next_commit: std::sync::atomic::AtomicBool::new(false),
             idle_readers: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -492,6 +511,8 @@ impl Shard {
             commits: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             has_splits: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            panic_next_commit: std::sync::atomic::AtomicBool::new(false),
             idle_readers: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -701,6 +722,14 @@ impl Shard {
             self.waiting.fetch_add(1, Ordering::AcqRel);
             !std::mem::replace(&mut queue.leading, true)
         };
+        // counted down however this save ends, panics included: `waiting` gates `fill_seen` and `warm_fill`
+        struct Waited<'a>(&'a AtomicUsize);
+        impl Drop for Waited<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        let _waited = Waited(&self.waiting);
         let answer = loop {
             if lead {
                 self.lead(&done);
@@ -710,15 +739,14 @@ impl Shard {
                 Err(()) => lead = true,
             }
         };
-        self.waiting.fetch_sub(1, Ordering::AcqRel);
         answer.map_err(|e| anyhow::anyhow!(e))?;
         Ok(order.into_iter().map(|(at, file)| (at, gained[&file])).collect())
     }
 
     /// Lead the group commits (`Queue`) until `own` is answered, then hand the lead on. The write lock is taken for
     /// each batch, so `confirm`, `settle` and the rest get it between batches.
-    fn lead(&self, own: &Completion) {
-        let _handoff = Handoff(self);
+    fn lead(&self, own: &Arc<Completion>) {
+        let _handoff = Handoff(self, own);
         while !own.is_done() {
             let mut conn = match self.lock() {
                 Ok(conn) => conn,
@@ -754,6 +782,10 @@ impl Shard {
                 }
                 queue.drain(..take).collect::<Vec<Pending>>()
             };
+            #[cfg(test)]
+            if self.panic_next_commit.swap(false, Ordering::AcqRel) {
+                panic!("a leader panicking mid-commit (test)");
+            }
             self.commit_group(&mut conn, batch);
         }
     }
