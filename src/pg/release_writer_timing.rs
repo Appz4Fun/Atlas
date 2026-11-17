@@ -85,7 +85,7 @@ with ordered as materialized (
 // `excluded`'s count. Reading file_timing before the insert is the same as
 // reading it in ON CONFLICT only because no other writer changes these files'
 // Timing meanwhile: every save of them holds the group#shard advisory lock
-// (`LOCK_PART`/`LOCK_PART_HELPER`) for the whole transaction.
+// (`lock_parts`) for the whole transaction.
 pub(super) const WRITE_FOLD:&str=write_sql!("
 with folded as materialized (
     select f.*,case when ($1::bigint[])[f.ord+1]=f.file_id then ($2::bigint[])[f.ord+1] end as present,

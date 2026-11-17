@@ -92,7 +92,7 @@ fn run(regression:bool) {
     let seed=fixture(true);assert_eq!(save(&mut client,&seed,100).unwrap(),SaveStats {releases:100,files:1600,parts:1600});
     client.batch_execute("analyze releases;analyze files;analyze segments").unwrap();
     let frozen=snapshot(&mut client);let input=fixture(false);
-    let batch:Vec<_>=input.iter().flat_map(|r|r.articles.iter().map(move|a|Incoming {release:r,release_key:identity(r).1,
+    let batch:Vec<_>=input.iter().flat_map(|r|r.articles.iter().map(move|a|Incoming {group:&r.group,release:r,release_key:identity(r).1,
         original_name_key:Sha256::digest(r.name.as_bytes()).into(),posted_at:crate::dates::article_timestamp(&r.date),
         posted_clock:crate::dates::naive_timestamp(&r.date),article:Some(a)})).collect();
     assert_eq!(batch.len(),2000);assert!(batch.iter().map(Incoming::approx_bytes).sum::<usize>()<MAX_BATCH_BYTES);

@@ -71,7 +71,7 @@ fn state(client:&mut Client,id:i64)->Result<Vec<i64>> {
 }
 fn probe(client:&mut Client,input:&Release,id:i64,label:&str)->Result<serde_json::Value> {
     let before=state(client,id)?;
-    let batch:Vec<_>=input.articles.iter().map(|article|Incoming {release:input,release_key:identity(input).1,
+    let batch:Vec<_>=input.articles.iter().map(|article|Incoming {group:&input.group,release:input,release_key:identity(input).1,
         original_name_key:Sha256::digest(input.name.as_bytes()).into(),posted_at:crate::dates::article_timestamp(&input.date),
         posted_clock:crate::dates::naive_timestamp(&input.date),article:Some(article)}).collect();
     ensure!(batch.len()==2000&&batch.iter().map(Incoming::approx_bytes).sum::<usize>()<MAX_BATCH_BYTES,"bounded multipart COPY input");
