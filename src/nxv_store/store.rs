@@ -95,7 +95,9 @@ impl StoreConfig {
 /// How often the retention thread sweeps.
 pub const RETENTION_EVERY: Duration = Duration::from_secs(300);
 /// How long a retired segment is remembered for the linker (an epoch older than this restarts anyway).
-const RETIRED_MEMORY: i64 = 14 * DAY;
+const RETIRED_MEMORY: i64 = 3 * DAY;
+/// How often the retired list drops what it no longer needs to remember, in memory and on disk.
+const RETIRED_PRUNE_EVERY: Duration = Duration::from_secs(3600);
 const RETIRED_FILE: &str = "retention-retired";
 /// Segments expired per hold of a group's locks.
 const RETENTION_CHUNK: usize = 32;
@@ -571,7 +573,14 @@ impl Store {
                 }
             }
         }
-        let retired = load_retired(&cfg.root)?;
+        let retired = load_retired(&cfg.root).unwrap_or_else(|e| {
+            eprintln!("header store retention: couldnt read the retired list, starting it empty: {e:#}");
+            HashMap::new()
+        });
+        match cfg.retention {
+            Some(age) => eprintln!("header store retention: day files not written for {:.1}h are deleted", age.as_secs_f64() / 3600.0),
+            None => eprintln!("header store retention: off (day files kept until the keep set and linker let them go)"),
+        }
         let mut barrier_identity = [0; 16];
         getrandom::fill(&mut barrier_identity).map_err(|e| anyhow!("barrier identity: {e}"))?;
         let shared = Arc::new(Shared {
@@ -655,7 +664,11 @@ impl Store {
             threads.push(
                 std::thread::Builder::new()
                     .name("nxv-retention".into())
-                    .spawn(move || retention_thread(weak, age))
+                    .spawn(move || {
+                        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| retention_thread(weak, age))).is_err() {
+                            eprintln!("header store retention: the sweeper panicked; no more day files are deleted until a restart");
+                        }
+                    })
                     .expect("spawning the retention sweeper"),
             );
         }
@@ -758,6 +771,29 @@ impl Store {
             .unwrap_or_else(|e| e.into_inner())
             .get(&(group.to_owned(), day))
             .is_some_and(|v| v.iter().any(|(id, _)| identity.is_none_or(|want| want == id.as_slice())))
+    }
+
+    /// Forgets retired entries older than `RETIRED_MEMORY` as of `now` (unix seconds) and rewrites the file to match.
+    pub fn prune_retired(&self, now: i64) -> Result<usize> {
+        let since = now - RETIRED_MEMORY;
+        let mut retired = self.retired.lock().unwrap_or_else(|e| e.into_inner());
+        let before: usize = retired.values().map(Vec::len).sum();
+        retired.retain(|_, v| {
+            v.retain(|(_, at)| *at >= since);
+            !v.is_empty()
+        });
+        let after: usize = retired.values().map(Vec::len).sum();
+        if before == after {
+            return Ok(0);
+        }
+        let mut text = String::new();
+        for ((group, day), v) in retired.iter() {
+            for (id, at) in v {
+                text.push_str(&retired_line(group, *day, id, *at));
+            }
+        }
+        write_retired(&self.cfg.root, &text)?;
+        Ok(before - after)
     }
 
     fn remember_retired(&self, group: &str, segments: impl Iterator<Item = (i64, [u8; 32])>, at: i64) -> Result<()> {
@@ -1641,18 +1677,26 @@ fn load_retired(root: &Path) -> Result<HashMap<(String, i64), Vec<([u8; 32], i64
         }
     }
     if dropped {
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, &kept)?;
-        super::sync::full_flush(&File::open(&tmp)?)?;
-        std::fs::rename(&tmp, &path)?;
-        sync_all_durable(&[&File::open(root.join(STATE_DIR))?])?;
+        write_retired(root, &kept)?;
     }
     Ok(out)
+}
+
+/// Replaces `_state/retention-retired` with `text`, durably.
+fn write_retired(root: &Path, text: &str) -> Result<()> {
+    let path = root.join(STATE_DIR).join(RETIRED_FILE);
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, text)?;
+    super::sync::full_flush(&File::open(&tmp)?)?;
+    std::fs::rename(&tmp, &path)?;
+    sync_all_durable(&[&File::open(root.join(STATE_DIR))?])?;
+    Ok(())
 }
 
 /// Sweeps every `RETENTION_EVERY` until the store goes or stops, logging what each sweep freed.
 fn retention_thread(store: std::sync::Weak<Store>, age: Duration) {
     let mut next = Instant::now() + Duration::from_secs(60);
+    let mut next_prune = Instant::now();
     loop {
         std::thread::sleep(Duration::from_secs(1));
         let Some(s) = store.upgrade() else { return };
@@ -1664,6 +1708,12 @@ fn retention_thread(store: std::sync::Weak<Store>, age: Duration) {
         }
         let started = Instant::now();
         let r = s.retention_sweep(std::time::SystemTime::now());
+        if Instant::now() >= next_prune {
+            next_prune = Instant::now() + RETIRED_PRUNE_EVERY;
+            if let Err(e) = s.prune_retired(chrono::Utc::now().timestamp()) {
+                eprintln!("header store retention: couldnt rewrite the retired list: {e:#}");
+            }
+        }
         drop(s);
         next = Instant::now() + RETENTION_EVERY;
         if r.removed > 0 || r.held > 0 {
@@ -2723,5 +2773,30 @@ mod tests {
             std::fs::read_to_string(dir.path().join(STATE_DIR).join(RETIRED_FILE)).unwrap(),
             retired_line("a.b", 5, &id, now)
         );
+    }
+
+    #[test]
+    fn the_retired_list_forgets_old_entries_in_memory_and_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = Store::open(cfg(dir.path()), keep_all()).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        store.remember_retired("g", [(1, [1u8; 32])].into_iter(), now - 4 * DAY).unwrap();
+        store.remember_retired("g", [(2, [2u8; 32])].into_iter(), now).unwrap();
+        assert_eq!(store.prune_retired(now).unwrap(), 1);
+        assert!(!store.retired("g", 1, None) && store.retired("g", 2, None));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(STATE_DIR).join(RETIRED_FILE)).unwrap(),
+            retired_line("g", 2, &[2u8; 32], now)
+        );
+        assert_eq!(store.prune_retired(now).unwrap(), 0);
+        store.close().unwrap();
+        drop(store);
+        // an unreadable list doesn't stop the store opening
+        let f = dir.path().join(STATE_DIR).join(RETIRED_FILE);
+        std::fs::remove_file(&f).unwrap();
+        std::fs::create_dir(&f).unwrap();
+        let (store, _) = Store::open(cfg(dir.path()), keep_all()).unwrap();
+        assert!(!store.retired("g", 2, None));
+        store.close().unwrap();
     }
 }

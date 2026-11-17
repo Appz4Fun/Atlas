@@ -158,6 +158,13 @@ pub(crate) async fn step(db: &Db, store: &Arc<Store>, epoch: i64, budget: Budget
             // of it is gone by design, soo the row counts as scanned and the epoch moves on
             drop(found);
             cache.block = None;
+            let unstaged = (blocks - index).max(0);
+            eprintln!(
+                "header store linker: {group} day {} was deleted by retention with {unstaged} of {blocks} blocks not \
+                 staged; counting it as scanned",
+                crate::nxv_store::segment::day_name(day)
+            );
+            crate::metrics::names::HEADER_STORE_RETIRED_UNSTAGED.inc(&[], unstaged as u64);
             on_native_db(db, move |c| {
                 super::linker::durable_execute(
                     c,
