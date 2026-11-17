@@ -30,6 +30,8 @@ pub struct SaveStats {
 }
 
 struct Incoming<'a> {
+    /// the release's group: one flush of a save with a local store holds rows of several group#shard parts
+    group: &'a str,
     release: &'a Release,
     release_key: [u8; 32],
     original_name_key: [u8; 32],
@@ -259,24 +261,31 @@ fn save_grouped(tx:&mut Transaction<'_>,groups:Parts<'_>,now:i64,helper_epoch:Op
         tx.batch_execute(CREATE_FOLD_STAGE)?;
         tx.batch_execute(&clear_temp(&FOLD_TABLES, 0))?;
     }
-    for ((group, shard), releases) in groups {
-        // The group's key shared, then the shard's alone: shards of a group save side by side, and a writer that takes
-        // the whole group (inferred, spotnet, repair: its key exclusively) still has every release of it to itself.
-        // One statement takes both in that order (each materialized CTE runs before the one reading it); a helper's
-        // lock_timeout is 0 (no limit) while it waits for them and `HELPER_LOCK_WAIT` after, set local as before.
-        let part = format!("{group}#{shard}");
-        if helper {
-            tx.query_typed_one(LOCK_PART_HELPER, &[(&group, Type::TEXT), (&part, Type::TEXT), (&super::ingest::HELPER_LOCK_WAIT, Type::TEXT)])?;
-        } else {
-            tx.query_typed_one(LOCK_PART, &[(&group, Type::TEXT), (&part, Type::TEXT)])?;
-        }
-        // Another connection's save of this shard has ended now that its lock is ours:
-        // its articles are counted or gone before this save asks which it already has.
+    // With a local store every part's locks are taken up front, in one statement and in the order the parts sort
+    // (each group's key shared, then its shards' alone, as one part at a time took them), and the save's rows go out
+    // in flushes that span parts: a flush is cut only by its size, so a save of ~14 parts sends its fold, COPY, file
+    // and release statements about once instead of once per part. Every row a flush writes is of a part whose lock
+    // is held from the first statement. Without a local store a part is locked and flushed at a time, as before.
+    let batched = local.is_some();
+    if batched {
+        lock_parts(tx, groups.keys().map(|&(group, shard)| (group, shard)), helper)?;
         if let Some(local) = &mut local {
-            local.locked(&part);
-            if local.store.has_unsettled_besides(local.xid.as_deref(), Some(&part))? {
-                local.store.settle_under(Some(&part), |xid| crate::article_local::pg_ended(tx, xid))?;
+            for &(group, shard) in groups.keys() {
+                let part = format!("{group}#{shard}");
+                // Another connection's save of this shard has ended now that its lock is ours:
+                // its articles are counted or gone before this save asks which it already has.
+                local.locked(&part);
+                if local.store.has_unsettled_besides(local.xid.as_deref(), Some(&part))? {
+                    local.store.settle_under(Some(&part), |xid| crate::article_local::pg_ended(tx, xid))?;
+                }
             }
+        }
+    }
+    let mut batch = Vec::new();
+    let mut bytes = 0;
+    for ((group, shard), releases) in groups {
+        if !batched {
+            lock_parts(tx, std::iter::once((group, shard)), helper)?;
         }
         // A junk marker applies to all fragments with this identity, including
         // fragments that would otherwise fill an earlier COPY batch.
@@ -292,8 +301,6 @@ fn save_grouped(tx:&mut Transaction<'_>,groups:Parts<'_>,now:i64,helper_epoch:Op
             })
             .map(|(_, &key)| (key, true))
             .collect();
-        let mut batch = Vec::new();
-        let mut bytes = 0;
         for (release, key) in releases.into_iter().zip(identities) {
             let marker = match junk.get_mut(&key) {
                 Some(pending) if *pending => std::mem::take(pending),
@@ -309,7 +316,7 @@ fn save_grouped(tx:&mut Transaction<'_>,groups:Parts<'_>,now:i64,helper_epoch:Op
                 .filter(|_| marker)
                 .chain(release.articles.iter().filter(|article| !marker && !article.message_id.is_empty()).map(Some));
             for article in rows {
-                let row = Incoming { release, release_key: key.1, original_name_key, posted_at, posted_clock, article };
+                let row = Incoming { group, release, release_key: key.1, original_name_key, posted_at, posted_clock, article };
                 let size = row.approx_bytes();
                 if batch.len() == MAX_BATCH_ROWS || (!batch.is_empty() && bytes + size > MAX_BATCH_BYTES) {
                     flush(tx, group, &batch, now, &mut stats, &mut timing_key, local.as_mut())?;
@@ -320,9 +327,15 @@ fn save_grouped(tx:&mut Transaction<'_>,groups:Parts<'_>,now:i64,helper_epoch:Op
                 bytes += size;
             }
         }
-        if !batch.is_empty() {
+        if !batched && !batch.is_empty() {
             flush(tx, group, &batch, now, &mut stats, &mut timing_key, local.as_mut())?;
+            batch.clear();
+            bytes = 0;
         }
+    }
+    if !batch.is_empty() {
+        let group = batch[0].group;
+        flush(tx, group, &batch, now, &mut stats, &mut timing_key, local.as_mut())?;
     }
     Ok((stats, local))
 }
@@ -376,7 +389,7 @@ fn flush(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], now: i64
         *timing_key = Some(timing::key(tx)?);
     }
     if let Some(local) = local {
-        return flush_local(tx, group, batch, now, stats, *timing_key, local);
+        return flush_local(tx, batch, now, stats, *timing_key, local);
     }
     tx.batch_execute(&clear_temp(&["pg_temp.atlas_release_input"], batch.len()))?;
     copy_input(tx, batch, *timing_key)?;
@@ -457,13 +470,13 @@ fn greatest(a: Option<i64>, b: Option<i64>) -> Option<i64> {
 /// A batch with the articles kept in the local article store: PostgreSQL gets
 /// the releases, then one folded row for each file and each release that
 /// gained an article. No article row goes to PostgreSQL.
-fn flush_local(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], now: i64, stats: &mut SaveStats, timing_key: Option<i64>, local: &mut Local) -> Result<()> {
+fn flush_local(tx: &mut Transaction<'_>, batch: &[Incoming<'_>], now: i64, stats: &mut SaveStats, timing_key: Option<i64>, local: &mut Local) -> Result<()> {
     // One row for each release named in the batch: the first staged row of it,
     // which is the one `distinct on ... order by ordinal` inserted.
     let mut heads = Vec::new();
     let mut head_of = HashMap::new();
     for (ordinal, row) in batch.iter().enumerate() {
-        head_of.entry((row.release.collection.is_some(), row.release_key)).or_insert_with(|| {
+        head_of.entry((row.group, row.release.collection.is_some(), row.release_key)).or_insert_with(|| {
             heads.push(ordinal);
             heads.len() - 1
         });
@@ -478,18 +491,19 @@ fn flush_local(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], no
     {
         use Type as T;
         let input = tx.copy_in(
-            "copy pg_temp.atlas_release_fold (ordinal, identity_key, is_collection, name, poster, posted_date, display_name,
+            "copy pg_temp.atlas_release_fold (ordinal, group_name, identity_key, is_collection, name, poster, posted_date, display_name,
                 is_obfuscated, junk, original_name, original_name_key, posted_at, posted_clock) from stdin binary",
         )?;
         let mut writer = BinaryCopyInWriter::new(
             input,
-            &[T::INT8, T::BYTEA, T::BOOL, T::TEXT, T::TEXT, T::TEXT, T::TEXT, T::BOOL, T::BOOL, T::BYTEA, T::BYTEA, T::INT8, T::INT8],
+            &[T::INT8, T::TEXT, T::BYTEA, T::BOOL, T::TEXT, T::TEXT, T::TEXT, T::TEXT, T::BOOL, T::BOOL, T::BYTEA, T::BYTEA, T::INT8, T::INT8],
         );
         for (head, &ordinal) in heads.iter().enumerate() {
             let row = &batch[ordinal];
             let r = row.release;
             writer.write(&[
                 &(head as i64),
+                &row.group,
                 &&row.release_key[..],
                 &r.collection.is_some(),
                 &pg_text(&r.name).as_ref(),
@@ -509,18 +523,18 @@ fn flush_local(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], no
     // A release with a program is deleted from the catalogue below; its
     // articles leave the store when this transaction commits.
     if heads.iter().any(|&ordinal| batch[ordinal].article.is_none()) {
-        let gone: Vec<i64> = tx.query_typed(RETRACTED, &[(&group, Type::TEXT)])?.iter().map(|row| row.try_get(0)).collect::<Result<_, _>>()?;
+        let gone: Vec<i64> = tx.query_typed(RETRACTED, &[])?.iter().map(|row| row.try_get(0)).collect::<Result<_, _>>()?;
         if !gone.is_empty() {
             let xid = local.xid(tx)?;
             local.store.retract(&xid, &gone)?;
         }
     }
-    let release = tx.query_typed_one(&WRITE_RELEASES.replace("pg_temp.atlas_release_input", "pg_temp.atlas_release_fold"), &[(&group, Type::TEXT)])?;
+    let release = tx.query_typed_one(WRITE_RELEASES_FOLD, &[])?;
     stats.releases += release.get::<_, i64>(0) as u64;
     // releases made by this statement have no articles in the local store yet: theirs arent looked up
     let fresh_releases: HashSet<i64> = release.try_get::<_, Vec<i64>>(1)?.into_iter().collect();
     let mut release_of = vec![None; heads.len()];
-    for row in tx.query_typed(RELEASE_IDS, &[(&group, Type::TEXT)])? {
+    for row in tx.query_typed(RELEASE_IDS, &[])? {
         release_of[usize::try_from(row.try_get::<_, i64>(0)?)?] = Some(row.try_get::<_, i64>(1)?);
     }
     // The first copy of a message id in a release wins, and one the release
@@ -530,7 +544,7 @@ fn flush_local(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], no
         let mut seen = std::collections::HashSet::new();
         for row in batch {
             let Some(article) = row.article else { continue };
-            let Some(release) = release_of[head_of[&(row.release.collection.is_some(), row.release_key)]] else { continue };
+            let Some(release) = release_of[head_of[&(row.group, row.release.collection.is_some(), row.release_key)]] else { continue };
             if seen.insert((release, article.message_id.as_bytes())) {
                 firsts.push((row, article, release));
             }
@@ -658,6 +672,22 @@ fn flush_local(tx: &mut Transaction<'_>, group: &str, batch: &[Incoming<'_>], no
             r.display_name = Some(name);
         }
     }
+    // The files in the order of the index `ADD_FILES` inserts into (release_id, filename_key) and `PLACE_FILES` /
+    // UPDATE_FILES_FOLD read by, so a flush touches each files B-tree page once, in order, instead of by arrival.
+    // Sorting here costs Atlas a few microseconds; `ord` follows the new order and `file_index` is remapped to it.
+    let files = {
+        let mut order: Vec<usize> = (0..files.len()).collect();
+        order.sort_unstable_by(|&a, &b| (files[a].release_id, files[a].filename_key).cmp(&(files[b].release_id, files[b].filename_key)));
+        let mut moved_to = vec![0; files.len()];
+        for (to, &from) in order.iter().enumerate() {
+            moved_to[from] = to;
+        }
+        for at in &mut file_index {
+            *at = moved_to[*at];
+        }
+        let mut slots: Vec<Option<FileFold<'_>>> = files.into_iter().map(Some).collect();
+        order.into_iter().map(|from| slots[from].take().expect("each file moves once")).collect::<Vec<_>>()
+    };
     {
         use Type as T;
         let input = tx.copy_in(
@@ -957,18 +987,53 @@ fn copy_input(tx: &mut Transaction<'_>, batch: &[Incoming<'_>], timing_key: Opti
     Ok(())
 }
 
-// Both advisory locks of a save part in one statement: the group's shared, then the part's exclusive. A materialized
-// CTE is computed before the query that reads it, so the order holds as with two statements.
-const LOCK_PART: &str = "
-    with g as materialized (select pg_advisory_xact_lock_shared(hashtextextended(current_schema() || ':' || $1, 7936)))
-    select pg_advisory_xact_lock(hashtextextended(current_schema() || ':' || $2, 7936)) from g";
+/// The advisory locks of `parts` (sorted, as a `Parts` map's keys are) in one statement: each group's key shared, then
+/// each of its parts' alone, in that order, as a save took them a part at a time before. Each lock is a materialized CTE
+/// reading the one before it, so they are taken one after another in the order written. A helper's lock_timeout is 0
+/// (no limit) while it waits for them and `HELPER_LOCK_WAIT` after, set local.
+fn lock_parts<'a>(tx: &mut Transaction<'_>, parts: impl IntoIterator<Item = (&'a str, u32)>, helper: bool) -> Result<()> {
+    let (sql, keys) = lock_parts_sql(parts, helper);
+    let mut params: Vec<(&(dyn postgres::types::ToSql + Sync), Type)> = keys.iter().map(|key| (key as _, Type::TEXT)).collect();
+    if helper {
+        params.push((&super::ingest::HELPER_LOCK_WAIT, Type::TEXT));
+    }
+    tx.query_typed_one(&sql, &params)?;
+    Ok(())
+}
 
-// A helper's: `set local lock_timeout = 0` before the locks and `= HELPER_LOCK_WAIT` ($3) after, as set_config(.., true).
-const LOCK_PART_HELPER: &str = "
-    with t as materialized (select pg_catalog.set_config('lock_timeout', '0', true)),
-    g as materialized (select pg_advisory_xact_lock_shared(hashtextextended(current_schema() || ':' || $1, 7936)) from t),
-    p as materialized (select pg_advisory_xact_lock(hashtextextended(current_schema() || ':' || $2, 7936)) from g)
-    select pg_catalog.set_config('lock_timeout', $3, true) from p";
+/// `lock_parts`' statement and its lock keys ($1.., then the helper's wait).
+fn lock_parts_sql<'a>(parts: impl IntoIterator<Item = (&'a str, u32)>, helper: bool) -> (String, Vec<String>) {
+    let mut keys = Vec::new();
+    let mut ctes = Vec::new();
+    let mut previous: Option<String> = None;
+    if helper {
+        ctes.push("t as materialized (select pg_catalog.set_config('lock_timeout', '0', true))".to_owned());
+        previous = Some("t".to_owned());
+    }
+    let mut last_group: Option<&str> = None;
+    for (group, shard) in parts {
+        let mut take = |key: String, shared: bool| {
+            keys.push(key);
+            let name = format!("l{}", keys.len());
+            let from = previous.as_deref().map_or(String::new(), |p| format!(" from {p}"));
+            let function = if shared { "pg_advisory_xact_lock_shared" } else { "pg_advisory_xact_lock" };
+            ctes.push(format!(
+                "{name} as materialized (select {function}(hashtextextended(current_schema() || ':' || ${}, 7936)){from})",
+                keys.len()
+            ));
+            previous = Some(name);
+        };
+        if last_group != Some(group) {
+            debug_assert!(last_group.is_none_or(|last| last < group), "parts are locked in sorted order");
+            take(group.to_owned(), true);
+            last_group = Some(group);
+        }
+        take(format!("{group}#{shard}"), false);
+    }
+    let last = previous.expect("at least one part");
+    let select = if helper { format!("select pg_catalog.set_config('lock_timeout', ${}, true) from {last}", keys.len() + 1) } else { format!("select 1 from {last}") };
+    (format!("with {} {select}", ctes.join(",\n    ")), keys)
+}
 
 // The connection-local table is reused when a pool connection is reused. A
 // commit or rollback leaves no rows for the next save.
@@ -1028,6 +1093,7 @@ const CREATE_STAGE: &str = "
 const CREATE_FOLD_STAGE: &str = "
     create temporary table if not exists pg_temp.atlas_release_fold (
         ordinal bigint primary key,
+        group_name text not null,
         identity_key bytea not null,
         is_collection boolean not null,
         name text not null,
@@ -1103,6 +1169,34 @@ const WRITE_RELEASES: &str = "
             where j.group_name = $1 and (j.is_collection, j.identity_key) = (s.is_collection, s.identity_key)
         )
         order by s.is_collection, s.identity_key, s.ordinal
+        on conflict (group_name, is_collection, identity_key) do nothing
+        returning id
+    )
+    select count(*), coalesce(array_agg(id), '{}')::bigint[] from added";
+
+// `WRITE_RELEASES` over the fold stage, whose rows carry their group: one flush may hold several groups' rows.
+const WRITE_RELEASES_FOLD: &str = "
+    with marked as (
+        select distinct group_name, is_collection, identity_key from pg_temp.atlas_release_fold where junk
+    ), remember as (
+        insert into release_writer_junk
+        select group_name, is_collection, identity_key from marked
+        on conflict do nothing
+    ), retract as (
+        delete from releases r using marked j
+        where (r.group_name, r.is_collection, r.identity_key) = (j.group_name, j.is_collection, j.identity_key)
+    ), added as (
+        insert into releases (group_name, is_collection, identity_key, name, poster, posted_date, display_name, is_obfuscated, original_name, original_name_key, posted_at, posted_clock)
+        select distinct on (s.group_name, s.is_collection, s.identity_key)
+            s.group_name, s.is_collection, s.identity_key, s.name, s.poster, s.posted_date, s.display_name, s.is_obfuscated, s.original_name, s.original_name_key, s.posted_at, s.posted_clock
+        from pg_temp.atlas_release_fold s
+        where not exists (
+            select 1 from marked j where (j.group_name, j.is_collection, j.identity_key) = (s.group_name, s.is_collection, s.identity_key)
+        ) and not exists (
+            select 1 from release_writer_junk j
+            where (j.group_name, j.is_collection, j.identity_key) = (s.group_name, s.is_collection, s.identity_key)
+        )
+        order by s.group_name, s.is_collection, s.identity_key, s.ordinal
         on conflict (group_name, is_collection, identity_key) do nothing
         returning id
     )
@@ -1253,14 +1347,14 @@ const UPDATE_FILES_FOLD: &str = concat!(
 const RELEASE_IDS: &str = "
     select s.ordinal, r.id
     from pg_temp.atlas_release_fold s
-    join releases r on r.group_name = $1 and (r.is_collection, r.identity_key) = (s.is_collection, s.identity_key)
+    join releases r on r.group_name = s.group_name and (r.is_collection, r.identity_key) = (s.is_collection, s.identity_key)
     where not s.junk";
 
 // The releases the junk markers of a batch are about to delete.
 const RETRACTED: &str = "
     select r.id
     from pg_temp.atlas_release_fold s
-    join releases r on r.group_name = $1 and (r.is_collection, r.identity_key) = (s.is_collection, s.identity_key)
+    join releases r on r.group_name = s.group_name and (r.is_collection, r.identity_key) = (s.is_collection, s.identity_key)
     where s.junk";
 
 // Create the files a batch names for the first time.
@@ -1405,6 +1499,174 @@ mod tests {
             row.get::<_, i64>("due_at"),
             103 + crate::catalog_facts::COMPLETE_SETTLE_SECS.load(std::sync::atomic::Ordering::Relaxed)
         );
+    }
+
+    #[test]
+    fn lock_parts_takes_each_group_shared_then_its_parts_alone_in_sorted_order() {
+        let (sql, keys) = lock_parts_sql([("a.b", 1), ("a.b", 5), ("c.d", 2)], false);
+        assert_eq!(keys, ["a.b", "a.b#1", "a.b#5", "c.d", "c.d#2"]);
+        let at = |needle: &str| sql.find(needle).unwrap_or_else(|| panic!("{needle} in {sql}"));
+        // each lock reads the one before it, so they run in this order; groups shared, parts exclusive
+        assert!(at("l1 as materialized (select pg_advisory_xact_lock_shared(") < at("l2 as materialized (select pg_advisory_xact_lock(hash"));
+        assert!(sql.contains("|| $2, 7936)) from l1)") && sql.contains("|| $5, 7936)) from l4)"));
+        assert!(sql.contains("l4 as materialized (select pg_advisory_xact_lock_shared(") && sql.ends_with("select 1 from l5"));
+        let (helper, keys) = lock_parts_sql([("a.b", 1)], true);
+        assert_eq!(keys, ["a.b", "a.b#1"]);
+        assert!(helper.starts_with("with t as materialized (select pg_catalog.set_config('lock_timeout', '0', true))"));
+        assert!(helper.contains("|| $1, 7936)) from t)") && helper.ends_with("select pg_catalog.set_config('lock_timeout', $3, true) from l2"));
+    }
+
+    /// Releases over two groups and many shards: several files, a replayed message id, a release split over two
+    /// fragments, a release retracted by a program, and a nameless article.
+    fn many_parts() -> Vec<Release> {
+        let mut all = Vec::new();
+        for group in ["alt.binaries.a", "alt.binaries.b"] {
+            for n in 0..40 {
+                let name = format!("Many.Parts.{n}");
+                let article = |file: &str, id: String, part: i64| Article {
+                    filename: Some(file.into()),
+                    message_id: id,
+                    subject: format!("{file} yEnc ({part}/3)"),
+                    author: format!("poster{} <p@x>", n % 3),
+                    date: format!("Mon, 0{} Jan 2024 10:00:00 +0000", 1 + n % 5),
+                    part: Some(part),
+                    total_parts: Some(3),
+                    bytes: 100 + n,
+                    lines: 10,
+                    number: 1000 + n as u64,
+                    ..Article::default()
+                };
+                let mut articles = vec![
+                    article(&format!("{name}.part1.rar"), format!("<{group}.{n}.1@x>"), 1),
+                    article(&format!("{name}.part1.rar"), format!("<{group}.{n}.2@x>"), 2),
+                    article(&format!("{name}.part2.rar"), format!("<{group}.{n}.3@x>"), 1),
+                    // a replay of the first in the same save
+                    article(&format!("{name}.part1.rar"), format!("<{group}.{n}.1@x>"), 1),
+                ];
+                if n % 7 == 3 {
+                    articles.push(article("setup.exe", format!("<{group}.{n}.exe@x>"), 1));
+                }
+                if n % 9 == 4 {
+                    articles.push(Article { filename: None, ..article("", format!("<{group}.{n}.raw@x>"), 1) });
+                }
+                let release = Release { name: name.clone(), group: group.into(), poster: format!("poster{}", n % 3), date: "2024-01-01".into(), articles, ..Release::default() };
+                if n % 5 == 0 {
+                    // the same release in two fragments: the second adds a part
+                    let mut late = release.clone();
+                    late.articles = vec![article(&format!("{name}.part1.rar"), format!("<{group}.{n}.late@x>"), 3)];
+                    all.push(release);
+                    all.push(late);
+                } else {
+                    all.push(release);
+                }
+            }
+        }
+        all
+    }
+
+    /// The catalogue rows a save leaves, by natural key, so two schemas compare whatever ids they handed out.
+    fn catalogue(client: &mut Client) -> Vec<String> {
+        let mut rows = Vec::new();
+        for sql in [
+            "select format('%s|%s|%s|%s|%s|%s|%s|%s', group_name, name, size, parts, complete, poster, posted_date, file_total)
+                from releases order by 1",
+            "select format('%s|%s|%s|%s|%s|%s|%s|%s|%s', r.group_name, r.name, f.filename, f.expected, f.distinct_parts, f.first_part,
+                f.last_part, f.complete, encode(f.subject_mid, 'escape'))
+                from files f join releases r on r.id = f.release_id order by 1",
+            "select format('%s|%s|%s|%s|%s|%s|%s|%s|%s', r.group_name, r.name, f.filename, t.articles, t.from_variants, t.lines,
+                t.number_first, t.number_last, t.utc_complete)
+                from file_timing t join files f on f.id = t.file_id join releases r on r.id = f.release_id order by 1",
+            "select format('%s|%s|%s|%s', r.group_name, r.name, q.due_at, q.generation) from pp_queue q join releases r on r.id = q.release_id order by 1",
+            "select format('%s|%s', group_name, encode(identity_key, 'hex')) from release_writer_junk order by 1",
+        ] {
+            rows.extend(client.query(sql, &[]).unwrap().iter().map(|row| row.get::<_, String>(0)));
+        }
+        rows.push(format!("articles {}", crate::pg::testing::articles(client)));
+        rows
+    }
+
+    #[test]
+    fn a_save_over_many_parts_writes_what_saving_each_part_alone_does() {
+        let (Some(together), Some(apart)) = (crate::pg::testing::Schema::native_writer(), crate::pg::testing::Schema::native_writer()) else { return };
+        let releases = many_parts();
+        let mut one = together.pool.get().unwrap();
+        let mut each = apart.pool.get().unwrap();
+        let parts = parts(&releases).unwrap();
+        assert!(parts.len() > 20, "the releases span many group#shard parts ({})", parts.len());
+        let stats = save(&mut one, &releases, 500).unwrap();
+        let mut summed = SaveStats::default();
+        for part in parts.values() {
+            let part: Vec<Release> = part.iter().map(|&release| release.clone()).collect();
+            let s = save(&mut each, &part, 500).unwrap();
+            (summed.releases, summed.files, summed.parts) = (summed.releases + s.releases, summed.files + s.files, summed.parts + s.parts);
+        }
+        assert_eq!(stats, summed);
+        assert!(stats.releases > 60 && stats.parts > 200, "{stats:?}");
+        let (a, b) = (catalogue(&mut one), catalogue(&mut each));
+        assert_eq!(a, b);
+        // and saving it all again is a replay in both
+        assert_eq!(save(&mut one, &releases, 600).unwrap(), SaveStats::default());
+        assert_eq!(catalogue(&mut one), a, "a replay changes nothing");
+    }
+
+    #[test]
+    fn a_failed_part_of_a_batched_save_leaves_nothing_in_the_store_or_the_catalogue() {
+        let Some(test) = crate::pg::testing::Schema::native_writer() else { return };
+        let mut client = test.pool.get().unwrap();
+        let mut releases = many_parts();
+        let good = releases.clone();
+        let mut failing = release("Overflow", "o.rar", "<o1@x>", 1);
+        failing.group = "alt.binaries.zzz".into();
+        failing.articles[0].bytes = i64::MAX;
+        failing.articles.push(Article { message_id: "<o2@x>".into(), ..failing.articles[0].clone() });
+        releases.push(failing);
+        assert!(save(&mut client, &releases, 500).is_err());
+        assert_eq!(client.query_one("select count(*) from releases", &[]).unwrap().get::<_, i64>(0), 0);
+        if let Some(store) = crate::article_local::of(&mut *client).unwrap() {
+            store.settle(|xid| crate::article_local::pg_ended(&mut *client, xid)).unwrap();
+        }
+        assert_eq!(crate::pg::testing::articles(&mut *client), 0, "the rolled-back save's articles are gone");
+        // the same save without the bad release writes all of it
+        let stats = save(&mut client, &good, 501).unwrap();
+        assert!(stats.releases > 60, "{stats:?}");
+    }
+
+    #[test]
+    fn a_batched_save_holds_every_parts_lock_before_it_writes_a_row() {
+        let Some(test) = crate::pg::testing::Schema::native_writer() else { return };
+        let releases = many_parts();
+        let keys: Vec<(String, u32)> = parts(&releases).unwrap().keys().map(|&(g, s)| (g.to_owned(), s)).collect();
+        let (last_group, last_shard) = keys.last().unwrap().clone();
+        let mut blocker = test.pool.get().unwrap();
+        let mut tx = blocker.transaction().unwrap();
+        tx.execute("select pg_advisory_xact_lock(hashtextextended(current_schema() || ':' || $1, 7936))", &[&format!("{last_group}#{last_shard}")]).unwrap();
+        std::thread::scope(|scope| {
+        let saver = scope.spawn(|| save(&mut test.pool.get().unwrap(), &releases, 500));
+        let mut watcher = test.pool.get().unwrap();
+        // the saver waits on the last part's lock with every earlier part's held and nothing written
+        let mut waited = None;
+        for _ in 0..200 {
+            let row = watcher.query_one(
+                "select a.pid, a.query, (select count(*) from pg_locks l where l.pid = a.pid and l.locktype = 'advisory' and l.granted and l.mode = 'ExclusiveLock')
+                 from pg_stat_activity a join pg_locks w on w.pid = a.pid and not w.granted and w.locktype = 'advisory'
+                 where a.datname = current_database() limit 1", &[]).ok();
+            if let Some(row) = row {
+                waited = Some((row.get::<_, String>(1), row.get::<_, i64>(2)));
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let (query, held) = waited.expect("the saver waits on the held lock");
+        assert!(query.contains("pg_advisory_xact_lock"), "waiting in the lock statement: {query}");
+        let local = crate::pg::testing::articles_are_local(&mut *watcher);
+        if local {
+            // one statement takes all: every other part's lock is held while it waits for the last
+            assert_eq!(held as usize, keys.len() - 1);
+            assert_eq!(crate::pg::testing::articles(&mut *watcher), 0, "nothing reached the local store yet");
+        }
+        tx.rollback().unwrap();
+        assert!(saver.join().unwrap().unwrap().releases > 60);
+        });
     }
 
     #[test]
