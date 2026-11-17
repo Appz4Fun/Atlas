@@ -242,6 +242,7 @@ dependencies = [
  "postgres",
  "quick-xml",
  "ratatui",
+ "rayon",
  "regex",
  "rusqlite",
  "rustls",

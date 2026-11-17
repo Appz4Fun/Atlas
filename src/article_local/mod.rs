@@ -30,7 +30,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
@@ -118,13 +118,16 @@ pub(crate) struct Shard {
     warming: std::sync::atomic::AtomicBool,
     /// saves waiting for the write lock in `add_fresh`: the fill runs only when none is (`fill_seen`)
     waiting: AtomicUsize,
-    /// Saves handed over for the next group commit (`add`): whoever takes the write lock next commits them all.
-    queue: Mutex<Vec<Pending>>,
+    /// Saves handed over for the next group commit (`add`), and whether a save leads the commits (`Queue::leading`).
+    queue: Mutex<Queue>,
     /// Group commits made (`commit_group`).
     commits: std::sync::atomic::AtomicU64,
     /// lookups `has` split over threads (tests)
     #[cfg(test)]
     pub(super) has_splits: std::sync::atomic::AtomicU64,
+    /// the next leader panics before its commit (tests)
+    #[cfg(test)]
+    pub(super) panic_next_commit: std::sync::atomic::AtomicBool,
     /// Idle read connections kept over every file of the store (`READERS_KEPT`), shared by them (`Store::of_shards`).
     idle_readers: Arc<AtomicUsize>,
 }
@@ -136,8 +139,125 @@ struct Pending {
     keys: Vec<u8>,
     /// its rows, in key order
     rows: Vec<OwnedRow>,
-    /// set once the transaction that carried its rows committed (`Ok`) or failed
-    done: Arc<Mutex<Option<Result<(), String>>>>,
+    /// answered once the transaction that carried its rows committed (`Ok`) or failed, or told to lead the commits
+    done: Arc<Completion>,
+}
+
+/// The saves waiting for a group commit of one file, and whether one of them is leading (`Shard::lead`).
+///
+/// One save at a time leads: it takes the write lock and commits batch after batch of the queue until its own save
+/// is answered, then hands the lead to the oldest save still queued, if any. The others wait on their own `Completion`
+/// and never touch the write lock. On prod (32 helper writers) every waiting save queued on the write lock itself,
+/// and each took it in turn only to find its rows already committed: four fifths of `Shard::add`'s time was that
+/// convoy of lock handoffs, against one fifth writing.
+struct Queue {
+    pending: Vec<Pending>,
+    /// a save is leading the commits: it, or the one it hands the lead to, will commit every save in `pending`
+    leading: bool,
+}
+
+/// What a waiting save hears (`Completion`).
+enum Turn {
+    Waiting,
+    /// the lead was handed to this save: it commits the queue now
+    Lead,
+    /// its rows committed (`Ok`) or failed
+    Done(Result<(), String>),
+}
+
+/// One save's answer, waited for on a condition variable of its own.
+struct Completion {
+    turn: Mutex<Turn>,
+    wake: Condvar,
+}
+
+impl Completion {
+    fn new() -> Self {
+        Self { turn: Mutex::new(Turn::Waiting), wake: Condvar::new() }
+    }
+
+    fn set(&self, turn: Turn) {
+        *self.turn.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = turn;
+        self.wake.notify_one();
+    }
+
+    /// Answer the save. An answer is final: nothing changes it after.
+    fn finish(&self, answer: Result<(), String>) {
+        self.set(Turn::Done(answer));
+    }
+
+    fn is_done(&self) -> bool {
+        matches!(*self.turn.lock().unwrap_or_else(std::sync::PoisonError::into_inner), Turn::Done(_))
+    }
+
+    /// Wait to be answered or handed the lead: `Ok` with the answer, `Err(())` to lead.
+    fn wait(&self) -> std::result::Result<Result<(), String>, ()> {
+        let mut turn = self.turn.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            match std::mem::replace(&mut *turn, Turn::Waiting) {
+                Turn::Waiting => turn = self.wake.wait(turn).unwrap_or_else(std::sync::PoisonError::into_inner),
+                Turn::Lead => return Err(()),
+                Turn::Done(answer) => {
+                    // left answered, should anything look again
+                    *turn = Turn::Done(answer.clone());
+                    return Ok(answer);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for Pending {
+    /// A save dropped unanswered (its leader panicked mid-commit) fails rather than leaving its caller waiting forever.
+    fn drop(&mut self) {
+        if !self.done.is_done() {
+            self.done.finish(Err("the local article store's group commit stopped before this save was written".to_owned()));
+        }
+    }
+}
+
+/// Hands the lead on when a leading save stops (`Shard::lead`), however it stops: to the oldest save still queued,
+/// or, with none queued, to whichever save comes next. A leader that panicked with its own save still queued takes it
+/// out first (it fails), so the lead isnt handed to the thread that is going away.
+struct Handoff<'a>(&'a Shard, &'a Arc<Completion>);
+
+impl Drop for Handoff<'_> {
+    fn drop(&mut self) {
+        let mut queue = self.0.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let own: Vec<Pending> = {
+            let mut own = Vec::new();
+            let mut at = 0;
+            while at < queue.pending.len() {
+                if Arc::ptr_eq(&queue.pending[at].done, self.1) {
+                    own.push(queue.pending.remove(at));
+                } else {
+                    at += 1;
+                }
+            }
+            own
+        };
+        drop(own); // answered with an error by `Pending`'s drop
+        match queue.pending.first() {
+            Some(next) => next.done.set(Turn::Lead),
+            None => queue.leading = false,
+        }
+    }
+}
+
+/// Threads the lookups of `has` run on, kept for the life of the process: on prod spawning and joining threads for
+/// every lookup (`std::thread::scope`) cost about as much as the lookups. Lookups block on disk reads, so these are
+/// not rayon's global pool, which other work computes on.
+const LOOKUP_THREADS: usize = 64;
+
+fn lookups() -> &'static rayon::ThreadPool {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(LOOKUP_THREADS)
+            .thread_name(|n| format!("article-lookup-{n}"))
+            .build()
+            .expect("the local article store's lookup threads")
+    })
 }
 
 /// A `NewRow` the group commit's writer, on another save's thread, can hold.
@@ -355,10 +475,12 @@ impl Shard {
             seen_filled_at: Mutex::new(None),
             warming: std::sync::atomic::AtomicBool::new(false),
             waiting: AtomicUsize::new(0),
-            queue: Mutex::new(Vec::new()),
+            queue: Mutex::new(Queue { pending: Vec::new(), leading: false }),
             commits: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             has_splits: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            panic_next_commit: std::sync::atomic::AtomicBool::new(false),
             idle_readers: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -385,10 +507,12 @@ impl Shard {
             seen_filled_at: Mutex::new(None),
             warming: std::sync::atomic::AtomicBool::new(false),
             waiting: AtomicUsize::new(0),
-            queue: Mutex::new(Vec::new()),
+            queue: Mutex::new(Queue { pending: Vec::new(), leading: false }),
             commits: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             has_splits: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            panic_next_commit: std::sync::atomic::AtomicBool::new(false),
             idle_readers: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -502,18 +626,13 @@ impl Shard {
             let each = cold.div_ceil(HAS_SPLIT.min(cold.div_ceil(HAS_ALONE)));
             #[cfg(test)]
             self.has_splits.fetch_add(1, Ordering::Relaxed);
-            std::thread::scope(|scope| {
-                let mut parts: Vec<_> = sorted[..cold].chunks(each).map(|part| scope.spawn(move || look(part))).collect();
-                if cold < sorted.len() {
-                    let warm = &sorted[cold..];
-                    parts.push(scope.spawn(move || look(warm)));
-                }
-                let mut found = Vec::with_capacity(keys.len());
-                for part in parts {
-                    found.extend(part.join().map_err(|_| anyhow::anyhow!("a local store lookup panicked"))??);
-                }
-                Ok::<_, anyhow::Error>(found)
-            })?
+            let mut parts: Vec<&[&(i64, &[u8])]> = sorted[..cold].chunks(each).collect();
+            if cold < sorted.len() {
+                parts.push(&sorted[cold..]);
+            }
+            use rayon::prelude::*;
+            let found: Vec<Vec<bool>> = lookups().install(|| parts.par_iter().map(|part| look(part)).collect::<Result<_>>())?;
+            found.into_iter().flatten().collect()
         };
         let mut answers = vec![false; keys.len()];
         for (&i, known) in order.iter().zip(found) {
@@ -590,48 +709,71 @@ impl Shard {
             })
             .collect();
         owned.sort_unstable_by(|a, b| (a.release_id, &a.message_id).cmp(&(b.release_id, &b.message_id)));
-        let done: Arc<Mutex<Option<Result<(), String>>>> = Arc::new(Mutex::new(None));
+        let done = Arc::new(Completion::new());
         let request = Pending { xid: xid.to_owned(), keys: encode_keys(rows)?, rows: owned, done: done.clone() };
-        self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(request);
         // the next fill's rows read here first, off the write lock: the fill under it then finds their pages cached
         self.warm_fill();
-        self.waiting.fetch_add(1, Ordering::AcqRel);
-        let locked = self.lock();
-        self.waiting.fetch_sub(1, Ordering::AcqRel);
-        let mut conn = match locked {
-            Ok(conn) => conn,
-            Err(error) => {
-                // taken back out, unless a writer already took it (then its answer stands)
-                self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|p| !Arc::ptr_eq(&p.done, &done));
-                if let Some(answer) = done.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
-                    answer.map_err(|e| anyhow::anyhow!(e))?;
-                    return Ok(order.into_iter().map(|(at, file)| (at, gained[&file])).collect());
-                }
-                return Err(error);
+        // Group commit: the save leading commits every save queued in one transaction, batch after batch, so a save
+        // may find its rows committed by another's. The rest wait for their own answer, off the write lock. An answer
+        // is final once set: only the leader sets it, after the transaction carrying the save committed or failed.
+        let mut lead = {
+            let mut queue = self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            queue.pending.push(request);
+            self.waiting.fetch_add(1, Ordering::AcqRel);
+            !std::mem::replace(&mut queue.leading, true)
+        };
+        // counted down however this save ends, panics included: `waiting` gates `fill_seen` and `warm_fill`
+        struct Waited<'a>(&'a AtomicUsize);
+        impl Drop for Waited<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        let _waited = Waited(&self.waiting);
+        let answer = loop {
+            if lead {
+                self.lead(&done);
+            }
+            match done.wait() {
+                Ok(answer) => break answer,
+                Err(()) => lead = true,
             }
         };
-        // Group commit: whoever holds the write lock commits every save queued so far in one transaction, so a save
-        // may find its rows committed by the one before it. Its answer is final once set: only a writer under this
-        // lock sets it, after its transaction committed or failed.
-        loop {
-            if let Some(answer) = done.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
-                drop(conn);
-                answer.map_err(|e| anyhow::anyhow!(e))?;
-                return Ok(order.into_iter().map(|(at, file)| (at, gained[&file])).collect());
-            }
+        answer.map_err(|e| anyhow::anyhow!(e))?;
+        Ok(order.into_iter().map(|(at, file)| (at, gained[&file])).collect())
+    }
+
+    /// Lead the group commits (`Queue`) until `own` is answered, then hand the lead on. The write lock is taken for
+    /// each batch, so `confirm`, `settle` and the rest get it between batches.
+    fn lead(&self, own: &Arc<Completion>) {
+        let _handoff = Handoff(self, own);
+        while !own.is_done() {
+            let mut conn = match self.lock() {
+                Ok(conn) => conn,
+                Err(error) => {
+                    // no save of this file can be written: every one queued fails with it
+                    let failed: Vec<Pending> =
+                        self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pending.drain(..).collect();
+                    for pending in &failed {
+                        pending.done.finish(Err(format!("{error:#}")));
+                    }
+                    return;
+                }
+            };
             if self.restart_wanted.swap(false, Ordering::AcqRel) {
                 restart_wal(&conn);
             }
             // the fill is best effort: a save never fails for it, and it goes on from `meta` next time. Only when no
-            // other save waits for this lock: it only speeds up `has`, which reads off the lock, and on prod its reads
-            // of cold pages under the lock held every save back
-            if self.waiting.load(Ordering::Acquire) == 0
+            // save but this one waits: it only speeds up `has`, which reads off the lock, and on prod its reads of cold
+            // pages under the lock held every save back
+            if self.waiting.load(Ordering::Acquire) <= 1
                 && let Err(error) = self.fill_seen(&mut conn)
             {
                 eprintln!("local article store: couldnt fill the lookup index this time: {error:#}");
             }
             let batch = {
                 let mut queue = self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let queue = &mut queue.pending;
                 let mut take = 0;
                 let mut count = 0;
                 while take < queue.len() && (take == 0 || count + queue[take].rows.len() <= GROUP_ROWS) {
@@ -640,6 +782,10 @@ impl Shard {
                 }
                 queue.drain(..take).collect::<Vec<Pending>>()
             };
+            #[cfg(test)]
+            if self.panic_next_commit.swap(false, Ordering::AcqRel) {
+                panic!("a leader panicking mid-commit (test)");
+            }
             self.commit_group(&mut conn, batch);
         }
     }
@@ -677,7 +823,7 @@ impl Shard {
                 (None, Ok(answers)) => std::mem::replace(&mut answers[at], Ok(())),
                 (None, Err(_)) => unreachable!(),
             };
-            *pending.done.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(answer);
+            pending.done.finish(answer);
         }
     }
 
