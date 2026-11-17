@@ -452,6 +452,26 @@ mod tests {
         runtime.owner.close();
     }
 
+    /// A read that handles a statement's error itself and returns a value (the repair reads return a statement
+    /// their budget cut short as `Deferred`) leaves the reader's transaction aborted; that is rolled back, not taken
+    /// for an owner failure. On prod the closing epoch proof sent into it failed with 25P02 and ended the attempt.
+    #[test]
+    fn native_reader_read_that_handled_its_own_error_doesnt_fail_the_owner() {
+        let Some(schema)=crate::pg::testing::Schema::new() else {return};
+        let runtime=runtime(&schema);
+        let reads=StepReads::for_owner(&runtime.owner).unwrap();
+        let value=reads.read(|tx|{
+            tx.batch_execute("set local statement_timeout='100ms'")?;
+            assert!(tx.batch_execute("select pg_sleep(2)").is_err());
+            Ok(7)
+        }).unwrap();
+        assert_eq!(value,7);
+        assert!(runtime.owner.reader_reads()>0,"it ran on a reader session");
+        assert_eq!(runtime.owner.failure(),None);
+        assert_eq!(reads.probe_moviehash(1).unwrap(),None,"the next read still runs");
+        runtime.owner.close();
+    }
+
     #[test]
     fn native_step_reads_fall_back_to_the_owner_without_reader_sessions() {
         let Some(schema)=crate::pg::testing::Schema::new() else {return};

@@ -348,10 +348,25 @@ impl Owner {
             let value = work(&mut tx)?;
             // `work` may have left a nearly spent statement timeout (the repair reads bound each statement by their
             // remaining budget); the closing proof gets its own
-            tx.batch_execute(&format!("set local statement_timeout = '{READER_PROOF_TIMEOUT}'"))?;
-            epoch.verify_reader(&mut tx)?;
-            tx.commit()?;
-            Ok(value)
+            let closing = tx
+                .batch_execute(&format!("set local statement_timeout = '{READER_PROOF_TIMEOUT}'"))
+                .map_err(anyhow::Error::from)
+                .and_then(|()| epoch.verify_reader(&mut tx));
+            match closing {
+                // `work` handled an error of its own and returned a value (the repair reads return a statement
+                // their budget cut short as `Deferred`), which left the transaction aborted: nothing more runs in
+                // it, so it is rolled back, as committing it on the owner would. Its reads all came before the
+                // abort, on the snapshot the opening proof was taken on. On prod this ended the whole attempt.
+                Err(error) if is_aborted_transaction(&error) => {
+                    tx.rollback()?;
+                    Ok(value)
+                }
+                Err(error) => Err(error),
+                Ok(()) => {
+                    tx.commit()?;
+                    Ok(value)
+                }
+            }
         })();
         if let Err(error) = &result {
             let canceled = super::outage::is_attempt_ended(error) && self.stop.load(Ordering::Acquire);
@@ -714,3 +729,11 @@ mod owner_admission_tests;
 #[cfg(test)]
 #[path="owner_epoch_protocol_tests.rs"]
 mod owner_epoch_protocol_tests;
+
+/// The error PostgreSQL gives a statement sent in a transaction an earlier error aborted (25P02).
+fn is_aborted_transaction(error: &anyhow::Error) -> bool {
+    error.chain().any(|e| {
+        e.downcast_ref::<postgres::Error>().and_then(postgres::Error::code)
+            == Some(&postgres::error::SqlState::IN_FAILED_SQL_TRANSACTION)
+    })
+}
