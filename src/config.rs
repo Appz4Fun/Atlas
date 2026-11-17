@@ -1483,8 +1483,14 @@ impl Config {
             native_reader_sessions: v
                 .get("native_reader_sessions")
                 .and_then(as_int)
-                .filter(|n| (0..=crate::pg::indexer_runtime::READER_SESSIONS_MOST as i64).contains(n))
-                .map(|n| n as usize),
+                .filter(|n| *n >= 0)
+                .map(|n| {
+                    let most = crate::pg::indexer_runtime::READER_SESSIONS_MOST;
+                    if n as u64 > most as u64 {
+                        eprintln!("native_reader_sessions = {n} is more than {most}; using {most}");
+                    }
+                    (n as u64).min(most as u64) as usize
+                }),
             parallel_groups: v
                 .get("parallel_groups")
                 .and_then(as_int)
@@ -2428,6 +2434,16 @@ mod tests {
         assert_eq!(cfg(json!({"backfill_lockstep_days": 0})), None);
         assert_eq!(cfg(json!({"backfill_lockstep_days": 8})), None);
         assert_eq!(cfg(json!({"backfill_lockstep_days": 7})), Some(7));
+    }
+
+    #[test]
+    fn native_reader_sessions_from_the_file_clamped() {
+        let cfg = |v: Value| Config::from_value(&v).native_reader_sessions;
+        assert_eq!(cfg(json!({"native_reader_sessions": 2})), Some(2));
+        assert_eq!(cfg(json!({"native_reader_sessions": 0})), Some(0));
+        assert_eq!(cfg(json!({"native_reader_sessions": 20})), Some(crate::pg::indexer_runtime::READER_SESSIONS_MOST));
+        assert_eq!(cfg(json!({"native_reader_sessions": -1})), None);
+        assert_eq!(cfg(json!({})), None);
     }
 
     #[test]

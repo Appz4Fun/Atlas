@@ -60,11 +60,15 @@ pub(crate) struct Runtime {
 /// catalog binding, now at most this late. A failed proof is never reused. Migrations take their own lock, not the
 /// indexer's (`migrate::run`), soo a schema migrated under a live owner is noticed up to this much (and one turn)
 /// later than before; writers that verify the epoch inside their own transaction are unaffected.
+const EPOCH_PROOF_FOR: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Read-only sessions beside the owner (`Owner::read_only`) unless `native_reader_sessions` says otherwise.
 pub(crate) const READER_SESSIONS: usize = 3;
 pub(crate) const READER_SESSIONS_MOST: usize = 8;
-
-const EPOCH_PROOF_FOR: std::time::Duration = std::time::Duration::from_secs(1);
+/// How long `Owner::read_only` waits for a free reader session before taking an owner turn instead.
+const READER_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+/// Statement timeout of the reader's own epoch proofs.
+const READER_PROOF_TIMEOUT: &str = "10s";
 
 /// The ownership lock and every cursor/catalog write use this same session.
 /// A lost session cannot continue writing through a different pooled client.
@@ -297,41 +301,54 @@ impl Owner {
 
     /// `work` in one READ ONLY REPEATABLE READ transaction. With reader sessions (`set_readers`) and an epoch, on one
     /// of those, never taking an owner turn: on prod the repair candidate scan and the post-processing step reads held
-    /// the owner session more than half its time, and backfill claims and saves queued behind them. The transaction's
-    /// first and last statements prove the epoch as a reader (`OwnerEpoch::verify_reader`): its snapshot is taken by
-    /// the first, so every row it reads was read while this epoch was current and its owner backend held the
-    /// exclusive lock, and the last proves no successor took over before the result is handed back. Without readers,
-    /// it runs on the owner session as before. Errors are classified as an owner callback's: a statement timeout or
-    /// an admission limit fails one step, a stop ends the attempt, anything else fails the owner.
+    /// the owner session more than half its time, and backfill claims and saves queued behind them.
+    ///
+    /// The transaction's first statement is the reader's epoch proof (`OwnerEpoch::verify_reader`), which takes the
+    /// snapshot: every row `work` reads was read while this epoch was the current active one and its owner backend
+    /// held the exclusive lock. The closing proof, before the result is handed back, sees the epoch rows of that same
+    /// snapshot again; what it adds is a fresh look at the live views (`pg_stat_activity`, `pg_locks`): the original
+    /// owner backend is still alive and still holds the exclusive indexer lock, which no successor can take while it
+    /// does. Each proof runs under its own statement timeout.
+    ///
+    /// No reader session free within `READER_WAIT` (or none can be opened): the read takes an owner turn, as it did
+    /// without readers, and a stop is noticed meanwhile. Without readers it always runs on the owner session. Errors
+    /// are classified as an owner callback's: a statement timeout or an admission limit fails one step, a stop ends
+    /// the attempt, anything else fails the owner.
     #[track_caller]
     pub(crate) fn read_only<T>(&self, work: impl FnOnce(&mut postgres::Transaction<'_>) -> Result<T>) -> Result<T> {
         fn start(client: &mut postgres::Client) -> Result<postgres::Transaction<'_>, postgres::Error> {
             client.build_transaction().isolation_level(postgres::IsolationLevel::RepeatableRead).read_only(true).start()
         }
+        let on_owner = |work: Box<dyn FnOnce(&mut postgres::Transaction<'_>) -> Result<T> + '_>| self.with(|client| {
+            let mut tx = start(client)?;
+            let value = work(&mut tx)?;
+            tx.commit()?;
+            Ok(value)
+        });
         let (Some(pool), Some(epoch)) = (self.readers.get(), self.epoch.as_ref()) else {
-            return self.with(|client| {
-                let mut tx = start(client)?;
-                let value = work(&mut tx)?;
-                tx.commit()?;
-                Ok(value)
-            });
+            return on_owner(Box::new(work));
+        };
+        if !self.accepting.load(Ordering::Acquire) || self.stop.load(Ordering::Acquire) {
+            return Err(AttemptEnded.into());
+        }
+        let Ok(mut client) = pool.get_before(std::time::Instant::now() + READER_WAIT) else {
+            return on_owner(Box::new(work));
         };
         let caller = caller_diagnostic();
         let result = (|| {
             if !self.accepting.load(Ordering::Acquire) || self.stop.load(Ordering::Acquire) {
                 return Err(AttemptEnded.into());
             }
-            let mut client = pool.get_before(std::time::Instant::now() + std::time::Duration::from_secs(30))?;
-            if !self.accepting.load(Ordering::Acquire) || self.stop.load(Ordering::Acquire) {
-                return Err(AttemptEnded.into());
-            }
             let mut tx = start(&mut client)?;
+            // SET takes no snapshot; the proof below is the first statement that does
+            tx.batch_execute(&format!("set local statement_timeout = '{READER_PROOF_TIMEOUT}'"))?;
             epoch.verify_reader(&mut tx)?;
+            tx.batch_execute("set local statement_timeout = default")?;
             self.reader_reads.fetch_add(1, Ordering::AcqRel);
             let value = work(&mut tx)?;
             // `work` may have left a nearly spent statement timeout (the repair reads bound each statement by their
             // remaining budget); the closing proof gets its own
-            tx.batch_execute("set local statement_timeout = '10s'")?;
+            tx.batch_execute(&format!("set local statement_timeout = '{READER_PROOF_TIMEOUT}'"))?;
             epoch.verify_reader(&mut tx)?;
             tx.commit()?;
             Ok(value)
@@ -346,6 +363,15 @@ impl Owner {
             }
         }
         result
+    }
+
+    /// Every reader session held, for tests of a full reader pool.
+    #[cfg(test)]
+    pub(crate) fn hold_readers_for_test(&self) -> Vec<super::Conn<'_>> {
+        let pool = self.readers.get().expect("reader sessions");
+        let mut held = Vec::new();
+        while let Ok(conn) = pool.get_before(std::time::Instant::now() + std::time::Duration::from_millis(200)) { held.push(conn); }
+        held
     }
 
     /// `epoch.verify` on this session, unless it passed within `EPOCH_PROOF_FOR`. Called with the session held.
@@ -544,7 +570,7 @@ impl Runtime {
             db = crate::indexer::with_helper_writers(db, super::ingest::Helpers::new(pool, &epoch).of(owner.clone()));
             println!("native saves: {n} helper writer sessions beside the owner");
         }
-        let readers = config.native_reader_sessions.unwrap_or(READER_SESSIONS).min(READER_SESSIONS_MOST);
+        let readers = config.native_reader_sessions.unwrap_or(READER_SESSIONS);
         if readers > 0 {
             owner.set_readers(Arc::new(super::Pool::new(&super::StorageConfig { max_connections: readers, ..storage.clone() })?));
             println!("native reads: {readers} read-only sessions beside the owner");

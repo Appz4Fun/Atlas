@@ -421,6 +421,38 @@ mod tests {
     }
 
     #[test]
+    fn native_step_reads_take_an_owner_turn_when_every_reader_is_busy() {
+        let Some(schema)=crate::pg::testing::Schema::new() else {return};
+        let runtime=runtime(&schema);
+        let reads=StepReads::for_owner(&runtime.owner).unwrap();
+        let owner_pid:i32=runtime.owner.with(|client|Ok(client.query_one("select pg_backend_pid()",&[])?.get(0))).unwrap();
+        let held=runtime.owner.hold_readers_for_test();
+        assert_eq!(held.len(),crate::pg::indexer_runtime::READER_SESSIONS);
+        let before=runtime.owner.reader_reads();let started=std::time::Instant::now();
+        let pid:i32=reads.read(|tx|Ok(tx.query_one("select pg_backend_pid()",&[])?.get(0))).unwrap();
+        assert_eq!(pid,owner_pid,"a full reader pool falls back to the owner turn");
+        assert!(started.elapsed()<std::time::Duration::from_secs(10),"a full reader pool must not hang a read");
+        assert_eq!(runtime.owner.reader_reads(),before);
+        assert_eq!(runtime.owner.failure(),None,"a full reader pool never ends the owner");
+        drop(held);
+        let pid:i32=reads.read(|tx|Ok(tx.query_one("select pg_backend_pid()",&[])?.get(0))).unwrap();
+        assert_ne!(pid,owner_pid);
+        runtime.owner.close();
+    }
+
+    #[test]
+    fn native_reader_statement_timeout_fails_one_step_not_the_owner() {
+        let Some(schema)=crate::pg::testing::Schema::new() else {return};
+        let runtime=runtime(&schema);
+        let reads=StepReads::for_owner(&runtime.owner).unwrap();
+        let error=reads.read(|tx|{tx.batch_execute("set local statement_timeout='100ms'")?;tx.batch_execute("select pg_sleep(2)")?;Ok(())}).unwrap_err();
+        assert!(super::super::outage::is_step_timed_out(&error),"{error:#}");
+        assert_eq!(runtime.owner.failure(),None);
+        assert_eq!(reads.probe_moviehash(1).unwrap(),None,"the next read still runs");
+        runtime.owner.close();
+    }
+
+    #[test]
     fn native_step_reads_fall_back_to_the_owner_without_reader_sessions() {
         let Some(schema)=crate::pg::testing::Schema::new() else {return};
         let mut config=crate::config::Config::default();

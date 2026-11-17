@@ -125,11 +125,6 @@ impl OwnerEpoch {
 }
 
 impl OwnerEpoch {
-    /// `verify` for a pooled read-only session beside the owner (`Owner::read_only`): this epoch is still the
-    /// current active one, of this database, schema, role, schema version and code, its original backend alive and
-    /// still holding the exclusive indexer lock, this session's search path on the owner's schema, and the catalog
-    /// binding unchanged. Only `backend_pid=pg_backend_pid()` is left out, as the reader is not that backend; it grants
-    /// no mutation (the session is READ ONLY, and every write still goes through a fenced session).
     /// `verify` on the owner backend itself, `verify_reader` on a read-only session beside it (`Owner::read_only`).
     pub(crate) fn verify_on(&self,client:&mut impl GenericClient)->Result<()> {
         let own:i32=client.query_one("select pg_backend_pid()",&[])?.try_get(0)?;
@@ -142,6 +137,14 @@ impl OwnerEpoch {
     /// This epoch under another id: one that is not (or no longer) the current epoch.
     #[cfg(test)]
     pub(crate) fn other_for_test(&self)->Self {let mut other=self.clone();other.id[0]^=0xff;other}
+    /// `verify` for a pooled read-only session beside the owner (`Owner::read_only`): in this transaction's snapshot,
+    /// this epoch is the current active one, of this database, schema, role, schema version and code, and the catalog
+    /// binding is unchanged; in the live views (`pg_stat_activity`, `pg_locks`, read fresh each call), its original
+    /// backend is alive and still holds the exclusive indexer lock; and this session's search path is the owner's
+    /// schema. Only `backend_pid=pg_backend_pid()` is left out, as the reader is not that backend. Called again later
+    /// in the same transaction, the epoch rows come from the same snapshot; only the live views are new, proving the
+    /// owner backend still holds the lock (which excludes a successor). It grants no mutation: the session is READ
+    /// ONLY, and every write still goes through a fenced session.
     pub(crate) fn verify_reader(&self,client:&mut impl GenericClient)->Result<()> {
         client.batch_execute("select pg_stat_clear_snapshot()")?;
         let valid:bool=client.query_typed_one("select current_schema()=$7 and exists(select 1 from native_runtime_current c join native_runtime_epochs e on e.epoch=c.epoch
